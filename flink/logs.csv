@@ -1,0 +1,101 @@
+query_id,timestamp,user_id,user_tier,query_text,query_type,selected_model,token_count_input,token_count_output,latency_ms,cost_usd,status,error_message,context_compressed,compression_ratio,cached_response
+q_001,2024-01-15T10:30:00Z,user_001,premium,What is machine learning and how does it work?,general,gpt-3.5-turbo,120,300,1200,0.0008,success,,false,0.0,false
+q_002,2024-01-15T10:31:15Z,user_002,enterprise,Write a Python function to implement binary search,code_generation,mistral-7b,95,250,1800,0.0000,success,,false,0.0,false
+q_003,2024-01-15T10:32:30Z,user_003,free,Explain quantum computing in simple terms,general,gpt-3.5-turbo,80,180,950,0.0005,success,,false,0.0,true
+q_004,2024-01-15T10:33:45Z,user_004,premium,Analyze the sentiment of customer reviews for our product,analysis,claude-3.5-sonnet,200,450,2200,0.0020,success,,true,0.3,false
+q_005,2024-01-15T10:35:00Z,user_005,enterprise,Summarize the quarterly earnings report and key insights,summarization,gpt-3.5-turbo,800,320,1400,0.0022,success,,true,0.4,false
+q_006,2024-01-15T10:36:20Z,user_006,free,Help me debug this JavaScript code that's not working,code_generation,mistral-7b,150,200,2100,0.0000,success,,false,0.0,false
+q_007,2024-01-15T10:37:40Z,user_007,premium,What are the latest trends in renewable energy?,general,gpt-3.5-turbo,110,280,1150,0.0008,success,,false,0.0,false
+q_008,2024-01-15T10:38:55Z,user_008,enterprise,Perform a SWOT analysis for our company's expansion plans,analysis,claude-3.5-sonnet,300,600,2800,0.0027,success,,false,0.0,false
+q_009,2024-01-15T10:40:10Z,user_009,free,Explain the concept of blockchain technology,general,gpt-3.5-turbo,90,220,1050,0.0006,success,,false,0.0,true
+q_010,2024-01-15T10:41:25Z,user_010,premium,Create a data visualization script in Python using matplotlib,code_generation,mistral-7b,180,350,2200,0.0000,success,,false,0.0,false
+q_011,2024-01-15T10:42:40Z,user_011,enterprise,Review and optimize our database query performance,analysis,claude-3.5-sonnet,250,400,2400,0.0020,success,,false,0.0,false
+q_012,2024-01-15T10:43:55Z,user_012,free,How do I prepare for a technical interview?,general,gpt-3.5-turbo,75,190,900,0.0005,success,,false,0.0,false
+q_013,2024-01-15T10:45:10Z,user_013,premium,Translate this technical document from English to Spanish,general,gpt-3.5-turbo,400,420,1600,0.0016,success,,true,0.2,false
+q_014,2024-01-15T10:46:25Z,user_014,enterprise,Design a microservices architecture for our new platform,code_generation,mistral-7b,220,480,2600,0.0000,success,,false,0.0,false
+q_015,2024-01-15T10:47:40Z,user_015,free,What are the benefits of cloud computing?,general,gpt-3.5-turbo,85,200,980,0.0006,success,,false,0.0,true
+q_016,2024-01-15T10:48:55Z,user_016,premium,Analyze market trends for electric vehicles in 2024,analysis,claude-3.5-sonnet,180,380,2100,0.0017,success,,false,0.0,false
+q_017,2024-01-15T10:50:10Z,user_017,enterprise,Generate API documentation for our REST endpoints,code_generation,mistral-7b,160,320,1900,0.0000,success,,false,0.0,false
+q_018,2024-01-15T10:51:25Z,user_018,free,Explain the difference between AI and machine learning,general,gpt-3.5-turbo,95,230,1100,0.0007,success,,false,0.0,false
+q_019,2024-01-15T10:52:40Z,user_019,premium,Help me write a business proposal for a new startup idea,general,gpt-3.5-turbo,300,500,1800,0.0016,success,,false,0.0,false
+q_020,2024-01-15T10:53:55Z,user_020,enterprise,Optimize our machine learning model for better performance,analysis,claude-3.5-sonnet,350,600,3000,0.0029,success,,true,0.25,false
+q_021,2024-01-15T10:55:10Z,user_021,free,How do I set up a development environment for React?,code_generation,mistral-7b,120,280,2000,0.0000,success,,false,0.0,false
+q_022,2024-01-15T10:56:25Z,user_022,premium,Summarize the key points from this research paper,summarization,gpt-3.5-turbo,600,250,1300,0.0017,success,,true,0.35,false
+q_023,2024-01-15T10:57:40Z,user_023,enterprise,Create a comprehensive testing strategy for our application,analysis,claude-3.5-sonnet,280,520,2500,0.0024,success,,false,0.0,false
+q_024,2024-01-15T10:58:55Z,user_024,free,What programming language should I learn first?,general,gpt-3.5-turbo,70,180,850,0.0005,success,,false,0.0,true
+q_025,2024-01-15T11:00:10Z,user_025,premium,Design a database schema for an e-commerce platform,code_generation,mistral-7b,200,400,2300,0.0000,success,,false,0.0,false
+q_026,2024-01-15T11:01:25Z,user_026,enterprise,Evaluate the ROI of our digital transformation initiative,analysis,claude-3.5-sonnet,320,580,2700,0.0027,success,,false,0.0,false
+q_027,2024-01-15T11:02:40Z,user_027,free,Explain how neural networks work in simple terms,general,gpt-3.5-turbo,100,250,1000,0.0007,success,,false,0.0,false
+q_028,2024-01-15T11:03:55Z,user_028,premium,Create a mobile app wireframe for food delivery service,general,gpt-3.5-turbo,150,350,1500,0.0010,success,,false,0.0,false
+q_029,2024-01-15T11:05:10Z,user_029,enterprise,Implement OAuth2 authentication in our Node.js API,code_generation,mistral-7b,180,380,2100,0.0000,success,,false,0.0,false
+q_030,2024-01-15T11:06:25Z,user_030,free,What are the career prospects in data science?,general,gpt-3.5-turbo,80,200,920,0.0006,success,,false,0.0,true
+q_031,2024-01-15T11:07:40Z,user_031,premium,Analyze user behavior patterns from our analytics data,analysis,claude-3.5-sonnet,250,450,2300,0.0021,success,,false,0.0,false
+q_032,2024-01-15T11:08:55Z,user_032,enterprise,Build a CI/CD pipeline using GitHub Actions,code_generation,mistral-7b,170,340,2000,0.0000,success,,false,0.0,false
+q_033,2024-01-15T11:10:10Z,user_033,free,How do I improve my coding skills?,general,gpt-3.5-turbo,65,170,800,0.0005,success,,false,0.0,false
+q_034,2024-01-15T11:11:25Z,user_034,premium,Write a detailed project plan for software migration,general,gpt-3.5-turbo,350,600,2000,0.0019,success,,false,0.0,false
+q_035,2024-01-15T11:12:40Z,user_035,enterprise,Optimize our cloud infrastructure costs and performance,analysis,claude-3.5-sonnet,300,550,2600,0.0025,success,,true,0.3,false
+q_036,2024-01-15T11:13:55Z,user_036,free,Explain the concept of DevOps and its benefits,general,gpt-3.5-turbo,90,210,950,0.0006,success,,false,0.0,false
+q_037,2024-01-15T11:15:10Z,user_037,premium,Create unit tests for our payment processing module,code_generation,mistral-7b,160,300,1900,0.0000,success,,false,0.0,false
+q_038,2024-01-15T11:16:25Z,user_038,enterprise,Develop a disaster recovery plan for our systems,analysis,claude-3.5-sonnet,280,500,2400,0.0023,success,,false,0.0,false
+q_039,2024-01-15T11:17:40Z,user_039,free,What is the future of artificial intelligence?,general,gpt-3.5-turbo,85,195,900,0.0006,success,,false,0.0,true
+q_040,2024-01-15T11:18:55Z,user_040,premium,Design a real-time chat application architecture,code_generation,mistral-7b,190,370,2200,0.0000,success,,false,0.0,false
+q_041,2024-01-15T11:20:10Z,user_041,enterprise,Implement Redis caching for session management,code_generation,mistral-7b,140,290,1800,0.0000,success,,false,0.0,false
+q_042,2024-01-15T11:21:25Z,user_042,free,How do I learn Docker containerization?,general,gpt-3.5-turbo,75,185,880,0.0005,success,,false,0.0,false
+q_043,2024-01-15T11:22:40Z,user_043,premium,Analyze competitor pricing strategies in our market,analysis,claude-3.5-sonnet,220,420,2200,0.0019,success,,false,0.0,false
+q_044,2024-01-15T11:23:55Z,user_044,enterprise,Create automated deployment scripts for Kubernetes,code_generation,mistral-7b,200,450,2400,0.0000,success,,false,0.0,false
+q_045,2024-01-15T11:25:10Z,user_045,free,What are the differences between SQL and NoSQL?,general,gpt-3.5-turbo,90,220,1000,0.0006,success,,false,0.0,true
+q_046,2024-01-15T11:26:25Z,user_046,premium,Generate comprehensive API rate limiting strategy,analysis,claude-3.5-sonnet,180,380,2100,0.0017,success,,false,0.0,false
+q_047,2024-01-15T11:27:40Z,user_047,enterprise,Build microservice communication using gRPC,code_generation,mistral-7b,170,360,2000,0.0000,success,,false,0.0,false
+q_048,2024-01-15T11:28:55Z,user_048,free,Explain cybersecurity best practices for developers,general,gpt-3.5-turbo,95,240,1100,0.0007,success,,false,0.0,false
+q_049,2024-01-15T11:30:10Z,user_049,premium,Design a scalable event-driven architecture,code_generation,mistral-7b,210,480,2500,0.0000,success,,false,0.0,false
+q_050,2024-01-15T11:31:25Z,user_050,enterprise,Evaluate machine learning models for fraud detection,analysis,claude-3.5-sonnet,320,620,2800,0.0028,success,,true,0.4,false
+q_051,2024-01-15T11:32:40Z,user_003,free,Help me understand async/await in JavaScript,code_generation,mistral-7b,110,250,1900,0.0000,success,,false,0.0,false
+q_052,2024-01-15T11:33:55Z,user_015,premium,Create a comprehensive backup and recovery plan,analysis,claude-3.5-sonnet,260,480,2300,0.0022,success,,false,0.0,false
+q_053,2024-01-15T11:35:10Z,user_008,enterprise,Implement JWT token authentication system,code_generation,mistral-7b,150,320,1800,0.0000,success,,false,0.0,false
+q_054,2024-01-15T11:36:25Z,user_024,free,What is the difference between frontend and backend?,general,gpt-3.5-turbo,70,180,850,0.0005,success,,false,0.0,true
+q_055,2024-01-15T11:37:40Z,user_012,premium,Optimize database queries for better performance,analysis,claude-3.5-sonnet,240,450,2400,0.0021,success,,false,0.0,false
+q_056,2024-01-15T11:38:55Z,user_033,enterprise,Build a monitoring dashboard using Grafana,code_generation,mistral-7b,180,390,2100,0.0000,success,,false,0.0,false
+q_057,2024-01-15T11:40:10Z,user_018,free,How do I get started with open source contribution?,general,gpt-3.5-turbo,85,200,920,0.0006,success,,false,0.0,false
+q_058,2024-01-15T11:41:25Z,user_027,premium,Design a multi-tenant SaaS application architecture,code_generation,mistral-7b,250,520,2600,0.0000,success,,false,0.0,false
+q_059,2024-01-15T11:42:40Z,user_036,enterprise,Analyze system performance bottlenecks and solutions,analysis,claude-3.5-sonnet,300,560,2700,0.0026,success,,true,0.35,false
+q_060,2024-01-15T11:43:55Z,user_009,free,Explain version control with Git basics,general,gpt-3.5-turbo,80,190,900,0.0005,success,,false,0.0,true
+q_061,2024-01-15T11:45:10Z,user_042,premium,Create automated testing pipeline for mobile apps,code_generation,mistral-7b,190,410,2200,0.0000,success,,false,0.0,false
+q_062,2024-01-15T11:46:25Z,user_001,enterprise,Develop chatbot integration for customer support,analysis,claude-3.5-sonnet,280,520,2500,0.0024,success,,false,0.0,false
+q_063,2024-01-15T11:47:40Z,user_030,free,What are the latest web development frameworks?,general,gpt-3.5-turbo,90,210,980,0.0006,success,,false,0.0,false
+q_064,2024-01-15T11:48:55Z,user_045,premium,Implement real-time data streaming with Apache Kafka,code_generation,mistral-7b,170,380,2000,0.0000,success,,false,0.0,false
+q_065,2024-01-15T11:50:10Z,user_021,enterprise,Design machine learning MLOps pipeline,analysis,claude-3.5-sonnet,340,640,2900,0.0029,success,,true,0.3,false
+q_066,2024-01-15T11:51:25Z,user_039,free,How do I prepare for a software engineering career?,general,gpt-3.5-turbo,85,195,900,0.0006,success,,false,0.0,false
+q_067,2024-01-15T11:52:40Z,user_016,premium,Build GraphQL API with authentication and caching,code_generation,mistral-7b,200,440,2300,0.0000,success,,false,0.0,false
+q_068,2024-01-15T11:53:55Z,user_048,enterprise,Analyze cloud migration costs and benefits,analysis,claude-3.5-sonnet,290,540,2600,0.0025,success,,false,0.0,false
+q_069,2024-01-15T11:55:10Z,user_006,free,Explain the importance of code documentation,general,gpt-3.5-turbo,75,170,830,0.0005,success,,false,0.0,true
+q_070,2024-01-15T11:56:25Z,user_054,premium,Create serverless functions for image processing,code_generation,mistral-7b,160,350,1900,0.0000,success,,false,0.0,false
+q_071,2024-01-15T11:57:40Z,user_011,enterprise,Optimize recommendation engine algorithms,analysis,claude-3.5-sonnet,320,600,2800,0.0028,success,,true,0.4,false
+q_072,2024-01-15T11:58:55Z,user_057,free,What is agile software development methodology?,general,gpt-3.5-turbo,80,185,870,0.0005,success,,false,0.0,false
+q_073,2024-01-15T12:00:10Z,user_025,premium,Implement blockchain smart contracts for voting,code_generation,mistral-7b,220,480,2500,0.0000,success,,false,0.0,false
+q_074,2024-01-15T12:01:25Z,user_038,enterprise,Design distributed caching strategy for high traffic,analysis,claude-3.5-sonnet,310,580,2700,0.0027,success,,false,0.0,false
+q_075,2024-01-15T12:02:40Z,user_066,free,How do I debug common programming errors?,general,gpt-3.5-turbo,70,160,800,0.0005,success,,false,0.0,false
+q_076,2024-01-15T12:03:55Z,user_044,premium,Build real-time collaborative editing system,code_generation,mistral-7b,240,520,2600,0.0000,success,,false,0.0,false
+q_077,2024-01-15T12:05:10Z,user_029,enterprise,Analyze user engagement metrics and improve UX,analysis,claude-3.5-sonnet,280,500,2400,0.0023,success,,false,0.0,false
+q_078,2024-01-15T12:06:25Z,user_072,free,What programming tools should every developer know?,general,gpt-3.5-turbo,85,200,920,0.0006,success,,false,0.0,true
+q_079,2024-01-15T12:07:40Z,user_031,premium,Create automated data backup and sync system,code_generation,mistral-7b,180,400,2100,0.0000,success,,false,0.0,false
+q_080,2024-01-15T12:08:55Z,user_050,enterprise,Implement advanced search with Elasticsearch,analysis,claude-3.5-sonnet,300,560,2700,0.0026,success,,true,0.35,false
+q_081,2024-01-15T12:10:10Z,user_004,premium,Generate error handling API,code_generation,mistral-7b,130,280,1700,0.0000,error,Model timeout after 300 seconds,false,0.0,false
+q_082,2024-01-15T12:11:25Z,user_007,enterprise,Create predictive analytics dashboard,analysis,claude-3.5-sonnet,350,650,3200,0.0030,success,,true,0.3,false
+q_083,2024-01-15T12:12:40Z,user_075,free,How to choose the right database for my project?,general,gpt-3.5-turbo,90,210,950,0.0006,success,,false,0.0,false
+q_084,2024-01-15T12:13:55Z,user_034,premium,Implement multi-factor authentication system,code_generation,mistral-7b,170,370,2000,0.0000,success,,false,0.0,false
+q_085,2024-01-15T12:15:10Z,user_019,enterprise,Design scalable content delivery network strategy,analysis,claude-3.5-sonnet,290,530,2500,0.0025,success,,false,0.0,false
+q_086,2024-01-15T12:16:25Z,user_081,free,What are the benefits of test-driven development?,general,gpt-3.5-turbo,80,180,880,0.0005,success,,false,0.0,true
+q_087,2024-01-15T12:17:40Z,user_040,premium,Build IoT device management platform,code_generation,mistral-7b,210,460,2400,0.0000,success,,false,0.0,false
+q_088,2024-01-15T12:18:55Z,user_026,enterprise,Optimize SQL queries for million-record datasets,analysis,claude-3.5-sonnet,270,490,2300,0.0023,success,,false,0.0,false
+q_089,2024-01-15T12:20:10Z,user_084,free,How do I learn data structures and algorithms?,general,gpt-3.5-turbo,75,175,850,0.0005,success,,false,0.0,false
+q_090,2024-01-15T12:21:25Z,user_049,premium,Create automated code review and quality gates,code_generation,mistral-7b,190,420,2200,0.0000,success,,false,0.0,false
+q_091,2024-01-15T12:22:40Z,user_035,enterprise,Design enterprise data warehouse architecture,analysis,claude-3.5-sonnet,330,610,2800,0.0028,success,,true,0.4,false
+q_092,2024-01-15T12:23:55Z,user_087,free,What is the future of mobile app development?,general,gpt-3.5-turbo,85,195,900,0.0006,success,,false,0.0,false
+q_093,2024-01-15T12:25:10Z,user_055,premium,Implement progressive web app with offline support,code_generation,mistral-7b,200,450,2300,0.0000,success,,false,0.0,false
+q_094,2024-01-15T12:26:25Z,user_043,enterprise,Analyze customer churn prediction models,analysis,claude-3.5-sonnet,310,570,2600,0.0026,success,,false,0.0,false
+q_095,2024-01-15T12:27:40Z,user_090,free,How do I get my first job as a developer?,general,gpt-3.5-turbo,70,165,820,0.0005,success,,false,0.0,true
+q_096,2024-01-15T12:28:55Z,user_058,premium,Build video streaming platform with CDN,code_generation,mistral-7b,230,500,2500,0.0000,success,,false,0.0,false
+q_097,2024-01-15T12:30:10Z,user_047,enterprise,Create anomaly detection system for security,analysis,claude-3.5-sonnet,340,620,2900,0.0029,success,,true,0.35,false
+q_098,2024-01-15T12:31:25Z,user_093,free,What are common software architecture patterns?,general,gpt-3.5-turbo,90,205,920,0.0006,success,,false,0.0,false
+q_099,2024-01-15T12:32:40Z,user_067,premium,Implement distributed tracing for microservices,code_generation,mistral-7b,180,390,2100,0.0000,success,,false,0.0,false
+q_100,2024-01-15T12:33:55Z,user_052,enterprise,Design AI-powered recommendation engine,analysis,claude-3.5-sonnet,360,680,3100,0.0031,success,,true,0.3,false

@@ -1,0 +1,250 @@
+api:
+  host: 0.0.0.0
+  port: 8080
+  log_level: info
+  cors_origins:
+  - '*'
+  rate_limiting:
+    enabled: true
+    requests_per_minute: 1000
+    burst_size: 100
+logging:
+  level: INFO
+  file: logs/llm_router.log
+  max_bytes: 10485760
+  backup_count: 5
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+router:
+  default_model: mistral-7b
+  routing_strategy: intelligent
+  models:
+    gpt-4-turbo:
+      provider: openai
+      api_key_env: OPENAI_API_KEY
+      max_tokens: 128000
+      cost_per_token: 3.0e-05
+      priority: 1
+      capabilities:
+      - reasoning
+      - coding
+      - analysis
+    claude-3.5-sonnet:
+      provider: anthropic
+      api_key_env: ANTHROPIC_API_KEY
+      max_tokens: 200000
+      cost_per_token: 1.5e-05
+      priority: 2
+      capabilities:
+      - reasoning
+      - writing
+      - analysis
+    mistral-7b:
+      provider: vllm
+      model_path: /models/mistral-7b-instruct
+      max_tokens: 8192
+      cost_per_token: 1.0e-06
+      priority: 3
+      capabilities:
+      - general
+      - coding
+      gpu_memory_gb: 16
+    llama-3.1-70b:
+      provider: vllm
+      model_path: /models/llama-3.1-70b-instruct
+      max_tokens: 128000
+      cost_per_token: 5.0e-06
+      priority: 4
+      capabilities:
+      - reasoning
+      - coding
+      - analysis
+      gpu_memory_gb: 80
+  routing_rules:
+  - condition: query_type == 'code_generation'
+    models:
+    - gpt-4-turbo
+    - mistral-7b
+    fallback: mistral-7b
+  - condition: query_type == 'analysis' AND token_count > 50000
+    models:
+    - claude-3.5-sonnet
+    - llama-3.1-70b
+    fallback: llama-3.1-70b
+  - condition: user_tier == 'premium'
+    models:
+    - gpt-4-turbo
+    - claude-3.5-sonnet
+    fallback: mistral-7b
+  - condition: user_tier == 'free'
+    models:
+    - mistral-7b
+    fallback: mistral-7b
+inference:
+  vllm:
+    host: localhost
+    port: 8000
+    worker_use_ray: true
+    engine_use_ray: true
+    max_model_len: 32768
+    gpu_memory_utilization: 0.9
+    tensor_parallel_size: 1
+    trust_remote_code: true
+  openai:
+    base_url: https://api.openai.com/v1
+    timeout: 60
+    max_retries: 3
+  anthropic:
+    base_url: https://api.anthropic.com
+    timeout: 60
+    max_retries: 3
+  compression:
+    enabled: true
+    max_context_tokens: 100000
+    compression_ratio: 0.3
+    method: semantic_graph
+  cache:
+    enabled: true
+    backend: redis
+    ttl: 3600
+    max_size: 1GB
+  batching:
+    enabled: true
+    max_batch_size: 32
+    max_wait_time_ms: 50
+kafka:
+  bootstrap_servers:
+  - localhost:9092
+  topics:
+    queries: llm-queries
+    responses: llm-responses
+    metrics: llm-metrics
+    errors: llm-errors
+  producer:
+    acks: all
+    retries: 3
+    batch_size: 16384
+    linger_ms: 5
+    compression_type: gzip
+  consumer:
+    group_id: llm-router-consumer
+    auto_offset_reset: latest
+    enable_auto_commit: true
+    max_poll_records: 500
+  enabled: false
+clickhouse:
+  host: localhost
+  port: 8123
+  database: llm_router
+  username: default
+  password: ''
+  tables:
+    queries:
+      name: query_logs
+      engine: MergeTree
+      partition_by: toYYYYMM(timestamp)
+      order_by: timestamp
+      ttl: timestamp + INTERVAL 90 DAY
+    metrics:
+      name: system_metrics
+      engine: ReplacingMergeTree
+      partition_by: toYYYYMMDD(timestamp)
+      order_by: (service, metric_name, timestamp)
+      ttl: timestamp + INTERVAL 30 DAY
+  enabled: false
+monitoring:
+  prometheus_port: 8000
+  prometheus:
+    scrape_interval: 15s
+    evaluation_interval: 15s
+  grafana:
+    port: 3000
+    admin_user: admin
+    admin_password: admin
+  alerts:
+    error_rate_threshold: 0.05
+    latency_threshold_ms: 5000
+    memory_usage_threshold: 0.9
+    disk_usage_threshold: 0.8
+  health_checks:
+    interval_seconds: 30
+    timeout_seconds: 10
+  enabled: false
+slack:
+  enabled: false
+  bot_token_env: SLACK_BOT_TOKEN
+  app_token_env: SLACK_APP_TOKEN
+  signing_secret_env: SLACK_SIGNING_SECRET
+  channels:
+  - general
+  - ai-testing
+  response_settings:
+    max_response_length: 2000
+    typing_indicator: true
+    thread_replies: true
+  rate_limiting:
+    requests_per_hour: 100
+    burst_requests: 5
+streamlit:
+  enabled: true
+  port: 8501
+  host: 0.0.0.0
+  theme: dark
+  dashboard:
+    refresh_interval_seconds: 30
+    max_log_entries: 1000
+    chart_update_interval: 5
+flink:
+  enabled: false
+  job_manager_host: localhost
+  job_manager_port: 8081
+  parallelism: 4
+  checkpointing_interval_ms: 5000
+security:
+  api_keys:
+    enabled: true
+    header_name: X-API-Key
+  jwt:
+    enabled: false
+    secret_key_env: JWT_SECRET_KEY
+    algorithm: HS256
+    expiration_hours: 24
+  cors:
+    enabled: true
+    allow_origins:
+    - '*'
+    allow_methods:
+    - GET
+    - POST
+    - PUT
+    - DELETE
+    allow_headers:
+    - '*'
+performance:
+  connection_pools:
+    database:
+      max_connections: 20
+      min_connections: 5
+    http:
+      max_connections: 100
+      timeout: 30
+  workers:
+    api_workers: 4
+    inference_workers: 2
+    pipeline_workers: 2
+  memory:
+    max_heap_size: 8G
+    gc_strategy: G1GC
+development:
+  debug: false
+  auto_reload: false
+  profiling: false
+  mock_external_apis: false
+features:
+  context_compression: true
+  semantic_caching: true
+  batch_processing: true
+  multi_modal: false
+  function_calling: true
+  streaming_responses: true
+pipeline:
+  enabled: false
