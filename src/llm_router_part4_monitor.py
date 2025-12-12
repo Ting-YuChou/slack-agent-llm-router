@@ -91,8 +91,8 @@ class SystemMonitor:
     
     async def _collect_system_metrics(self) -> SystemHealth:
         """Collect system metrics"""
-        # CPU usage
-        cpu_percent = psutil.cpu_percent(interval=1)
+        # CPU usage (non-blocking sample)
+        cpu_percent = psutil.cpu_percent(interval=None)
         
         # Memory usage
         memory = psutil.virtual_memory()
@@ -159,11 +159,12 @@ class SystemMonitor:
         for i, memory in enumerate(health.gpu_memory):
             self.gpu_memory.labels(gpu_id=str(i)).set(memory)
     
-    def get_current_health(self) -> Optional[SystemHealth]:
-        """Get current system health synchronously"""
+    async def get_current_health(self) -> Optional[SystemHealth]:
+        """Get current system health asynchronously"""
         try:
-            return asyncio.run(self._collect_system_metrics())
-        except:
+            return await self._collect_system_metrics()
+        except Exception as exc:
+            logger.debug(f"Failed to collect system health: {exc}")
             return None
     
     def stop_monitoring(self):
@@ -286,12 +287,12 @@ class AlertManager:
             
             # Map metric names to values
             context = {
-                'error_rate': metrics.get('error_rate', 0),
-                'avg_latency_ms': metrics.get('avg_latency_ms', 0),
-                'memory_usage': metrics.get('memory_usage', 0),
-                'disk_usage': metrics.get('disk_usage', 0),
-                'cpu_usage': metrics.get('cpu_usage', 0),
-                'model_health_status': metrics.get('model_health_status', 'healthy')
+                'error_rate': self._get_metric_value(metrics, ['application.error_rate', 'error_rate'], 0),
+                'avg_latency_ms': self._get_metric_value(metrics, ['application.avg_latency_ms', 'avg_latency_ms'], 0),
+                'memory_usage': self._get_metric_value(metrics, ['system.memory_usage', 'memory_usage'], 0),
+                'disk_usage': self._get_metric_value(metrics, ['system.disk_usage', 'disk_usage'], 0),
+                'cpu_usage': self._get_metric_value(metrics, ['system.cpu_usage', 'cpu_usage'], 0),
+                'model_health_status': self._get_metric_value(metrics, ['application.model_health_status', 'model_health_status'], 'healthy')
             }
             
             # Evaluate condition
@@ -300,6 +301,14 @@ class AlertManager:
         except Exception as e:
             logger.error(f"Failed to evaluate condition for rule {rule.name}: {e}")
             return False
+
+    @staticmethod
+    def _get_metric_value(metrics: Dict[str, Any], keys: List[str], default: Any) -> Any:
+        """Return first available metric value for given keys"""
+        for key in keys:
+            if key in metrics:
+                return metrics[key]
+        return default
     
     async def _trigger_alert(self, rule: AlertRule, metrics: Dict[str, float]):
         """Trigger alert and send notifications"""
@@ -784,7 +793,7 @@ class MonitoringService:
         }
         
         # System health
-        system_health = self.system_monitor.get_current_health()
+        system_health = await self.system_monitor.get_current_health()
         if system_health:
             health_status['components']['system'] = {
                 'healthy': system_health.cpu_usage < 90 and system_health.memory_usage < 90,

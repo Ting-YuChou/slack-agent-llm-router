@@ -82,7 +82,7 @@ class MetricEntry:
             'service': self.service,
             'metric_name': self.metric_name,
             'metric_value': self.metric_value,
-            'labels': labels  # ClickHouse Map type
+            'labels': self.labels  # ClickHouse Map type
         }
 
 
