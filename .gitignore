@@ -1,0 +1,44 @@
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.env
+.env.*
+.venv/
+venv/
+
+# Packaging / build
+build/
+dist/
+site/
+htmlcov/
+.coverage*
+
+# Logs / runtime artifacts
+logs/
+*.log
+
+# Data outputs
+data/processed/
+data/cache/
+queries/logs.csv
+flink/logs.csv
+
+# Docker / Compose
+docker-compose.yml
+docker-compose.prod.yml
+
+# Local credentials
+slack/credentials/
+
