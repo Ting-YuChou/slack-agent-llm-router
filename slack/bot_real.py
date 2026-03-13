@@ -716,6 +716,18 @@ class SlackBot:
         """Split long response into multiple parts"""
         if len(text) <= max_length:
             return [text]
+
+        def append_chunk(chunk: str):
+            chunk = chunk.strip()
+            if not chunk:
+                return
+
+            if len(chunk) <= max_length:
+                parts.append(chunk)
+                return
+
+            for start in range(0, len(chunk), max_length):
+                parts.append(chunk[start:start + max_length])
         
         parts = []
         current_part = ""
@@ -731,7 +743,7 @@ class SlackBot:
                     current_part = paragraph
             else:
                 if current_part:
-                    parts.append(current_part)
+                    append_chunk(current_part)
                     current_part = paragraph
                 else:
                     # Paragraph is too long, split by sentences
@@ -744,11 +756,11 @@ class SlackBot:
                                 current_part = sentence
                         else:
                             if current_part:
-                                parts.append(current_part)
+                                append_chunk(current_part)
                             current_part = sentence
         
         if current_part:
-            parts.append(current_part)
+            append_chunk(current_part)
         
         return parts
     

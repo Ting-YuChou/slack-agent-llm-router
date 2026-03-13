@@ -50,6 +50,27 @@ source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+### Clean Local Env
+
+For a clean virtualenv:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-dev.txt
+python -m pytest tests -q
+```
+
+For a clean conda environment:
+
+```bash
+conda env create -f environment.yml
+conda activate slack-llm-router
+python -m pytest tests -q
+```
+
+Pytest is configured in `pytest.ini` to disable the built-in capture plugin because the current macOS + conda base environment can segfault while importing `readline`.
+
 ### Configuration
 
 Copy the environment template and configure your settings:
@@ -228,15 +249,17 @@ Execute the test suite:
 
 ```bash
 # Run all tests
-pytest tests/ -v
+python -m pytest tests -q
 
 # Run specific tests
-pytest tests/test_pipeline.py -v
-pytest tests/test_inference.py -v
+python -m pytest tests/test_pipeline.py -q
+python -m pytest tests/test_inference.py -q
 
 # Generate coverage report
-pytest tests/ --cov=src --cov-report=html
+python -m pytest tests/ --cov=src --cov-report=html
 ```
+
+`pytest.ini` disables pytest's built-in capture plugin because the current macOS + conda base combination can segfault while importing `readline`.
 
 ### Code Quality
 
@@ -311,6 +334,22 @@ The project includes GitHub Actions workflows for:
 - Code quality checks and security scans
 - Docker image building and publishing
 - Deployment to staging and production environments
+
+The repository now includes a test workflow at [`.github/workflows/tests.yml`](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/.github/workflows/tests.yml).
+
+How to use it:
+
+1. Push a branch to GitHub or open a pull request.
+2. Open the `Actions` tab in GitHub.
+3. Select the `Tests` workflow to see logs and results.
+4. To run it manually, open `Actions` -> `Tests` -> `Run workflow`.
+
+What it does:
+
+- Sets up Python 3.12
+- Installs the lightweight CI dependencies from `requirements-ci.txt`
+- Runs `python -m pytest tests -q`
+- Verifies the source tree compiles with `python -m compileall src tests slack`
 
 ### Scaling
 

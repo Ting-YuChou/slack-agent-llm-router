@@ -363,7 +363,11 @@ class OpenAIProvider(BaseInferenceProvider):
                 model_name=model_name,
                 token_count_input=usage.prompt_tokens,
                 token_count_output=usage.completion_tokens,
+                total_tokens=usage.prompt_tokens + usage.completion_tokens,
                 latency_ms=int((time.time() - start_time) * 1000),
+                tokens_per_second=(
+                    usage.completion_tokens / max(time.time() - start_time, 1e-6)
+                ),
                 cost_usd=self._calculate_cost(usage, model_name),
                 provider="openai",
                 cached=False
@@ -459,7 +463,11 @@ class AnthropicProvider(BaseInferenceProvider):
                 model_name=model_name,
                 token_count_input=response.usage.input_tokens,
                 token_count_output=response.usage.output_tokens,
+                total_tokens=response.usage.input_tokens + response.usage.output_tokens,
                 latency_ms=int((time.time() - start_time) * 1000),
+                tokens_per_second=(
+                    response.usage.output_tokens / max(time.time() - start_time, 1e-6)
+                ),
                 cost_usd=self._calculate_cost(response.usage, model_name),
                 provider="anthropic",
                 cached=False
@@ -571,7 +579,13 @@ class vLLMProvider(BaseInferenceProvider):
                 model_name=model_name,
                 token_count_input=usage.get("prompt_tokens", 0),
                 token_count_output=usage.get("completion_tokens", 0),
+                total_tokens=usage.get("total_tokens", 0) or (
+                    usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+                ),
                 latency_ms=int((time.time() - start_time) * 1000),
+                tokens_per_second=(
+                    usage.get("completion_tokens", 0) / max(time.time() - start_time, 1e-6)
+                ),
                 cost_usd=0.0,  # Self-hosted models have no API cost
                 provider="vllm",
                 cached=False
@@ -767,7 +781,9 @@ class InferenceEngine:
                 model_name=routing_decision.selected_model if 'routing_decision' in locals() else "unknown",
                 token_count_input=0,
                 token_count_output=0,
+                total_tokens=0,
                 latency_ms=int((time.time() - start_time) * 1000),
+                tokens_per_second=0.0,
                 cost_usd=0.0,
                 provider="error",
                 cached=False,

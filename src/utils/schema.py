@@ -1,6 +1,6 @@
 from enum import Enum
 from typing import Optional, Dict, Any, List, Union
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime
 import uuid
 
@@ -38,8 +38,9 @@ class Attachment(BaseModel):
     url: Optional[str] = None
     content: Optional[bytes] = None
     
-    @validator('size_bytes')
-    def validate_size(cls, v):
+    @field_validator('size_bytes')
+    @classmethod
+    def validate_size(cls, v: int) -> int:
         if v <= 0:
             raise ValueError('File size must be positive')
         if v > 100_000_000:  # 100MB limit
@@ -70,14 +71,16 @@ class QueryRequest(BaseModel):
     conversation_id: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
     
-    @validator('query')
-    def validate_query(cls, v):
+    @field_validator('query')
+    @classmethod
+    def validate_query(cls, v: str) -> str:
         if not v.strip():
             raise ValueError('Query cannot be empty or whitespace only')
         return v.strip()
     
-    @validator('attachments')
-    def validate_attachments(cls, v):
+    @field_validator('attachments')
+    @classmethod
+    def validate_attachments(cls, v: List[Attachment]) -> List[Attachment]:
         if len(v) > 10:  # Max 10 attachments
             raise ValueError('Too many attachments (max 10)')
         return v
@@ -115,13 +118,11 @@ class InferenceResponse(BaseModel):
     # Timestamps
     timestamp: datetime = Field(default_factory=datetime.now)
     
-    @validator('total_tokens', always=True)
-    def validate_total_tokens(cls, v, values):
-        input_tokens = values.get('token_count_input', 0)
-        output_tokens = values.get('token_count_output', 0)
-        if v == 0:  # Auto-calculate if not provided
-            return input_tokens + output_tokens
-        return v
+    @model_validator(mode='after')
+    def validate_total_tokens(self):
+        if self.total_tokens == 0:
+            self.total_tokens = self.token_count_input + self.token_count_output
+        return self
 
 class RoutingDecision(BaseModel):
     # Core routing decision
@@ -160,7 +161,7 @@ class ModelConfig(BaseModel):
     priority: int = Field(ge=1)
     
     # Capabilities
-    capabilities: List[str] = Field(..., min_items=1)
+    capabilities: List[str] = Field(..., min_length=1)
     
     # Resource requirements
     gpu_memory_gb: Optional[int] = Field(None, ge=1)
@@ -168,8 +169,9 @@ class ModelConfig(BaseModel):
     # Authentication
     api_key_env: Optional[str] = None
     
-    @validator('capabilities')
-    def validate_capabilities(cls, v):
+    @field_validator('capabilities')
+    @classmethod
+    def validate_capabilities(cls, v: List[str]) -> List[str]:
         valid_capabilities = {
             'reasoning', 'coding', 'analysis', 'writing', 
             'creative', 'general', 'math', 'translation'
@@ -186,8 +188,9 @@ class SystemMetric(BaseModel):
     labels: Dict[str, str] = Field(default_factory=dict)
     unit: Optional[str] = None
     
-    @validator('name')
-    def validate_metric_name(cls, v):
+    @field_validator('name')
+    @classmethod
+    def validate_metric_name(cls, v: str) -> str:
         if not v.replace('_', '').replace('.', '').isalnum():
             raise ValueError('Metric name must be alphanumeric with underscores/dots')
         return v
@@ -214,12 +217,12 @@ class ErrorResponse(BaseModel):
 # Health check models
 class HealthStatus(BaseModel):
     service: str
-    status: str = Field(..., regex=r'^(healthy|degraded|unhealthy)$')
+    status: str = Field(..., pattern=r'^(healthy|degraded|unhealthy)$')
     timestamp: datetime = Field(default_factory=datetime.now)
     details: Optional[Dict[str, Any]] = None
     version: Optional[str] = None
 
 class ComponentHealth(BaseModel):
-    overall_status: str = Field(..., regex=r'^(healthy|degraded|unhealthy)$')
+    overall_status: str = Field(..., pattern=r'^(healthy|degraded|unhealthy)$')
     components: Dict[str, HealthStatus]
     timestamp: datetime = Field(default_factory=datetime.now)

@@ -314,9 +314,11 @@ class ModelRouter:
                 model_selection = self._fallback_routing(query_context)
             
             # Create routing decision
+            query_type = query_context['query_type']
+            query_type_value = query_type.value if hasattr(query_type, 'value') else str(query_type)
             decision = RoutingDecision(
                 selected_model=model_selection.model_name,
-                query_type=query_context['query_type'],
+                query_type=query_type,
                 token_count=query_context['token_count'],
                 estimated_cost=self._estimate_cost(model_selection, query_context),
                 routing_reason=model_selection.reason,
@@ -327,7 +329,7 @@ class ModelRouter:
             # Update metrics
             ROUTER_METRICS.routing_decisions.labels(
                 model=model_selection.model_name,
-                query_type=query_context['query_type'].value
+                query_type=query_type_value
             ).inc()
             
             ROUTER_METRICS.routing_latency.observe(decision.routing_time_ms / 1000)
@@ -602,7 +604,7 @@ class ModelRouter:
         stats = self.model_stats.get(model_name, {})
         
         return {
-            'config': asdict(model_config),
+            'config': model_config.model_dump(),
             'stats': stats,
             'available': True  # TODO: Implement actual availability check
         }
