@@ -5,9 +5,16 @@ High-priority query processing and real-time analytics
 
 import json
 import logging
+import os
+from pathlib import Path
+import sys
 import time
 from datetime import datetime
 from typing import Dict, Any, List, Optional
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from pyflink.datastream import StreamExecutionEnvironment
 from pyflink.table import StreamTableEnvironment, EnvironmentSettings
@@ -21,35 +28,73 @@ from pyflink.common.time import Time
 logger = logging.getLogger(__name__)
 
 
+# Keep these helpers local to this module so Beam workers can unpickle UDFs
+# without importing additional repo-local modules.
+HIGH_PRIORITY_KEYWORDS = [
+    "urgent",
+    "critical",
+    "emergency",
+    "asap",
+    "immediately",
+    "production",
+    "outage",
+    "down",
+    "error",
+    "bug",
+]
+
+
+def calculate_priority(query_text: str, user_tier: str, user_id: str = "") -> str:
+    """Calculate query priority using the same rules as local tests."""
+    normalized_query = (query_text or "").lower()
+    normalized_tier = (user_tier or "free").lower()
+
+    if normalized_tier == "enterprise":
+        return "high"
+
+    if any(keyword in normalized_query for keyword in HIGH_PRIORITY_KEYWORDS):
+        return "critical"
+
+    if normalized_tier == "premium":
+        return "medium"
+
+    return "low"
+
+
+def classify_query_event(data: Dict[str, Any], timestamp: datetime | None = None) -> Dict[str, Any]:
+    """Apply priority enrichment to an event payload."""
+    event = dict(data)
+    priority = calculate_priority(
+        query_text=event.get("query_text", ""),
+        user_tier=event.get("user_tier", "free"),
+        user_id=event.get("user_id", ""),
+    )
+    event["priority"] = priority
+    event["processing_timestamp"] = (timestamp or datetime.now()).isoformat()
+    event["route_to_fast_lane"] = priority in {"high", "critical"}
+    return event
+
+
+def build_fast_lane_event(data: Dict[str, Any], timestamp: datetime | None = None) -> Dict[str, Any]:
+    """Build the fast-lane output payload."""
+    event = classify_query_event(data, timestamp=timestamp)
+    event["fast_lane_processed"] = event["route_to_fast_lane"]
+    event["processing_timestamp"] = (timestamp or datetime.now()).isoformat()
+    return event
+
+
 class QueryPriorityClassifier(MapFunction):
     """Classify queries by priority for routing"""
     
     def __init__(self):
-        self.high_priority_keywords = [
-            'urgent', 'critical', 'emergency', 'asap', 'immediately',
-            'production', 'outage', 'down', 'error', 'bug'
-        ]
+        self.high_priority_keywords = HIGH_PRIORITY_KEYWORDS
         self.enterprise_users = set()  # Load from config
         
     def map(self, value: str) -> Dict[str, Any]:
         """Map incoming query to priority classification"""
         try:
             data = json.loads(value)
-            
-            # Extract query information
-            query_text = data.get('query_text', '').lower()
-            user_tier = data.get('user_tier', 'free')
-            user_id = data.get('user_id', '')
-            
-            # Determine priority
-            priority = self._calculate_priority(query_text, user_tier, user_id)
-            
-            # Add priority and routing info
-            data['priority'] = priority
-            data['processing_timestamp'] = datetime.now().isoformat()
-            data['route_to_fast_lane'] = priority in ['high', 'critical']
-            
-            return data
+            return classify_query_event(data)
             
         except json.JSONDecodeError:
             logger.error(f"Invalid JSON in message: {value}")
@@ -60,20 +105,7 @@ class QueryPriorityClassifier(MapFunction):
     
     def _calculate_priority(self, query_text: str, user_tier: str, user_id: str) -> str:
         """Calculate query priority based on content and user"""
-        # High priority for enterprise users
-        if user_tier == 'enterprise':
-            return 'high'
-        
-        # Critical priority for urgent keywords
-        if any(keyword in query_text for keyword in self.high_priority_keywords):
-            return 'critical'
-        
-        # Medium priority for premium users
-        if user_tier == 'premium':
-            return 'medium'
-        
-        # Default to low priority
-        return 'low'
+        return calculate_priority(query_text, user_tier, user_id)
 
 
 class HighPriorityFilter(FilterFunction):
@@ -268,7 +300,7 @@ def create_flink_job(config: Dict[str, Any]):
     kafka_props = {
         'bootstrap.servers': ','.join(config.get('kafka', {}).get('bootstrap_servers', ['localhost:9092'])),
         'group.id': config.get('kafka', {}).get('consumer_group', 'flink-llm-processor'),
-        'auto.offset.reset': 'latest'
+        'auto.offset.reset': config.get('kafka', {}).get('auto_offset_reset', 'latest')
     }
     
     # Create Kafka consumer for query logs
@@ -320,22 +352,20 @@ def create_flink_job(config: Dict[str, Any]):
     
     # Step 5: High-priority query fast lane
     fast_lane_stream = (high_priority_stream
-                       .map(lambda x: json.dumps({
-                           **x,
-                           'fast_lane_processed': True,
-                           'processing_timestamp': datetime.now().isoformat()
-                       }), output_type=Types.STRING()))
+                       .map(lambda x: json.dumps(build_fast_lane_event(x)), output_type=Types.STRING()))
     
     # Output streams
-    metrics_stream.add_sink(result_producer, "Metrics Sink")
-    anomaly_stream.add_sink(alert_producer, "Anomaly Alert Sink")
-    fast_lane_stream.add_sink(result_producer, "Fast Lane Sink")
+    metrics_stream.add_sink(result_producer).name("Metrics Sink")
+    anomaly_stream.add_sink(alert_producer).name("Anomaly Alert Sink")
+    fast_lane_stream.add_sink(result_producer).name("Fast Lane Sink")
     
     return env
 
 
 def main():
     """Main entry point for Flink job"""
+    config_json = os.environ.get("FLINK_CONFIG_JSON")
+
     # Load configuration
     config = {
         'parallelism': 4,
@@ -350,6 +380,9 @@ def main():
             }
         }
     }
+
+    if config_json:
+        config = json.loads(config_json)
     
     # Create and execute job
     env = create_flink_job(config)

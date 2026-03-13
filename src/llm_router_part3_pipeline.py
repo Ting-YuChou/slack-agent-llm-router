@@ -101,9 +101,6 @@ class KafkaProducerManager:
             'value_serializer': self._serialize_message,
             'key_serializer': lambda x: x.encode('utf-8') if x else None,
             'acks': config.get('producer', {}).get('acks', 'all'),
-            'retries': config.get('producer', {}).get('retries', 3),
-            'batch_size': config.get('producer', {}).get('batch_size', 16384),
-            'linger_ms': config.get('producer', {}).get('linger_ms', 5),
             'compression_type': config.get('producer', {}).get('compression_type', 'gzip')
         }
         
@@ -241,7 +238,6 @@ class ClickHouseManager:
             'port': config.get('port', 8123),
             'username': config.get('username', 'default'),
             'password': config.get('password', ''),
-            'database': self.database
         }
         
         # Batch insertion settings
@@ -253,19 +249,40 @@ class ClickHouseManager:
             'model_performance': []
         }
         self.last_batch_time = time.time()
+
+    def _insert_dict_rows(self, table_name: str, records: List[Dict[str, Any]]):
+        """Insert dictionary records with explicit column ordering."""
+        if not records:
+            return
+
+        columns = list(records[0].keys())
+        rows = [[record.get(column) for column in columns] for record in records]
+        self.client.insert(table_name, rows, column_names=columns)
         
     async def initialize(self):
         """Initialize ClickHouse connection and create tables"""
         try:
-            self.client = clickhouse_connect.get_client(**self.connection_params)
-            
+            admin_client = clickhouse_connect.get_client(
+                **self.connection_params,
+                database='default'
+            )
+
             # Test connection
-            result = self.client.query('SELECT 1')
+            result = admin_client.query('SELECT 1')
             if result.result_rows:
                 logger.info("ClickHouse connection established successfully")
             
             # Create database if not exists
+            self.client = admin_client
             await self._create_database()
+
+            if self.database != 'default':
+                admin_client.close()
+                self.client = clickhouse_connect.get_client(
+                    **self.connection_params,
+                    database=self.database
+                )
+                self.client.query('SELECT 1')
             
             # Create tables
             await self._create_tables()
@@ -309,7 +326,7 @@ class ClickHouseManager:
         ) ENGINE = MergeTree()
         PARTITION BY toYYYYMM(timestamp)
         ORDER BY (timestamp, user_id, query_id)
-        TTL timestamp + INTERVAL 90 DAY
+        TTL toDateTime(timestamp) + INTERVAL 90 DAY
         """.format(database=self.database)
         
         # System metrics table
@@ -323,7 +340,7 @@ class ClickHouseManager:
         ) ENGINE = ReplacingMergeTree()
         PARTITION BY toYYYYMMDD(timestamp)
         ORDER BY (service, metric_name, timestamp)
-        TTL timestamp + INTERVAL 30 DAY
+        TTL toDateTime(timestamp) + INTERVAL 30 DAY
         """.format(database=self.database)
         
         # Model performance table
@@ -342,7 +359,7 @@ class ClickHouseManager:
         ) ENGINE = ReplacingMergeTree()
         PARTITION BY toYYYYMMDD(timestamp)
         ORDER BY (model_name, timestamp)
-        TTL timestamp + INTERVAL 60 DAY
+        TTL toDateTime(timestamp) + INTERVAL 60 DAY
         """.format(database=self.database)
         
         # User analytics table
@@ -382,10 +399,11 @@ class ClickHouseManager:
         """Insert single query log entry"""
         try:
             data = [query_log.to_dict()]
-            self.client.insert('query_logs', data)
+            self._insert_dict_rows('query_logs', data)
             logger.debug(f"Inserted query log: {query_log.query_id}")
         except Exception as e:
             logger.error(f"Failed to insert query log: {e}")
+            raise
     
     async def batch_insert_query_logs(self, query_logs: List[QueryLogEntry]):
         """Batch insert query log entries"""
@@ -394,21 +412,23 @@ class ClickHouseManager:
         
         try:
             data = [log.to_dict() for log in query_logs]
-            self.client.insert('query_logs', data)
+            self._insert_dict_rows('query_logs', data)
             logger.info(f"Batch inserted {len(query_logs)} query logs")
             PIPELINE_METRICS.records_inserted.labels(table='query_logs').inc(len(query_logs))
         except Exception as e:
             logger.error(f"Failed to batch insert query logs: {e}")
             PIPELINE_METRICS.insertion_errors.inc()
+            raise
     
     async def insert_metric(self, metric: MetricEntry):
         """Insert single metric entry"""
         try:
             data = [metric.to_dict()]
-            self.client.insert('system_metrics', data)
+            self._insert_dict_rows('system_metrics', data)
             logger.debug(f"Inserted metric: {metric.service}.{metric.metric_name}")
         except Exception as e:
             logger.error(f"Failed to insert metric: {e}")
+            raise
     
     async def batch_insert_metrics(self, metrics: List[MetricEntry]):
         """Batch insert metric entries"""
@@ -417,12 +437,13 @@ class ClickHouseManager:
         
         try:
             data = [metric.to_dict() for metric in metrics]
-            self.client.insert('system_metrics', data)
+            self._insert_dict_rows('system_metrics', data)
             logger.info(f"Batch inserted {len(metrics)} metrics")
             PIPELINE_METRICS.records_inserted.labels(table='system_metrics').inc(len(metrics))
         except Exception as e:
             logger.error(f"Failed to batch insert metrics: {e}")
             PIPELINE_METRICS.insertion_errors.inc()
+            raise
     
     async def get_query_analytics(self, user_id: str = None, hours: int = 24) -> Dict[str, Any]:
         """Get query analytics for dashboard"""
@@ -558,6 +579,7 @@ class KafkaConsumerManager:
         }
         self.batch_size = 100
         self.last_batch_time = time.time()
+        self.running = False
         
     async def initialize(self):
         """Initialize Kafka consumers"""
@@ -581,6 +603,7 @@ class KafkaConsumerManager:
     
     async def start_consuming(self):
         """Start consuming messages from all topics"""
+        self.running = True
         tasks = []
         
         # Start consumer tasks
@@ -700,7 +723,7 @@ class KafkaConsumerManager:
     
     async def _batch_processor(self):
         """Process batches periodically"""
-        while True:
+        while self.running:
             try:
                 current_time = time.time()
                 
@@ -708,17 +731,13 @@ class KafkaConsumerManager:
                 if (len(self.batch_processors['queries']) >= self.batch_size or 
                     current_time - self.last_batch_time > 30):
                     
-                    if self.batch_processors['queries']:
-                        await self.clickhouse.batch_insert_query_logs(self.batch_processors['queries'])
-                        self.batch_processors['queries'].clear()
+                    await self.flush_pending_batches(include_metrics=False)
                 
                 # Process metrics batch
                 if (len(self.batch_processors['metrics']) >= self.batch_size or 
                     current_time - self.last_batch_time > 30):
                     
-                    if self.batch_processors['metrics']:
-                        await self.clickhouse.batch_insert_metrics(self.batch_processors['metrics'])
-                        self.batch_processors['metrics'].clear()
+                    await self.flush_pending_batches(include_queries=False)
                 
                 # Update last batch time
                 if current_time - self.last_batch_time > 30:
@@ -729,6 +748,20 @@ class KafkaConsumerManager:
             except Exception as e:
                 logger.error(f"Batch processor error: {e}")
                 await asyncio.sleep(10)
+        
+        await self.flush_pending_batches()
+
+    async def flush_pending_batches(self, include_queries: bool = True, include_metrics: bool = True):
+        """Flush any pending Kafka batches to ClickHouse immediately"""
+        if include_queries and self.batch_processors['queries']:
+            await self.clickhouse.batch_insert_query_logs(self.batch_processors['queries'])
+            self.batch_processors['queries'].clear()
+
+        if include_metrics and self.batch_processors['metrics']:
+            await self.clickhouse.batch_insert_metrics(self.batch_processors['metrics'])
+            self.batch_processors['metrics'].clear()
+
+        self.last_batch_time = time.time()
     
     def _deserialize_message(self, message: bytes) -> Dict[str, Any]:
         """Deserialize message from JSON bytes"""
@@ -736,6 +769,8 @@ class KafkaConsumerManager:
     
     async def shutdown(self):
         """Shutdown all consumers"""
+        self.running = False
+        await self.flush_pending_batches()
         for consumer in self.consumers.values():
             await consumer.stop()
         logger.info("Kafka consumers shutdown complete")
@@ -794,6 +829,11 @@ class KafkaIngestionPipeline:
     async def get_model_performance(self, hours: int = 24) -> List[Dict[str, Any]]:
         """Get model performance from ClickHouse"""
         return await self.clickhouse_manager.get_model_performance(hours)
+
+    async def flush(self):
+        """Flush any pending consumer batches to ClickHouse"""
+        if self.consumer_manager:
+            await self.consumer_manager.flush_pending_batches()
     
     def get_health_status(self) -> Dict[str, Any]:
         """Get pipeline health status"""
