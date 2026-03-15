@@ -3,7 +3,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.llm_router_part4_monitor import AlertManager, AlertRule, SystemHealth, SystemMonitor
+from src.llm_router_part4_monitor import (
+    AlertManager,
+    AlertRule,
+    SystemHealth,
+    SystemMonitor,
+)
 
 
 class TestSystemMonitor:
@@ -11,8 +16,14 @@ class TestSystemMonitor:
     async def test_collect_system_metrics(self, monkeypatch, fixed_datetime):
         monitor = SystemMonitor({"collection_interval": 1})
 
-        monkeypatch.setattr("src.llm_router_part4_monitor.psutil.cpu_percent", lambda interval=None: 12.5)
-        monkeypatch.setattr("src.llm_router_part4_monitor.psutil.virtual_memory", lambda: SimpleNamespace(percent=55.0))
+        monkeypatch.setattr(
+            "src.llm_router_part4_monitor.psutil.cpu_percent",
+            lambda interval=None: 12.5,
+        )
+        monkeypatch.setattr(
+            "src.llm_router_part4_monitor.psutil.virtual_memory",
+            lambda: SimpleNamespace(percent=55.0),
+        )
         monkeypatch.setattr(
             "src.llm_router_part4_monitor.psutil.disk_usage",
             lambda _path: SimpleNamespace(used=200, total=400),
@@ -21,14 +32,19 @@ class TestSystemMonitor:
             "src.llm_router_part4_monitor.psutil.net_io_counters",
             lambda: SimpleNamespace(bytes_sent=1000, bytes_recv=2000),
         )
-        monkeypatch.setattr("src.llm_router_part4_monitor.psutil.pids", lambda: [1, 2, 3])
+        monkeypatch.setattr(
+            "src.llm_router_part4_monitor.psutil.pids", lambda: [1, 2, 3]
+        )
         monkeypatch.setattr("src.llm_router_part4_monitor.psutil.boot_time", lambda: 10)
         monkeypatch.setattr("src.llm_router_part4_monitor.time.time", lambda: 110)
         monkeypatch.setattr(
             "src.llm_router_part4_monitor.GPUtil.getGPUs",
             lambda: [SimpleNamespace(load=0.25, memoryUtil=0.5)],
         )
-        monkeypatch.setattr("src.llm_router_part4_monitor.datetime", SimpleNamespace(now=lambda: fixed_datetime))
+        monkeypatch.setattr(
+            "src.llm_router_part4_monitor.datetime",
+            SimpleNamespace(now=lambda: fixed_datetime),
+        )
 
         health = await monitor._collect_system_metrics()
 
@@ -75,7 +91,10 @@ class TestAlertManager:
             description="Latency too high",
         )
 
-        assert manager._evaluate_condition(rule, {"application.avg_latency_ms": 8000}) is True
+        assert (
+            manager._evaluate_condition(rule, {"application.avg_latency_ms": 8000})
+            is True
+        )
         assert manager._evaluate_condition(rule, {"avg_latency_ms": 1000}) is False
 
     @pytest.mark.asyncio

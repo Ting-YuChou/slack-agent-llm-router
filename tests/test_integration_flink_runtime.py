@@ -18,7 +18,9 @@ def _port_open(host: str, port: int) -> bool:
 @pytest.mark.integration
 def test_flink_runtime_processes_query_from_kafka_back_to_kafka():
     if not _port_open("localhost", 9092) or not _port_open("localhost", 8081):
-        pytest.skip("Kafka or Flink is not running. Start `docker compose up -d kafka flink-jobmanager flink-taskmanager` first.")
+        pytest.skip(
+            "Kafka or Flink is not running. Start `docker compose up -d kafka flink-jobmanager flink-taskmanager` first."
+        )
 
     result = subprocess.run(
         [sys.executable, str(ROOT / "scripts" / "flink_runtime_smoke.py")],

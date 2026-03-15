@@ -71,7 +71,9 @@ class TestQueryLogEntry:
 class TestKafkaProducerManager:
     @pytest.mark.asyncio
     async def test_initialize_creates_producer(self, pipeline_config):
-        with patch("src.llm_router_part3_pipeline.AIOKafkaProducer") as mock_producer_cls:
+        with patch(
+            "src.llm_router_part3_pipeline.AIOKafkaProducer"
+        ) as mock_producer_cls:
             producer = AsyncMock()
             mock_producer_cls.return_value = producer
 
@@ -97,8 +99,12 @@ class TestKafkaProducerManager:
 
 class TestClickHouseManager:
     @pytest.mark.asyncio
-    async def test_insert_query_log_calls_insert(self, pipeline_config, sample_query_log):
-        with patch("src.llm_router_part3_pipeline.clickhouse_connect.get_client") as mock_get_client:
+    async def test_insert_query_log_calls_insert(
+        self, pipeline_config, sample_query_log
+    ):
+        with patch(
+            "src.llm_router_part3_pipeline.clickhouse_connect.get_client"
+        ) as mock_get_client:
             client = MagicMock()
             client.query.return_value.result_rows = [[1]]
             mock_get_client.return_value = client
@@ -119,7 +125,9 @@ class TestClickHouseManager:
 
     @pytest.mark.asyncio
     async def test_insert_metric_calls_insert(self, pipeline_config):
-        with patch("src.llm_router_part3_pipeline.clickhouse_connect.get_client") as mock_get_client:
+        with patch(
+            "src.llm_router_part3_pipeline.clickhouse_connect.get_client"
+        ) as mock_get_client:
             client = MagicMock()
             client.query.return_value.result_rows = [[1]]
             mock_get_client.return_value = client
@@ -162,7 +170,9 @@ class TestKafkaIngestionPipeline:
         pipeline.running = True
         pipeline.producer_manager.producer = object()
         pipeline.clickhouse_manager.client = object()
-        pipeline.consumer_manager = SimpleNamespace(consumers={"queries": object(), "metrics": object()})
+        pipeline.consumer_manager = SimpleNamespace(
+            consumers={"queries": object(), "metrics": object()}
+        )
 
         health = pipeline.get_health_status()
 
@@ -193,4 +203,6 @@ class TestKafkaIngestionPipeline:
 
         await pipeline.log_query(request, response, decision)
 
-        pipeline.producer_manager.produce_query_log.assert_awaited_once_with(request, response, decision)
+        pipeline.producer_manager.produce_query_log.assert_awaited_once_with(
+            request, response, decision
+        )

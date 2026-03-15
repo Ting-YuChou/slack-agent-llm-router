@@ -19,14 +19,25 @@ logger = logging.getLogger(__name__)
 
 class ProjectSetup:
     """Handles project initialization and environment setup"""
-    
+
     def __init__(self, project_root: str = "."):
         self.project_root = Path(project_root).absolute()
         self.required_dirs = [
-            "config", "data/queries", "data/processed/routed",
-            "docker", ".github/workflows", "flink", "kafka",
-            "clickhouse/data", "monitoring/grafana", "slack/credentials",
-            "streamlit_ui", "logs", "src/models", "src/utils", "tests"
+            "config",
+            "data/queries",
+            "data/processed/routed",
+            "docker",
+            ".github/workflows",
+            "flink",
+            "kafka",
+            "clickhouse/data",
+            "monitoring/grafana",
+            "slack/credentials",
+            "streamlit_ui",
+            "logs",
+            "src/models",
+            "src/utils",
+            "tests",
         ]
         self.required_files = {
             ".gitignore": self._get_gitignore_content(),
@@ -40,111 +51,119 @@ class ProjectSetup:
             "streamlit_ui/config.toml": self._get_streamlit_config(),
             ".github/workflows/ci.yml": self._get_github_actions_config(),
         }
-        
+
     def setup_project_environment(self):
         """Complete project setup"""
         logger.info("Starting project environment setup...")
-        
+
         # Create directory structure
         self._create_directories()
-        
+
         # Create configuration files
         self._create_files()
-        
+
         # Setup Python environment
         self._setup_python_environment()
-        
+
         # Validate environment
         self._validate_environment()
-        
+
         logger.info("Project environment setup completed successfully!")
-        
+
     def _create_directories(self):
         """Create required directory structure"""
         logger.info("Creating project directories...")
-        
+
         for dir_path in self.required_dirs:
             full_path = self.project_root / dir_path
             full_path.mkdir(parents=True, exist_ok=True)
             logger.debug(f"Created directory: {full_path}")
-            
+
         # Create __init__.py files for Python packages
         python_packages = ["src", "src/models", "src/utils", "tests"]
         for package in python_packages:
             init_file = self.project_root / package / "__init__.py"
             init_file.touch(exist_ok=True)
-            
+
     def _create_files(self):
         """Create required configuration files"""
         logger.info("Creating configuration files...")
-        
+
         for file_path, content in self.required_files.items():
             full_path = self.project_root / file_path
-            
+
             if not full_path.exists():
                 full_path.parent.mkdir(parents=True, exist_ok=True)
                 full_path.write_text(content)
                 logger.debug(f"Created file: {full_path}")
             else:
                 logger.debug(f"File already exists: {full_path}")
-                
+
     def _setup_python_environment(self):
         """Setup Python virtual environment and install dependencies"""
         logger.info("Setting up Python environment...")
-        
+
         # Check if virtual environment exists
         venv_path = self.project_root / "venv"
         if not venv_path.exists():
             logger.info("Creating virtual environment...")
             subprocess.run([sys.executable, "-m", "venv", str(venv_path)], check=True)
-            
+
         # Install requirements
         requirements_path = self.project_root / "requirements.txt"
         if requirements_path.exists():
             logger.info("Installing Python dependencies...")
-            pip_path = venv_path / "bin" / "pip" if os.name != 'nt' else venv_path / "Scripts" / "pip.exe"
-            subprocess.run([str(pip_path), "install", "-r", str(requirements_path)], check=True)
-            
+            pip_path = (
+                venv_path / "bin" / "pip"
+                if os.name != "nt"
+                else venv_path / "Scripts" / "pip.exe"
+            )
+            subprocess.run(
+                [str(pip_path), "install", "-r", str(requirements_path)], check=True
+            )
+
     def _validate_environment(self):
         """Validate that the environment is properly set up"""
         logger.info("Validating environment setup...")
-        
+
         # Check required directories
         for dir_path in self.required_dirs:
             full_path = self.project_root / dir_path
             if not full_path.exists():
                 raise FileNotFoundError(f"Required directory missing: {full_path}")
-                
+
         # Check critical files
         critical_files = ["config/config.yaml", "requirements.txt"]
         for file_path in critical_files:
             full_path = self.project_root / file_path
             if not full_path.exists():
                 raise FileNotFoundError(f"Critical file missing: {full_path}")
-                
+
         # Validate configuration
         self._validate_config()
-        
+
         logger.info("Environment validation completed successfully!")
-        
+
     def _validate_config(self):
         """Validate configuration file"""
         config_path = self.project_root / "config" / "config.yaml"
-        
+
         try:
-            with open(config_path, 'r') as f:
+            with open(config_path, "r") as f:
                 config = yaml.safe_load(f)
-                
+
             # Validate required sections
             required_sections = ["api", "router", "inference", "kafka", "monitoring"]
             for section in required_sections:
                 if section not in config:
-                    raise ValueError(f"Required configuration section missing: {section}")
-                    
+                    raise ValueError(
+                        f"Required configuration section missing: {section}"
+                    )
+
         except Exception as e:
             logger.error(f"Configuration validation failed: {e}")
             raise
-            
+
     def _get_gitignore_content(self) -> str:
         return """# Byte-compiled / optimized / DLL files
 __pycache__/
@@ -592,46 +611,49 @@ structlog==23.2.0
 """
 
     def _get_kafka_topics_config(self) -> str:
-        return json.dumps({
-            "topics": [
-                {
-                    "name": "llm-queries",
-                    "partitions": 6,
-                    "replication_factor": 1,
-                    "config": {
-                        "retention.ms": "604800000",
-                        "compression.type": "gzip"
-                    }
-                },
-                {
-                    "name": "llm-responses",
-                    "partitions": 6,
-                    "replication_factor": 1,
-                    "config": {
-                        "retention.ms": "604800000",
-                        "compression.type": "gzip"
-                    }
-                },
-                {
-                    "name": "llm-metrics",
-                    "partitions": 3,
-                    "replication_factor": 1,
-                    "config": {
-                        "retention.ms": "2592000000",
-                        "compression.type": "gzip"
-                    }
-                },
-                {
-                    "name": "llm-errors",
-                    "partitions": 3,
-                    "replication_factor": 1,
-                    "config": {
-                        "retention.ms": "2592000000",
-                        "compression.type": "gzip"
-                    }
-                }
-            ]
-        }, indent=2)
+        return json.dumps(
+            {
+                "topics": [
+                    {
+                        "name": "llm-queries",
+                        "partitions": 6,
+                        "replication_factor": 1,
+                        "config": {
+                            "retention.ms": "604800000",
+                            "compression.type": "gzip",
+                        },
+                    },
+                    {
+                        "name": "llm-responses",
+                        "partitions": 6,
+                        "replication_factor": 1,
+                        "config": {
+                            "retention.ms": "604800000",
+                            "compression.type": "gzip",
+                        },
+                    },
+                    {
+                        "name": "llm-metrics",
+                        "partitions": 3,
+                        "replication_factor": 1,
+                        "config": {
+                            "retention.ms": "2592000000",
+                            "compression.type": "gzip",
+                        },
+                    },
+                    {
+                        "name": "llm-errors",
+                        "partitions": 3,
+                        "replication_factor": 1,
+                        "config": {
+                            "retention.ms": "2592000000",
+                            "compression.type": "gzip",
+                        },
+                    },
+                ]
+            },
+            indent=2,
+        )
 
     def _get_clickhouse_schema(self) -> str:
         return """-- LLM Router ClickHouse Schema
@@ -780,57 +802,57 @@ alerting:
 """
 
     def _get_grafana_dashboard(self) -> str:
-        return json.dumps({
-            "dashboard": {
-                "id": None,
-                "title": "LLM Router Platform Dashboard",
-                "tags": ["llm", "ai", "production"],
-                "timezone": "browser",
-                "panels": [
-                    {
-                        "id": 1,
-                        "title": "Request Rate",
-                        "type": "stat",
-                        "targets": [
-                            {
-                                "expr": "rate(llm_requests_total[5m])",
-                                "legendFormat": "Requests/sec"
-                            }
-                        ],
-                        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
-                    },
-                    {
-                        "id": 2,
-                        "title": "Response Time",
-                        "type": "stat",
-                        "targets": [
-                            {
-                                "expr": "histogram_quantile(0.95, rate(llm_request_duration_seconds_bucket[5m]))",
-                                "legendFormat": "95th percentile"
-                            }
-                        ],
-                        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
-                    },
-                    {
-                        "id": 3,
-                        "title": "Model Usage Distribution",
-                        "type": "piechart",
-                        "targets": [
-                            {
-                                "expr": "sum by (model) (rate(llm_requests_total[1h]))",
-                                "legendFormat": "{{model}}"
-                            }
-                        ],
-                        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
-                    }
-                ],
-                "time": {
-                    "from": "now-6h",
-                    "to": "now"
-                },
-                "refresh": "30s"
-            }
-        }, indent=2)
+        return json.dumps(
+            {
+                "dashboard": {
+                    "id": None,
+                    "title": "LLM Router Platform Dashboard",
+                    "tags": ["llm", "ai", "production"],
+                    "timezone": "browser",
+                    "panels": [
+                        {
+                            "id": 1,
+                            "title": "Request Rate",
+                            "type": "stat",
+                            "targets": [
+                                {
+                                    "expr": "rate(llm_requests_total[5m])",
+                                    "legendFormat": "Requests/sec",
+                                }
+                            ],
+                            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+                        },
+                        {
+                            "id": 2,
+                            "title": "Response Time",
+                            "type": "stat",
+                            "targets": [
+                                {
+                                    "expr": "histogram_quantile(0.95, rate(llm_request_duration_seconds_bucket[5m]))",
+                                    "legendFormat": "95th percentile",
+                                }
+                            ],
+                            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+                        },
+                        {
+                            "id": 3,
+                            "title": "Model Usage Distribution",
+                            "type": "piechart",
+                            "targets": [
+                                {
+                                    "expr": "sum by (model) (rate(llm_requests_total[1h]))",
+                                    "legendFormat": "{{model}}",
+                                }
+                            ],
+                            "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8},
+                        },
+                    ],
+                    "time": {"from": "now-6h", "to": "now"},
+                    "refresh": "30s",
+                }
+            },
+            indent=2,
+        )
 
     def _get_streamlit_config(self) -> str:
         return """[theme]

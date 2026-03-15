@@ -18,7 +18,9 @@ def _port_open(host: str, port: int) -> bool:
 @pytest.mark.integration
 def test_kafka_messages_are_flushed_to_clickhouse():
     if not _port_open("localhost", 9092) or not _port_open("localhost", 8123):
-        pytest.skip("Kafka or ClickHouse is not running. Start `docker compose up -d kafka clickhouse` first.")
+        pytest.skip(
+            "Kafka or ClickHouse is not running. Start `docker compose up -d kafka clickhouse` first."
+        )
 
     result = subprocess.run(
         [sys.executable, str(ROOT / "scripts" / "integration_smoke.py")],

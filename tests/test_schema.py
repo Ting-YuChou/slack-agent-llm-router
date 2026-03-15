@@ -1,7 +1,14 @@
 import pytest
 from pydantic import ValidationError
 
-from src.utils.schema import Attachment, AttachmentType, InferenceResponse, ModelConfig, QueryRequest, SystemMetric
+from src.utils.schema import (
+    Attachment,
+    AttachmentType,
+    InferenceResponse,
+    ModelConfig,
+    QueryRequest,
+    SystemMetric,
+)
 
 
 def test_attachment_size_validation():

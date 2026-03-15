@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class QueryLogEntry:
     """Structure for query log entries"""
+
     query_id: str
     timestamp: datetime
     user_id: str
@@ -47,28 +48,33 @@ class QueryLogEntry:
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion"""
         return {
-            'query_id': self.query_id,
-            'timestamp': self.timestamp,
-            'user_id': self.user_id,
-            'user_tier': self.user_tier.value if isinstance(self.user_tier, UserTier) else    str(self.user_tier),
-            'query_text': self.query_text[:10000],
-            'query_type': self.query_type.value if hasattr(self.query_type, 'value') else str(self.query_type),
-            'selected_model': self.selected_model,
-            'token_count_input': self.token_count_input,
-            'token_count_output': self.token_count_output,
-            'latency_ms': self.latency_ms,
-            'cost_usd': self.cost_usd,
-            'status': self.status,
-            'error_message': self.error_message[:1000] if self.error_message else "",
-            'context_compressed': self.context_compressed,
-            'compression_ratio': self.compression_ratio,
-            'cached_response': self.cached_response
-    }
+            "query_id": self.query_id,
+            "timestamp": self.timestamp,
+            "user_id": self.user_id,
+            "user_tier": self.user_tier.value
+            if isinstance(self.user_tier, UserTier)
+            else str(self.user_tier),
+            "query_text": self.query_text[:10000],
+            "query_type": self.query_type.value
+            if hasattr(self.query_type, "value")
+            else str(self.query_type),
+            "selected_model": self.selected_model,
+            "token_count_input": self.token_count_input,
+            "token_count_output": self.token_count_output,
+            "latency_ms": self.latency_ms,
+            "cost_usd": self.cost_usd,
+            "status": self.status,
+            "error_message": self.error_message[:1000] if self.error_message else "",
+            "context_compressed": self.context_compressed,
+            "compression_ratio": self.compression_ratio,
+            "cached_response": self.cached_response,
+        }
 
 
 @dataclass
 class MetricEntry:
     """Structure for system metrics"""
+
     timestamp: datetime
     service: str
     metric_name: str
@@ -78,32 +84,34 @@ class MetricEntry:
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion"""
         return {
-            'timestamp': self.timestamp,
-            'service': self.service,
-            'metric_name': self.metric_name,
-            'metric_value': self.metric_value,
-            'labels': self.labels  # ClickHouse Map type
+            "timestamp": self.timestamp,
+            "service": self.service,
+            "metric_name": self.metric_name,
+            "metric_value": self.metric_value,
+            "labels": self.labels,  # ClickHouse Map type
         }
 
 
 class KafkaProducerManager:
     """Manages Kafka message production"""
-    
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.bootstrap_servers = config.get('bootstrap_servers', ['localhost:9092'])
+        self.bootstrap_servers = config.get("bootstrap_servers", ["localhost:9092"])
         self.producer = None
-        self.topics = config.get('topics', {})
-        
+        self.topics = config.get("topics", {})
+
         # Producer configuration
         self.producer_config = {
-            'bootstrap_servers': self.bootstrap_servers,
-            'value_serializer': self._serialize_message,
-            'key_serializer': lambda x: x.encode('utf-8') if x else None,
-            'acks': config.get('producer', {}).get('acks', 'all'),
-            'compression_type': config.get('producer', {}).get('compression_type', 'gzip')
+            "bootstrap_servers": self.bootstrap_servers,
+            "value_serializer": self._serialize_message,
+            "key_serializer": lambda x: x.encode("utf-8") if x else None,
+            "acks": config.get("producer", {}).get("acks", "all"),
+            "compression_type": config.get("producer", {}).get(
+                "compression_type", "gzip"
+            ),
         }
-        
+
     async def initialize(self):
         """Initialize Kafka producer"""
         try:
@@ -113,8 +121,13 @@ class KafkaProducerManager:
         except Exception as e:
             logger.error(f"Failed to initialize Kafka producer: {e}")
             raise
-    
-    async def produce_query_log(self, query_request: QueryRequest, inference_response: InferenceResponse, routing_decision: Any):
+
+    async def produce_query_log(
+        self,
+        query_request: QueryRequest,
+        inference_response: InferenceResponse,
+        routing_decision: Any,
+    ):
         """Produce query log message"""
         try:
             query_log = QueryLogEntry(
@@ -123,47 +136,61 @@ class KafkaProducerManager:
                 user_id=query_request.user_id,
                 user_tier=query_request.user_tier,
                 query_text=query_request.query,
-                query_type=routing_decision.query_type.value if hasattr(routing_decision.query_type, 'value') else str(routing_decision.query_type),
+                query_type=routing_decision.query_type.value
+                if hasattr(routing_decision.query_type, "value")
+                else str(routing_decision.query_type),
                 selected_model=inference_response.model_name,
                 token_count_input=inference_response.token_count_input,
                 token_count_output=inference_response.token_count_output,
                 latency_ms=inference_response.latency_ms,
                 cost_usd=inference_response.cost_usd,
-                status='success' if not hasattr(inference_response, 'error') else 'error',
-                error_message=getattr(inference_response, 'error', ''),
-                context_compressed=getattr(inference_response, 'compressed_context', False),
-                compression_ratio=0.3 if getattr(inference_response, 'compressed_context', False) else 0.0,
-                cached_response=inference_response.cached
+                status="success"
+                if not hasattr(inference_response, "error")
+                else "error",
+                error_message=getattr(inference_response, "error", ""),
+                context_compressed=getattr(
+                    inference_response, "compressed_context", False
+                ),
+                compression_ratio=0.3
+                if getattr(inference_response, "compressed_context", False)
+                else 0.0,
+                cached_response=inference_response.cached,
             )
-            
+
             await self.producer.send(
-                topic=self.topics.get('queries', 'llm-queries'),
+                topic=self.topics.get("queries", "llm-queries"),
                 key=query_log.user_id,
-                value=query_log.to_dict()
+                value=query_log.to_dict(),
             )
-            
-            PIPELINE_METRICS.messages_produced.labels(topic='queries').inc()
-            
+
+            PIPELINE_METRICS.messages_produced.labels(topic="queries").inc()
+
         except Exception as e:
             logger.error(f"Failed to produce query log: {e}")
             PIPELINE_METRICS.producer_errors.inc()
-    
+
     async def produce_response_log(self, response_data: Dict[str, Any]):
         """Produce response log message"""
         try:
             await self.producer.send(
-                topic=self.topics.get('responses', 'llm-responses'),
-                key=response_data.get('query_id'),
-                value=response_data
+                topic=self.topics.get("responses", "llm-responses"),
+                key=response_data.get("query_id"),
+                value=response_data,
             )
-            
-            PIPELINE_METRICS.messages_produced.labels(topic='responses').inc()
-            
+
+            PIPELINE_METRICS.messages_produced.labels(topic="responses").inc()
+
         except Exception as e:
             logger.error(f"Failed to produce response log: {e}")
             PIPELINE_METRICS.producer_errors.inc()
-    
-    async def produce_metric(self, service: str, metric_name: str, metric_value: float, labels: Dict[str, str] = None):
+
+    async def produce_metric(
+        self,
+        service: str,
+        metric_name: str,
+        metric_value: float,
+        labels: Dict[str, str] = None,
+    ):
         """Produce system metric"""
         try:
             metric_entry = MetricEntry(
@@ -171,38 +198,38 @@ class KafkaProducerManager:
                 service=service,
                 metric_name=metric_name,
                 metric_value=metric_value,
-                labels=labels or {}
+                labels=labels or {},
             )
-            
+
             await self.producer.send(
-                topic=self.topics.get('metrics', 'llm-metrics'),
+                topic=self.topics.get("metrics", "llm-metrics"),
                 key=f"{service}:{metric_name}",
-                value=metric_entry.to_dict()
+                value=metric_entry.to_dict(),
             )
-            
-            PIPELINE_METRICS.messages_produced.labels(topic='metrics').inc()
-            
+
+            PIPELINE_METRICS.messages_produced.labels(topic="metrics").inc()
+
         except Exception as e:
             logger.error(f"Failed to produce metric: {e}")
             PIPELINE_METRICS.producer_errors.inc()
-    
+
     async def produce_error(self, error_data: Dict[str, Any]):
         """Produce error message"""
         try:
-            error_data['timestamp'] = datetime.now(timezone.utc)
-            
+            error_data["timestamp"] = datetime.now(timezone.utc)
+
             await self.producer.send(
-                topic=self.topics.get('errors', 'llm-errors'),
-                key=error_data.get('error_id', str(uuid.uuid4())),
-                value=error_data
+                topic=self.topics.get("errors", "llm-errors"),
+                key=error_data.get("error_id", str(uuid.uuid4())),
+                value=error_data,
             )
-            
-            PIPELINE_METRICS.messages_produced.labels(topic='errors').inc()
-            
+
+            PIPELINE_METRICS.messages_produced.labels(topic="errors").inc()
+
         except Exception as e:
             logger.error(f"Failed to produce error: {e}")
             PIPELINE_METRICS.producer_errors.inc()
-    
+
     def _serialize_message(self, message: Any) -> bytes:
         """Serialize message to JSON bytes"""
         if isinstance(message, dict):
@@ -211,11 +238,11 @@ class KafkaProducerManager:
                 if isinstance(obj, datetime):
                     return obj.isoformat()
                 raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
-            
-            return json.dumps(message, default=default_serializer).encode('utf-8')
+
+            return json.dumps(message, default=default_serializer).encode("utf-8")
         else:
-            return json.dumps(message).encode('utf-8')
-    
+            return json.dumps(message).encode("utf-8")
+
     async def shutdown(self):
         """Shutdown producer"""
         if self.producer:
@@ -225,28 +252,28 @@ class KafkaProducerManager:
 
 class ClickHouseManager:
     """Manages ClickHouse database operations"""
-    
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.client: Optional[Client] = None
-        self.database = config.get('database', 'llm_router')
-        self.tables = config.get('tables', {})
-        
+        self.database = config.get("database", "llm_router")
+        self.tables = config.get("tables", {})
+
         # Connection settings
         self.connection_params = {
-            'host': config.get('host', 'localhost'),
-            'port': config.get('port', 8123),
-            'username': config.get('username', 'default'),
-            'password': config.get('password', ''),
+            "host": config.get("host", "localhost"),
+            "port": config.get("port", 8123),
+            "username": config.get("username", "default"),
+            "password": config.get("password", ""),
         }
-        
+
         # Batch insertion settings
         self.batch_size = 1000
         self.batch_timeout = 30  # seconds
         self.pending_batches = {
-            'query_logs': [],
-            'metrics': [],
-            'model_performance': []
+            "query_logs": [],
+            "metrics": [],
+            "model_performance": [],
         }
         self.last_batch_time = time.time()
 
@@ -258,41 +285,39 @@ class ClickHouseManager:
         columns = list(records[0].keys())
         rows = [[record.get(column) for column in columns] for record in records]
         self.client.insert(table_name, rows, column_names=columns)
-        
+
     async def initialize(self):
         """Initialize ClickHouse connection and create tables"""
         try:
             admin_client = clickhouse_connect.get_client(
-                **self.connection_params,
-                database='default'
+                **self.connection_params, database="default"
             )
 
             # Test connection
-            result = admin_client.query('SELECT 1')
+            result = admin_client.query("SELECT 1")
             if result.result_rows:
                 logger.info("ClickHouse connection established successfully")
-            
+
             # Create database if not exists
             self.client = admin_client
             await self._create_database()
 
-            if self.database != 'default':
+            if self.database != "default":
                 admin_client.close()
                 self.client = clickhouse_connect.get_client(
-                    **self.connection_params,
-                    database=self.database
+                    **self.connection_params, database=self.database
                 )
-                self.client.query('SELECT 1')
-            
+                self.client.query("SELECT 1")
+
             # Create tables
             await self._create_tables()
-            
+
             logger.info("ClickHouse manager initialized successfully")
-            
+
         except Exception as e:
             logger.error(f"Failed to initialize ClickHouse: {e}")
             raise
-    
+
     async def _create_database(self):
         """Create database if not exists"""
         try:
@@ -301,7 +326,7 @@ class ClickHouseManager:
         except Exception as e:
             logger.error(f"Failed to create database: {e}")
             raise
-    
+
     async def _create_tables(self):
         """Create all required tables"""
         # Query logs table
@@ -327,8 +352,10 @@ class ClickHouseManager:
         PARTITION BY toYYYYMM(timestamp)
         ORDER BY (timestamp, user_id, query_id)
         TTL toDateTime(timestamp) + INTERVAL 90 DAY
-        """.format(database=self.database)
-        
+        """.format(
+            database=self.database
+        )
+
         # System metrics table
         metrics_sql = """
         CREATE TABLE IF NOT EXISTS {database}.system_metrics (
@@ -341,8 +368,10 @@ class ClickHouseManager:
         PARTITION BY toYYYYMMDD(timestamp)
         ORDER BY (service, metric_name, timestamp)
         TTL toDateTime(timestamp) + INTERVAL 30 DAY
-        """.format(database=self.database)
-        
+        """.format(
+            database=self.database
+        )
+
         # Model performance table
         performance_sql = """
         CREATE TABLE IF NOT EXISTS {database}.model_performance (
@@ -360,8 +389,10 @@ class ClickHouseManager:
         PARTITION BY toYYYYMMDD(timestamp)
         ORDER BY (model_name, timestamp)
         TTL toDateTime(timestamp) + INTERVAL 60 DAY
-        """.format(database=self.database)
-        
+        """.format(
+            database=self.database
+        )
+
         # User analytics table
         user_analytics_sql = """
         CREATE TABLE IF NOT EXISTS {database}.user_analytics (
@@ -378,74 +409,82 @@ class ClickHouseManager:
         PARTITION BY toYYYYMM(date)
         ORDER BY (user_id, date)
         TTL date + INTERVAL 180 DAY
-        """.format(database=self.database)
-        
+        """.format(
+            database=self.database
+        )
+
         # Execute table creation
         tables = [
             ("query_logs", query_logs_sql),
             ("system_metrics", metrics_sql),
             ("model_performance", performance_sql),
-            ("user_analytics", user_analytics_sql)
+            ("user_analytics", user_analytics_sql),
         ]
-        
+
         for table_name, sql in tables:
             try:
                 self.client.command(sql)
                 logger.info(f"Table {table_name} created/verified")
             except Exception as e:
                 logger.error(f"Failed to create table {table_name}: {e}")
-    
+
     async def insert_query_log(self, query_log: QueryLogEntry):
         """Insert single query log entry"""
         try:
             data = [query_log.to_dict()]
-            self._insert_dict_rows('query_logs', data)
+            self._insert_dict_rows("query_logs", data)
             logger.debug(f"Inserted query log: {query_log.query_id}")
         except Exception as e:
             logger.error(f"Failed to insert query log: {e}")
             raise
-    
+
     async def batch_insert_query_logs(self, query_logs: List[QueryLogEntry]):
         """Batch insert query log entries"""
         if not query_logs:
             return
-        
+
         try:
             data = [log.to_dict() for log in query_logs]
-            self._insert_dict_rows('query_logs', data)
+            self._insert_dict_rows("query_logs", data)
             logger.info(f"Batch inserted {len(query_logs)} query logs")
-            PIPELINE_METRICS.records_inserted.labels(table='query_logs').inc(len(query_logs))
+            PIPELINE_METRICS.records_inserted.labels(table="query_logs").inc(
+                len(query_logs)
+            )
         except Exception as e:
             logger.error(f"Failed to batch insert query logs: {e}")
             PIPELINE_METRICS.insertion_errors.inc()
             raise
-    
+
     async def insert_metric(self, metric: MetricEntry):
         """Insert single metric entry"""
         try:
             data = [metric.to_dict()]
-            self._insert_dict_rows('system_metrics', data)
+            self._insert_dict_rows("system_metrics", data)
             logger.debug(f"Inserted metric: {metric.service}.{metric.metric_name}")
         except Exception as e:
             logger.error(f"Failed to insert metric: {e}")
             raise
-    
+
     async def batch_insert_metrics(self, metrics: List[MetricEntry]):
         """Batch insert metric entries"""
         if not metrics:
             return
-        
+
         try:
             data = [metric.to_dict() for metric in metrics]
-            self._insert_dict_rows('system_metrics', data)
+            self._insert_dict_rows("system_metrics", data)
             logger.info(f"Batch inserted {len(metrics)} metrics")
-            PIPELINE_METRICS.records_inserted.labels(table='system_metrics').inc(len(metrics))
+            PIPELINE_METRICS.records_inserted.labels(table="system_metrics").inc(
+                len(metrics)
+            )
         except Exception as e:
             logger.error(f"Failed to batch insert metrics: {e}")
             PIPELINE_METRICS.insertion_errors.inc()
             raise
-    
-    async def get_query_analytics(self, user_id: str = None, hours: int = 24) -> Dict[str, Any]:
+
+    async def get_query_analytics(
+        self, user_id: str = None, hours: int = 24
+    ) -> Dict[str, Any]:
         """Get query analytics for dashboard"""
         try:
             base_query = f"""
@@ -460,53 +499,57 @@ class ClickHouseManager:
             FROM {self.database}.query_logs 
             WHERE timestamp >= now() - INTERVAL {hours} HOUR
             """
-            
+
             if user_id:
                 base_query += f" AND user_id = '{user_id}'"
-            
+
             # Overall stats
             overall_query = base_query + " GROUP BY selected_model, query_type"
             result = self.client.query(overall_query)
-            
+
             # Process results
             analytics = {
-                'total_queries': 0,
-                'total_tokens': 0,
-                'total_cost': 0.0,
-                'avg_latency': 0.0,
-                'success_rate': 0.0,
-                'model_breakdown': {},
-                'query_type_breakdown': {}
+                "total_queries": 0,
+                "total_tokens": 0,
+                "total_cost": 0.0,
+                "avg_latency": 0.0,
+                "success_rate": 0.0,
+                "model_breakdown": {},
+                "query_type_breakdown": {},
             }
-            
+
             for row in result.result_rows:
-                analytics['total_queries'] += row[0]
-                analytics['total_tokens'] += row[1]
-                analytics['total_cost'] += row[2]
-                
+                analytics["total_queries"] += row[0]
+                analytics["total_tokens"] += row[1]
+                analytics["total_cost"] += row[2]
+
                 model = row[5]
                 query_type = row[6]
-                
-                if model not in analytics['model_breakdown']:
-                    analytics['model_breakdown'][model] = {'queries': 0, 'cost': 0.0}
-                analytics['model_breakdown'][model]['queries'] += row[0]
-                analytics['model_breakdown'][model]['cost'] += row[2]
-                
-                if query_type not in analytics['query_type_breakdown']:
-                    analytics['query_type_breakdown'][query_type] = 0
-                analytics['query_type_breakdown'][query_type] += row[0]
-            
+
+                if model not in analytics["model_breakdown"]:
+                    analytics["model_breakdown"][model] = {"queries": 0, "cost": 0.0}
+                analytics["model_breakdown"][model]["queries"] += row[0]
+                analytics["model_breakdown"][model]["cost"] += row[2]
+
+                if query_type not in analytics["query_type_breakdown"]:
+                    analytics["query_type_breakdown"][query_type] = 0
+                analytics["query_type_breakdown"][query_type] += row[0]
+
             # Calculate averages
-            if analytics['total_queries'] > 0:
-                analytics['avg_latency'] = sum(row[3] for row in result.result_rows) / len(result.result_rows)
-                analytics['success_rate'] = sum(row[4] for row in result.result_rows) / len(result.result_rows)
-            
+            if analytics["total_queries"] > 0:
+                analytics["avg_latency"] = sum(
+                    row[3] for row in result.result_rows
+                ) / len(result.result_rows)
+                analytics["success_rate"] = sum(
+                    row[4] for row in result.result_rows
+                ) / len(result.result_rows)
+
             return analytics
-            
+
         except Exception as e:
             logger.error(f"Failed to get query analytics: {e}")
             return {}
-    
+
     async def get_model_performance(self, hours: int = 24) -> List[Dict[str, Any]]:
         """Get model performance metrics"""
         try:
@@ -524,27 +567,29 @@ class ClickHouseManager:
             GROUP BY selected_model
             ORDER BY requests DESC
             """
-            
+
             result = self.client.query(query)
-            
+
             performance_data = []
             for row in result.result_rows:
-                performance_data.append({
-                    'model_name': row[0],
-                    'requests': row[1],
-                    'success_rate': row[2],
-                    'avg_latency_ms': row[3],
-                    'tokens_per_second': row[4],
-                    'error_count': row[5],
-                    'total_cost': row[6]
-                })
-            
+                performance_data.append(
+                    {
+                        "model_name": row[0],
+                        "requests": row[1],
+                        "success_rate": row[2],
+                        "avg_latency_ms": row[3],
+                        "tokens_per_second": row[4],
+                        "error_count": row[5],
+                        "total_cost": row[6],
+                    }
+                )
+
             return performance_data
-            
+
         except Exception as e:
             logger.error(f"Failed to get model performance: {e}")
             return []
-    
+
     def shutdown(self):
         """Shutdown ClickHouse connection"""
         if self.client:
@@ -554,75 +599,75 @@ class ClickHouseManager:
 
 class KafkaConsumerManager:
     """Manages Kafka message consumption"""
-    
+
     def __init__(self, config: Dict[str, Any], clickhouse_manager: ClickHouseManager):
         self.config = config
         self.clickhouse = clickhouse_manager
-        self.bootstrap_servers = config.get('bootstrap_servers', ['localhost:9092'])
-        self.topics = config.get('topics', {})
+        self.bootstrap_servers = config.get("bootstrap_servers", ["localhost:9092"])
+        self.topics = config.get("topics", {})
         self.consumers = {}
-        
+
         # Consumer configuration
         self.consumer_config = {
-            'bootstrap_servers': self.bootstrap_servers,
-            'group_id': config.get('consumer', {}).get('group_id', 'llm-router-consumer'),
-            'auto_offset_reset': config.get('consumer', {}).get('auto_offset_reset', 'latest'),
-            'enable_auto_commit': config.get('consumer', {}).get('enable_auto_commit', True),
-            'max_poll_records': config.get('consumer', {}).get('max_poll_records', 500),
-            'value_deserializer': self._deserialize_message
+            "bootstrap_servers": self.bootstrap_servers,
+            "group_id": config.get("consumer", {}).get(
+                "group_id", "llm-router-consumer"
+            ),
+            "auto_offset_reset": config.get("consumer", {}).get(
+                "auto_offset_reset", "latest"
+            ),
+            "enable_auto_commit": config.get("consumer", {}).get(
+                "enable_auto_commit", True
+            ),
+            "max_poll_records": config.get("consumer", {}).get("max_poll_records", 500),
+            "value_deserializer": self._deserialize_message,
         }
-        
+
         # Batch processing
-        self.batch_processors = {
-            'queries': [],
-            'metrics': []
-        }
+        self.batch_processors = {"queries": [], "metrics": []}
         self.batch_size = 100
         self.last_batch_time = time.time()
         self.running = False
-        
+
     async def initialize(self):
         """Initialize Kafka consumers"""
         try:
             # Create consumer for each topic
             for topic_key, topic_name in self.topics.items():
-                if topic_key in ['queries', 'responses', 'metrics', 'errors']:
-                    consumer = AIOKafkaConsumer(
-                        topic_name,
-                        **self.consumer_config
-                    )
+                if topic_key in ["queries", "responses", "metrics", "errors"]:
+                    consumer = AIOKafkaConsumer(topic_name, **self.consumer_config)
                     await consumer.start()
                     self.consumers[topic_key] = consumer
                     logger.info(f"Consumer for topic {topic_name} initialized")
-            
+
             logger.info(f"Kafka consumers initialized for {len(self.consumers)} topics")
-            
+
         except Exception as e:
             logger.error(f"Failed to initialize Kafka consumers: {e}")
             raise
-    
+
     async def start_consuming(self):
         """Start consuming messages from all topics"""
         self.running = True
         tasks = []
-        
+
         # Start consumer tasks
         for topic_key, consumer in self.consumers.items():
-            if topic_key == 'queries':
+            if topic_key == "queries":
                 tasks.append(asyncio.create_task(self._consume_queries(consumer)))
-            elif topic_key == 'responses':
+            elif topic_key == "responses":
                 tasks.append(asyncio.create_task(self._consume_responses(consumer)))
-            elif topic_key == 'metrics':
+            elif topic_key == "metrics":
                 tasks.append(asyncio.create_task(self._consume_metrics(consumer)))
-            elif topic_key == 'errors':
+            elif topic_key == "errors":
                 tasks.append(asyncio.create_task(self._consume_errors(consumer)))
-        
+
         # Start batch processor
         tasks.append(asyncio.create_task(self._batch_processor()))
-        
+
         # Wait for all tasks
         await asyncio.gather(*tasks, return_exceptions=True)
-    
+
     async def _consume_queries(self, consumer: AIOKafkaConsumer):
         """Consume query log messages"""
         try:
@@ -630,36 +675,38 @@ class KafkaConsumerManager:
                 try:
                     data = message.value
                     query_log = QueryLogEntry(
-                        query_id=data['query_id'],
-                        timestamp=datetime.fromisoformat(data['timestamp'].replace('Z', '+00:00')),
-                        user_id=data['user_id'],
-                        user_tier=data['user_tier'],
-                        query_text=data['query_text'],
-                        query_type=data['query_type'],
-                        selected_model=data['selected_model'],
-                        token_count_input=data['token_count_input'],
-                        token_count_output=data['token_count_output'],
-                        latency_ms=data['latency_ms'],
-                        cost_usd=data['cost_usd'],
-                        status=data['status'],
-                        error_message=data.get('error_message', ''),
-                        context_compressed=data.get('context_compressed', False),
-                        compression_ratio=data.get('compression_ratio', 0.0),
-                        cached_response=data.get('cached_response', False)
+                        query_id=data["query_id"],
+                        timestamp=datetime.fromisoformat(
+                            data["timestamp"].replace("Z", "+00:00")
+                        ),
+                        user_id=data["user_id"],
+                        user_tier=data["user_tier"],
+                        query_text=data["query_text"],
+                        query_type=data["query_type"],
+                        selected_model=data["selected_model"],
+                        token_count_input=data["token_count_input"],
+                        token_count_output=data["token_count_output"],
+                        latency_ms=data["latency_ms"],
+                        cost_usd=data["cost_usd"],
+                        status=data["status"],
+                        error_message=data.get("error_message", ""),
+                        context_compressed=data.get("context_compressed", False),
+                        compression_ratio=data.get("compression_ratio", 0.0),
+                        cached_response=data.get("cached_response", False),
                     )
-                    
+
                     # Add to batch
-                    self.batch_processors['queries'].append(query_log)
-                    
-                    PIPELINE_METRICS.messages_consumed.labels(topic='queries').inc()
-                    
+                    self.batch_processors["queries"].append(query_log)
+
+                    PIPELINE_METRICS.messages_consumed.labels(topic="queries").inc()
+
                 except Exception as e:
                     logger.error(f"Failed to process query message: {e}")
                     PIPELINE_METRICS.consumer_errors.inc()
-                    
+
         except Exception as e:
             logger.error(f"Query consumer error: {e}")
-    
+
     async def _consume_responses(self, consumer: AIOKafkaConsumer):
         """Consume response log messages"""
         try:
@@ -668,16 +715,16 @@ class KafkaConsumerManager:
                     data = message.value
                     # Process response data (for future analytics)
                     logger.debug(f"Processed response: {data.get('query_id')}")
-                    
-                    PIPELINE_METRICS.messages_consumed.labels(topic='responses').inc()
-                    
+
+                    PIPELINE_METRICS.messages_consumed.labels(topic="responses").inc()
+
                 except Exception as e:
                     logger.error(f"Failed to process response message: {e}")
                     PIPELINE_METRICS.consumer_errors.inc()
-                    
+
         except Exception as e:
             logger.error(f"Response consumer error: {e}")
-    
+
     async def _consume_metrics(self, consumer: AIOKafkaConsumer):
         """Consume system metrics messages"""
         try:
@@ -685,25 +732,27 @@ class KafkaConsumerManager:
                 try:
                     data = message.value
                     metric_entry = MetricEntry(
-                        timestamp=datetime.fromisoformat(data['timestamp'].replace('Z', '+00:00')),
-                        service=data['service'],
-                        metric_name=data['metric_name'],
-                        metric_value=data['metric_value'],
-                        labels=data.get('labels', {})
+                        timestamp=datetime.fromisoformat(
+                            data["timestamp"].replace("Z", "+00:00")
+                        ),
+                        service=data["service"],
+                        metric_name=data["metric_name"],
+                        metric_value=data["metric_value"],
+                        labels=data.get("labels", {}),
                     )
-                    
+
                     # Add to batch
-                    self.batch_processors['metrics'].append(metric_entry)
-                    
-                    PIPELINE_METRICS.messages_consumed.labels(topic='metrics').inc()
-                    
+                    self.batch_processors["metrics"].append(metric_entry)
+
+                    PIPELINE_METRICS.messages_consumed.labels(topic="metrics").inc()
+
                 except Exception as e:
                     logger.error(f"Failed to process metric message: {e}")
                     PIPELINE_METRICS.consumer_errors.inc()
-                    
+
         except Exception as e:
             logger.error(f"Metrics consumer error: {e}")
-    
+
     async def _consume_errors(self, consumer: AIOKafkaConsumer):
         """Consume error messages"""
         try:
@@ -711,62 +760,68 @@ class KafkaConsumerManager:
                 try:
                     data = message.value
                     logger.error(f"System error logged: {data}")
-                    
-                    PIPELINE_METRICS.messages_consumed.labels(topic='errors').inc()
-                    
+
+                    PIPELINE_METRICS.messages_consumed.labels(topic="errors").inc()
+
                 except Exception as e:
                     logger.error(f"Failed to process error message: {e}")
                     PIPELINE_METRICS.consumer_errors.inc()
-                    
+
         except Exception as e:
             logger.error(f"Error consumer error: {e}")
-    
+
     async def _batch_processor(self):
         """Process batches periodically"""
         while self.running:
             try:
                 current_time = time.time()
-                
+
                 # Process query logs batch
-                if (len(self.batch_processors['queries']) >= self.batch_size or 
-                    current_time - self.last_batch_time > 30):
-                    
+                if (
+                    len(self.batch_processors["queries"]) >= self.batch_size
+                    or current_time - self.last_batch_time > 30
+                ):
                     await self.flush_pending_batches(include_metrics=False)
-                
+
                 # Process metrics batch
-                if (len(self.batch_processors['metrics']) >= self.batch_size or 
-                    current_time - self.last_batch_time > 30):
-                    
+                if (
+                    len(self.batch_processors["metrics"]) >= self.batch_size
+                    or current_time - self.last_batch_time > 30
+                ):
                     await self.flush_pending_batches(include_queries=False)
-                
+
                 # Update last batch time
                 if current_time - self.last_batch_time > 30:
                     self.last_batch_time = current_time
-                
+
                 await asyncio.sleep(5)  # Check every 5 seconds
-                
+
             except Exception as e:
                 logger.error(f"Batch processor error: {e}")
                 await asyncio.sleep(10)
-        
+
         await self.flush_pending_batches()
 
-    async def flush_pending_batches(self, include_queries: bool = True, include_metrics: bool = True):
+    async def flush_pending_batches(
+        self, include_queries: bool = True, include_metrics: bool = True
+    ):
         """Flush any pending Kafka batches to ClickHouse immediately"""
-        if include_queries and self.batch_processors['queries']:
-            await self.clickhouse.batch_insert_query_logs(self.batch_processors['queries'])
-            self.batch_processors['queries'].clear()
+        if include_queries and self.batch_processors["queries"]:
+            await self.clickhouse.batch_insert_query_logs(
+                self.batch_processors["queries"]
+            )
+            self.batch_processors["queries"].clear()
 
-        if include_metrics and self.batch_processors['metrics']:
-            await self.clickhouse.batch_insert_metrics(self.batch_processors['metrics'])
-            self.batch_processors['metrics'].clear()
+        if include_metrics and self.batch_processors["metrics"]:
+            await self.clickhouse.batch_insert_metrics(self.batch_processors["metrics"])
+            self.batch_processors["metrics"].clear()
 
         self.last_batch_time = time.time()
-    
+
     def _deserialize_message(self, message: bytes) -> Dict[str, Any]:
         """Deserialize message from JSON bytes"""
-        return json.loads(message.decode('utf-8'))
-    
+        return json.loads(message.decode("utf-8"))
+
     async def shutdown(self):
         """Shutdown all consumers"""
         self.running = False
@@ -778,54 +833,73 @@ class KafkaConsumerManager:
 
 class KafkaIngestionPipeline:
     """Main Kafka ingestion pipeline coordinator"""
-    
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.clickhouse_manager = ClickHouseManager(config.get('clickhouse', {}))
+        self.clickhouse_manager = ClickHouseManager(config.get("clickhouse", {}))
         self.producer_manager = KafkaProducerManager(config)
         self.consumer_manager = None  # Will be initialized after ClickHouse
         self.running = False
-        
+
     async def initialize(self):
         """Initialize the complete pipeline"""
         logger.info("Initializing Kafka ingestion pipeline...")
-        
+
         # Initialize ClickHouse first
         await self.clickhouse_manager.initialize()
-        
+
         # Initialize producer
         await self.producer_manager.initialize()
-        
+
         # Initialize consumer with ClickHouse manager
-        self.consumer_manager = KafkaConsumerManager(self.config, self.clickhouse_manager)
+        self.consumer_manager = KafkaConsumerManager(
+            self.config, self.clickhouse_manager
+        )
         await self.consumer_manager.initialize()
-        
+
         logger.info("Kafka ingestion pipeline initialized successfully")
-    
+
     async def start(self):
         """Start the pipeline"""
         logger.info("Starting Kafka ingestion pipeline...")
         self.running = True
-        
+
         # Start consuming messages
         await self.consumer_manager.start_consuming()
-    
-    async def log_query(self, query_request: QueryRequest, inference_response: InferenceResponse, routing_decision: Any):
+
+    async def log_query(
+        self,
+        query_request: QueryRequest,
+        inference_response: InferenceResponse,
+        routing_decision: Any,
+    ):
         """Log query through the pipeline"""
-        await self.producer_manager.produce_query_log(query_request, inference_response, routing_decision)
-    
-    async def log_metric(self, service: str, metric_name: str, metric_value: float, labels: Dict[str, str] = None):
+        await self.producer_manager.produce_query_log(
+            query_request, inference_response, routing_decision
+        )
+
+    async def log_metric(
+        self,
+        service: str,
+        metric_name: str,
+        metric_value: float,
+        labels: Dict[str, str] = None,
+    ):
         """Log metric through the pipeline"""
-        await self.producer_manager.produce_metric(service, metric_name, metric_value, labels)
-    
+        await self.producer_manager.produce_metric(
+            service, metric_name, metric_value, labels
+        )
+
     async def log_error(self, error_data: Dict[str, Any]):
         """Log error through the pipeline"""
         await self.producer_manager.produce_error(error_data)
-    
-    async def get_analytics(self, user_id: str = None, hours: int = 24) -> Dict[str, Any]:
+
+    async def get_analytics(
+        self, user_id: str = None, hours: int = 24
+    ) -> Dict[str, Any]:
         """Get analytics from ClickHouse"""
         return await self.clickhouse_manager.get_query_analytics(user_id, hours)
-    
+
     async def get_model_performance(self, hours: int = 24) -> List[Dict[str, Any]]:
         """Get model performance from ClickHouse"""
         return await self.clickhouse_manager.get_model_performance(hours)
@@ -834,26 +908,30 @@ class KafkaIngestionPipeline:
         """Flush any pending consumer batches to ClickHouse"""
         if self.consumer_manager:
             await self.consumer_manager.flush_pending_batches()
-    
+
     def get_health_status(self) -> Dict[str, Any]:
         """Get pipeline health status"""
         return {
             "pipeline_running": self.running,
             "producer_healthy": self.producer_manager.producer is not None,
-            "consumer_healthy": bool(self.consumer_manager and self.consumer_manager.consumers),
+            "consumer_healthy": bool(
+                self.consumer_manager and self.consumer_manager.consumers
+            ),
             "clickhouse_healthy": self.clickhouse_manager.client is not None,
-            "total_consumers": len(self.consumer_manager.consumers) if self.consumer_manager else 0
+            "total_consumers": len(self.consumer_manager.consumers)
+            if self.consumer_manager
+            else 0,
         }
-    
+
     async def shutdown(self):
         """Shutdown the pipeline"""
         logger.info("Shutting down Kafka ingestion pipeline...")
         self.running = False
-        
+
         if self.consumer_manager:
             await self.consumer_manager.shutdown()
-        
+
         await self.producer_manager.shutdown()
         self.clickhouse_manager.shutdown()
-        
+
         logger.info("Kafka ingestion pipeline shutdown complete")

@@ -34,7 +34,9 @@ def inference_config():
 
 class TestOpenAIProvider:
     @pytest.mark.asyncio
-    async def test_generate_response_returns_complete_inference_response(self, sample_query_request):
+    async def test_generate_response_returns_complete_inference_response(
+        self, sample_query_request
+    ):
         with patch("src.llm_router_part2_inference.openai.AsyncOpenAI") as mock_openai:
             mock_response = MagicMock()
             mock_response.output_text = "Use a simple helper."
@@ -60,8 +62,12 @@ class TestOpenAIProvider:
 
 class TestAnthropicProvider:
     @pytest.mark.asyncio
-    async def test_generate_response_returns_complete_inference_response(self, sample_query_request):
-        with patch("src.llm_router_part2_inference.anthropic.AsyncAnthropic") as mock_anthropic:
+    async def test_generate_response_returns_complete_inference_response(
+        self, sample_query_request
+    ):
+        with patch(
+            "src.llm_router_part2_inference.anthropic.AsyncAnthropic"
+        ) as mock_anthropic:
             mock_response = MagicMock()
             mock_response.content = [MagicMock(text="Anthropic answer")]
             mock_response.usage.input_tokens = 9
@@ -74,7 +80,9 @@ class TestAnthropicProvider:
             provider = AnthropicProvider({"api_key": "test-key"})
             await provider.initialize()
 
-            response = await provider.generate_response(sample_query_request, "claude-3.5-sonnet")
+            response = await provider.generate_response(
+                sample_query_request, "claude-3.5-sonnet"
+            )
 
             assert response.response_text == "Anthropic answer"
             assert response.provider == "anthropic"
@@ -108,14 +116,18 @@ class TestResponseCache:
 
 class TestBatchProcessor:
     @pytest.mark.asyncio
-    async def test_disabled_batching_processes_immediately(self, sample_query_request, inference_response_factory):
+    async def test_disabled_batching_processes_immediately(
+        self, sample_query_request, inference_response_factory
+    ):
         provider = AsyncMock()
         provider.generate_response.return_value = inference_response_factory()
 
         processor = BatchProcessor({"enabled": False})
         response = await processor.add_request(sample_query_request, provider, "gpt-5")
 
-        provider.generate_response.assert_awaited_once_with(sample_query_request, "gpt-5")
+        provider.generate_response.assert_awaited_once_with(
+            sample_query_request, "gpt-5"
+        )
         assert response.model_name == "gpt-5"
 
 
@@ -128,13 +140,17 @@ class TestInferenceEngine:
         inference_response_factory,
     ):
         router = MagicMock()
-        router.route_query = AsyncMock(return_value=SimpleNamespace(selected_model="gpt-5"))
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="gpt-5")
+        )
         router.get_model_info.return_value = {"config": {"provider": "openai"}}
         router.update_model_stats = MagicMock()
 
         engine = InferenceEngine(inference_config, router)
         engine.providers = {"openai": AsyncMock()}
-        engine.providers["openai"].generate_response = AsyncMock(return_value=inference_response_factory())
+        engine.providers["openai"].generate_response = AsyncMock(
+            return_value=inference_response_factory()
+        )
         engine.cache.get_cached_response = AsyncMock(return_value=None)
         engine.cache.cache_response = AsyncMock()
         engine.context_compressor.compress_context = AsyncMock(return_value="short ctx")
@@ -154,7 +170,9 @@ class TestInferenceEngine:
         sample_query_request,
     ):
         router = MagicMock()
-        router.route_query = AsyncMock(return_value=SimpleNamespace(selected_model="gpt-5"))
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="gpt-5")
+        )
         router.get_model_info.return_value = {"config": {"provider": "openai"}}
         router.update_model_stats = MagicMock()
 
@@ -187,7 +205,9 @@ class TestInferenceEngine:
         sample_query_request,
     ):
         router = MagicMock()
-        router.route_query = AsyncMock(return_value=SimpleNamespace(selected_model="unknown-model"))
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="unknown-model")
+        )
         router.get_model_info.return_value = None
         router.update_model_stats = MagicMock()
 

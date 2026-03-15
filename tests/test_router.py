@@ -2,7 +2,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.llm_router_part1_router import ModelRouter, QueryClassifier, RoutingRule, TokenCounter
+from src.llm_router_part1_router import (
+    ModelRouter,
+    QueryClassifier,
+    RoutingRule,
+    TokenCounter,
+)
 from src.utils.schema import QueryRequest, QueryType, UserTier
 
 
@@ -11,7 +16,9 @@ class TestQueryClassifier:
         classifier = QueryClassifier()
         classifier._is_initialized = True
 
-        query_type, confidence = classifier.classify_query("Write a Python function to sort a list")
+        query_type, confidence = classifier.classify_query(
+            "Write a Python function to sort a list"
+        )
 
         assert query_type == QueryType.CODE_GENERATION
         assert confidence > 0.1
@@ -33,7 +40,9 @@ class TestRoutingRule:
             fallback="gpt-5",
         )
 
-        assert rule.matches({"query_type": "code_generation", "token_count": 128}) is True
+        assert (
+            rule.matches({"query_type": "code_generation", "token_count": 128}) is True
+        )
         assert rule.matches({"query_type": "analysis", "token_count": 128}) is False
 
 
@@ -41,12 +50,17 @@ class TestModelRouter:
     @pytest.mark.asyncio
     async def test_route_query_prefers_rule_based_selection(self, router_config):
         router = ModelRouter(router_config)
-        router.classifier.classify_query = lambda _query: (QueryType.CODE_GENERATION, 0.95)
+        router.classifier.classify_query = lambda _query: (
+            QueryType.CODE_GENERATION,
+            0.95,
+        )
         router.token_counter.count_tokens = lambda _query, _model="default": 128
         router.model_stats["gpt-5"] = {"success_rate": 0.99, "avg_latency": 500}
         router.model_stats["mistral-7b"] = {"success_rate": 0.90, "avg_latency": 300}
 
-        request = QueryRequest(query="Write a Python helper", user_id="u1", user_tier=UserTier.PREMIUM)
+        request = QueryRequest(
+            query="Write a Python helper", user_id="u1", user_tier=UserTier.PREMIUM
+        )
         decision = await router.route_query(request)
 
         assert decision.selected_model in {"gpt-5", "mistral-7b"}

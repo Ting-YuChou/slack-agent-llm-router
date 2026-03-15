@@ -15,12 +15,12 @@ logger = logging.getLogger(__name__)
 def generate_deployment_configs(output_dir: str = "."):
     """Generate all deployment configurations"""
     output_path = Path(output_dir)
-    
+
     # Create deployment directories
     (output_path / "docker").mkdir(exist_ok=True)
     (output_path / "k8s").mkdir(exist_ok=True)
     (output_path / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
-    
+
     # Generate configurations
     generate_dockerfile(output_path / "docker" / "Dockerfile")
     generate_docker_compose(output_path / "docker-compose.yml")
@@ -29,13 +29,13 @@ def generate_deployment_configs(output_dir: str = "."):
     generate_helm_chart(output_path / "helm")
     generate_github_actions(output_path / ".github" / "workflows")
     generate_terraform_config(output_path / "terraform")
-    
+
     logger.info(f"Deployment configurations generated in {output_path}")
 
 
 def generate_dockerfile(output_path: Path):
     """Generate production Dockerfile"""
-    dockerfile_content = '''# Multi-stage Dockerfile for LLM Router Platform
+    dockerfile_content = """# Multi-stage Dockerfile for LLM Router Platform
 # Production-optimized with security best practices
 
 # Build stage
@@ -115,14 +115,14 @@ ENV PYTHONPATH=/app \\
 
 # Default command
 CMD ["python", "main.py", "start", "--config", "config/config.yaml"]
-'''
-    
+"""
+
     output_path.write_text(dockerfile_content)
 
 
 def generate_docker_compose(output_path: Path):
     """Generate development docker-compose.yml"""
-    compose_content = '''version: '3.8'
+    compose_content = """version: '3.8'
 
 services:
   llm-router:
@@ -269,14 +269,14 @@ volumes:
 networks:
   llm-router-network:
     driver: bridge
-'''
-    
+"""
+
     output_path.write_text(compose_content)
 
 
 def generate_docker_compose_prod(output_path: Path):
     """Generate production docker-compose.yml"""
-    compose_prod_content = '''version: '3.8'
+    compose_prod_content = """version: '3.8'
 
 services:
   llm-router:
@@ -389,27 +389,27 @@ networks:
   llm-router-prod:
     driver: overlay
     attachable: true
-'''
-    
+"""
+
     output_path.write_text(compose_prod_content)
 
 
 def generate_kubernetes_manifests(output_path: Path):
     """Generate Kubernetes manifests"""
     output_path.mkdir(exist_ok=True)
-    
+
     # Namespace
-    namespace_yaml = '''apiVersion: v1
+    namespace_yaml = """apiVersion: v1
 kind: Namespace
 metadata:
   name: llm-router
   labels:
     name: llm-router
-'''
+"""
     (output_path / "namespace.yaml").write_text(namespace_yaml)
-    
+
     # ConfigMap
-    configmap_yaml = '''apiVersion: v1
+    configmap_yaml = """apiVersion: v1
 kind: ConfigMap
 metadata:
   name: llm-router-config
@@ -427,11 +427,11 @@ data:
       port: 8123
     monitoring:
       prometheus_port: 8000
-'''
+"""
     (output_path / "configmap.yaml").write_text(configmap_yaml)
-    
+
     # Secrets
-    secrets_yaml = '''apiVersion: v1
+    secrets_yaml = """apiVersion: v1
 kind: Secret
 metadata:
   name: llm-router-secrets
@@ -441,11 +441,11 @@ data:
   openai-api-key: ""  # Base64 encoded
   anthropic-api-key: ""  # Base64 encoded
   slack-bot-token: ""  # Base64 encoded
-'''
+"""
     (output_path / "secrets.yaml").write_text(secrets_yaml)
-    
+
     # Deployment
-    deployment_yaml = '''apiVersion: apps/v1
+    deployment_yaml = """apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: llm-router
@@ -535,11 +535,11 @@ spec:
           name: llm-router-config
       - name: logs
         emptyDir: {}
-'''
+"""
     (output_path / "deployment.yaml").write_text(deployment_yaml)
-    
+
     # Service
-    service_yaml = '''apiVersion: v1
+    service_yaml = """apiVersion: v1
 kind: Service
 metadata:
   name: llm-router-service
@@ -559,9 +559,9 @@ spec:
     targetPort: 8000
     protocol: TCP
   type: ClusterIP
-'''
+"""
     (output_path / "service.yaml").write_text(service_yaml)
-    
+
     # Additional manifests omitted for brevity - similar pattern continues
 
 
@@ -571,19 +571,19 @@ def generate_helm_chart(output_path: Path):
     chart_path = output_path / "llm-router"
     chart_path.mkdir(exist_ok=True)
     (chart_path / "templates").mkdir(exist_ok=True)
-    
+
     # Chart.yaml
-    chart_yaml = '''apiVersion: v2
+    chart_yaml = """apiVersion: v2
 name: llm-router
 description: A Helm chart for LLM Router Platform
 type: application
 version: 0.1.0
 appVersion: "1.0.0"
-'''
+"""
     (chart_path / "Chart.yaml").write_text(chart_yaml)
-    
+
     # values.yaml
-    values_yaml = '''replicaCount: 3
+    values_yaml = """replicaCount: 3
 
 image:
   repository: llm-router
@@ -601,14 +601,14 @@ resources:
   requests:
     cpu: 500m
     memory: 1Gi
-'''
+"""
     (chart_path / "values.yaml").write_text(values_yaml)
 
 
 def generate_github_actions(output_path: Path):
     """Generate GitHub Actions workflows"""
     # CI workflow
-    ci_yaml = '''name: CI Pipeline
+    ci_yaml = """name: CI Pipeline
 
 on:
   push:
@@ -655,16 +655,16 @@ jobs:
     - name: Build Docker image
       run: |
         docker build -t llm-router:latest -f docker/Dockerfile .
-'''
+"""
     (output_path / "ci.yml").write_text(ci_yaml)
 
 
 def generate_terraform_config(output_path: Path):
     """Generate Terraform configurations for infrastructure"""
     output_path.mkdir(exist_ok=True)
-    
+
     # Main Terraform configuration
-    main_tf = '''terraform {
+    main_tf = """terraform {
   required_version = ">= 1.0"
   required_providers {
     aws = {
@@ -708,7 +708,7 @@ resource "aws_subnet" "private" {
 data "aws_availability_zones" "available" {
   state = "available"
 }
-'''
+"""
     (output_path / "main.tf").write_text(main_tf)
 
 

@@ -4,7 +4,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from slack.bot_real import ConversationContext, ConversationManager, SlackBot, SlackMessageHandler, UserManager
+from slack.bot_real import (
+    ConversationContext,
+    ConversationManager,
+    SlackBot,
+    SlackMessageHandler,
+    UserManager,
+)
 from src.utils.schema import UserTier
 
 
@@ -96,7 +102,11 @@ class TestSlackMessageHandler:
             user_manager=UserManager(),
             conversation_manager=ConversationManager({}),
             inference_engine=SimpleNamespace(
-                process_query=AsyncMock(return_value=inference_response_factory(response_text="hello from model"))
+                process_query=AsyncMock(
+                    return_value=inference_response_factory(
+                        response_text="hello from model"
+                    )
+                )
             ),
         )
         handler = SlackMessageHandler(bot)
@@ -116,8 +126,12 @@ class TestSlackMessageHandler:
         )
         handler = SlackMessageHandler(bot)
 
-        free_tokens = handler._get_max_tokens_for_user(UserTier.FREE, {"response_length": "short"})
-        enterprise_tokens = handler._get_max_tokens_for_user(UserTier.ENTERPRISE, {"response_length": "long"})
+        free_tokens = handler._get_max_tokens_for_user(
+            UserTier.FREE, {"response_length": "short"}
+        )
+        enterprise_tokens = handler._get_max_tokens_for_user(
+            UserTier.ENTERPRISE, {"response_length": "long"}
+        )
 
         assert free_tokens == 500
         assert enterprise_tokens == 16000
