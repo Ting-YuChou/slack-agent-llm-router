@@ -374,7 +374,7 @@ def inference_response_factory():
     def _build(**overrides):
         payload = {
             "response_text": "generated response",
-            "model_name": "gpt-4-turbo",
+            "model_name": "gpt-5",
             "provider": "openai",
             "token_count_input": 10,
             "token_count_output": 20,
@@ -396,7 +396,7 @@ def router_config():
         "default_model": "mistral-7b",
         "routing_strategy": "intelligent",
         "models": {
-            "gpt-4-turbo": {
+            "gpt-5": {
                 "provider": "openai",
                 "max_tokens": 8192,
                 "cost_per_token": 0.00003,
@@ -417,7 +417,7 @@ def router_config():
         "routing_rules": [
             {
                 "condition": "query_type == 'code_generation'",
-                "models": ["gpt-4-turbo", "mistral-7b"],
+                "models": ["gpt-5", "mistral-7b"],
                 "fallback": "mistral-7b",
             }
         ],

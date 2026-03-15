@@ -37,19 +37,19 @@ class TestOpenAIProvider:
     async def test_generate_response_returns_complete_inference_response(self, sample_query_request):
         with patch("src.llm_router_part2_inference.openai.AsyncOpenAI") as mock_openai:
             mock_response = MagicMock()
-            mock_response.choices = [MagicMock()]
-            mock_response.choices[0].message.content = "Use a simple helper."
-            mock_response.usage.prompt_tokens = 12
-            mock_response.usage.completion_tokens = 18
+            mock_response.output_text = "Use a simple helper."
+            mock_response.usage.input_tokens = 12
+            mock_response.usage.output_tokens = 18
+            mock_response.usage.total_tokens = 30
 
             mock_client = AsyncMock()
-            mock_client.chat.completions.create.return_value = mock_response
+            mock_client.responses.create.return_value = mock_response
             mock_openai.return_value = mock_client
 
             provider = OpenAIProvider({"api_key": "test-key"})
             await provider.initialize()
 
-            response = await provider.generate_response(sample_query_request, "gpt-4-turbo")
+            response = await provider.generate_response(sample_query_request, "gpt-5")
 
             assert response.response_text == "Use a simple helper."
             assert response.provider == "openai"
@@ -100,8 +100,8 @@ class TestResponseCache:
             max_tokens=10,
         )
 
-        key_a = cache.generate_cache_key(request_a, "gpt-4-turbo")
-        key_b = cache.generate_cache_key(request_b, "gpt-4-turbo")
+        key_a = cache.generate_cache_key(request_a, "gpt-5")
+        key_b = cache.generate_cache_key(request_b, "gpt-5")
 
         assert key_a != key_b
 
@@ -113,10 +113,10 @@ class TestBatchProcessor:
         provider.generate_response.return_value = inference_response_factory()
 
         processor = BatchProcessor({"enabled": False})
-        response = await processor.add_request(sample_query_request, provider, "gpt-4-turbo")
+        response = await processor.add_request(sample_query_request, provider, "gpt-5")
 
-        provider.generate_response.assert_awaited_once_with(sample_query_request, "gpt-4-turbo")
-        assert response.model_name == "gpt-4-turbo"
+        provider.generate_response.assert_awaited_once_with(sample_query_request, "gpt-5")
+        assert response.model_name == "gpt-5"
 
 
 class TestInferenceEngine:
@@ -128,7 +128,7 @@ class TestInferenceEngine:
         inference_response_factory,
     ):
         router = MagicMock()
-        router.route_query = AsyncMock(return_value=SimpleNamespace(selected_model="gpt-4-turbo"))
+        router.route_query = AsyncMock(return_value=SimpleNamespace(selected_model="gpt-5"))
         router.get_model_info.return_value = {"config": {"provider": "openai"}}
         router.update_model_stats = MagicMock()
 
@@ -154,14 +154,14 @@ class TestInferenceEngine:
         sample_query_request,
     ):
         router = MagicMock()
-        router.route_query = AsyncMock(return_value=SimpleNamespace(selected_model="gpt-4-turbo"))
+        router.route_query = AsyncMock(return_value=SimpleNamespace(selected_model="gpt-5"))
         router.get_model_info.return_value = {"config": {"provider": "openai"}}
         router.update_model_stats = MagicMock()
 
         engine = InferenceEngine(inference_config, router)
         cached_payload = {
             "response_text": "from cache",
-            "model_name": "gpt-4-turbo",
+            "model_name": "gpt-5",
             "provider": "openai",
             "token_count_input": 3,
             "token_count_output": 7,

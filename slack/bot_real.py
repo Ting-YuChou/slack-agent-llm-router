@@ -801,7 +801,7 @@ class SlackBot:
         # This would integrate with the monitoring service
         return {
             'healthy': True,
-            'available_models': ['gpt-4-turbo', 'claude-3.5-sonnet', 'mistral-7b'],
+            'available_models': ['gpt-5', 'claude-3.5-sonnet', 'mistral-7b'],
             'avg_response_time': 1200,
             'uptime': '99.9%'
         }
@@ -867,7 +867,7 @@ class SlackBot:
             'cache_hit_rate': 23.5,
             'model_breakdown': {
                 'mistral-7b': {'queries': 200, 'cost': 0.0},
-                'gpt-4-turbo': {'queries': 80, 'cost': 1.80},
+                'gpt-5': {'queries': 80, 'cost': 1.80},
                 'claude-3.5-sonnet': {'queries': 44, 'cost': 0.65}
             },
             'query_type_breakdown': {

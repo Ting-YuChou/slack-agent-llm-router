@@ -18,7 +18,7 @@ router:
   default_model: mistral-7b
   routing_strategy: intelligent
   models:
-    gpt-4-turbo:
+    gpt-5:
       provider: openai
       api_key_env: OPENAI_API_KEY
       max_tokens: 128000
@@ -62,7 +62,7 @@ router:
   routing_rules:
   - condition: query_type == 'code_generation'
     models:
-    - gpt-4-turbo
+    - gpt-5
     - mistral-7b
     fallback: mistral-7b
   - condition: query_type == 'analysis' AND token_count > 50000
@@ -72,7 +72,7 @@ router:
     fallback: llama-3.1-70b
   - condition: user_tier == 'premium'
     models:
-    - gpt-4-turbo
+    - gpt-5
     - claude-3.5-sonnet
     fallback: mistral-7b
   - condition: user_tier == 'free'

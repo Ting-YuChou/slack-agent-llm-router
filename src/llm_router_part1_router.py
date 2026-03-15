@@ -208,6 +208,7 @@ class TokenCounter:
         try:
             # OpenAI models
             self.encoders['gpt-4'] = tiktoken.encoding_for_model("gpt-4")
+            self.encoders['gpt-5'] = tiktoken.encoding_for_model("gpt-4")
             self.encoders['gpt-3.5-turbo'] = tiktoken.encoding_for_model("gpt-3.5-turbo")
             
             # Anthropic models (approximation using GPT-4 tokenizer)
@@ -235,7 +236,9 @@ class TokenCounter:
     def _get_encoder_key(self, model: str) -> str:
         """Map model name to encoder key"""
         model_lower = model.lower()
-        if 'gpt-4' in model_lower:
+        if 'gpt-5' in model_lower:
+            return 'gpt-5'
+        elif 'gpt-4' in model_lower:
             return 'gpt-4'
         elif 'gpt-3.5' in model_lower or 'turbo' in model_lower:
             return 'gpt-3.5-turbo'

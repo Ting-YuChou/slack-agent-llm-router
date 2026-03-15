@@ -111,7 +111,7 @@ def get_mock_model_data() -> List[Dict[str, Any]]:
     """Mock model performance data"""
     return [
         {
-            'model_name': 'GPT-4 Turbo',
+            'model_name': 'GPT-5',
             'status': 'online',
             'requests': 12450,
             'success_rate': 98.7,
@@ -582,7 +582,7 @@ def main():
         # Sample logs
         sample_logs = [
             {"time": "14:25:32", "level": "INFO", "component": "inference", "message": "Model inference completed successfully", "id": "req-abc123"},
-            {"time": "14:23:15", "level": "WARNING", "component": "router", "message": "High latency detected for model gpt-4-turbo", "id": "req-abc122"},
+            {"time": "14:23:15", "level": "WARNING", "component": "router", "message": "High latency detected for model gpt-5", "id": "req-abc122"},
             {"time": "14:22:48", "level": "INFO", "component": "slack", "message": "Message processed for user user-789", "id": "req-abc121"},
             {"time": "14:20:12", "level": "ERROR", "component": "pipeline", "message": "Failed to insert batch to ClickHouse", "id": "req-abc120"},
         ]

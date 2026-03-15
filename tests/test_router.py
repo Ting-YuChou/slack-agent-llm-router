@@ -29,8 +29,8 @@ class TestRoutingRule:
     def test_matches_returns_true_for_matching_context(self):
         rule = RoutingRule(
             condition="query_type == 'code_generation' and token_count < 1000",
-            models=["gpt-4-turbo"],
-            fallback="gpt-4-turbo",
+            models=["gpt-5"],
+            fallback="gpt-5",
         )
 
         assert rule.matches({"query_type": "code_generation", "token_count": 128}) is True
@@ -43,13 +43,13 @@ class TestModelRouter:
         router = ModelRouter(router_config)
         router.classifier.classify_query = lambda _query: (QueryType.CODE_GENERATION, 0.95)
         router.token_counter.count_tokens = lambda _query, _model="default": 128
-        router.model_stats["gpt-4-turbo"] = {"success_rate": 0.99, "avg_latency": 500}
+        router.model_stats["gpt-5"] = {"success_rate": 0.99, "avg_latency": 500}
         router.model_stats["mistral-7b"] = {"success_rate": 0.90, "avg_latency": 300}
 
         request = QueryRequest(query="Write a Python helper", user_id="u1", user_tier=UserTier.PREMIUM)
         decision = await router.route_query(request)
 
-        assert decision.selected_model in {"gpt-4-turbo", "mistral-7b"}
+        assert decision.selected_model in {"gpt-5", "mistral-7b"}
         assert decision.query_type == QueryType.CODE_GENERATION
         assert "Rule-based selection" in decision.routing_reason
 

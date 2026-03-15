@@ -38,7 +38,7 @@ def test_query_request_rejects_too_many_attachments():
 def test_inference_response_auto_calculates_total_tokens_when_zero():
     response = InferenceResponse(
         response_text="ok",
-        model_name="gpt-4-turbo",
+        model_name="gpt-5",
         provider="openai",
         token_count_input=11,
         token_count_output=13,

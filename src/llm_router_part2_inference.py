@@ -340,33 +340,27 @@ class OpenAIProvider(BaseInferenceProvider):
         start_time = time.time()
         
         try:
-            # Prepare messages
-            messages = [{"role": "user", "content": request.query}]
-            if request.context:
-                messages.insert(0, {"role": "system", "content": request.context})
-            
-            # Make API call
-            response = await self.client.chat.completions.create(
+            response = await self.client.responses.create(
                 model=model_name,
-                messages=messages,
-                max_tokens=request.max_tokens,
+                input=request.query,
+                instructions=request.context or None,
+                max_output_tokens=request.max_tokens,
                 temperature=request.temperature,
-                stream=False
+                user=request.user_id
             )
             
-            # Extract response data
-            generated_text = response.choices[0].message.content
             usage = response.usage
+            generated_text = response.output_text
             
             return InferenceResponse(
                 response_text=generated_text,
                 model_name=model_name,
-                token_count_input=usage.prompt_tokens,
-                token_count_output=usage.completion_tokens,
-                total_tokens=usage.prompt_tokens + usage.completion_tokens,
+                token_count_input=usage.input_tokens,
+                token_count_output=usage.output_tokens,
+                total_tokens=usage.total_tokens,
                 latency_ms=int((time.time() - start_time) * 1000),
                 tokens_per_second=(
-                    usage.completion_tokens / max(time.time() - start_time, 1e-6)
+                    usage.output_tokens / max(time.time() - start_time, 1e-6)
                 ),
                 cost_usd=self._calculate_cost(usage, model_name),
                 provider="openai",
@@ -380,21 +374,17 @@ class OpenAIProvider(BaseInferenceProvider):
     async def stream_response(self, request: QueryRequest, model_name: str) -> AsyncIterator[str]:
         """Stream response using OpenAI API"""
         try:
-            messages = [{"role": "user", "content": request.query}]
-            if request.context:
-                messages.insert(0, {"role": "system", "content": request.context})
-            
-            stream = await self.client.chat.completions.create(
+            async with self.client.responses.stream(
                 model=model_name,
-                messages=messages,
-                max_tokens=request.max_tokens,
+                input=request.query,
+                instructions=request.context or None,
+                max_output_tokens=request.max_tokens,
                 temperature=request.temperature,
-                stream=True
-            )
-            
-            async for chunk in stream:
-                if chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
+                user=request.user_id
+            ) as stream:
+                async for event in stream:
+                    if event.type == "response.output_text.delta":
+                        yield event.delta
                     
         except Exception as e:
             logger.error(f"OpenAI streaming error: {e}")
@@ -404,14 +394,14 @@ class OpenAIProvider(BaseInferenceProvider):
         """Calculate cost based on usage"""
         # OpenAI pricing (example rates - update with actual rates)
         pricing = {
-            "gpt-4-turbo": {"input": 0.01/1000, "output": 0.03/1000},
+            "gpt-5": {"input": 0.01/1000, "output": 0.03/1000},
             "gpt-3.5-turbo": {"input": 0.0015/1000, "output": 0.002/1000}
         }
         
         model_pricing = pricing.get(model_name, {"input": 0.001/1000, "output": 0.002/1000})
         
-        input_cost = usage.prompt_tokens * model_pricing["input"]
-        output_cost = usage.completion_tokens * model_pricing["output"]
+        input_cost = usage.input_tokens * model_pricing["input"]
+        output_cost = usage.output_tokens * model_pricing["output"]
         
         return input_cost + output_cost
     
@@ -420,7 +410,7 @@ class OpenAIProvider(BaseInferenceProvider):
         return {
             "provider": "openai",
             "status": "healthy" if self.client else "unhealthy",
-            "models_available": ["gpt-4-turbo", "gpt-3.5-turbo"]
+            "models_available": ["gpt-5", "gpt-5.4", "gpt-3.5-turbo"]
         }
 
 

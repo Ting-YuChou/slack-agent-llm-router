@@ -50,7 +50,7 @@ def sample_query_log():
         user_tier=UserTier.PREMIUM,
         query_text="Analyze this data",
         query_type="analysis",
-        selected_model="gpt-4-turbo",
+        selected_model="gpt-5",
         token_count_input=100,
         token_count_output=50,
         latency_ms=850,
@@ -107,7 +107,15 @@ class TestClickHouseManager:
             await manager.initialize()
             await manager.insert_query_log(sample_query_log)
 
-            client.insert.assert_called_once_with("query_logs", [sample_query_log.to_dict()])
+            expected_payload = sample_query_log.to_dict()
+            expected_columns = list(expected_payload.keys())
+            expected_rows = [[expected_payload[column] for column in expected_columns]]
+
+            client.insert.assert_called_once_with(
+                "query_logs",
+                expected_rows,
+                column_names=expected_columns,
+            )
 
     @pytest.mark.asyncio
     async def test_insert_metric_calls_insert(self, pipeline_config):
@@ -128,7 +136,15 @@ class TestClickHouseManager:
             )
             await manager.insert_metric(metric)
 
-            client.insert.assert_called_once_with("system_metrics", [metric.to_dict()])
+            expected_payload = metric.to_dict()
+            expected_columns = list(expected_payload.keys())
+            expected_rows = [[expected_payload[column] for column in expected_columns]]
+
+            client.insert.assert_called_once_with(
+                "system_metrics",
+                expected_rows,
+                column_names=expected_columns,
+            )
 
 
 class TestKafkaConsumerManager:
@@ -164,7 +180,7 @@ class TestKafkaIngestionPipeline:
         request = QueryRequest(query="hello", user_id="u1", user_tier=UserTier.FREE)
         response = InferenceResponse(
             response_text="world",
-            model_name="gpt-4-turbo",
+            model_name="gpt-5",
             provider="openai",
             token_count_input=1,
             token_count_output=1,
