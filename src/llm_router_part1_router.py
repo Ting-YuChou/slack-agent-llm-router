@@ -39,7 +39,10 @@ class RoutingRule:
         """Check if this rule matches the given query context"""
         try:
             # Simple condition evaluation (in production, use a more robust parser)
-            return eval(self.condition, {"__builtins__": {}}, query_context)
+            normalized_condition = re.sub(r"\bAND\b", "and", self.condition)
+            normalized_condition = re.sub(r"\bOR\b", "or", normalized_condition)
+            normalized_condition = re.sub(r"\bNOT\b", "not", normalized_condition)
+            return eval(normalized_condition, {"__builtins__": {}}, query_context)
         except Exception:
             return False
 

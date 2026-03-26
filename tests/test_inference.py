@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -130,6 +131,70 @@ class TestBatchProcessor:
         )
         assert response.model_name == "gpt-5"
 
+    @pytest.mark.asyncio
+    async def test_enabled_batching_coalesces_identical_requests(
+        self, sample_query_request, inference_response_factory
+    ):
+        provider = AsyncMock()
+        request_started = asyncio.Event()
+        release_request = asyncio.Event()
+
+        async def generate_response(_request, _model_name):
+            request_started.set()
+            await release_request.wait()
+            return inference_response_factory(response_text="coalesced")
+
+        provider.generate_response.side_effect = generate_response
+
+        processor = BatchProcessor(
+            {"enabled": True, "max_batch_size": 8, "max_wait_time_ms": 1}
+        )
+
+        first_task = asyncio.create_task(
+            processor.add_request(sample_query_request.model_copy(), provider, "gpt-5")
+        )
+        await request_started.wait()
+        second_task = asyncio.create_task(
+            processor.add_request(sample_query_request.model_copy(), provider, "gpt-5")
+        )
+        release_request.set()
+
+        response_a, response_b = await asyncio.gather(first_task, second_task)
+
+        assert provider.generate_response.await_count == 1
+        assert response_a.response_text == "coalesced"
+        assert response_b.response_text == "coalesced"
+        assert response_a is not response_b
+
+    @pytest.mark.asyncio
+    async def test_enabled_batching_dispatches_distinct_requests_as_batch(
+        self, sample_query_request, inference_response_factory
+    ):
+        provider = AsyncMock()
+        provider.generate_batch_responses = AsyncMock(
+            return_value=[
+                inference_response_factory(response_text="first"),
+                inference_response_factory(response_text="second"),
+            ]
+        )
+
+        processor = BatchProcessor(
+            {"enabled": True, "max_batch_size": 2, "max_wait_time_ms": 50}
+        )
+        request_b = sample_query_request.model_copy(
+            update={"query": "Write a Rust function to add two numbers"}
+        )
+
+        response_a, response_b = await asyncio.gather(
+            processor.add_request(sample_query_request, provider, "gpt-5"),
+            processor.add_request(request_b, provider, "gpt-5"),
+        )
+
+        provider.generate_batch_responses.assert_awaited_once()
+        provider.generate_response.assert_not_called()
+        assert response_a.response_text == "first"
+        assert response_b.response_text == "second"
+
 
 class TestInferenceEngine:
     @pytest.mark.asyncio
@@ -162,6 +227,8 @@ class TestInferenceEngine:
         assert request.context == "short ctx"
         router.update_model_stats.assert_called_once()
         engine.cache.cache_response.assert_awaited_once()
+        cached_payload = engine.cache.cache_response.await_args.args[1]
+        assert isinstance(cached_payload["timestamp"], str)
 
     @pytest.mark.asyncio
     async def test_process_query_returns_cached_response(

@@ -144,9 +144,7 @@ class KafkaProducerManager:
                 token_count_output=inference_response.token_count_output,
                 latency_ms=inference_response.latency_ms,
                 cost_usd=inference_response.cost_usd,
-                status="success"
-                if not hasattr(inference_response, "error")
-                else "error",
+                status="error" if inference_response.error else "success",
                 error_message=getattr(inference_response, "error", ""),
                 context_compressed=getattr(
                     inference_response, "compressed_context", False

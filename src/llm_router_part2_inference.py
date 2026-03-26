@@ -9,8 +9,8 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Any, AsyncIterator, Union
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Any, AsyncIterator, Union, Tuple
 import hashlib
 
 import httpx
@@ -305,10 +305,38 @@ class ResponseCache:
 
     def generate_cache_key(self, request: QueryRequest, model_name: str) -> str:
         """Generate cache key for request"""
-        key_data = (
-            f"{model_name}:{request.query}:{request.temperature}:{request.max_tokens}"
-        )
-        return hashlib.md5(key_data.encode()).hexdigest()
+        attachment_signatures = []
+        for attachment in request.attachments:
+            attachment_signatures.append(
+                {
+                    "name": attachment.name,
+                    "type": attachment.type.value,
+                    "size_bytes": attachment.size_bytes,
+                    "mime_type": attachment.mime_type,
+                    "url": attachment.url,
+                    "content_sha1": hashlib.sha1(attachment.content).hexdigest()
+                    if attachment.content
+                    else None,
+                }
+            )
+
+        key_payload = {
+            "model_name": model_name,
+            "user_id": request.user_id,
+            "user_tier": request.user_tier.value,
+            "query": request.query,
+            "context": request.context,
+            "max_tokens": request.max_tokens,
+            "temperature": request.temperature,
+            "priority": request.priority,
+            "session_id": request.session_id,
+            "conversation_id": request.conversation_id,
+            "metadata": request.metadata,
+            "attachments": attachment_signatures,
+        }
+        return hashlib.sha256(
+            json.dumps(key_payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
 
 
 class BaseInferenceProvider(ABC):
@@ -341,6 +369,14 @@ class BaseInferenceProvider(ABC):
     def get_health_status(self) -> Dict[str, Any]:
         """Get provider health status"""
         pass
+
+    async def generate_batch_responses(
+        self, requests: List[QueryRequest], model_name: str
+    ) -> List[InferenceResponse]:
+        """Generate responses for a batch of requests."""
+        return await asyncio.gather(
+            *(self.generate_response(request, model_name) for request in requests)
+        )
 
 
 class OpenAIProvider(BaseInferenceProvider):
@@ -675,6 +711,20 @@ class vLLMProvider(BaseInferenceProvider):
 class BatchProcessor:
     """Batch processing for multiple inference requests"""
 
+    @dataclass
+    class CoalescedRequest:
+        request: QueryRequest
+        shared_future: asyncio.Future
+
+    @dataclass
+    class BatchBucket:
+        provider: BaseInferenceProvider
+        model_name: str
+        entries: Dict[str, "BatchProcessor.CoalescedRequest"] = field(
+            default_factory=dict
+        )
+        flush_task: Optional[asyncio.Task] = None
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.enabled = config.get("enabled", True)
@@ -682,7 +732,8 @@ class BatchProcessor:
         self.max_wait_time = (
             config.get("max_wait_time_ms", 50) / 1000
         )  # Convert to seconds
-        self.pending_requests = []
+        self.pending_requests: Dict[Tuple[int, str], BatchProcessor.BatchBucket] = {}
+        self.inflight_requests: Dict[Tuple[int, str, str], asyncio.Future] = {}
         self.batch_lock = asyncio.Lock()
 
     async def add_request(
@@ -692,9 +743,159 @@ class BatchProcessor:
         if not self.enabled:
             return await provider.generate_response(request, model_name)
 
-        # For now, implement simple batching logic
-        # In production, implement more sophisticated batching based on model compatibility
-        return await provider.generate_response(request, model_name)
+        loop = asyncio.get_running_loop()
+        bucket_key = (id(provider), model_name)
+        coalesce_key = self._build_coalesce_key(request, model_name)
+        inflight_key = (id(provider), model_name, coalesce_key)
+
+        async with self.batch_lock:
+            shared_future = self.inflight_requests.get(inflight_key)
+            if shared_future is None:
+                bucket = self.pending_requests.get(bucket_key)
+                if bucket is None:
+                    bucket = self.BatchBucket(provider=provider, model_name=model_name)
+                    self.pending_requests[bucket_key] = bucket
+
+                entry = bucket.entries.get(coalesce_key)
+                if entry is None:
+                    entry = self.CoalescedRequest(
+                        request=request.model_copy(deep=True),
+                        shared_future=loop.create_future(),
+                    )
+                    bucket.entries[coalesce_key] = entry
+                shared_future = entry.shared_future
+
+                if len(bucket.entries) >= self.max_batch_size:
+                    self._schedule_flush_locked(bucket_key, bucket, immediate=True)
+                elif bucket.flush_task is None or bucket.flush_task.done():
+                    self._schedule_flush_locked(bucket_key, bucket, immediate=False)
+
+        response = await shared_future
+        return response.model_copy(deep=True)
+
+    def _schedule_flush_locked(
+        self, bucket_key: Tuple[int, str], bucket: "BatchProcessor.BatchBucket",
+        immediate: bool
+    ):
+        """Schedule a batch flush for a bucket."""
+        if bucket.flush_task and not bucket.flush_task.done():
+            if immediate:
+                bucket.flush_task.cancel()
+            else:
+                return
+
+        if immediate:
+            bucket.flush_task = asyncio.create_task(self._flush_bucket(bucket_key))
+        else:
+            bucket.flush_task = asyncio.create_task(self._delayed_flush(bucket_key))
+
+    async def _delayed_flush(self, bucket_key: Tuple[int, str]):
+        """Flush a bucket after the configured wait time."""
+        try:
+            await asyncio.sleep(self.max_wait_time)
+            await self._flush_bucket(bucket_key)
+        except asyncio.CancelledError:
+            return
+
+    async def _flush_bucket(self, bucket_key: Tuple[int, str]):
+        """Flush a coalesced batch to the provider."""
+        async with self.batch_lock:
+            bucket = self.pending_requests.pop(bucket_key, None)
+            if bucket is None or not bucket.entries:
+                return
+
+            current_task = asyncio.current_task()
+            if (
+                bucket.flush_task
+                and bucket.flush_task is not current_task
+                and not bucket.flush_task.done()
+            ):
+                bucket.flush_task.cancel()
+            bucket.flush_task = None
+            entry_items = list(bucket.entries.items())
+            inflight_keys = []
+            for coalesce_key, entry in entry_items:
+                inflight_key = (id(bucket.provider), bucket.model_name, coalesce_key)
+                self.inflight_requests[inflight_key] = entry.shared_future
+                inflight_keys.append(inflight_key)
+
+        try:
+            entries = [entry for _, entry in entry_items]
+            requests = [entry.request for entry in entries]
+            if len(requests) == 1:
+                responses = [
+                    await bucket.provider.generate_response(
+                        requests[0], bucket.model_name
+                    )
+                ]
+            else:
+                responses = await bucket.provider.generate_batch_responses(
+                    requests, bucket.model_name
+                )
+
+            if len(responses) != len(entries):
+                raise ValueError("Batch provider returned an unexpected response count")
+
+            for entry, response in zip(entries, responses):
+                if entry.shared_future.done():
+                    continue
+                entry.shared_future.set_result(response)
+        except Exception as exc:
+            for entry in entries:
+                if entry.shared_future.done():
+                    continue
+                entry.shared_future.set_exception(exc)
+        finally:
+            async with self.batch_lock:
+                for inflight_key in inflight_keys:
+                    self.inflight_requests.pop(inflight_key, None)
+
+    def _build_coalesce_key(self, request: QueryRequest, model_name: str) -> str:
+        """Build a stable signature for in-flight request coalescing."""
+        attachment_signatures = []
+        for attachment in request.attachments:
+            attachment_signatures.append(
+                {
+                    "name": attachment.name,
+                    "type": attachment.type.value,
+                    "size_bytes": attachment.size_bytes,
+                    "mime_type": attachment.mime_type,
+                    "url": attachment.url,
+                    "content_sha1": hashlib.sha1(attachment.content).hexdigest()
+                    if attachment.content
+                    else None,
+                }
+            )
+
+        payload = {
+            "model_name": model_name,
+            "user_id": request.user_id,
+            "user_tier": request.user_tier.value,
+            "query": request.query,
+            "context": request.context,
+            "max_tokens": request.max_tokens,
+            "temperature": request.temperature,
+            "priority": request.priority,
+            "session_id": request.session_id,
+            "conversation_id": request.conversation_id,
+            "metadata": request.metadata,
+            "attachments": attachment_signatures,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+
+    async def shutdown(self):
+        """Flush pending coalesced requests during shutdown."""
+        async with self.batch_lock:
+            flush_tasks = []
+            for bucket_key, bucket in list(self.pending_requests.items()):
+                if bucket.flush_task and not bucket.flush_task.done():
+                    bucket.flush_task.cancel()
+                flush_tasks.append(asyncio.create_task(self._flush_bucket(bucket_key)))
+
+        if flush_tasks:
+            await asyncio.gather(*flush_tasks, return_exceptions=True)
 
 
 class InferenceEngine:
@@ -791,7 +992,10 @@ class InferenceEngine:
             response.compressed_context = compressed_context
 
             # Step 6: Cache response
-            await self.cache.cache_response(cache_key, response.__dict__)
+            await self.cache.cache_response(
+                cache_key,
+                response.model_dump(mode="json"),
+            )
 
             # Step 7: Update metrics and stats
             inference_time = time.time() - start_time
@@ -902,7 +1106,7 @@ class InferenceEngine:
         stats["total_cost"] += response.cost_usd
         stats["total_time"] += inference_time
 
-        if hasattr(response, "error"):
+        if response.error:
             stats["error_count"] += 1
 
     def get_health_status(self) -> Dict[str, Any]:
@@ -922,6 +1126,8 @@ class InferenceEngine:
     async def shutdown(self):
         """Shutdown the inference engine"""
         logger.info("Shutting down inference engine...")
+
+        await self.batch_processor.shutdown()
 
         # Close HTTP clients
         for provider in self.providers.values():

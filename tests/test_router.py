@@ -45,6 +45,15 @@ class TestRoutingRule:
         )
         assert rule.matches({"query_type": "analysis", "token_count": 128}) is False
 
+    def test_matches_supports_uppercase_logical_operators(self):
+        rule = RoutingRule(
+            condition="query_type == 'analysis' AND token_count > 500",
+            models=["gpt-5"],
+            fallback="gpt-5",
+        )
+
+        assert rule.matches({"query_type": "analysis", "token_count": 800}) is True
+
 
 class TestModelRouter:
     @pytest.mark.asyncio
