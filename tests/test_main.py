@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -73,8 +74,38 @@ class DummyPipeline:
     async def start(self):
         return None
 
+    async def get_query_analytics(self, user_id=None, hours=24):
+        return {
+            "total_queries": 12,
+            "total_tokens": 240,
+            "total_cost": 1.75,
+            "avg_latency": 321.0,
+            "success_rate": 99.0,
+            "model_breakdown": {
+                "gpt-5": {"queries": 7, "cost": 1.25},
+                "mistral-7b": {"queries": 5, "cost": 0.5},
+            },
+            "query_type_breakdown": {"general": 8, "analysis": 4},
+        }
+
+    async def get_model_performance(self, hours=24):
+        return [
+            {
+                "model_name": "gpt-5",
+                "requests": 7,
+                "success_rate": 99.5,
+                "avg_latency_ms": 412.0,
+                "tokens_per_second": 155.0,
+                "error_count": 0,
+                "total_cost": 1.25,
+            }
+        ]
+
     async def shutdown(self):
         return None
+
+    def is_healthy(self):
+        return True
 
 
 class DummyMonitoring:
@@ -89,6 +120,23 @@ class DummyMonitoring:
 
     async def get_system_metrics(self):
         return {"status": "ok"}
+
+    async def get_dashboard_data(self):
+        return {
+            "alert_status": {
+                "recent_alerts": [
+                    {
+                        "rule_name": "high_latency",
+                        "severity": "warning",
+                        "description": "Latency exceeded threshold",
+                        "current_value": 2500,
+                        "threshold": 2000,
+                        "timestamp": "2026-04-04T00:00:00Z",
+                        "trigger_count": 2,
+                    }
+                ]
+            }
+        }
 
     async def shutdown(self):
         return None
@@ -120,7 +168,6 @@ def patched_platform_deps(monkeypatch):
     monkeypatch.setattr(main, "KafkaIngestionPipeline", DummyPipeline)
     monkeypatch.setattr(main, "MonitoringService", DummyMonitoring)
     monkeypatch.setattr(main, "SlackBot", DummySlackBot)
-
 
 class TestPlatformInitialization:
     def test_get_api_worker_count_respects_dev_and_config(self):
@@ -241,3 +288,130 @@ class TestApiApp:
             response = client.get("/metrics")
 
         assert response.status_code == 503
+
+    def test_dashboard_endpoint_returns_live_bundle_without_optional_services(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(tmp_path)
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.get("/dashboard")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["time_window_hours"] == 24
+        assert body["sources"]["analytics"] == "in_memory_metrics"
+        assert body["capabilities"]["pipeline_analytics"] is False
+        assert "overview" in body
+        assert "alerts" in body
+
+    def test_dashboard_endpoint_prefers_pipeline_and_monitoring_data(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(tmp_path)
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        platform.services["pipeline"] = DummyPipeline({})
+        platform.services["monitoring"] = DummyMonitoring({})
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.get("/dashboard", params={"hours": 6})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["time_window_hours"] == 6
+        assert body["sources"]["analytics"] == "clickhouse"
+        assert body["sources"]["model_performance"] == "clickhouse"
+        assert body["capabilities"]["pipeline_analytics"] is True
+        assert body["analytics"]["query_type_breakdown"]["general"] == 8
+        assert body["model_performance"][0]["model_name"] == "gpt-5"
+        assert any(
+            alert["source"] == "monitoring_service" for alert in body["alerts"]
+        )
+
+    def test_dashboard_logs_endpoint_reads_structured_logs(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(tmp_path)
+        log_path = tmp_path / "llm_router.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "timestamp": "2026-04-04T10:00:00Z",
+                            "level": "INFO",
+                            "logger": "service.router",
+                            "message": "Routing completed",
+                            "request_id": "req-1",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "timestamp": "2026-04-04T10:01:00Z",
+                            "level": "ERROR",
+                            "logger": "service.pipeline",
+                            "message": "Batch insert failed",
+                            "request_id": "req-2",
+                        }
+                    ),
+                ]
+            )
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.get(
+                "/dashboard/logs",
+                params={"level": "ERROR", "component": "pipeline", "limit": 10},
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["count"] == 1
+        assert body["logs"][0]["component"] == "pipeline"
+        assert body["logs"][0]["request_id"] == "req-2"
+
+    def test_dashboard_logs_endpoint_returns_recent_logs_without_filters(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(tmp_path)
+        log_path = tmp_path / "llm_router.log"
+        log_path.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "timestamp": "2026-04-04T10:00:00Z",
+                            "level": "INFO",
+                            "logger": "service.router",
+                            "message": "Routing completed",
+                            "request_id": "req-1",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "timestamp": "2026-04-04T10:01:00Z",
+                            "level": "ERROR",
+                            "logger": "service.pipeline",
+                            "message": "Batch insert failed",
+                            "request_id": "req-2",
+                        }
+                    ),
+                ]
+            )
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.get("/dashboard/logs", params={"limit": 10})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["count"] == 2
+        assert body["logs"][0]["request_id"] == "req-2"
+        assert body["logs"][1]["request_id"] == "req-1"
