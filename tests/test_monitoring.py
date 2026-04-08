@@ -6,6 +6,8 @@ import pytest
 from src.llm_router_part4_monitor import (
     AlertManager,
     AlertRule,
+    MetricsCollector,
+    MonitoringService,
     SystemHealth,
     SystemMonitor,
 )
@@ -125,3 +127,86 @@ class TestAlertManager:
         assert len(calls) == 1
         assert len(manager.alert_history) == 1
         assert manager.alert_history[0]["rule_name"] == "high_error_rate"
+
+    @pytest.mark.asyncio
+    async def test_record_external_alert_preserves_stream_payload(self):
+        manager = AlertManager({})
+        calls = []
+
+        class Handler:
+            async def send_alert(self, payload):
+                calls.append(payload)
+
+        manager.notification_handlers = {"test": Handler()}
+
+        await manager.record_external_alert(
+            {
+                "alert_type": "anomaly_detected",
+                "anomaly_type": "high_latency",
+                "severity": "warning",
+                "description": "Latency above baseline",
+                "model_name": "mistral-7b",
+                "provider": "vllm",
+                "emitted_at": "2026-04-08T12:00:00Z",
+                "metrics": {"avg_latency_ms": 720.0},
+            }
+        )
+
+        assert len(manager.alert_history) == 1
+        assert manager.alert_history[0]["rule_name"] == "high_latency"
+        assert manager.alert_history[0]["current_value"] == 720.0
+        assert calls[0]["model_name"] == "mistral-7b"
+
+
+class TestMetricsCollector:
+    def test_record_stream_model_metrics_updates_summary(self):
+        collector = MetricsCollector({"stream_metrics_staleness_seconds": 300})
+        collector.record_stream_model_metrics(
+            {
+                "event_type": "analytics.model_metrics_1m",
+                "emitted_at": datetime.now().isoformat(),
+                "model_name": "gpt-5",
+                "provider": "openai",
+                "request_count": 4,
+                "error_count": 1,
+                "avg_latency_ms": 250.0,
+                "queries_per_second": 0.2,
+                "cache_hit_rate": 0.5,
+                "cached_count": 2,
+                "window_end_ms": 1_710_000_060_000,
+            }
+        )
+
+        summary = collector.get_stream_metrics_summary(hours=1)
+
+        assert summary["request_count"] == 4
+        assert summary["error_rate"] == pytest.approx(0.25)
+        assert summary["models"]["gpt-5"]["avg_latency_ms"] == 250.0
+        assert summary["sample_count"] == 1
+
+
+class TestMonitoringService:
+    @pytest.mark.asyncio
+    async def test_dashboard_data_includes_stream_analytics(self):
+        service = MonitoringService({"stream_metrics_staleness_seconds": 300})
+        await service.initialize()
+        await service.ingest_stream_model_metrics(
+            {
+                "event_type": "analytics.model_metrics_1m",
+                "emitted_at": datetime.now().isoformat(),
+                "model_name": "gpt-5",
+                "provider": "openai",
+                "request_count": 3,
+                "error_count": 0,
+                "avg_latency_ms": 140.0,
+                "queries_per_second": 0.05,
+                "cache_hit_rate": 0.0,
+                "cached_count": 0,
+                "window_end_ms": 1_710_000_060_000,
+            }
+        )
+
+        dashboard = await service.get_dashboard_data()
+
+        assert dashboard["stream_analytics"]["models"]["gpt-5"]["request_count"] == 3
+        assert dashboard["current_metrics"]["streaming"]["request_count"] == 3

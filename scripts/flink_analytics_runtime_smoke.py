@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Runtime smoke test for Kafka -> Flink -> Kafka using Dockerized Flink.
+Runtime smoke test for inference.completed -> analytics.model_metrics_1m using Dockerized Flink.
 """
 
 import argparse
@@ -32,15 +32,13 @@ def run_compose(args):
 
 
 def create_topics(
-    requests_raw_topic: str,
-    requests_enriched_topic: str,
-    fast_lane_hints_topic: str,
+    inference_completed_topic: str,
+    analytics_metrics_topic: str,
     alerts_topic: str,
 ):
     for topic in (
-        requests_raw_topic,
-        requests_enriched_topic,
-        fast_lane_hints_topic,
+        inference_completed_topic,
+        analytics_metrics_topic,
         alerts_topic,
     ):
         run_compose(
@@ -76,7 +74,7 @@ def submit_flink_job(config: dict) -> str:
             "run",
             "-d",
             "-py",
-            "/workspace/flink/job.py",
+            "/workspace/flink/analytics_job.py",
         ]
     )
     for line in result.stdout.splitlines():
@@ -89,7 +87,7 @@ def cancel_flink_job(job_id: str):
     run_compose(["exec", "-T", "flink-jobmanager", "flink", "cancel", job_id])
 
 
-async def wait_for_fast_lane_hint(topic: str, group_id: str, timeout: float) -> dict:
+async def wait_for_metrics_event(topic: str, group_id: str, timeout: float) -> dict:
     consumer = AIOKafkaConsumer(
         topic,
         bootstrap_servers="localhost:9092",
@@ -106,14 +104,16 @@ async def wait_for_fast_lane_hint(topic: str, group_id: str, timeout: float) -> 
             for records in batch.values():
                 for record in records:
                     value = record.value
-                    if value.get("hint_type") == "fast_lane_candidate":
+                    if value.get("event_type") == "analytics.model_metrics_1m":
                         return value
-        raise TimeoutError(f"Timed out waiting for fast-lane hint on topic {topic}")
+        raise TimeoutError(
+            f"Timed out waiting for analytics.model_metrics_1m event on topic {topic}"
+        )
     finally:
         await consumer.stop()
 
 
-async def produce_query(topic: str, suffix: str):
+async def produce_completion_events(topic: str, suffix: str):
     producer = AIOKafkaProducer(
         bootstrap_servers="localhost:9092",
         value_serializer=lambda data: json.dumps(data).encode("utf-8"),
@@ -122,74 +122,74 @@ async def produce_query(topic: str, suffix: str):
     )
     await producer.start()
     try:
-        request_id = f"flink-runtime-{suffix}"
-        await producer.send_and_wait(
-            topic,
-            key=request_id,
-            value={
-                "event_type": "requests.raw",
-                "event_version": "1.0",
-                "emitted_at": "2026-03-13T12:00:00+00:00",
-                "request_id": request_id,
-                "query_id": request_id,
-                "request_timestamp": "2026-03-13T12:00:00+00:00",
-                "user_id": "runtime-user",
-                "user_tier": "free",
-                "query_text": "Critical production outage, respond ASAP",
-                "max_tokens": 256,
-                "temperature": 0.2,
-                "attachments_count": 0,
-                "metadata": {"source": "runtime_smoke"},
-            },
-        )
+        for index in range(3):
+            request_id = f"analytics-runtime-{suffix}-{index}"
+            await producer.send_and_wait(
+                topic,
+                key=request_id,
+                value={
+                    "event_type": "inference.completed",
+                    "event_version": "1.0",
+                    "emitted_at": "2026-04-08T12:00:00+00:00",
+                    "request_id": request_id,
+                    "query_id": request_id,
+                    "user_id": "runtime-user",
+                    "user_tier": "free",
+                    "selected_model": "mistral-7b",
+                    "provider": "vllm",
+                    "status": "success",
+                    "latency_ms": 200 + (index * 50),
+                    "token_count_input": 10,
+                    "token_count_output": 20,
+                    "total_tokens": 30,
+                    "tokens_per_second": 100.0 + (index * 10),
+                    "cost_usd": 0.0,
+                    "cached_response": False,
+                },
+            )
     finally:
         await producer.stop()
 
 
 async def run_smoke(timeout_seconds: float):
     suffix = uuid.uuid4().hex[:8]
-    requests_raw_topic = f"flink-runtime-requests-raw-{suffix}"
-    requests_enriched_topic = f"flink-runtime-requests-enriched-{suffix}"
-    fast_lane_hints_topic = f"flink-runtime-fast-lane-hints-{suffix}"
-    alerts_topic = f"flink-runtime-alerts-{suffix}"
-    group_id = f"flink-runtime-group-{suffix}"
+    inference_completed_topic = f"flink-runtime-inference-completed-{suffix}"
+    analytics_metrics_topic = f"flink-runtime-model-metrics-{suffix}"
+    alerts_topic = f"flink-runtime-analytics-alerts-{suffix}"
+    group_id = f"flink-runtime-analytics-group-{suffix}"
     config = {
         "parallelism": 1,
         "checkpoint_interval_ms": 10000,
+        "window_size_seconds": 5,
+        "anomaly_threshold_multiplier": 2.0,
         "kafka": {
             "bootstrap_servers": ["kafka:29092"],
             "consumer_group": group_id,
             "auto_offset_reset": "earliest",
             "topics": {
-                "requests_raw": requests_raw_topic,
-                "requests_enriched": requests_enriched_topic,
-                "fast_lane_hints": fast_lane_hints_topic,
+                "inference_completed": inference_completed_topic,
+                "analytics_model_metrics_1m": analytics_metrics_topic,
                 "alerts": alerts_topic,
             },
         },
     }
 
-    create_topics(
-        requests_raw_topic,
-        requests_enriched_topic,
-        fast_lane_hints_topic,
-        alerts_topic,
-    )
+    create_topics(inference_completed_topic, analytics_metrics_topic, alerts_topic)
     job_id = submit_flink_job(config)
     try:
         await asyncio.sleep(8)
         consumer_task = asyncio.create_task(
-            wait_for_fast_lane_hint(
-                fast_lane_hints_topic,
+            wait_for_metrics_event(
+                analytics_metrics_topic,
                 f"{group_id}-consumer",
                 timeout_seconds,
             )
         )
-        await produce_query(requests_raw_topic, suffix)
+        await produce_completion_events(inference_completed_topic, suffix)
         result = await consumer_task
         print(
-            f"Flink runtime smoke test passed: fast-lane hints topic {fast_lane_hints_topic} "
-            f"received hint for request_id={result.get('request_id')}"
+            f"Flink analytics runtime smoke test passed: metrics topic {analytics_metrics_topic} "
+            f"received aggregate for model={result.get('model_name')}"
         )
     finally:
         cancel_flink_job(job_id)
@@ -197,7 +197,7 @@ async def run_smoke(timeout_seconds: float):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run Kafka -> Flink -> Kafka runtime smoke test"
+        description="Run inference.completed -> analytics.model_metrics_1m smoke test"
     )
     parser.add_argument("--timeout-seconds", type=float, default=45.0)
     return parser.parse_args()

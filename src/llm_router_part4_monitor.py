@@ -36,6 +36,18 @@ from src.utils.metrics import (
 logger = logging.getLogger(__name__)
 
 
+def _parse_event_timestamp(value: Any) -> datetime:
+    """Parse event timestamps emitted by the streaming pipeline."""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            logger.debug(f"Failed to parse event timestamp: {value}")
+    return datetime.now()
+
+
 @dataclass
 class AlertRule:
     """Alert rule configuration"""
@@ -398,18 +410,57 @@ class AlertManager:
             "trigger_count": rule.trigger_count,
         }
 
-        # Add to history
+        self._append_alert_to_history(alert_data)
+        await self._dispatch_alert(alert_data)
+
+    def _append_alert_to_history(self, alert_data: Dict[str, Any]):
+        """Persist an alert in the in-memory alert history."""
         self.alert_history.append(alert_data)
         if len(self.alert_history) > self.max_history_size:
             self.alert_history.pop(0)
 
-        # Send notifications
+    async def _dispatch_alert(self, alert_data: Dict[str, Any]):
+        """Send an alert to all configured notification handlers."""
         for handler_name, handler in self.notification_handlers.items():
             try:
                 await handler.send_alert(alert_data)
-                logger.info(f"Alert sent via {handler_name}: {rule.name}")
+                logger.info(
+                    f"Alert sent via {handler_name}: {alert_data.get('rule_name')}"
+                )
             except Exception as e:
                 logger.error(f"Failed to send alert via {handler_name}: {e}")
+
+    async def record_external_alert(self, alert_data: Dict[str, Any]):
+        """Record and optionally notify on alert events emitted by the stream layer."""
+        metrics = alert_data.get("metrics", {}) if isinstance(alert_data, dict) else {}
+        anomaly_type = alert_data.get("anomaly_type")
+        metric_name = anomaly_type or alert_data.get("alert_type")
+        current_value = None
+
+        if anomaly_type == "high_latency":
+            current_value = metrics.get("avg_latency_ms")
+        elif anomaly_type == "high_volume":
+            current_value = metrics.get("queries_per_second")
+        elif anomaly_type == "high_error_rate":
+            current_value = metrics.get("error_rate")
+
+        normalized_alert = {
+            "rule_name": anomaly_type or alert_data.get("alert_type", "external_alert"),
+            "severity": alert_data.get("severity", "warning"),
+            "description": alert_data.get("description", "External alert"),
+            "threshold": alert_data.get("threshold"),
+            "current_value": current_value,
+            "timestamp": alert_data.get("emitted_at", datetime.now().isoformat()),
+            "trigger_count": 1,
+            "metric_name": metric_name,
+            "alert_type": alert_data.get("alert_type"),
+            "source": "stream_pipeline",
+            "model_name": alert_data.get("model_name"),
+            "provider": alert_data.get("provider"),
+        }
+
+        self._append_alert_to_history(normalized_alert)
+        await self._dispatch_alert(normalized_alert)
 
     def _get_current_value(self, rule: AlertRule, metrics: Dict[str, float]) -> float:
         """Get current value for the metric being alerted on"""
@@ -539,14 +590,24 @@ class MetricsCollector:
         self.collection_interval = config.get("collection_interval", 30)
         self.metrics_history = []
         self.max_history_size = 1000
+        self.stream_metrics_history = []
+        self.latest_stream_metrics_by_model: Dict[str, Dict[str, Any]] = {}
+        self.stream_metrics_staleness_seconds = config.get(
+            "stream_metrics_staleness_seconds", 300
+        )
 
     async def collect_all_metrics(self) -> Dict[str, Any]:
         """Collect metrics from all sources"""
+        system_metrics = await self._collect_system_metrics()
+        application_metrics = await self._collect_application_metrics()
+        business_metrics = await self._collect_business_metrics()
+        streaming_metrics = self._collect_streaming_metrics()
         metrics = {
             "timestamp": datetime.now().isoformat(),
-            "system": await self._collect_system_metrics(),
-            "application": await self._collect_application_metrics(),
-            "business": await self._collect_business_metrics(),
+            "system": system_metrics,
+            "application": application_metrics,
+            "business": business_metrics,
+            "streaming": streaming_metrics,
         }
 
         # Add to history
@@ -583,8 +644,28 @@ class MetricsCollector:
             router_metrics = self._extract_prometheus_metrics(ROUTER_METRICS)
             inference_metrics = self._extract_prometheus_metrics(INFERENCE_METRICS)
             pipeline_metrics = self._extract_prometheus_metrics(PIPELINE_METRICS)
+            streaming_metrics = self._collect_streaming_metrics()
+            application_metrics = {
+                **router_metrics,
+                **inference_metrics,
+                **pipeline_metrics,
+            }
 
-            return {**router_metrics, **inference_metrics, **pipeline_metrics}
+            if streaming_metrics.get("request_count", 0) > 0:
+                application_metrics.update(
+                    {
+                        "avg_latency_ms": streaming_metrics.get("avg_latency_ms", 0.0),
+                        "error_rate": streaming_metrics.get("error_rate", 0.0),
+                        "queries_per_second": streaming_metrics.get(
+                            "queries_per_second", 0.0
+                        ),
+                        "cache_hit_rate": streaming_metrics.get(
+                            "cache_hit_rate", 0.0
+                        ),
+                    }
+                )
+
+            return application_metrics
         except Exception as e:
             logger.error(f"Failed to collect application metrics: {e}")
             return {}
@@ -619,6 +700,101 @@ class MetricsCollector:
             logger.debug(f"Metrics extraction error: {e}")
 
         return extracted
+
+    def record_stream_model_metrics(self, metric_event: Dict[str, Any]):
+        """Store a consumed analytics.model_metrics_1m event for dashboard use."""
+        event = dict(metric_event)
+        event.setdefault("timestamp", event.get("emitted_at", datetime.now().isoformat()))
+        model_name = str(event.get("model_name", "unknown"))
+
+        self.stream_metrics_history.append(event)
+        if len(self.stream_metrics_history) > self.max_history_size:
+            self.stream_metrics_history.pop(0)
+
+        self.latest_stream_metrics_by_model[model_name] = event
+
+    def _recent_stream_metrics(self, hours: int = 1) -> List[Dict[str, Any]]:
+        """Return stream metrics still within the configured freshness window."""
+        cutoff = datetime.now() - timedelta(hours=hours)
+
+        return [
+            metric
+            for metric in self.stream_metrics_history
+            if _parse_event_timestamp(metric.get("timestamp")) >= cutoff
+        ]
+
+    def _fresh_stream_metrics(self) -> List[Dict[str, Any]]:
+        """Return the latest non-stale stream window for each model."""
+        cutoff = datetime.now() - timedelta(seconds=self.stream_metrics_staleness_seconds)
+        return [
+            metric
+            for metric in self.latest_stream_metrics_by_model.values()
+            if _parse_event_timestamp(metric.get("timestamp")) >= cutoff
+        ]
+
+    def _collect_streaming_metrics(self) -> Dict[str, Any]:
+        """Build a lightweight aggregate view from recent Flink model windows."""
+        fresh_metrics = self._fresh_stream_metrics()
+        if not fresh_metrics:
+            return {
+                "models": {},
+                "request_count": 0,
+                "avg_latency_ms": 0.0,
+                "error_rate": 0.0,
+                "queries_per_second": 0.0,
+                "cache_hit_rate": 0.0,
+            }
+
+        total_requests = sum(int(m.get("request_count", 0) or 0) for m in fresh_metrics)
+        total_errors = sum(int(m.get("error_count", 0) or 0) for m in fresh_metrics)
+        total_cached = sum(int(m.get("cached_count", 0) or 0) for m in fresh_metrics)
+        weighted_latency = sum(
+            float(m.get("avg_latency_ms", 0.0) or 0.0)
+            * int(m.get("request_count", 0) or 0)
+            for m in fresh_metrics
+        )
+        total_qps = sum(
+            float(m.get("queries_per_second", 0.0) or 0.0) for m in fresh_metrics
+        )
+
+        latest_models = {}
+        for metric in fresh_metrics:
+            model_name = str(metric.get("model_name", "unknown"))
+            latest_models[model_name] = {
+                "provider": metric.get("provider"),
+                "request_count": int(metric.get("request_count", 0) or 0),
+                "avg_latency_ms": float(metric.get("avg_latency_ms", 0.0) or 0.0),
+                "error_rate": float(metric.get("error_rate", 0.0) or 0.0),
+                "queries_per_second": float(
+                    metric.get("queries_per_second", 0.0) or 0.0
+                ),
+                "cache_hit_rate": float(metric.get("cache_hit_rate", 0.0) or 0.0),
+                "window_end_ms": int(metric.get("window_end_ms", 0) or 0),
+            }
+
+        return {
+            "models": latest_models,
+            "request_count": total_requests,
+            "avg_latency_ms": (
+                weighted_latency / total_requests if total_requests > 0 else 0.0
+            ),
+            "error_rate": (total_errors / total_requests if total_requests > 0 else 0.0),
+            "queries_per_second": total_qps,
+            "cache_hit_rate": (
+                total_cached / total_requests if total_requests > 0 else 0.0
+            ),
+        }
+
+    def get_stream_metrics_summary(self, hours: int = 1) -> Dict[str, Any]:
+        """Expose a dashboard-friendly summary of recent Flink model windows."""
+        recent_metrics = self._recent_stream_metrics(hours=hours)
+        summary = self._collect_streaming_metrics()
+        summary["period_hours"] = hours
+        summary["sample_count"] = len(recent_metrics)
+        summary["total_requests_in_period"] = sum(
+            int(metric.get("request_count", 0) or 0) for metric in recent_metrics
+        )
+        return summary
 
     def get_metrics_summary(self, hours: int = 1) -> Dict[str, Any]:
         """Get metrics summary for the specified time period"""
@@ -921,10 +1097,19 @@ class MonitoringService:
         """Get performance optimization report"""
         return await self.performance_profiler.generate_optimization_report()
 
+    async def ingest_stream_model_metrics(self, metric_event: Dict[str, Any]):
+        """Consume windowed analytics events forwarded by the pipeline."""
+        self.metrics_collector.record_stream_model_metrics(metric_event)
+
+    async def ingest_stream_alert(self, alert_event: Dict[str, Any]):
+        """Consume alert events forwarded by the pipeline."""
+        await self.alert_manager.record_external_alert(alert_event)
+
     async def get_dashboard_data(self) -> Dict[str, Any]:
         """Get data for monitoring dashboard"""
         current_metrics = await self.metrics_collector.collect_all_metrics()
         metrics_summary = self.metrics_collector.get_metrics_summary(hours=1)
+        stream_analytics = self.metrics_collector.get_stream_metrics_summary(hours=1)
         alert_status = self.alert_manager.get_alert_status()
         performance_report = (
             await self.performance_profiler.generate_optimization_report()
@@ -933,6 +1118,7 @@ class MonitoringService:
         return {
             "current_metrics": current_metrics,
             "metrics_summary": metrics_summary,
+            "stream_analytics": stream_analytics,
             "alert_status": alert_status,
             "performance_report": performance_report,
             "timestamp": datetime.now().isoformat(),

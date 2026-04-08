@@ -35,7 +35,8 @@ from prometheus_client import start_http_server
 # Import all our components
 from src.llm_router_part1_router import ModelRouter
 from src.llm_router_part2_inference import InferenceEngine
-from src.llm_router_part3_pipeline import KafkaIngestionPipeline
+from src.llm_router_part3_policy import PolicyMaterializer, RoutingPolicyCache
+from src.llm_router_part3_pipeline import KafkaIngestionPipeline, KafkaProducerManager
 from src.llm_router_part4_monitor import MonitoringService
 from src.utils.logger import setup_logging
 from src.utils.metrics import (
@@ -112,16 +113,46 @@ class LLMRouterPlatform:
         pipeline_config["pipeline"] = dict(self.config.get("pipeline", {}))
         return pipeline_config
 
+    def _build_event_producer_config(self) -> Dict[str, Any]:
+        """Build producer-only Kafka config for API-side event emission."""
+        return dict(self.config.get("kafka", {}))
+
+    def _event_streaming_enabled(self) -> bool:
+        """Return whether request/completion event streaming is enabled."""
+        return self._service_enabled("pipeline") or self._service_enabled("flink")
+
+    def _policy_cache_enabled(self) -> bool:
+        """Return whether Flink routing hints should be materialized into shared cache."""
+        return bool(self.config.get("policy_cache", {}).get("enabled", False))
+
+    def _build_policy_cache_config(self) -> Dict[str, Any]:
+        """Build shared policy cache config."""
+        return dict(self.config.get("policy_cache", {}))
+
     async def _initialize_core_services(self):
         """Initialize the router and inference services required by the API."""
+        if self._event_streaming_enabled():
+            self.services["event_producer"] = KafkaProducerManager(
+                config=self._build_event_producer_config()
+            )
+            await self.services["event_producer"].initialize()
+
+        if self._policy_cache_enabled():
+            self.services["policy_cache"] = RoutingPolicyCache(
+                config=self._build_policy_cache_config()
+            )
+            await self.services["policy_cache"].initialize()
+
         self.services["router"] = ModelRouter(
-            config=self.config.get("router", {})
+            config=self.config.get("router", {}),
+            policy_cache=self.services.get("policy_cache"),
         )
         await self.services["router"].initialize()
 
         self.services["inference"] = InferenceEngine(
             config=self.config.get("inference", {}),
-            router=self.services["router"]
+            router=self.services["router"],
+            event_producer=self.services.get("event_producer"),
         )
         await self.services["inference"].initialize()
 
@@ -132,6 +163,19 @@ class LLMRouterPlatform:
                 config=self._build_pipeline_config()
             )
             await self.services["pipeline"].initialize()
+
+        if self._policy_cache_enabled():
+            if "policy_cache" not in self.services:
+                self.services["policy_cache"] = RoutingPolicyCache(
+                    config=self._build_policy_cache_config()
+                )
+                await self.services["policy_cache"].initialize()
+
+            self.services["policy_materializer"] = PolicyMaterializer(
+                kafka_config=dict(self.config.get("kafka", {})),
+                policy_cache=self.services["policy_cache"],
+            )
+            await self.services["policy_materializer"].initialize()
 
         if self._service_enabled("monitoring"):
             self.services["monitoring"] = MonitoringService(
@@ -145,6 +189,18 @@ class LLMRouterPlatform:
                 inference_engine=self.services["inference"]
             )
             await self.services["slack_bot"].initialize()
+
+        pipeline_service = self.services.get("pipeline")
+        monitoring_service = self.services.get("monitoring")
+        attach_monitoring = getattr(
+            pipeline_service, "attach_monitoring_service", None
+        )
+        if (
+            pipeline_service is not None
+            and monitoring_service is not None
+            and callable(attach_monitoring)
+        ):
+            attach_monitoring(monitoring_service)
 
     async def _initialize_services(
         self, include_api: bool = True, include_background: bool = True
@@ -187,6 +243,14 @@ class LLMRouterPlatform:
                     asyncio.create_task(
                         self.services["pipeline"].start(),
                         name="kafka_pipeline"
+                    )
+                )
+
+            if "policy_materializer" in self.services:
+                tasks.append(
+                    asyncio.create_task(
+                        self.services["policy_materializer"].start(),
+                        name="policy_materializer",
                     )
                 )
 
@@ -286,6 +350,21 @@ class LLMRouterPlatform:
             "services": service_status,
             "timestamp": time.time(),
         }
+
+    async def _publish_request_raw_event(self, query_request: QueryRequest):
+        """Best-effort publication of pre-inference API events."""
+        producer = self.services.get("event_producer")
+        if producer is None:
+            return
+
+        publish_method = getattr(producer, "produce_request_raw", None)
+        if publish_method is None:
+            return
+
+        try:
+            await publish_method(query_request)
+        except Exception as exc:
+            self.logger.warning(f"Failed to publish requests.raw event: {exc}")
 
     def _iter_metric_samples(self, metric):
         """Iterate over metric children with their label values."""
@@ -410,6 +489,7 @@ class LLMRouterPlatform:
             normalized_models.append(
                 {
                     "model_name": model.get("model_name", "unknown"),
+                    "provider": model.get("provider"),
                     "requests": int(model.get("requests", 0) or 0),
                     "success_rate": model.get("success_rate"),
                     "avg_latency_ms": model.get("avg_latency_ms"),
@@ -514,7 +594,7 @@ class LLMRouterPlatform:
         for alert in alerts:
             normalized.append(
                 {
-                    "source": "monitoring_service",
+                    "source": alert.get("source", "monitoring_service"),
                     "severity": alert.get("severity", "warning"),
                     "title": alert.get("rule_name", "Monitoring alert"),
                     "description": alert.get("description", "Alert triggered"),
@@ -760,6 +840,7 @@ class LLMRouterPlatform:
                 active_requests.labels(endpoint=endpoint).inc()
 
             try:
+                await self._publish_request_raw_event(query_data)
                 result = await self.services["inference"].process_query(query_data)
                 status_code = 502 if result.error else 200
                 return JSONResponse(
