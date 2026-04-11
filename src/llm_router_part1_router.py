@@ -326,10 +326,35 @@ class ModelRouter:
             provider.lower()
             for provider in config.get("fast_lane_providers", ["vllm"])
         ]
+        self.scoring = {
+            "reliability_weight": 40.0,
+            "latency_weight": 20.0,
+            "cost_weight_cap": 20.0,
+            "priority_weight": 2.0,
+            "context_fit_full_weight": 10.0,
+            "context_fit_partial_weight": 5.0,
+            "default_model_bonus": 4.0,
+            "gpt5_default_bonus": 3.0,
+            "sonnet_enterprise_bonus": 12.0,
+            "sonnet_difficult_task_bonus": 10.0,
+            "difficult_task_token_threshold": 50000,
+            "local_simple_task_bonus": 12.0,
+            "simple_task_token_threshold": 1200,
+            "local_simple_task_types": [
+                "general",
+                "summarization",
+                "brainstorming",
+                "planning",
+                "translation",
+                "question_answering",
+            ],
+        }
+        self.scoring.update(dict(config.get("scoring", {})))
 
         # Performance tracking
         self.model_stats: Dict[str, Dict[str, float]] = {}
         self.request_cache: Dict[str, RoutingDecision] = {}
+        self._initialized = False
 
         self._load_models()
         self._load_routing_rules()
@@ -339,7 +364,23 @@ class ModelRouter:
         await self.classifier.initialize()
         if self.policy_cache and hasattr(self.policy_cache, "initialize"):
             await self.policy_cache.initialize()
+        self._initialized = True
         logger.info("Model router initialized successfully")
+
+    def is_healthy(self) -> bool:
+        """Return whether the router is ready to serve traffic."""
+        default_model_loaded = self.default_model in self.models
+        classifier_ready = getattr(self.classifier, "_is_initialized", False)
+        policy_cache_healthy = True
+        if self.policy_cache and hasattr(self.policy_cache, "is_healthy"):
+            policy_cache_healthy = self.policy_cache.is_healthy()
+        return (
+            self._initialized
+            and classifier_ready
+            and bool(self.models)
+            and default_model_loaded
+            and policy_cache_healthy
+        )
 
     def _load_models(self):
         """Load model configurations"""
@@ -406,15 +447,15 @@ class ModelRouter:
 
             return decision
 
-        except Exception as e:
-            logger.error(f"Routing failed: {e}")
+        except Exception:
+            logger.exception("Routing failed")
             # Fallback to default model
             return RoutingDecision(
                 selected_model=self.default_model,
                 query_type=QueryType.GENERAL,
                 token_count=0,
                 estimated_cost=0.0,
-                routing_reason=f"Fallback due to error: {str(e)}",
+                routing_reason="Fallback due to routing error",
                 routing_time_ms=int((time.time() - start_time) * 1000),
                 confidence=0.0,
             )
@@ -614,7 +655,10 @@ class ModelRouter:
         """Check if user tier has access to model"""
         tier_priorities = {"free": 3, "premium": 2, "enterprise": 1}
 
-        user_priority = tier_priorities.get(user_tier, 3)
+        user_tier_value = (
+            user_tier.value if hasattr(user_tier, "value") else str(user_tier)
+        )
+        user_priority = tier_priorities.get(user_tier_value, 3)
         model_priority = model_config.priority
 
         # Lower priority number = higher priority access
@@ -625,46 +669,92 @@ class ModelRouter:
         if not candidates:
             return self.default_model
 
-        scores = {}
-
-        for model_name in candidates:
-            model_config = self.models[model_name]
-            score = 0.0
-
-            # Performance-based scoring
-            model_stats = self.model_stats.get(model_name, {})
-            success_rate = model_stats.get("success_rate", 0.95)
-            avg_latency = model_stats.get("avg_latency", 1000)  # ms
-
-            score += success_rate * 40  # Reliability weight
-            score += max(
-                0, 20 - avg_latency / 100
-            )  # Speed weight (lower latency = higher score)
-
-            # Cost efficiency (inverse relationship)
-            cost_per_token = model_config.cost_per_token
-            if cost_per_token > 0:
-                cost_score = 1 / (cost_per_token * 1000000)  # Normalize
-                score += min(cost_score, 20)  # Cap cost benefit
-            else:
-                score += 20  # Free models get max cost score
-
-            # Priority-based scoring
-            score += (10 - model_config.priority) * 2  # Higher priority = higher score
-
-            # Context length compatibility
-            token_count = context["token_count"]
-            if (
-                token_count <= model_config.max_tokens * 0.8
-            ):  # 80% utilization threshold
-                score += 10
-            elif token_count <= model_config.max_tokens:
-                score += 5
-
-            scores[model_name] = score
+        scores = {
+            model_name: self._score_model(model_name, context)
+            for model_name in candidates
+        }
 
         # Return model with highest score
         return max(candidates, key=lambda x: scores.get(x, 0))
+
+    def _score_model(self, model_name: str, context: Dict[str, Any]) -> float:
+        """Score a single model for the provided routing context."""
+        model_config = self.models[model_name]
+        score = 0.0
+
+        # Performance-based scoring
+        model_stats = self.model_stats.get(model_name, {})
+        success_rate = model_stats.get("success_rate", 0.95)
+        avg_latency = model_stats.get("avg_latency", 1000)  # ms
+
+        score += success_rate * float(self.scoring["reliability_weight"])
+        score += max(
+            0, float(self.scoring["latency_weight"]) - avg_latency / 100
+        )  # Speed weight (lower latency = higher score)
+
+        # Cost efficiency (inverse relationship)
+        cost_per_token = model_config.cost_per_token
+        if cost_per_token > 0:
+            cost_score = 1 / (cost_per_token * 1000000)  # Normalize
+            score += min(cost_score, float(self.scoring["cost_weight_cap"]))
+        else:
+            score += float(self.scoring["cost_weight_cap"])
+
+        # Priority-based scoring
+        score += (10 - model_config.priority) * float(
+            self.scoring["priority_weight"]
+        )
+
+        # Context length compatibility
+        token_count = context["token_count"]
+        if token_count <= model_config.max_tokens * 0.8:
+            score += float(self.scoring["context_fit_full_weight"])
+        elif token_count <= model_config.max_tokens:
+            score += float(self.scoring["context_fit_partial_weight"])
+
+        score += self._contextual_model_bonus(model_name, context)
+        return score
+
+    def _contextual_model_bonus(self, model_name: str, context: Dict[str, Any]) -> float:
+        """Apply model-specific routing bias for default and difficult-task paths."""
+        bonus = 0.0
+        query_type = str(context.get("query_type", "general"))
+        token_count = int(context.get("token_count", 0))
+        has_attachments = bool(context.get("has_attachments", False))
+        user_tier = context.get("user_tier")
+        user_tier_value = (
+            user_tier.value if hasattr(user_tier, "value") else str(user_tier)
+        )
+        difficult_threshold = int(self.scoring["difficult_task_token_threshold"])
+        simple_threshold = int(self.scoring["simple_task_token_threshold"])
+        simple_task_types = {
+            str(query_type_name).lower()
+            for query_type_name in self.scoring.get("local_simple_task_types", [])
+        }
+        model_provider = self.models[model_name].provider.lower()
+
+        if model_name == self.default_model:
+            bonus += float(self.scoring["default_model_bonus"])
+
+        if model_name == "gpt-5" and user_tier_value != "enterprise":
+            if query_type not in {"analysis", "reasoning"} or token_count <= difficult_threshold:
+                bonus += float(self.scoring["gpt5_default_bonus"])
+
+        if model_name == "claude-sonnet-4-6":
+            if user_tier_value == "enterprise":
+                bonus += float(self.scoring["sonnet_enterprise_bonus"])
+            if query_type in {"analysis", "reasoning"} and token_count > difficult_threshold:
+                bonus += float(self.scoring["sonnet_difficult_task_bonus"])
+
+        if (
+            model_provider == "vllm"
+            and query_type in simple_task_types
+            and token_count <= simple_threshold
+            and not has_attachments
+        ):
+            bonus += float(self.scoring["local_simple_task_bonus"])
+
+        return bonus
 
     def _round_robin_routing(self, context: Dict[str, Any]) -> ModelSelection:
         """Simple round-robin model selection"""

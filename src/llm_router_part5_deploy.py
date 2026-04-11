@@ -244,8 +244,11 @@ services:
     image: vllm/vllm-openai:latest
     ports:
       - "8001:8000"
-    environment:
-      - MODEL_NAME=mistralai/Mistral-7B-Instruct-v0.2
+    command:
+      - --model
+      - mistralai/Mistral-7B-Instruct-v0.2
+      - --served-model-name
+      - mistral-7b
     volumes:
       - ./models:/models
     deploy:

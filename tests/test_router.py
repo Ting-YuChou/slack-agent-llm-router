@@ -83,6 +83,7 @@ class TestModelRouter:
         assert router._has_capability(model, "code_generation") is True
         assert router._check_user_access(model, "free") is True
         assert router._check_user_access(model, "enterprise") is True
+        assert router._check_user_access(model, UserTier.ENTERPRISE) is True
 
         router.update_model_stats("mistral-7b", success=True, latency_ms=200)
         router.update_model_stats("mistral-7b", success=False, latency_ms=400)
@@ -104,7 +105,7 @@ class TestModelRouter:
             }
         )
 
-        assert selection.model_name == "mistral-7b"
+        assert selection.model_name == "gpt-5"
         assert "default" in selection.reason.lower()
 
     @pytest.mark.asyncio
@@ -145,7 +146,7 @@ class TestModelRouter:
                 return {
                     "policy_source": "request",
                     "route_to_fast_lane": True,
-                    "preferred_models": ["claude-3.5-sonnet"],
+                    "preferred_models": ["claude-sonnet-4-6"],
                     "hint_reason": "priority=high",
                 }
 
@@ -153,11 +154,11 @@ class TestModelRouter:
             {
                 "default_model": "mistral-7b",
                 "routing_strategy": "intelligent",
-                "fast_lane_models": ["claude-3.5-sonnet"],
+                "fast_lane_models": ["claude-sonnet-4-6"],
                 "models": {
-                    "claude-3.5-sonnet": {
+                    "claude-sonnet-4-6": {
                         "provider": "anthropic",
-                        "max_tokens": 200000,
+                        "max_tokens": 1000000,
                         "cost_per_token": 0.000015,
                         "priority": 2,
                         "capabilities": ["reasoning", "writing", "analysis"],
@@ -179,7 +180,7 @@ class TestModelRouter:
         )
         router.classifier.classify_query = lambda _query: (QueryType.ANALYSIS, 0.95)
         router.token_counter.count_tokens = lambda _query, _model="default": 256
-        router.model_stats["claude-3.5-sonnet"] = {
+        router.model_stats["claude-sonnet-4-6"] = {
             "success_rate": 0.99,
             "avg_latency": 700,
         }
@@ -192,5 +193,199 @@ class TestModelRouter:
 
         decision = await router.route_query(request)
 
-        assert decision.selected_model == "claude-3.5-sonnet"
+        assert decision.selected_model == "claude-sonnet-4-6"
         assert "Policy-cache selection" in decision.routing_reason
+
+    @pytest.mark.asyncio
+    async def test_route_query_prefers_local_model_for_simple_general_queries(self):
+        router = ModelRouter(
+            {
+                "default_model": "gpt-5",
+                "routing_strategy": "intelligent",
+                "models": {
+                    "gpt-5": {
+                        "provider": "openai",
+                        "max_tokens": 128000,
+                        "cost_per_token": 0.00003,
+                        "priority": 2,
+                        "capabilities": ["general", "reasoning", "coding", "analysis"],
+                        "api_key_env": "OPENAI_API_KEY",
+                    },
+                    "claude-sonnet-4-6": {
+                        "provider": "anthropic",
+                        "max_tokens": 1000000,
+                        "cost_per_token": 0.000015,
+                        "priority": 1,
+                        "capabilities": ["reasoning", "writing", "analysis"],
+                        "api_key_env": "ANTHROPIC_API_KEY",
+                    },
+                    "mistral-7b": {
+                        "provider": "vllm",
+                        "model_path": "/models/mistral",
+                        "max_tokens": 4096,
+                        "cost_per_token": 0.0,
+                        "priority": 3,
+                        "capabilities": ["general", "coding"],
+                        "gpu_memory_gb": 16,
+                    },
+                },
+                "routing_rules": [],
+            }
+        )
+        router.classifier.classify_query = lambda _query: (QueryType.GENERAL, 0.9)
+        router.token_counter.count_tokens = lambda _query, _model="default": 400
+
+        request = QueryRequest(
+            query="Summarize the meeting notes",
+            user_id="premium-user",
+            user_tier=UserTier.PREMIUM,
+        )
+
+        decision = await router.route_query(request)
+
+        assert decision.selected_model == "mistral-7b"
+        assert "Capability-based selection" in decision.routing_reason
+
+    @pytest.mark.asyncio
+    async def test_route_query_prefers_sonnet_for_heavy_analysis_and_enterprise(self):
+        router = ModelRouter(
+            {
+                "default_model": "gpt-5",
+                "routing_strategy": "intelligent",
+                "models": {
+                    "gpt-5": {
+                        "provider": "openai",
+                        "max_tokens": 128000,
+                        "cost_per_token": 0.00003,
+                        "priority": 2,
+                        "capabilities": ["general", "reasoning", "coding", "analysis"],
+                        "api_key_env": "OPENAI_API_KEY",
+                    },
+                    "claude-sonnet-4-6": {
+                        "provider": "anthropic",
+                        "max_tokens": 1000000,
+                        "cost_per_token": 0.000015,
+                        "priority": 1,
+                        "capabilities": ["general", "reasoning", "writing", "analysis"],
+                        "api_key_env": "ANTHROPIC_API_KEY",
+                    },
+                },
+                "routing_rules": [
+                    {
+                        "condition": "user_tier == 'enterprise'",
+                        "models": ["claude-sonnet-4-6", "gpt-5"],
+                        "fallback": "claude-sonnet-4-6",
+                    },
+                    {
+                        "condition": "query_type == 'analysis' AND token_count > 50000",
+                        "models": ["claude-sonnet-4-6", "gpt-5"],
+                        "fallback": "claude-sonnet-4-6",
+                    },
+                ],
+            }
+        )
+        router.classifier.classify_query = lambda _query: (QueryType.ANALYSIS, 0.95)
+        router.token_counter.count_tokens = lambda _query, _model="default": 60000
+
+        heavy_analysis_request = QueryRequest(
+            query="Analyze this large incident dataset",
+            user_id="premium-user",
+            user_tier=UserTier.PREMIUM,
+        )
+        enterprise_request = QueryRequest(
+            query="Review this enterprise architecture proposal",
+            user_id="enterprise-user",
+            user_tier=UserTier.ENTERPRISE,
+        )
+
+        heavy_analysis_decision = await router.route_query(heavy_analysis_request)
+        enterprise_decision = await router.route_query(enterprise_request)
+
+        assert heavy_analysis_decision.selected_model == "claude-sonnet-4-6"
+        assert enterprise_decision.selected_model == "claude-sonnet-4-6"
+
+    def test_select_best_model_applies_gpt5_default_bonus(self):
+        router = ModelRouter(
+            {
+                "default_model": "gpt-5",
+                "routing_strategy": "intelligent",
+                "models": {
+                    "gpt-5": {
+                        "provider": "openai",
+                        "max_tokens": 128000,
+                        "cost_per_token": 0.00003,
+                        "priority": 2,
+                        "capabilities": ["general", "reasoning", "coding", "analysis"],
+                        "api_key_env": "OPENAI_API_KEY",
+                    },
+                    "claude-sonnet-4-6": {
+                        "provider": "anthropic",
+                        "max_tokens": 1000000,
+                        "cost_per_token": 0.000015,
+                        "priority": 1,
+                        "capabilities": ["general", "reasoning", "writing", "analysis"],
+                        "api_key_env": "ANTHROPIC_API_KEY",
+                    },
+                },
+                "routing_rules": [],
+            }
+        )
+        router.model_stats["gpt-5"] = {"success_rate": 0.98, "avg_latency": 600}
+        router.model_stats["claude-sonnet-4-6"] = {
+            "success_rate": 0.98,
+            "avg_latency": 600,
+        }
+
+        selected_model = router._select_best_model(
+            ["gpt-5", "claude-sonnet-4-6"],
+            {
+                "query_type": "general",
+                "token_count": 512,
+                "user_tier": "premium",
+            },
+        )
+
+        assert selected_model == "gpt-5"
+
+    def test_select_best_model_applies_sonnet_bonus_for_enterprise_difficult_tasks(self):
+        router = ModelRouter(
+            {
+                "default_model": "gpt-5",
+                "routing_strategy": "intelligent",
+                "models": {
+                    "gpt-5": {
+                        "provider": "openai",
+                        "max_tokens": 128000,
+                        "cost_per_token": 0.00003,
+                        "priority": 2,
+                        "capabilities": ["general", "reasoning", "coding", "analysis"],
+                        "api_key_env": "OPENAI_API_KEY",
+                    },
+                    "claude-sonnet-4-6": {
+                        "provider": "anthropic",
+                        "max_tokens": 1000000,
+                        "cost_per_token": 0.000015,
+                        "priority": 1,
+                        "capabilities": ["reasoning", "writing", "analysis"],
+                        "api_key_env": "ANTHROPIC_API_KEY",
+                    },
+                },
+                "routing_rules": [],
+            }
+        )
+        router.model_stats["gpt-5"] = {"success_rate": 0.99, "avg_latency": 450}
+        router.model_stats["claude-sonnet-4-6"] = {
+            "success_rate": 0.98,
+            "avg_latency": 650,
+        }
+
+        selected_model = router._select_best_model(
+            ["gpt-5", "claude-sonnet-4-6"],
+            {
+                "query_type": "analysis",
+                "token_count": 60000,
+                "user_tier": UserTier.ENTERPRISE,
+            },
+        )
+
+        assert selected_model == "claude-sonnet-4-6"

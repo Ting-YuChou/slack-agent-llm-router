@@ -16,6 +16,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import secrets
 import signal
 import sys
 import time
@@ -27,9 +28,11 @@ from typing import Any, Dict, List, Optional
 import click
 import uvicorn
 import yaml
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 from prometheus_client import start_http_server
 
 # Import all our components
@@ -38,19 +41,24 @@ from src.llm_router_part2_inference import InferenceEngine
 from src.llm_router_part3_policy import PolicyMaterializer, RoutingPolicyCache
 from src.llm_router_part3_pipeline import KafkaIngestionPipeline, KafkaProducerManager
 from src.llm_router_part4_monitor import MonitoringService
-from src.utils.logger import setup_logging
+from src.utils.logger import security_logger, setup_logging
 from src.utils.metrics import (
     INFERENCE_METRICS,
     ROUTER_METRICS,
     SYSTEM_METRICS,
     USER_METRICS,
+    histogram_average,
+    sum_metric_by_label,
+    sum_metric_values,
 )
-from src.utils.schema import QueryRequest
+from src.utils.schema import PlatformConfig, QueryRequest
 from slack.bot import SlackBot
 
 
 DEFAULT_CONFIG_PATH = "config/config.yaml"
 CONFIG_ENV_VAR = "LLM_ROUTER_CONFIG"
+DEFAULT_API_KEY_ENV_VAR = "LLM_ROUTER_API_KEYS"
+PUBLIC_ENDPOINTS = {"/live", "/ready", "/health"}
 
 
 def resolve_config_path(config_path: Optional[str] = None) -> str:
@@ -87,12 +95,15 @@ class LLMRouterPlatform:
             log_file=self.config.get("logging", {}).get("file", "logs/llm_router.log")
         )
         self.logger = logging.getLogger(__name__)
+        self._log_configuration_warnings()
 
     def _load_config(self) -> Dict:
         """Load configuration from YAML file"""
         try:
-            with open(self.config_path, 'r') as f:
-                return yaml.safe_load(f)
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                raw_config = yaml.safe_load(f) or {}
+            validated = PlatformConfig.model_validate(raw_config)
+            return validated.model_dump(mode="json")
         except FileNotFoundError:
             logging.getLogger(__name__).error(
                 f"Configuration file not found: {self.config_path}"
@@ -101,6 +112,52 @@ class LLMRouterPlatform:
         except yaml.YAMLError as e:
             logging.getLogger(__name__).error(f"Error parsing configuration: {e}")
             sys.exit(1)
+        except ValidationError as e:
+            logging.getLogger(__name__).error(
+                "Invalid configuration in %s: %s", self.config_path, e
+            )
+            sys.exit(1)
+
+    def _log_configuration_warnings(self):
+        """Log high-risk runtime configuration warnings."""
+        security_config = self._security_config()
+        cors_config = dict(security_config.get("cors", {}))
+        clickhouse_config = dict(self.config.get("clickhouse", {}))
+        monitoring_config = dict(self.config.get("monitoring", {}))
+        slack_config = dict(self.config.get("slack", {}))
+
+        if cors_config.get("enabled", False) and cors_config.get("allow_origins") == ["*"]:
+            self.logger.warning(
+                "CORS is configured with a wildcard origin; restrict allow_origins before production rollout."
+            )
+
+        if self._api_key_auth_enabled() and not self._configured_api_keys():
+            self.logger.warning(
+                "API key authentication is enabled but no keys were loaded from %s.",
+                self._api_key_env_var_name(),
+            )
+
+        if clickhouse_config.get("enabled", False) and clickhouse_config.get(
+            "password", ""
+        ) in {"", "llm_router_pass"}:
+            self.logger.warning(
+                "ClickHouse is enabled with an empty or default password; move credentials to a secret-backed environment."
+            )
+
+        grafana_password = (
+            monitoring_config.get("grafana", {}) or {}
+        ).get("admin_password")
+        if monitoring_config.get("enabled", False) and grafana_password == "admin":
+            self.logger.warning(
+                "Monitoring is enabled with the default Grafana admin password."
+            )
+
+        if slack_config.get("enabled", False) and slack_config.get(
+            "state_backend", "memory"
+        ) == "memory":
+            self.logger.warning(
+                "Slack bot state is configured for in-memory storage; this is not horizontally scalable."
+            )
 
     def _service_enabled(self, section: str) -> bool:
         """Return whether a top-level config section is enabled."""
@@ -186,7 +243,8 @@ class LLMRouterPlatform:
         if self._service_enabled("slack"):
             self.services["slack_bot"] = SlackBot(
                 config=self.config.get("slack", {}),
-                inference_engine=self.services["inference"]
+                inference_engine=self.services["inference"],
+                services=self.services,
             )
             await self.services["slack_bot"].initialize()
 
@@ -335,6 +393,70 @@ class LLMRouterPlatform:
                     error_type=error_type,
                 ).inc()
 
+    def _security_config(self) -> Dict[str, Any]:
+        """Return security configuration."""
+        return dict(self.config.get("security", {}))
+
+    def _api_keys_config(self) -> Dict[str, Any]:
+        """Return API key authentication config."""
+        return dict(self._security_config().get("api_keys", {}))
+
+    def _api_key_auth_enabled(self) -> bool:
+        """Return whether API key auth is enabled."""
+        return bool(self._api_keys_config().get("enabled", False))
+
+    def _api_key_header_name(self) -> str:
+        """Return the configured API key header name."""
+        return str(self._api_keys_config().get("header_name", "X-API-Key"))
+
+    def _api_key_env_var_name(self) -> str:
+        """Return the environment variable containing accepted API keys."""
+        return str(self._api_keys_config().get("env_var", DEFAULT_API_KEY_ENV_VAR))
+
+    def _configured_api_keys(self) -> List[str]:
+        """Load accepted API keys from the configured environment variable."""
+        raw_value = os.getenv(self._api_key_env_var_name(), "")
+        normalized = raw_value.replace("\n", ",")
+        return [key.strip() for key in normalized.split(",") if key.strip()]
+
+    def _api_key_auth_configured(self) -> bool:
+        """Return whether auth is either disabled or fully configured."""
+        return not self._api_key_auth_enabled() or bool(self._configured_api_keys())
+
+    def _request_path_is_public(self, path: str) -> bool:
+        """Return whether the request path is publicly accessible."""
+        return path in PUBLIC_ENDPOINTS
+
+    def _extract_api_key(self, request: Request) -> Optional[str]:
+        """Extract an API key from supported request headers."""
+        header_name = self._api_key_header_name()
+        header_value = request.headers.get(header_name)
+        if header_value:
+            return header_value.strip()
+
+        authorization = request.headers.get("Authorization", "")
+        if authorization.lower().startswith("bearer "):
+            return authorization[7:].strip()
+
+        return None
+
+    def _is_valid_api_key(self, provided_key: Optional[str]) -> bool:
+        """Return whether the provided API key matches a configured key."""
+        if not provided_key:
+            return False
+
+        for expected_key in self._configured_api_keys():
+            if secrets.compare_digest(provided_key, expected_key):
+                return True
+        return False
+
+    def _build_liveness_payload(self) -> Dict[str, Any]:
+        """Build process liveness payload."""
+        return {
+            "status": "live",
+            "timestamp": time.time(),
+        }
+
     def _get_service_status(self) -> Dict[str, bool]:
         """Return health status for initialized services."""
         service_status = {}
@@ -342,14 +464,43 @@ class LLMRouterPlatform:
             service_status[name] = getattr(service, "is_healthy", lambda: True)()
         return service_status
 
-    def _build_health_payload(self) -> Dict[str, Any]:
-        """Build health response payload."""
+    def _build_readiness_payload(self) -> Dict[str, Any]:
+        """Build readiness response payload."""
         service_status = self._get_service_status()
+        required_services = ["router", "inference"]
+        missing_services = [
+            service_name
+            for service_name in required_services
+            if service_name not in self.services
+        ]
+        unhealthy_services = [
+            service_name
+            for service_name in required_services
+            if service_name in service_status and not service_status[service_name]
+        ]
+        api_key_auth_configured = self._api_key_auth_configured()
+        ready = (
+            not missing_services
+            and not unhealthy_services
+            and api_key_auth_configured
+        )
         return {
-            "status": "healthy" if all(service_status.values()) else "unhealthy",
+            "status": "ready" if ready else "not_ready",
             "services": service_status,
+            "required_services": required_services,
+            "missing_services": missing_services,
+            "unhealthy_services": unhealthy_services,
+            "security": {
+                "api_key_auth_enabled": self._api_key_auth_enabled(),
+                "api_key_header_name": self._api_key_header_name(),
+                "api_keys_configured": api_key_auth_configured,
+            },
             "timestamp": time.time(),
         }
+
+    def _build_health_payload(self) -> Dict[str, Any]:
+        """Build backward-compatible health payload."""
+        return self._build_readiness_payload()
 
     async def _publish_request_raw_event(self, query_request: QueryRequest):
         """Best-effort publication of pre-inference API events."""
@@ -366,59 +517,21 @@ class LLMRouterPlatform:
         except Exception as exc:
             self.logger.warning(f"Failed to publish requests.raw event: {exc}")
 
-    def _iter_metric_samples(self, metric):
-        """Iterate over metric children with their label values."""
-        if metric is None:
-            return
-
-        label_names = tuple(getattr(metric, "_labelnames", ()) or ())
-        metric_children = getattr(metric, "_metrics", None)
-
-        if metric_children:
-            for label_values, child in metric_children.items():
-                if not isinstance(label_values, tuple):
-                    label_values = (label_values,)
-                yield dict(zip(label_names, label_values)), child
-            return
-
-        if hasattr(metric, "_value"):
-            yield {}, metric
-
-    def _child_value(self, child, attr_name: str = "_value") -> float:
-        """Safely read a numeric Prometheus child metric value."""
-        if child is None:
-            return 0.0
-
-        value_holder = getattr(child, attr_name, None)
-        raw_value = getattr(value_holder, "_value", 0.0)
-        try:
-            return float(raw_value)
-        except (TypeError, ValueError):
-            return 0.0
-
     def _sum_metric_values(self, metric) -> float:
-        """Sum all child values for a metric."""
-        total = 0.0
-        for _labels, child in self._iter_metric_samples(metric) or []:
-            total += self._child_value(child)
-        return total
+        """Sum all collected values for a counter or gauge metric."""
+        return sum_metric_values(metric)
 
     def _histogram_average(self, histogram) -> float:
-        """Compute histogram average across all labeled children."""
-        total_sum = 0.0
-        total_count = 0.0
-        for _labels, child in self._iter_metric_samples(histogram) or []:
-            total_sum += self._child_value(child, "_sum")
-            total_count += self._child_value(child, "_count")
-        return total_sum / total_count if total_count > 0 else 0.0
+        """Compute histogram average using collected public samples."""
+        return histogram_average(histogram)
 
     def _sum_metric_by_label(self, metric, label_name: str) -> Dict[str, float]:
-        """Aggregate a metric by label value."""
-        totals: Dict[str, float] = {}
-        for labels, child in self._iter_metric_samples(metric) or []:
-            label_value = labels.get(label_name, "unknown")
-            totals[label_value] = totals.get(label_value, 0.0) + self._child_value(child)
-        return totals
+        """Aggregate a metric by label value using collected public samples."""
+        return sum_metric_by_label(metric, label_name)
+
+    def _process_local_metrics_authoritative(self) -> bool:
+        """Return whether process-local metrics represent the full serving instance."""
+        return mp.current_process().name == "MainProcess"
 
     def _build_business_metrics(self) -> Dict[str, Any]:
         """Build business metrics directly from Prometheus collectors."""
@@ -529,7 +642,9 @@ class LLMRouterPlatform:
                     "total_cost": float(cost_totals.get(model_name, 0.0) or 0.0),
                 }
             )
-        return self._normalize_model_performance(model_data, source="in_memory_metrics")
+        return self._normalize_model_performance(
+            model_data, source="process_local_metrics"
+        )
 
     def _build_threshold_alerts(self) -> List[Dict[str, Any]]:
         """Convert threshold alerts to a dashboard-friendly format."""
@@ -611,6 +726,8 @@ class LLMRouterPlatform:
         """Build a dashboard-friendly live snapshot."""
         business_metrics = self._build_business_metrics()
         system_report = self._build_system_snapshot()
+        process_local_authoritative = self._process_local_metrics_authoritative()
+        observability_warnings: List[str] = []
         user_report = {
             "users": {
                 "by_tier": dict(business_metrics.get("user_tier_distribution", {})),
@@ -646,15 +763,34 @@ class LLMRouterPlatform:
             ),
         }
         model_performance = self._fallback_model_performance()
-        alerts = self._build_threshold_alerts()
+        alerts = (
+            self._build_threshold_alerts() if process_local_authoritative else []
+        )
 
         sources = {
-            "overview": "in_memory_metrics",
-            "analytics": "in_memory_metrics",
-            "model_performance": "in_memory_metrics",
-            "alerts": "thresholds",
+            "overview": "process_local_metrics",
+            "analytics": "process_local_metrics",
+            "model_performance": "process_local_metrics",
+            "inference": "process_local_metrics",
+            "system": "process_local_metrics",
+            "alerts": "process_local_thresholds",
             "logs": "structured_log_file",
         }
+        source_authority = {
+            "overview": process_local_authoritative,
+            "analytics": process_local_authoritative,
+            "model_performance": process_local_authoritative,
+            "inference": process_local_authoritative,
+            "system": process_local_authoritative,
+            "alerts": process_local_authoritative,
+            "logs": True,
+        }
+
+        if not process_local_authoritative:
+            observability_warnings.append(
+                "Dashboard metrics are process-local because the API is running in a worker process without pipeline-backed aggregation."
+            )
+            sources["alerts"] = "disabled_non_authoritative_process_local"
 
         for model in model_performance:
             model_name = model["model_name"]
@@ -669,6 +805,7 @@ class LLMRouterPlatform:
             )
             alerts.extend(self._normalize_monitoring_alerts(recent_alerts))
             sources["alerts"] = "thresholds+monitoring_service"
+            source_authority["alerts"] = process_local_authoritative
 
         if "pipeline" in self.services:
             pipeline_analytics = await self.services["pipeline"].get_query_analytics(
@@ -679,6 +816,34 @@ class LLMRouterPlatform:
             )
 
             if pipeline_analytics:
+                overview.update(
+                    {
+                        "total_requests": int(
+                            pipeline_analytics.get("total_queries", 0) or 0
+                        ),
+                        "avg_latency_ms": float(
+                            pipeline_analytics.get("avg_latency", 0.0) or 0.0
+                        ),
+                        "success_rate": float(
+                            pipeline_analytics.get("success_rate", 0.0) or 0.0
+                        )
+                        / 100.0,
+                        "total_cost": float(
+                            pipeline_analytics.get("total_cost", 0.0) or 0.0
+                        ),
+                        "cache_hit_rate": None,
+                        "error_rate": max(
+                            0.0,
+                            1.0
+                            - (
+                                float(
+                                    pipeline_analytics.get("success_rate", 0.0) or 0.0
+                                )
+                                / 100.0
+                            ),
+                        ),
+                    }
+                )
                 analytics.update(
                     {
                         "total_queries": int(
@@ -711,13 +876,32 @@ class LLMRouterPlatform:
                     model_name: float(stats.get("cost", 0.0) or 0.0)
                     for model_name, stats in model_breakdown.items()
                 }
+                sources["overview"] = "clickhouse"
                 sources["analytics"] = "clickhouse"
+                sources["inference"] = "clickhouse"
+                source_authority["overview"] = True
+                source_authority["analytics"] = True
+                source_authority["inference"] = True
 
             if pipeline_models:
                 model_performance = self._normalize_model_performance(
                     pipeline_models, source="clickhouse"
                 )
                 sources["model_performance"] = "clickhouse"
+                source_authority["model_performance"] = True
+
+            source_authority["alerts"] = bool(
+                "monitoring" in self.services or process_local_authoritative
+            )
+
+        inference_snapshot = self._build_inference_snapshot(business_metrics)
+        if sources["inference"] == "clickhouse":
+            inference_snapshot = {
+                "total_requests": analytics.get("total_queries", 0),
+                "total_cost": analytics.get("total_cost", 0.0),
+                "cache_hit_rate": overview.get("cache_hit_rate"),
+                "error_rate": overview.get("error_rate", 0.0),
+            }
 
         health = self._build_health_payload()
         return {
@@ -726,12 +910,25 @@ class LLMRouterPlatform:
             "health": health,
             "overview": overview,
             "system": system_report,
-            "inference": self._build_inference_snapshot(business_metrics),
+            "inference": inference_snapshot,
             "user_report": user_report,
             "analytics": analytics,
             "model_performance": model_performance,
             "alerts": alerts,
             "sources": sources,
+            "source_authority": source_authority,
+            "observability": {
+                "authoritative": all(
+                    source_authority[key]
+                    for key in ["overview", "analytics", "model_performance"]
+                ),
+                "metrics_scope": (
+                    "durable_backend"
+                    if "pipeline" in self.services
+                    else "process_local"
+                ),
+                "warnings": observability_warnings,
+            },
             "capabilities": {
                 "pipeline_analytics": "pipeline" in self.services,
                 "monitoring": "monitoring" in self.services,
@@ -823,10 +1020,78 @@ class LLMRouterPlatform:
             lifespan=lifespan,
         )
 
-        # Health check endpoint
+        cors_config = dict(self._security_config().get("cors", {}))
+        if cors_config.get("enabled", False):
+            app.add_middleware(
+                CORSMiddleware,
+                allow_origins=list(cors_config.get("allow_origins", ["*"])),
+                allow_credentials=bool(cors_config.get("allow_credentials", False)),
+                allow_methods=list(cors_config.get("allow_methods", ["GET", "POST"])),
+                allow_headers=list(cors_config.get("allow_headers", ["*"])),
+            )
+
+        @app.middleware("http")
+        async def enforce_api_auth(request: Request, call_next):
+            if request.method == "OPTIONS" or self._request_path_is_public(
+                request.url.path
+            ):
+                return await call_next(request)
+
+            if not self._api_key_auth_enabled():
+                return await call_next(request)
+
+            source_ip = request.client.host if request.client else None
+            if not self._api_key_auth_configured():
+                security_logger.log_authentication_attempt(
+                    user_id="anonymous",
+                    success=False,
+                    source_ip=source_ip,
+                    path=request.url.path,
+                    method=request.method,
+                    reason="api_keys_not_configured",
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "auth_unavailable",
+                        "message": "API authentication is enabled but no API keys are configured",
+                    },
+                )
+
+            if self._is_valid_api_key(self._extract_api_key(request)):
+                return await call_next(request)
+
+            security_logger.log_authentication_attempt(
+                user_id="anonymous",
+                success=False,
+                source_ip=source_ip,
+                path=request.url.path,
+                method=request.method,
+                reason="invalid_or_missing_api_key",
+            )
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": "unauthorized",
+                    "message": "A valid API key is required",
+                },
+            )
+
+        @app.get("/live")
+        async def live_check():
+            return self._build_liveness_payload()
+
+        @app.get("/ready")
+        async def ready_check():
+            readiness = self._build_readiness_payload()
+            status_code = 200 if readiness["status"] == "ready" else 503
+            return JSONResponse(status_code=status_code, content=readiness)
+
         @app.get("/health")
         async def health_check():
-            return self._build_health_payload()
+            health = self._build_health_payload()
+            status_code = 200 if health["status"] == "ready" else 503
+            return JSONResponse(status_code=status_code, content=health)
 
         # Model routing endpoint
         @app.post("/route")
@@ -847,12 +1112,15 @@ class LLMRouterPlatform:
                     status_code=status_code,
                     content=jsonable_encoder(result),
                 )
-            except Exception as e:
+            except Exception:
                 status_code = 500
-                self.logger.error(f"Query processing error: {e}")
+                self.logger.exception("Query processing error")
                 return JSONResponse(
                     status_code=status_code,
-                    content={"error": str(e)},
+                    content={
+                        "error": "internal_server_error",
+                        "message": "Request processing failed",
+                    },
                 )
             finally:
                 self._record_api_metrics(
