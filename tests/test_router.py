@@ -106,3 +106,91 @@ class TestModelRouter:
 
         assert selection.model_name == "mistral-7b"
         assert "default" in selection.reason.lower()
+
+    @pytest.mark.asyncio
+    async def test_route_query_uses_policy_cache_fast_lane_bias(self, router_config):
+        class PolicyCacheStub:
+            async def get_effective_policy(self, request_id, user_id):
+                return {
+                    "policy_source": "user",
+                    "route_to_fast_lane": True,
+                    "preferred_models": [],
+                    "hint_reason": "priority=critical",
+                }
+
+        router = ModelRouter(router_config, policy_cache=PolicyCacheStub())
+        router.classifier.classify_query = lambda _query: (
+            QueryType.CODE_GENERATION,
+            0.95,
+        )
+        router.token_counter.count_tokens = lambda _query, _model="default": 128
+        router.model_stats["gpt-5"] = {"success_rate": 0.99, "avg_latency": 500}
+        router.model_stats["mistral-7b"] = {"success_rate": 0.90, "avg_latency": 100}
+
+        request = QueryRequest(
+            query="Urgent fix for production issue",
+            user_id="u1",
+            user_tier=UserTier.PREMIUM,
+        )
+
+        decision = await router.route_query(request)
+
+        assert decision.selected_model == "mistral-7b"
+        assert "Policy-cache selection" in decision.routing_reason
+
+    @pytest.mark.asyncio
+    async def test_route_query_prefers_explicit_fast_lane_model(self):
+        class PolicyCacheStub:
+            async def get_effective_policy(self, request_id, user_id):
+                return {
+                    "policy_source": "request",
+                    "route_to_fast_lane": True,
+                    "preferred_models": ["claude-3.5-sonnet"],
+                    "hint_reason": "priority=high",
+                }
+
+        router = ModelRouter(
+            {
+                "default_model": "mistral-7b",
+                "routing_strategy": "intelligent",
+                "fast_lane_models": ["claude-3.5-sonnet"],
+                "models": {
+                    "claude-3.5-sonnet": {
+                        "provider": "anthropic",
+                        "max_tokens": 200000,
+                        "cost_per_token": 0.000015,
+                        "priority": 2,
+                        "capabilities": ["reasoning", "writing", "analysis"],
+                        "api_key_env": "ANTHROPIC_API_KEY",
+                    },
+                    "mistral-7b": {
+                        "provider": "vllm",
+                        "model_path": "/models/mistral",
+                        "max_tokens": 4096,
+                        "cost_per_token": 0.0,
+                        "priority": 3,
+                        "capabilities": ["general", "coding"],
+                        "gpu_memory_gb": 16,
+                    },
+                },
+                "routing_rules": [],
+            },
+            policy_cache=PolicyCacheStub(),
+        )
+        router.classifier.classify_query = lambda _query: (QueryType.ANALYSIS, 0.95)
+        router.token_counter.count_tokens = lambda _query, _model="default": 256
+        router.model_stats["claude-3.5-sonnet"] = {
+            "success_rate": 0.99,
+            "avg_latency": 700,
+        }
+
+        request = QueryRequest(
+            query="Please analyze this customer escalation",
+            user_id="enterprise-user",
+            user_tier=UserTier.ENTERPRISE,
+        )
+
+        decision = await router.route_query(request)
+
+        assert decision.selected_model == "claude-3.5-sonnet"
+        assert "Policy-cache selection" in decision.routing_reason

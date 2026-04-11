@@ -231,6 +231,43 @@ class TestInferenceEngine:
         assert isinstance(cached_payload["timestamp"], str)
 
     @pytest.mark.asyncio
+    async def test_process_query_publishes_inference_completed_event(
+        self,
+        inference_config,
+        sample_query_request,
+        inference_response_factory,
+    ):
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(
+                selected_model="gpt-5",
+                query_type=SimpleNamespace(value="analysis"),
+                routing_reason="Rule-based selection",
+            )
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+        router.update_model_stats = MagicMock()
+
+        event_producer = AsyncMock()
+        event_producer.produce_inference_completed = AsyncMock()
+
+        engine = InferenceEngine(
+            inference_config,
+            router,
+            event_producer=event_producer,
+        )
+        engine.providers = {"openai": AsyncMock()}
+        engine.providers["openai"].generate_response = AsyncMock(
+            return_value=inference_response_factory()
+        )
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+        engine.cache.cache_response = AsyncMock()
+
+        await engine.process_query(sample_query_request)
+
+        event_producer.produce_inference_completed.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_process_query_returns_cached_response(
         self,
         inference_config,
@@ -264,6 +301,36 @@ class TestInferenceEngine:
         assert response.cached is True
         assert response.response_text == "from cache"
         engine.cache.cache_response.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_process_query_publishes_error_completion_event_when_provider_missing(
+        self,
+        inference_config,
+        sample_query_request,
+    ):
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="unknown-model")
+        )
+        router.get_model_info.return_value = None
+        router.update_model_stats = MagicMock()
+
+        event_producer = AsyncMock()
+        event_producer.produce_inference_completed = AsyncMock()
+
+        engine = InferenceEngine(
+            inference_config,
+            router,
+            event_producer=event_producer,
+        )
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+
+        response = await engine.process_query(sample_query_request)
+
+        assert response.provider == "error"
+        event_producer.produce_inference_completed.assert_awaited_once()
+        published_response = event_producer.produce_inference_completed.await_args.args[1]
+        assert published_response.provider == "error"
 
     @pytest.mark.asyncio
     async def test_process_query_returns_error_response_when_provider_missing(

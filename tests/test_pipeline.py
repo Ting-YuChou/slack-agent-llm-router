@@ -7,11 +7,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.llm_router_part3_pipeline import (
+    AlertEventEntry,
     ClickHouseManager,
     KafkaConsumerManager,
     KafkaIngestionPipeline,
     KafkaProducerManager,
     MetricEntry,
+    ModelPerformanceEntry,
     QueryLogEntry,
 )
 from src.utils.schema import InferenceResponse, QueryRequest, UserTier
@@ -26,6 +28,12 @@ def pipeline_config():
             "responses": "test-responses",
             "metrics": "test-metrics",
             "errors": "test-errors",
+            "requests_raw": "requests.raw",
+            "inference_completed": "inference.completed",
+            "requests_enriched": "requests.enriched",
+            "fast_lane_hints": "fast_lane_hints",
+            "analytics_model_metrics_1m": "analytics.model_metrics_1m",
+            "alerts": "alerts",
         },
         "consumer": {
             "group_id": "test-group",
@@ -96,6 +104,56 @@ class TestKafkaProducerManager:
         assert decoded["value"] == 42
         assert "timestamp" in decoded
 
+    @pytest.mark.asyncio
+    async def test_produce_request_raw_emits_requests_raw_event(self, pipeline_config):
+        manager = KafkaProducerManager(pipeline_config)
+        manager.producer = AsyncMock()
+        request = QueryRequest(query="hello", user_id="u1", user_tier=UserTier.FREE)
+
+        await manager.produce_request_raw(request)
+
+        send_kwargs = manager.producer.send.await_args.kwargs
+        assert send_kwargs["topic"] == "requests.raw"
+        assert send_kwargs["key"] == "u1"
+        assert send_kwargs["value"]["event_type"] == "requests.raw"
+        assert send_kwargs["value"]["request_id"] == request.request_id
+        assert send_kwargs["value"]["query_text"] == "hello"
+
+    @pytest.mark.asyncio
+    async def test_produce_inference_completed_emits_completion_event(
+        self, pipeline_config
+    ):
+        manager = KafkaProducerManager(pipeline_config)
+        manager.producer = AsyncMock()
+        request = QueryRequest(query="hello", user_id="u1", user_tier=UserTier.FREE)
+        response = InferenceResponse(
+            response_text="world",
+            model_name="gpt-5",
+            provider="openai",
+            token_count_input=3,
+            token_count_output=5,
+            total_tokens=8,
+            latency_ms=12,
+            tokens_per_second=120.0,
+            cost_usd=0.01,
+        )
+        routing_decision = SimpleNamespace(
+            query_type=SimpleNamespace(value="analysis"),
+            routing_reason="Rule-based selection",
+            routing_strategy="intelligent",
+            fallback_models=["mistral-7b"],
+        )
+
+        await manager.produce_inference_completed(request, response, routing_decision)
+
+        send_kwargs = manager.producer.send.await_args.kwargs
+        assert send_kwargs["topic"] == "inference.completed"
+        assert send_kwargs["key"] == request.request_id
+        assert send_kwargs["value"]["event_type"] == "inference.completed"
+        assert send_kwargs["value"]["selected_model"] == "gpt-5"
+        assert send_kwargs["value"]["query_type"] == "analysis"
+        assert send_kwargs["value"]["fallback_models"] == ["mistral-7b"]
+
 
 class TestClickHouseManager:
     @pytest.mark.asyncio
@@ -154,6 +212,88 @@ class TestClickHouseManager:
                 column_names=expected_columns,
             )
 
+    @pytest.mark.asyncio
+    async def test_batch_insert_model_performance_calls_insert(self, pipeline_config):
+        with patch(
+            "src.llm_router_part3_pipeline.clickhouse_connect.get_client"
+        ) as mock_get_client:
+            client = MagicMock()
+            client.query.return_value.result_rows = [[1]]
+            mock_get_client.return_value = client
+
+            manager = ClickHouseManager(pipeline_config["clickhouse"])
+            await manager.initialize()
+
+            metric = ModelPerformanceEntry(
+                timestamp=datetime.now(timezone.utc),
+                model_name="mistral-7b",
+                provider="vllm",
+                window_start_ms=1_710_000_000_000,
+                window_end_ms=1_710_000_060_000,
+                window_size_seconds=60,
+                requests_count=6,
+                success_count=5,
+                success_rate=5 / 6,
+                avg_latency_ms=240.0,
+                avg_tokens_per_second=110.0,
+                error_count=1,
+                total_tokens=360,
+                total_cost_usd=0.0,
+                queries_per_second=0.1,
+                cache_hit_rate=0.5,
+                cached_count=3,
+            )
+
+            await manager.batch_insert_model_performance([metric])
+
+            expected_payload = metric.to_dict()
+            expected_columns = list(expected_payload.keys())
+            expected_rows = [[expected_payload[column] for column in expected_columns]]
+
+            client.insert.assert_called_with(
+                "model_performance",
+                expected_rows,
+                column_names=expected_columns,
+            )
+
+    @pytest.mark.asyncio
+    async def test_batch_insert_alert_events_calls_insert(self, pipeline_config):
+        with patch(
+            "src.llm_router_part3_pipeline.clickhouse_connect.get_client"
+        ) as mock_get_client:
+            client = MagicMock()
+            client.query.return_value.result_rows = [[1]]
+            mock_get_client.return_value = client
+
+            manager = ClickHouseManager(pipeline_config["clickhouse"])
+            await manager.initialize()
+
+            alert = AlertEventEntry(
+                timestamp=datetime.now(timezone.utc),
+                alert_type="anomaly_detected",
+                severity="warning",
+                description="Latency spiked",
+                anomaly_type="high_latency",
+                source_event_type="analytics.model_metrics_1m",
+                model_name="mistral-7b",
+                provider="vllm",
+                window_start_ms=1_710_000_000_000,
+                window_end_ms=1_710_000_060_000,
+                payload_json='{"severity":"warning"}',
+            )
+
+            await manager.batch_insert_alert_events([alert])
+
+            expected_payload = alert.to_dict()
+            expected_columns = list(expected_payload.keys())
+            expected_rows = [[expected_payload[column] for column in expected_columns]]
+
+            client.insert.assert_called_with(
+                "alert_events",
+                expected_rows,
+                column_names=expected_columns,
+            )
+
 
 class TestKafkaConsumerManager:
     def test_deserialize_message_returns_json_payload(self, pipeline_config):
@@ -161,6 +301,19 @@ class TestKafkaConsumerManager:
         raw = json.dumps({"hello": "world"}).encode("utf-8")
 
         assert consumer._deserialize_message(raw) == {"hello": "world"}
+
+    @pytest.mark.asyncio
+    async def test_notify_observers_invokes_async_handler(self, pipeline_config):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        seen = []
+
+        async def handler(payload):
+            seen.append(payload["event_type"])
+
+        consumer.register_observer("alerts", handler)
+        await consumer._notify_observers("alerts", {"event_type": "alerts"})
+
+        assert seen == ["alerts"]
 
 
 class TestKafkaIngestionPipeline:
@@ -206,3 +359,18 @@ class TestKafkaIngestionPipeline:
         pipeline.producer_manager.produce_query_log.assert_awaited_once_with(
             request, response, decision
         )
+
+    def test_attach_monitoring_service_registers_stream_handlers(self, pipeline_config):
+        pipeline = KafkaIngestionPipeline(pipeline_config)
+
+        class MonitoringStub:
+            async def ingest_stream_model_metrics(self, metric_event):
+                return metric_event
+
+            async def ingest_stream_alert(self, alert_event):
+                return alert_event
+
+        pipeline.attach_monitoring_service(MonitoringStub())
+
+        assert len(pipeline._stream_handlers["analytics_model_metrics_1m"]) == 1
+        assert len(pipeline._stream_handlers["alerts"]) == 1

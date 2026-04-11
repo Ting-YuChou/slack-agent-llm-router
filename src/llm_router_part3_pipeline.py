@@ -4,6 +4,7 @@ Handles real-time data ingestion, processing, and storage to ClickHouse
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -22,6 +23,116 @@ from src.utils.metrics import PIPELINE_METRICS
 from src.utils.schema import QueryRequest, InferenceResponse, SystemMetric, UserTier
 
 logger = logging.getLogger(__name__)
+
+EVENT_SCHEMA_VERSION = "1.0"
+
+
+def _isoformat_utc(timestamp: Optional[datetime] = None) -> str:
+    """Serialize a timestamp using an explicit UTC ISO-8601 string."""
+    timestamp = timestamp or datetime.now(timezone.utc)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _enum_value(value: Any) -> Any:
+    """Return the primitive enum value when present."""
+    return getattr(value, "value", value)
+
+
+def _parse_datetime(
+    value: Optional[Any], *, default: Optional[datetime] = None
+) -> datetime:
+    """Parse ISO timestamps emitted by the platform into timezone-aware datetimes."""
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            logger.debug(f"Failed to parse datetime value: {value}")
+
+    return default or datetime.now(timezone.utc)
+
+
+def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
+    """Build the pre-inference event emitted by the API request path."""
+    attachments = [
+        {
+            "id": attachment.id,
+            "name": attachment.name,
+            "type": _enum_value(attachment.type),
+            "size_bytes": attachment.size_bytes,
+            "mime_type": attachment.mime_type,
+        }
+        for attachment in query_request.attachments
+    ]
+
+    return {
+        "event_type": "requests.raw",
+        "event_version": EVENT_SCHEMA_VERSION,
+        "emitted_at": _isoformat_utc(),
+        "request_id": query_request.request_id,
+        "query_id": query_request.request_id,
+        "user_id": query_request.user_id,
+        "user_tier": _enum_value(query_request.user_tier),
+        "request_timestamp": _isoformat_utc(query_request.timestamp),
+        "query_text": query_request.query,
+        "context": query_request.context,
+        "max_tokens": query_request.max_tokens,
+        "temperature": query_request.temperature,
+        "priority": query_request.priority,
+        "session_id": query_request.session_id,
+        "conversation_id": query_request.conversation_id,
+        "metadata": query_request.metadata or {},
+        "attachments": attachments,
+        "attachments_count": len(attachments),
+    }
+
+
+def build_inference_completed_event(
+    query_request: QueryRequest,
+    inference_response: InferenceResponse,
+    routing_decision: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Build the post-inference event emitted after request completion."""
+    query_type = getattr(routing_decision, "query_type", None)
+    routing_strategy = getattr(routing_decision, "routing_strategy", None)
+
+    return {
+        "event_type": "inference.completed",
+        "event_version": EVENT_SCHEMA_VERSION,
+        "emitted_at": _isoformat_utc(),
+        "request_id": query_request.request_id,
+        "query_id": query_request.request_id,
+        "user_id": query_request.user_id,
+        "user_tier": _enum_value(query_request.user_tier),
+        "request_timestamp": _isoformat_utc(query_request.timestamp),
+        "completion_timestamp": _isoformat_utc(inference_response.timestamp),
+        "query_text": query_request.query,
+        "query_type": _enum_value(query_type),
+        "selected_model": inference_response.model_name,
+        "provider": inference_response.provider,
+        "status": "error" if inference_response.error else "success",
+        "error_message": inference_response.error or "",
+        "latency_ms": inference_response.latency_ms,
+        "token_count_input": inference_response.token_count_input,
+        "token_count_output": inference_response.token_count_output,
+        "total_tokens": inference_response.total_tokens,
+        "tokens_per_second": inference_response.tokens_per_second,
+        "cost_usd": inference_response.cost_usd,
+        "cached_response": inference_response.cached,
+        "context_compressed": inference_response.compressed_context,
+        "response_length_chars": len(inference_response.response_text or ""),
+        "routing_reason": getattr(routing_decision, "routing_reason", None),
+        "routing_strategy": _enum_value(routing_strategy),
+        "fallback_models": list(
+            getattr(routing_decision, "fallback_models", []) or []
+        ),
+    }
 
 
 @dataclass
@@ -92,6 +203,94 @@ class MetricEntry:
         }
 
 
+@dataclass
+class ModelPerformanceEntry:
+    """Structure for Flink windowed model performance events."""
+
+    timestamp: datetime
+    model_name: str
+    provider: str
+    window_start_ms: int
+    window_end_ms: int
+    window_size_seconds: int
+    requests_count: int
+    success_count: int
+    success_rate: float
+    avg_latency_ms: float
+    avg_tokens_per_second: float
+    error_count: int
+    total_tokens: int
+    total_cost_usd: float
+    queries_per_second: float
+    cache_hit_rate: float
+    cached_count: int
+    gpu_utilization: float = 0.0
+    memory_usage_gb: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for database insertion."""
+        return {
+            "timestamp": self.timestamp,
+            "model_name": self.model_name,
+            "provider": self.provider,
+            "window_start_ms": self.window_start_ms,
+            "window_end_ms": self.window_end_ms,
+            "window_size_seconds": self.window_size_seconds,
+            "requests_count": self.requests_count,
+            "success_count": self.success_count,
+            "success_rate": self.success_rate,
+            "avg_latency_ms": self.avg_latency_ms,
+            "avg_tokens_per_second": self.avg_tokens_per_second,
+            "error_count": self.error_count,
+            "total_tokens": self.total_tokens,
+            "total_cost_usd": self.total_cost_usd,
+            "queries_per_second": self.queries_per_second,
+            "cache_hit_rate": self.cache_hit_rate,
+            "cached_count": self.cached_count,
+            "gpu_utilization": self.gpu_utilization,
+            "memory_usage_gb": self.memory_usage_gb,
+        }
+
+
+@dataclass
+class AlertEventEntry:
+    """Structure for persisted alert events."""
+
+    timestamp: datetime
+    alert_type: str
+    severity: str
+    description: str
+    anomaly_type: str = ""
+    source_event_type: str = ""
+    request_id: str = ""
+    query_id: str = ""
+    user_id: str = ""
+    model_name: str = ""
+    provider: str = ""
+    window_start_ms: int = 0
+    window_end_ms: int = 0
+    payload_json: str = "{}"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for database insertion."""
+        return {
+            "timestamp": self.timestamp,
+            "alert_type": self.alert_type,
+            "severity": self.severity,
+            "description": self.description,
+            "anomaly_type": self.anomaly_type,
+            "source_event_type": self.source_event_type,
+            "request_id": self.request_id,
+            "query_id": self.query_id,
+            "user_id": self.user_id,
+            "model_name": self.model_name,
+            "provider": self.provider,
+            "window_start_ms": self.window_start_ms,
+            "window_end_ms": self.window_end_ms,
+            "payload_json": self.payload_json,
+        }
+
+
 class KafkaProducerManager:
     """Manages Kafka message production"""
 
@@ -122,6 +321,61 @@ class KafkaProducerManager:
             logger.error(f"Failed to initialize Kafka producer: {e}")
             raise
 
+    def is_healthy(self) -> bool:
+        """Return whether the Kafka producer has been initialized."""
+        return self.producer is not None
+
+    def _topic_name(self, topic_key: str, default_topic: str) -> str:
+        """Resolve a logical topic key to the configured Kafka topic name."""
+        return self.topics.get(topic_key, default_topic)
+
+    async def _send_message(
+        self,
+        topic_key: str,
+        default_topic: str,
+        *,
+        key: Optional[str],
+        value: Dict[str, Any],
+    ):
+        """Send a JSON-serializable message to Kafka and update metrics."""
+        try:
+            await self.producer.send(
+                topic=self._topic_name(topic_key, default_topic),
+                key=key,
+                value=value,
+            )
+            PIPELINE_METRICS.messages_produced.labels(topic=topic_key).inc()
+        except Exception as e:
+            logger.error(f"Failed to produce {topic_key} message: {e}")
+            PIPELINE_METRICS.producer_errors.inc()
+
+    async def produce_request_raw(self, query_request: QueryRequest):
+        """Produce a pre-inference API request event."""
+        await self._send_message(
+            "requests_raw",
+            "requests.raw",
+            key=query_request.user_id,
+            value=build_request_raw_event(query_request),
+        )
+
+    async def produce_inference_completed(
+        self,
+        query_request: QueryRequest,
+        inference_response: InferenceResponse,
+        routing_decision: Optional[Any] = None,
+    ):
+        """Produce a post-inference completion event."""
+        await self._send_message(
+            "inference_completed",
+            "inference.completed",
+            key=query_request.request_id,
+            value=build_inference_completed_event(
+                query_request,
+                inference_response,
+                routing_decision=routing_decision,
+            ),
+        )
+
     async def produce_query_log(
         self,
         query_request: QueryRequest,
@@ -129,58 +383,46 @@ class KafkaProducerManager:
         routing_decision: Any,
     ):
         """Produce query log message"""
-        try:
-            query_log = QueryLogEntry(
-                query_id=str(uuid.uuid4()),
-                timestamp=datetime.now(timezone.utc),
-                user_id=query_request.user_id,
-                user_tier=query_request.user_tier,
-                query_text=query_request.query,
-                query_type=routing_decision.query_type.value
-                if hasattr(routing_decision.query_type, "value")
-                else str(routing_decision.query_type),
-                selected_model=inference_response.model_name,
-                token_count_input=inference_response.token_count_input,
-                token_count_output=inference_response.token_count_output,
-                latency_ms=inference_response.latency_ms,
-                cost_usd=inference_response.cost_usd,
-                status="error" if inference_response.error else "success",
-                error_message=getattr(inference_response, "error", ""),
-                context_compressed=getattr(
-                    inference_response, "compressed_context", False
-                ),
-                compression_ratio=0.3
-                if getattr(inference_response, "compressed_context", False)
-                else 0.0,
-                cached_response=inference_response.cached,
-            )
+        query_log = QueryLogEntry(
+            query_id=str(uuid.uuid4()),
+            timestamp=datetime.now(timezone.utc),
+            user_id=query_request.user_id,
+            user_tier=query_request.user_tier,
+            query_text=query_request.query,
+            query_type=routing_decision.query_type.value
+            if hasattr(routing_decision.query_type, "value")
+            else str(routing_decision.query_type),
+            selected_model=inference_response.model_name,
+            token_count_input=inference_response.token_count_input,
+            token_count_output=inference_response.token_count_output,
+            latency_ms=inference_response.latency_ms,
+            cost_usd=inference_response.cost_usd,
+            status="error" if inference_response.error else "success",
+            error_message=getattr(inference_response, "error", ""),
+            context_compressed=getattr(
+                inference_response, "compressed_context", False
+            ),
+            compression_ratio=0.3
+            if getattr(inference_response, "compressed_context", False)
+            else 0.0,
+            cached_response=inference_response.cached,
+        )
 
-            await self.producer.send(
-                topic=self.topics.get("queries", "llm-queries"),
-                key=query_log.user_id,
-                value=query_log.to_dict(),
-            )
-
-            PIPELINE_METRICS.messages_produced.labels(topic="queries").inc()
-
-        except Exception as e:
-            logger.error(f"Failed to produce query log: {e}")
-            PIPELINE_METRICS.producer_errors.inc()
+        await self._send_message(
+            "queries",
+            "llm-queries",
+            key=query_log.user_id,
+            value=query_log.to_dict(),
+        )
 
     async def produce_response_log(self, response_data: Dict[str, Any]):
         """Produce response log message"""
-        try:
-            await self.producer.send(
-                topic=self.topics.get("responses", "llm-responses"),
-                key=response_data.get("query_id"),
-                value=response_data,
-            )
-
-            PIPELINE_METRICS.messages_produced.labels(topic="responses").inc()
-
-        except Exception as e:
-            logger.error(f"Failed to produce response log: {e}")
-            PIPELINE_METRICS.producer_errors.inc()
+        await self._send_message(
+            "responses",
+            "llm-responses",
+            key=response_data.get("query_id"),
+            value=response_data,
+        )
 
     async def produce_metric(
         self,
@@ -190,43 +432,31 @@ class KafkaProducerManager:
         labels: Dict[str, str] = None,
     ):
         """Produce system metric"""
-        try:
-            metric_entry = MetricEntry(
-                timestamp=datetime.now(timezone.utc),
-                service=service,
-                metric_name=metric_name,
-                metric_value=metric_value,
-                labels=labels or {},
-            )
+        metric_entry = MetricEntry(
+            timestamp=datetime.now(timezone.utc),
+            service=service,
+            metric_name=metric_name,
+            metric_value=metric_value,
+            labels=labels or {},
+        )
 
-            await self.producer.send(
-                topic=self.topics.get("metrics", "llm-metrics"),
-                key=f"{service}:{metric_name}",
-                value=metric_entry.to_dict(),
-            )
-
-            PIPELINE_METRICS.messages_produced.labels(topic="metrics").inc()
-
-        except Exception as e:
-            logger.error(f"Failed to produce metric: {e}")
-            PIPELINE_METRICS.producer_errors.inc()
+        await self._send_message(
+            "metrics",
+            "llm-metrics",
+            key=f"{service}:{metric_name}",
+            value=metric_entry.to_dict(),
+        )
 
     async def produce_error(self, error_data: Dict[str, Any]):
         """Produce error message"""
-        try:
-            error_data["timestamp"] = datetime.now(timezone.utc)
+        error_data["timestamp"] = datetime.now(timezone.utc)
 
-            await self.producer.send(
-                topic=self.topics.get("errors", "llm-errors"),
-                key=error_data.get("error_id", str(uuid.uuid4())),
-                value=error_data,
-            )
-
-            PIPELINE_METRICS.messages_produced.labels(topic="errors").inc()
-
-        except Exception as e:
-            logger.error(f"Failed to produce error: {e}")
-            PIPELINE_METRICS.producer_errors.inc()
+        await self._send_message(
+            "errors",
+            "llm-errors",
+            key=error_data.get("error_id", str(uuid.uuid4())),
+            value=error_data,
+        )
 
     def _serialize_message(self, message: Any) -> bytes:
         """Serialize message to JSON bytes"""
@@ -272,6 +502,7 @@ class ClickHouseManager:
             "query_logs": [],
             "metrics": [],
             "model_performance": [],
+            "alert_events": [],
         }
         self.last_batch_time = time.time()
 
@@ -375,12 +606,21 @@ class ClickHouseManager:
         CREATE TABLE IF NOT EXISTS {database}.model_performance (
             timestamp DateTime64(3),
             model_name String,
+            provider String DEFAULT '',
+            window_start_ms UInt64 DEFAULT 0,
+            window_end_ms UInt64 DEFAULT 0,
+            window_size_seconds UInt32 DEFAULT 60,
             requests_count UInt32,
+            success_count UInt32 DEFAULT 0,
             success_rate Float32,
             avg_latency_ms Float32,
             avg_tokens_per_second Float32,
             error_count UInt32,
+            total_tokens UInt32 DEFAULT 0,
             total_cost_usd Float64,
+            queries_per_second Float32 DEFAULT 0,
+            cache_hit_rate Float32 DEFAULT 0,
+            cached_count UInt32 DEFAULT 0,
             gpu_utilization Float32,
             memory_usage_gb Float32
         ) ENGINE = ReplacingMergeTree()
@@ -411,12 +651,37 @@ class ClickHouseManager:
             database=self.database
         )
 
+        alert_events_sql = """
+        CREATE TABLE IF NOT EXISTS {database}.alert_events (
+            timestamp DateTime64(3),
+            alert_type String,
+            severity String,
+            description String,
+            anomaly_type String,
+            source_event_type String,
+            request_id String,
+            query_id String,
+            user_id String,
+            model_name String,
+            provider String,
+            window_start_ms UInt64,
+            window_end_ms UInt64,
+            payload_json String
+        ) ENGINE = ReplacingMergeTree()
+        PARTITION BY toYYYYMMDD(timestamp)
+        ORDER BY (severity, alert_type, timestamp)
+        TTL toDateTime(timestamp) + INTERVAL 30 DAY
+        """.format(
+            database=self.database
+        )
+
         # Execute table creation
         tables = [
             ("query_logs", query_logs_sql),
             ("system_metrics", metrics_sql),
             ("model_performance", performance_sql),
             ("user_analytics", user_analytics_sql),
+            ("alert_events", alert_events_sql),
         ]
 
         for table_name, sql in tables:
@@ -425,6 +690,24 @@ class ClickHouseManager:
                 logger.info(f"Table {table_name} created/verified")
             except Exception as e:
                 logger.error(f"Failed to create table {table_name}: {e}")
+
+        alter_statements = [
+            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS provider String DEFAULT ''",
+            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS window_start_ms UInt64 DEFAULT 0",
+            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS window_end_ms UInt64 DEFAULT 0",
+            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS window_size_seconds UInt32 DEFAULT 60",
+            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS success_count UInt32 DEFAULT 0",
+            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS total_tokens UInt32 DEFAULT 0",
+            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS queries_per_second Float32 DEFAULT 0",
+            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS cache_hit_rate Float32 DEFAULT 0",
+            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS cached_count UInt32 DEFAULT 0",
+        ]
+
+        for sql in alter_statements:
+            try:
+                self.client.command(sql)
+            except Exception as e:
+                logger.debug(f"Skipping optional schema migration: {e}")
 
     async def insert_query_log(self, query_log: QueryLogEntry):
         """Insert single query log entry"""
@@ -477,6 +760,42 @@ class ClickHouseManager:
             )
         except Exception as e:
             logger.error(f"Failed to batch insert metrics: {e}")
+            PIPELINE_METRICS.insertion_errors.inc()
+            raise
+
+    async def batch_insert_model_performance(
+        self, metrics: List[ModelPerformanceEntry]
+    ):
+        """Batch insert aggregated model performance windows."""
+        if not metrics:
+            return
+
+        try:
+            data = [metric.to_dict() for metric in metrics]
+            self._insert_dict_rows("model_performance", data)
+            logger.info(f"Batch inserted {len(metrics)} model performance windows")
+            PIPELINE_METRICS.records_inserted.labels(table="model_performance").inc(
+                len(metrics)
+            )
+        except Exception as e:
+            logger.error(f"Failed to batch insert model performance: {e}")
+            PIPELINE_METRICS.insertion_errors.inc()
+            raise
+
+    async def batch_insert_alert_events(self, alerts: List[AlertEventEntry]):
+        """Batch insert alert events."""
+        if not alerts:
+            return
+
+        try:
+            data = [alert.to_dict() for alert in alerts]
+            self._insert_dict_rows("alert_events", data)
+            logger.info(f"Batch inserted {len(alerts)} alert events")
+            PIPELINE_METRICS.records_inserted.labels(table="alert_events").inc(
+                len(alerts)
+            )
+        except Exception as e:
+            logger.error(f"Failed to batch insert alert events: {e}")
             PIPELINE_METRICS.insertion_errors.inc()
             raise
 
@@ -553,16 +872,17 @@ class ClickHouseManager:
         try:
             query = f"""
             SELECT 
-                selected_model,
-                count() as requests,
-                countIf(status = 'success') * 100.0 / count() as success_rate,
-                avg(latency_ms) as avg_latency,
-                sum(token_count_input + token_count_output) / sum(latency_ms) * 1000 as tokens_per_second,
-                countIf(status != 'success') as errors,
-                sum(cost_usd) as total_cost
-            FROM {self.database}.query_logs 
+                model_name,
+                any(provider) as provider,
+                sum(requests_count) as requests,
+                sum(success_count) * 100.0 / nullIf(sum(requests_count), 0) as success_rate,
+                sum(avg_latency_ms * requests_count) / nullIf(sum(requests_count), 0) as avg_latency,
+                sum(avg_tokens_per_second * requests_count) / nullIf(sum(requests_count), 0) as tokens_per_second,
+                sum(error_count) as errors,
+                sum(total_cost_usd) as total_cost
+            FROM {self.database}.model_performance
             WHERE timestamp >= now() - INTERVAL {hours} HOUR
-            GROUP BY selected_model
+            GROUP BY model_name
             ORDER BY requests DESC
             """
 
@@ -573,6 +893,41 @@ class ClickHouseManager:
                 performance_data.append(
                     {
                         "model_name": row[0],
+                        "provider": row[1],
+                        "requests": row[2],
+                        "success_rate": row[3],
+                        "avg_latency_ms": row[4],
+                        "tokens_per_second": row[5],
+                        "error_count": row[6],
+                        "total_cost": row[7],
+                    }
+                )
+
+            if performance_data:
+                return performance_data
+
+            fallback_query = f"""
+            SELECT 
+                selected_model,
+                count() as requests,
+                countIf(status = 'success') * 100.0 / count() as success_rate,
+                avg(latency_ms) as avg_latency,
+                sum(token_count_input + token_count_output) / nullIf(sum(latency_ms), 0) * 1000 as tokens_per_second,
+                countIf(status != 'success') as errors,
+                sum(cost_usd) as total_cost
+            FROM {self.database}.query_logs 
+            WHERE timestamp >= now() - INTERVAL {hours} HOUR
+            GROUP BY selected_model
+            ORDER BY requests DESC
+            """
+
+            result = self.client.query(fallback_query)
+            performance_data = []
+            for row in result.result_rows:
+                performance_data.append(
+                    {
+                        "model_name": row[0],
+                        "provider": "",
                         "requests": row[1],
                         "success_rate": row[2],
                         "avg_latency_ms": row[3],
@@ -622,7 +977,16 @@ class KafkaConsumerManager:
         }
 
         # Batch processing
-        self.batch_processors = {"queries": [], "metrics": []}
+        self.batch_processors = {
+            "queries": [],
+            "metrics": [],
+            "analytics_model_metrics_1m": [],
+            "alerts": [],
+        }
+        self.observers: Dict[str, List[Callable[[Dict[str, Any]], Any]]] = {
+            "analytics_model_metrics_1m": [],
+            "alerts": [],
+        }
         self.batch_size = 100
         self.last_batch_time = time.time()
         self.running = False
@@ -632,7 +996,14 @@ class KafkaConsumerManager:
         try:
             # Create consumer for each topic
             for topic_key, topic_name in self.topics.items():
-                if topic_key in ["queries", "responses", "metrics", "errors"]:
+                if topic_key in [
+                    "queries",
+                    "responses",
+                    "metrics",
+                    "errors",
+                    "analytics_model_metrics_1m",
+                    "alerts",
+                ]:
                     consumer = AIOKafkaConsumer(topic_name, **self.consumer_config)
                     await consumer.start()
                     self.consumers[topic_key] = consumer
@@ -659,6 +1030,14 @@ class KafkaConsumerManager:
                 tasks.append(asyncio.create_task(self._consume_metrics(consumer)))
             elif topic_key == "errors":
                 tasks.append(asyncio.create_task(self._consume_errors(consumer)))
+            elif topic_key == "analytics_model_metrics_1m":
+                tasks.append(
+                    asyncio.create_task(
+                        self._consume_analytics_model_metrics(consumer)
+                    )
+                )
+            elif topic_key == "alerts":
+                tasks.append(asyncio.create_task(self._consume_alerts(consumer)))
 
         # Start batch processor
         tasks.append(asyncio.create_task(self._batch_processor()))
@@ -768,28 +1147,127 @@ class KafkaConsumerManager:
         except Exception as e:
             logger.error(f"Error consumer error: {e}")
 
+    def register_observer(self, topic_key: str, callback: Callable[[Dict[str, Any]], Any]):
+        """Register an observer for consumed stream events."""
+        self.observers.setdefault(topic_key, []).append(callback)
+
+    async def _notify_observers(self, topic_key: str, payload: Dict[str, Any]):
+        """Forward a consumed event to any registered in-process observers."""
+        for callback in self.observers.get(topic_key, []):
+            try:
+                result = callback(payload)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as e:
+                logger.warning(f"Observer for {topic_key} failed: {e}")
+
+    def _build_model_performance_entry(
+        self, data: Dict[str, Any]
+    ) -> ModelPerformanceEntry:
+        """Convert a Flink analytics window event to a ClickHouse row."""
+        window_end_ms = int(data.get("window_end_ms", 0) or 0)
+        event_time = _parse_datetime(
+            data.get("emitted_at"),
+            default=datetime.fromtimestamp(window_end_ms / 1000, tz=timezone.utc)
+            if window_end_ms
+            else datetime.now(timezone.utc),
+        )
+
+        return ModelPerformanceEntry(
+            timestamp=event_time,
+            model_name=str(data.get("model_name", "unknown")),
+            provider=str(data.get("provider", "")),
+            window_start_ms=int(data.get("window_start_ms", 0) or 0),
+            window_end_ms=window_end_ms,
+            window_size_seconds=int(data.get("window_size_seconds", 60) or 60),
+            requests_count=int(data.get("request_count", 0) or 0),
+            success_count=int(data.get("success_count", 0) or 0),
+            success_rate=float(data.get("success_rate", 0.0) or 0.0),
+            avg_latency_ms=float(data.get("avg_latency_ms", 0.0) or 0.0),
+            avg_tokens_per_second=float(
+                data.get("avg_tokens_per_second", 0.0) or 0.0
+            ),
+            error_count=int(data.get("error_count", 0) or 0),
+            total_tokens=int(data.get("total_tokens", 0) or 0),
+            total_cost_usd=float(data.get("total_cost_usd", 0.0) or 0.0),
+            queries_per_second=float(data.get("queries_per_second", 0.0) or 0.0),
+            cache_hit_rate=float(data.get("cache_hit_rate", 0.0) or 0.0),
+            cached_count=int(data.get("cached_count", 0) or 0),
+        )
+
+    def _build_alert_event_entry(self, data: Dict[str, Any]) -> AlertEventEntry:
+        """Convert an alert event payload to a ClickHouse row."""
+        return AlertEventEntry(
+            timestamp=_parse_datetime(data.get("emitted_at")),
+            alert_type=str(data.get("alert_type", "unknown")),
+            severity=str(data.get("severity", "warning")),
+            description=str(data.get("description", "")),
+            anomaly_type=str(data.get("anomaly_type", "")),
+            source_event_type=str(data.get("original_event_type", "")),
+            request_id=str(data.get("request_id", "") or ""),
+            query_id=str(data.get("query_id", "") or ""),
+            user_id=str(data.get("user_id", "") or ""),
+            model_name=str(data.get("model_name", "") or ""),
+            provider=str(data.get("provider", "") or ""),
+            window_start_ms=int(data.get("window_start_ms", 0) or 0),
+            window_end_ms=int(data.get("window_end_ms", 0) or 0),
+            payload_json=json.dumps(data, default=str),
+        )
+
+    async def _consume_analytics_model_metrics(self, consumer: AIOKafkaConsumer):
+        """Consume Flink model metrics window events."""
+        try:
+            async for message in consumer:
+                try:
+                    data = message.value
+                    metric_entry = self._build_model_performance_entry(data)
+                    self.batch_processors["analytics_model_metrics_1m"].append(
+                        metric_entry
+                    )
+                    await self._notify_observers("analytics_model_metrics_1m", data)
+
+                    PIPELINE_METRICS.messages_consumed.labels(
+                        topic="analytics_model_metrics_1m"
+                    ).inc()
+                except Exception as e:
+                    logger.error(f"Failed to process model metrics event: {e}")
+                    PIPELINE_METRICS.consumer_errors.inc()
+        except Exception as e:
+            logger.error(f"Analytics model metrics consumer error: {e}")
+
+    async def _consume_alerts(self, consumer: AIOKafkaConsumer):
+        """Consume Flink and platform alert events."""
+        try:
+            async for message in consumer:
+                try:
+                    data = message.value
+                    alert_entry = self._build_alert_event_entry(data)
+                    self.batch_processors["alerts"].append(alert_entry)
+                    await self._notify_observers("alerts", data)
+
+                    PIPELINE_METRICS.messages_consumed.labels(topic="alerts").inc()
+                except Exception as e:
+                    logger.error(f"Failed to process alert event: {e}")
+                    PIPELINE_METRICS.consumer_errors.inc()
+        except Exception as e:
+            logger.error(f"Alert consumer error: {e}")
+
     async def _batch_processor(self):
         """Process batches periodically"""
         while self.running:
             try:
                 current_time = time.time()
+                reached_batch_size = any(
+                    len(batch) >= self.batch_size
+                    for batch in self.batch_processors.values()
+                )
+                batch_timeout_elapsed = current_time - self.last_batch_time > 30
 
-                # Process query logs batch
-                if (
-                    len(self.batch_processors["queries"]) >= self.batch_size
-                    or current_time - self.last_batch_time > 30
-                ):
-                    await self.flush_pending_batches(include_metrics=False)
-
-                # Process metrics batch
-                if (
-                    len(self.batch_processors["metrics"]) >= self.batch_size
-                    or current_time - self.last_batch_time > 30
-                ):
-                    await self.flush_pending_batches(include_queries=False)
+                if reached_batch_size or batch_timeout_elapsed:
+                    await self.flush_pending_batches()
 
                 # Update last batch time
-                if current_time - self.last_batch_time > 30:
+                if batch_timeout_elapsed:
                     self.last_batch_time = current_time
 
                 await asyncio.sleep(5)  # Check every 5 seconds
@@ -800,19 +1278,29 @@ class KafkaConsumerManager:
 
         await self.flush_pending_batches()
 
-    async def flush_pending_batches(
-        self, include_queries: bool = True, include_metrics: bool = True
-    ):
+    async def flush_pending_batches(self):
         """Flush any pending Kafka batches to ClickHouse immediately"""
-        if include_queries and self.batch_processors["queries"]:
+        if self.batch_processors["queries"]:
             await self.clickhouse.batch_insert_query_logs(
                 self.batch_processors["queries"]
             )
             self.batch_processors["queries"].clear()
 
-        if include_metrics and self.batch_processors["metrics"]:
+        if self.batch_processors["metrics"]:
             await self.clickhouse.batch_insert_metrics(self.batch_processors["metrics"])
             self.batch_processors["metrics"].clear()
+
+        if self.batch_processors["analytics_model_metrics_1m"]:
+            await self.clickhouse.batch_insert_model_performance(
+                self.batch_processors["analytics_model_metrics_1m"]
+            )
+            self.batch_processors["analytics_model_metrics_1m"].clear()
+
+        if self.batch_processors["alerts"]:
+            await self.clickhouse.batch_insert_alert_events(
+                self.batch_processors["alerts"]
+            )
+            self.batch_processors["alerts"].clear()
 
         self.last_batch_time = time.time()
 
@@ -837,6 +1325,10 @@ class KafkaIngestionPipeline:
         self.clickhouse_manager = ClickHouseManager(config.get("clickhouse", {}))
         self.producer_manager = KafkaProducerManager(config)
         self.consumer_manager = None  # Will be initialized after ClickHouse
+        self._stream_handlers: Dict[str, List[Callable[[Dict[str, Any]], Any]]] = {
+            "analytics_model_metrics_1m": [],
+            "alerts": [],
+        }
         self.running = False
 
     async def initialize(self):
@@ -854,6 +1346,9 @@ class KafkaIngestionPipeline:
             self.config, self.clickhouse_manager
         )
         await self.consumer_manager.initialize()
+        for topic_key, callbacks in self._stream_handlers.items():
+            for callback in callbacks:
+                self.consumer_manager.register_observer(topic_key, callback)
 
         logger.info("Kafka ingestion pipeline initialized successfully")
 
@@ -901,6 +1396,28 @@ class KafkaIngestionPipeline:
     async def get_model_performance(self, hours: int = 24) -> List[Dict[str, Any]]:
         """Get model performance from ClickHouse"""
         return await self.clickhouse_manager.get_model_performance(hours)
+
+    def register_stream_handler(
+        self, topic_key: str, callback: Callable[[Dict[str, Any]], Any]
+    ):
+        """Register an in-process handler for consumed stream topics."""
+        self._stream_handlers.setdefault(topic_key, []).append(callback)
+        if self.consumer_manager:
+            self.consumer_manager.register_observer(topic_key, callback)
+
+    def attach_monitoring_service(self, monitoring_service: Any):
+        """Forward consumed analytics streams into the monitoring service."""
+        model_metrics_handler = getattr(
+            monitoring_service, "ingest_stream_model_metrics", None
+        )
+        if callable(model_metrics_handler):
+            self.register_stream_handler(
+                "analytics_model_metrics_1m", model_metrics_handler
+            )
+
+        alert_handler = getattr(monitoring_service, "ingest_stream_alert", None)
+        if callable(alert_handler):
+            self.register_stream_handler("alerts", alert_handler)
 
     async def flush(self):
         """Flush any pending consumer batches to ClickHouse"""

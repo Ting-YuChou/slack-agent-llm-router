@@ -7,12 +7,9 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import numpy as np
-import asyncio
+import os
 import httpx
-import json
-from datetime import datetime, timedelta
+from datetime import datetime
 import time
 from typing import Dict, List, Any, Optional
 
@@ -39,162 +36,171 @@ st.set_page_config(
 # DATA LOADING AND API
 # ============================================================================
 
+DEFAULT_API_BASE_URL = os.getenv(
+    "LLM_ROUTER_DASHBOARD_API_URL", "http://localhost:8080"
+)
+TIME_RANGE_TO_HOURS = {
+    "Last Hour": 1,
+    "Last 6 Hours": 6,
+    "Last 24 Hours": 24,
+    "Last 7 Days": 168,
+}
+MAX_HISTORY_POINTS = 60
+
 class DashboardAPI:
     """Professional API client for dashboard data"""
-    
-    def __init__(self, base_url: str = "http://localhost:8080"):
-        self.base_url = base_url
+
+    def __init__(self, base_url: Optional[str] = None):
+        self.base_url = (base_url or DEFAULT_API_BASE_URL).rstrip("/")
         self.timeout = 10.0
-    
-    async def get_system_health(self) -> Dict[str, Any]:
-        """Get system health status with error handling"""
+
+    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Perform a GET request and normalize failures."""
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.get(f"{self.base_url}/health")
-                return response.json() if response.status_code == 200 else self._get_mock_health()
-        except Exception:
-            return self._get_mock_health()
-    
-    async def get_metrics(self) -> Dict[str, Any]:
-        """Get system metrics with fallback to mock data"""
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.get(f"{self.base_url}/metrics")
-                return response.json() if response.status_code == 200 else self._get_mock_metrics()
-        except Exception:
-            return self._get_mock_metrics()
-    
-    def _get_mock_health(self) -> Dict[str, Any]:
-        """Mock health data for demo purposes"""
-        return {
-            'status': 'healthy',
-            'uptime_seconds': 169920,  # 47.2 hours
-            'cpu_usage_percent': 23.5,
-            'memory_usage_percent': 67.8,
-            'components': {
-                'inference_engine': {'healthy': True},
-                'router': {'healthy': True},
-                'kafka_pipeline': {'healthy': True},
-                'monitoring': {'healthy': True},
-                'slack_bot': {'healthy': True}
-            }
-        }
-    
-    def _get_mock_metrics(self) -> Dict[str, Any]:
-        """Mock metrics data for demo purposes"""
-        return {
-            'total_requests': 24567,
-            'avg_latency_ms': 847,
-            'error_rate': 0.012,
-            'total_cost': 127.45,
-            'cache_hit_rate': 0.783,
-            'success_rate': 0.992
-        }
+            with httpx.Client(timeout=self.timeout) as client:
+                response = client.get(f"{self.base_url}{path}", params=params)
+                response.raise_for_status()
+                return response.json()
+        except Exception as exc:
+            return {"error": str(exc), "path": path}
+
+    def get_dashboard(self, hours: int = 24) -> Dict[str, Any]:
+        """Get live dashboard bundle."""
+        return self._get("/dashboard", params={"hours": hours})
+
+    def get_logs(
+        self,
+        limit: int = 50,
+        level: Optional[str] = None,
+        component: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get recent structured logs."""
+        params: Dict[str, Any] = {"limit": limit}
+        if level and level != "ALL":
+            params["level"] = level
+        if component and component != "ALL":
+            params["component"] = component
+        return self._get("/dashboard/logs", params=params)
+
+
+def build_empty_dashboard_payload(error: Optional[str] = None) -> Dict[str, Any]:
+    """Return an empty dashboard payload when backend data is unavailable."""
+    return {
+        "error": error,
+        "health": {"status": "unknown", "services": {}},
+        "overview": {},
+        "analytics": {},
+        "model_performance": [],
+        "alerts": [],
+        "sources": {},
+        "capabilities": {},
+        "timestamp": time.time(),
+    }
+
 
 @st.cache_data(ttl=30)
-def get_dashboard_data():
-    """Get cached dashboard data"""
+def get_dashboard_data(hours: int) -> Dict[str, Any]:
+    """Get cached live dashboard data."""
     api = DashboardAPI()
-    
+    payload = api.get_dashboard(hours=hours)
+    if payload.get("error"):
+        return build_empty_dashboard_payload(payload["error"])
+    return payload
+
+
+@st.cache_data(ttl=15)
+def get_dashboard_logs(limit: int, level: str, component: str) -> Dict[str, Any]:
+    """Get cached live dashboard logs."""
+    api = DashboardAPI()
+    payload = api.get_logs(limit=limit, level=level, component=component)
+    if payload.get("error"):
+        return {"error": payload["error"], "logs": []}
+    return payload
+
+
+def safe_number(value: Any, default: float = 0.0) -> float:
+    """Convert a possibly missing metric to float."""
+    if value is None:
+        return default
     try:
-        return {
-            'health': api._get_mock_health(),
-            'metrics': api._get_mock_metrics(),
-            'model_performance': get_mock_model_data(),
-            'analytics': get_mock_analytics_data()
-        }
-    except Exception as e:
-        st.error(f"Error loading data: {e}")
-        return {}
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
-def get_mock_model_data() -> List[Dict[str, Any]]:
-    """Mock model performance data"""
-    return [
-        {
-            'model_name': 'GPT-5',
-            'status': 'online',
-            'requests': 12450,
-            'success_rate': 98.7,
-            'avg_latency_ms': 1234,
-            'total_cost': 89.23,
-            'efficiency': 85
-        },
-        {
-            'model_name': 'Claude 3.5 Sonnet',
-            'status': 'online',
-            'requests': 8920,
-            'success_rate': 99.2,
-            'avg_latency_ms': 987,
-            'total_cost': 34.56,
-            'efficiency': 92
-        },
-        {
-            'model_name': 'Mistral 7B',
-            'status': 'online',
-            'requests': 3197,
-            'success_rate': 97.1,
-            'avg_latency_ms': 456,
-            'total_cost': 3.66,
-            'efficiency': 94
-        },
-        {
-            'model_name': 'Llama 3.1 70B',
-            'status': 'degraded',
-            'requests': 1245,
-            'success_rate': 95.8,
-            'avg_latency_ms': 2156,
-            'total_cost': 12.34,
-            'efficiency': 76
-        }
-    ]
 
-def get_mock_analytics_data() -> Dict[str, Any]:
-    """Mock analytics data"""
-    return {
-        'query_type_breakdown': {
-            'general': 45,
-            'code_generation': 30,
-            'analysis': 15,
-            'summarization': 10
-        },
-        'model_cost_breakdown': {
-            'GPT-4 Turbo': 89.23,
-            'Claude 3.5 Sonnet': 34.56,
-            'Mistral 7B': 3.66
-        },
-        'user_tier_distribution': {
-            'Free': 85,
-            'Premium': 12,
-            'Enterprise': 3
+def format_optional_number(
+    value: Any,
+    decimals: int = 1,
+    suffix: str = "",
+    prefix: str = "",
+) -> str:
+    """Format optional numeric values for tables and cards."""
+    if value is None:
+        return "-"
+
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return "-"
+
+    if decimals == 0:
+        formatted = f"{numeric_value:,.0f}"
+    else:
+        formatted = f"{numeric_value:,.{decimals}f}"
+
+    return f"{prefix}{formatted}{suffix}"
+
+
+def update_live_history(data: Dict[str, Any]):
+    """Track live dashboard snapshots across refreshes."""
+    history = st.session_state.setdefault("dashboard_history", [])
+    overview = data.get("overview", {})
+    sample_timestamp = float(data.get("timestamp", time.time()) or time.time())
+    if history and abs(history[-1]["sample_timestamp"] - sample_timestamp) < 1:
+        return
+
+    history.append(
+        {
+            "sample_timestamp": sample_timestamp,
+            "label": datetime.fromtimestamp(sample_timestamp).strftime("%H:%M:%S"),
+            "total_requests": safe_number(overview.get("total_requests")),
+            "avg_latency_ms": safe_number(overview.get("avg_latency_ms")),
+            "total_cost": safe_number(overview.get("total_cost")),
+            "cache_hit_rate": safe_number(overview.get("cache_hit_rate")) * 100,
         }
-    }
+    )
+    st.session_state.dashboard_history = history[-MAX_HISTORY_POINTS:]
 
 # ============================================================================
 # CHART CREATION FUNCTIONS
 # ============================================================================
 
-def create_professional_line_chart(data: List[float], title: str, color: str = "#3b82f6") -> go.Figure:
-    """Create professional line chart with gradient fill"""
-    hours = list(range(24))
-    
+def create_professional_line_chart(
+    x_values: List[Any],
+    y_values: List[float],
+    title: str,
+    color: str = "#3b82f6",
+    x_title: str = "Sample",
+):
+    """Create professional line chart with gradient fill."""
     fig = go.Figure()
-    
-    # Add gradient fill
+
     fig.add_trace(go.Scatter(
-        x=hours,
-        y=data,
-        mode='lines',
+        x=x_values,
+        y=y_values,
+        mode='lines+markers',
         line=dict(color=color, width=3, shape='spline'),
-        fill='tonexty',
+        fill='tozeroy',
         fillcolor=f'rgba({int(color[1:3], 16)}, {int(color[3:5], 16)}, {int(color[5:7], 16)}, 0.1)',
+        marker=dict(size=7),
         name=title,
         showlegend=False
     ))
-    
+
     fig.update_layout(
         title=dict(text=title, font=dict(size=18, family="Inter", weight=600)),
         xaxis=dict(
-            title="Hour of Day",
+            title=x_title,
             showgrid=True,
             gridcolor='#f1f5f9',
             showline=False
@@ -211,6 +217,35 @@ def create_professional_line_chart(data: List[float], title: str, color: str = "
         height=320
     )
     
+    return fig
+
+
+def create_professional_bar_chart(
+    frame: pd.DataFrame,
+    x_field: str,
+    y_field: str,
+    title: str,
+    color: str = "#3b82f6",
+) -> go.Figure:
+    """Create professional bar chart."""
+    fig = px.bar(
+        frame,
+        x=x_field,
+        y=y_field,
+        color_discrete_sequence=[color],
+    )
+
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=18, family="Inter", weight=600)),
+        plot_bgcolor='transparent',
+        paper_bgcolor='transparent',
+        font=dict(family="Inter", size=12, color='#475569'),
+        showlegend=False,
+        margin=dict(t=60, r=20, b=40, l=40),
+        height=320,
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True, gridcolor='#f1f5f9')
     return fig
 
 def create_professional_pie_chart(values: List[float], labels: List[str], title: str) -> go.Figure:
@@ -280,39 +315,68 @@ def render_sidebar():
             index=2
         )
         
-        # Auto-refresh toggle
-        auto_refresh = st.checkbox("Auto Refresh (30s)", value=True)
+        st.caption("Dashboard responses are cached for 30 seconds. Use Refresh Now to fetch a new snapshot.")
         
         # Manual refresh button
         if st.button("🔄 Refresh Now", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
-        
+
+        return page, time_range
+
+
+def render_sidebar_status(data: Dict[str, Any]):
+    """Render live sidebar status after dashboard data loads."""
+    health = data.get("health", {})
+    services = health.get("services", {})
+    capabilities = data.get("capabilities", {})
+    sources = data.get("sources", {})
+    status = health.get("status", "unknown")
+
+    status_color = {
+        "healthy": "#10b981",
+        "unhealthy": "#ef4444",
+        "unknown": "#f59e0b",
+    }.get(status, "#f59e0b")
+    status_label = {
+        "healthy": "Operational",
+        "unhealthy": "Degraded",
+        "unknown": "Unavailable",
+    }.get(status, "Unavailable")
+
+    active_services = sum(1 for service_ok in services.values() if service_ok)
+    total_services = len(services)
+    active_models = len(data.get("model_performance", []))
+    analytics_source = sources.get("analytics", "unavailable").replace("_", " ")
+    pipeline_state = "enabled" if capabilities.get("pipeline_analytics") else "disabled"
+
+    with st.sidebar:
         st.markdown("---")
-        
-        # System status
-        st.markdown("""
+        st.markdown(f"""
         <div style="background: #f1f5f9; padding: 20px; border-radius: 12px;">
             <div style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 8px;">
                 <span style="color: #94a3b8; font-weight: 500;">System Status</span>
-                <span style="font-weight: 600; color: #10b981;">● Operational</span>
+                <span style="font-weight: 600; color: {status_color};">● {status_label}</span>
             </div>
             <div style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 8px;">
-                <span style="color: #94a3b8; font-weight: 500;">Uptime</span>
-                <span style="font-weight: 600; color: #0f172a;">99.9%</span>
+                <span style="color: #94a3b8; font-weight: 500;">Services Healthy</span>
+                <span style="font-weight: 600; color: #0f172a;">{active_services}/{total_services}</span>
             </div>
             <div style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 8px;">
-                <span style="color: #94a3b8; font-weight: 500;">Active Models</span>
-                <span style="font-weight: 600; color: #0f172a;">4/4</span>
+                <span style="color: #94a3b8; font-weight: 500;">Visible Models</span>
+                <span style="font-weight: 600; color: #0f172a;">{active_models}</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 8px;">
+                <span style="color: #94a3b8; font-weight: 500;">Analytics Source</span>
+                <span style="font-weight: 600; color: #0f172a;">{analytics_source}</span>
             </div>
             <div style="display: flex; justify-content: space-between; font-size: 13px;">
-                <span style="color: #94a3b8; font-weight: 500;">Version</span>
-                <span style="font-weight: 600; color: #0f172a;">v2.1.0</span>
+                <span style="color: #94a3b8; font-weight: 500;">Pipeline</span>
+                <span style="font-weight: 600; color: #0f172a;">{pipeline_state}</span>
             </div>
         </div>
         """, unsafe_allow_html=True)
-        
-        return page, time_range, auto_refresh
+        st.caption(f"API: `{DEFAULT_API_BASE_URL}`")
 
 def render_header():
     """Render professional header"""
@@ -338,129 +402,177 @@ def render_header():
 
 def render_key_metrics(data: Dict[str, Any]):
     """Render key metrics cards"""
-    metrics = data.get('metrics', {})
-    
+    metrics = data.get('overview', {})
+
     col1, col2, col3, col4, col5 = st.columns(5)
-    
+
     with col1:
         st.metric(
-            "Total Requests",
-            f"{metrics.get('total_requests', 0):,}",
-            delta="+12.3% vs yesterday",
-            delta_color="normal"
+            "Requests",
+            format_optional_number(metrics.get('total_requests'), decimals=0),
         )
-    
+
     with col2:
         st.metric(
             "Avg Response Time",
-            f"{metrics.get('avg_latency_ms', 0):.0f}ms",
-            delta="-8.2% vs yesterday",
-            delta_color="inverse"
+            format_optional_number(metrics.get('avg_latency_ms'), decimals=0, suffix="ms"),
         )
-    
+
     with col3:
-        success_rate = metrics.get('success_rate', 0) * 100
         st.metric(
             "Success Rate",
-            f"{success_rate:.1f}%",
-            delta="+0.3% vs yesterday",
-            delta_color="normal"
+            format_optional_number(
+                safe_number(metrics.get('success_rate')) * 100,
+                decimals=1,
+                suffix="%",
+            ),
         )
-    
+
     with col4:
         st.metric(
-            "Daily Cost",
-            f"${metrics.get('total_cost', 0):.2f}",
-            delta="+5.1% vs yesterday",
-            delta_color="inverse"
+            "Cost",
+            format_optional_number(metrics.get('total_cost'), decimals=2, prefix="$"),
         )
-    
+
     with col5:
-        cache_rate = metrics.get('cache_hit_rate', 0) * 100
         st.metric(
             "Cache Hit Rate",
-            f"{cache_rate:.1f}%",
-            delta="+2.1% vs yesterday",
-            delta_color="normal"
+            format_optional_number(
+                safe_number(metrics.get('cache_hit_rate')) * 100,
+                decimals=1,
+                suffix="%",
+            ),
         )
 
 def render_charts(data: Dict[str, Any]):
     """Render performance charts"""
-    st.markdown("### 📈 Performance Analytics")
-    
+    st.markdown("### 📈 Live Performance Analytics")
+
     col1, col2 = st.columns(2)
-    
-    # Generate sample data
-    hours = list(range(24))
-    requests_data = [np.random.poisson(100) + 50 for _ in hours]
-    latency_data = [np.random.normal(800, 200) for _ in hours]
-    
+    history = st.session_state.get("dashboard_history", [])
+    model_data = data.get("model_performance", [])
+
     with col1:
-        fig_requests = create_professional_line_chart(
-            requests_data, 
-            "Request Volume", 
-            "#3b82f6"
-        )
-        st.plotly_chart(fig_requests, use_container_width=True)
-    
+        if len(history) >= 2:
+            fig_requests = create_professional_line_chart(
+                [point["label"] for point in history],
+                [point["total_requests"] for point in history],
+                "Requests Across Refresh Samples",
+                "#3b82f6",
+                x_title="Refresh Sample",
+            )
+            st.plotly_chart(fig_requests, use_container_width=True)
+        elif model_data:
+            df = pd.DataFrame(model_data).sort_values("requests", ascending=False)
+            fig_requests = create_professional_bar_chart(
+                df,
+                "model_name",
+                "requests",
+                "Requests by Model",
+                "#3b82f6",
+            )
+            st.plotly_chart(fig_requests, use_container_width=True)
+        else:
+            st.info("No live request volume data available yet.")
+
     with col2:
-        fig_latency = create_professional_line_chart(
-            latency_data, 
-            "Response Times", 
-            "#8b5cf6"
-        )
-        st.plotly_chart(fig_latency, use_container_width=True)
+        if len(history) >= 2:
+            fig_latency = create_professional_line_chart(
+                [point["label"] for point in history],
+                [point["avg_latency_ms"] for point in history],
+                "Latency Across Refresh Samples",
+                "#8b5cf6",
+                x_title="Refresh Sample",
+            )
+            st.plotly_chart(fig_latency, use_container_width=True)
+        elif model_data:
+            latency_frame = pd.DataFrame(
+                [row for row in model_data if row.get("avg_latency_ms") is not None]
+            )
+            if not latency_frame.empty:
+                fig_latency = create_professional_bar_chart(
+                    latency_frame.sort_values("avg_latency_ms", ascending=False),
+                    "model_name",
+                    "avg_latency_ms",
+                    "Latency by Model (ms)",
+                    "#8b5cf6",
+                )
+                st.plotly_chart(fig_latency, use_container_width=True)
+            else:
+                st.info("Per-model latency is available when ClickHouse analytics are enabled.")
+        else:
+            st.info("No live latency data available yet.")
 
 def render_model_performance(data: Dict[str, Any]):
     """Render model performance table"""
     st.markdown("### 🤖 Model Performance")
-    st.markdown("**Real-time performance metrics across all models**")
-    
+    st.markdown("**Live performance metrics across the models visible to this dashboard**")
+    st.caption(
+        f"Source: `{data.get('sources', {}).get('model_performance', 'unavailable')}`"
+    )
+
     model_data = data.get('model_performance', [])
     if model_data:
         df = pd.DataFrame(model_data)
-        
-        # Format the dataframe
-        df['requests'] = df['requests'].apply(lambda x: f"{x:,}")
-        df['success_rate'] = df['success_rate'].apply(lambda x: f"{x:.1f}%")
-        df['avg_latency_ms'] = df['avg_latency_ms'].apply(lambda x: f"{x:,}ms")
-        df['total_cost'] = df['total_cost'].apply(lambda x: f"${x:.2f}")
-        df['efficiency'] = df['efficiency'].apply(lambda x: f"{x}%")
-        
-        # Add status indicators
-        def format_status(status):
-            if status == 'online':
-                return "🟢 Online"
-            elif status == 'degraded':
-                return "🟡 Degraded"
-            else:
-                return "🔴 Offline"
-        
-        df['status'] = df['status'].apply(format_status)
-        
-        # Rename columns
-        df.columns = ['Model', 'Status', 'Requests', 'Success Rate', 'Avg Latency', 'Cost', 'Efficiency']
-        
+        df['requests'] = df['requests'].apply(
+            lambda value: format_optional_number(value, decimals=0)
+        )
+        df['success_rate'] = df['success_rate'].apply(
+            lambda value: format_optional_number(value, decimals=1, suffix="%")
+        )
+        df['avg_latency_ms'] = df['avg_latency_ms'].apply(
+            lambda value: format_optional_number(value, decimals=0, suffix="ms")
+        )
+        df['tokens_per_second'] = df['tokens_per_second'].apply(
+            lambda value: format_optional_number(value, decimals=1)
+        )
+        df['error_count'] = df['error_count'].apply(
+            lambda value: format_optional_number(value, decimals=0)
+        )
+        df['total_cost'] = df['total_cost'].apply(
+            lambda value: format_optional_number(value, decimals=2, prefix="$")
+        )
+        df = df.rename(
+            columns={
+                'model_name': 'Model',
+                'requests': 'Requests',
+                'success_rate': 'Success Rate',
+                'avg_latency_ms': 'Avg Latency',
+                'tokens_per_second': 'Tokens / Sec',
+                'error_count': 'Errors',
+                'total_cost': 'Cost',
+                'source': 'Source',
+            }
+        )
         st.dataframe(df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No model performance data is currently available.")
 
 def render_analytics_charts(data: Dict[str, Any]):
     """Render analytics pie charts"""
     st.markdown("### 📊 Distribution Analytics")
-    
+    st.caption(f"Source: `{data.get('sources', {}).get('analytics', 'unavailable')}`")
+
     analytics = data.get('analytics', {})
-    
+
     col1, col2, col3 = st.columns(3)
-    
+
     with col1:
-        query_data = analytics.get('query_type_breakdown', {})
-        if query_data:
+        primary_breakdown = analytics.get('query_type_breakdown') or analytics.get(
+            'model_request_distribution', {}
+        )
+        if primary_breakdown:
             fig = create_professional_pie_chart(
-                list(query_data.values()),
-                list(query_data.keys()),
+                list(primary_breakdown.values()),
+                list(primary_breakdown.keys()),
                 "Query Distribution"
+                if analytics.get('query_type_breakdown')
+                else "Model Request Mix",
             )
             st.plotly_chart(fig, use_container_width=True)
-    
+        else:
+            st.info("No query distribution data available.")
+
     with col2:
         cost_data = analytics.get('model_cost_breakdown', {})
         if cost_data:
@@ -470,7 +582,9 @@ def render_analytics_charts(data: Dict[str, Any]):
                 "Cost Breakdown"
             )
             st.plotly_chart(fig, use_container_width=True)
-    
+        else:
+            st.info("No model cost data available.")
+
     with col3:
         user_data = analytics.get('user_tier_distribution', {})
         if user_data:
@@ -480,13 +594,116 @@ def render_analytics_charts(data: Dict[str, Any]):
                 "User Tiers"
             )
             st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No user tier data available.")
 
-def render_alerts():
+def render_alerts(data: Dict[str, Any]):
     """Render system alerts"""
     st.markdown("### 🚨 System Alerts")
-    
-    st.success("✅ **System Healthy** - All services operating within normal parameters")
-    st.warning("⚠️ **High Latency Detected** - Llama 3.1 70B showing elevated response times (2.1s avg)")
+    st.caption(f"Source: `{data.get('sources', {}).get('alerts', 'unavailable')}`")
+
+    alerts = data.get("alerts", [])
+    if not alerts:
+        st.success("✅ No active alerts detected in live metrics.")
+        return
+
+    severity_rank = {"critical": 0, "warning": 1, "info": 2}
+    sorted_alerts = sorted(
+        alerts,
+        key=lambda alert: severity_rank.get(alert.get("severity", "info"), 3),
+    )
+
+    for alert in sorted_alerts[:10]:
+        severity = alert.get("severity", "info")
+        timestamp = alert.get("timestamp") or "unknown time"
+        message = (
+            f"**{alert.get('title', 'Alert')}** - {alert.get('description', 'No details')}"
+            f"\n\nSource: `{alert.get('source', 'unknown')}` • Timestamp: `{timestamp}`"
+        )
+        if severity == "critical":
+            st.error(message)
+        elif severity == "warning":
+            st.warning(message)
+        else:
+            st.info(message)
+
+
+def render_data_availability_notice(data: Dict[str, Any]):
+    """Show data availability or backend connectivity notices."""
+    if data.get("error"):
+        st.error(
+            "Dashboard backend is unavailable. "
+            f"API: `{DEFAULT_API_BASE_URL}`\n\n{data['error']}"
+        )
+        return
+
+    capabilities = data.get("capabilities", {})
+    partial_reasons = []
+    if not capabilities.get("pipeline_analytics"):
+        partial_reasons.append(
+            "detailed query and model analytics are limited because the pipeline service is not active in this backend process"
+        )
+    if not capabilities.get("monitoring"):
+        partial_reasons.append(
+            "alert history is limited to threshold-based checks because the monitoring service is disabled"
+        )
+    if not capabilities.get("logs"):
+        partial_reasons.append(
+            "the configured structured log file is not present, so the Logs page may be empty"
+        )
+
+    if partial_reasons:
+        st.info("Live dashboard connected. " + "; ".join(partial_reasons) + ".")
+
+
+def render_logs_page():
+    """Render live structured logs page."""
+    st.markdown("### 📋 System Logs")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        log_level = st.selectbox("Log Level", ["ALL", "ERROR", "WARNING", "INFO", "DEBUG"])
+    with col2:
+        component = st.selectbox(
+            "Component",
+            ["ALL", "api", "main", "inference", "router", "pipeline", "monitoring", "slack", "bot"],
+        )
+    with col3:
+        log_count = st.slider("Number of logs", 10, 100, 50)
+
+    log_payload = get_dashboard_logs(log_count, log_level, component)
+    if log_payload.get("error"):
+        st.error(
+            "Unable to load structured logs from the backend.\n\n"
+            f"{log_payload['error']}"
+        )
+        return
+
+    logs = log_payload.get("logs", [])
+    if not logs:
+        st.info("No log entries matched the current filters.")
+        return
+
+    for log in logs:
+        level_color = {
+            "ERROR": "#ef4444",
+            "WARNING": "#f59e0b",
+            "INFO": "#3b82f6",
+            "DEBUG": "#6b7280",
+        }.get(log.get("level"), "#000000")
+        timestamp = log.get("timestamp") or "-"
+        request_id = log.get("request_id") or "-"
+
+        st.markdown(f"""
+        <div style="border-left: 4px solid {level_color}; padding: 12px; margin: 8px 0;
+                   background: #f8fafc; font-family: monospace; font-size: 13px; border-radius: 4px;">
+            <strong>{timestamp}</strong>
+            <span style="color: {level_color}; font-weight: bold;">[{log.get('level', 'INFO')}]</span>
+            <span style="color: #64748b;">{log.get('component', 'app')}</span> -
+            {log.get('message', '')}<br>
+            <small style="color: #94a3b8;">Request ID: {request_id}</small>
+        </div>
+        """, unsafe_allow_html=True)
 
 # ============================================================================
 # MAIN APPLICATION
@@ -494,31 +711,26 @@ def render_alerts():
 
 def main():
     """Main application function"""
-    
+
     # Load professional styling
     load_professional_css()
-    
-    # Auto-refresh functionality
-    if 'last_refresh' not in st.session_state:
-        st.session_state.last_refresh = time.time()
-    
+
     # Sidebar
-    page, time_range, auto_refresh = render_sidebar()
-    
-    # Auto-refresh logic
-    if auto_refresh:
-        current_time = time.time()
-        if current_time - st.session_state.last_refresh > 30:  # 30 seconds
-            st.session_state.last_refresh = current_time
-            st.rerun()
-    
+    page, time_range = render_sidebar()
+    hours = TIME_RANGE_TO_HOURS.get(time_range, 24)
+
     # Main content area
     render_header()
-    
+
     # Load data
     with st.spinner("Loading dashboard data..."):
-        data = get_dashboard_data()
-    
+        data = get_dashboard_data(hours)
+
+    render_sidebar_status(data)
+    render_data_availability_notice(data)
+    if not data.get("error"):
+        update_live_history(data)
+
     # Render based on selected page
     if page == "📊 Overview":
         render_key_metrics(data)
@@ -527,79 +739,35 @@ def main():
         st.markdown("---")
         render_model_performance(data)
         st.markdown("---")
-        render_alerts()
+        render_alerts(data)
         st.markdown("---")
         render_analytics_charts(data)
-    
+
     elif page == "🤖 Models":
         render_model_performance(data)
         st.markdown("---")
         render_analytics_charts(data)
-    
+
     elif page == "⚡ Performance":
         render_charts(data)
         st.markdown("---")
         render_key_metrics(data)
-    
+
     elif page == "👥 Users":
         st.markdown("### 👥 User Analytics")
-        st.info("User analytics view - showing user activity and engagement metrics")
+        st.info("Live user distribution and engagement metrics from the dashboard backend.")
         render_analytics_charts(data)
-    
+
     elif page == "💰 Costs":
         st.markdown("### 💰 Cost Analytics")
-        st.info("Cost optimization view - detailed cost breakdown and efficiency metrics")
+        st.info("Live cost distribution based on the models visible to this dashboard.")
         render_analytics_charts(data)
-    
+
     elif page == "🚨 Alerts":
-        render_alerts()
-        st.markdown("---")
-        st.markdown("### Alert Configuration")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.slider("CPU Alert Threshold (%)", 50, 100, 80)
-            st.slider("Memory Alert Threshold (%)", 50, 100, 80)
-        with col2:
-            st.slider("Error Rate Threshold (%)", 1, 20, 5)
-            st.slider("Latency Threshold (ms)", 500, 10000, 2000)
-        
-        if st.button("Update Alert Settings", use_container_width=True):
-            st.success("Alert settings updated successfully!")
-    
+        render_alerts(data)
+
     elif page == "📋 Logs":
-        st.markdown("### 📋 System Logs")
-        
-        # Log filters
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            log_level = st.selectbox("Log Level", ["ALL", "ERROR", "WARNING", "INFO", "DEBUG"])
-        with col2:
-            component = st.selectbox("Component", ["ALL", "inference", "router", "pipeline", "slack"])
-        with col3:
-            log_count = st.slider("Number of logs", 10, 100, 50)
-        
-        # Sample logs
-        sample_logs = [
-            {"time": "14:25:32", "level": "INFO", "component": "inference", "message": "Model inference completed successfully", "id": "req-abc123"},
-            {"time": "14:23:15", "level": "WARNING", "component": "router", "message": "High latency detected for model gpt-5", "id": "req-abc122"},
-            {"time": "14:22:48", "level": "INFO", "component": "slack", "message": "Message processed for user user-789", "id": "req-abc121"},
-            {"time": "14:20:12", "level": "ERROR", "component": "pipeline", "message": "Failed to insert batch to ClickHouse", "id": "req-abc120"},
-        ]
-        
-        for log in sample_logs[:log_count]:
-            level_color = {"ERROR": "#ef4444", "WARNING": "#f59e0b", "INFO": "#3b82f6", "DEBUG": "#6b7280"}.get(log["level"], "#000000")
-            
-            st.markdown(f"""
-            <div style="border-left: 4px solid {level_color}; padding: 12px; margin: 8px 0; 
-                       background: #f8fafc; font-family: monospace; font-size: 13px; border-radius: 4px;">
-                <strong>{log['time']}</strong> 
-                <span style="color: {level_color}; font-weight: bold;">[{log['level']}]</span>
-                <span style="color: #64748b;">{log['component']}</span> - 
-                {log['message']}<br>
-                <small style="color: #94a3b8;">Request ID: {log['id']}</small>
-            </div>
-            """, unsafe_allow_html=True)
+        render_logs_page()
 
 if __name__ == "__main__":
     main()

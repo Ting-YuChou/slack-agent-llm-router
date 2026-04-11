@@ -17,6 +17,8 @@ logging:
 router:
   default_model: mistral-7b
   routing_strategy: intelligent
+  fast_lane_models:
+  - claude-3.5-sonnet
   models:
     gpt-5:
       provider: openai
@@ -60,6 +62,11 @@ router:
       - analysis
       gpu_memory_gb: 80
   routing_rules:
+  - condition: user_tier == 'enterprise'
+    models:
+    - claude-3.5-sonnet
+    - gpt-5
+    fallback: claude-3.5-sonnet
   - condition: query_type == 'code_generation'
     models:
     - gpt-5
@@ -118,6 +125,12 @@ kafka:
     queries: llm-queries
     responses: llm-responses
     metrics: llm-metrics
+    requests_raw: requests.raw
+    inference_completed: inference.completed
+    requests_enriched: requests.enriched
+    fast_lane_hints: fast_lane_hints
+    analytics_model_metrics_1m: analytics.model_metrics_1m
+    alerts: alerts
     errors: llm-errors
   producer:
     acks: all
@@ -168,6 +181,7 @@ monitoring:
   health_checks:
     interval_seconds: 30
     timeout_seconds: 10
+  stream_metrics_staleness_seconds: 300
   enabled: false
 slack:
   enabled: false
@@ -199,6 +213,18 @@ flink:
   job_manager_port: 8081
   parallelism: 4
   checkpointing_interval_ms: 5000
+policy_cache:
+  enabled: false
+  request_ttl_seconds: 300
+  user_ttl_seconds: 900
+  local_cache_ttl_seconds: 5
+  redis:
+    host: localhost
+    port: 6379
+    db: 1
+    key_prefix: routing_policy
+  consumer:
+    group_id: llm-router-policy-materializer
 security:
   api_keys:
     enabled: true

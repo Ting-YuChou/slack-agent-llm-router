@@ -901,9 +901,15 @@ class BatchProcessor:
 class InferenceEngine:
     """Main inference engine coordinating all providers"""
 
-    def __init__(self, config: Dict[str, Any], router: ModelRouter):
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        router: ModelRouter,
+        event_producer: Optional[Any] = None,
+    ):
         self.config = config
         self.router = router
+        self.event_producer = event_producer
         self.providers = {}
         self.context_compressor = ContextCompressor(config.get("compression", {}))
         self.cache = ResponseCache(config.get("cache", {}))
@@ -960,7 +966,13 @@ class InferenceEngine:
             if cached_response:
                 logger.info(f"Cache hit for request {request_id}")
                 cached_response["cached"] = True
-                return InferenceResponse(**cached_response)
+                response = InferenceResponse(**cached_response)
+                await self._publish_inference_completed_event(
+                    request,
+                    response,
+                    routing_decision=routing_decision,
+                )
+                return response
 
             # Step 3: Context compression if needed
             compressed_context = False
@@ -1014,6 +1026,11 @@ class InferenceEngine:
                 model=model_name, provider=response.provider
             ).observe(inference_time)
 
+            await self._publish_inference_completed_event(
+                request,
+                response,
+                routing_decision=routing_decision,
+            )
             return response
 
         except Exception as e:
@@ -1036,7 +1053,7 @@ class InferenceEngine:
             logger.error(f"Inference failed for request {request_id}: {e}")
 
             # Return error response
-            return InferenceResponse(
+            error_response = InferenceResponse(
                 response_text=f"Error processing request: {str(e)}",
                 model_name=routing_decision.selected_model
                 if "routing_decision" in locals()
@@ -1051,6 +1068,14 @@ class InferenceEngine:
                 cached=False,
                 error=str(e),
             )
+            await self._publish_inference_completed_event(
+                request,
+                error_response,
+                routing_decision=routing_decision
+                if "routing_decision" in locals()
+                else None,
+            )
+            return error_response
 
     async def stream_query(self, request: QueryRequest) -> AsyncIterator[str]:
         """Stream query response"""
@@ -1084,6 +1109,25 @@ class InferenceEngine:
 
         provider_name = model_info["config"]["provider"]
         return self.providers.get(provider_name)
+
+    async def _publish_inference_completed_event(
+        self,
+        request: QueryRequest,
+        response: InferenceResponse,
+        routing_decision: Optional[Any] = None,
+    ):
+        """Best-effort publication of post-inference completion events."""
+        if not self.event_producer:
+            return
+
+        publish_method = getattr(self.event_producer, "produce_inference_completed", None)
+        if publish_method is None:
+            return
+
+        try:
+            await publish_method(request, response, routing_decision)
+        except Exception as exc:
+            logger.warning(f"Failed to publish inference completion event: {exc}")
 
     async def _update_stats(
         self, model_name: str, response: InferenceResponse, inference_time: float

@@ -312,14 +312,20 @@ class TokenCounter:
 class ModelRouter:
     """Main router class for intelligent model selection"""
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], policy_cache: Optional[Any] = None):
         self.config = config
+        self.policy_cache = policy_cache
         self.models: Dict[str, ModelConfig] = {}
         self.routing_rules: List[RoutingRule] = []
         self.classifier = QueryClassifier()
         self.token_counter = TokenCounter()
         self.default_model = config.get("default_model", "mistral-7b")
         self.routing_strategy = config.get("routing_strategy", "intelligent")
+        self.fast_lane_models: List[str] = list(config.get("fast_lane_models", []))
+        self.fast_lane_providers: List[str] = [
+            provider.lower()
+            for provider in config.get("fast_lane_providers", ["vllm"])
+        ]
 
         # Performance tracking
         self.model_stats: Dict[str, Dict[str, float]] = {}
@@ -331,6 +337,8 @@ class ModelRouter:
     async def initialize(self):
         """Initialize the router and its components"""
         await self.classifier.initialize()
+        if self.policy_cache and hasattr(self.policy_cache, "initialize"):
+            await self.policy_cache.initialize()
         logger.info("Model router initialized successfully")
 
     def _load_models(self):
@@ -437,10 +445,51 @@ class ModelRouter:
             "timestamp": time.time(),
         }
 
+        policy_context = await self._get_policy_context(request)
+        context.update(policy_context)
+
         return context
+
+    async def _get_policy_context(self, request: QueryRequest) -> Dict[str, Any]:
+        """Load request/user-level routing hints from the shared policy cache."""
+        if not self.policy_cache:
+            return {
+                "policy_source": "none",
+                "route_to_fast_lane": False,
+                "preferred_models": [],
+                "hint_reason": None,
+            }
+
+        get_policy = getattr(self.policy_cache, "get_effective_policy", None)
+        if not callable(get_policy):
+            return {
+                "policy_source": "none",
+                "route_to_fast_lane": False,
+                "preferred_models": [],
+                "hint_reason": None,
+            }
+
+        try:
+            policy = await get_policy(request.request_id, request.user_id)
+        except Exception as e:
+            logger.warning(f"Failed to load routing policy for request {request.request_id}: {e}")
+            policy = {}
+
+        return {
+            "policy_source": policy.get("policy_source", "none"),
+            "route_to_fast_lane": bool(policy.get("route_to_fast_lane", False)),
+            "preferred_models": list(policy.get("preferred_models", []) or []),
+            "hint_reason": policy.get("hint_reason"),
+            "policy_priority": policy.get("priority"),
+            "policy_query_type": policy.get("query_type"),
+        }
 
     async def _intelligent_routing(self, context: Dict[str, Any]) -> ModelSelection:
         """Intelligent routing based on query analysis and rules"""
+        policy_selection = self._policy_based_routing(context)
+        if policy_selection is not None:
+            return policy_selection
+
         # Apply rule-based routing first
         for rule in self.routing_rules:
             if rule.matches(context):
@@ -457,22 +506,46 @@ class ModelRouter:
         # Fallback to capability-based routing
         return self._capability_based_routing(context)
 
+    def _policy_based_routing(self, context: Dict[str, Any]) -> Optional[ModelSelection]:
+        """Prefer low-latency local models when policy cache marks a request/user hot."""
+        preferred_models = [
+            model_name
+            for model_name in context.get("preferred_models", [])
+            if model_name in self.models
+        ]
+        policy_source = context.get("policy_source", "none")
+        route_to_fast_lane = bool(context.get("route_to_fast_lane", False))
+
+        if not preferred_models and not route_to_fast_lane:
+            return None
+
+        candidates = list(preferred_models)
+        if route_to_fast_lane:
+            for model_name in self._get_fast_lane_candidates():
+                if model_name not in candidates:
+                    candidates.append(model_name)
+
+        suitable_models = self._filter_models_for_context(candidates, context)
+        if not suitable_models:
+            return None
+
+        selected_model = self._select_best_model(suitable_models, context)
+        hint_reason = context.get("hint_reason") or "fast-lane promotion"
+        confidence = 0.97 if policy_source == "request" else 0.92
+
+        return ModelSelection(
+            model_name=selected_model,
+            confidence=confidence,
+            reason=(
+                f"Policy-cache selection ({policy_source}): {hint_reason}"
+            ),
+        )
+
     def _capability_based_routing(self, context: Dict[str, Any]) -> ModelSelection:
         """Route based on model capabilities and query requirements"""
-        query_type = context["query_type"]
-        token_count = context["token_count"]
-        user_tier = context["user_tier"]
-
-        # Filter models by capability
-        suitable_models = []
-        for model_name, model_config in self.models.items():
-            # Check if model has required capability
-            if self._has_capability(model_config, query_type):
-                # Check token limits
-                if token_count <= model_config.max_tokens:
-                    # Check user tier access
-                    if self._check_user_access(model_config, user_tier):
-                        suitable_models.append(model_name)
+        suitable_models = self._filter_models_for_context(
+            list(self.models.keys()), context
+        )
 
         if not suitable_models:
             return ModelSelection(
@@ -486,6 +559,40 @@ class ModelRouter:
         return ModelSelection(
             model_name=best_model, confidence=0.8, reason="Capability-based selection"
         )
+
+    def _filter_models_for_context(
+        self, candidate_models: List[str], context: Dict[str, Any]
+    ) -> List[str]:
+        """Filter candidate models against capability, token, and tier constraints."""
+        query_type = context["query_type"]
+        token_count = context["token_count"]
+        user_tier = context["user_tier"]
+
+        suitable_models = []
+        for model_name in candidate_models:
+            model_config = self.models.get(model_name)
+            if not model_config:
+                continue
+            if not self._has_capability(model_config, query_type):
+                continue
+            if token_count > model_config.max_tokens:
+                continue
+            if not self._check_user_access(model_config, user_tier):
+                continue
+            suitable_models.append(model_name)
+
+        return suitable_models
+
+    def _get_fast_lane_candidates(self) -> List[str]:
+        """Resolve the configured fast-lane models for synchronous low-latency routing."""
+        if self.fast_lane_models:
+            return [model_name for model_name in self.fast_lane_models if model_name in self.models]
+
+        candidates = []
+        for model_name, model_config in self.models.items():
+            if model_config.provider.lower() in self.fast_lane_providers:
+                candidates.append(model_name)
+        return candidates
 
     def _has_capability(self, model_config: ModelConfig, query_type: str) -> bool:
         """Check if model has capability for query type"""
@@ -679,4 +786,5 @@ class ModelRouter:
             "routing_strategy": self.routing_strategy,
             "model_stats": self.model_stats,
             "active_rules": len(self.routing_rules),
+            "policy_cache_enabled": bool(self.policy_cache),
         }
