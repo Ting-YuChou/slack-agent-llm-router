@@ -30,11 +30,11 @@ TEST_CONFIG = {
                 'max_tokens': 4096,
                 'capabilities': ['text']
             },
-            'claude-3.5-sonnet': {
+            'claude-sonnet-4-6': {
                 'provider': 'anthropic',
                 'priority': 2,
                 'cost_per_token': 0.000003,
-                'max_tokens': 200000,
+                'max_tokens': 1000000,
                 'capabilities': ['text', 'analysis']
             },
             'mistral-7b': {
@@ -47,7 +47,7 @@ TEST_CONFIG = {
         },
         'routing_rules': {
             'general': 'gpt-3.5-turbo',
-            'analysis': 'claude-3.5-sonnet',
+            'analysis': 'claude-sonnet-4-6',
             'code_generation': 'mistral-7b',
             'summarization': 'gpt-3.5-turbo'
         }
@@ -214,7 +214,7 @@ def sample_inference_responses():
         ),
         InferenceResponse(
             response_text="Based on the Q3 sales data analysis...",
-            model_name="claude-3.5-sonnet",
+            model_name="claude-sonnet-4-6",
             token_count_input=500,
             token_count_output=800,
             latency_ms=3000,
