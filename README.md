@@ -57,21 +57,32 @@ The Slack bot no longer replies to every channel message.
 It responds only to:
 
 - `app_mention`
-- slash commands such as `/llm ...`
+- slash commands such as `/llm help` and free-form queries such as `/llm explain this error`
 - replies inside an active bot thread
+
+Allowed Slack channels can be configured by channel name or channel ID.
+
+Slack file attachments on message / mention events are converted into `QueryRequest.attachments`.
+Files up to the configured size limit are downloaded with the bot token; text-like files are inlined into provider prompts, while larger or binary files keep metadata and private URLs only.
+
+Slack tiering:
+
+- `slack.user_tiers.overrides` maps Slack user IDs to `free` / `premium` / `enterprise`
+- `slack.rate_limiting.by_tier` applies tier-specific hourly and burst limits
+- model visibility respects the routed model's tier access rules
 
 Slack state backends:
 
 - `memory`: process-local only
-- `file`: persists to a local JSON file
-- `redis`: recommended for durable multi-process state
+- `file`: persists a JSON snapshot to the configured path
+- `redis`: persists per-user, per-rate-limit, per-conversation, and per-thread keys for multi-process durability
 
-State includes:
+Persisted Slack state includes:
 
 - user tier and preferences
 - rate-limit counters
 - conversation history
-- per-user query history and lightweight analytics
+- active bot thread tracking
 
 ## Quick Start
 
@@ -166,7 +177,7 @@ Important defaults in `config/config.yaml`:
 
 - API auth enabled with `X-API-Key`
 - Redis cache enabled for inference responses
-- Slack state backend set to `redis`
+- Slack state backend defaults to `memory` and can be switched to `file` or `redis`
 - pipeline disabled by default for host-run config
 - Streamlit enabled in host config, but not started by root compose
 

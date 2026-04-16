@@ -194,3 +194,77 @@ class TestModelRouter:
 
         assert decision.selected_model == "claude-3.5-sonnet"
         assert "Policy-cache selection" in decision.routing_reason
+
+    @pytest.mark.asyncio
+    async def test_route_query_normalizes_enum_user_tier_for_rule_matching(
+        self, router_config
+    ):
+        premium_router_config = dict(router_config)
+        premium_router_config["routing_rules"] = [
+            {
+                "condition": "user_tier == 'premium'",
+                "models": ["gpt-5"],
+                "fallback": "mistral-7b",
+            }
+        ]
+
+        router = ModelRouter(premium_router_config)
+        router.classifier.classify_query = lambda _query: (QueryType.ANALYSIS, 0.95)
+        router.token_counter.count_tokens = lambda _query, _model="default": 128
+        router.model_stats["gpt-5"] = {"success_rate": 0.99, "avg_latency": 500}
+
+        request = QueryRequest(
+            query="Analyze this architecture",
+            user_id="u1",
+            user_tier=UserTier.PREMIUM,
+        )
+
+        decision = await router.route_query(request)
+
+        assert decision.selected_model == "gpt-5"
+        assert "Rule-based selection" in decision.routing_reason
+
+    @pytest.mark.asyncio
+    async def test_route_query_respects_request_metadata_preferred_models(self):
+        router = ModelRouter(
+            {
+                "default_model": "mistral-7b",
+                "routing_strategy": "intelligent",
+                "models": {
+                    "claude-3.5-sonnet": {
+                        "provider": "anthropic",
+                        "max_tokens": 200000,
+                        "cost_per_token": 0.000015,
+                        "priority": 2,
+                        "capabilities": ["reasoning", "analysis"],
+                        "api_key_env": "ANTHROPIC_API_KEY",
+                    },
+                    "mistral-7b": {
+                        "provider": "vllm",
+                        "model_path": "/models/mistral",
+                        "max_tokens": 4096,
+                        "cost_per_token": 0.0,
+                        "priority": 3,
+                        "capabilities": ["general", "analysis"],
+                        "gpu_memory_gb": 16,
+                    },
+                },
+                "routing_rules": [],
+            }
+        )
+        router.classifier.classify_query = lambda _query: (QueryType.ANALYSIS, 0.95)
+        router.token_counter.count_tokens = lambda _query, _model="default": 128
+        router.model_stats["claude-3.5-sonnet"] = {"success_rate": 0.99, "avg_latency": 700}
+        router.model_stats["mistral-7b"] = {"success_rate": 0.90, "avg_latency": 100}
+
+        request = QueryRequest(
+            query="Analyze the attached incidents",
+            user_id="premium-user",
+            user_tier=UserTier.PREMIUM,
+            metadata={"preferred_models": ["claude-3.5-sonnet"]},
+        )
+
+        decision = await router.route_query(request)
+
+        assert decision.selected_model == "claude-3.5-sonnet"
+        assert "Policy-cache selection" in decision.routing_reason

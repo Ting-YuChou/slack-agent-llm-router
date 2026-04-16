@@ -170,9 +170,19 @@ class DummyMonitoring:
 
 
 class DummySlackBot:
-    def __init__(self, config, inference_engine):
+    def __init__(
+        self,
+        config,
+        inference_engine,
+        router=None,
+        monitoring_service=None,
+        analytics_service=None,
+    ):
         self.config = config
         self.inference_engine = inference_engine
+        self.router = router
+        self.monitoring_service = monitoring_service
+        self.analytics_service = analytics_service
 
     async def initialize(self):
         return None

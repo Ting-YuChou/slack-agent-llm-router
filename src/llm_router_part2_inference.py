@@ -23,7 +23,12 @@ from transformers import AutoTokenizer
 from src.llm_router_part1_router import ModelRouter
 from src.utils.logger import setup_logging
 from src.utils.metrics import INFERENCE_METRICS
-from src.utils.schema import QueryRequest, InferenceResponse, ModelConfig
+from src.utils.schema import (
+    AttachmentType,
+    QueryRequest,
+    InferenceResponse,
+    ModelConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -342,6 +347,19 @@ class ResponseCache:
 class BaseInferenceProvider(ABC):
     """Abstract base class for inference providers"""
 
+    ATTACHMENT_PROMPT_CHAR_LIMIT = 12_000
+    ATTACHMENT_PREVIEW_CHAR_LIMIT = 4_000
+    TEXT_MIME_MARKERS = (
+        "text/",
+        "json",
+        "csv",
+        "xml",
+        "yaml",
+        "yml",
+        "markdown",
+        "javascript",
+    )
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.client = None
@@ -369,6 +387,95 @@ class BaseInferenceProvider(ABC):
     def get_health_status(self) -> Dict[str, Any]:
         """Get provider health status"""
         pass
+
+    def _build_prompt(self, request: QueryRequest) -> str:
+        """Build a provider prompt that includes context plus extracted attachment content."""
+        prompt_sections = []
+
+        response_style_instructions = (request.metadata or {}).get(
+            "response_style_instructions"
+        )
+        if response_style_instructions:
+            prompt_sections.append(f"Response style instructions:\n{response_style_instructions}")
+
+        prompt = request.query
+        attachment_prompt = self._build_attachment_prompt(request)
+        if attachment_prompt:
+            prompt = f"{prompt}\n\n{attachment_prompt}"
+        if request.context:
+            prompt_sections.append(f"Context: {request.context}")
+        prompt_sections.append(f"Query: {prompt}")
+        return "\n\n".join(prompt_sections)
+
+    def _build_attachment_prompt(self, request: QueryRequest) -> str:
+        """Render attachment metadata and extracted text into the provider prompt."""
+        if not request.attachments:
+            return ""
+
+        sections = [
+            "Use the following attachment data when it is relevant to the user's request:"
+        ]
+        remaining_chars = self.ATTACHMENT_PROMPT_CHAR_LIMIT
+
+        for index, attachment in enumerate(request.attachments, start=1):
+            header = (
+                f"[Attachment {index}] {attachment.name} "
+                f"({attachment.mime_type}, {attachment.size_bytes} bytes)"
+            )
+            sections.append(header)
+
+            extracted_text = self._extract_attachment_text(attachment)
+            if not extracted_text:
+                sections.append(
+                    "Binary attachment metadata only. No text could be extracted automatically."
+                )
+                continue
+
+            excerpt_limit = min(self.ATTACHMENT_PREVIEW_CHAR_LIMIT, remaining_chars)
+            if excerpt_limit <= 0:
+                sections.append("Additional extracted text omitted because the prompt limit was reached.")
+                break
+
+            excerpt = extracted_text[:excerpt_limit]
+            if len(extracted_text) > excerpt_limit:
+                excerpt = f"{excerpt}\n...[truncated]"
+            sections.append(f"Content excerpt:\n{excerpt}")
+            remaining_chars -= len(excerpt)
+
+        return "\n\n".join(sections)
+
+    def _extract_attachment_text(self, attachment) -> Optional[str]:
+        """Decode text-like attachment content into a prompt-safe string."""
+        if not attachment.content or not self._is_text_attachment(attachment):
+            return None
+
+        for encoding in ("utf-8", "utf-8-sig", "latin-1"):
+            try:
+                decoded = attachment.content.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+
+            normalized = decoded.strip()
+            if not normalized:
+                return None
+
+            printable = sum(
+                1 for character in normalized if character.isprintable() or character in "\n\r\t"
+            )
+            if printable / max(len(normalized), 1) < 0.85:
+                continue
+            return normalized
+
+        return None
+
+    def _is_text_attachment(self, attachment) -> bool:
+        """Return whether an attachment is safe to inline as text."""
+        mime_type = (attachment.mime_type or "").lower()
+        if attachment.type != AttachmentType.DOCUMENT:
+            return False
+        return mime_type.startswith("text/") or any(
+            marker in mime_type for marker in self.TEXT_MIME_MARKERS
+        )
 
     async def generate_batch_responses(
         self, requests: List[QueryRequest], model_name: str
@@ -401,10 +508,11 @@ class OpenAIProvider(BaseInferenceProvider):
         start_time = time.time()
 
         try:
+            prompt = self._build_prompt(request)
             response = await self.client.responses.create(
                 model=model_name,
-                input=request.query,
-                instructions=request.context or None,
+                input=prompt,
+                instructions=None,
                 max_output_tokens=request.max_tokens,
                 temperature=request.temperature,
                 user=request.user_id,
@@ -437,10 +545,11 @@ class OpenAIProvider(BaseInferenceProvider):
     ) -> AsyncIterator[str]:
         """Stream response using OpenAI API"""
         try:
+            prompt = self._build_prompt(request)
             async with self.client.responses.stream(
                 model=model_name,
-                input=request.query,
-                instructions=request.context or None,
+                input=prompt,
+                instructions=None,
                 max_output_tokens=request.max_tokens,
                 temperature=request.temperature,
                 user=request.user_id,
@@ -501,10 +610,7 @@ class AnthropicProvider(BaseInferenceProvider):
         start_time = time.time()
 
         try:
-            # Prepare prompt
-            prompt = request.query
-            if request.context:
-                prompt = f"Context: {request.context}\n\nQuery: {request.query}"
+            prompt = self._build_prompt(request)
 
             # Make API call
             response = await self.client.messages.create(
@@ -541,9 +647,7 @@ class AnthropicProvider(BaseInferenceProvider):
     ) -> AsyncIterator[str]:
         """Stream response using Anthropic API"""
         try:
-            prompt = request.query
-            if request.context:
-                prompt = f"Context: {request.context}\n\nQuery: {request.query}"
+            prompt = self._build_prompt(request)
 
             async with self.client.messages.stream(
                 model=model_name,
@@ -623,10 +727,7 @@ class vLLMProvider(BaseInferenceProvider):
         start_time = time.time()
 
         try:
-            # Prepare request payload
-            prompt = request.query
-            if request.context:
-                prompt = f"{request.context}\n\n{request.query}"
+            prompt = self._build_prompt(request)
 
             payload = {
                 "model": model_name,
@@ -671,9 +772,7 @@ class vLLMProvider(BaseInferenceProvider):
     ) -> AsyncIterator[str]:
         """Stream response using vLLM"""
         try:
-            prompt = request.query
-            if request.context:
-                prompt = f"{request.context}\n\n{request.query}"
+            prompt = self._build_prompt(request)
 
             payload = {
                 "model": model_name,
