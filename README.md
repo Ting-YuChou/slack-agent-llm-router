@@ -60,18 +60,23 @@ It responds only to:
 - slash commands such as `/llm ...`
 - replies inside an active bot thread
 
+Allowed Slack channels can be configured by channel name or channel ID.
+
+Slack file attachments on message / mention events are converted into `QueryRequest.attachments`.
+Files up to the configured size limit are downloaded with the bot token; larger files keep metadata and private URLs only.
+
 Slack state backends:
 
 - `memory`: process-local only
-- `file`: persists to a local JSON file
-- `redis`: recommended for durable multi-process state
+- `file`: persists a JSON snapshot to the configured path
+- `redis`: persists per-user, per-rate-limit, per-conversation, and per-thread keys for multi-process durability
 
-State includes:
+Persisted Slack state includes:
 
 - user tier and preferences
 - rate-limit counters
 - conversation history
-- per-user query history and lightweight analytics
+- active bot thread tracking
 
 ## Quick Start
 
@@ -166,7 +171,7 @@ Important defaults in `config/config.yaml`:
 
 - API auth enabled with `X-API-Key`
 - Redis cache enabled for inference responses
-- Slack state backend set to `redis`
+- Slack state backend defaults to `memory` and can be switched to `file` or `redis`
 - pipeline disabled by default for host-run config
 - Streamlit enabled in host config, but not started by root compose
 
