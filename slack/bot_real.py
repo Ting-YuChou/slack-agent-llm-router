@@ -425,14 +425,27 @@ class ConversationContext:
 class UserManager:
     """Manages user data and preferences"""
 
-    def __init__(self):
+    def __init__(
+        self,
+        default_tier: str = UserTier.FREE.value,
+        tier_overrides: Optional[Dict[str, str]] = None,
+    ):
+        self.default_tier = self._normalize_tier_name(default_tier)
+        self.tier_overrides = {
+            user_id: self._normalize_tier_name(tier_name)
+            for user_id, tier_name in (tier_overrides or {}).items()
+        }
         self.users = {}  # In production, use a database
         self.rate_limits = {}
 
     def get_user_tier(self, user_id: str) -> UserTier:
         """Get user tier from user data"""
         user_data = self.users.get(user_id, {})
-        tier_name = user_data.get("tier", "free")
+        tier_name = (
+            user_data.get("tier")
+            or self.tier_overrides.get(user_id)
+            or self.default_tier
+        )
 
         try:
             return UserTier(tier_name)
@@ -497,6 +510,37 @@ class UserManager:
 
         self.users[user_id]["preferences"].update(preferences)
         self.users[user_id]["updated_at"] = datetime.now().isoformat()
+
+    def ensure_user_record(self, user_id: str) -> bool:
+        """Apply configured tier defaults/overrides to the in-memory user record."""
+        if not user_id:
+            return False
+
+        previous_tier = self.users.get(user_id, {}).get("tier")
+        resolved_tier = self.tier_overrides.get(user_id)
+        if resolved_tier is None and previous_tier is None and self.default_tier != UserTier.FREE.value:
+            resolved_tier = self.default_tier
+
+        if resolved_tier is None:
+            return False
+
+        if user_id not in self.users:
+            self.users[user_id] = {}
+
+        if previous_tier == resolved_tier:
+            return False
+
+        self.users[user_id]["tier"] = resolved_tier
+        self.users[user_id]["updated_at"] = datetime.now().isoformat()
+        return True
+
+    def _normalize_tier_name(self, tier_name: Optional[str]) -> str:
+        """Normalize tier names used in config and persisted user state."""
+        normalized = (tier_name or UserTier.FREE.value).strip().lower()
+        try:
+            return UserTier(normalized).value
+        except ValueError:
+            return UserTier.FREE.value
 
 
 class ConversationManager:
@@ -606,6 +650,24 @@ class SlackMessageHandler:
             "clear": self._handle_clear_command,
         }
 
+    def extract_prefixed_command_text(self, text: str) -> Optional[str]:
+        """Strip inline `/llm` / `!llm` prefixes while preserving the raw payload."""
+        normalized = (text or "").strip()
+        for prefix in ("/llm", "!llm"):
+            if normalized == prefix:
+                return ""
+            if normalized.startswith(f"{prefix} "):
+                return normalized[len(prefix) :].strip()
+        return None
+
+    def is_supported_command(self, command_text: str) -> bool:
+        """Return whether the first token maps to a supported Slack command."""
+        normalized = (command_text or "").strip()
+        if not normalized:
+            return True
+        command_name = normalized.split(maxsplit=1)[0].lower()
+        return command_name in self.commands
+
     async def handle_message(
         self, event: Dict[str, Any], client: AsyncWebClient
     ) -> Optional[str]:
@@ -620,9 +682,16 @@ class SlackMessageHandler:
         if not text and not attachments:
             return await self._handle_help_command([], user_id, channel_id, client)
 
-        if text.startswith("/llm ") or text.startswith("!llm "):
-            command_text = text[5:].strip()
-            return await self._handle_command(command_text, user_id, channel_id, client)
+        command_text = self.extract_prefixed_command_text(text)
+        if command_text is not None:
+            return await self._handle_command_or_query(
+                command_text,
+                user_id,
+                channel_id,
+                thread_ts,
+                client,
+                attachments=attachments,
+            )
 
         if not text and attachments:
             text = self._build_attachment_only_query(attachments)
@@ -637,10 +706,35 @@ class SlackMessageHandler:
             attachments=attachments,
         )
 
-    async def _handle_command(
-        self, command_text: str, user_id: str, channel_id: str, client: AsyncWebClient
+    async def _handle_command_or_query(
+        self,
+        command_text: str,
+        user_id: str,
+        channel_id: str,
+        thread_ts: Optional[str],
+        client: AsyncWebClient,
+        attachments: Optional[List[Attachment]] = None,
     ) -> str:
-        """Handle bot commands"""
+        """Handle inline `/llm` / `!llm` payloads as commands or free-form queries."""
+        return await self._handle_command(
+            command_text,
+            user_id,
+            channel_id,
+            thread_ts,
+            client,
+            attachments=attachments or [],
+        )
+
+    async def _handle_command(
+        self,
+        command_text: str,
+        user_id: str,
+        channel_id: str,
+        thread_ts: Optional[str],
+        client: AsyncWebClient,
+        attachments: Optional[List[Attachment]] = None,
+    ) -> str:
+        """Handle bot commands, falling back to a free-form query when appropriate."""
         parts = command_text.split()
         if not parts:
             return await self._handle_help_command([], user_id, channel_id, client)
@@ -650,8 +744,14 @@ class SlackMessageHandler:
 
         if command in self.commands:
             return await self.commands[command](args, user_id, channel_id, client)
-        else:
-            return f"Unknown command: `{command}`. Type `/llm help` for available commands."
+        return await self._handle_query(
+            command_text,
+            user_id,
+            channel_id,
+            thread_ts,
+            client,
+            attachments=attachments,
+        )
 
     async def _handle_help_command(
         self, args: List[str], user_id: str, channel_id: str, client: AsyncWebClient
@@ -685,9 +785,7 @@ Mention me in a channel, use `/llm ...`, or reply inside an active bot thread.
 ✅ Usage analytics and cost tracking
 
 *User Tiers:*
-🆓 Free: Basic models, 100 requests/hour
-💎 Premium: All models, 500 requests/hour, priority support
-🏢 Enterprise: Custom limits, dedicated resources
+{self.bot._format_tier_limit_summary()}
         """
         return help_text.strip()
 
@@ -737,7 +835,24 @@ Mention me in a channel, use `/llm ...`, or reply inside an active bot thread.
             elif setting_name == "threading":
                 user_prefs["threading"] = setting_value.lower() in ["on", "true", "yes"]
             elif setting_name == "preferred_models":
-                models = [m.strip() for m in setting_value.split(",")]
+                normalized_value = setting_value.strip().lower()
+                if normalized_value in {"auto", "none", "clear"}:
+                    models = []
+                else:
+                    models = [m.strip() for m in setting_value.split(",") if m.strip()]
+                    if not models:
+                        return "Invalid preferred_models value. Use a comma-separated model list or `auto` to clear."
+
+                    available_models = set(getattr(getattr(self.bot, "router", None), "models", {}))
+                    if available_models:
+                        unknown_models = [
+                            model_name for model_name in models if model_name not in available_models
+                        ]
+                        if unknown_models:
+                            return (
+                                "Unknown model(s): "
+                                + ", ".join(f"`{model_name}`" for model_name in unknown_models)
+                            )
                 user_prefs["preferred_models"] = models
             else:
                 return f"Invalid setting: `{setting_name}` or value: `{setting_value}`"
@@ -920,6 +1035,18 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             )
 
             # Create query request
+            conversation_id_builder = getattr(
+                self.bot, "_conversation_context_key", None
+            )
+            if callable(conversation_id_builder):
+                conversation_id = conversation_id_builder(
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    thread_ts=thread_ts,
+                )
+            else:
+                conversation_id = f"{user_id}:{channel_id}:{thread_ts or 'main'}"
+
             query_request = QueryRequest(
                 query=text,
                 user_id=user_id,
@@ -929,11 +1056,14 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 temperature=0.7,
                 priority=1 if user_tier != UserTier.FREE else 3,
                 attachments=attachments or [],
+                session_id=context.session_id,
+                conversation_id=conversation_id,
                 metadata=(
                     self.bot._build_query_metadata(
                         channel_id=channel_id,
                         thread_ts=thread_ts,
                         attachments=attachments or [],
+                        user_preferences=user_prefs,
                     )
                     if hasattr(self.bot, "_build_query_metadata")
                     else {}
@@ -942,6 +1072,19 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
 
             # Process through inference engine
             response = await self.bot.inference_engine.process_query(query_request)
+
+            if getattr(response, "error", None):
+                logger.error(
+                    "Slack query failed for user %s in channel %s: %s",
+                    user_id,
+                    channel_id,
+                    response.error,
+                )
+                SLACK_METRICS.errors.labels(error_type="inference_error_response").inc()
+                error_builder = getattr(self.bot, "_build_user_safe_error_message", None)
+                if callable(error_builder):
+                    return error_builder()
+                return "❌ Sorry, I couldn't process that request right now. Please try again in a moment."
 
             # Add to conversation history
             context.add_message("user", text)
@@ -956,7 +1099,10 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         except Exception as e:
             logger.error(f"Error processing query: {e}")
             SLACK_METRICS.errors.labels(error_type=type(e).__name__).inc()
-            return f"❌ Sorry, I encountered an error processing your request: {str(e)}"
+            error_builder = getattr(self.bot, "_build_user_safe_error_message", None)
+            if callable(error_builder):
+                return error_builder()
+            return "❌ Sorry, I couldn't process that request right now. Please try again in a moment."
 
     def _get_max_tokens_for_user(
         self, user_tier: UserTier, preferences: Dict[str, Any]
@@ -1002,8 +1148,15 @@ class SlackBot:
         self.monitoring_service = monitoring_service
         self.analytics_service = analytics_service
 
+        tier_settings = config.get("user_tiers", {})
+        default_user_tier = tier_settings.get("default", UserTier.FREE.value)
+        tier_overrides = tier_settings.get("overrides", {})
+
         # Initialize components
-        self.user_manager = UserManager()
+        self.user_manager = UserManager(
+            default_tier=default_user_tier,
+            tier_overrides=tier_overrides,
+        )
         self.conversation_manager = ConversationManager(config)
         self.message_handler = SlackMessageHandler(self)
 
@@ -1179,22 +1332,60 @@ class SlackBot:
             )
             return
 
-        # Process command
+        user_state_changed = self._synchronize_user_tier(user_id)
+        is_supported_command = True
+        message_handler_is_supported_command = getattr(
+            self.message_handler, "is_supported_command", None
+        )
+        if callable(message_handler_is_supported_command):
+            is_supported_command = message_handler_is_supported_command(command_text)
+        if not is_supported_command:
+            rate_limit_config = self._get_rate_limit_config_for_user(user_id)
+            if not self.user_manager.check_rate_limit(user_id, rate_limit_config):
+                await self._post_command_response(
+                    channel_id,
+                    user_id,
+                    self._build_rate_limit_message(user_id),
+                )
+                if user_state_changed:
+                    await self._persist_user_state(user_id)
+                return
+
         response_text = await self.message_handler._handle_command(
-            command_text, user_id, channel_id, self.web_client
+            command_text,
+            user_id,
+            channel_id,
+            None,
+            self.web_client,
         )
 
         await self._post_command_response(channel_id, user_id, response_text)
+        if not is_supported_command:
+            await self._persist_message_state(
+                user_id=user_id,
+                conversation_key=self._conversation_context_key(
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    thread_ts=None,
+                ),
+            )
+        elif user_state_changed:
+            await self._persist_user_state(user_id)
 
     async def _process_message(self, event: Dict[str, Any]):
         """Process incoming message"""
         try:
             channel_id = event.get("channel")
             user_id = event.get("user")
+            user_state_changed = self._synchronize_user_tier(user_id)
+            user_prefs = self.user_manager.get_user_preferences(user_id)
 
             if self._is_query_event(event):
-                if not self.user_manager.check_rate_limit(user_id, self.rate_limiting):
+                rate_limit_config = self._get_rate_limit_config_for_user(user_id)
+                if not self.user_manager.check_rate_limit(user_id, rate_limit_config):
                     await self._send_rate_limit_message(channel_id, user_id)
+                    if user_state_changed:
+                        await self._persist_user_state(user_id)
                     return
 
             attachments = await self._extract_query_attachments(event)
@@ -1209,11 +1400,14 @@ class SlackBot:
             if response_text:
                 # Determine if we should reply in thread
                 thread_ts = None
-                if self.config.get("response_settings", {}).get(
-                    "thread_replies", True
-                ) and event.get("thread_ts"):
+                threading_enabled = user_prefs.get("threading", True)
+                if event.get("thread_ts"):
                     thread_ts = event.get("thread_ts")
-                elif event.get("ts"):
+                elif (
+                    self.config.get("response_settings", {}).get("thread_replies", True)
+                    and threading_enabled
+                    and event.get("ts")
+                ):
                     thread_ts = event.get("ts")
 
                 # Split long responses
@@ -1244,7 +1438,7 @@ class SlackBot:
                     active_thread_key = self._thread_key(channel_id, thread_ts)
 
                 query_event = self._is_query_event(event)
-                if query_event:
+                if query_event or user_state_changed:
                     state_changed = True
 
                 if state_changed:
@@ -1256,7 +1450,7 @@ class SlackBot:
                             thread_ts=event.get("thread_ts") or event.get("ts"),
                         )
                     await self._persist_message_state(
-                        user_id=user_id if query_event else None,
+                        user_id=user_id if (query_event or user_state_changed) else None,
                         conversation_key=conversation_key,
                         active_thread_key=active_thread_key,
                     )
@@ -1265,7 +1459,7 @@ class SlackBot:
             logger.error(f"Error processing message: {e}")
             await self.web_client.chat_postMessage(
                 channel=event.get("channel"),
-                text=f"❌ Sorry, I encountered an error: {str(e)}",
+                text=self._build_user_safe_error_message(),
             )
 
     def _split_response(self, text: str, max_length: int) -> List[str]:
@@ -1322,22 +1516,25 @@ class SlackBot:
 
     async def _send_rate_limit_message(self, channel_id: str, user_id: str):
         """Send rate limit exceeded message"""
-        user_tier = self.user_manager.get_user_tier(user_id)
+        await self.web_client.chat_postMessage(
+            channel=channel_id,
+            text=self._build_rate_limit_message(user_id),
+        )
 
-        message = f"""
+    def _build_rate_limit_message(self, user_id: str) -> str:
+        """Build a tier-aware rate-limit message for Slack responses."""
+        user_tier = self.user_manager.get_user_tier(user_id)
+        limits = self._get_rate_limit_config_for_tier(user_tier)
+        return f"""
 🚫 *Rate Limit Exceeded*
 
 <@{user_id}>, you've reached your hourly request limit.
 
 *Your tier:* {user_tier.value.title()}
+*Hourly limit:* {limits.get('requests_per_hour', 0)}
+*Burst limit:* {limits.get('burst_requests', 0)} requests / 5 min
 *Limit resets:* At the top of each hour
-
-*Upgrade for higher limits:*
-💎 Premium: 500 requests/hour
-🏢 Enterprise: Custom limits
-        """
-
-        await self.web_client.chat_postMessage(channel=channel_id, text=message.strip())
+        """.strip()
 
     async def _cleanup_sessions_periodically(self):
         """Periodically clean up expired sessions"""
@@ -1392,9 +1589,10 @@ class SlackBot:
             for request_time in self.user_manager.rate_limits.get(user_id, [])
             if request_time > rate_limit_window
         ]
+        rate_limit_config = self._get_rate_limit_config_for_user(user_id)
         remaining_requests = max(
             0,
-            self.rate_limiting.get("requests_per_hour", 100) - len(recent_requests),
+            rate_limit_config.get("requests_per_hour", 100) - len(recent_requests),
         )
 
         analytics = {}
@@ -1416,11 +1614,18 @@ class SlackBot:
         if not self.router:
             return []
 
+        user_tier = self.user_manager.get_user_tier(user_id)
+        check_user_access = getattr(self.router, "_check_user_access", None)
         models = []
         for model_name in getattr(self.router, "models", {}):
             model_info = self.router.get_model_info(model_name)
             if not model_info:
                 continue
+
+            model_config = getattr(self.router, "models", {}).get(model_name)
+            if callable(check_user_access) and model_config is not None:
+                if not check_user_access(model_config, user_tier.value):
+                    continue
 
             config = model_info["config"]
             provider_name = config.get("provider", "unknown")
@@ -1656,28 +1861,90 @@ class SlackBot:
             return matching_keys
         return len(matching_keys)
 
+    def _is_supported_inline_command(self, text: str) -> bool:
+        """Return whether inline `/llm` / `!llm` text maps to a supported command."""
+        extract_command_text = getattr(
+            self.message_handler, "extract_prefixed_command_text", None
+        )
+        if not callable(extract_command_text):
+            return False
+        command_text = extract_command_text(text)
+        if command_text is None:
+            return False
+        is_supported_command = getattr(self.message_handler, "is_supported_command", None)
+        if not callable(is_supported_command):
+            return False
+        return is_supported_command(command_text)
+
     def _is_query_text(self, text: str) -> bool:
         """Return whether a Slack message should count against rate limits."""
         normalized = (text or "").strip()
-        return bool(normalized) and not (
-            normalized.startswith("/llm ") or normalized.startswith("!llm ")
-        )
+        if not normalized:
+            return False
+        return not self._is_supported_inline_command(normalized)
 
     def _is_query_event(self, event: Dict[str, Any]) -> bool:
         """Return whether a Slack event should consume query quota."""
         return self._is_query_text(event.get("text", "")) or bool(event.get("files"))
 
+    def _synchronize_user_tier(self, user_id: Optional[str]) -> bool:
+        """Apply configured user-tier defaults/overrides to the in-memory state."""
+        return self.user_manager.ensure_user_record(user_id or "")
+
+    def _get_rate_limit_config_for_tier(self, user_tier: UserTier) -> Dict[str, int]:
+        """Resolve rate-limit settings for a concrete tier."""
+        base_limits = {
+            "requests_per_hour": int(self.rate_limiting.get("requests_per_hour", 100) or 100),
+            "burst_requests": int(self.rate_limiting.get("burst_requests", 5) or 5),
+        }
+        tier_overrides = self.rate_limiting.get("by_tier", {}).get(user_tier.value, {})
+        if isinstance(tier_overrides, dict):
+            for key in ("requests_per_hour", "burst_requests"):
+                if key in tier_overrides:
+                    base_limits[key] = int(tier_overrides[key])
+        return base_limits
+
+    def _get_rate_limit_config_for_user(self, user_id: str) -> Dict[str, int]:
+        """Resolve rate-limit settings for the user's current tier."""
+        return self._get_rate_limit_config_for_tier(self.user_manager.get_user_tier(user_id))
+
+    def _format_tier_limit_summary(self) -> str:
+        """Render the configured tier limits for Slack help text."""
+        summaries = []
+        for tier in (UserTier.FREE, UserTier.PREMIUM, UserTier.ENTERPRISE):
+            limits = self._get_rate_limit_config_for_tier(tier)
+            summaries.append(
+                f"{self._tier_emoji(tier)} {tier.value.title()}: "
+                f"{limits['requests_per_hour']} requests/hour, "
+                f"{limits['burst_requests']} burst requests / 5 min"
+            )
+        return "\n".join(summaries)
+
+    def _tier_emoji(self, tier: UserTier) -> str:
+        if tier == UserTier.PREMIUM:
+            return "💎"
+        if tier == UserTier.ENTERPRISE:
+            return "🏢"
+        return "🆓"
+
     async def _post_command_response(self, channel_id: str, user_id: str, text: str):
         """Respond to a slash command, preferring ephemeral responses."""
+        max_length = self.config.get("response_settings", {}).get(
+            "max_response_length", 2000
+        )
+        responses = self._split_response(text, max_length)
+
         if hasattr(self.web_client, "chat_postEphemeral"):
-            await self.web_client.chat_postEphemeral(
-                channel=channel_id,
-                user=user_id,
-                text=text,
-            )
+            for response_text in responses:
+                await self.web_client.chat_postEphemeral(
+                    channel=channel_id,
+                    user=user_id,
+                    text=response_text,
+                )
             return
 
-        await self.web_client.chat_postMessage(channel=channel_id, text=text)
+        for response_text in responses:
+            await self.web_client.chat_postMessage(channel=channel_id, text=response_text)
 
     def _spawn_background_task(self, coroutine, name: str):
         """Track background tasks so request acks stay fast without losing errors."""
@@ -1721,17 +1988,65 @@ class SlackBot:
         channel_id: str,
         thread_ts: Optional[str],
         attachments: List[Attachment],
+        user_preferences: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Attach Slack-specific metadata to routed queries."""
+        user_preferences = user_preferences or {}
+        preferred_models = [
+            model_name
+            for model_name in user_preferences.get("preferred_models", [])
+            if model_name
+        ]
+        response_style_instructions = self._build_response_style_instructions(
+            user_preferences
+        )
         return {
             "source": "slack",
+            "preferred_models": preferred_models,
+            "response_style_instructions": response_style_instructions,
             "slack": {
                 "channel_id": channel_id,
                 "thread_ts": thread_ts,
                 "attachment_count": len(attachments),
                 "attachment_names": [attachment.name for attachment in attachments],
+                "technical_level": user_preferences.get("technical_level", "intermediate"),
+                "threading": user_preferences.get("threading", True),
+                "response_length": user_preferences.get("response_length", "medium"),
             },
         }
+
+    def _build_response_style_instructions(
+        self, user_preferences: Optional[Dict[str, Any]]
+    ) -> Optional[str]:
+        """Translate Slack user preferences into provider-friendly style instructions."""
+        preferences = user_preferences or {}
+        technical_level = preferences.get("technical_level", "intermediate")
+        response_length = preferences.get("response_length", "medium")
+
+        technical_guidance = {
+            "beginner": "Explain in simple terms, define jargon, and include short practical examples.",
+            "intermediate": "Assume working familiarity with the topic and balance clarity with technical depth.",
+            "expert": "Use precise technical terminology, skip foundational explanations, and focus on advanced detail.",
+        }
+        length_guidance = {
+            "short": "Keep the response concise and focused on the key answer.",
+            "medium": "Use a moderate amount of detail.",
+            "long": "Provide a thorough, detailed answer when the topic warrants it.",
+        }
+
+        instructions = []
+        if technical_level in technical_guidance:
+            instructions.append(technical_guidance[technical_level])
+        if response_length in length_guidance:
+            instructions.append(length_guidance[response_length])
+
+        if not instructions:
+            return None
+        return " ".join(instructions)
+
+    def _build_user_safe_error_message(self) -> str:
+        """Return a generic Slack-safe error message without leaking internals."""
+        return "❌ Sorry, I couldn't process that request right now. Please try again in a moment."
 
     def _conversation_context_key(
         self, user_id: str, channel_id: str, thread_ts: Optional[str]

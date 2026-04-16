@@ -110,6 +110,33 @@ class TestSlackMessageHandler:
         assert bot.user_manager.get_user_preferences("u1")["response_length"] == "long"
 
     @pytest.mark.asyncio
+    async def test_settings_command_validates_and_clears_preferred_models(self):
+        bot = SimpleNamespace(
+            user_manager=UserManager(),
+            router=SimpleNamespace(models={"gpt-5": object(), "mistral-7b": object()}),
+            conversation_manager=ConversationManager({}),
+            inference_engine=SimpleNamespace(process_query=AsyncMock()),
+        )
+        handler = SlackMessageHandler(bot)
+
+        invalid_message = await handler._handle_settings_command(
+            ["preferred_models", "unknown-model"],
+            "u1",
+            "c1",
+            client=None,
+        )
+        cleared_message = await handler._handle_settings_command(
+            ["preferred_models", "auto"],
+            "u1",
+            "c1",
+            client=None,
+        )
+
+        assert "Unknown model" in invalid_message
+        assert "Updated preferred_models" in cleared_message
+        assert bot.user_manager.get_user_preferences("u1")["preferred_models"] == []
+
+    @pytest.mark.asyncio
     async def test_handle_query_updates_history(self, inference_response_factory):
         bot = SimpleNamespace(
             user_manager=UserManager(),
@@ -148,6 +175,70 @@ class TestSlackMessageHandler:
 
         assert free_tokens == 500
         assert enterprise_tokens == 8192
+
+    @pytest.mark.asyncio
+    async def test_handle_query_passes_preference_metadata(self, inference_response_factory):
+        user_manager = UserManager()
+        user_manager.update_user_preferences(
+            "u1",
+            {
+                "technical_level": "expert",
+                "preferred_models": ["gpt-5"],
+                "response_length": "long",
+            },
+        )
+        inference_engine = SimpleNamespace(
+            process_query=AsyncMock(
+                return_value=inference_response_factory(response_text="hello from model")
+            )
+        )
+        bot = SimpleNamespace(
+            user_manager=user_manager,
+            conversation_manager=ConversationManager({}),
+            inference_engine=inference_engine,
+            _build_query_metadata=SlackBot._build_query_metadata,
+            _conversation_context_key=SlackBot._conversation_context_key,
+            _build_response_style_instructions=SlackBot._build_response_style_instructions,
+            _build_user_safe_error_message=lambda: "safe error",
+        )
+        bot._build_query_metadata = bot._build_query_metadata.__get__(bot, SimpleNamespace)
+        bot._conversation_context_key = bot._conversation_context_key.__get__(bot, SimpleNamespace)
+        bot._build_response_style_instructions = bot._build_response_style_instructions.__get__(
+            bot, SimpleNamespace
+        )
+        handler = SlackMessageHandler(bot)
+
+        await handler._handle_query("hello", "u1", "c1", None, client=None)
+
+        request = inference_engine.process_query.await_args.args[0]
+        assert request.metadata["preferred_models"] == ["gpt-5"]
+        assert "advanced detail" in request.metadata["response_style_instructions"]
+        assert request.session_id is not None
+        assert request.conversation_id == "u1:c1:main"
+
+    @pytest.mark.asyncio
+    async def test_handle_query_returns_safe_error_when_engine_returns_error_response(
+        self, inference_response_factory
+    ):
+        bot = SimpleNamespace(
+            user_manager=UserManager(),
+            conversation_manager=ConversationManager({}),
+            inference_engine=SimpleNamespace(
+                process_query=AsyncMock(
+                    return_value=inference_response_factory(
+                        response_text="Error processing request: upstream failure",
+                        provider="error",
+                        error="upstream failure",
+                    )
+                )
+            ),
+            _build_user_safe_error_message=lambda: "safe error",
+        )
+        handler = SlackMessageHandler(bot)
+
+        response = await handler._handle_query("hello", "u1", "c1", None, client=None)
+
+        assert response == "safe error"
 
 
 class TestSlackBot:
@@ -256,6 +347,30 @@ class TestSlackBot:
         bot.message_handler.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_process_message_respects_threading_preference(self, inference_response_factory):
+        inference_engine = SimpleNamespace(
+            process_query=AsyncMock(
+                return_value=inference_response_factory(response_text="threadless response")
+            )
+        )
+        bot = SlackBot({"channels": []}, inference_engine=inference_engine)
+        bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+        bot.user_manager.check_rate_limit = lambda *_args, **_kwargs: True
+        bot.user_manager.update_user_preferences("U1", {"threading": False})
+
+        await bot._process_message(
+            {
+                "channel": "C1",
+                "user": "U1",
+                "text": "hello",
+                "ts": "1700.1",
+            }
+        )
+
+        assert bot.web_client.chat_postMessage.await_args.kwargs["thread_ts"] is None
+        assert bot.active_threads == {}
+
+    @pytest.mark.asyncio
     async def test_slash_command_prefers_ephemeral_response(self):
         bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
         bot.web_client = SimpleNamespace(
@@ -279,6 +394,42 @@ class TestSlackBot:
             text="ok",
         )
         bot.web_client.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_slash_command_routes_free_form_query(self, inference_response_factory):
+        inference_engine = SimpleNamespace(
+            process_query=AsyncMock(
+                return_value=inference_response_factory(response_text="free-form answer")
+            )
+        )
+        bot = SlackBot({"channels": []}, inference_engine=inference_engine)
+        bot.web_client = SimpleNamespace(
+            chat_postEphemeral=AsyncMock(),
+            chat_postMessage=AsyncMock(),
+        )
+
+        await bot._handle_slash_command(
+            {
+                "channel_id": "C1",
+                "channel_name": "general",
+                "user_id": "U1",
+                "text": "write a Python function",
+            }
+        )
+
+        request = inference_engine.process_query.await_args.args[0]
+        assert request.query == "write a Python function"
+        bot.web_client.chat_postEphemeral.assert_awaited_once_with(
+            channel="C1",
+            user="U1",
+            text="free-form answer",
+        )
+
+    def test_inline_prefixed_free_form_queries_consume_quota(self):
+        bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
+
+        assert bot._is_query_event({"text": "!llm write a Python function"}) is True
+        assert bot._is_query_event({"text": "!llm help"}) is False
 
     @pytest.mark.asyncio
     async def test_process_message_passes_resolved_attachments_to_query(
@@ -312,6 +463,40 @@ class TestSlackBot:
 
         request = inference_engine.process_query.await_args.args[0]
         assert request.attachments == [attachment]
+
+    @pytest.mark.asyncio
+    async def test_process_message_uses_tier_specific_rate_limits(self):
+        observed_config = {}
+        bot = SlackBot(
+            {
+                "channels": [],
+                "user_tiers": {"overrides": {"U1": "premium"}},
+                "rate_limiting": {
+                    "requests_per_hour": 100,
+                    "burst_requests": 5,
+                    "by_tier": {
+                        "premium": {
+                            "requests_per_hour": 500,
+                            "burst_requests": 20,
+                        }
+                    },
+                },
+            },
+            inference_engine=SimpleNamespace(),
+        )
+        bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+        bot.message_handler = SimpleNamespace(handle_message=AsyncMock(return_value=None))
+
+        def capture_rate_limit(_user_id, config):
+            observed_config.update(config)
+            return True
+
+        bot.user_manager.check_rate_limit = capture_rate_limit
+
+        await bot._process_message({"channel": "C1", "user": "U1", "text": "hello"})
+
+        assert observed_config == {"requests_per_hour": 500, "burst_requests": 20}
+        assert bot.user_manager.get_user_tier("U1") == UserTier.PREMIUM
 
     @pytest.mark.asyncio
     async def test_attachment_only_message_uses_default_query_text(
@@ -396,6 +581,77 @@ class TestSlackBot:
         assert len(attachments) == 1
         assert attachments[0].content == b"abc"
         assert attachments[0].type == AttachmentType.DOCUMENT
+
+    @pytest.mark.asyncio
+    async def test_get_available_models_filters_by_user_tier(self):
+        class RouterStub:
+            def __init__(self):
+                self.models = {
+                    "mistral-7b": SimpleNamespace(priority=3),
+                    "claude-3.5-sonnet": SimpleNamespace(priority=2),
+                }
+
+            def _check_user_access(self, model_config, user_tier):
+                tier_priorities = {"free": 3, "premium": 2, "enterprise": 1}
+                return model_config.priority >= tier_priorities[user_tier]
+
+            def get_model_info(self, model_name):
+                configs = {
+                    "mistral-7b": {
+                        "provider": "vllm",
+                        "capabilities": ["general"],
+                        "max_tokens": 4096,
+                        "cost_per_token": 0.0,
+                    },
+                    "gpt-5": {
+                        "provider": "openai",
+                        "capabilities": ["analysis"],
+                        "max_tokens": 8192,
+                        "cost_per_token": 0.00003,
+                    },
+                    "claude-3.5-sonnet": {
+                        "provider": "openai",
+                        "capabilities": ["analysis"],
+                        "max_tokens": 8192,
+                        "cost_per_token": 0.00003,
+                    },
+                }
+                return {"config": configs[model_name]}
+
+        healthy_provider = SimpleNamespace(get_health_status=lambda: {"status": "healthy"})
+        inference_engine = SimpleNamespace(
+            providers={"vllm": healthy_provider, "openai": healthy_provider}
+        )
+        bot = SlackBot(
+            {
+                "channels": [],
+                "user_tiers": {"overrides": {"UP": "premium"}},
+            },
+            inference_engine=inference_engine,
+            router=RouterStub(),
+        )
+
+        free_models = await bot.get_available_models("UF")
+        premium_models = await bot.get_available_models("UP")
+
+        assert [model["name"] for model in free_models] == ["mistral-7b"]
+        assert [model["name"] for model in premium_models] == [
+            "mistral-7b",
+            "claude-3.5-sonnet",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_process_message_hides_internal_exception_details(self):
+        bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
+        bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+        bot.user_manager.check_rate_limit = lambda *_args, **_kwargs: True
+        bot.message_handler = SimpleNamespace(handle_message=AsyncMock(side_effect=RuntimeError("boom")))
+
+        await bot._process_message({"channel": "C1", "user": "U1", "text": "hello"})
+
+        message_text = bot.web_client.chat_postMessage.await_args.kwargs["text"]
+        assert "boom" not in message_text
+        assert "couldn't process that request" in message_text
 
 
 class TestSlackStateStores:

@@ -57,13 +57,19 @@ The Slack bot no longer replies to every channel message.
 It responds only to:
 
 - `app_mention`
-- slash commands such as `/llm ...`
+- slash commands such as `/llm help` and free-form queries such as `/llm explain this error`
 - replies inside an active bot thread
 
 Allowed Slack channels can be configured by channel name or channel ID.
 
 Slack file attachments on message / mention events are converted into `QueryRequest.attachments`.
-Files up to the configured size limit are downloaded with the bot token; larger files keep metadata and private URLs only.
+Files up to the configured size limit are downloaded with the bot token; text-like files are inlined into provider prompts, while larger or binary files keep metadata and private URLs only.
+
+Slack tiering:
+
+- `slack.user_tiers.overrides` maps Slack user IDs to `free` / `premium` / `enterprise`
+- `slack.rate_limiting.by_tier` applies tier-specific hourly and burst limits
+- model visibility respects the routed model's tier access rules
 
 Slack state backends:
 
