@@ -3,6 +3,7 @@ Policy cache materialization for Flink routing hints.
 
 This layer keeps Kafka and Flink off the synchronous API path:
 - background workers consume requests.enriched / fast_lane_hints
+- background workers consume routing.guardrails
 - hints are materialized into Redis with a tiny in-process L1 cache
 - API workers read the shared policy cache during routing
 """
@@ -32,13 +33,19 @@ class RoutingPolicyCache:
         self.redis_db = int(redis_config.get("db", 1))
         self.key_prefix = redis_config.get("key_prefix", "routing_policy")
         self.request_ttl_seconds = int(self.config.get("request_ttl_seconds", 300))
+        self.session_ttl_seconds = int(self.config.get("session_ttl_seconds", 600))
         self.user_ttl_seconds = int(self.config.get("user_ttl_seconds", 900))
+        self.guardrail_ttl_seconds = int(self.config.get("guardrail_ttl_seconds", 180))
         self.local_cache_ttl_seconds = int(
             self.config.get("local_cache_ttl_seconds", 5)
         )
         self.redis_client = None
         self._initialized = False
         self._local_cache: Dict[str, Dict[str, Any]] = {}
+        self._local_guardrail_index: Dict[str, set[str]] = {
+            "model": set(),
+            "provider": set(),
+        }
 
     async def initialize(self):
         """Initialize Redis if the policy cache is enabled."""
@@ -67,6 +74,18 @@ class RoutingPolicyCache:
 
     def _cache_key(self, namespace: str, identifier: str) -> str:
         return f"{self.key_prefix}:{namespace}:{identifier}"
+
+    def _guardrail_index_key(self, scope_type: str) -> str:
+        return self._cache_key("guardrails", scope_type)
+
+    def _guardrail_cache_key(self, scope_type: str, identifier: str) -> str:
+        return self._cache_key(f"guardrail:{scope_type}", identifier)
+
+    def _user_hint_cache_key(self, user_id: str) -> str:
+        return self._cache_key("user_hint", user_id)
+
+    def _user_state_cache_key(self, user_id: str) -> str:
+        return self._cache_key("user_state", user_id)
 
     def _local_get(self, cache_key: str) -> Optional[Dict[str, Any]]:
         record = self._local_cache.get(cache_key)
@@ -127,41 +146,93 @@ class RoutingPolicyCache:
         return await self._get_json(self._cache_key("request", request_id))
 
     async def get_user_policy(self, user_id: str) -> Optional[Dict[str, Any]]:
-        """Get user-scoped fast-lane promotions if present."""
+        """Get the merged user-scoped policy view."""
         if not user_id:
             return None
-        return await self._get_json(self._cache_key("user", user_id))
+        user_state_policy = await self.get_user_state_policy(user_id)
+        user_hint_policy = await self.get_user_hint_policy(user_id)
+
+        if user_state_policy and user_hint_policy:
+            return self._merge_policy_records(user_state_policy, user_hint_policy)
+        if user_hint_policy:
+            return user_hint_policy
+        return user_state_policy
+
+    async def get_user_hint_policy(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Get user-scoped fast-lane hint policy if present."""
+        if not user_id:
+            return None
+        return await self._get_json(self._user_hint_cache_key(user_id))
+
+    async def get_user_state_policy(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Get rolling user-scoped policy state if present."""
+        if not user_id:
+            return None
+        return await self._get_json(self._user_state_cache_key(user_id))
+
+    async def get_session_policy(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get session-scoped rolling routing policy if present."""
+        if not session_id:
+            return None
+        return await self._get_json(self._cache_key("session", session_id))
 
     async def get_effective_policy(
-        self, request_id: Optional[str], user_id: Optional[str]
+        self,
+        request_id: Optional[str],
+        user_id: Optional[str],
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Merge request and user policy views for the router hot path."""
+        """Merge request, session, user, and guardrail policy views for the router."""
         request_policy = await self.get_request_policy(request_id or "")
+        session_policy = await self.get_session_policy(session_id or "")
         user_policy = await self.get_user_policy(user_id or "")
-
-        if request_policy and user_policy:
-            merged = dict(user_policy)
-            merged.update(
-                {
-                    key: value
-                    for key, value in request_policy.items()
-                    if value not in (None, "", [], {})
-                }
-            )
-            merged["policy_source"] = "request+user"
-            return merged
-
-        if request_policy:
-            request_policy = dict(request_policy)
-            request_policy["policy_source"] = "request"
-            return request_policy
+        active_guardrails = await self.get_active_guardrails()
+        merged: Dict[str, Any] = {}
+        policy_sources: List[str] = []
 
         if user_policy:
-            user_policy = dict(user_policy)
-            user_policy["policy_source"] = "user"
-            return user_policy
+            merged = dict(user_policy)
+            policy_sources.append("user")
+        if session_policy:
+            merged = self._merge_policy_records(merged, session_policy)
+            policy_sources.append("session")
+        if request_policy:
+            merged = self._merge_policy_records(merged, request_policy)
+            policy_sources.append("request")
 
-        return {}
+        if policy_sources:
+            merged["policy_source"] = "+".join(reversed(policy_sources))
+            merged.update(active_guardrails)
+            return merged
+
+        return dict(active_guardrails)
+
+    def _merge_policy_records(
+        self, base_policy: Dict[str, Any], override_policy: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Merge request and user policies while preserving list semantics."""
+        merged = dict(base_policy)
+        list_fields = {
+            "preferred_models",
+            "avoid_models",
+            "avoid_providers",
+        }
+
+        for key, value in override_policy.items():
+            if value in (None, "", [], {}):
+                continue
+
+            if key in list_fields:
+                combined = []
+                for item in list(value) + list(merged.get(key, []) or []):
+                    if item not in combined:
+                        combined.append(item)
+                merged[key] = combined
+                continue
+
+            merged[key] = value
+
+        return merged
 
     async def materialize_request_enriched(self, event: Dict[str, Any]):
         """Materialize requests.enriched events into request/user caches."""
@@ -180,7 +251,20 @@ class RoutingPolicyCache:
             "priority": priority,
             "route_to_fast_lane": route_to_fast_lane,
             "query_type": event.get("query_type"),
-            "preferred_models": [],
+            "query_complexity": event.get("query_complexity"),
+            "requires_low_latency": bool(event.get("requires_low_latency", False)),
+            "requires_high_reasoning": bool(
+                event.get("requires_high_reasoning", False)
+            ),
+            "long_context": bool(event.get("long_context", False)),
+            "attachment_heavy": bool(event.get("attachment_heavy", False)),
+            "code_heavy": bool(event.get("code_heavy", False)),
+            "session_hotness": event.get("session_hotness"),
+            "cost_sensitivity": event.get("cost_sensitivity"),
+            "error_sensitivity": event.get("error_sensitivity"),
+            "preferred_models": list(event.get("preferred_models", []) or []),
+            "avoid_models": list(event.get("avoid_models", []) or []),
+            "avoid_providers": list(event.get("avoid_providers", []) or []),
             "hint_reason": event.get("enrichment_stage", "priority_classification"),
             "source_event_type": event.get("event_type", "requests.enriched"),
             "updated_at": updated_at,
@@ -195,19 +279,37 @@ class RoutingPolicyCache:
 
         # User-level promotions should be short-lived and only written on fast-lane wins.
         if route_to_fast_lane and user_id:
+            existing_user_policy = await self.get_user_hint_policy(user_id)
             user_policy = {
                 "request_id": request_id,
                 "user_id": user_id,
                 "priority": priority,
                 "route_to_fast_lane": True,
                 "query_type": event.get("query_type"),
-                "preferred_models": [],
+                "query_complexity": event.get("query_complexity"),
+                "requires_low_latency": bool(event.get("requires_low_latency", False)),
+                "requires_high_reasoning": bool(
+                    event.get("requires_high_reasoning", False)
+                ),
+                "long_context": bool(event.get("long_context", False)),
+                "attachment_heavy": bool(event.get("attachment_heavy", False)),
+                "code_heavy": bool(event.get("code_heavy", False)),
+                "session_hotness": event.get("session_hotness"),
+                "cost_sensitivity": event.get("cost_sensitivity"),
+                "error_sensitivity": event.get("error_sensitivity"),
+                "preferred_models": list(event.get("preferred_models", []) or []),
+                "avoid_models": list(event.get("avoid_models", []) or []),
+                "avoid_providers": list(event.get("avoid_providers", []) or []),
                 "hint_reason": f"requests.enriched priority={priority}",
                 "source_event_type": event.get("event_type", "requests.enriched"),
                 "updated_at": updated_at,
             }
+            if existing_user_policy:
+                user_policy = self._merge_policy_records(
+                    existing_user_policy, user_policy
+                )
             await self._set_json(
-                self._cache_key("user", user_id),
+                self._user_hint_cache_key(user_id),
                 user_policy,
                 self.user_ttl_seconds,
             )
@@ -219,10 +321,17 @@ class RoutingPolicyCache:
 
         request_id = str(event.get("request_id", "") or "")
         user_id = str(event.get("user_id", "") or "")
+        existing_request_policy = await self.get_request_policy(request_id)
+        existing_user_policy = await self.get_user_hint_policy(user_id)
         selected_model = event.get("selected_model")
         preferred_models = [selected_model] if selected_model else []
         updated_at = event.get("emitted_at")
         route_to_fast_lane = bool(event.get("route_to_fast_lane", False))
+        requires_low_latency = event.get("requires_low_latency")
+        requires_high_reasoning = event.get("requires_high_reasoning")
+        long_context = event.get("long_context")
+        attachment_heavy = event.get("attachment_heavy")
+        code_heavy = event.get("code_heavy")
 
         request_policy = {
             "request_id": request_id,
@@ -230,11 +339,34 @@ class RoutingPolicyCache:
             "priority": event.get("priority"),
             "route_to_fast_lane": route_to_fast_lane,
             "query_type": event.get("query_type"),
+            "query_complexity": event.get("query_complexity"),
+            "requires_low_latency": (
+                bool(requires_low_latency) if requires_low_latency is not None else None
+            ),
+            "requires_high_reasoning": (
+                bool(requires_high_reasoning)
+                if requires_high_reasoning is not None
+                else None
+            ),
+            "long_context": bool(long_context) if long_context is not None else None,
+            "attachment_heavy": (
+                bool(attachment_heavy) if attachment_heavy is not None else None
+            ),
+            "code_heavy": bool(code_heavy) if code_heavy is not None else None,
+            "session_hotness": event.get("session_hotness"),
+            "cost_sensitivity": event.get("cost_sensitivity"),
+            "error_sensitivity": event.get("error_sensitivity"),
             "preferred_models": preferred_models,
+            "avoid_models": list(event.get("avoid_models", []) or []),
+            "avoid_providers": list(event.get("avoid_providers", []) or []),
             "hint_reason": event.get("hint_reason", "fast_lane_candidate"),
             "source_event_type": event.get("event_type", "fast_lane_hints"),
             "updated_at": updated_at,
         }
+        if existing_request_policy:
+            request_policy = self._merge_policy_records(
+                existing_request_policy, request_policy
+            )
 
         if request_id:
             await self._set_json(
@@ -250,16 +382,224 @@ class RoutingPolicyCache:
                 "priority": event.get("priority"),
                 "route_to_fast_lane": True,
                 "query_type": event.get("query_type"),
+                "query_complexity": event.get("query_complexity"),
+                "requires_low_latency": (
+                    bool(requires_low_latency)
+                    if requires_low_latency is not None
+                    else None
+                ),
+                "requires_high_reasoning": (
+                    bool(requires_high_reasoning)
+                    if requires_high_reasoning is not None
+                    else None
+                ),
+                "long_context": (
+                    bool(long_context) if long_context is not None else None
+                ),
+                "attachment_heavy": (
+                    bool(attachment_heavy) if attachment_heavy is not None else None
+                ),
+                "code_heavy": bool(code_heavy) if code_heavy is not None else None,
+                "session_hotness": event.get("session_hotness"),
+                "cost_sensitivity": event.get("cost_sensitivity"),
+                "error_sensitivity": event.get("error_sensitivity"),
                 "preferred_models": preferred_models,
+                "avoid_models": list(event.get("avoid_models", []) or []),
+                "avoid_providers": list(event.get("avoid_providers", []) or []),
                 "hint_reason": event.get("hint_reason", "fast_lane_candidate"),
                 "source_event_type": event.get("event_type", "fast_lane_hints"),
                 "updated_at": updated_at,
             }
+            if existing_user_policy:
+                user_policy = self._merge_policy_records(
+                    existing_user_policy, user_policy
+                )
             await self._set_json(
-                self._cache_key("user", user_id),
+                self._user_hint_cache_key(user_id),
                 user_policy,
                 self.user_ttl_seconds,
             )
+
+    async def materialize_routing_policy_state(self, event: Dict[str, Any]):
+        """Materialize rolling user/session policy state emitted by Flink analytics."""
+        if not event:
+            return
+
+        scope_type = str(event.get("scope_type", "") or "").lower()
+        scope_key = str(event.get("scope_key", "") or "")
+        if scope_type not in {"user", "session"} or not scope_key:
+            return
+
+        payload = {
+            "scope_type": scope_type,
+            "scope_key": scope_key,
+            "user_id": event.get("user_id"),
+            "session_id": event.get("session_id"),
+            "user_tier": event.get("user_tier"),
+            "query_type": event.get("query_type"),
+            "query_complexity": event.get("query_complexity"),
+            "requires_low_latency": bool(event.get("requires_low_latency", False)),
+            "requires_high_reasoning": bool(
+                event.get("requires_high_reasoning", False)
+            ),
+            "route_to_fast_lane": bool(event.get("route_to_fast_lane", False)),
+            "session_hotness": event.get("session_hotness"),
+            "cost_sensitivity": event.get("cost_sensitivity"),
+            "error_sensitivity": event.get("error_sensitivity"),
+            "burst_protection_active": bool(
+                event.get("burst_protection_active", False)
+            ),
+            "enterprise_priority_active": bool(
+                event.get("enterprise_priority_active", False)
+            ),
+            "recent_request_count": int(event.get("recent_request_count", 0) or 0),
+            "recent_error_rate": float(event.get("recent_error_rate", 0.0) or 0.0),
+            "avg_total_tokens": float(event.get("avg_total_tokens", 0.0) or 0.0),
+            "avg_cost_usd": float(event.get("avg_cost_usd", 0.0) or 0.0),
+            "avg_latency_ms": float(event.get("avg_latency_ms", 0.0) or 0.0),
+            "fast_lane_hit_rate": float(event.get("fast_lane_hit_rate", 0.0) or 0.0),
+            "query_type_breakdown": dict(event.get("query_type_breakdown", {}) or {}),
+            "preferred_models": list(event.get("preferred_models", []) or []),
+            "avoid_models": list(event.get("avoid_models", []) or []),
+            "avoid_providers": list(event.get("avoid_providers", []) or []),
+            "hint_reason": event.get("hint_reason", "rolling_policy_state"),
+            "source_event_type": event.get("event_type", "routing.policy_state"),
+            "updated_at": event.get("emitted_at"),
+        }
+
+        cache_key = self._cache_key("session", scope_key)
+        ttl_seconds = self.session_ttl_seconds
+        if scope_type == "user":
+            cache_key = self._user_state_cache_key(scope_key)
+            ttl_seconds = self.user_ttl_seconds
+        await self._set_json(
+            cache_key,
+            payload,
+            ttl_seconds,
+        )
+
+    async def materialize_routing_guardrail(self, event: Dict[str, Any]):
+        """Materialize routing.guardrails events into model/provider guardrail views."""
+        if not event:
+            return
+
+        scope_type = str(event.get("scope_type", "") or "").lower()
+        scope_key = str(event.get("scope_key", "") or "")
+        if scope_type not in {"model", "provider"} or not scope_key:
+            return
+
+        payload = {
+            "scope_type": scope_type,
+            "scope_key": scope_key,
+            "guardrail_action": str(event.get("guardrail_action", "avoid") or "avoid"),
+            "severity": str(event.get("severity", "warning") or "warning"),
+            "trigger_type": str(event.get("trigger_type", "unknown") or "unknown"),
+            "description": str(event.get("description", "") or ""),
+            "provider": event.get("provider"),
+            "model_name": event.get("model_name"),
+            "updated_at": event.get("emitted_at"),
+            "source_event_type": event.get("event_type", "routing.guardrails"),
+        }
+
+        if not self.enabled or not self.redis_client:
+            self._local_guardrail_index.setdefault(scope_type, set()).add(scope_key)
+            self._local_set(
+                self._guardrail_cache_key(scope_type, scope_key),
+                payload,
+                self.guardrail_ttl_seconds,
+            )
+            return
+
+        cache_key = self._guardrail_cache_key(scope_type, scope_key)
+        index_key = self._guardrail_index_key(scope_type)
+        await self._set_json(cache_key, payload, self.guardrail_ttl_seconds)
+        try:
+            await self.redis_client.sadd(index_key, scope_key)
+        except Exception as e:
+            logger.warning(
+                f"Failed to update routing guardrail index {scope_type}:{scope_key}: {e}"
+            )
+
+    async def get_active_guardrails(self) -> Dict[str, Any]:
+        """Return active model/provider guardrails for router candidate filtering."""
+        active_model_guardrails = await self._read_guardrail_scope("model")
+        active_provider_guardrails = await self._read_guardrail_scope("provider")
+
+        policy = {
+            "blocked_models": [],
+            "warn_models": [],
+            "blocked_providers": [],
+            "warn_providers": [],
+            "guardrail_reasons": {},
+        }
+
+        for scope_type, guardrails in [
+            ("model", active_model_guardrails),
+            ("provider", active_provider_guardrails),
+        ]:
+            for scope_key, payload in guardrails.items():
+                guardrail_action = str(
+                    payload.get("guardrail_action", "avoid") or "avoid"
+                )
+                reason = payload.get("description") or payload.get("trigger_type")
+                if scope_type == "model":
+                    target_key = (
+                        "blocked_models"
+                        if guardrail_action == "avoid"
+                        else "warn_models"
+                    )
+                else:
+                    target_key = (
+                        "blocked_providers"
+                        if guardrail_action == "avoid"
+                        else "warn_providers"
+                    )
+                if scope_key not in policy[target_key]:
+                    policy[target_key].append(scope_key)
+                policy["guardrail_reasons"][f"{scope_type}:{scope_key}"] = reason
+
+        return policy
+
+    async def _read_guardrail_scope(self, scope_type: str) -> Dict[str, Dict[str, Any]]:
+        """Read active guardrails for one scope and prune expired entries."""
+        active: Dict[str, Dict[str, Any]] = {}
+
+        if not self.enabled or not self.redis_client:
+            for scope_key in list(self._local_guardrail_index.get(scope_type, set())):
+                payload = self._local_get(
+                    self._guardrail_cache_key(scope_type, scope_key)
+                )
+                if payload is None:
+                    self._local_guardrail_index.setdefault(scope_type, set()).discard(
+                        scope_key
+                    )
+                    continue
+                active[scope_key] = payload
+            return active
+
+        index_key = self._guardrail_index_key(scope_type)
+        try:
+            members = await self.redis_client.smembers(index_key)
+        except Exception as e:
+            logger.warning(f"Failed to read routing guardrail index {scope_type}: {e}")
+            return active
+
+        for member in members:
+            scope_key = str(member)
+            payload = await self._get_json(
+                self._guardrail_cache_key(scope_type, scope_key)
+            )
+            if payload is None:
+                try:
+                    await self.redis_client.srem(index_key, scope_key)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to prune expired routing guardrail {scope_type}:{scope_key}: {e}"
+                    )
+                continue
+            active[scope_key] = payload
+
+        return active
 
     async def shutdown(self):
         """Shutdown the shared policy cache."""
@@ -311,7 +651,12 @@ class PolicyMaterializer:
         if not self.policy_cache.enabled:
             return
 
-        topic_keys = ("requests_enriched", "fast_lane_hints")
+        topic_keys = (
+            "requests_enriched",
+            "fast_lane_hints",
+            "routing_guardrails",
+            "routing_policy_state",
+        )
         for topic_key in topic_keys:
             topic_name = self.topics.get(topic_key)
             if not topic_name:
@@ -338,6 +683,22 @@ class PolicyMaterializer:
             tasks.append(
                 asyncio.create_task(
                     self._consume_fast_lane_hints(self.consumers["fast_lane_hints"])
+                )
+            )
+        if "routing_guardrails" in self.consumers:
+            tasks.append(
+                asyncio.create_task(
+                    self._consume_routing_guardrails(
+                        self.consumers["routing_guardrails"]
+                    )
+                )
+            )
+        if "routing_policy_state" in self.consumers:
+            tasks.append(
+                asyncio.create_task(
+                    self._consume_routing_policy_state(
+                        self.consumers["routing_policy_state"]
+                    )
                 )
             )
 
@@ -370,6 +731,36 @@ class PolicyMaterializer:
                     )
         except Exception as e:
             logger.error(f"fast_lane_hints consumer error: {e}")
+
+    async def _consume_routing_guardrails(self, consumer: AIOKafkaConsumer):
+        try:
+            async for message in consumer:
+                if not self.running:
+                    break
+                try:
+                    await self.policy_cache.materialize_routing_guardrail(message.value)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to materialize routing_guardrails message: {e}"
+                    )
+        except Exception as e:
+            logger.error(f"routing_guardrails consumer error: {e}")
+
+    async def _consume_routing_policy_state(self, consumer: AIOKafkaConsumer):
+        try:
+            async for message in consumer:
+                if not self.running:
+                    break
+                try:
+                    await self.policy_cache.materialize_routing_policy_state(
+                        message.value
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to materialize routing_policy_state message: {e}"
+                    )
+        except Exception as e:
+            logger.error(f"routing_policy_state consumer error: {e}")
 
     @staticmethod
     def _deserialize_message(message: bytes) -> Dict[str, Any]:

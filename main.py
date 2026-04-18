@@ -92,7 +92,7 @@ class LLMRouterPlatform:
         # Setup logging
         setup_logging(
             log_level=self.config.get("logging", {}).get("level", "INFO"),
-            log_file=self.config.get("logging", {}).get("file", "logs/llm_router.log")
+            log_file=self.config.get("logging", {}).get("file", "logs/llm_router.log"),
         )
         self.logger = logging.getLogger(__name__)
         self._log_configuration_warnings()
@@ -126,7 +126,9 @@ class LLMRouterPlatform:
         monitoring_config = dict(self.config.get("monitoring", {}))
         slack_config = dict(self.config.get("slack", {}))
 
-        if cors_config.get("enabled", False) and cors_config.get("allow_origins") == ["*"]:
+        if cors_config.get("enabled", False) and cors_config.get("allow_origins") == [
+            "*"
+        ]:
             self.logger.warning(
                 "CORS is configured with a wildcard origin; restrict allow_origins before production rollout."
             )
@@ -144,17 +146,18 @@ class LLMRouterPlatform:
                 "ClickHouse is enabled with an empty or default password; move credentials to a secret-backed environment."
             )
 
-        grafana_password = (
-            monitoring_config.get("grafana", {}) or {}
-        ).get("admin_password")
+        grafana_password = (monitoring_config.get("grafana", {}) or {}).get(
+            "admin_password"
+        )
         if monitoring_config.get("enabled", False) and grafana_password == "admin":
             self.logger.warning(
                 "Monitoring is enabled with the default Grafana admin password."
             )
 
-        if slack_config.get("enabled", False) and slack_config.get(
-            "state_backend", "memory"
-        ) == "memory":
+        if (
+            slack_config.get("enabled", False)
+            and slack_config.get("state_backend", "memory") == "memory"
+        ):
             self.logger.warning(
                 "Slack bot state is configured for in-memory storage; this is not horizontally scalable."
             )
@@ -253,9 +256,7 @@ class LLMRouterPlatform:
 
         pipeline_service = self.services.get("pipeline")
         monitoring_service = self.services.get("monitoring")
-        attach_monitoring = getattr(
-            pipeline_service, "attach_monitoring_service", None
-        )
+        attach_monitoring = getattr(pipeline_service, "attach_monitoring_service", None)
         if (
             pipeline_service is not None
             and monitoring_service is not None
@@ -302,8 +303,7 @@ class LLMRouterPlatform:
             if "pipeline" in self.services:
                 tasks.append(
                     asyncio.create_task(
-                        self.services["pipeline"].start(),
-                        name="kafka_pipeline"
+                        self.services["pipeline"].start(), name="kafka_pipeline"
                     )
                 )
 
@@ -318,16 +318,14 @@ class LLMRouterPlatform:
             if "monitoring" in self.services:
                 tasks.append(
                     asyncio.create_task(
-                        self.services["monitoring"].start(),
-                        name="monitoring_service"
+                        self.services["monitoring"].start(), name="monitoring_service"
                     )
                 )
 
             if "slack_bot" in self.services:
                 tasks.append(
                     asyncio.create_task(
-                        self.services["slack_bot"].start(),
-                        name="slack_bot"
+                        self.services["slack_bot"].start(), name="slack_bot"
                     )
                 )
 
@@ -335,8 +333,7 @@ class LLMRouterPlatform:
             api_config = self.config.get("api", {})
             tasks.append(
                 asyncio.create_task(
-                    self._start_api_server(api_config),
-                    name="api_server"
+                    self._start_api_server(api_config), name="api_server"
                 )
             )
 
@@ -361,15 +358,19 @@ class LLMRouterPlatform:
             host=api_config.get("host", "0.0.0.0"),
             port=api_config.get("port", 8080),
             loop="asyncio",
-            log_level=api_config.get("log_level", "info")
+            log_level=api_config.get("log_level", "info"),
         )
 
         server = uvicorn.Server(config)
         await server.serve()
 
     def _record_api_metrics(
-        self, endpoint: str, method: str, status_code: int,
-        duration_seconds: float, error_type: Optional[str] = None
+        self,
+        endpoint: str,
+        method: str,
+        status_code: int,
+        duration_seconds: float,
+        error_type: Optional[str] = None,
     ):
         """Record request-level API metrics."""
         requests_total = getattr(SYSTEM_METRICS, "requests_total", None)
@@ -483,9 +484,7 @@ class LLMRouterPlatform:
         ]
         api_key_auth_configured = self._api_key_auth_configured()
         ready = (
-            not missing_services
-            and not unhealthy_services
-            and api_key_auth_configured
+            not missing_services and not unhealthy_services and api_key_auth_configured
         )
         return {
             "status": "ready" if ready else "not_ready",
@@ -538,11 +537,21 @@ class LLMRouterPlatform:
 
     def _build_business_metrics(self) -> Dict[str, Any]:
         """Build business metrics directly from Prometheus collectors."""
-        total_requests = self._sum_metric_values(getattr(SYSTEM_METRICS, "requests_total", None))
-        total_errors = self._sum_metric_values(getattr(SYSTEM_METRICS, "errors_total", None))
-        total_cost = self._sum_metric_values(getattr(INFERENCE_METRICS, "cost_total", None))
-        cache_hits = self._sum_metric_values(getattr(INFERENCE_METRICS, "cache_hits", None))
-        cache_misses = self._sum_metric_values(getattr(INFERENCE_METRICS, "cache_misses", None))
+        total_requests = self._sum_metric_values(
+            getattr(SYSTEM_METRICS, "requests_total", None)
+        )
+        total_errors = self._sum_metric_values(
+            getattr(SYSTEM_METRICS, "errors_total", None)
+        )
+        total_cost = self._sum_metric_values(
+            getattr(INFERENCE_METRICS, "cost_total", None)
+        )
+        cache_hits = self._sum_metric_values(
+            getattr(INFERENCE_METRICS, "cache_hits", None)
+        )
+        cache_misses = self._sum_metric_values(
+            getattr(INFERENCE_METRICS, "cache_misses", None)
+        )
         total_cache_requests = cache_hits + cache_misses
 
         return {
@@ -554,7 +563,9 @@ class LLMRouterPlatform:
             "cache_hit_rate": (
                 cache_hits / total_cache_requests if total_cache_requests > 0 else 0.0
             ),
-            "error_rate": (total_errors / total_requests if total_requests > 0 else 0.0),
+            "error_rate": (
+                total_errors / total_requests if total_requests > 0 else 0.0
+            ),
             "model_distribution": self._sum_metric_by_label(
                 getattr(ROUTER_METRICS, "routing_decisions", None),
                 "model",
@@ -568,7 +579,9 @@ class LLMRouterPlatform:
     def _build_system_snapshot(self) -> Dict[str, Any]:
         """Build a minimal system snapshot for the dashboard."""
         return {
-            "cpu_usage": self._sum_metric_values(getattr(SYSTEM_METRICS, "cpu_usage", None)),
+            "cpu_usage": self._sum_metric_values(
+                getattr(SYSTEM_METRICS, "cpu_usage", None)
+            ),
             "memory_usage_percent": self._sum_metric_values(
                 getattr(SYSTEM_METRICS, "memory_usage_percent", None)
             ),
@@ -692,8 +705,7 @@ class LLMRouterPlatform:
                     "severity": severity,
                     "title": f"{metric_name} threshold exceeded",
                     "description": (
-                        f"{metric_name} is {value:.2f} "
-                        f"(threshold: {threshold:.2f})"
+                        f"{metric_name} is {value:.2f} " f"(threshold: {threshold:.2f})"
                     )
                     if isinstance(value, (int, float))
                     and isinstance(threshold, (int, float))
@@ -706,7 +718,9 @@ class LLMRouterPlatform:
             )
         return alerts
 
-    def _normalize_monitoring_alerts(self, alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _normalize_monitoring_alerts(
+        self, alerts: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
         """Normalize monitoring alerts from the monitoring service."""
         normalized = []
         for alert in alerts:
@@ -741,8 +755,7 @@ class LLMRouterPlatform:
         overview = {
             "total_requests": int(business_metrics.get("total_requests_24h", 0) or 0),
             "avg_latency_ms": (
-                float(business_metrics.get("average_response_time", 0.0) or 0.0)
-                * 1000
+                float(business_metrics.get("average_response_time", 0.0) or 0.0) * 1000
             ),
             "success_rate": max(
                 0.0,
@@ -766,9 +779,15 @@ class LLMRouterPlatform:
             ),
         }
         model_performance = self._fallback_model_performance()
-        alerts = (
-            self._build_threshold_alerts() if process_local_authoritative else []
-        )
+        alerts = self._build_threshold_alerts() if process_local_authoritative else []
+        routing_features = {}
+        routing_guardrails = {
+            "guardrail_count": 0,
+            "scope_breakdown": {},
+            "trigger_breakdown": {},
+            "recent_guardrails": [],
+            "persisted_guardrails": [],
+        }
 
         sources = {
             "overview": "process_local_metrics",
@@ -777,6 +796,8 @@ class LLMRouterPlatform:
             "inference": "process_local_metrics",
             "system": "process_local_metrics",
             "alerts": "process_local_thresholds",
+            "routing_features": "unavailable",
+            "routing_guardrails": "unavailable",
             "logs": "structured_log_file",
         }
         source_authority = {
@@ -802,13 +823,23 @@ class LLMRouterPlatform:
 
         monitoring_dashboard = None
         if "monitoring" in self.services:
-            monitoring_dashboard = await self.services["monitoring"].get_dashboard_data()
+            monitoring_dashboard = await self.services[
+                "monitoring"
+            ].get_dashboard_data()
             recent_alerts = monitoring_dashboard.get("alert_status", {}).get(
                 "recent_alerts", []
             )
             alerts.extend(self._normalize_monitoring_alerts(recent_alerts))
             sources["alerts"] = "thresholds+monitoring_service"
             source_authority["alerts"] = process_local_authoritative
+            routing_features = dict(
+                monitoring_dashboard.get("routing_features", {}) or {}
+            )
+            sources["routing_features"] = "monitoring_service"
+            routing_guardrails.update(
+                dict(monitoring_dashboard.get("routing_guardrails", {}) or {})
+            )
+            sources["routing_guardrails"] = "monitoring_service"
 
         if "pipeline" in self.services:
             pipeline_analytics = await self.services["pipeline"].get_query_analytics(
@@ -816,6 +847,14 @@ class LLMRouterPlatform:
             )
             pipeline_models = await self.services["pipeline"].get_model_performance(
                 hours=hours
+            )
+            get_routing_guardrails = getattr(
+                self.services["pipeline"], "get_routing_guardrails", None
+            )
+            pipeline_guardrails = (
+                await get_routing_guardrails(hours=hours)
+                if callable(get_routing_guardrails)
+                else []
             )
 
             if pipeline_analytics:
@@ -897,6 +936,13 @@ class LLMRouterPlatform:
                 "monitoring" in self.services or process_local_authoritative
             )
 
+            if pipeline_guardrails:
+                routing_guardrails["persisted_guardrails"] = pipeline_guardrails
+                if sources["routing_guardrails"] == "monitoring_service":
+                    sources["routing_guardrails"] = "monitoring_service+clickhouse"
+                else:
+                    sources["routing_guardrails"] = "clickhouse"
+
         inference_snapshot = self._build_inference_snapshot(business_metrics)
         if sources["inference"] == "clickhouse":
             inference_snapshot = {
@@ -918,6 +964,8 @@ class LLMRouterPlatform:
             "analytics": analytics,
             "model_performance": model_performance,
             "alerts": alerts,
+            "routing_features": routing_features,
+            "routing_guardrails": routing_guardrails,
             "sources": sources,
             "source_authority": source_authority,
             "observability": {
@@ -977,12 +1025,16 @@ class LLMRouterPlatform:
         component: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Return recent structured log entries with optional filtering."""
-        log_path = Path(self.config.get("logging", {}).get("file", "logs/llm_router.log"))
+        log_path = Path(
+            self.config.get("logging", {}).get("file", "logs/llm_router.log")
+        )
         if not log_path.exists():
             return []
 
         try:
-            raw_lines = log_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            raw_lines = log_path.read_text(
+                encoding="utf-8", errors="ignore"
+            ).splitlines()
         except OSError:
             return []
 
@@ -1171,7 +1223,7 @@ class LLMRouterPlatform:
 
         for name, service in self.services.items():
             try:
-                if hasattr(service, 'shutdown'):
+                if hasattr(service, "shutdown"):
                     await service.shutdown()
                 self.logger.info(f"Service {name} shutdown successfully")
             except Exception as e:
@@ -1243,7 +1295,7 @@ def start(config: str, dev: bool):
             port=8080,
             factory=True,
             reload=True,
-            log_level="debug"
+            log_level="debug",
         )
     else:
         platform = LLMRouterPlatform(config_path=config)
@@ -1293,11 +1345,15 @@ def start_workers(config: str):
 def setup():
     """Setup initial project structure and dependencies"""
     from src.llm_router_part0_setup import setup_project_environment
+
     setup_project_environment()
 
 
 @cli.command()
-@click.option("--service", help="Specific service to check (router, inference, pipeline, monitoring)")
+@click.option(
+    "--service",
+    help="Specific service to check (router, inference, pipeline, monitoring)",
+)
 def health(service: Optional[str]):
     """Check system health"""
     # Implementation for health checks
@@ -1305,10 +1361,13 @@ def health(service: Optional[str]):
 
 
 @cli.command()
-@click.option("--output", default="docker-compose.yml", help="Output file for Docker Compose")
+@click.option(
+    "--output", default="docker-compose.yml", help="Output file for Docker Compose"
+)
 def deploy(output: str):
     """Generate deployment configurations"""
     from src.llm_router_part5_deploy import generate_deployment_configs
+
     generate_deployment_configs(output)
 
 
