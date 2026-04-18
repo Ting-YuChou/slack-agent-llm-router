@@ -33,6 +33,8 @@ def pipeline_config():
             "requests_enriched": "requests.enriched",
             "fast_lane_hints": "fast_lane_hints",
             "analytics_model_metrics_1m": "analytics.model_metrics_1m",
+            "routing_guardrails": "routing.guardrails",
+            "routing_policy_state": "routing.policy_state",
             "alerts": "alerts",
         },
         "consumer": {
@@ -125,7 +127,13 @@ class TestKafkaProducerManager:
     ):
         manager = KafkaProducerManager(pipeline_config)
         manager.producer = AsyncMock()
-        request = QueryRequest(query="hello", user_id="u1", user_tier=UserTier.FREE)
+        request = QueryRequest(
+            query="hello",
+            user_id="u1",
+            user_tier=UserTier.FREE,
+            session_id="session-1",
+            conversation_id="u1:c1:main",
+        )
         response = InferenceResponse(
             response_text="world",
             model_name="gpt-5",
@@ -141,6 +149,10 @@ class TestKafkaProducerManager:
             query_type=SimpleNamespace(value="analysis"),
             routing_reason="Rule-based selection",
             routing_strategy="intelligent",
+            route_to_fast_lane=True,
+            actual_fast_lane_hit=True,
+            policy_source="session+user",
+            hint_reason="fast_lane_affinity",
             fallback_models=["mistral-7b"],
         )
 
@@ -153,6 +165,11 @@ class TestKafkaProducerManager:
         assert send_kwargs["value"]["selected_model"] == "gpt-5"
         assert send_kwargs["value"]["query_type"] == "analysis"
         assert send_kwargs["value"]["fallback_models"] == ["mistral-7b"]
+        assert send_kwargs["value"]["session_id"] == "session-1"
+        assert send_kwargs["value"]["conversation_id"] == "u1:c1:main"
+        assert send_kwargs["value"]["route_to_fast_lane"] is True
+        assert send_kwargs["value"]["actual_fast_lane_hit"] is True
+        assert send_kwargs["value"]["policy_source"] == "session+user"
 
 
 class TestClickHouseManager:
@@ -364,13 +381,21 @@ class TestKafkaIngestionPipeline:
         pipeline = KafkaIngestionPipeline(pipeline_config)
 
         class MonitoringStub:
+            async def ingest_stream_request_enriched(self, routing_event):
+                return routing_event
+
             async def ingest_stream_model_metrics(self, metric_event):
                 return metric_event
+
+            async def ingest_stream_routing_guardrail(self, guardrail_event):
+                return guardrail_event
 
             async def ingest_stream_alert(self, alert_event):
                 return alert_event
 
         pipeline.attach_monitoring_service(MonitoringStub())
 
+        assert len(pipeline._stream_handlers["requests_enriched"]) == 1
         assert len(pipeline._stream_handlers["analytics_model_metrics_1m"]) == 1
+        assert len(pipeline._stream_handlers["routing_guardrails"]) == 1
         assert len(pipeline._stream_handlers["alerts"]) == 1

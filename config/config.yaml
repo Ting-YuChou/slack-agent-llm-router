@@ -130,6 +130,8 @@ kafka:
     requests_enriched: requests.enriched
     fast_lane_hints: fast_lane_hints
     analytics_model_metrics_1m: analytics.model_metrics_1m
+    routing_guardrails: routing.guardrails
+    routing_policy_state: routing.policy_state
     alerts: alerts
     errors: llm-errors
   producer:
@@ -239,7 +241,9 @@ flink:
 policy_cache:
   enabled: false
   request_ttl_seconds: 300
+  session_ttl_seconds: 600
   user_ttl_seconds: 900
+  guardrail_ttl_seconds: 180
   local_cache_ttl_seconds: 5
   redis:
     host: localhost

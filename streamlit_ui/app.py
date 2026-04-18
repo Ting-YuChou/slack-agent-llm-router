@@ -302,7 +302,7 @@ def render_sidebar():
         
         page = st.radio(
             "Select View",
-            ["📊 Overview", "🤖 Models", "⚡ Performance", "👥 Users", "💰 Costs", "🚨 Alerts", "📋 Logs"],
+            ["📊 Overview", "🤖 Models", "⚡ Performance", "🧭 Routing", "👥 Users", "💰 Costs", "🚨 Alerts", "📋 Logs"],
             label_visibility="collapsed"
         )
         
@@ -628,6 +628,156 @@ def render_alerts(data: Dict[str, Any]):
             st.info(message)
 
 
+def render_routing_features(data: Dict[str, Any]):
+    """Render request-side Flink routing feature summaries."""
+    st.markdown("### 🧭 Routing Features")
+    st.caption(
+        f"Source: `{data.get('sources', {}).get('routing_features', 'unavailable')}`"
+    )
+
+    routing_features = data.get("routing_features", {}) or {}
+    request_count = int(routing_features.get("request_count", 0) or 0)
+    if request_count <= 0:
+        st.info("No request-side Flink routing feature data is currently available.")
+        return
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Requests", request_count)
+    with col2:
+        st.metric(
+            "Fast Lane Candidates",
+            int(routing_features.get("fast_lane_count", 0) or 0),
+        )
+    with col3:
+        st.metric(
+            "High Reasoning",
+            int(routing_features.get("requires_high_reasoning_count", 0) or 0),
+        )
+
+    breakdown_col1, breakdown_col2, breakdown_col3 = st.columns(3)
+    breakdowns = [
+        ("Query Type", routing_features.get("query_type_breakdown", {})),
+        ("Complexity", routing_features.get("query_complexity_breakdown", {})),
+        ("Session Hotness", routing_features.get("session_hotness_breakdown", {})),
+    ]
+
+    for column, (title, breakdown) in zip(
+        [breakdown_col1, breakdown_col2, breakdown_col3], breakdowns
+    ):
+        with column:
+            st.markdown(f"**{title}**")
+            if breakdown:
+                chart = pd.DataFrame(
+                    {"Category": list(breakdown.keys()), "Count": list(breakdown.values())}
+                )
+                st.bar_chart(chart.set_index("Category"))
+            else:
+                st.info(f"No {title.lower()} data available.")
+
+    preference_col1, preference_col2, preference_col3 = st.columns(3)
+    preference_sections = [
+        ("Preferred Models", routing_features.get("top_preferred_models", {})),
+        ("Avoid Models", routing_features.get("top_avoid_models", {})),
+        ("Avoid Providers", routing_features.get("top_avoid_providers", {})),
+    ]
+
+    for column, (title, items) in zip(
+        [preference_col1, preference_col2, preference_col3], preference_sections
+    ):
+        with column:
+            st.markdown(f"**{title}**")
+            if items:
+                st.dataframe(
+                    pd.DataFrame(
+                        {"Name": list(items.keys()), "Count": list(items.values())}
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.info(f"No {title.lower()} data available.")
+
+    recent_requests = routing_features.get("recent_requests", [])
+    if recent_requests:
+        st.markdown("**Recent Routing Feature Events**")
+        st.dataframe(pd.DataFrame(recent_requests), use_container_width=True, hide_index=True)
+
+
+def render_routing_guardrails(data: Dict[str, Any]):
+    """Render recent routing guardrails from Flink analytics."""
+    st.markdown("### 🛡️ Routing Guardrails")
+    st.caption(
+        f"Source: `{data.get('sources', {}).get('routing_guardrails', 'unavailable')}`"
+    )
+
+    routing_guardrails = data.get("routing_guardrails", {}) or {}
+    recent_guardrails = routing_guardrails.get("recent_guardrails", []) or []
+    persisted_guardrails = routing_guardrails.get("persisted_guardrails", []) or []
+    total_count = int(routing_guardrails.get("guardrail_count", 0) or 0)
+
+    if total_count <= 0 and not persisted_guardrails:
+        st.success("✅ No active routing guardrails are currently visible.")
+        return
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Recent Guardrails", total_count)
+    with col2:
+        st.metric(
+            "Scopes",
+            len(routing_guardrails.get("scope_breakdown", {}) or {}),
+        )
+    with col3:
+        st.metric(
+            "Triggers",
+            len(routing_guardrails.get("trigger_breakdown", {}) or {}),
+        )
+
+    breakdown_col1, breakdown_col2 = st.columns(2)
+    with breakdown_col1:
+        scope_breakdown = routing_guardrails.get("scope_breakdown", {}) or {}
+        st.markdown("**Scope Breakdown**")
+        if scope_breakdown:
+            st.bar_chart(
+                pd.DataFrame(
+                    {
+                        "Scope": list(scope_breakdown.keys()),
+                        "Count": list(scope_breakdown.values()),
+                    }
+                ).set_index("Scope")
+            )
+        else:
+            st.info("No scope breakdown data available.")
+
+    with breakdown_col2:
+        trigger_breakdown = routing_guardrails.get("trigger_breakdown", {}) or {}
+        st.markdown("**Trigger Breakdown**")
+        if trigger_breakdown:
+            st.bar_chart(
+                pd.DataFrame(
+                    {
+                        "Trigger": list(trigger_breakdown.keys()),
+                        "Count": list(trigger_breakdown.values()),
+                    }
+                ).set_index("Trigger")
+            )
+        else:
+            st.info("No trigger breakdown data available.")
+
+    if recent_guardrails:
+        st.markdown("**Recent Guardrails**")
+        st.dataframe(pd.DataFrame(recent_guardrails), use_container_width=True, hide_index=True)
+
+    if persisted_guardrails:
+        st.markdown("**Persisted Guardrails**")
+        st.dataframe(
+            pd.DataFrame(persisted_guardrails),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
 def render_data_availability_notice(data: Dict[str, Any]):
     """Show data availability or backend connectivity notices."""
     if data.get("error"):
@@ -739,6 +889,10 @@ def main():
         st.markdown("---")
         render_model_performance(data)
         st.markdown("---")
+        render_routing_features(data)
+        st.markdown("---")
+        render_routing_guardrails(data)
+        st.markdown("---")
         render_alerts(data)
         st.markdown("---")
         render_analytics_charts(data)
@@ -753,6 +907,11 @@ def main():
         st.markdown("---")
         render_key_metrics(data)
 
+    elif page == "🧭 Routing":
+        render_routing_features(data)
+        st.markdown("---")
+        render_routing_guardrails(data)
+
     elif page == "👥 Users":
         st.markdown("### 👥 User Analytics")
         st.info("Live user distribution and engagement metrics from the dashboard backend.")
@@ -765,6 +924,8 @@ def main():
 
     elif page == "🚨 Alerts":
         render_alerts(data)
+        st.markdown("---")
+        render_routing_guardrails(data)
 
     elif page == "📋 Logs":
         render_logs_page()

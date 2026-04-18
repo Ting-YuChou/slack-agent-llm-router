@@ -150,6 +150,10 @@ class RoutingDecision(BaseModel):
     # Metadata
     routing_strategy: str = "intelligent"
     user_tier: UserTier = UserTier.FREE
+    route_to_fast_lane: bool = False
+    actual_fast_lane_hit: bool = False
+    policy_source: str = "none"
+    hint_reason: Optional[str] = None
 
 
 class ModelSelection(BaseModel):

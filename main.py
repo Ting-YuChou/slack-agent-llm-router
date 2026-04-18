@@ -650,12 +650,22 @@ class LLMRouterPlatform:
         }
         model_performance = self._fallback_model_performance()
         alerts = self._build_threshold_alerts()
+        routing_features = {}
+        routing_guardrails = {
+            "guardrail_count": 0,
+            "scope_breakdown": {},
+            "trigger_breakdown": {},
+            "recent_guardrails": [],
+            "persisted_guardrails": [],
+        }
 
         sources = {
             "overview": "in_memory_metrics",
             "analytics": "in_memory_metrics",
             "model_performance": "in_memory_metrics",
             "alerts": "thresholds",
+            "routing_features": "unavailable",
+            "routing_guardrails": "unavailable",
             "logs": "structured_log_file",
         }
 
@@ -672,6 +682,14 @@ class LLMRouterPlatform:
             )
             alerts.extend(self._normalize_monitoring_alerts(recent_alerts))
             sources["alerts"] = "thresholds+monitoring_service"
+            routing_features = dict(
+                monitoring_dashboard.get("routing_features", {}) or {}
+            )
+            sources["routing_features"] = "monitoring_service"
+            routing_guardrails.update(
+                dict(monitoring_dashboard.get("routing_guardrails", {}) or {})
+            )
+            sources["routing_guardrails"] = "monitoring_service"
 
         if "pipeline" in self.services:
             pipeline_analytics = await self.services["pipeline"].get_query_analytics(
@@ -679,6 +697,14 @@ class LLMRouterPlatform:
             )
             pipeline_models = await self.services["pipeline"].get_model_performance(
                 hours=hours
+            )
+            get_routing_guardrails = getattr(
+                self.services["pipeline"], "get_routing_guardrails", None
+            )
+            pipeline_guardrails = (
+                await get_routing_guardrails(hours=hours)
+                if callable(get_routing_guardrails)
+                else []
             )
 
             if pipeline_analytics:
@@ -722,6 +748,13 @@ class LLMRouterPlatform:
                 )
                 sources["model_performance"] = "clickhouse"
 
+            if pipeline_guardrails:
+                routing_guardrails["persisted_guardrails"] = pipeline_guardrails
+                if sources["routing_guardrails"] == "monitoring_service":
+                    sources["routing_guardrails"] = "monitoring_service+clickhouse"
+                else:
+                    sources["routing_guardrails"] = "clickhouse"
+
         health = self._build_health_payload()
         return {
             "timestamp": time.time(),
@@ -734,6 +767,8 @@ class LLMRouterPlatform:
             "analytics": analytics,
             "model_performance": model_performance,
             "alerts": alerts,
+            "routing_features": routing_features,
+            "routing_guardrails": routing_guardrails,
             "sources": sources,
             "capabilities": {
                 "pipeline_analytics": "pipeline" in self.services,

@@ -137,6 +137,7 @@ class TestModelRouter:
 
         assert decision.selected_model == "mistral-7b"
         assert "Policy-cache selection" in decision.routing_reason
+        assert decision.actual_fast_lane_hit is True
 
     @pytest.mark.asyncio
     async def test_route_query_prefers_explicit_fast_lane_model(self):
@@ -194,6 +195,39 @@ class TestModelRouter:
 
         assert decision.selected_model == "claude-3.5-sonnet"
         assert "Policy-cache selection" in decision.routing_reason
+
+    @pytest.mark.asyncio
+    async def test_route_query_uses_session_policy_model_pinning(self, router_config):
+        class PolicyCacheStub:
+            async def get_effective_policy(self, request_id, user_id, session_id=None):
+                assert session_id == "session-42"
+                return {
+                    "policy_source": "session+user",
+                    "preferred_models": ["gpt-5"],
+                    "query_type": "analysis",
+                    "query_complexity": "complex",
+                    "requires_high_reasoning": True,
+                    "hint_reason": "session_model_pinning",
+                }
+
+        router = ModelRouter(router_config, policy_cache=PolicyCacheStub())
+        router.classifier.classify_query = lambda _query: (QueryType.GENERAL, 0.6)
+        router.token_counter.count_tokens = lambda _query, _model="default": 256
+        router.model_stats["gpt-5"] = {"success_rate": 0.97, "avg_latency": 650}
+        router.model_stats["mistral-7b"] = {"success_rate": 0.95, "avg_latency": 90}
+
+        request = QueryRequest(
+            query="Continue the same architecture analysis as before",
+            user_id="u1",
+            user_tier=UserTier.ENTERPRISE,
+            session_id="session-42",
+        )
+
+        decision = await router.route_query(request)
+
+        assert decision.selected_model == "gpt-5"
+        assert decision.policy_source == "session+user"
+        assert "session_model_pinning" in decision.routing_reason
 
     @pytest.mark.asyncio
     async def test_route_query_normalizes_enum_user_tier_for_rule_matching(
@@ -268,3 +302,122 @@ class TestModelRouter:
 
         assert decision.selected_model == "claude-3.5-sonnet"
         assert "Policy-cache selection" in decision.routing_reason
+
+    @pytest.mark.asyncio
+    async def test_route_query_respects_user_burst_protection_cost_bias(self):
+        class PolicyCacheStub:
+            async def get_effective_policy(self, request_id, user_id):
+                return {
+                    "policy_source": "user",
+                    "cost_sensitivity": "high",
+                    "requires_low_latency": True,
+                    "session_hotness": "hot",
+                    "burst_protection_active": True,
+                    "hint_reason": "burst_protection",
+                }
+
+        router = ModelRouter(
+            {
+                "default_model": "mistral-7b",
+                "routing_strategy": "intelligent",
+                "models": {
+                    "gpt-5": {
+                        "provider": "openai",
+                        "max_tokens": 8192,
+                        "cost_per_token": 0.00003,
+                        "priority": 1,
+                        "capabilities": ["general", "analysis", "reasoning"],
+                    },
+                    "mistral-7b": {
+                        "provider": "vllm",
+                        "model_path": "/models/mistral",
+                        "max_tokens": 4096,
+                        "cost_per_token": 0.0,
+                        "priority": 3,
+                        "capabilities": ["general", "analysis", "coding"],
+                    },
+                },
+                "routing_rules": [],
+            },
+            policy_cache=PolicyCacheStub(),
+        )
+        router.classifier.classify_query = lambda _query: (QueryType.ANALYSIS, 0.9)
+        router.token_counter.count_tokens = lambda _query, _model="default": 128
+        router.model_stats["gpt-5"] = {"success_rate": 0.99, "avg_latency": 600}
+        router.model_stats["mistral-7b"] = {"success_rate": 0.93, "avg_latency": 110}
+
+        request = QueryRequest(
+            query="Summarize the alerts from the last few minutes",
+            user_id="u2",
+            user_tier=UserTier.FREE,
+        )
+
+        decision = await router.route_query(request)
+
+        assert decision.selected_model == "mistral-7b"
+        assert decision.policy_source == "user"
+        assert "burst_protection" in decision.routing_reason
+
+    @pytest.mark.asyncio
+    async def test_route_query_uses_policy_features_for_high_reasoning_selection(
+        self, router_config
+    ):
+        class PolicyCacheStub:
+            async def get_effective_policy(self, request_id, user_id):
+                return {
+                    "policy_source": "request",
+                    "query_type": "analysis",
+                    "query_complexity": "complex",
+                    "requires_high_reasoning": True,
+                    "route_to_fast_lane": False,
+                    "preferred_models": [],
+                }
+
+        router = ModelRouter(router_config, policy_cache=PolicyCacheStub())
+        router.classifier.classify_query = lambda _query: (QueryType.GENERAL, 0.75)
+        router.token_counter.count_tokens = lambda _query, _model="default": 256
+        router.model_stats["gpt-5"] = {"success_rate": 0.99, "avg_latency": 600}
+        router.model_stats["mistral-7b"] = {"success_rate": 0.92, "avg_latency": 120}
+
+        request = QueryRequest(
+            query="Need a root cause analysis for this production incident",
+            user_id="u1",
+            user_tier=UserTier.ENTERPRISE,
+        )
+
+        decision = await router.route_query(request)
+
+        assert decision.selected_model == "gpt-5"
+        assert "Policy-cache selection" in decision.routing_reason
+
+    @pytest.mark.asyncio
+    async def test_route_query_filters_blocked_provider_guardrails(self, router_config):
+        class PolicyCacheStub:
+            async def get_effective_policy(self, request_id, user_id):
+                return {
+                    "policy_source": "request",
+                    "preferred_models": ["gpt-5"],
+                    "blocked_providers": ["openai"],
+                    "guardrail_reasons": {
+                        "provider:openai": "Provider latency exceeded threshold"
+                    },
+                }
+
+        router = ModelRouter(router_config, policy_cache=PolicyCacheStub())
+        router.classifier.classify_query = lambda _query: (
+            QueryType.CODE_GENERATION,
+            0.95,
+        )
+        router.token_counter.count_tokens = lambda _query, _model="default": 128
+        router.model_stats["gpt-5"] = {"success_rate": 0.99, "avg_latency": 500}
+        router.model_stats["mistral-7b"] = {"success_rate": 0.90, "avg_latency": 100}
+
+        request = QueryRequest(
+            query="Write a Python helper",
+            user_id="u1",
+            user_tier=UserTier.PREMIUM,
+        )
+
+        decision = await router.route_query(request)
+
+        assert decision.selected_model == "mistral-7b"
