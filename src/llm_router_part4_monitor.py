@@ -820,7 +820,9 @@ class MetricsCollector:
     def record_request_routing_features(self, routing_event: Dict[str, Any]):
         """Store a consumed requests.enriched event for dashboard use."""
         event = dict(routing_event)
-        event.setdefault("timestamp", event.get("emitted_at", datetime.now().isoformat()))
+        event.setdefault(
+            "timestamp", event.get("emitted_at", datetime.now().isoformat())
+        )
         self.routing_feature_history.append(event)
         if len(self.routing_feature_history) > self.max_history_size:
             self.routing_feature_history.pop(0)
@@ -912,7 +914,9 @@ class MetricsCollector:
     def record_routing_guardrail(self, guardrail_event: Dict[str, Any]):
         """Store a consumed routing.guardrails event for dashboard use."""
         event = dict(guardrail_event)
-        event.setdefault("timestamp", event.get("emitted_at", datetime.now().isoformat()))
+        event.setdefault(
+            "timestamp", event.get("emitted_at", datetime.now().isoformat())
+        )
         self.routing_guardrail_history.append(event)
         if len(self.routing_guardrail_history) > self.max_history_size:
             self.routing_guardrail_history.pop(0)
@@ -1291,7 +1295,9 @@ class MonitoringService:
         metrics_summary = self.metrics_collector.get_metrics_summary(hours=1)
         stream_analytics = self.metrics_collector.get_stream_metrics_summary(hours=1)
         routing_features = self.metrics_collector.get_routing_feature_summary(hours=1)
-        routing_guardrails = self.metrics_collector.get_routing_guardrail_summary(hours=1)
+        routing_guardrails = self.metrics_collector.get_routing_guardrail_summary(
+            hours=1
+        )
         alert_status = self.alert_manager.get_alert_status()
         performance_report = (
             await self.performance_profiler.generate_optimization_report()

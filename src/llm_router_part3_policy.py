@@ -35,9 +35,7 @@ class RoutingPolicyCache:
         self.request_ttl_seconds = int(self.config.get("request_ttl_seconds", 300))
         self.session_ttl_seconds = int(self.config.get("session_ttl_seconds", 600))
         self.user_ttl_seconds = int(self.config.get("user_ttl_seconds", 900))
-        self.guardrail_ttl_seconds = int(
-            self.config.get("guardrail_ttl_seconds", 180)
-        )
+        self.guardrail_ttl_seconds = int(self.config.get("guardrail_ttl_seconds", 180))
         self.local_cache_ttl_seconds = int(
             self.config.get("local_cache_ttl_seconds", 5)
         )
@@ -307,7 +305,9 @@ class RoutingPolicyCache:
                 "updated_at": updated_at,
             }
             if existing_user_policy:
-                user_policy = self._merge_policy_records(existing_user_policy, user_policy)
+                user_policy = self._merge_policy_records(
+                    existing_user_policy, user_policy
+                )
             await self._set_json(
                 self._user_hint_cache_key(user_id),
                 user_policy,
@@ -538,10 +538,16 @@ class RoutingPolicyCache:
             ("provider", active_provider_guardrails),
         ]:
             for scope_key, payload in guardrails.items():
-                guardrail_action = str(payload.get("guardrail_action", "avoid") or "avoid")
+                guardrail_action = str(
+                    payload.get("guardrail_action", "avoid") or "avoid"
+                )
                 reason = payload.get("description") or payload.get("trigger_type")
                 if scope_type == "model":
-                    target_key = "blocked_models" if guardrail_action == "avoid" else "warn_models"
+                    target_key = (
+                        "blocked_models"
+                        if guardrail_action == "avoid"
+                        else "warn_models"
+                    )
                 else:
                     target_key = (
                         "blocked_providers"
@@ -560,7 +566,9 @@ class RoutingPolicyCache:
 
         if not self.enabled or not self.redis_client:
             for scope_key in list(self._local_guardrail_index.get(scope_type, set())):
-                payload = self._local_get(self._guardrail_cache_key(scope_type, scope_key))
+                payload = self._local_get(
+                    self._guardrail_cache_key(scope_type, scope_key)
+                )
                 if payload is None:
                     self._local_guardrail_index.setdefault(scope_type, set()).discard(
                         scope_key
@@ -578,7 +586,9 @@ class RoutingPolicyCache:
 
         for member in members:
             scope_key = str(member)
-            payload = await self._get_json(self._guardrail_cache_key(scope_type, scope_key))
+            payload = await self._get_json(
+                self._guardrail_cache_key(scope_type, scope_key)
+            )
             if payload is None:
                 try:
                     await self.redis_client.srem(index_key, scope_key)
