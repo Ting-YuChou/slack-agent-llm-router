@@ -65,7 +65,22 @@ if True:
 
 if _missing("numpy"):
     numpy = _ensure_module("numpy")
+
+    class _NdArray(list):
+        pass
+
+    numpy.ndarray = _NdArray
     numpy.array = lambda value: value
+    numpy.asarray = (
+        lambda value: value
+        if isinstance(value, _NdArray)
+        else _NdArray(value)
+        if hasattr(value, "__iter__") and not isinstance(value, (str, bytes, dict))
+        else value
+    )
+    numpy.isscalar = lambda value: not hasattr(value, "__iter__") or isinstance(
+        value, (str, bytes)
+    )
 
 
 if True:
