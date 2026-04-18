@@ -102,6 +102,12 @@ def build_inference_completed_event(
     """Build the post-inference event emitted after request completion."""
     query_type = getattr(routing_decision, "query_type", None)
     routing_strategy = getattr(routing_decision, "routing_strategy", None)
+    route_to_fast_lane = bool(getattr(routing_decision, "route_to_fast_lane", False))
+    actual_fast_lane_hit = bool(
+        getattr(routing_decision, "actual_fast_lane_hit", False)
+    )
+    policy_source = getattr(routing_decision, "policy_source", None)
+    hint_reason = getattr(routing_decision, "hint_reason", None)
 
     return {
         "event_type": "inference.completed",
@@ -111,6 +117,8 @@ def build_inference_completed_event(
         "query_id": query_request.request_id,
         "user_id": query_request.user_id,
         "user_tier": _enum_value(query_request.user_tier),
+        "session_id": query_request.session_id,
+        "conversation_id": query_request.conversation_id,
         "request_timestamp": _isoformat_utc(query_request.timestamp),
         "completion_timestamp": _isoformat_utc(inference_response.timestamp),
         "query_text": query_request.query,
@@ -130,6 +138,10 @@ def build_inference_completed_event(
         "response_length_chars": len(inference_response.response_text or ""),
         "routing_reason": getattr(routing_decision, "routing_reason", None),
         "routing_strategy": _enum_value(routing_strategy),
+        "route_to_fast_lane": route_to_fast_lane,
+        "actual_fast_lane_hit": actual_fast_lane_hit,
+        "policy_source": policy_source,
+        "hint_reason": hint_reason,
         "fallback_models": list(getattr(routing_decision, "fallback_models", []) or []),
     }
 
@@ -956,6 +968,57 @@ class ClickHouseManager:
             logger.error(f"Failed to get model performance: {e}")
             return []
 
+    async def get_routing_guardrails(self, hours: int = 24) -> List[Dict[str, Any]]:
+        """Get recent routing guardrail events persisted through the alert stream."""
+        try:
+            query = f"""
+            SELECT
+                timestamp,
+                alert_type,
+                severity,
+                description,
+                model_name,
+                provider,
+                payload_json
+            FROM {self.database}.alert_events
+            WHERE timestamp >= now() - INTERVAL {hours} HOUR
+              AND source_event_type = 'routing.guardrails'
+            ORDER BY timestamp DESC
+            LIMIT 50
+            """
+
+            result = self.client.query(query)
+            guardrails = []
+            for row in result.result_rows:
+                payload = {}
+                raw_payload = row[6] or "{}"
+                try:
+                    payload = json.loads(raw_payload)
+                except Exception:
+                    payload = {}
+
+                guardrails.append(
+                    {
+                        "timestamp": row[0].isoformat()
+                        if hasattr(row[0], "isoformat")
+                        else str(row[0]),
+                        "trigger_type": row[1],
+                        "severity": row[2],
+                        "description": row[3],
+                        "model_name": row[4],
+                        "provider": row[5],
+                        "scope_type": payload.get("scope_type"),
+                        "scope_key": payload.get("scope_key"),
+                        "guardrail_action": payload.get("guardrail_action"),
+                        "source": "clickhouse",
+                    }
+                )
+
+            return guardrails
+        except Exception as e:
+            logger.error(f"Failed to get routing guardrails: {e}")
+            return []
+
     def shutdown(self):
         """Shutdown ClickHouse connection"""
         if self.client:
@@ -997,7 +1060,9 @@ class KafkaConsumerManager:
             "alerts": [],
         }
         self.observers: Dict[str, List[Callable[[Dict[str, Any]], Any]]] = {
+            "requests_enriched": [],
             "analytics_model_metrics_1m": [],
+            "routing_guardrails": [],
             "alerts": [],
         }
         self.batch_size = 100
@@ -1020,7 +1085,9 @@ class KafkaConsumerManager:
                     "responses",
                     "metrics",
                     "errors",
+                    "requests_enriched",
                     "analytics_model_metrics_1m",
+                    "routing_guardrails",
                     "alerts",
                 ]:
                     consumer = AIOKafkaConsumer(topic_name, **self.consumer_config)
@@ -1049,9 +1116,17 @@ class KafkaConsumerManager:
                 tasks.append(asyncio.create_task(self._consume_metrics(consumer)))
             elif topic_key == "errors":
                 tasks.append(asyncio.create_task(self._consume_errors(consumer)))
+            elif topic_key == "requests_enriched":
+                tasks.append(
+                    asyncio.create_task(self._consume_requests_enriched(consumer))
+                )
             elif topic_key == "analytics_model_metrics_1m":
                 tasks.append(
                     asyncio.create_task(self._consume_analytics_model_metrics(consumer))
+                )
+            elif topic_key == "routing_guardrails":
+                tasks.append(
+                    asyncio.create_task(self._consume_routing_guardrails(consumer))
                 )
             elif topic_key == "alerts":
                 tasks.append(asyncio.create_task(self._consume_alerts(consumer)))
@@ -1218,13 +1293,16 @@ class KafkaConsumerManager:
 
     def _build_alert_event_entry(self, data: Dict[str, Any]) -> AlertEventEntry:
         """Convert an alert event payload to a ClickHouse row."""
+        event_type = str(data.get("event_type", "") or "")
         return AlertEventEntry(
             timestamp=_parse_datetime(data.get("emitted_at")),
-            alert_type=str(data.get("alert_type", "unknown")),
+            alert_type=str(
+                data.get("alert_type") or data.get("trigger_type") or "unknown"
+            ),
             severity=str(data.get("severity", "warning")),
             description=str(data.get("description", "")),
-            anomaly_type=str(data.get("anomaly_type", "")),
-            source_event_type=str(data.get("original_event_type", "")),
+            anomaly_type=str(data.get("anomaly_type") or data.get("trigger_type", "")),
+            source_event_type=str(data.get("original_event_type") or event_type),
             request_id=str(data.get("request_id", "") or ""),
             query_id=str(data.get("query_id", "") or ""),
             user_id=str(data.get("user_id", "") or ""),
@@ -1234,6 +1312,22 @@ class KafkaConsumerManager:
             window_end_ms=int(data.get("window_end_ms", 0) or 0),
             payload_json=json.dumps(data, default=str),
         )
+
+    async def _consume_requests_enriched(self, consumer: AIOKafkaConsumer):
+        """Consume request-side Flink enrichment events for observers."""
+        try:
+            async for message in consumer:
+                try:
+                    data = message.value
+                    await self._notify_observers("requests_enriched", data)
+                    PIPELINE_METRICS.messages_consumed.labels(
+                        topic="requests_enriched"
+                    ).inc()
+                except Exception as e:
+                    logger.error(f"Failed to process requests.enriched event: {e}")
+                    PIPELINE_METRICS.consumer_errors.inc()
+        except Exception as e:
+            logger.error(f"requests.enriched consumer error: {e}")
 
     async def _consume_analytics_model_metrics(self, consumer: AIOKafkaConsumer):
         """Consume Flink model metrics window events."""
@@ -1274,6 +1368,25 @@ class KafkaConsumerManager:
                     PIPELINE_METRICS.consumer_errors.inc()
         except Exception as e:
             logger.error(f"Alert consumer error: {e}")
+
+    async def _consume_routing_guardrails(self, consumer: AIOKafkaConsumer):
+        """Consume routing guardrail events for persistence and observers."""
+        try:
+            async for message in consumer:
+                try:
+                    data = message.value
+                    guardrail_entry = self._build_alert_event_entry(data)
+                    self.batch_processors["alerts"].append(guardrail_entry)
+                    await self._notify_observers("routing_guardrails", data)
+
+                    PIPELINE_METRICS.messages_consumed.labels(
+                        topic="routing_guardrails"
+                    ).inc()
+                except Exception as e:
+                    logger.error(f"Failed to process routing guardrail event: {e}")
+                    PIPELINE_METRICS.consumer_errors.inc()
+        except Exception as e:
+            logger.error(f"routing.guardrails consumer error: {e}")
 
     async def _batch_processor(self):
         """Process batches periodically"""
@@ -1399,7 +1512,9 @@ class KafkaIngestionPipeline:
         self.producer_manager = KafkaProducerManager(config)
         self.consumer_manager = None  # Will be initialized after ClickHouse
         self._stream_handlers: Dict[str, List[Callable[[Dict[str, Any]], Any]]] = {
+            "requests_enriched": [],
             "analytics_model_metrics_1m": [],
+            "routing_guardrails": [],
             "alerts": [],
         }
         self.running = False
@@ -1470,6 +1585,10 @@ class KafkaIngestionPipeline:
         """Get model performance from ClickHouse"""
         return await self.clickhouse_manager.get_model_performance(hours)
 
+    async def get_routing_guardrails(self, hours: int = 24) -> List[Dict[str, Any]]:
+        """Get persisted routing guardrails from ClickHouse."""
+        return await self.clickhouse_manager.get_routing_guardrails(hours)
+
     def register_stream_handler(
         self, topic_key: str, callback: Callable[[Dict[str, Any]], Any]
     ):
@@ -1480,12 +1599,26 @@ class KafkaIngestionPipeline:
 
     def attach_monitoring_service(self, monitoring_service: Any):
         """Forward consumed analytics streams into the monitoring service."""
+        request_feature_handler = getattr(
+            monitoring_service, "ingest_stream_request_enriched", None
+        )
+        if callable(request_feature_handler):
+            self.register_stream_handler("requests_enriched", request_feature_handler)
+
         model_metrics_handler = getattr(
             monitoring_service, "ingest_stream_model_metrics", None
         )
         if callable(model_metrics_handler):
             self.register_stream_handler(
                 "analytics_model_metrics_1m", model_metrics_handler
+            )
+
+        routing_guardrail_handler = getattr(
+            monitoring_service, "ingest_stream_routing_guardrail", None
+        )
+        if callable(routing_guardrail_handler):
+            self.register_stream_handler(
+                "routing_guardrails", routing_guardrail_handler
             )
 
         alert_handler = getattr(monitoring_service, "ingest_stream_alert", None)

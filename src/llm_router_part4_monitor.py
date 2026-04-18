@@ -4,6 +4,7 @@ Comprehensive observability, alerting, and performance monitoring
 """
 
 import asyncio
+from collections import Counter as CollectionCounter
 import json
 import logging
 import time
@@ -434,7 +435,9 @@ class AlertManager:
         """Record and optionally notify on alert events emitted by the stream layer."""
         metrics = alert_data.get("metrics", {}) if isinstance(alert_data, dict) else {}
         anomaly_type = alert_data.get("anomaly_type")
-        metric_name = anomaly_type or alert_data.get("alert_type")
+        event_type = alert_data.get("event_type")
+        trigger_type = alert_data.get("trigger_type")
+        metric_name = anomaly_type or trigger_type or alert_data.get("alert_type")
         current_value = None
 
         if anomaly_type == "high_latency":
@@ -445,7 +448,9 @@ class AlertManager:
             current_value = metrics.get("error_rate")
 
         normalized_alert = {
-            "rule_name": anomaly_type or alert_data.get("alert_type", "external_alert"),
+            "rule_name": anomaly_type
+            or trigger_type
+            or alert_data.get("alert_type", "external_alert"),
             "severity": alert_data.get("severity", "warning"),
             "description": alert_data.get("description", "External alert"),
             "threshold": alert_data.get("threshold"),
@@ -454,9 +459,17 @@ class AlertManager:
             "trigger_count": 1,
             "metric_name": metric_name,
             "alert_type": alert_data.get("alert_type"),
-            "source": "stream_pipeline",
+            "event_type": event_type,
+            "source": (
+                "routing_guardrails"
+                if event_type == "routing.guardrails"
+                else "stream_pipeline"
+            ),
             "model_name": alert_data.get("model_name"),
             "provider": alert_data.get("provider"),
+            "scope_type": alert_data.get("scope_type"),
+            "scope_key": alert_data.get("scope_key"),
+            "guardrail_action": alert_data.get("guardrail_action"),
         }
 
         self._append_alert_to_history(normalized_alert)
@@ -592,6 +605,8 @@ class MetricsCollector:
         self.max_history_size = 1000
         self.stream_metrics_history = []
         self.latest_stream_metrics_by_model: Dict[str, Dict[str, Any]] = {}
+        self.routing_feature_history = []
+        self.routing_guardrail_history = []
         self.stream_metrics_staleness_seconds = config.get(
             "stream_metrics_staleness_seconds", 300
         )
@@ -602,12 +617,14 @@ class MetricsCollector:
         application_metrics = await self._collect_application_metrics()
         business_metrics = await self._collect_business_metrics()
         streaming_metrics = self._collect_streaming_metrics()
+        routing_metrics = self.get_routing_feature_summary(hours=1)
         metrics = {
             "timestamp": datetime.now().isoformat(),
             "system": system_metrics,
             "application": application_metrics,
             "business": business_metrics,
             "streaming": streaming_metrics,
+            "routing": routing_metrics,
         }
 
         # Add to history
@@ -799,6 +816,156 @@ class MetricsCollector:
             int(metric.get("request_count", 0) or 0) for metric in recent_metrics
         )
         return summary
+
+    def record_request_routing_features(self, routing_event: Dict[str, Any]):
+        """Store a consumed requests.enriched event for dashboard use."""
+        event = dict(routing_event)
+        event.setdefault("timestamp", event.get("emitted_at", datetime.now().isoformat()))
+        self.routing_feature_history.append(event)
+        if len(self.routing_feature_history) > self.max_history_size:
+            self.routing_feature_history.pop(0)
+
+    def _recent_request_routing_features(self, hours: int = 1) -> List[Dict[str, Any]]:
+        cutoff = datetime.now() - timedelta(hours=hours)
+        return [
+            event
+            for event in self.routing_feature_history
+            if _parse_event_timestamp(event.get("timestamp")) >= cutoff
+        ]
+
+    def get_routing_feature_summary(self, hours: int = 1) -> Dict[str, Any]:
+        """Summarize recent request-side Flink routing features."""
+        recent_events = self._recent_request_routing_features(hours=hours)
+        if not recent_events:
+            return {
+                "period_hours": hours,
+                "request_count": 0,
+                "fast_lane_count": 0,
+                "requires_high_reasoning_count": 0,
+                "query_type_breakdown": {},
+                "query_complexity_breakdown": {},
+                "session_hotness_breakdown": {},
+                "top_preferred_models": {},
+                "top_avoid_models": {},
+                "top_avoid_providers": {},
+                "recent_requests": [],
+            }
+
+        query_type_counts = CollectionCounter(
+            str(event.get("query_type", "unknown")) for event in recent_events
+        )
+        query_complexity_counts = CollectionCounter(
+            str(event.get("query_complexity", "unknown")) for event in recent_events
+        )
+        session_hotness_counts = CollectionCounter(
+            str(event.get("session_hotness", "unknown")) for event in recent_events
+        )
+        preferred_model_counts = CollectionCounter()
+        avoid_model_counts = CollectionCounter()
+        avoid_provider_counts = CollectionCounter()
+
+        for event in recent_events:
+            preferred_model_counts.update(list(event.get("preferred_models", []) or []))
+            avoid_model_counts.update(list(event.get("avoid_models", []) or []))
+            avoid_provider_counts.update(list(event.get("avoid_providers", []) or []))
+
+        recent_requests = []
+        for event in recent_events[-10:]:
+            recent_requests.append(
+                {
+                    "request_id": event.get("request_id"),
+                    "query_type": event.get("query_type"),
+                    "query_complexity": event.get("query_complexity"),
+                    "priority": event.get("priority"),
+                    "route_to_fast_lane": bool(event.get("route_to_fast_lane", False)),
+                    "requires_low_latency": bool(
+                        event.get("requires_low_latency", False)
+                    ),
+                    "requires_high_reasoning": bool(
+                        event.get("requires_high_reasoning", False)
+                    ),
+                    "session_hotness": event.get("session_hotness"),
+                    "cost_sensitivity": event.get("cost_sensitivity"),
+                    "error_sensitivity": event.get("error_sensitivity"),
+                    "timestamp": event.get("timestamp"),
+                }
+            )
+
+        return {
+            "period_hours": hours,
+            "request_count": len(recent_events),
+            "fast_lane_count": sum(
+                1 for event in recent_events if event.get("route_to_fast_lane")
+            ),
+            "requires_high_reasoning_count": sum(
+                1 for event in recent_events if event.get("requires_high_reasoning")
+            ),
+            "query_type_breakdown": dict(query_type_counts),
+            "query_complexity_breakdown": dict(query_complexity_counts),
+            "session_hotness_breakdown": dict(session_hotness_counts),
+            "top_preferred_models": dict(preferred_model_counts.most_common(5)),
+            "top_avoid_models": dict(avoid_model_counts.most_common(5)),
+            "top_avoid_providers": dict(avoid_provider_counts.most_common(5)),
+            "recent_requests": recent_requests,
+        }
+
+    def record_routing_guardrail(self, guardrail_event: Dict[str, Any]):
+        """Store a consumed routing.guardrails event for dashboard use."""
+        event = dict(guardrail_event)
+        event.setdefault("timestamp", event.get("emitted_at", datetime.now().isoformat()))
+        self.routing_guardrail_history.append(event)
+        if len(self.routing_guardrail_history) > self.max_history_size:
+            self.routing_guardrail_history.pop(0)
+
+    def _recent_routing_guardrails(self, hours: int = 1) -> List[Dict[str, Any]]:
+        cutoff = datetime.now() - timedelta(hours=hours)
+        return [
+            event
+            for event in self.routing_guardrail_history
+            if _parse_event_timestamp(event.get("timestamp")) >= cutoff
+        ]
+
+    def get_routing_guardrail_summary(self, hours: int = 1) -> Dict[str, Any]:
+        """Summarize recent routing guardrails for dashboard use."""
+        recent_events = self._recent_routing_guardrails(hours=hours)
+        if not recent_events:
+            return {
+                "period_hours": hours,
+                "guardrail_count": 0,
+                "scope_breakdown": {},
+                "trigger_breakdown": {},
+                "recent_guardrails": [],
+            }
+
+        scope_counts = CollectionCounter(
+            str(event.get("scope_type", "unknown")) for event in recent_events
+        )
+        trigger_counts = CollectionCounter(
+            str(event.get("trigger_type", "unknown")) for event in recent_events
+        )
+        recent_guardrails = []
+        for event in recent_events[-10:]:
+            recent_guardrails.append(
+                {
+                    "scope_type": event.get("scope_type"),
+                    "scope_key": event.get("scope_key"),
+                    "trigger_type": event.get("trigger_type"),
+                    "guardrail_action": event.get("guardrail_action"),
+                    "severity": event.get("severity"),
+                    "description": event.get("description"),
+                    "model_name": event.get("model_name"),
+                    "provider": event.get("provider"),
+                    "timestamp": event.get("timestamp"),
+                }
+            )
+
+        return {
+            "period_hours": hours,
+            "guardrail_count": len(recent_events),
+            "scope_breakdown": dict(scope_counts),
+            "trigger_breakdown": dict(trigger_counts),
+            "recent_guardrails": recent_guardrails,
+        }
 
     def get_metrics_summary(self, hours: int = 1) -> Dict[str, Any]:
         """Get metrics summary for the specified time period"""
@@ -1105,6 +1272,15 @@ class MonitoringService:
         """Consume windowed analytics events forwarded by the pipeline."""
         self.metrics_collector.record_stream_model_metrics(metric_event)
 
+    async def ingest_stream_request_enriched(self, routing_event: Dict[str, Any]):
+        """Consume request enrichment events forwarded by the pipeline."""
+        self.metrics_collector.record_request_routing_features(routing_event)
+
+    async def ingest_stream_routing_guardrail(self, guardrail_event: Dict[str, Any]):
+        """Consume routing guardrail events forwarded by the pipeline."""
+        self.metrics_collector.record_routing_guardrail(guardrail_event)
+        await self.alert_manager.record_external_alert(guardrail_event)
+
     async def ingest_stream_alert(self, alert_event: Dict[str, Any]):
         """Consume alert events forwarded by the pipeline."""
         await self.alert_manager.record_external_alert(alert_event)
@@ -1114,6 +1290,8 @@ class MonitoringService:
         current_metrics = await self.metrics_collector.collect_all_metrics()
         metrics_summary = self.metrics_collector.get_metrics_summary(hours=1)
         stream_analytics = self.metrics_collector.get_stream_metrics_summary(hours=1)
+        routing_features = self.metrics_collector.get_routing_feature_summary(hours=1)
+        routing_guardrails = self.metrics_collector.get_routing_guardrail_summary(hours=1)
         alert_status = self.alert_manager.get_alert_status()
         performance_report = (
             await self.performance_profiler.generate_optimization_report()
@@ -1123,6 +1301,8 @@ class MonitoringService:
             "current_metrics": current_metrics,
             "metrics_summary": metrics_summary,
             "stream_analytics": stream_analytics,
+            "routing_features": routing_features,
+            "routing_guardrails": routing_guardrails,
             "alert_status": alert_status,
             "performance_report": performance_report,
             "timestamp": datetime.now().isoformat(),

@@ -436,6 +436,13 @@ class ModelRouter:
                 routing_reason=model_selection.reason,
                 routing_time_ms=int((time.time() - start_time) * 1000),
                 confidence=model_selection.confidence,
+                route_to_fast_lane=bool(query_context.get("route_to_fast_lane", False)),
+                actual_fast_lane_hit=(
+                    bool(query_context.get("route_to_fast_lane", False))
+                    and model_selection.model_name in self._get_fast_lane_candidates()
+                ),
+                policy_source=str(query_context.get("policy_source", "none") or "none"),
+                hint_reason=query_context.get("hint_reason"),
             )
 
             # Update metrics
@@ -488,6 +495,10 @@ class ModelRouter:
 
         policy_context = await self._get_policy_context(request)
         context.update(policy_context)
+        if policy_context.get("policy_query_type"):
+            context["query_type"] = policy_context["policy_query_type"]
+        if policy_context.get("query_complexity"):
+            context["query_complexity"] = policy_context["query_complexity"]
 
         return context
 
@@ -495,6 +506,11 @@ class ModelRouter:
         """Load request/user-level routing hints from the shared policy cache."""
         metadata = request.metadata or {}
         metadata_preferred_models = list(metadata.get("preferred_models", []) or [])
+        metadata_avoid_models = list(metadata.get("avoid_models", []) or [])
+        metadata_avoid_providers = [
+            str(provider).lower()
+            for provider in list(metadata.get("avoid_providers", []) or [])
+        ]
 
         if not self.policy_cache:
             return {
@@ -503,6 +519,12 @@ class ModelRouter:
                 else "none",
                 "route_to_fast_lane": False,
                 "preferred_models": metadata_preferred_models,
+                "avoid_models": metadata_avoid_models,
+                "avoid_providers": metadata_avoid_providers,
+                "blocked_models": [],
+                "blocked_providers": [],
+                "warn_models": [],
+                "warn_providers": [],
                 "hint_reason": (
                     "preferred_models from request metadata"
                     if metadata_preferred_models
@@ -518,6 +540,12 @@ class ModelRouter:
                 else "none",
                 "route_to_fast_lane": False,
                 "preferred_models": metadata_preferred_models,
+                "avoid_models": metadata_avoid_models,
+                "avoid_providers": metadata_avoid_providers,
+                "blocked_models": [],
+                "blocked_providers": [],
+                "warn_models": [],
+                "warn_providers": [],
                 "hint_reason": (
                     "preferred_models from request metadata"
                     if metadata_preferred_models
@@ -526,7 +554,19 @@ class ModelRouter:
             }
 
         try:
-            policy = await get_policy(request.request_id, request.user_id)
+            policy = await get_policy(
+                request.request_id,
+                request.user_id,
+                request.session_id,
+            )
+        except TypeError:
+            try:
+                policy = await get_policy(request.request_id, request.user_id)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to load routing policy for request {request.request_id}: {e}"
+                )
+                policy = {}
         except Exception as e:
             logger.warning(
                 f"Failed to load routing policy for request {request.request_id}: {e}"
@@ -540,6 +580,21 @@ class ModelRouter:
             if model_name not in combined_preferred_models:
                 combined_preferred_models.append(model_name)
 
+        combined_avoid_models = []
+        for model_name in metadata_avoid_models + list(
+            policy.get("avoid_models", []) or []
+        ):
+            if model_name not in combined_avoid_models:
+                combined_avoid_models.append(model_name)
+
+        combined_avoid_providers = []
+        for provider_name in metadata_avoid_providers + [
+            str(provider).lower()
+            for provider in list(policy.get("avoid_providers", []) or [])
+        ]:
+            if provider_name not in combined_avoid_providers:
+                combined_avoid_providers.append(provider_name)
+
         policy_source = policy.get("policy_source", "none")
         if metadata_preferred_models:
             policy_source = (
@@ -552,6 +607,13 @@ class ModelRouter:
             "policy_source": policy_source,
             "route_to_fast_lane": bool(policy.get("route_to_fast_lane", False)),
             "preferred_models": combined_preferred_models,
+            "avoid_models": combined_avoid_models,
+            "avoid_providers": combined_avoid_providers,
+            "blocked_models": list(policy.get("blocked_models", []) or []),
+            "blocked_providers": list(policy.get("blocked_providers", []) or []),
+            "warn_models": list(policy.get("warn_models", []) or []),
+            "warn_providers": list(policy.get("warn_providers", []) or []),
+            "guardrail_reasons": dict(policy.get("guardrail_reasons", {}) or {}),
             "hint_reason": policy.get("hint_reason")
             or (
                 "preferred_models from request metadata"
@@ -560,6 +622,20 @@ class ModelRouter:
             ),
             "policy_priority": policy.get("priority"),
             "policy_query_type": policy.get("query_type"),
+            "query_complexity": policy.get("query_complexity"),
+            "requires_low_latency": bool(policy.get("requires_low_latency", False)),
+            "requires_high_reasoning": bool(
+                policy.get("requires_high_reasoning", False)
+            ),
+            "long_context": bool(policy.get("long_context", False)),
+            "attachment_heavy": bool(policy.get("attachment_heavy", False)),
+            "code_heavy": bool(policy.get("code_heavy", False)),
+            "session_hotness": policy.get("session_hotness"),
+            "cost_sensitivity": policy.get("cost_sensitivity"),
+            "error_sensitivity": policy.get("error_sensitivity"),
+            "burst_protection_active": bool(
+                policy.get("burst_protection_active", False)
+            ),
         }
 
     async def _intelligent_routing(self, context: Dict[str, Any]) -> ModelSelection:
@@ -588,11 +664,7 @@ class ModelRouter:
         self, context: Dict[str, Any]
     ) -> Optional[ModelSelection]:
         """Prefer low-latency local models when policy cache marks a request/user hot."""
-        preferred_models = [
-            model_name
-            for model_name in context.get("preferred_models", [])
-            if model_name in self.models
-        ]
+        preferred_models = self._derive_preferred_models_from_context(context)
         policy_source = context.get("policy_source", "none")
         route_to_fast_lane = bool(context.get("route_to_fast_lane", False))
 
@@ -600,6 +672,21 @@ class ModelRouter:
             return None
 
         candidates = list(preferred_models)
+        explicitly_preferred_models = list(context.get("preferred_models", []) or [])
+        preferred_candidates = self._filter_models_for_context(
+            explicitly_preferred_models, context
+        )
+
+        if preferred_candidates:
+            selected_model = self._select_best_model(preferred_candidates, context)
+            hint_reason = context.get("hint_reason") or "preferred model pin"
+            confidence = 0.98 if policy_source == "request" else 0.94
+            return ModelSelection(
+                model_name=selected_model,
+                confidence=confidence,
+                reason=f"Policy-cache selection ({policy_source}): {hint_reason}",
+            )
+
         if route_to_fast_lane:
             for model_name in self._get_fast_lane_candidates():
                 if model_name not in candidates:
@@ -618,6 +705,82 @@ class ModelRouter:
             confidence=confidence,
             reason=(f"Policy-cache selection ({policy_source}): {hint_reason}"),
         )
+
+    def _derive_preferred_models_from_context(
+        self, context: Dict[str, Any]
+    ) -> List[str]:
+        """Convert policy features into an ordered set of preferred model candidates."""
+        preferred_models: List[str] = []
+
+        def _append(models: List[str]):
+            for model_name in models:
+                if model_name in self.models and model_name not in preferred_models:
+                    preferred_models.append(model_name)
+
+        _append(list(context.get("preferred_models", []) or []))
+
+        if bool(context.get("requires_low_latency", False)):
+            _append(self._get_fast_lane_candidates())
+
+        if (
+            bool(context.get("requires_high_reasoning", False))
+            or context.get("query_complexity") == "complex"
+        ):
+            _append(self._models_with_capabilities(["reasoning", "analysis"]))
+
+        policy_query_type = str(context.get("policy_query_type") or "").lower()
+        if policy_query_type in {"code_generation", "code_analysis"} or bool(
+            context.get("code_heavy", False)
+        ):
+            _append(self._models_with_capabilities(["coding"]))
+
+        if bool(context.get("long_context", False)) or bool(
+            context.get("attachment_heavy", False)
+        ):
+            _append(self._models_with_large_context(context))
+
+        if str(context.get("session_hotness", "")).lower() == "hot" and not bool(
+            context.get("requires_high_reasoning", False)
+        ):
+            _append(self._get_fast_lane_candidates())
+
+        if str(context.get("cost_sensitivity", "")).lower() == "high":
+            _append(self._models_sorted_by_cost())
+
+        return preferred_models
+
+    def _models_with_capabilities(self, capabilities: List[str]) -> List[str]:
+        """Return models that advertise at least one requested capability."""
+        matches: List[Tuple[str, int]] = []
+        for model_name, model_config in self.models.items():
+            model_caps = {cap.lower() for cap in model_config.capabilities}
+            if any(cap.lower() in model_caps for cap in capabilities):
+                matches.append((model_name, model_config.priority))
+        matches.sort(key=lambda item: item[1])
+        return [model_name for model_name, _priority in matches]
+
+    def _models_with_large_context(self, context: Dict[str, Any]) -> List[str]:
+        """Return models with enough headroom for large-context requests."""
+        requested_tokens = max(
+            int(context.get("token_count", 0) or 0),
+            int(context.get("max_tokens", 0) or 0),
+        )
+        minimum_context = max(4096, requested_tokens)
+        matches = [
+            (model_name, model_config.max_tokens)
+            for model_name, model_config in self.models.items()
+            if model_config.max_tokens >= minimum_context
+        ]
+        matches.sort(key=lambda item: item[1], reverse=True)
+        return [model_name for model_name, _max_tokens in matches]
+
+    def _models_sorted_by_cost(self) -> List[str]:
+        """Return models ordered from cheapest to most expensive."""
+        ranked = sorted(
+            self.models.items(),
+            key=lambda item: (item[1].cost_per_token, item[1].priority),
+        )
+        return [model_name for model_name, _model_config in ranked]
 
     def _capability_based_routing(self, context: Dict[str, Any]) -> ModelSelection:
         """Route based on model capabilities and query requirements"""
@@ -645,11 +808,26 @@ class ModelRouter:
         query_type = context["query_type"]
         token_count = context["token_count"]
         user_tier = context["user_tier"]
+        avoid_models = set(context.get("avoid_models", []) or [])
+        blocked_models = set(context.get("blocked_models", []) or [])
+        avoid_providers = {
+            str(provider).lower()
+            for provider in list(context.get("avoid_providers", []) or [])
+        }
+        blocked_providers = {
+            str(provider).lower()
+            for provider in list(context.get("blocked_providers", []) or [])
+        }
 
         suitable_models = []
         for model_name in candidate_models:
             model_config = self.models.get(model_name)
             if not model_config:
+                continue
+            if model_name in avoid_models or model_name in blocked_models:
+                continue
+            provider_name = model_config.provider.lower()
+            if provider_name in avoid_providers or provider_name in blocked_providers:
                 continue
             if not self._has_capability(model_config, query_type):
                 continue
@@ -683,8 +861,13 @@ class ModelRouter:
             "code_analysis": ["coding", "analysis", "general"],
             "analysis": ["analysis", "reasoning", "general"],
             "reasoning": ["reasoning", "analysis", "general"],
+            "planning": ["reasoning", "analysis", "general"],
+            "brainstorming": ["creative", "writing", "general"],
+            "question_answering": ["reasoning", "analysis", "general"],
+            "summarization": ["analysis", "writing", "general"],
             "creative_writing": ["writing", "creative", "general"],
             "math": ["reasoning", "analysis", "general"],
+            "translation": ["translation", "general"],
         }
 
         required_capabilities = capability_mapping.get(query_type, ["general"])
@@ -718,10 +901,23 @@ class ModelRouter:
         if not candidates:
             return self.default_model
 
-        scores = {
-            model_name: self._score_model(model_name, context)
-            for model_name in candidates
+        scores = {}
+        warn_models = set(context.get("warn_models", []) or [])
+        warn_providers = {
+            str(provider).lower()
+            for provider in list(context.get("warn_providers", []) or [])
         }
+
+        for model_name in candidates:
+            score = self._score_model(model_name, context)
+            model_config = self.models[model_name]
+
+            if model_name in warn_models:
+                score -= 15
+            if model_config.provider.lower() in warn_providers:
+                score -= 12
+
+            scores[model_name] = score
 
         # Return model with highest score
         return max(candidates, key=lambda x: scores.get(x, 0))
@@ -736,18 +932,27 @@ class ModelRouter:
         success_rate = model_stats.get("success_rate", 0.95)
         avg_latency = model_stats.get("avg_latency", 1000)  # ms
 
-        score += success_rate * float(self.scoring["reliability_weight"])
+        error_sensitivity = str(context.get("error_sensitivity", "")).lower()
+        reliability_weight = float(self.scoring["reliability_weight"])
+        if error_sensitivity == "high":
+            reliability_weight += 10.0
+
+        score += success_rate * reliability_weight
         score += max(
             0, float(self.scoring["latency_weight"]) - avg_latency / 100
         )  # Speed weight (lower latency = higher score)
 
         # Cost efficiency (inverse relationship)
         cost_per_token = model_config.cost_per_token
+        cost_sensitivity = str(context.get("cost_sensitivity", "")).lower()
+        cost_weight_cap = float(self.scoring["cost_weight_cap"])
+        if cost_sensitivity == "high":
+            cost_weight_cap += 10.0
         if cost_per_token > 0:
             cost_score = 1 / (cost_per_token * 1000000)  # Normalize
-            score += min(cost_score, float(self.scoring["cost_weight_cap"]))
+            score += min(cost_score, cost_weight_cap)
         else:
-            score += float(self.scoring["cost_weight_cap"])
+            score += cost_weight_cap
 
         # Priority-based scoring
         score += (10 - model_config.priority) * float(self.scoring["priority_weight"])

@@ -25,6 +25,7 @@ def _write_config(tmp_path: Path, overrides=None) -> Path:
                 "inference_completed": "inference.completed",
                 "requests_enriched": "requests.enriched",
                 "fast_lane_hints": "fast_lane_hints",
+                "routing_guardrails": "routing.guardrails",
                 "alerts": "alerts",
             },
         },

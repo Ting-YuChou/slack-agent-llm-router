@@ -157,6 +157,29 @@ class TestAlertManager:
         assert manager.alert_history[0]["current_value"] == 720.0
         assert calls[0]["model_name"] == "mistral-7b"
 
+    @pytest.mark.asyncio
+    async def test_record_external_alert_normalizes_routing_guardrail_payload(self):
+        manager = AlertManager({})
+
+        await manager.record_external_alert(
+            {
+                "event_type": "routing.guardrails",
+                "trigger_type": "high_error_rate",
+                "severity": "error",
+                "description": "Model error rate exceeded the guardrail threshold",
+                "scope_type": "model",
+                "scope_key": "gpt-5",
+                "guardrail_action": "avoid",
+                "model_name": "gpt-5",
+                "provider": "openai",
+                "emitted_at": "2026-04-08T12:00:00Z",
+            }
+        )
+
+        assert manager.alert_history[-1]["rule_name"] == "high_error_rate"
+        assert manager.alert_history[-1]["source"] == "routing_guardrails"
+        assert manager.alert_history[-1]["scope_key"] == "gpt-5"
+
 
 class TestMetricsCollector:
     def test_record_stream_model_metrics_updates_summary(self):
@@ -184,6 +207,44 @@ class TestMetricsCollector:
         assert summary["models"]["gpt-5"]["avg_latency_ms"] == 250.0
         assert summary["sample_count"] == 1
 
+    def test_routing_feature_and_guardrail_summaries(self):
+        collector = MetricsCollector({"stream_metrics_staleness_seconds": 300})
+        collector.record_request_routing_features(
+            {
+                "event_type": "requests.enriched",
+                "emitted_at": datetime.now().isoformat(),
+                "request_id": "req-1",
+                "query_type": "analysis",
+                "query_complexity": "complex",
+                "session_hotness": "hot",
+                "route_to_fast_lane": True,
+                "requires_high_reasoning": True,
+                "preferred_models": ["gpt-5"],
+                "avoid_providers": ["openai"],
+            }
+        )
+        collector.record_routing_guardrail(
+            {
+                "event_type": "routing.guardrails",
+                "emitted_at": datetime.now().isoformat(),
+                "scope_type": "model",
+                "scope_key": "gpt-5",
+                "trigger_type": "high_error_rate",
+                "guardrail_action": "avoid",
+                "severity": "error",
+                "description": "Model error rate exceeded threshold",
+            }
+        )
+
+        feature_summary = collector.get_routing_feature_summary(hours=1)
+        guardrail_summary = collector.get_routing_guardrail_summary(hours=1)
+
+        assert feature_summary["request_count"] == 1
+        assert feature_summary["query_type_breakdown"]["analysis"] == 1
+        assert feature_summary["top_preferred_models"]["gpt-5"] == 1
+        assert guardrail_summary["guardrail_count"] == 1
+        assert guardrail_summary["scope_breakdown"]["model"] == 1
+
 
 class TestMonitoringService:
     @pytest.mark.asyncio
@@ -205,8 +266,34 @@ class TestMonitoringService:
                 "window_end_ms": 1_710_000_060_000,
             }
         )
+        await service.ingest_stream_request_enriched(
+            {
+                "event_type": "requests.enriched",
+                "emitted_at": datetime.now().isoformat(),
+                "request_id": "req-1",
+                "query_type": "analysis",
+                "query_complexity": "complex",
+                "session_hotness": "hot",
+                "route_to_fast_lane": True,
+                "requires_high_reasoning": True,
+            }
+        )
+        await service.ingest_stream_routing_guardrail(
+            {
+                "event_type": "routing.guardrails",
+                "emitted_at": datetime.now().isoformat(),
+                "scope_type": "provider",
+                "scope_key": "openai",
+                "trigger_type": "provider_high_latency",
+                "guardrail_action": "avoid",
+                "severity": "error",
+                "description": "Provider latency exceeded threshold",
+            }
+        )
 
         dashboard = await service.get_dashboard_data()
 
         assert dashboard["stream_analytics"]["models"]["gpt-5"]["request_count"] == 3
         assert dashboard["current_metrics"]["streaming"]["request_count"] == 3
+        assert dashboard["routing_features"]["request_count"] == 1
+        assert dashboard["routing_guardrails"]["guardrail_count"] == 1

@@ -4,7 +4,10 @@ import pytest
 
 from flink.logic import (
     build_model_metrics_window_event,
+    build_routing_policy_state_event,
     detect_metric_anomalies,
+    detect_model_routing_guardrails,
+    detect_provider_routing_guardrails,
     validate_inference_completed_event,
 )
 
@@ -88,3 +91,148 @@ def test_flink_analytics_detects_high_latency_error_and_volume():
     assert "high_latency" in anomaly_types
     assert "high_volume" in anomaly_types
     assert "high_error_rate" in anomaly_types
+
+
+@pytest.mark.integration
+def test_flink_analytics_emits_model_and_provider_routing_guardrails():
+    metric_event = build_model_metrics_window_event(
+        model_name="gpt-5",
+        provider="openai",
+        window_start_ms=1_710_000_000_000,
+        window_end_ms=1_710_000_060_000,
+        window_size_seconds=60,
+        request_count=10,
+        success_count=6,
+        error_count=4,
+        latency_sum_ms=62000.0,
+        tokens_per_second_sum=900.0,
+        token_count_input=600,
+        token_count_output=1400,
+        total_tokens=2000,
+        total_cost_usd=0.20,
+        cached_count=0,
+        timestamp=datetime(2026, 4, 8, 12, 3, 0),
+    )
+
+    model_guardrails = detect_model_routing_guardrails(
+        metric_event,
+        latency_history=[900.0, 1100.0, 950.0],
+        qps_history=[0.9, 1.1, 1.0],
+        error_rate_history=[0.01, 0.02, 0.01],
+        cache_hit_rate_history=[0.50, 0.45, 0.48],
+        cost_per_1k_history=[0.03, 0.04, 0.035],
+        timestamp=datetime(2026, 4, 8, 12, 4, 0),
+    )
+    provider_guardrails = detect_provider_routing_guardrails(
+        metric_event,
+        latency_history=[1000.0, 1200.0, 950.0],
+        error_rate_history=[0.01, 0.02, 0.01],
+        timestamp=datetime(2026, 4, 8, 12, 4, 0),
+    )
+
+    assert any(
+        guardrail["event_type"] == "routing.guardrails"
+        and guardrail["scope_type"] == "model"
+        and guardrail["scope_key"] == "gpt-5"
+        for guardrail in model_guardrails
+    )
+    assert any(
+        guardrail["event_type"] == "routing.guardrails"
+        and guardrail["scope_type"] == "provider"
+        and guardrail["scope_key"] == "openai"
+        for guardrail in provider_guardrails
+    )
+
+
+@pytest.mark.integration
+def test_flink_analytics_builds_user_rolling_policy_state():
+    policy_event = build_routing_policy_state_event(
+        scope_type="user",
+        scope_key="user-rolling-1",
+        window_size_seconds=300,
+        events=[
+            {
+                "user_id": "user-rolling-1",
+                "user_tier": "free",
+                "query_type": "summarization",
+                "selected_model": "gpt-5",
+                "provider": "openai",
+                "status": "success",
+                "latency_ms": 600,
+                "total_tokens": 900,
+                "cost_usd": 0.030,
+                "route_to_fast_lane": True,
+                "actual_fast_lane_hit": True,
+            }
+            for _ in range(10)
+        ],
+        timestamp=datetime(2026, 4, 17, 12, 5, 0),
+    )
+
+    assert policy_event["event_type"] == "routing.policy_state"
+    assert policy_event["scope_type"] == "user"
+    assert policy_event["burst_protection_active"] is True
+    assert policy_event["cost_sensitivity"] == "high"
+    assert policy_event["avoid_models"] == ["gpt-5"]
+    assert policy_event["route_to_fast_lane"] is True
+
+
+@pytest.mark.integration
+def test_flink_analytics_builds_session_model_pin_policy_state():
+    policy_event = build_routing_policy_state_event(
+        scope_type="session",
+        scope_key="session-rolling-1",
+        window_size_seconds=300,
+        events=[
+            {
+                "user_id": "enterprise-1",
+                "session_id": "session-rolling-1",
+                "user_tier": "enterprise",
+                "query_type": "analysis",
+                "selected_model": "gpt-5",
+                "provider": "openai",
+                "status": "success",
+                "latency_ms": 1200,
+                "total_tokens": 1800,
+                "cost_usd": 0.025,
+                "route_to_fast_lane": False,
+                "actual_fast_lane_hit": False,
+            }
+            for _ in range(4)
+        ],
+        timestamp=datetime(2026, 4, 17, 12, 6, 0),
+    )
+
+    assert policy_event["scope_type"] == "session"
+    assert policy_event["preferred_models"] == ["gpt-5"]
+    assert policy_event["requires_high_reasoning"] is True
+    assert policy_event["query_complexity"] in {"moderate", "complex"}
+
+
+@pytest.mark.integration
+def test_flink_analytics_fast_lane_hit_rate_uses_actual_hits():
+    policy_event = build_routing_policy_state_event(
+        scope_type="user",
+        scope_key="user-rolling-2",
+        window_size_seconds=300,
+        events=[
+            {
+                "user_id": "user-rolling-2",
+                "user_tier": "premium",
+                "query_type": "summarization",
+                "selected_model": "gpt-5",
+                "provider": "openai",
+                "status": "success",
+                "latency_ms": 300,
+                "total_tokens": 300,
+                "cost_usd": 0.005,
+                "route_to_fast_lane": True,
+                "actual_fast_lane_hit": False,
+            }
+            for _ in range(6)
+        ],
+        timestamp=datetime(2026, 4, 17, 12, 7, 0),
+    )
+
+    assert policy_event["fast_lane_hit_rate"] == 0.0
+    assert policy_event["route_to_fast_lane"] is False
