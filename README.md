@@ -45,9 +45,9 @@ Clone the repository and install dependencies:
 ```bash
 git clone https://github.com/your-org/slack-agent-llm-router.git
 cd slack-agent-llm-router
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install -r requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r requirements-dev.txt
 ```
 
 ### Clean Local Env
@@ -73,50 +73,66 @@ Pytest is configured in `pytest.ini` to disable the built-in capture plugin beca
 
 ### Configuration
 
-Copy the environment template and configure your settings:
+Set the required environment variables before starting the API:
 
 ```bash
-cp .env.example .env
-```
-
-Required environment variables:
-
-```bash
+LLM_ROUTER_API_KEYS=dev-api-key
 OPENAI_API_KEY=your_openai_key
-ANTHROPIC_API_KEY=your_anthropic_key  
+ANTHROPIC_API_KEY=your_anthropic_key
 SLACK_BOT_TOKEN=xoxb-your-slack-token
-KAFKA_BOOTSTRAP_SERVERS=localhost:9092
-CLICKHOUSE_HOST=localhost
-REDIS_HOST=localhost
 ```
 
-Update the main configuration file at `config/config.yaml` with your model preferences and routing rules.
+Notes:
+
+- API key auth is enabled in `config/config.yaml` by default.
+- `LLM_ROUTER_API_KEYS` accepts a comma-separated list of valid keys.
+- The API reads runtime config from `config/config.yaml` unless `LLM_ROUTER_CONFIG` is set.
+- For `docker compose` local development, the app containers use `config/config.compose.yaml`.
+- Set at least one cloud provider key before sending requests. The compose stack is intentionally cloud-only and does not start a local vLLM model server.
 
 ### Running with Docker
 
-Start all services using Docker Compose:
+Bring up the local full stack:
 
 ```bash
-docker-compose up -d
+docker compose up -d --build
 ```
 
 This starts:
-- Kafka for message streaming
+
+- Redis for shared state and caching
+- Kafka for event streaming
 - ClickHouse for analytics storage
-- Redis for response caching
-- Prometheus for metrics collection
-- Grafana for visualization
+- API service on `http://localhost:8080`
+- Background workers for the Kafka -> ClickHouse pipeline
+- Flink JobManager / TaskManager for stream-processing experiments
+
+Useful follow-up commands:
+
+```bash
+docker compose logs -f api workers
+docker compose ps
+```
 
 ### Manual Startup
 
-For development, you can run components individually:
+If you do not want to run the API and workers inside containers:
 
 ```bash
-# Start external services
-docker-compose up -d kafka clickhouse redis prometheus grafana
+# Start infra dependencies
+docker compose up -d redis kafka clickhouse
 
-# Start the main application
-python main.py
+# Start the API in development mode
+python main.py start-api --dev --config config/config.yaml
+
+# Start background workers when pipeline/slack/monitoring are enabled
+python main.py start-workers --config config/config.yaml
+```
+
+For a single-process local run that starts both API and enabled background services:
+
+```bash
+python main.py start --config config/config.yaml
 ```
 
 ### Verification
@@ -124,68 +140,49 @@ python main.py
 Check that services are running:
 
 ```bash
-# Health check
-curl http://localhost:8080/health
+# Liveness
+curl http://localhost:8080/live
+
+# Readiness
+curl http://localhost:8080/ready
 
 # Test query
-curl -X POST http://localhost:8080/v1/query \
+curl -X POST http://localhost:8080/route \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-api-key" \
   -d '{"query": "Hello, how are you?", "user_id": "test_user"}'
 ```
 
-Access the web interfaces:
-- Streamlit Dashboard: http://localhost:8501
-- Grafana Monitoring: http://localhost:3000 (admin/admin)
-- Prometheus Metrics: http://localhost:9090
+`/health` is kept as a backward-compatible alias for `/ready`.
 
 ## Project Structure
 
-```
+``` 
 slack-agent-llm-router/
 ├── main.py                           # Application entry point
+├── docker-compose.yml                # Local full-stack compose (infra + API + workers)
 ├── config/
-│   └── config.yaml                   # Main configuration file
-├── data/
-│   ├── queries/
-│   │   └── logs.csv                  # Sample query data
-│   └── processed/
-│       └── routed/                   # Processing outputs
+│   ├── config.yaml                   # Host-run configuration
+│   └── config.compose.yaml           # Compose runtime configuration
 ├── docker/
-│   ├── docker-compose.yml            # Service orchestration
-│   ├── Dockerfile                    # Application container
-│   └── requirements.txt              # Container dependencies
+│   ├── Dockerfile                    # API/worker runtime image
+│   ├── requirements-runtime.txt      # Runtime-only Python dependencies
+│   └── flink/
+│       └── Dockerfile                # Flink image build
 ├── flink/
-│   ├── job.py                        # Stream processing logic
-│   └── README.md                     # Flink deployment guide
-├── kafka/
-│   ├── producer.log                  # Producer logs
-│   ├── consumer.log                  # Consumer logs
-│   └── topics.json                   # Topic configuration
-├── clickhouse/
-│   ├── schema.sql                    # Database schema
-│   └── data/                         # Data storage
-├── monitoring/
-│   ├── prometheus.yml                # Metrics configuration
-│   └── grafana/
-│       └── dashboard.json            # Dashboard definition
+│   └── analytics_job.py              # Stream processing logic
 ├── slack/
-│   ├── bot.py                        # Slack bot endpoints
-│   └── credentials/
-│       └── token.txt                 # Bot authentication
+│   ├── bot.py                        # Slack bot entrypoint
+│   └── bot_real.py                   # Slack bot implementation
 ├── streamlit_ui/
-│   ├── app.py                        # Web dashboard
-│   └── config.toml                   # UI settings
+│   └── app.py                        # Optional Streamlit UI source
 ├── src/
-│   ├── models/
-│   │   └── mistral_engine.py         # Model abstraction layer
-│   └── utils/
-│       ├── logger.py                 # Logging utilities
-│       ├── schema.py                 # Data validation models
-│       └── metrics.py                # Prometheus metrics
+│   ├── models/                       # Provider and engine implementations
+│   └── utils/                        # Logging, schema, metrics helpers
 └── tests/
-    ├── test_pipeline.py              # Pipeline tests
+    ├── test_main.py                  # API tests
     ├── test_inference.py             # Inference tests
-    └── conftest.py                   # Test configuration
+    └── test_router.py                # Routing tests
 ```
 
 ## Configuration
@@ -196,16 +193,16 @@ Configure available models in `config/config.yaml`:
 
 ```yaml
 models:
-  gpt-4-turbo:
+  gpt-5:
     provider: openai
     cost_per_token: 0.00001
     max_tokens: 128000
-    capabilities: [text, analysis, coding]
+    capabilities: [text, analysis, coding, general]
   
-  claude-3.5-sonnet:
+  claude-sonnet-4-6:
     provider: anthropic
     cost_per_token: 0.000003  
-    max_tokens: 200000
+    max_tokens: 1000000
     capabilities: [text, analysis, reasoning]
   
   mistral-7b:
@@ -221,10 +218,17 @@ Define query routing logic:
 
 ```yaml
 routing_rules:
-  general: claude-3.5-sonnet
-  code_generation: mistral-7b
-  analysis: gpt-4-turbo
-  creative_writing: claude-3.5-sonnet
+  enterprise: claude-sonnet-4-6
+  heavy_analysis: claude-sonnet-4-6
+  code_generation: [gpt-5, mistral-7b]
+
+scoring:
+  default_model_bonus: 4
+  gpt5_default_bonus: 3
+  sonnet_enterprise_bonus: 12
+  sonnet_difficult_task_bonus: 10
+  local_simple_task_bonus: 12
+  simple_task_token_threshold: 1200
 ```
 
 ### Slack Configuration
@@ -234,12 +238,22 @@ Configure the Slack bot integration:
 ```yaml
 slack:
   enabled: true
-  bot_token: "${SLACK_BOT_TOKEN}"
-  rate_limits:
-    free: 10
-    premium: 100
-    enterprise: 1000
+  bot_token_env: SLACK_BOT_TOKEN
+  app_token_env: SLACK_APP_TOKEN
+  channels:
+    - general
+  state_backend: redis
+  state_key_prefix: slack_state
+  redis:
+    host: localhost
+    port: 6379
+    db: 2
+    password_env: REDIS_PASSWORD
 ```
+
+`state_backend: redis` is the recommended production default for Slack because it survives process restarts and supports multi-instance state sharing. Use `file` only for single-node local runs.
+
+For compose-based local development, `config/config.compose.yaml` already points Slack state, the inference cache, and policy-cache Redis to the internal `redis` service name.
 
 ## Development
 
@@ -289,11 +303,13 @@ To add a new model provider:
 
 ### Metrics Dashboard
 
-The platform provides comprehensive monitoring through:
+The application exposes these monitoring-oriented API endpoints:
 
-- Streamlit UI at http://localhost:8501 for real-time metrics
-- Grafana dashboards at http://localhost:3000 for detailed analytics
-- Prometheus metrics at http://localhost:9090 for raw data
+- `GET /dashboard`
+- `GET /dashboard/logs`
+- `GET /metrics`
+
+When API key auth is enabled, these endpoints require a valid API key. The checked-in root compose file does not start Grafana or Prometheus.
 
 ### Key Metrics
 
@@ -319,11 +335,10 @@ Alerts are configured for:
 
 ### Docker Production
 
-Build and deploy the production image:
+This repository does not check in a production compose file. To generate deployment assets:
 
 ```bash
-docker build -t slack-agent-llm-router:latest .
-docker-compose -f docker-compose.prod.yml up -d
+python main.py deploy --output .
 ```
 
 ### CI/CD Pipeline
@@ -366,10 +381,9 @@ For high-volume deployments:
 
 The platform supports:
 
-- API key authentication for all endpoints
-- Role-based access control for different user tiers
-- Rate limiting to prevent abuse
-- Request validation and sanitization
+- API key authentication for all application endpoints except `/live`, `/ready`, and `/health`
+- Request validation via Pydantic models
+- Structured application logging for diagnostics and audit trails
 
 ### Data Privacy
 
@@ -385,17 +399,18 @@ Security measures include:
 ### Common Issues
 
 Connection errors:
-- Verify all services are running with `docker-compose ps`
+- Verify infra services are running with `docker compose ps`
 - Check network connectivity between containers
 - Validate environment variables and configuration
 
 Performance issues:
-- Monitor resource usage in Grafana dashboards
+- Inspect `/dashboard` or `/metrics` with a valid API key
 - Check cache hit rates and optimize if needed
 - Review query routing efficiency
 
 Authentication failures:
 - Verify API keys are correctly configured
+- Check that `LLM_ROUTER_API_KEYS` is set in the API process environment
 - Check Slack bot token permissions
 - Validate user tier assignments
 
@@ -404,8 +419,7 @@ Authentication failures:
 Application logs are available in several locations:
 
 - Application logs: `logs/llm_router.log`
-- Kafka logs: `kafka/producer.log` and `kafka/consumer.log`
-- Container logs: `docker-compose logs [service_name]`
+- Container logs: `docker compose logs [service_name]`
 
 ## Contributing
 
@@ -417,7 +431,7 @@ Fork the repository and set up your development environment:
 git clone https://github.com/your-username/slack-agent-llm-router.git
 cd slack-agent-llm-router
 git checkout -b feature/your-feature-name
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 ```
 
 ### Contribution Guidelines
