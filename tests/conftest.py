@@ -69,6 +69,7 @@ if _missing("numpy"):
     class _NdArray(list):
         pass
 
+    numpy.bool_ = bool
     numpy.ndarray = _NdArray
     numpy.array = lambda value: value
     numpy.asarray = (
