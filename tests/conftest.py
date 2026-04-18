@@ -116,6 +116,7 @@ if _missing("redis"):
     class _AsyncRedis:
         _global_store = {}
         _global_set_store = {}
+
         def __init__(self, *args, **kwargs):
             self.store = self.__class__._global_store
             self.set_store = self.__class__._global_set_store

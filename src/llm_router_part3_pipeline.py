@@ -130,9 +130,7 @@ def build_inference_completed_event(
         "response_length_chars": len(inference_response.response_text or ""),
         "routing_reason": getattr(routing_decision, "routing_reason", None),
         "routing_strategy": _enum_value(routing_strategy),
-        "fallback_models": list(
-            getattr(routing_decision, "fallback_models", []) or []
-        ),
+        "fallback_models": list(getattr(routing_decision, "fallback_models", []) or []),
     }
 
 
@@ -400,9 +398,7 @@ class KafkaProducerManager:
             cost_usd=inference_response.cost_usd,
             status="error" if inference_response.error else "success",
             error_message=getattr(inference_response, "error", ""),
-            context_compressed=getattr(
-                inference_response, "compressed_context", False
-            ),
+            context_compressed=getattr(inference_response, "compressed_context", False),
             compression_ratio=0.3
             if getattr(inference_response, "compressed_context", False)
             else 0.0,
@@ -1008,12 +1004,10 @@ class KafkaConsumerManager:
         self.last_batch_time = time.time()
         self.running = False
         self.pending_commit_offsets: Dict[str, Dict[TopicPartition, int]] = {
-            topic_key: {}
-            for topic_key in self.batch_processors
+            topic_key: {} for topic_key in self.batch_processors
         }
         self.awaiting_commit_offsets: Dict[str, Dict[TopicPartition, int]] = {
-            topic_key: {}
-            for topic_key in self.batch_processors
+            topic_key: {} for topic_key in self.batch_processors
         }
 
     async def initialize(self):
@@ -1057,9 +1051,7 @@ class KafkaConsumerManager:
                 tasks.append(asyncio.create_task(self._consume_errors(consumer)))
             elif topic_key == "analytics_model_metrics_1m":
                 tasks.append(
-                    asyncio.create_task(
-                        self._consume_analytics_model_metrics(consumer)
-                    )
+                    asyncio.create_task(self._consume_analytics_model_metrics(consumer))
                 )
             elif topic_key == "alerts":
                 tasks.append(asyncio.create_task(self._consume_alerts(consumer)))
@@ -1176,7 +1168,9 @@ class KafkaConsumerManager:
         except Exception as e:
             logger.error(f"Error consumer error: {e}")
 
-    def register_observer(self, topic_key: str, callback: Callable[[Dict[str, Any]], Any]):
+    def register_observer(
+        self, topic_key: str, callback: Callable[[Dict[str, Any]], Any]
+    ):
         """Register an observer for consumed stream events."""
         self.observers.setdefault(topic_key, []).append(callback)
 
@@ -1213,9 +1207,7 @@ class KafkaConsumerManager:
             success_count=int(data.get("success_count", 0) or 0),
             success_rate=float(data.get("success_rate", 0.0) or 0.0),
             avg_latency_ms=float(data.get("avg_latency_ms", 0.0) or 0.0),
-            avg_tokens_per_second=float(
-                data.get("avg_tokens_per_second", 0.0) or 0.0
-            ),
+            avg_tokens_per_second=float(data.get("avg_tokens_per_second", 0.0) or 0.0),
             error_count=int(data.get("error_count", 0) or 0),
             total_tokens=int(data.get("total_tokens", 0) or 0),
             total_cost_usd=float(data.get("total_cost_usd", 0.0) or 0.0),
@@ -1347,7 +1339,9 @@ class KafkaConsumerManager:
     ):
         """Flush one batched topic and commit offsets after durable persistence."""
         if self.awaiting_commit_offsets.get(topic_key):
-            await self._commit_offsets(topic_key, self.awaiting_commit_offsets[topic_key])
+            await self._commit_offsets(
+                topic_key, self.awaiting_commit_offsets[topic_key]
+            )
             self.awaiting_commit_offsets[topic_key].clear()
 
         batch = list(self.batch_processors.get(topic_key, []))
@@ -1372,9 +1366,7 @@ class KafkaConsumerManager:
         await self._flush_batch_topic(
             "queries", self.clickhouse.batch_insert_query_logs
         )
-        await self._flush_batch_topic(
-            "metrics", self.clickhouse.batch_insert_metrics
-        )
+        await self._flush_batch_topic("metrics", self.clickhouse.batch_insert_metrics)
         await self._flush_batch_topic(
             "analytics_model_metrics_1m",
             self.clickhouse.batch_insert_model_performance,

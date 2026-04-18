@@ -202,9 +202,7 @@ class DummySlackBot:
         self.monitoring_service = monitoring_service or resolved_services.get(
             "monitoring"
         )
-        self.analytics_service = analytics_service or resolved_services.get(
-            "pipeline"
-        )
+        self.analytics_service = analytics_service or resolved_services.get("pipeline")
 
     async def initialize(self):
         return None
@@ -228,7 +226,9 @@ class DummyEventProducer:
     async def produce_request_raw(self, request):
         self.request_events.append(request)
 
-    async def produce_inference_completed(self, request, response, routing_decision=None):
+    async def produce_inference_completed(
+        self, request, response, routing_decision=None
+    ):
         self.completion_events.append((request, response, routing_decision))
 
     async def shutdown(self):
@@ -284,6 +284,7 @@ def patched_platform_deps(monkeypatch):
     monkeypatch.setattr(main, "PolicyMaterializer", DummyPolicyMaterializer)
     monkeypatch.setattr(main, "MonitoringService", DummyMonitoring)
     monkeypatch.setattr(main, "SlackBot", DummySlackBot)
+
 
 class TestPlatformInitialization:
     def test_get_api_worker_count_respects_dev_and_config(self):
@@ -355,7 +356,10 @@ class TestPlatformInitialization:
 
         await platform._initialize_services(include_api=True, include_background=True)
 
-        assert platform.services["pipeline"].attached_monitoring is platform.services["monitoring"]
+        assert (
+            platform.services["pipeline"].attached_monitoring
+            is platform.services["monitoring"]
+        )
 
     @pytest.mark.asyncio
     async def test_initialize_services_adds_event_producer_when_flink_enabled(
@@ -373,7 +377,10 @@ class TestPlatformInitialization:
         await platform._initialize_services(include_api=True, include_background=False)
 
         assert "event_producer" in platform.services
-        assert platform.services["inference"].event_producer is platform.services["event_producer"]
+        assert (
+            platform.services["inference"].event_producer
+            is platform.services["event_producer"]
+        )
 
     @pytest.mark.asyncio
     async def test_initialize_services_adds_policy_cache_when_enabled(
@@ -388,7 +395,10 @@ class TestPlatformInitialization:
         await platform._initialize_services(include_api=True, include_background=False)
 
         assert "policy_cache" in platform.services
-        assert platform.services["router"].policy_cache is platform.services["policy_cache"]
+        assert (
+            platform.services["router"].policy_cache
+            is platform.services["policy_cache"]
+        )
 
     @pytest.mark.asyncio
     async def test_workers_only_mode_skips_core_services_when_not_needed(
@@ -429,7 +439,10 @@ class TestPlatformInitialization:
         await platform._initialize_services(include_api=False, include_background=True)
 
         assert "policy_materializer" in platform.services
-        assert platform.services["policy_materializer"].policy_cache is platform.services["policy_cache"]
+        assert (
+            platform.services["policy_materializer"].policy_cache
+            is platform.services["policy_cache"]
+        )
 
     @pytest.mark.asyncio
     async def test_initialize_services_passes_service_registry_to_slack_bot(
@@ -760,9 +773,7 @@ class TestApiApp:
         assert body["analytics"]["query_type_breakdown"]["general"] == 8
         assert body["overview"]["total_requests"] == 12
         assert body["model_performance"][0]["model_name"] == "gpt-5"
-        assert any(
-            alert["source"] == "monitoring_service" for alert in body["alerts"]
-        )
+        assert any(alert["source"] == "monitoring_service" for alert in body["alerts"])
 
     def test_dashboard_logs_endpoint_reads_structured_logs(
         self, tmp_path, patched_platform_deps

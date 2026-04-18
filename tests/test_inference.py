@@ -202,7 +202,9 @@ class TestResponseCache:
         redis_client = AsyncMock()
         redis_client.ping = AsyncMock(return_value=True)
 
-        with patch("src.llm_router_part2_inference.redis.Redis", return_value=redis_client) as mock_redis:
+        with patch(
+            "src.llm_router_part2_inference.redis.Redis", return_value=redis_client
+        ) as mock_redis:
             cache = ResponseCache(
                 {
                     "enabled": True,
@@ -454,7 +456,9 @@ class TestInferenceEngine:
 
         assert response.provider == "error"
         event_producer.produce_inference_completed.assert_awaited_once()
-        published_response = event_producer.produce_inference_completed.await_args.args[1]
+        published_response = event_producer.produce_inference_completed.await_args.args[
+            1
+        ]
         assert published_response.provider == "error"
 
     @pytest.mark.asyncio

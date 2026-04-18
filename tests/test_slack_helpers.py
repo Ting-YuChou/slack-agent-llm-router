@@ -177,7 +177,9 @@ class TestSlackMessageHandler:
         assert enterprise_tokens == 8192
 
     @pytest.mark.asyncio
-    async def test_handle_query_passes_preference_metadata(self, inference_response_factory):
+    async def test_handle_query_passes_preference_metadata(
+        self, inference_response_factory
+    ):
         user_manager = UserManager()
         user_manager.update_user_preferences(
             "u1",
@@ -189,7 +191,9 @@ class TestSlackMessageHandler:
         )
         inference_engine = SimpleNamespace(
             process_query=AsyncMock(
-                return_value=inference_response_factory(response_text="hello from model")
+                return_value=inference_response_factory(
+                    response_text="hello from model"
+                )
             )
         )
         bot = SimpleNamespace(
@@ -201,10 +205,14 @@ class TestSlackMessageHandler:
             _build_response_style_instructions=SlackBot._build_response_style_instructions,
             _build_user_safe_error_message=lambda: "safe error",
         )
-        bot._build_query_metadata = bot._build_query_metadata.__get__(bot, SimpleNamespace)
-        bot._conversation_context_key = bot._conversation_context_key.__get__(bot, SimpleNamespace)
-        bot._build_response_style_instructions = bot._build_response_style_instructions.__get__(
+        bot._build_query_metadata = bot._build_query_metadata.__get__(
             bot, SimpleNamespace
+        )
+        bot._conversation_context_key = bot._conversation_context_key.__get__(
+            bot, SimpleNamespace
+        )
+        bot._build_response_style_instructions = (
+            bot._build_response_style_instructions.__get__(bot, SimpleNamespace)
         )
         handler = SlackMessageHandler(bot)
 
@@ -347,10 +355,14 @@ class TestSlackBot:
         bot.message_handler.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_process_message_respects_threading_preference(self, inference_response_factory):
+    async def test_process_message_respects_threading_preference(
+        self, inference_response_factory
+    ):
         inference_engine = SimpleNamespace(
             process_query=AsyncMock(
-                return_value=inference_response_factory(response_text="threadless response")
+                return_value=inference_response_factory(
+                    response_text="threadless response"
+                )
             )
         )
         bot = SlackBot({"channels": []}, inference_engine=inference_engine)
@@ -377,7 +389,9 @@ class TestSlackBot:
             chat_postEphemeral=AsyncMock(),
             chat_postMessage=AsyncMock(),
         )
-        bot.message_handler = SimpleNamespace(_handle_command=AsyncMock(return_value="ok"))
+        bot.message_handler = SimpleNamespace(
+            _handle_command=AsyncMock(return_value="ok")
+        )
 
         await bot._handle_slash_command(
             {
@@ -396,10 +410,14 @@ class TestSlackBot:
         bot.web_client.chat_postMessage.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_slash_command_routes_free_form_query(self, inference_response_factory):
+    async def test_slash_command_routes_free_form_query(
+        self, inference_response_factory
+    ):
         inference_engine = SimpleNamespace(
             process_query=AsyncMock(
-                return_value=inference_response_factory(response_text="free-form answer")
+                return_value=inference_response_factory(
+                    response_text="free-form answer"
+                )
             )
         )
         bot = SlackBot({"channels": []}, inference_engine=inference_engine)
@@ -485,7 +503,9 @@ class TestSlackBot:
             inference_engine=SimpleNamespace(),
         )
         bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
-        bot.message_handler = SimpleNamespace(handle_message=AsyncMock(return_value=None))
+        bot.message_handler = SimpleNamespace(
+            handle_message=AsyncMock(return_value=None)
+        )
 
         def capture_rate_limit(_user_id, config):
             observed_config.update(config)
@@ -618,7 +638,9 @@ class TestSlackBot:
                 }
                 return {"config": configs[model_name]}
 
-        healthy_provider = SimpleNamespace(get_health_status=lambda: {"status": "healthy"})
+        healthy_provider = SimpleNamespace(
+            get_health_status=lambda: {"status": "healthy"}
+        )
         inference_engine = SimpleNamespace(
             providers={"vllm": healthy_provider, "openai": healthy_provider}
         )
@@ -645,7 +667,9 @@ class TestSlackBot:
         bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
         bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
         bot.user_manager.check_rate_limit = lambda *_args, **_kwargs: True
-        bot.message_handler = SimpleNamespace(handle_message=AsyncMock(side_effect=RuntimeError("boom")))
+        bot.message_handler = SimpleNamespace(
+            handle_message=AsyncMock(side_effect=RuntimeError("boom"))
+        )
 
         await bot._process_message({"channel": "C1", "user": "U1", "text": "hello"})
 
@@ -673,7 +697,14 @@ class TestSlackStateStores:
     @pytest.mark.asyncio
     async def test_redis_state_store_round_trips_snapshot(self):
         store = RedisSlackStateStore(
-            {"redis": {"host": "localhost", "port": 6379, "db": 0, "key_prefix": "test"}}
+            {
+                "redis": {
+                    "host": "localhost",
+                    "port": 6379,
+                    "db": 0,
+                    "key_prefix": "test",
+                }
+            }
         )
         snapshot = {
             "schema_version": 1,
@@ -693,10 +724,24 @@ class TestSlackStateStores:
         prefix = "test-multi-user"
         now = datetime.now().timestamp()
         store_one = RedisSlackStateStore(
-            {"redis": {"host": "localhost", "port": 6379, "db": 0, "key_prefix": prefix}}
+            {
+                "redis": {
+                    "host": "localhost",
+                    "port": 6379,
+                    "db": 0,
+                    "key_prefix": prefix,
+                }
+            }
         )
         store_two = RedisSlackStateStore(
-            {"redis": {"host": "localhost", "port": 6379, "db": 0, "key_prefix": prefix}}
+            {
+                "redis": {
+                    "host": "localhost",
+                    "port": 6379,
+                    "db": 0,
+                    "key_prefix": prefix,
+                }
+            }
         )
 
         await store_one.initialize()
@@ -724,7 +769,14 @@ class TestSlackStateStores:
     async def test_redis_state_store_rejects_stale_conversation_overwrite(self):
         prefix = "test-stale-conversation"
         store = RedisSlackStateStore(
-            {"redis": {"host": "localhost", "port": 6379, "db": 0, "key_prefix": prefix}}
+            {
+                "redis": {
+                    "host": "localhost",
+                    "port": 6379,
+                    "db": 0,
+                    "key_prefix": prefix,
+                }
+            }
         )
         await store.initialize()
 

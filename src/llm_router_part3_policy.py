@@ -331,9 +331,7 @@ class PolicyMaterializer:
         if "requests_enriched" in self.consumers:
             tasks.append(
                 asyncio.create_task(
-                    self._consume_requests_enriched(
-                        self.consumers["requests_enriched"]
-                    )
+                    self._consume_requests_enriched(self.consumers["requests_enriched"])
                 )
             )
         if "fast_lane_hints" in self.consumers:
@@ -367,7 +365,9 @@ class PolicyMaterializer:
                 try:
                     await self.policy_cache.materialize_fast_lane_hint(message.value)
                 except Exception as e:
-                    logger.warning(f"Failed to materialize fast_lane_hints message: {e}")
+                    logger.warning(
+                        f"Failed to materialize fast_lane_hints message: {e}"
+                    )
         except Exception as e:
             logger.error(f"fast_lane_hints consumer error: {e}")
 

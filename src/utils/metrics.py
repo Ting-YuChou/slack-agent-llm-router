@@ -556,7 +556,9 @@ class MetricsCollector:
 
     def _get_model_usage_distribution(self) -> Dict[str, float]:
         """Get model usage distribution"""
-        model_counts = defaultdict(float, sum_metric_by_label(ROUTER_METRICS.routing_decisions, "model"))
+        model_counts = defaultdict(
+            float, sum_metric_by_label(ROUTER_METRICS.routing_decisions, "model")
+        )
         total = sum(model_counts.values())
         if total == 0:
             return {}

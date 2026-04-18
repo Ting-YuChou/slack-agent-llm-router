@@ -505,7 +505,9 @@ class MemoryConfig(ConfigModel):
 
 
 class PerformanceConfig(ConfigModel):
-    connection_pools: ConnectionPoolsConfig = Field(default_factory=ConnectionPoolsConfig)
+    connection_pools: ConnectionPoolsConfig = Field(
+        default_factory=ConnectionPoolsConfig
+    )
     workers: WorkerConfig = Field(default_factory=WorkerConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
 

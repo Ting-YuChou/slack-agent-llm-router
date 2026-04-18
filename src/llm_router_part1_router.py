@@ -324,10 +324,9 @@ class ModelRouter:
         self.routing_strategy = config.get("routing_strategy", "intelligent")
         self.fast_lane_models: List[str] = list(config.get("fast_lane_models", []))
         self.fast_lane_providers: List[str] = [
-            provider.lower()
-            for provider in config.get("fast_lane_providers", ["vllm"])
+            provider.lower() for provider in config.get("fast_lane_providers", ["vllm"])
         ]
-        self.scoring = {
+        self.scoring: Dict[str, Any] = {
             "reliability_weight": 40.0,
             "latency_weight": 20.0,
             "cost_weight_cap": 20.0,
@@ -499,7 +498,9 @@ class ModelRouter:
 
         if not self.policy_cache:
             return {
-                "policy_source": "request_metadata" if metadata_preferred_models else "none",
+                "policy_source": "request_metadata"
+                if metadata_preferred_models
+                else "none",
                 "route_to_fast_lane": False,
                 "preferred_models": metadata_preferred_models,
                 "hint_reason": (
@@ -512,7 +513,9 @@ class ModelRouter:
         get_policy = getattr(self.policy_cache, "get_effective_policy", None)
         if not callable(get_policy):
             return {
-                "policy_source": "request_metadata" if metadata_preferred_models else "none",
+                "policy_source": "request_metadata"
+                if metadata_preferred_models
+                else "none",
                 "route_to_fast_lane": False,
                 "preferred_models": metadata_preferred_models,
                 "hint_reason": (
@@ -525,7 +528,9 @@ class ModelRouter:
         try:
             policy = await get_policy(request.request_id, request.user_id)
         except Exception as e:
-            logger.warning(f"Failed to load routing policy for request {request.request_id}: {e}")
+            logger.warning(
+                f"Failed to load routing policy for request {request.request_id}: {e}"
+            )
             policy = {}
 
         combined_preferred_models = []
@@ -579,7 +584,9 @@ class ModelRouter:
         # Fallback to capability-based routing
         return self._capability_based_routing(context)
 
-    def _policy_based_routing(self, context: Dict[str, Any]) -> Optional[ModelSelection]:
+    def _policy_based_routing(
+        self, context: Dict[str, Any]
+    ) -> Optional[ModelSelection]:
         """Prefer low-latency local models when policy cache marks a request/user hot."""
         preferred_models = [
             model_name
@@ -609,9 +616,7 @@ class ModelRouter:
         return ModelSelection(
             model_name=selected_model,
             confidence=confidence,
-            reason=(
-                f"Policy-cache selection ({policy_source}): {hint_reason}"
-            ),
+            reason=(f"Policy-cache selection ({policy_source}): {hint_reason}"),
         )
 
     def _capability_based_routing(self, context: Dict[str, Any]) -> ModelSelection:
@@ -659,7 +664,11 @@ class ModelRouter:
     def _get_fast_lane_candidates(self) -> List[str]:
         """Resolve the configured fast-lane models for synchronous low-latency routing."""
         if self.fast_lane_models:
-            return [model_name for model_name in self.fast_lane_models if model_name in self.models]
+            return [
+                model_name
+                for model_name in self.fast_lane_models
+                if model_name in self.models
+            ]
 
         candidates = []
         for model_name, model_config in self.models.items():
@@ -741,9 +750,7 @@ class ModelRouter:
             score += float(self.scoring["cost_weight_cap"])
 
         # Priority-based scoring
-        score += (10 - model_config.priority) * float(
-            self.scoring["priority_weight"]
-        )
+        score += (10 - model_config.priority) * float(self.scoring["priority_weight"])
 
         # Context length compatibility
         token_count = context["token_count"]
@@ -755,16 +762,15 @@ class ModelRouter:
         score += self._contextual_model_bonus(model_name, context)
         return score
 
-    def _contextual_model_bonus(self, model_name: str, context: Dict[str, Any]) -> float:
+    def _contextual_model_bonus(
+        self, model_name: str, context: Dict[str, Any]
+    ) -> float:
         """Apply model-specific routing bias for default and difficult-task paths."""
         bonus = 0.0
         query_type = str(context.get("query_type", "general"))
         token_count = int(context.get("token_count", 0))
         has_attachments = bool(context.get("has_attachments", False))
-        user_tier = context.get("user_tier")
-        user_tier_value = (
-            user_tier.value if hasattr(user_tier, "value") else str(user_tier)
-        )
+        user_tier_value = self._normalize_user_tier(context.get("user_tier"))
         difficult_threshold = int(self.scoring["difficult_task_token_threshold"])
         simple_threshold = int(self.scoring["simple_task_token_threshold"])
         simple_task_types = {
@@ -777,13 +783,19 @@ class ModelRouter:
             bonus += float(self.scoring["default_model_bonus"])
 
         if model_name == "gpt-5" and user_tier_value != "enterprise":
-            if query_type not in {"analysis", "reasoning"} or token_count <= difficult_threshold:
+            if (
+                query_type not in {"analysis", "reasoning"}
+                or token_count <= difficult_threshold
+            ):
                 bonus += float(self.scoring["gpt5_default_bonus"])
 
         if model_name == "claude-sonnet-4-6":
             if user_tier_value == "enterprise":
                 bonus += float(self.scoring["sonnet_enterprise_bonus"])
-            if query_type in {"analysis", "reasoning"} and token_count > difficult_threshold:
+            if (
+                query_type in {"analysis", "reasoning"}
+                and token_count > difficult_threshold
+            ):
                 bonus += float(self.scoring["sonnet_difficult_task_bonus"])
 
         if (

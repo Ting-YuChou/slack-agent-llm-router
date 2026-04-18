@@ -110,9 +110,7 @@ def test_platform_config_accepts_redis_slack_state_backend():
 
 
 def test_checked_in_compose_config_validates():
-    config_path = (
-        Path(__file__).resolve().parents[1] / "config" / "config.compose.yaml"
-    )
+    config_path = Path(__file__).resolve().parents[1] / "config" / "config.compose.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     validated = PlatformConfig.model_validate(config)
 

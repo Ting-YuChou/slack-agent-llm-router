@@ -254,7 +254,10 @@ class TestModelRouter:
         )
         router.classifier.classify_query = lambda _query: (QueryType.ANALYSIS, 0.95)
         router.token_counter.count_tokens = lambda _query, _model="default": 128
-        router.model_stats["claude-3.5-sonnet"] = {"success_rate": 0.99, "avg_latency": 700}
+        router.model_stats["claude-3.5-sonnet"] = {
+            "success_rate": 0.99,
+            "avg_latency": 700,
+        }
         router.model_stats["mistral-7b"] = {"success_rate": 0.90, "avg_latency": 100}
 
         request = QueryRequest(

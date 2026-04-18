@@ -416,7 +416,9 @@ class BaseInferenceProvider(ABC):
             "response_style_instructions"
         )
         if response_style_instructions:
-            prompt_sections.append(f"Response style instructions:\n{response_style_instructions}")
+            prompt_sections.append(
+                f"Response style instructions:\n{response_style_instructions}"
+            )
 
         prompt = request.query
         attachment_prompt = self._build_attachment_prompt(request)
@@ -453,7 +455,9 @@ class BaseInferenceProvider(ABC):
 
             excerpt_limit = min(self.ATTACHMENT_PREVIEW_CHAR_LIMIT, remaining_chars)
             if excerpt_limit <= 0:
-                sections.append("Additional extracted text omitted because the prompt limit was reached.")
+                sections.append(
+                    "Additional extracted text omitted because the prompt limit was reached."
+                )
                 break
 
             excerpt = extracted_text[:excerpt_limit]
@@ -480,7 +484,9 @@ class BaseInferenceProvider(ABC):
                 return None
 
             printable = sum(
-                1 for character in normalized if character.isprintable() or character in "\n\r\t"
+                1
+                for character in normalized
+                if character.isprintable() or character in "\n\r\t"
             )
             if printable / max(len(normalized), 1) < 0.85:
                 continue
@@ -897,8 +903,10 @@ class BatchProcessor:
         return response.model_copy(deep=True)
 
     def _schedule_flush_locked(
-        self, bucket_key: Tuple[int, str], bucket: "BatchProcessor.BatchBucket",
-        immediate: bool
+        self,
+        bucket_key: Tuple[int, str],
+        bucket: "BatchProcessor.BatchBucket",
+        immediate: bool,
     ):
         """Schedule a batch flush for a bucket."""
         if bucket.flush_task and not bucket.flush_task.done():
@@ -1133,7 +1141,11 @@ class InferenceEngine:
                 )
 
             # Step 4: Generate response, falling back to local models for cloud outages
-            response, model_name, routing_decision = await self._generate_response_with_fallback(
+            (
+                response,
+                model_name,
+                routing_decision,
+            ) = await self._generate_response_with_fallback(
                 request,
                 routing_decision,
             )
@@ -1182,7 +1194,9 @@ class InferenceEngine:
                 ).inc()
 
             # Update router stats
-            if "routing_decision" in locals() and not getattr(exc, "_attempt_recorded", False):
+            if "routing_decision" in locals() and not getattr(
+                exc, "_attempt_recorded", False
+            ):
                 self.router.update_model_stats(
                     model_name=routing_decision.selected_model,
                     success=False,
@@ -1281,8 +1295,12 @@ class InferenceEngine:
             last_exception = exc
             for fallback_model in fallback_models:
                 fallback_started_at = time.time()
-                fallback_cache_key = self.cache.generate_cache_key(request, fallback_model)
-                cached_response = await self.cache.get_cached_response(fallback_cache_key)
+                fallback_cache_key = self.cache.generate_cache_key(
+                    request, fallback_model
+                )
+                cached_response = await self.cache.get_cached_response(
+                    fallback_cache_key
+                )
                 if cached_response:
                     cached_response["cached"] = True
                     response = InferenceResponse(**cached_response)
@@ -1298,7 +1316,9 @@ class InferenceEngine:
                     )
 
                 try:
-                    response = await self._execute_model_request(request, fallback_model)
+                    response = await self._execute_model_request(
+                        request, fallback_model
+                    )
                     return (
                         response,
                         fallback_model,
@@ -1403,12 +1423,16 @@ class InferenceEngine:
                 continue
             if context["token_count"] > model_config.max_tokens:
                 continue
-            if hasattr(self.router, "_has_capability") and not self.router._has_capability(
+            if hasattr(
+                self.router, "_has_capability"
+            ) and not self.router._has_capability(
                 model_config,
                 context["query_type"],
             ):
                 continue
-            if hasattr(self.router, "_check_user_access") and not self.router._check_user_access(
+            if hasattr(
+                self.router, "_check_user_access"
+            ) and not self.router._check_user_access(
                 model_config,
                 context["user_tier"],
             ):
@@ -1461,7 +1485,9 @@ class InferenceEngine:
         if not self.event_producer:
             return
 
-        publish_method = getattr(self.event_producer, "produce_inference_completed", None)
+        publish_method = getattr(
+            self.event_producer, "produce_inference_completed", None
+        )
         if publish_method is None:
             return
 
