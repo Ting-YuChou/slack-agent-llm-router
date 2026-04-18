@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from aiokafka.structs import TopicPartition
 
 from src.llm_router_part3_pipeline import (
     AlertEventEntry,
@@ -314,6 +315,53 @@ class TestKafkaConsumerManager:
         await consumer._notify_observers("alerts", {"event_type": "alerts"})
 
         assert seen == ["alerts"]
+
+    @pytest.mark.asyncio
+    async def test_flush_pending_batches_commits_offsets_after_clickhouse_write(
+        self, pipeline_config, sample_query_log
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        consumer.clickhouse.batch_insert_query_logs = AsyncMock()
+        consumer.consumers["queries"] = AsyncMock()
+        tp = TopicPartition("test-queries", 0)
+        consumer.batch_processors["queries"].append(sample_query_log)
+        consumer.pending_commit_offsets["queries"][tp] = 8
+
+        await consumer.flush_pending_batches()
+
+        consumer.clickhouse.batch_insert_query_logs.assert_awaited_once_with(
+            [sample_query_log]
+        )
+        consumer.consumers["queries"].commit.assert_awaited_once_with({tp: 8})
+        assert consumer.batch_processors["queries"] == []
+        assert consumer.pending_commit_offsets["queries"] == {}
+        assert consumer.awaiting_commit_offsets["queries"] == {}
+
+    @pytest.mark.asyncio
+    async def test_flush_pending_batches_retries_commit_without_duplicate_writes(
+        self, pipeline_config, sample_query_log
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        consumer.clickhouse.batch_insert_query_logs = AsyncMock()
+        consumer.consumers["queries"] = AsyncMock()
+        consumer.consumers["queries"].commit = AsyncMock(
+            side_effect=[RuntimeError("commit failed"), None]
+        )
+        tp = TopicPartition("test-queries", 0)
+        consumer.batch_processors["queries"].append(sample_query_log)
+        consumer.pending_commit_offsets["queries"][tp] = 9
+
+        with pytest.raises(RuntimeError, match="commit failed"):
+            await consumer.flush_pending_batches()
+
+        assert consumer.clickhouse.batch_insert_query_logs.await_count == 1
+        assert consumer.batch_processors["queries"] == []
+        assert consumer.awaiting_commit_offsets["queries"] == {tp: 9}
+
+        await consumer.flush_pending_batches()
+
+        assert consumer.clickhouse.batch_insert_query_logs.await_count == 1
+        assert consumer.awaiting_commit_offsets["queries"] == {}
 
 
 class TestKafkaIngestionPipeline:

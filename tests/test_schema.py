@@ -1,4 +1,7 @@
+from pathlib import Path
+
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from src.utils.schema import (
@@ -6,6 +9,7 @@ from src.utils.schema import (
     AttachmentType,
     InferenceResponse,
     ModelConfig,
+    PlatformConfig,
     QueryRequest,
     SystemMetric,
 )
@@ -73,3 +77,43 @@ def test_model_config_rejects_unknown_capability():
 def test_system_metric_name_validation():
     with pytest.raises(ValidationError):
         SystemMetric(name="bad metric name", value=1.0)
+
+
+def test_platform_config_rejects_invalid_api_port():
+    with pytest.raises(ValidationError):
+        PlatformConfig(api={"port": 70000})
+
+
+def test_platform_config_rejects_unknown_slack_state_backend():
+    with pytest.raises(ValidationError):
+        PlatformConfig(slack={"state_backend": "sqlite"})
+
+
+def test_platform_config_defaults_file_state_path():
+    config = PlatformConfig(slack={"state_backend": "file"})
+
+    assert config.slack.state_file == "data/slack_state.json"
+
+
+def test_platform_config_accepts_redis_slack_state_backend():
+    config = PlatformConfig(
+        slack={
+            "state_backend": "redis",
+            "state_key_prefix": "slack_state_test",
+            "redis": {"host": "localhost", "port": 6379, "db": 5},
+        }
+    )
+
+    assert config.slack.state_backend == "redis"
+    assert config.slack.state_key_prefix == "slack_state_test"
+    assert config.slack.redis["db"] == 5
+
+
+def test_checked_in_compose_config_validates():
+    config_path = Path(__file__).resolve().parents[1] / "config" / "config.compose.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    validated = PlatformConfig.model_validate(config)
+
+    assert validated.pipeline.enabled is True
+    assert validated.kafka.bootstrap_servers == ["kafka:29092"]
+    assert validated.clickhouse.host == "clickhouse"

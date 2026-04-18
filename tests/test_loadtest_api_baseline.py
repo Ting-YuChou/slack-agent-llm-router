@@ -3,11 +3,7 @@ from pathlib import Path
 
 
 MODULE = runpy.run_path(
-    str(
-        Path(__file__).resolve().parents[1]
-        / "scripts"
-        / "loadtest_api_baseline.py"
-    )
+    str(Path(__file__).resolve().parents[1] / "scripts" / "loadtest_api_baseline.py")
 )
 
 

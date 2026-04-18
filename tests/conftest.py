@@ -65,7 +65,23 @@ if True:
 
 if _missing("numpy"):
     numpy = _ensure_module("numpy")
+
+    class _NdArray(list):
+        pass
+
+    numpy.bool_ = bool
+    numpy.ndarray = _NdArray
     numpy.array = lambda value: value
+    numpy.asarray = (
+        lambda value: value
+        if isinstance(value, _NdArray)
+        else _NdArray(value)
+        if hasattr(value, "__iter__") and not isinstance(value, (str, bytes, dict))
+        else value
+    )
+    numpy.isscalar = lambda value: not hasattr(value, "__iter__") or isinstance(
+        value, (str, bytes)
+    )
 
 
 if True:
@@ -111,8 +127,9 @@ if _missing("anthropic"):
 if _missing("redis"):
     redis = _ensure_module("redis")
     redis_asyncio = _ensure_module("redis.asyncio")
+    _REDIS_STORES = {}
 
-    class _Redis:
+    class _AsyncRedis:
         _global_store = {}
         _global_set_store = {}
 
@@ -152,13 +169,43 @@ if _missing("redis"):
         def from_url(cls, *_args, **_kwargs):
             return cls()
 
-    redis_asyncio.Redis = _Redis
+    class _SyncRedis:
+        def __init__(self, host="localhost", port=6379, db=0, **kwargs):
+            key = (
+                host,
+                port,
+                db,
+                kwargs.get("username"),
+                kwargs.get("password"),
+                kwargs.get("ssl", False),
+            )
+            self.store = _REDIS_STORES.setdefault(key, {})
+
+        def ping(self):
+            return True
+
+        def hget(self, name, key):
+            return self.store.get(name, {}).get(key)
+
+        def hset(self, name, key, value):
+            self.store.setdefault(name, {})[key] = value
+
+        def hdel(self, name, key):
+            if name in self.store:
+                self.store[name].pop(key, None)
+
+        def hgetall(self, name):
+            return dict(self.store.get(name, {}))
+
+    redis.Redis = _SyncRedis
+    redis_asyncio.Redis = _AsyncRedis
     redis.asyncio = redis_asyncio
 
 
 if _missing("aiokafka"):
     aiokafka = _ensure_module("aiokafka")
     aiokafka_errors = _ensure_module("aiokafka.errors")
+    aiokafka_structs = _ensure_module("aiokafka.structs")
 
     class _Producer:
         def __init__(self, *args, **kwargs):
@@ -183,6 +230,9 @@ if _missing("aiokafka"):
         async def stop(self):
             return None
 
+        async def commit(self, *_args, **_kwargs):
+            return None
+
         def __aiter__(self):
             async def _empty():
                 if False:
@@ -190,8 +240,24 @@ if _missing("aiokafka"):
 
             return _empty()
 
+    class _TopicPartition:
+        def __init__(self, topic, partition):
+            self.topic = topic
+            self.partition = partition
+
+        def __hash__(self):
+            return hash((self.topic, self.partition))
+
+        def __eq__(self, other):
+            return (
+                isinstance(other, _TopicPartition)
+                and self.topic == other.topic
+                and self.partition == other.partition
+            )
+
     aiokafka.AIOKafkaProducer = _Producer
     aiokafka.AIOKafkaConsumer = _Consumer
+    aiokafka_structs.TopicPartition = _TopicPartition
     aiokafka_errors.KafkaError = Exception
 
 
@@ -420,15 +486,15 @@ def inference_response_factory():
 @pytest.fixture
 def router_config():
     return {
-        "default_model": "mistral-7b",
+        "default_model": "gpt-5",
         "routing_strategy": "intelligent",
         "models": {
             "gpt-5": {
                 "provider": "openai",
                 "max_tokens": 8192,
                 "cost_per_token": 0.00003,
-                "priority": 1,
-                "capabilities": ["reasoning", "coding", "analysis"],
+                "priority": 2,
+                "capabilities": ["general", "reasoning", "coding", "analysis"],
                 "api_key_env": "OPENAI_API_KEY",
             },
             "mistral-7b": {

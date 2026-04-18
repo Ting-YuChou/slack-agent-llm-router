@@ -659,9 +659,7 @@ class MetricsCollector:
                         "queries_per_second": streaming_metrics.get(
                             "queries_per_second", 0.0
                         ),
-                        "cache_hit_rate": streaming_metrics.get(
-                            "cache_hit_rate", 0.0
-                        ),
+                        "cache_hit_rate": streaming_metrics.get("cache_hit_rate", 0.0),
                     }
                 )
 
@@ -704,7 +702,9 @@ class MetricsCollector:
     def record_stream_model_metrics(self, metric_event: Dict[str, Any]):
         """Store a consumed analytics.model_metrics_1m event for dashboard use."""
         event = dict(metric_event)
-        event.setdefault("timestamp", event.get("emitted_at", datetime.now().isoformat()))
+        event.setdefault(
+            "timestamp", event.get("emitted_at", datetime.now().isoformat())
+        )
         model_name = str(event.get("model_name", "unknown"))
 
         self.stream_metrics_history.append(event)
@@ -725,7 +725,9 @@ class MetricsCollector:
 
     def _fresh_stream_metrics(self) -> List[Dict[str, Any]]:
         """Return the latest non-stale stream window for each model."""
-        cutoff = datetime.now() - timedelta(seconds=self.stream_metrics_staleness_seconds)
+        cutoff = datetime.now() - timedelta(
+            seconds=self.stream_metrics_staleness_seconds
+        )
         return [
             metric
             for metric in self.latest_stream_metrics_by_model.values()
@@ -778,7 +780,9 @@ class MetricsCollector:
             "avg_latency_ms": (
                 weighted_latency / total_requests if total_requests > 0 else 0.0
             ),
-            "error_rate": (total_errors / total_requests if total_requests > 0 else 0.0),
+            "error_rate": (
+                total_errors / total_requests if total_requests > 0 else 0.0
+            ),
             "queries_per_second": total_qps,
             "cache_hit_rate": (
                 total_cached / total_requests if total_requests > 0 else 0.0

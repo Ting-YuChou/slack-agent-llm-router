@@ -2,6 +2,7 @@
 .DS_Store
 .idea/
 .vscode/
+.playwright-cli/
 
 # Python
 __pycache__/
@@ -42,3 +43,6 @@ docker-compose.prod.yml
 # Local credentials
 slack/credentials/
 
+# Local notes / assets
+SYSTEM_DESIGN_INTERVIEW_PREP_ZH_EN.md
+assets/

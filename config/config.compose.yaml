@@ -3,22 +3,23 @@ api:
   port: 8080
   log_level: info
   cors_origins:
-  - '*'
-  rate_limiting:
-    enabled: true
-    requests_per_minute: 1000
-    burst_size: 100
+    - http://localhost:3000
+    - http://127.0.0.1:3000
+    - http://localhost:8501
+    - http://127.0.0.1:8501
+
 logging:
   level: INFO
   file: logs/llm_router.log
   max_bytes: 10485760
   backup_count: 5
-  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
 router:
   default_model: gpt-5
   routing_strategy: intelligent
   fast_lane_models:
-  - mistral-7b
+    - gpt-5
   scoring:
     reliability_weight: 40
     latency_weight: 20
@@ -31,15 +32,15 @@ router:
     sonnet_enterprise_bonus: 12
     sonnet_difficult_task_bonus: 10
     difficult_task_token_threshold: 50000
-    local_simple_task_bonus: 12
+    local_simple_task_bonus: 0
     simple_task_token_threshold: 1200
     local_simple_task_types:
-    - general
-    - summarization
-    - brainstorming
-    - planning
-    - translation
-    - question_answering
+      - general
+      - summarization
+      - brainstorming
+      - planning
+      - translation
+      - question_answering
   models:
     gpt-5:
       provider: openai
@@ -48,10 +49,10 @@ router:
       cost_per_token: 3.0e-05
       priority: 2
       capabilities:
-      - general
-      - reasoning
-      - coding
-      - analysis
+        - general
+        - reasoning
+        - coding
+        - analysis
     claude-sonnet-4-6:
       provider: anthropic
       api_key_env: ANTHROPIC_API_KEY
@@ -59,57 +60,26 @@ router:
       cost_per_token: 1.5e-05
       priority: 1
       capabilities:
-      - reasoning
-      - writing
-      - analysis
-    mistral-7b:
-      provider: vllm
-      model_path: /models/mistral-7b-instruct
-      max_tokens: 8192
-      cost_per_token: 1.0e-06
-      priority: 3
-      capabilities:
-      - general
-      - coding
-      gpu_memory_gb: 16
-    llama-3.1-70b:
-      provider: vllm
-      model_path: /models/llama-3.1-70b-instruct
-      max_tokens: 128000
-      cost_per_token: 5.0e-06
-      priority: 4
-      capabilities:
-      - reasoning
-      - coding
-      - analysis
-      gpu_memory_gb: 80
+        - reasoning
+        - writing
+        - analysis
   routing_rules:
-  - condition: user_tier == 'enterprise'
-    models:
-    - claude-sonnet-4-6
-    - gpt-5
-    fallback: claude-sonnet-4-6
-  - condition: query_type == 'code_generation'
-    models:
-    - gpt-5
-    - mistral-7b
-    fallback: gpt-5
-  - condition: query_type == 'analysis' AND token_count > 50000
-    models:
-    - claude-sonnet-4-6
-    - gpt-5
-    fallback: claude-sonnet-4-6
+    - condition: user_tier == 'enterprise'
+      models:
+        - claude-sonnet-4-6
+        - gpt-5
+      fallback: claude-sonnet-4-6
+    - condition: query_type == 'code_generation'
+      models:
+        - gpt-5
+      fallback: gpt-5
+    - condition: query_type == 'analysis' AND token_count > 50000
+      models:
+        - claude-sonnet-4-6
+        - gpt-5
+      fallback: claude-sonnet-4-6
+
 inference:
-  vllm:
-    base_url: http://127.0.0.1:8001
-    host: localhost
-    port: 8001
-    worker_use_ray: true
-    engine_use_ray: true
-    max_model_len: 32768
-    gpu_memory_utilization: 0.9
-    tensor_parallel_size: 1
-    trust_remote_code: true
   openai:
     base_url: https://api.openai.com/v1
     timeout: 60
@@ -129,7 +99,7 @@ inference:
     ttl: 3600
     max_size: 1GB
     redis:
-      host: localhost
+      host: redis
       port: 6379
       db: 0
       password_env: REDIS_PASSWORD
@@ -137,9 +107,10 @@ inference:
     enabled: true
     max_batch_size: 32
     max_wait_time_ms: 50
+
 kafka:
   bootstrap_servers:
-  - localhost:9092
+    - kafka:29092
   topics:
     queries: llm-queries
     responses: llm-responses
@@ -162,27 +133,16 @@ kafka:
     auto_offset_reset: latest
     enable_auto_commit: false
     max_poll_records: 500
-  enabled: false
+  enabled: true
+
 clickhouse:
-  host: localhost
+  host: clickhouse
   port: 8123
-  database: llm_router
-  username: default
-  password: ''
-  tables:
-    queries:
-      name: query_logs
-      engine: MergeTree
-      partition_by: toYYYYMM(timestamp)
-      order_by: timestamp
-      ttl: timestamp + INTERVAL 90 DAY
-    metrics:
-      name: system_metrics
-      engine: ReplacingMergeTree
-      partition_by: toYYYYMMDD(timestamp)
-      order_by: (service, metric_name, timestamp)
-      ttl: timestamp + INTERVAL 30 DAY
-  enabled: false
+  database: default
+  username: llm_router
+  password: llm_router_pass
+  enabled: true
+
 monitoring:
   prometheus_port: 8000
   prometheus:
@@ -202,14 +162,15 @@ monitoring:
     timeout_seconds: 10
   stream_metrics_staleness_seconds: 300
   enabled: false
+
 slack:
   enabled: false
   bot_token_env: SLACK_BOT_TOKEN
   app_token_env: SLACK_APP_TOKEN
   signing_secret_env: SLACK_SIGNING_SECRET
   channels:
-  - general
-  - ai-testing
+    - general
+    - ai-testing
   response_settings:
     max_response_length: 2000
     typing_indicator: true
@@ -217,56 +178,40 @@ slack:
   rate_limiting:
     requests_per_hour: 100
     burst_requests: 5
-    by_tier:
-      premium:
-        requests_per_hour: 500
-        burst_requests: 20
-      enterprise:
-        requests_per_hour: 2000
-        burst_requests: 50
-  attachments:
-    enabled: true
-    max_files: 10
-    max_file_size_bytes: 10000000
-    download_timeout_seconds: 30
-  user_tiers:
-    default: free
-    overrides: {}
-  state_backend: memory
-  state_file: queries/slack_state.json
+  state_backend: redis
   state_key_prefix: slack_state
   redis:
-    host: localhost
+    host: redis
     port: 6379
     db: 2
     password_env: REDIS_PASSWORD
+
 streamlit:
-  enabled: true
+  enabled: false
   port: 8501
   host: 0.0.0.0
   theme: dark
-  dashboard:
-    refresh_interval_seconds: 30
-    max_log_entries: 1000
-    chart_update_interval: 5
+
 flink:
   enabled: false
-  job_manager_host: localhost
+  job_manager_host: flink-jobmanager
   job_manager_port: 8081
   parallelism: 4
   checkpointing_interval_ms: 5000
+
 policy_cache:
   enabled: false
   request_ttl_seconds: 300
   user_ttl_seconds: 900
   local_cache_ttl_seconds: 5
   redis:
-    host: localhost
+    host: redis
     port: 6379
     db: 1
     key_prefix: routing_policy
   consumer:
     group_id: llm-router-policy-materializer
+
 security:
   api_keys:
     enabled: true
@@ -280,15 +225,23 @@ security:
   cors:
     enabled: true
     allow_origins:
-    - '*'
+      - http://localhost:3000
+      - http://127.0.0.1:3000
+      - http://localhost:8501
+      - http://127.0.0.1:8501
     allow_methods:
-    - GET
-    - POST
-    - PUT
-    - DELETE
+      - GET
+      - POST
+      - PUT
+      - DELETE
     allow_headers:
-    - '*'
+      - '*'
+
 performance:
+  workers:
+    api_workers: 1
+    inference_workers: 1
+    pipeline_workers: 1
   connection_pools:
     database:
       max_connections: 20
@@ -296,18 +249,16 @@ performance:
     http:
       max_connections: 100
       timeout: 30
-  workers:
-    api_workers: 4
-    inference_workers: 2
-    pipeline_workers: 2
   memory:
     max_heap_size: 8G
     gc_strategy: G1GC
+
 development:
   debug: false
   auto_reload: false
   profiling: false
   mock_external_apis: false
+
 features:
   context_compression: true
   semantic_caching: true
@@ -315,5 +266,6 @@ features:
   multi_modal: false
   function_calling: true
   streaming_responses: true
+
 pipeline:
-  enabled: false
+  enabled: true

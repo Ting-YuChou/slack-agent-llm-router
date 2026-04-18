@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -13,7 +14,7 @@ def _write_config(tmp_path: Path, overrides=None) -> Path:
     config = {
         "api": {"host": "127.0.0.1", "port": 8080, "log_level": "info"},
         "logging": {"level": "INFO", "file": str(tmp_path / "llm_router.log")},
-        "router": {"default_model": "mistral-7b", "routing_strategy": "intelligent"},
+        "router": {"default_model": "gpt-5", "routing_strategy": "intelligent"},
         "inference": {},
         "pipeline": {"enabled": False},
         "kafka": {
@@ -32,6 +33,14 @@ def _write_config(tmp_path: Path, overrides=None) -> Path:
         "slack": {"enabled": False},
         "flink": {"enabled": False},
         "policy_cache": {"enabled": False},
+        "security": {
+            "api_keys": {
+                "enabled": False,
+                "header_name": "X-API-Key",
+                "env_var": "LLM_ROUTER_API_KEYS",
+            },
+            "cors": {"enabled": False},
+        },
     }
 
     if overrides:
@@ -49,6 +58,9 @@ class DummyRouter:
 
     async def initialize(self):
         return None
+
+    def is_healthy(self):
+        return True
 
 
 class DummyInferenceEngine:
@@ -76,6 +88,9 @@ class DummyInferenceEngine:
 
     async def shutdown(self):
         return None
+
+    def is_healthy(self):
+        return True
 
 
 class DummyPipeline:
@@ -174,15 +189,20 @@ class DummySlackBot:
         self,
         config,
         inference_engine,
+        services=None,
         router=None,
         monitoring_service=None,
         analytics_service=None,
     ):
         self.config = config
         self.inference_engine = inference_engine
-        self.router = router
-        self.monitoring_service = monitoring_service
-        self.analytics_service = analytics_service
+        resolved_services = services or {}
+        self.services = resolved_services
+        self.router = router or resolved_services.get("router")
+        self.monitoring_service = monitoring_service or resolved_services.get(
+            "monitoring"
+        )
+        self.analytics_service = analytics_service or resolved_services.get("pipeline")
 
     async def initialize(self):
         return None
@@ -206,7 +226,9 @@ class DummyEventProducer:
     async def produce_request_raw(self, request):
         self.request_events.append(request)
 
-    async def produce_inference_completed(self, request, response, routing_decision=None):
+    async def produce_inference_completed(
+        self, request, response, routing_decision=None
+    ):
         self.completion_events.append((request, response, routing_decision))
 
     async def shutdown(self):
@@ -263,12 +285,19 @@ def patched_platform_deps(monkeypatch):
     monkeypatch.setattr(main, "MonitoringService", DummyMonitoring)
     monkeypatch.setattr(main, "SlackBot", DummySlackBot)
 
+
 class TestPlatformInitialization:
     def test_get_api_worker_count_respects_dev_and_config(self):
         config = {"performance": {"workers": {"api_workers": 4}}}
 
         assert main.get_api_worker_count(config, dev=False) == 4
         assert main.get_api_worker_count(config, dev=True) == 1
+
+    def test_invalid_config_exits_on_schema_validation(self, tmp_path):
+        config_path = _write_config(tmp_path, overrides={"api": {"port": 70000}})
+
+        with pytest.raises(SystemExit):
+            main.LLMRouterPlatform(config_path=str(config_path))
 
     @pytest.mark.asyncio
     async def test_initialize_services_skips_disabled_background_services(
@@ -327,7 +356,10 @@ class TestPlatformInitialization:
 
         await platform._initialize_services(include_api=True, include_background=True)
 
-        assert platform.services["pipeline"].attached_monitoring is platform.services["monitoring"]
+        assert (
+            platform.services["pipeline"].attached_monitoring
+            is platform.services["monitoring"]
+        )
 
     @pytest.mark.asyncio
     async def test_initialize_services_adds_event_producer_when_flink_enabled(
@@ -345,7 +377,10 @@ class TestPlatformInitialization:
         await platform._initialize_services(include_api=True, include_background=False)
 
         assert "event_producer" in platform.services
-        assert platform.services["inference"].event_producer is platform.services["event_producer"]
+        assert (
+            platform.services["inference"].event_producer
+            is platform.services["event_producer"]
+        )
 
     @pytest.mark.asyncio
     async def test_initialize_services_adds_policy_cache_when_enabled(
@@ -360,7 +395,10 @@ class TestPlatformInitialization:
         await platform._initialize_services(include_api=True, include_background=False)
 
         assert "policy_cache" in platform.services
-        assert platform.services["router"].policy_cache is platform.services["policy_cache"]
+        assert (
+            platform.services["router"].policy_cache
+            is platform.services["policy_cache"]
+        )
 
     @pytest.mark.asyncio
     async def test_workers_only_mode_skips_core_services_when_not_needed(
@@ -401,10 +439,177 @@ class TestPlatformInitialization:
         await platform._initialize_services(include_api=False, include_background=True)
 
         assert "policy_materializer" in platform.services
-        assert platform.services["policy_materializer"].policy_cache is platform.services["policy_cache"]
+        assert (
+            platform.services["policy_materializer"].policy_cache
+            is platform.services["policy_cache"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_initialize_services_passes_service_registry_to_slack_bot(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(
+            tmp_path,
+            overrides={"slack": {"enabled": True}},
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+
+        await platform._initialize_services(include_api=True, include_background=True)
+
+        assert "slack_bot" in platform.services
+        assert platform.services["slack_bot"].services is platform.services
 
 
 class TestApiApp:
+    def test_live_endpoint_is_public_and_ready_endpoint_reports_missing_services(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(
+            tmp_path,
+            overrides={
+                "security": {
+                    "api_keys": {
+                        "enabled": True,
+                        "header_name": "X-API-Key",
+                        "env_var": "LLM_ROUTER_API_KEYS",
+                    },
+                    "cors": {"enabled": False},
+                }
+            },
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            live_response = client.get("/live")
+            ready_response = client.get("/ready")
+            health_response = client.get("/health")
+
+        assert live_response.status_code == 200
+        assert live_response.json()["status"] == "live"
+
+        assert ready_response.status_code == 503
+        ready_body = ready_response.json()
+        assert ready_body["status"] == "not_ready"
+        assert ready_body["missing_services"] == ["router", "inference"]
+        assert ready_body["security"]["api_keys_configured"] is False
+
+        assert health_response.status_code == 503
+        assert health_response.json()["status"] == "not_ready"
+
+    def test_ready_endpoint_returns_200_when_core_services_and_auth_are_configured(
+        self, tmp_path, monkeypatch, patched_platform_deps
+    ):
+        monkeypatch.setenv("LLM_ROUTER_API_KEYS", "test-key")
+        config_path = _write_config(
+            tmp_path,
+            overrides={
+                "security": {
+                    "api_keys": {
+                        "enabled": True,
+                        "header_name": "X-API-Key",
+                        "env_var": "LLM_ROUTER_API_KEYS",
+                    },
+                    "cors": {"enabled": False},
+                }
+            },
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        platform.services["router"] = DummyRouter({})
+        platform.services["inference"] = DummyInferenceEngine({}, DummyRouter({}))
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.get("/ready")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "ready"
+        assert response.json()["security"]["api_keys_configured"] is True
+
+    def test_route_endpoint_requires_api_key_when_enabled(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(
+            tmp_path,
+            overrides={
+                "security": {
+                    "api_keys": {
+                        "enabled": True,
+                        "header_name": "X-API-Key",
+                        "env_var": "LLM_ROUTER_API_KEYS",
+                    },
+                    "cors": {"enabled": False},
+                }
+            },
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        platform.services["inference"] = DummyInferenceEngine({}, DummyRouter({}))
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post("/route", json={"query": "hello", "user_id": "u1"})
+
+        assert response.status_code == 503
+        assert response.json()["error"] == "auth_unavailable"
+
+    def test_route_endpoint_accepts_configured_api_key(
+        self, tmp_path, monkeypatch, patched_platform_deps
+    ):
+        monkeypatch.setenv("LLM_ROUTER_API_KEYS", "test-key")
+        config_path = _write_config(
+            tmp_path,
+            overrides={
+                "security": {
+                    "api_keys": {
+                        "enabled": True,
+                        "header_name": "X-API-Key",
+                        "env_var": "LLM_ROUTER_API_KEYS",
+                    },
+                    "cors": {"enabled": False},
+                }
+            },
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        platform.services["inference"] = DummyInferenceEngine({}, DummyRouter({}))
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/route",
+                json={"query": "hello", "user_id": "u1"},
+                headers={"X-API-Key": "test-key"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["response_text"] == "ok"
+
+    @pytest.mark.parametrize("path", ["/dashboard", "/dashboard/logs", "/metrics"])
+    def test_management_endpoints_require_api_key_when_enabled(
+        self, path, tmp_path, monkeypatch, patched_platform_deps
+    ):
+        monkeypatch.setenv("LLM_ROUTER_API_KEYS", "test-key")
+        config_path = _write_config(
+            tmp_path,
+            overrides={
+                "security": {
+                    "api_keys": {
+                        "enabled": True,
+                        "header_name": "X-API-Key",
+                        "env_var": "LLM_ROUTER_API_KEYS",
+                    },
+                    "cors": {"enabled": False},
+                }
+            },
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.get(path)
+
+        assert response.status_code == 401
+        assert response.json()["error"] == "unauthorized"
+
     def test_route_endpoint_returns_200_for_success(
         self, tmp_path, patched_platform_deps
     ):
@@ -434,6 +639,27 @@ class TestApiApp:
 
         assert response.status_code == 502
         assert response.json()["error"] == "upstream"
+
+    def test_route_endpoint_returns_sanitized_error_for_unhandled_exception(
+        self, tmp_path, patched_platform_deps
+    ):
+        class ExplodingInferenceEngine(DummyInferenceEngine):
+            async def process_query(self, request):
+                raise RuntimeError("database password leaked")
+
+        config_path = _write_config(tmp_path)
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        platform.services["inference"] = ExplodingInferenceEngine({}, DummyRouter({}))
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post("/route", json={"query": "hello", "user_id": "u1"})
+
+        assert response.status_code == 500
+        body = response.json()
+        assert body["error"] == "internal_server_error"
+        assert body["message"] == "Request processing failed"
+        assert "database password leaked" not in response.text
 
     def test_route_endpoint_validates_request_body(
         self, tmp_path, patched_platform_deps
@@ -494,10 +720,33 @@ class TestApiApp:
         assert response.status_code == 200
         body = response.json()
         assert body["time_window_hours"] == 24
-        assert body["sources"]["analytics"] == "in_memory_metrics"
+        assert body["sources"]["analytics"] == "process_local_metrics"
+        assert body["source_authority"]["analytics"] is True
+        assert body["observability"]["authoritative"] is True
         assert body["capabilities"]["pipeline_analytics"] is False
         assert "overview" in body
         assert "alerts" in body
+
+    def test_dashboard_endpoint_marks_process_local_metrics_non_authoritative_in_worker(
+        self, tmp_path, monkeypatch, patched_platform_deps
+    ):
+        config_path = _write_config(tmp_path)
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        app = platform._create_fastapi_app()
+        monkeypatch.setattr(
+            main.mp, "current_process", lambda: SimpleNamespace(name="SpawnProcess-2")
+        )
+
+        with TestClient(app) as client:
+            response = client.get("/dashboard")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["source_authority"]["analytics"] is False
+        assert body["sources"]["alerts"] == "disabled_non_authoritative_process_local"
+        assert body["observability"]["authoritative"] is False
+        assert body["observability"]["metrics_scope"] == "process_local"
+        assert body["alerts"] == []
 
     def test_dashboard_endpoint_prefers_pipeline_and_monitoring_data(
         self, tmp_path, patched_platform_deps
@@ -514,14 +763,17 @@ class TestApiApp:
         assert response.status_code == 200
         body = response.json()
         assert body["time_window_hours"] == 6
+        assert body["sources"]["overview"] == "clickhouse"
         assert body["sources"]["analytics"] == "clickhouse"
         assert body["sources"]["model_performance"] == "clickhouse"
+        assert body["sources"]["inference"] == "clickhouse"
+        assert body["source_authority"]["analytics"] is True
+        assert body["observability"]["authoritative"] is True
         assert body["capabilities"]["pipeline_analytics"] is True
         assert body["analytics"]["query_type_breakdown"]["general"] == 8
+        assert body["overview"]["total_requests"] == 12
         assert body["model_performance"][0]["model_name"] == "gpt-5"
-        assert any(
-            alert["source"] == "monitoring_service" for alert in body["alerts"]
-        )
+        assert any(alert["source"] == "monitoring_service" for alert in body["alerts"])
 
     def test_dashboard_logs_endpoint_reads_structured_logs(
         self, tmp_path, patched_platform_deps
@@ -607,3 +859,42 @@ class TestApiApp:
         assert body["count"] == 2
         assert body["logs"][0]["request_id"] == "req-2"
         assert body["logs"][1]["request_id"] == "req-1"
+
+    def test_cors_preflight_respects_security_cors_config(
+        self, tmp_path, monkeypatch, patched_platform_deps
+    ):
+        monkeypatch.setenv("LLM_ROUTER_API_KEYS", "test-key")
+        config_path = _write_config(
+            tmp_path,
+            overrides={
+                "security": {
+                    "api_keys": {
+                        "enabled": True,
+                        "header_name": "X-API-Key",
+                        "env_var": "LLM_ROUTER_API_KEYS",
+                    },
+                    "cors": {
+                        "enabled": True,
+                        "allow_origins": ["https://example.com"],
+                        "allow_methods": ["POST"],
+                        "allow_headers": ["X-API-Key", "Content-Type"],
+                    },
+                }
+            },
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        platform.services["inference"] = DummyInferenceEngine({}, DummyRouter({}))
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.options(
+                "/route",
+                headers={
+                    "Origin": "https://example.com",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "X-API-Key, Content-Type",
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.headers["access-control-allow-origin"] == "https://example.com"

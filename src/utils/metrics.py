@@ -12,6 +12,91 @@ import threading
 from collections import defaultdict
 
 
+METRIC_CREATED_SUFFIX = "_created"
+METRIC_BUCKET_SUFFIX = "_bucket"
+METRIC_SUM_SUFFIX = "_sum"
+METRIC_COUNT_SUFFIX = "_count"
+METRIC_INFO_SUFFIX = "_info"
+
+
+def _iter_collected_samples(metric: Optional[MetricWrapperBase]):
+    """Iterate over Prometheus samples using the public collect API."""
+    if metric is None or not hasattr(metric, "collect"):
+        return
+
+    for metric_family in metric.collect():
+        for sample in getattr(metric_family, "samples", ()):
+            yield sample
+
+
+def _sample_value(sample: Any) -> float:
+    """Coerce a collected sample value to float."""
+    try:
+        return float(sample.value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _base_metric_sample(sample: Any) -> bool:
+    """Return whether a sample represents a counter/gauge value, not metadata."""
+    return not sample.name.endswith(
+        (
+            METRIC_CREATED_SUFFIX,
+            METRIC_BUCKET_SUFFIX,
+            METRIC_SUM_SUFFIX,
+            METRIC_COUNT_SUFFIX,
+            METRIC_INFO_SUFFIX,
+        )
+    )
+
+
+def sum_metric_values(metric: Optional[MetricWrapperBase]) -> float:
+    """Sum all counter or gauge values for a metric."""
+    total = 0.0
+    for sample in _iter_collected_samples(metric) or ():
+        if _base_metric_sample(sample):
+            total += _sample_value(sample)
+    return total
+
+
+def sum_metric_by_label(
+    metric: Optional[MetricWrapperBase], label_name: str
+) -> Dict[str, float]:
+    """Aggregate counter or gauge values by label."""
+    totals: Dict[str, float] = {}
+    for sample in _iter_collected_samples(metric) or ():
+        if not _base_metric_sample(sample):
+            continue
+        label_value = sample.labels.get(label_name, "unknown")
+        totals[label_value] = totals.get(label_value, 0.0) + _sample_value(sample)
+    return totals
+
+
+def histogram_average(metric: Optional[MetricWrapperBase]) -> float:
+    """Compute the average value represented by a histogram-like metric."""
+    total_sum = 0.0
+    total_count = 0.0
+    for sample in _iter_collected_samples(metric) or ():
+        if sample.name.endswith(METRIC_SUM_SUFFIX):
+            total_sum += _sample_value(sample)
+        elif sample.name.endswith(METRIC_COUNT_SUFFIX):
+            total_count += _sample_value(sample)
+    return total_sum / total_count if total_count > 0 else 0.0
+
+
+def metric_value_for_labels(
+    metric: Optional[MetricWrapperBase], labels: Dict[str, str]
+) -> float:
+    """Return the summed value for samples matching an exact label subset."""
+    total = 0.0
+    for sample in _iter_collected_samples(metric) or ():
+        if not _base_metric_sample(sample):
+            continue
+        if all(sample.labels.get(key) == value for key, value in labels.items()):
+            total += _sample_value(sample)
+    return total
+
+
 # System-wide metrics
 class SystemMetrics:
     """System-level metrics"""
@@ -450,34 +535,30 @@ class MetricsCollector:
         """Get counter value for last 24 hours (simplified)"""
         # In a real implementation, this would query the time series data
         # For now, return current counter value
-        return sum(counter._value.values())
+        return sum_metric_values(counter)
 
     def _get_histogram_average(self, histogram: Histogram) -> float:
         """Get average value from histogram"""
-        total_count = sum(histogram._count.values())
-        total_sum = sum(histogram._sum.values())
-        return total_sum / total_count if total_count > 0 else 0
+        return histogram_average(histogram)
 
     def _calculate_cache_hit_rate(self) -> float:
         """Calculate cache hit rate"""
-        hits = sum(INFERENCE_METRICS.cache_hits._value.values())
-        misses = sum(INFERENCE_METRICS.cache_misses._value.values())
+        hits = sum_metric_values(INFERENCE_METRICS.cache_hits)
+        misses = sum_metric_values(INFERENCE_METRICS.cache_misses)
         total = hits + misses
         return hits / total if total > 0 else 0
 
     def _calculate_error_rate(self) -> float:
         """Calculate overall error rate"""
-        total_requests = sum(SYSTEM_METRICS.requests_total._value.values())
-        total_errors = sum(SYSTEM_METRICS.errors_total._value.values())
+        total_requests = sum_metric_values(SYSTEM_METRICS.requests_total)
+        total_errors = sum_metric_values(SYSTEM_METRICS.errors_total)
         return total_errors / total_requests if total_requests > 0 else 0
 
     def _get_model_usage_distribution(self) -> Dict[str, float]:
         """Get model usage distribution"""
-        model_counts = defaultdict(float)
-        for labels, count in ROUTER_METRICS.routing_decisions._value.items():
-            model = labels[0] if labels else "unknown"
-            model_counts[model] += count
-
+        model_counts = defaultdict(
+            float, sum_metric_by_label(ROUTER_METRICS.routing_decisions, "model")
+        )
         total = sum(model_counts.values())
         if total == 0:
             return {}
@@ -486,12 +567,7 @@ class MetricsCollector:
 
     def _get_user_tier_distribution(self) -> Dict[str, float]:
         """Get user tier distribution"""
-        tier_counts = {}
-        for labels, count in USER_METRICS.users_by_tier._value.items():
-            tier = labels[0] if labels else "unknown"
-            tier_counts[tier] = count
-
-        return tier_counts
+        return sum_metric_by_label(USER_METRICS.users_by_tier, "user_tier")
 
 
 # Performance tracking decorators
@@ -613,16 +689,18 @@ class MetricsReporter:
         return {
             "timestamp": time.time(),
             "system": {
-                "cpu_usage": SYSTEM_METRICS.cpu_usage._value._value,
-                "memory_usage_percent": SYSTEM_METRICS.memory_usage_percent._value._value,
-                "active_requests": sum(SYSTEM_METRICS.active_requests._value.values()),
-                "total_requests": sum(SYSTEM_METRICS.requests_total._value.values()),
-                "total_errors": sum(SYSTEM_METRICS.errors_total._value.values()),
+                "cpu_usage": sum_metric_values(SYSTEM_METRICS.cpu_usage),
+                "memory_usage_percent": sum_metric_values(
+                    SYSTEM_METRICS.memory_usage_percent
+                ),
+                "active_requests": sum_metric_values(SYSTEM_METRICS.active_requests),
+                "total_requests": sum_metric_values(SYSTEM_METRICS.requests_total),
+                "total_errors": sum_metric_values(SYSTEM_METRICS.errors_total),
             },
             "inference": {
-                "total_requests": sum(INFERENCE_METRICS.requests_total._value.values()),
-                "total_tokens": sum(INFERENCE_METRICS.tokens_processed._value.values()),
-                "total_cost": sum(INFERENCE_METRICS.cost_total._value.values()),
+                "total_requests": sum_metric_values(INFERENCE_METRICS.requests_total),
+                "total_tokens": sum_metric_values(INFERENCE_METRICS.tokens_processed),
+                "total_cost": sum_metric_values(INFERENCE_METRICS.cost_total),
                 "cache_hit_rate": self.collector._calculate_cache_hit_rate(),
                 "error_rate": self.collector._calculate_error_rate(),
             },
@@ -634,20 +712,23 @@ class MetricsReporter:
         models = {}
 
         # Collect per-model metrics
-        for labels, value in ROUTER_METRICS.routing_decisions._value.items():
-            model = labels[0] if labels else "unknown"
+        for model, value in sum_metric_by_label(
+            ROUTER_METRICS.routing_decisions, "model"
+        ).items():
             if model not in models:
                 models[model] = {"requests": 0, "tokens": 0, "cost": 0.0, "errors": 0}
             models[model]["requests"] += value
 
         # Add token and cost data
-        for labels, value in INFERENCE_METRICS.tokens_processed._value.items():
-            model = labels[0] if labels else "unknown"
+        for model, value in sum_metric_by_label(
+            INFERENCE_METRICS.tokens_processed, "model"
+        ).items():
             if model in models:
                 models[model]["tokens"] += value
 
-        for labels, value in INFERENCE_METRICS.cost_total._value.items():
-            model = labels[0] if labels else "unknown"
+        for model, value in sum_metric_by_label(
+            INFERENCE_METRICS.cost_total, "model"
+        ).items():
             if model in models:
                 models[model]["cost"] += value
 
@@ -658,20 +739,20 @@ class MetricsReporter:
         return {
             "timestamp": time.time(),
             "users": {
-                "by_tier": dict(USER_METRICS.users_by_tier._value),
-                "total_queries": sum(USER_METRICS.queries_per_user._value.values()),
-                "total_tokens": sum(USER_METRICS.tokens_per_user._value.values()),
-                "total_cost": sum(USER_METRICS.cost_per_user._value.values()),
+                "by_tier": sum_metric_by_label(USER_METRICS.users_by_tier, "user_tier"),
+                "total_queries": sum_metric_values(USER_METRICS.queries_per_user),
+                "total_tokens": sum_metric_values(USER_METRICS.tokens_per_user),
+                "total_cost": sum_metric_values(USER_METRICS.cost_per_user),
             },
             "slack": {
-                "messages_processed": sum(
-                    SLACK_METRICS.messages_processed._value.values()
+                "messages_processed": sum_metric_values(
+                    SLACK_METRICS.messages_processed
                 ),
-                "active_users_1h": SLACK_METRICS.active_users.labels(
-                    time_window="1h"
-                )._value._value,
-                "rate_limited_users": sum(
-                    SLACK_METRICS.rate_limited_users._value.values()
+                "active_users_1h": metric_value_for_labels(
+                    SLACK_METRICS.active_users, {"time_window": "1h"}
+                ),
+                "rate_limited_users": sum_metric_values(
+                    SLACK_METRICS.rate_limited_users
                 ),
             },
         }
@@ -850,6 +931,10 @@ __all__ = [
     "AlertThresholds",
     "SlidingWindowCounter",
     "BusinessMetrics",
+    "sum_metric_values",
+    "sum_metric_by_label",
+    "histogram_average",
+    "metric_value_for_labels",
     "track_request_metrics",
     "track_inference_metrics",
     "reset_metrics",

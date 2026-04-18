@@ -6,10 +6,12 @@ Handles inference requests across OpenAI, Anthropic, and vLLM providers
 import asyncio
 import json
 import logging
+import os
 import time
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Any, AsyncIterator, Union, Tuple
 import hashlib
 
@@ -261,8 +263,10 @@ class ResponseCache:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.enabled = config.get("enabled", True)
+        self.backend = str(config.get("backend", "redis")).lower()
         self.ttl = config.get("ttl", 3600)  # 1 hour
         self.max_size = config.get("max_size", "1GB")
+        self.redis_config = dict(config.get("redis", {}))
         self.redis_client = None
 
     async def initialize(self):
@@ -270,9 +274,25 @@ class ResponseCache:
         if not self.enabled:
             return
 
+        if self.backend != "redis":
+            logger.warning(
+                "Unsupported response cache backend '%s'; disabling cache",
+                self.backend,
+            )
+            self.enabled = False
+            return
+
         try:
+            password = None
+            password_env = self.redis_config.get("password_env")
+            if password_env:
+                password = os.getenv(str(password_env))
             self.redis_client = redis.Redis(
-                host="localhost", port=6379, db=0, decode_responses=True
+                host=self.redis_config.get("host", "localhost"),
+                port=int(self.redis_config.get("port", 6379)),
+                db=int(self.redis_config.get("db", 0)),
+                password=password,
+                decode_responses=True,
             )
             await self.redis_client.ping()
             logger.info("Response cache initialized")
@@ -396,7 +416,9 @@ class BaseInferenceProvider(ABC):
             "response_style_instructions"
         )
         if response_style_instructions:
-            prompt_sections.append(f"Response style instructions:\n{response_style_instructions}")
+            prompt_sections.append(
+                f"Response style instructions:\n{response_style_instructions}"
+            )
 
         prompt = request.query
         attachment_prompt = self._build_attachment_prompt(request)
@@ -433,7 +455,9 @@ class BaseInferenceProvider(ABC):
 
             excerpt_limit = min(self.ATTACHMENT_PREVIEW_CHAR_LIMIT, remaining_chars)
             if excerpt_limit <= 0:
-                sections.append("Additional extracted text omitted because the prompt limit was reached.")
+                sections.append(
+                    "Additional extracted text omitted because the prompt limit was reached."
+                )
                 break
 
             excerpt = extracted_text[:excerpt_limit]
@@ -460,7 +484,9 @@ class BaseInferenceProvider(ABC):
                 return None
 
             printable = sum(
-                1 for character in normalized if character.isprintable() or character in "\n\r\t"
+                1
+                for character in normalized
+                if character.isprintable() or character in "\n\r\t"
             )
             if printable / max(len(normalized), 1) < 0.85:
                 continue
@@ -664,10 +690,10 @@ class AnthropicProvider(BaseInferenceProvider):
 
     def _calculate_cost(self, usage, model_name: str) -> float:
         """Calculate cost based on usage"""
-        # Anthropic pricing (example rates)
+        # Anthropic pricing, aligned to current Claude 4 family defaults.
         pricing = {
-            "claude-3.5-sonnet": {"input": 0.003 / 1000, "output": 0.015 / 1000},
-            "claude-3-opus": {"input": 0.015 / 1000, "output": 0.075 / 1000},
+            "claude-sonnet-4-6": {"input": 0.003 / 1000, "output": 0.015 / 1000},
+            "claude-opus-4-6": {"input": 0.005 / 1000, "output": 0.025 / 1000},
         }
 
         model_pricing = pricing.get(
@@ -684,7 +710,7 @@ class AnthropicProvider(BaseInferenceProvider):
         return {
             "provider": "anthropic",
             "status": "healthy" if self.client else "unhealthy",
-            "models_available": ["claude-3.5-sonnet", "claude-3-opus"],
+            "models_available": ["claude-sonnet-4-6", "claude-opus-4-6"],
         }
 
 
@@ -693,9 +719,13 @@ class vLLMProvider(BaseInferenceProvider):
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        self.base_url = (
-            f"http://{config.get('host', 'localhost')}:{config.get('port', 8000)}"
-        )
+        configured_base_url = config.get("base_url")
+        if configured_base_url:
+            self.base_url = str(configured_base_url).rstrip("/")
+        else:
+            self.base_url = (
+                f"http://{config.get('host', 'localhost')}:{config.get('port', 8000)}"
+            )
         self.http_client = None
 
     async def initialize(self):
@@ -873,8 +903,10 @@ class BatchProcessor:
         return response.model_copy(deep=True)
 
     def _schedule_flush_locked(
-        self, bucket_key: Tuple[int, str], bucket: "BatchProcessor.BatchBucket",
-        immediate: bool
+        self,
+        bucket_key: Tuple[int, str],
+        bucket: "BatchProcessor.BatchBucket",
+        immediate: bool,
     ):
         """Schedule a batch flush for a bucket."""
         if bucket.flush_task and not bucket.flush_task.done():
@@ -1016,6 +1048,7 @@ class InferenceEngine:
 
         # Performance tracking
         self.inference_stats = {}
+        self._initialized = False
 
     async def initialize(self):
         """Initialize all providers and components"""
@@ -1036,13 +1069,29 @@ class InferenceEngine:
             self.providers["anthropic"] = AnthropicProvider(self.config["anthropic"])
             await self.providers["anthropic"].initialize()
 
-        if "vllm" in self.config:
-            self.providers["vllm"] = vLLMProvider(self.config["vllm"])
+        vllm_config = dict(self.config.get("vllm", {}) or {})
+        if self._vllm_configured(vllm_config):
+            self.providers["vllm"] = vLLMProvider(vllm_config)
             await self.providers["vllm"].initialize()
 
+        self._initialized = True
         logger.info(
             f"Inference engine initialized with {len(self.providers)} providers"
         )
+
+    def _vllm_configured(self, config: Dict[str, Any]) -> bool:
+        """Return whether a usable vLLM endpoint has been configured."""
+        if not config:
+            return False
+
+        if config.get("base_url"):
+            return True
+
+        return bool(config.get("host")) and bool(config.get("port"))
+
+    def is_healthy(self) -> bool:
+        """Return whether the inference engine is ready to process requests."""
+        return self._initialized and bool(self.providers)
 
     async def process_query(self, request: QueryRequest) -> InferenceResponse:
         """Process query through the complete inference pipeline"""
@@ -1091,22 +1140,24 @@ class InferenceEngine:
                     f"Compressed context from {original_length} to {len(request.context)} chars"
                 )
 
-            # Step 4: Get appropriate provider
-            provider = self._get_provider_for_model(model_name)
-            if not provider:
-                raise ValueError(f"No provider available for model: {model_name}")
-
-            # Step 5: Generate response
-            response = await self.batch_processor.add_request(
-                request, provider, model_name
+            # Step 4: Generate response, falling back to local models for cloud outages
+            (
+                response,
+                model_name,
+                routing_decision,
+            ) = await self._generate_response_with_fallback(
+                request,
+                routing_decision,
             )
             response.compressed_context = compressed_context
 
             # Step 6: Cache response
-            await self.cache.cache_response(
-                cache_key,
-                response.model_dump(mode="json"),
-            )
+            if not response.cached:
+                cache_key = self.cache.generate_cache_key(request, model_name)
+                await self.cache.cache_response(
+                    cache_key,
+                    response.model_dump(mode="json"),
+                )
 
             # Step 7: Update metrics and stats
             inference_time = time.time() - start_time
@@ -1132,28 +1183,31 @@ class InferenceEngine:
             )
             return response
 
-        except Exception as e:
+        except Exception as exc:
             # Update error metrics
-            INFERENCE_METRICS.errors_total.labels(
-                model=routing_decision.selected_model
-                if "routing_decision" in locals()
-                else "unknown",
-                error_type=type(e).__name__,
-            ).inc()
+            if not getattr(exc, "_attempt_recorded", False):
+                INFERENCE_METRICS.errors_total.labels(
+                    model=routing_decision.selected_model
+                    if "routing_decision" in locals()
+                    else "unknown",
+                    error_type=type(exc).__name__,
+                ).inc()
 
             # Update router stats
-            if "routing_decision" in locals():
+            if "routing_decision" in locals() and not getattr(
+                exc, "_attempt_recorded", False
+            ):
                 self.router.update_model_stats(
                     model_name=routing_decision.selected_model,
                     success=False,
                     latency_ms=int((time.time() - start_time) * 1000),
                 )
 
-            logger.error(f"Inference failed for request {request_id}: {e}")
+            logger.exception(f"Inference failed for request {request_id}")
 
             # Return error response
             error_response = InferenceResponse(
-                response_text=f"Error processing request: {str(e)}",
+                response_text="Request processing failed",
                 model_name=routing_decision.selected_model
                 if "routing_decision" in locals()
                 else "unknown",
@@ -1165,7 +1219,7 @@ class InferenceEngine:
                 cost_usd=0.0,
                 provider="error",
                 cached=False,
-                error=str(e),
+                error="inference_failed",
             )
             await self._publish_inference_completed_event(
                 request,
@@ -1193,9 +1247,9 @@ class InferenceEngine:
             async for chunk in provider.stream_response(request, model_name):
                 yield chunk
 
-        except Exception as e:
-            logger.error(f"Streaming failed: {e}")
-            yield f"Error: {str(e)}"
+        except Exception:
+            logger.exception("Streaming failed")
+            yield "Error: Request processing failed"
 
     def _get_provider_for_model(
         self, model_name: str
@@ -1209,6 +1263,218 @@ class InferenceEngine:
         provider_name = model_info["config"]["provider"]
         return self.providers.get(provider_name)
 
+    async def _generate_response_with_fallback(
+        self,
+        request: QueryRequest,
+        routing_decision: Any,
+    ) -> Tuple[InferenceResponse, str, Any]:
+        """Generate a response and fall back to local models when cloud models fail."""
+        primary_model = routing_decision.selected_model
+        primary_started_at = time.time()
+
+        try:
+            response = await self._execute_model_request(request, primary_model)
+            return response, primary_model, routing_decision
+        except Exception as exc:
+            self._record_failed_attempt(primary_model, exc, primary_started_at)
+            fallback_models = self._get_local_fallback_models(
+                request,
+                routing_decision,
+                exclude_models=[primary_model],
+            )
+
+            if not fallback_models:
+                raise
+
+            logger.warning(
+                "Primary model %s failed; attempting local fallback candidates %s",
+                primary_model,
+                fallback_models,
+            )
+
+            last_exception = exc
+            for fallback_model in fallback_models:
+                fallback_started_at = time.time()
+                fallback_cache_key = self.cache.generate_cache_key(
+                    request, fallback_model
+                )
+                cached_response = await self.cache.get_cached_response(
+                    fallback_cache_key
+                )
+                if cached_response:
+                    cached_response["cached"] = True
+                    response = InferenceResponse(**cached_response)
+                    return (
+                        response,
+                        fallback_model,
+                        self._build_fallback_routing_decision(
+                            routing_decision,
+                            original_model=primary_model,
+                            fallback_model=fallback_model,
+                            from_cache=True,
+                        ),
+                    )
+
+                try:
+                    response = await self._execute_model_request(
+                        request, fallback_model
+                    )
+                    return (
+                        response,
+                        fallback_model,
+                        self._build_fallback_routing_decision(
+                            routing_decision,
+                            original_model=primary_model,
+                            fallback_model=fallback_model,
+                        ),
+                    )
+                except Exception as fallback_exc:
+                    self._record_failed_attempt(
+                        fallback_model,
+                        fallback_exc,
+                        fallback_started_at,
+                    )
+                    last_exception = fallback_exc
+
+            raise last_exception
+
+    async def _execute_model_request(
+        self, request: QueryRequest, model_name: str
+    ) -> InferenceResponse:
+        """Execute a request against a specific model."""
+        provider = self._get_provider_for_model(model_name)
+        if not provider:
+            raise ValueError(f"No provider available for model: {model_name}")
+        return await self.batch_processor.add_request(request, provider, model_name)
+
+    def _record_failed_attempt(
+        self,
+        model_name: str,
+        exc: Exception,
+        attempt_started_at: float,
+    ):
+        """Record metrics and router stats for a failed model attempt."""
+        setattr(exc, "_attempt_recorded", True)
+        INFERENCE_METRICS.errors_total.labels(
+            model=model_name,
+            error_type=type(exc).__name__,
+        ).inc()
+        self.router.update_model_stats(
+            model_name=model_name,
+            success=False,
+            latency_ms=int((time.time() - attempt_started_at) * 1000),
+        )
+        if model_name not in self.inference_stats:
+            self.inference_stats[model_name] = {
+                "total_requests": 0,
+                "total_tokens": 0,
+                "total_cost": 0.0,
+                "total_time": 0.0,
+                "error_count": 0,
+            }
+        self.inference_stats[model_name]["total_requests"] += 1
+        self.inference_stats[model_name]["error_count"] += 1
+        self.inference_stats[model_name]["total_time"] += max(
+            time.time() - attempt_started_at,
+            0.0,
+        )
+
+    def _get_local_fallback_models(
+        self,
+        request: QueryRequest,
+        routing_decision: Any,
+        exclude_models: Optional[List[str]] = None,
+    ) -> List[str]:
+        """Rank local vLLM candidates that can safely replace a failed cloud model."""
+        selected_model = routing_decision.selected_model
+        selected_model_info = self.router.get_model_info(selected_model)
+        if not selected_model_info:
+            return []
+
+        selected_provider = selected_model_info["config"]["provider"].lower()
+        if selected_provider == "vllm":
+            return []
+
+        exclude = set(exclude_models or [])
+        context = {
+            "query_type": (
+                routing_decision.query_type.value
+                if hasattr(routing_decision, "query_type")
+                and hasattr(routing_decision.query_type, "value")
+                else str(getattr(routing_decision, "query_type", "general"))
+            ),
+            "token_count": getattr(
+                routing_decision,
+                "token_count",
+                self.router.token_counter.count_tokens(request.query),
+            ),
+            "user_tier": request.user_tier,
+            "priority": request.priority,
+            "max_tokens": request.max_tokens,
+            "temperature": request.temperature,
+            "has_attachments": bool(request.attachments),
+        }
+
+        ranked_candidates = []
+        for model_name, model_config in getattr(self.router, "models", {}).items():
+            if model_name in exclude:
+                continue
+            if getattr(model_config, "provider", "").lower() != "vllm":
+                continue
+            if context["token_count"] > model_config.max_tokens:
+                continue
+            if hasattr(
+                self.router, "_has_capability"
+            ) and not self.router._has_capability(
+                model_config,
+                context["query_type"],
+            ):
+                continue
+            if hasattr(
+                self.router, "_check_user_access"
+            ) and not self.router._check_user_access(
+                model_config,
+                context["user_tier"],
+            ):
+                continue
+            score = (
+                self.router._score_model(model_name, context)
+                if hasattr(self.router, "_score_model")
+                else 0.0
+            )
+            ranked_candidates.append((score, model_name))
+
+        ranked_candidates.sort(reverse=True)
+        return [model_name for _score, model_name in ranked_candidates]
+
+    def _build_fallback_routing_decision(
+        self,
+        routing_decision: Any,
+        original_model: str,
+        fallback_model: str,
+        from_cache: bool = False,
+    ) -> Any:
+        """Attach fallback metadata to the routing decision used for downstream events."""
+        suffix = (
+            f"{getattr(routing_decision, 'routing_reason', 'Selected model failed')}; "
+            f"local fallback from {original_model} to {fallback_model}"
+        )
+        if from_cache:
+            suffix += " (cached)"
+
+        if hasattr(routing_decision, "model_copy"):
+            return routing_decision.model_copy(
+                update={
+                    "selected_model": fallback_model,
+                    "routing_reason": suffix,
+                }
+            )
+
+        payload = dict(vars(routing_decision))
+        payload["selected_model"] = fallback_model
+        payload["routing_reason"] = suffix
+        return SimpleNamespace(**payload)
+
     async def _publish_inference_completed_event(
         self,
         request: QueryRequest,
@@ -1219,7 +1485,9 @@ class InferenceEngine:
         if not self.event_producer:
             return
 
-        publish_method = getattr(self.event_producer, "produce_inference_completed", None)
+        publish_method = getattr(
+            self.event_producer, "produce_inference_completed", None
+        )
         if publish_method is None:
             return
 
@@ -1281,4 +1549,5 @@ class InferenceEngine:
         if self.cache.redis_client:
             await self.cache.redis_client.close()
 
+        self._initialized = False
         logger.info("Inference engine shutdown complete")

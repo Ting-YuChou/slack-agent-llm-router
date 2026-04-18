@@ -1,6 +1,7 @@
 try:
     from .bot_real import SlackBot  # noqa: F401
 except Exception:
+
     class SlackBot:
         def __init__(self, *args, **kwargs):
             self.running = False

@@ -15,6 +15,7 @@ import uuid
 
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 from aiokafka.errors import KafkaError
+from aiokafka.structs import TopicPartition
 import clickhouse_connect
 from clickhouse_connect.driver import Client
 
@@ -129,9 +130,7 @@ def build_inference_completed_event(
         "response_length_chars": len(inference_response.response_text or ""),
         "routing_reason": getattr(routing_decision, "routing_reason", None),
         "routing_strategy": _enum_value(routing_strategy),
-        "fallback_models": list(
-            getattr(routing_decision, "fallback_models", []) or []
-        ),
+        "fallback_models": list(getattr(routing_decision, "fallback_models", []) or []),
     }
 
 
@@ -399,9 +398,7 @@ class KafkaProducerManager:
             cost_usd=inference_response.cost_usd,
             status="error" if inference_response.error else "success",
             error_message=getattr(inference_response, "error", ""),
-            context_compressed=getattr(
-                inference_response, "compressed_context", False
-            ),
+            context_compressed=getattr(inference_response, "compressed_context", False),
             compression_ratio=0.3
             if getattr(inference_response, "compressed_context", False)
             else 0.0,
@@ -506,24 +503,35 @@ class ClickHouseManager:
         }
         self.last_batch_time = time.time()
 
-    def _insert_dict_rows(self, table_name: str, records: List[Dict[str, Any]]):
+    async def _run_blocking(self, func: Callable[..., Any], *args, **kwargs):
+        """Run a blocking ClickHouse client call outside the event loop."""
+        return await asyncio.to_thread(func, *args, **kwargs)
+
+    async def _insert_dict_rows(self, table_name: str, records: List[Dict[str, Any]]):
         """Insert dictionary records with explicit column ordering."""
         if not records:
             return
 
         columns = list(records[0].keys())
         rows = [[record.get(column) for column in columns] for record in records]
-        self.client.insert(table_name, rows, column_names=columns)
+        await self._run_blocking(
+            self.client.insert,
+            table_name,
+            rows,
+            column_names=columns,
+        )
 
     async def initialize(self):
         """Initialize ClickHouse connection and create tables"""
         try:
-            admin_client = clickhouse_connect.get_client(
-                **self.connection_params, database="default"
+            admin_client = await self._run_blocking(
+                clickhouse_connect.get_client,
+                **self.connection_params,
+                database="default",
             )
 
             # Test connection
-            result = admin_client.query("SELECT 1")
+            result = await self._run_blocking(admin_client.query, "SELECT 1")
             if result.result_rows:
                 logger.info("ClickHouse connection established successfully")
 
@@ -532,11 +540,13 @@ class ClickHouseManager:
             await self._create_database()
 
             if self.database != "default":
-                admin_client.close()
-                self.client = clickhouse_connect.get_client(
-                    **self.connection_params, database=self.database
+                await self._run_blocking(admin_client.close)
+                self.client = await self._run_blocking(
+                    clickhouse_connect.get_client,
+                    **self.connection_params,
+                    database=self.database,
                 )
-                self.client.query("SELECT 1")
+                await self._run_blocking(self.client.query, "SELECT 1")
 
             # Create tables
             await self._create_tables()
@@ -550,7 +560,10 @@ class ClickHouseManager:
     async def _create_database(self):
         """Create database if not exists"""
         try:
-            self.client.command(f"CREATE DATABASE IF NOT EXISTS {self.database}")
+            await self._run_blocking(
+                self.client.command,
+                f"CREATE DATABASE IF NOT EXISTS {self.database}",
+            )
             logger.info(f"Database {self.database} created/verified")
         except Exception as e:
             logger.error(f"Failed to create database: {e}")
@@ -686,7 +699,7 @@ class ClickHouseManager:
 
         for table_name, sql in tables:
             try:
-                self.client.command(sql)
+                await self._run_blocking(self.client.command, sql)
                 logger.info(f"Table {table_name} created/verified")
             except Exception as e:
                 logger.error(f"Failed to create table {table_name}: {e}")
@@ -705,7 +718,7 @@ class ClickHouseManager:
 
         for sql in alter_statements:
             try:
-                self.client.command(sql)
+                await self._run_blocking(self.client.command, sql)
             except Exception as e:
                 logger.debug(f"Skipping optional schema migration: {e}")
 
@@ -713,7 +726,7 @@ class ClickHouseManager:
         """Insert single query log entry"""
         try:
             data = [query_log.to_dict()]
-            self._insert_dict_rows("query_logs", data)
+            await self._insert_dict_rows("query_logs", data)
             logger.debug(f"Inserted query log: {query_log.query_id}")
         except Exception as e:
             logger.error(f"Failed to insert query log: {e}")
@@ -726,7 +739,7 @@ class ClickHouseManager:
 
         try:
             data = [log.to_dict() for log in query_logs]
-            self._insert_dict_rows("query_logs", data)
+            await self._insert_dict_rows("query_logs", data)
             logger.info(f"Batch inserted {len(query_logs)} query logs")
             PIPELINE_METRICS.records_inserted.labels(table="query_logs").inc(
                 len(query_logs)
@@ -740,7 +753,7 @@ class ClickHouseManager:
         """Insert single metric entry"""
         try:
             data = [metric.to_dict()]
-            self._insert_dict_rows("system_metrics", data)
+            await self._insert_dict_rows("system_metrics", data)
             logger.debug(f"Inserted metric: {metric.service}.{metric.metric_name}")
         except Exception as e:
             logger.error(f"Failed to insert metric: {e}")
@@ -753,7 +766,7 @@ class ClickHouseManager:
 
         try:
             data = [metric.to_dict() for metric in metrics]
-            self._insert_dict_rows("system_metrics", data)
+            await self._insert_dict_rows("system_metrics", data)
             logger.info(f"Batch inserted {len(metrics)} metrics")
             PIPELINE_METRICS.records_inserted.labels(table="system_metrics").inc(
                 len(metrics)
@@ -772,7 +785,7 @@ class ClickHouseManager:
 
         try:
             data = [metric.to_dict() for metric in metrics]
-            self._insert_dict_rows("model_performance", data)
+            await self._insert_dict_rows("model_performance", data)
             logger.info(f"Batch inserted {len(metrics)} model performance windows")
             PIPELINE_METRICS.records_inserted.labels(table="model_performance").inc(
                 len(metrics)
@@ -789,7 +802,7 @@ class ClickHouseManager:
 
         try:
             data = [alert.to_dict() for alert in alerts]
-            self._insert_dict_rows("alert_events", data)
+            await self._insert_dict_rows("alert_events", data)
             logger.info(f"Batch inserted {len(alerts)} alert events")
             PIPELINE_METRICS.records_inserted.labels(table="alert_events").inc(
                 len(alerts)
@@ -822,7 +835,7 @@ class ClickHouseManager:
 
             # Overall stats
             overall_query = base_query + " GROUP BY selected_model, query_type"
-            result = self.client.query(overall_query)
+            result = await self._run_blocking(self.client.query, overall_query)
 
             # Process results
             analytics = {
@@ -886,7 +899,7 @@ class ClickHouseManager:
             ORDER BY requests DESC
             """
 
-            result = self.client.query(query)
+            result = await self._run_blocking(self.client.query, query)
 
             performance_data = []
             for row in result.result_rows:
@@ -921,7 +934,7 @@ class ClickHouseManager:
             ORDER BY requests DESC
             """
 
-            result = self.client.query(fallback_query)
+            result = await self._run_blocking(self.client.query, fallback_query)
             performance_data = []
             for row in result.result_rows:
                 performance_data.append(
@@ -970,7 +983,7 @@ class KafkaConsumerManager:
                 "auto_offset_reset", "latest"
             ),
             "enable_auto_commit": config.get("consumer", {}).get(
-                "enable_auto_commit", True
+                "enable_auto_commit", False
             ),
             "max_poll_records": config.get("consumer", {}).get("max_poll_records", 500),
             "value_deserializer": self._deserialize_message,
@@ -990,6 +1003,12 @@ class KafkaConsumerManager:
         self.batch_size = 100
         self.last_batch_time = time.time()
         self.running = False
+        self.pending_commit_offsets: Dict[str, Dict[TopicPartition, int]] = {
+            topic_key: {} for topic_key in self.batch_processors
+        }
+        self.awaiting_commit_offsets: Dict[str, Dict[TopicPartition, int]] = {
+            topic_key: {} for topic_key in self.batch_processors
+        }
 
     async def initialize(self):
         """Initialize Kafka consumers"""
@@ -1032,9 +1051,7 @@ class KafkaConsumerManager:
                 tasks.append(asyncio.create_task(self._consume_errors(consumer)))
             elif topic_key == "analytics_model_metrics_1m":
                 tasks.append(
-                    asyncio.create_task(
-                        self._consume_analytics_model_metrics(consumer)
-                    )
+                    asyncio.create_task(self._consume_analytics_model_metrics(consumer))
                 )
             elif topic_key == "alerts":
                 tasks.append(asyncio.create_task(self._consume_alerts(consumer)))
@@ -1074,6 +1091,7 @@ class KafkaConsumerManager:
 
                     # Add to batch
                     self.batch_processors["queries"].append(query_log)
+                    self._track_commit_offset("queries", message)
 
                     PIPELINE_METRICS.messages_consumed.labels(topic="queries").inc()
 
@@ -1092,6 +1110,7 @@ class KafkaConsumerManager:
                     data = message.value
                     # Process response data (for future analytics)
                     logger.debug(f"Processed response: {data.get('query_id')}")
+                    await self._commit_processed_message("responses", message)
 
                     PIPELINE_METRICS.messages_consumed.labels(topic="responses").inc()
 
@@ -1120,6 +1139,7 @@ class KafkaConsumerManager:
 
                     # Add to batch
                     self.batch_processors["metrics"].append(metric_entry)
+                    self._track_commit_offset("metrics", message)
 
                     PIPELINE_METRICS.messages_consumed.labels(topic="metrics").inc()
 
@@ -1137,6 +1157,7 @@ class KafkaConsumerManager:
                 try:
                     data = message.value
                     logger.error(f"System error logged: {data}")
+                    await self._commit_processed_message("errors", message)
 
                     PIPELINE_METRICS.messages_consumed.labels(topic="errors").inc()
 
@@ -1147,7 +1168,9 @@ class KafkaConsumerManager:
         except Exception as e:
             logger.error(f"Error consumer error: {e}")
 
-    def register_observer(self, topic_key: str, callback: Callable[[Dict[str, Any]], Any]):
+    def register_observer(
+        self, topic_key: str, callback: Callable[[Dict[str, Any]], Any]
+    ):
         """Register an observer for consumed stream events."""
         self.observers.setdefault(topic_key, []).append(callback)
 
@@ -1184,9 +1207,7 @@ class KafkaConsumerManager:
             success_count=int(data.get("success_count", 0) or 0),
             success_rate=float(data.get("success_rate", 0.0) or 0.0),
             avg_latency_ms=float(data.get("avg_latency_ms", 0.0) or 0.0),
-            avg_tokens_per_second=float(
-                data.get("avg_tokens_per_second", 0.0) or 0.0
-            ),
+            avg_tokens_per_second=float(data.get("avg_tokens_per_second", 0.0) or 0.0),
             error_count=int(data.get("error_count", 0) or 0),
             total_tokens=int(data.get("total_tokens", 0) or 0),
             total_cost_usd=float(data.get("total_cost_usd", 0.0) or 0.0),
@@ -1224,6 +1245,7 @@ class KafkaConsumerManager:
                     self.batch_processors["analytics_model_metrics_1m"].append(
                         metric_entry
                     )
+                    self._track_commit_offset("analytics_model_metrics_1m", message)
                     await self._notify_observers("analytics_model_metrics_1m", data)
 
                     PIPELINE_METRICS.messages_consumed.labels(
@@ -1243,6 +1265,7 @@ class KafkaConsumerManager:
                     data = message.value
                     alert_entry = self._build_alert_event_entry(data)
                     self.batch_processors["alerts"].append(alert_entry)
+                    self._track_commit_offset("alerts", message)
                     await self._notify_observers("alerts", data)
 
                     PIPELINE_METRICS.messages_consumed.labels(topic="alerts").inc()
@@ -1278,29 +1301,79 @@ class KafkaConsumerManager:
 
         await self.flush_pending_batches()
 
+    def _track_commit_offset(self, topic_key: str, message: Any):
+        """Track the latest offset eligible for commit after durable write."""
+        topic = getattr(message, "topic", None)
+        partition = getattr(message, "partition", None)
+        offset = getattr(message, "offset", None)
+        if topic is None or partition is None or offset is None:
+            return
+
+        topic_partition = TopicPartition(topic, partition)
+        self.pending_commit_offsets.setdefault(topic_key, {})[topic_partition] = (
+            int(offset) + 1
+        )
+
+    async def _commit_offsets(self, topic_key: str, offsets: Dict[TopicPartition, int]):
+        """Commit explicit offsets for a topic when manual commits are enabled."""
+        if self.consumer_config.get("enable_auto_commit", False) or not offsets:
+            return
+
+        consumer = self.consumers.get(topic_key)
+        if consumer is None:
+            return
+
+        await consumer.commit(dict(offsets))
+
+    async def _commit_processed_message(self, topic_key: str, message: Any):
+        """Commit a non-batched message immediately after successful processing."""
+        self._track_commit_offset(topic_key, message)
+        offsets = dict(self.pending_commit_offsets.get(topic_key, {}))
+        self.pending_commit_offsets[topic_key].clear()
+        await self._commit_offsets(topic_key, offsets)
+
+    async def _flush_batch_topic(
+        self,
+        topic_key: str,
+        insert_method: Callable[[List[Any]], Any],
+    ):
+        """Flush one batched topic and commit offsets after durable persistence."""
+        if self.awaiting_commit_offsets.get(topic_key):
+            await self._commit_offsets(
+                topic_key, self.awaiting_commit_offsets[topic_key]
+            )
+            self.awaiting_commit_offsets[topic_key].clear()
+
+        batch = list(self.batch_processors.get(topic_key, []))
+        if not batch:
+            return
+
+        await insert_method(batch)
+        self.batch_processors[topic_key].clear()
+        self.awaiting_commit_offsets[topic_key] = dict(
+            self.pending_commit_offsets.get(topic_key, {})
+        )
+        self.pending_commit_offsets[topic_key].clear()
+
+        if self.awaiting_commit_offsets[topic_key]:
+            await self._commit_offsets(
+                topic_key, self.awaiting_commit_offsets[topic_key]
+            )
+            self.awaiting_commit_offsets[topic_key].clear()
+
     async def flush_pending_batches(self):
         """Flush any pending Kafka batches to ClickHouse immediately"""
-        if self.batch_processors["queries"]:
-            await self.clickhouse.batch_insert_query_logs(
-                self.batch_processors["queries"]
-            )
-            self.batch_processors["queries"].clear()
-
-        if self.batch_processors["metrics"]:
-            await self.clickhouse.batch_insert_metrics(self.batch_processors["metrics"])
-            self.batch_processors["metrics"].clear()
-
-        if self.batch_processors["analytics_model_metrics_1m"]:
-            await self.clickhouse.batch_insert_model_performance(
-                self.batch_processors["analytics_model_metrics_1m"]
-            )
-            self.batch_processors["analytics_model_metrics_1m"].clear()
-
-        if self.batch_processors["alerts"]:
-            await self.clickhouse.batch_insert_alert_events(
-                self.batch_processors["alerts"]
-            )
-            self.batch_processors["alerts"].clear()
+        await self._flush_batch_topic(
+            "queries", self.clickhouse.batch_insert_query_logs
+        )
+        await self._flush_batch_topic("metrics", self.clickhouse.batch_insert_metrics)
+        await self._flush_batch_topic(
+            "analytics_model_metrics_1m",
+            self.clickhouse.batch_insert_model_performance,
+        )
+        await self._flush_batch_topic(
+            "alerts", self.clickhouse.batch_insert_alert_events
+        )
 
         self.last_batch_time = time.time()
 
