@@ -217,7 +217,23 @@ slack:
   rate_limiting:
     requests_per_hour: 100
     burst_requests: 5
-  state_backend: redis
+    by_tier:
+      premium:
+        requests_per_hour: 500
+        burst_requests: 20
+      enterprise:
+        requests_per_hour: 2000
+        burst_requests: 50
+  attachments:
+    enabled: true
+    max_files: 10
+    max_file_size_bytes: 10000000
+    download_timeout_seconds: 30
+  user_tiers:
+    default: free
+    overrides: {}
+  state_backend: memory
+  state_file: queries/slack_state.json
   state_key_prefix: slack_state
   redis:
     host: localhost

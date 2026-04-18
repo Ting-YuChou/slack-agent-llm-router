@@ -1,462 +1,246 @@
 # Slack Agent LLM Router
 
-A production-grade multi-model deployment system for enterprise AI applications with Slack integration, real-time analytics, and intelligent model routing.
+Multi-model LLM router with a FastAPI API, Slack bot integration, Kafka/ClickHouse analytics, and local Docker Compose support.
 
-## Project Overview
+## What It Does
 
-This platform provides intelligent routing between multiple LLM providers (OpenAI, Anthropic, vLLM) with comprehensive monitoring, cost optimization, and enterprise-ready deployment capabilities.
+- Routes requests across `gpt-5`, `claude-sonnet-4-6`, and optional local `vLLM` models
+- Exposes a protected API for query routing and dashboard access
+- Supports Slack bot interactions through `app_mention`, slash commands, and active reply threads
+- Persists analytics and request events through Kafka and ClickHouse when the pipeline is enabled
+- Supports Redis-backed cache and Slack state for multi-process durability
 
-## Features
+## Current Routing Behavior
 
-- Multi-provider LLM routing with cost optimization
-- Real-time data pipeline using Kafka and ClickHouse
-- Comprehensive monitoring with Prometheus and Grafana
-- Slack bot integration with conversation management
-- Context compression for long queries
-- Response caching and performance optimization
-- Docker-based deployment with CI/CD pipeline
-- Stream processing with Apache Flink
-- Interactive dashboard with Streamlit
+The default host-run config in [config/config.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.yaml) is tuned like this:
 
-## Architecture
+- `gpt-5` is the default model
+- `claude-sonnet-4-6` gets extra weight for `enterprise` users and difficult `analysis` / `reasoning` requests
+- simple general tasks can prefer local `vLLM` models such as `mistral-7b`
+- if a cloud model fails on the non-streaming API path, inference can fall back to a local model when one is configured
 
-The system consists of several core components:
+The compose runtime config in [config/config.compose.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.compose.yaml) is intentionally cloud-only:
 
-- Model Router: Intelligent query classification and model selection
-- Inference Engine: Multi-provider model integration with caching
-- Data Pipeline: Real-time data processing and analytics storage
-- Monitoring Service: System metrics and alerting
-- Slack Integration: Enterprise chat bot with rich responses
-- Web Dashboard: Real-time performance and usage analytics
+- it does not start a local `vLLM` server
+- it disables local-model scoring bias so the API does not route to a non-existent local model
+
+## API Surface
+
+Public health endpoints:
+
+- `GET /live`
+- `GET /ready`
+- `GET /health`
+
+Protected endpoints:
+
+- `POST /route`
+- `GET /metrics`
+- `GET /dashboard`
+- `GET /dashboard/logs`
+
+API key auth is enabled by default. The accepted keys come from `LLM_ROUTER_API_KEYS`.
+
+Example:
+
+```bash
+curl -X POST http://localhost:8080/route \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-api-key" \
+  -d '{"query": "Summarize this design", "user_id": "test-user"}'
+```
+
+## Slack Behavior
+
+The Slack bot no longer replies to every channel message.
+
+It responds only to:
+
+- `app_mention`
+- slash commands such as `/llm help` and free-form queries such as `/llm explain this error`
+- replies inside an active bot thread
+
+Allowed Slack channels can be configured by channel name or channel ID.
+
+Slack file attachments on message / mention events are converted into `QueryRequest.attachments`.
+Files up to the configured size limit are downloaded with the bot token; text-like files are inlined into provider prompts, while larger or binary files keep metadata and private URLs only.
+
+Slack tiering:
+
+- `slack.user_tiers.overrides` maps Slack user IDs to `free` / `premium` / `enterprise`
+- `slack.rate_limiting.by_tier` applies tier-specific hourly and burst limits
+- model visibility respects the routed model's tier access rules
+
+Slack state backends:
+
+- `memory`: process-local only
+- `file`: persists a JSON snapshot to the configured path
+- `redis`: persists per-user, per-rate-limit, per-conversation, and per-thread keys for multi-process durability
+
+Persisted Slack state includes:
+
+- user tier and preferences
+- rate-limit counters
+- conversation history
+- active bot thread tracking
 
 ## Quick Start
 
 ### Prerequisites
 
-- Python 3.9 or higher
-- Docker and Docker Compose
-- 8GB RAM minimum (16GB recommended)
-- CUDA-compatible GPU (optional, for local models)
+- Python 3.9+
+- Docker / Docker Compose
+- OpenAI and/or Anthropic API key if you want live model responses
+- optional GPU and local model server if you want `vLLM`
 
-### Installation
-
-Clone the repository and install dependencies:
-
-```bash
-git clone https://github.com/your-org/slack-agent-llm-router.git
-cd slack-agent-llm-router
-python3 -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements-dev.txt
-```
-
-### Clean Local Env
-
-For a clean virtualenv:
+### Install
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.txt
-python -m pytest tests -q
 ```
 
-For a clean conda environment:
+### Environment
+
+Minimum useful env vars:
 
 ```bash
-conda env create -f environment.yml
-conda activate slack-llm-router
-python -m pytest tests -q
+export LLM_ROUTER_API_KEYS=dev-api-key
+export OPENAI_API_KEY=your_openai_key
+export ANTHROPIC_API_KEY=your_anthropic_key
+export SLACK_BOT_TOKEN=xoxb-your-slack-token
+export SLACK_APP_TOKEN=xapp-your-slack-app-token
 ```
 
-Pytest is configured in `pytest.ini` to disable the built-in capture plugin because the current macOS + conda base environment can segfault while importing `readline`.
+## Running Locally
 
-### Configuration
+### Option 1: Full Stack With Docker Compose
 
-Set the required environment variables before starting the API:
+The root [docker-compose.yml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/docker-compose.yml) starts:
 
-```bash
-LLM_ROUTER_API_KEYS=dev-api-key
-OPENAI_API_KEY=your_openai_key
-ANTHROPIC_API_KEY=your_anthropic_key
-SLACK_BOT_TOKEN=xoxb-your-slack-token
-```
+- Redis
+- Kafka
+- ClickHouse
+- API container
+- worker container
+- Flink JobManager / TaskManager
 
-Notes:
-
-- API key auth is enabled in `config/config.yaml` by default.
-- `LLM_ROUTER_API_KEYS` accepts a comma-separated list of valid keys.
-- The API reads runtime config from `config/config.yaml` unless `LLM_ROUTER_CONFIG` is set.
-- For `docker compose` local development, the app containers use `config/config.compose.yaml`.
-- Set at least one cloud provider key before sending requests. The compose stack is intentionally cloud-only and does not start a local vLLM model server.
-
-### Running with Docker
-
-Bring up the local full stack:
+Start it:
 
 ```bash
 docker compose up -d --build
 ```
 
-This starts:
-
-- Redis for shared state and caching
-- Kafka for event streaming
-- ClickHouse for analytics storage
-- API service on `http://localhost:8080`
-- Background workers for the Kafka -> ClickHouse pipeline
-- Flink JobManager / TaskManager for stream-processing experiments
-
-Useful follow-up commands:
+Useful commands:
 
 ```bash
-docker compose logs -f api workers
 docker compose ps
+docker compose logs -f api workers
+docker compose config
 ```
 
-### Manual Startup
+Compose uses [config/config.compose.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.compose.yaml).
 
-If you do not want to run the API and workers inside containers:
+### Option 2: Host-Run API / Workers
+
+Start infra only:
 
 ```bash
-# Start infra dependencies
 docker compose up -d redis kafka clickhouse
+```
 
-# Start the API in development mode
+Start the API:
+
+```bash
 python main.py start-api --dev --config config/config.yaml
+```
 
-# Start background workers when pipeline/slack/monitoring are enabled
+Start background workers:
+
+```bash
 python main.py start-workers --config config/config.yaml
 ```
 
-For a single-process local run that starts both API and enabled background services:
+Run everything in one process:
 
 ```bash
 python main.py start --config config/config.yaml
 ```
 
-### Verification
+## Configuration Files
 
-Check that services are running:
+- [config/config.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.yaml): host-run configuration, includes optional local `vLLM`
+- [config/config.compose.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.compose.yaml): compose runtime configuration, uses service names like `redis`, `kafka`, `clickhouse`
 
-```bash
-# Liveness
-curl http://localhost:8080/live
+Important defaults in `config/config.yaml`:
 
-# Readiness
-curl http://localhost:8080/ready
+- API auth enabled with `X-API-Key`
+- Redis cache enabled for inference responses
+- Slack state backend defaults to `memory` and can be switched to `file` or `redis`
+- pipeline disabled by default for host-run config
+- Streamlit enabled in host config, but not started by root compose
 
-# Test query
-curl -X POST http://localhost:8080/route \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: dev-api-key" \
-  -d '{"query": "Hello, how are you?", "user_id": "test_user"}'
-```
+## Repository Layout
 
-`/health` is kept as a backward-compatible alias for `/ready`.
-
-## Project Structure
-
-``` 
-slack-agent-llm-router/
-├── main.py                           # Application entry point
-├── docker-compose.yml                # Local full-stack compose (infra + API + workers)
+```text
+.
+├── main.py
+├── docker-compose.yml
 ├── config/
-│   ├── config.yaml                   # Host-run configuration
-│   └── config.compose.yaml           # Compose runtime configuration
+│   ├── config.yaml
+│   └── config.compose.yaml
 ├── docker/
-│   ├── Dockerfile                    # API/worker runtime image
-│   ├── requirements-runtime.txt      # Runtime-only Python dependencies
+│   ├── Dockerfile
+│   ├── requirements-runtime.txt
 │   └── flink/
-│       └── Dockerfile                # Flink image build
+│       └── Dockerfile
 ├── flink/
-│   └── analytics_job.py              # Stream processing logic
+│   └── analytics_job.py
 ├── slack/
-│   ├── bot.py                        # Slack bot entrypoint
-│   └── bot_real.py                   # Slack bot implementation
-├── streamlit_ui/
-│   └── app.py                        # Optional Streamlit UI source
+│   ├── bot.py
+│   └── bot_real.py
 ├── src/
-│   ├── models/                       # Provider and engine implementations
-│   └── utils/                        # Logging, schema, metrics helpers
+│   ├── llm_router_part1_router.py
+│   ├── llm_router_part2_inference.py
+│   ├── llm_router_part3_pipeline.py
+│   ├── llm_router_part3_policy.py
+│   ├── llm_router_part4_monitor.py
+│   └── utils/
 └── tests/
-    ├── test_main.py                  # API tests
-    ├── test_inference.py             # Inference tests
-    └── test_router.py                # Routing tests
 ```
 
-## Configuration
+## Testing
 
-### Model Configuration
-
-Configure available models in `config/config.yaml`:
-
-```yaml
-models:
-  gpt-5:
-    provider: openai
-    cost_per_token: 0.00001
-    max_tokens: 128000
-    capabilities: [text, analysis, coding, general]
-  
-  claude-sonnet-4-6:
-    provider: anthropic
-    cost_per_token: 0.000003  
-    max_tokens: 1000000
-    capabilities: [text, analysis, reasoning]
-  
-  mistral-7b:
-    provider: vllm
-    cost_per_token: 0.0
-    max_tokens: 8192
-    capabilities: [text, coding]
-```
-
-### Routing Rules
-
-Define query routing logic:
-
-```yaml
-routing_rules:
-  enterprise: claude-sonnet-4-6
-  heavy_analysis: claude-sonnet-4-6
-  code_generation: [gpt-5, mistral-7b]
-
-scoring:
-  default_model_bonus: 4
-  gpt5_default_bonus: 3
-  sonnet_enterprise_bonus: 12
-  sonnet_difficult_task_bonus: 10
-  local_simple_task_bonus: 12
-  simple_task_token_threshold: 1200
-```
-
-### Slack Configuration
-
-Configure the Slack bot integration:
-
-```yaml
-slack:
-  enabled: true
-  bot_token_env: SLACK_BOT_TOKEN
-  app_token_env: SLACK_APP_TOKEN
-  channels:
-    - general
-  state_backend: redis
-  state_key_prefix: slack_state
-  redis:
-    host: localhost
-    port: 6379
-    db: 2
-    password_env: REDIS_PASSWORD
-```
-
-`state_backend: redis` is the recommended production default for Slack because it survives process restarts and supports multi-instance state sharing. Use `file` only for single-node local runs.
-
-For compose-based local development, `config/config.compose.yaml` already points Slack state, the inference cache, and policy-cache Redis to the internal `redis` service name.
-
-## Development
-
-### Running Tests
-
-Execute the test suite:
+Run the main regression suite:
 
 ```bash
-# Run all tests
+python -m pytest tests/test_router.py tests/test_inference.py tests/test_main.py tests/test_slack_helpers.py tests/test_schema.py tests/test_pipeline.py -q
+```
+
+Run all tests:
+
+```bash
 python -m pytest tests -q
+```
 
-# Run specific tests
+Useful focused suites:
+
+```bash
+python -m pytest tests/test_main.py -q
+python -m pytest tests/test_slack_helpers.py -q
 python -m pytest tests/test_pipeline.py -q
-python -m pytest tests/test_inference.py -q
-
-# Generate coverage report
-python -m pytest tests/ --cov=src --cov-report=html
 ```
 
-`pytest.ini` disables pytest's built-in capture plugin because the current macOS + conda base combination can segfault while importing `readline`.
+`pytest.ini` disables built-in capture because the current local macOS / conda base combination can crash on `readline`.
 
-### Code Quality
+## Notes And Limitations
 
-Maintain code quality with formatting and linting:
+- root compose does not start a local `vLLM` model server
+- `stream_query` does not currently have the same cloud-to-local fallback path as the main non-streaming route
+- monitoring in this repo is API/dashboard-oriented; root compose does not start Grafana or Prometheus UI services
+- Slack `redis` backend is the right choice for durability, but true production rollout still needs secret management and runtime ops hardening
 
-```bash
-# Format code
-black src/ tests/
+## Deployment Notes
 
-# Lint code  
-flake8 src/ tests/
-
-# Type checking
-mypy src/
-```
-
-### Adding New Models
-
-To add a new model provider:
-
-1. Update the model configuration in `config/config.yaml`
-2. Implement the provider interface in `src/models/`
-3. Add routing rules for the new model
-4. Update tests to include the new model
-
-## Monitoring
-
-### Metrics Dashboard
-
-The application exposes these monitoring-oriented API endpoints:
-
-- `GET /dashboard`
-- `GET /dashboard/logs`
-- `GET /metrics`
-
-When API key auth is enabled, these endpoints require a valid API key. The checked-in root compose file does not start Grafana or Prometheus.
-
-### Key Metrics
-
-Important metrics tracked include:
-
-- Request rates and response times by model
-- Cost tracking and optimization opportunities
-- Error rates and system health indicators
-- Cache performance and hit rates
-- User behavior and usage patterns
-
-### Alerting
-
-Alerts are configured for:
-
-- High error rates above 5%
-- Response times exceeding 10 seconds
-- System resource usage above 90%
-- Model availability issues
-- Unusual cost patterns
-
-## Deployment
-
-### Docker Production
-
-This repository does not check in a production compose file. To generate deployment assets:
-
-```bash
-python main.py deploy --output .
-```
-
-### CI/CD Pipeline
-
-The project includes GitHub Actions workflows for:
-
-- Automated testing on pull requests
-- Code quality checks and security scans
-- Docker image building and publishing
-- Deployment to staging and production environments
-
-The repository now includes a test workflow at [`.github/workflows/tests.yml`](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/.github/workflows/tests.yml).
-
-How to use it:
-
-1. Push a branch to GitHub or open a pull request.
-2. Open the `Actions` tab in GitHub.
-3. Select the `Tests` workflow to see logs and results.
-4. To run it manually, open `Actions` -> `Tests` -> `Run workflow`.
-
-What it does:
-
-- Sets up Python 3.12
-- Installs the lightweight CI dependencies from `requirements-ci.txt`
-- Runs `python -m pytest tests -q`
-- Verifies the source tree compiles with `python -m compileall src tests slack`
-
-### Scaling
-
-For high-volume deployments:
-
-- Use multiple application instances behind a load balancer
-- Scale Kafka partitions for increased throughput
-- Configure ClickHouse clustering for analytics
-- Implement Redis clustering for cache scaling
-
-## Security
-
-### Authentication
-
-The platform supports:
-
-- API key authentication for all application endpoints except `/live`, `/ready`, and `/health`
-- Request validation via Pydantic models
-- Structured application logging for diagnostics and audit trails
-
-### Data Privacy
-
-Security measures include:
-
-- Optional query logging with configurable retention
-- Encryption in transit for all communications
-- Audit logging for compliance requirements
-- Secure credential management
-
-## Troubleshooting
-
-### Common Issues
-
-Connection errors:
-- Verify infra services are running with `docker compose ps`
-- Check network connectivity between containers
-- Validate environment variables and configuration
-
-Performance issues:
-- Inspect `/dashboard` or `/metrics` with a valid API key
-- Check cache hit rates and optimize if needed
-- Review query routing efficiency
-
-Authentication failures:
-- Verify API keys are correctly configured
-- Check that `LLM_ROUTER_API_KEYS` is set in the API process environment
-- Check Slack bot token permissions
-- Validate user tier assignments
-
-### Logs
-
-Application logs are available in several locations:
-
-- Application logs: `logs/llm_router.log`
-- Container logs: `docker compose logs [service_name]`
-
-## Contributing
-
-### Development Setup
-
-Fork the repository and set up your development environment:
-
-```bash
-git clone https://github.com/your-username/slack-agent-llm-router.git
-cd slack-agent-llm-router
-git checkout -b feature/your-feature-name
-pip install -r requirements-dev.txt
-```
-
-### Contribution Guidelines
-
-- Follow PEP 8 style guidelines
-- Add type hints to all functions
-- Include comprehensive docstrings
-- Maintain test coverage above 90%
-- Update documentation for new features
-
-### Pull Request Process
-
-1. Create a feature branch from main
-2. Implement your changes with tests
-3. Ensure all tests pass and code is formatted
-4. Submit a pull request with a clear description
-5. Address any review feedback
-
-
-## Support
-
-For questions, issues, or contributions:
-
-- GitHub Issues: Report bugs and request features
-- Documentation: Refer to component-specific README files
-- Community: Join discussions in GitHub Discussions
-
-For enterprise support and custom implementations, contact the development team.
+`python main.py deploy --output .` can generate deployment artifacts, but the checked-in repo should be treated as the source of truth for local development, not the generated templates.

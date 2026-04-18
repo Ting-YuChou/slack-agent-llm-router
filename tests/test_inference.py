@@ -12,7 +12,7 @@ from src.llm_router_part2_inference import (
     ResponseCache,
     vLLMProvider,
 )
-from src.utils.schema import QueryRequest, UserTier
+from src.utils.schema import Attachment, AttachmentType, QueryRequest, UserTier
 
 
 @pytest.fixture
@@ -60,6 +60,76 @@ class TestOpenAIProvider:
             assert response.total_tokens == 30
             assert response.tokens_per_second > 0
             assert response.cached is False
+
+    @pytest.mark.asyncio
+    async def test_generate_response_includes_attachment_text_in_prompt(
+        self, sample_query_request
+    ):
+        with patch("src.llm_router_part2_inference.openai.AsyncOpenAI") as mock_openai:
+            mock_response = MagicMock()
+            mock_response.output_text = "Used attachment content"
+            mock_response.usage.input_tokens = 10
+            mock_response.usage.output_tokens = 10
+            mock_response.usage.total_tokens = 20
+
+            mock_client = AsyncMock()
+            mock_client.responses.create.return_value = mock_response
+            mock_openai.return_value = mock_client
+
+            provider = OpenAIProvider({"api_key": "test-key"})
+            await provider.initialize()
+
+            request = sample_query_request.model_copy(
+                update={
+                    "attachments": [
+                        Attachment(
+                            name="report.csv",
+                            type=AttachmentType.DOCUMENT,
+                            size_bytes=11,
+                            mime_type="text/csv",
+                            content=b"a,b\n1,2\n",
+                        )
+                    ]
+                }
+            )
+
+            await provider.generate_response(request, "gpt-5")
+
+            prompt = mock_client.responses.create.await_args.kwargs["input"]
+            assert "report.csv" in prompt
+            assert "a,b\n1,2" in prompt
+
+    @pytest.mark.asyncio
+    async def test_generate_response_includes_response_style_instructions(
+        self, sample_query_request
+    ):
+        with patch("src.llm_router_part2_inference.openai.AsyncOpenAI") as mock_openai:
+            mock_response = MagicMock()
+            mock_response.output_text = "Styled answer"
+            mock_response.usage.input_tokens = 8
+            mock_response.usage.output_tokens = 12
+            mock_response.usage.total_tokens = 20
+
+            mock_client = AsyncMock()
+            mock_client.responses.create.return_value = mock_response
+            mock_openai.return_value = mock_client
+
+            provider = OpenAIProvider({"api_key": "test-key"})
+            await provider.initialize()
+
+            request = sample_query_request.model_copy(
+                update={
+                    "metadata": {
+                        "response_style_instructions": "Use precise technical terminology."
+                    }
+                }
+            )
+
+            await provider.generate_response(request, "gpt-5")
+
+            prompt = mock_client.responses.create.await_args.kwargs["input"]
+            assert "Response style instructions" in prompt
+            assert "Use precise technical terminology." in prompt
 
 
 class TestAnthropicProvider:

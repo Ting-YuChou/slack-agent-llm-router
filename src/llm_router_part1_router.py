@@ -20,6 +20,7 @@ from src.utils.schema import (
     QueryRequest,
     QueryType,
     RoutingDecision,
+    UserTier,
 )
 
 
@@ -476,7 +477,7 @@ class ModelRouter:
             "query_type": query_type.value,
             "token_count": token_count,
             "user_id": request.user_id,
-            "user_tier": request.user_tier,
+            "user_tier": self._normalize_user_tier(request.user_tier),
             "priority": request.priority,
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
@@ -493,21 +494,32 @@ class ModelRouter:
 
     async def _get_policy_context(self, request: QueryRequest) -> Dict[str, Any]:
         """Load request/user-level routing hints from the shared policy cache."""
+        metadata = request.metadata or {}
+        metadata_preferred_models = list(metadata.get("preferred_models", []) or [])
+
         if not self.policy_cache:
             return {
-                "policy_source": "none",
+                "policy_source": "request_metadata" if metadata_preferred_models else "none",
                 "route_to_fast_lane": False,
-                "preferred_models": [],
-                "hint_reason": None,
+                "preferred_models": metadata_preferred_models,
+                "hint_reason": (
+                    "preferred_models from request metadata"
+                    if metadata_preferred_models
+                    else None
+                ),
             }
 
         get_policy = getattr(self.policy_cache, "get_effective_policy", None)
         if not callable(get_policy):
             return {
-                "policy_source": "none",
+                "policy_source": "request_metadata" if metadata_preferred_models else "none",
                 "route_to_fast_lane": False,
-                "preferred_models": [],
-                "hint_reason": None,
+                "preferred_models": metadata_preferred_models,
+                "hint_reason": (
+                    "preferred_models from request metadata"
+                    if metadata_preferred_models
+                    else None
+                ),
             }
 
         try:
@@ -516,11 +528,31 @@ class ModelRouter:
             logger.warning(f"Failed to load routing policy for request {request.request_id}: {e}")
             policy = {}
 
+        combined_preferred_models = []
+        for model_name in metadata_preferred_models + list(
+            policy.get("preferred_models", []) or []
+        ):
+            if model_name not in combined_preferred_models:
+                combined_preferred_models.append(model_name)
+
+        policy_source = policy.get("policy_source", "none")
+        if metadata_preferred_models:
+            policy_source = (
+                f"request_metadata+{policy_source}"
+                if policy_source != "none"
+                else "request_metadata"
+            )
+
         return {
-            "policy_source": policy.get("policy_source", "none"),
+            "policy_source": policy_source,
             "route_to_fast_lane": bool(policy.get("route_to_fast_lane", False)),
-            "preferred_models": list(policy.get("preferred_models", []) or []),
-            "hint_reason": policy.get("hint_reason"),
+            "preferred_models": combined_preferred_models,
+            "hint_reason": policy.get("hint_reason")
+            or (
+                "preferred_models from request metadata"
+                if metadata_preferred_models
+                else None
+            ),
             "policy_priority": policy.get("priority"),
             "policy_query_type": policy.get("query_type"),
         }
@@ -655,14 +687,22 @@ class ModelRouter:
         """Check if user tier has access to model"""
         tier_priorities = {"free": 3, "premium": 2, "enterprise": 1}
 
-        user_tier_value = (
-            user_tier.value if hasattr(user_tier, "value") else str(user_tier)
-        )
-        user_priority = tier_priorities.get(user_tier_value, 3)
+        normalized_tier = self._normalize_user_tier(user_tier)
+        user_priority = tier_priorities.get(normalized_tier, 3)
         model_priority = model_config.priority
 
         # Lower priority number = higher priority access
         return model_priority >= user_priority
+
+    def _normalize_user_tier(self, user_tier: Any) -> str:
+        """Normalize request/user tier values for rule evaluation and access checks."""
+        if isinstance(user_tier, UserTier):
+            return user_tier.value
+        if hasattr(user_tier, "value"):
+            return str(user_tier.value).lower()
+        if isinstance(user_tier, str):
+            return user_tier.lower()
+        return UserTier.FREE.value
 
     def _select_best_model(self, candidates: List[str], context: Dict[str, Any]) -> str:
         """Select the best model from candidates based on multiple factors"""

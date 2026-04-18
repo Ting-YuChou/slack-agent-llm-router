@@ -114,8 +114,11 @@ if _missing("redis"):
     _REDIS_STORES = {}
 
     class _AsyncRedis:
+        _global_store = {}
+        _global_set_store = {}
         def __init__(self, *args, **kwargs):
-            self.store = {}
+            self.store = self.__class__._global_store
+            self.set_store = self.__class__._global_set_store
 
         async def ping(self):
             return True
@@ -123,10 +126,33 @@ if _missing("redis"):
         async def get(self, key):
             return self.store.get(key)
 
+        async def set(self, key, value):
+            self.store[key] = value
+
         async def setex(self, key, _ttl, value):
             self.store[key] = value
 
-    class _Redis:
+        async def delete(self, key):
+            self.store.pop(key, None)
+            self.set_store.pop(key, None)
+
+        async def sadd(self, key, member):
+            self.set_store.setdefault(key, set()).add(member)
+
+        async def srem(self, key, member):
+            self.set_store.setdefault(key, set()).discard(member)
+
+        async def smembers(self, key):
+            return set(self.set_store.get(key, set()))
+
+        async def close(self):
+            return None
+
+        @classmethod
+        def from_url(cls, *_args, **_kwargs):
+            return cls()
+
+    class _SyncRedis:
         def __init__(self, host="localhost", port=6379, db=0, **kwargs):
             key = (
                 host,
@@ -154,7 +180,7 @@ if _missing("redis"):
         def hgetall(self, name):
             return dict(self.store.get(name, {}))
 
-    redis.Redis = _Redis
+    redis.Redis = _SyncRedis
     redis_asyncio.Redis = _AsyncRedis
     redis.asyncio = redis_asyncio
 

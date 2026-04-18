@@ -7,13 +7,12 @@ import asyncio
 import json
 import logging
 import os
-import threading
 import time
 import uuid
-from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Set
+from dataclasses import dataclass
 
 from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.socket_mode.async_client import AsyncSocketModeClient
@@ -21,33 +20,407 @@ from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
 import httpx
 
-from src.utils.logger import setup_logging
-from src.utils.schema import QueryRequest, UserTier
-from src.utils.metrics import (
-    INFERENCE_METRICS,
-    SLACK_METRICS,
-    USER_METRICS,
-    histogram_average,
-)
+from src.utils.schema import Attachment, AttachmentType, QueryRequest, UserTier
+from src.utils.metrics import SLACK_METRICS
 
 logger = logging.getLogger(__name__)
-DEFAULT_SLACK_STATE_FILE = "data/slack_state.json"
-DEFAULT_USER_PREFERENCES = {
-    "response_length": "medium",
-    "technical_level": "intermediate",
-    "preferred_models": [],
-    "threading": True,
-}
+
+MAX_QUERY_TOKENS = 8192
+STATE_SCHEMA_VERSION = 1
 
 
-def default_user_preferences() -> Dict[str, Any]:
-    """Return a fresh copy of default Slack user preferences."""
-    return {
-        "response_length": DEFAULT_USER_PREFERENCES["response_length"],
-        "technical_level": DEFAULT_USER_PREFERENCES["technical_level"],
-        "preferred_models": list(DEFAULT_USER_PREFERENCES["preferred_models"]),
-        "threading": DEFAULT_USER_PREFERENCES["threading"],
-    }
+class SlackStateStore:
+    """Base class for Slack state persistence backends."""
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+
+    async def initialize(self):
+        """Initialize the backend."""
+
+    async def load_state(self) -> Dict[str, Any]:
+        """Load a previously persisted state snapshot."""
+        return {}
+
+    async def save_state(self, snapshot: Dict[str, Any]):
+        """Persist a state snapshot."""
+
+    async def shutdown(self):
+        """Release backend resources."""
+
+
+class MemorySlackStateStore(SlackStateStore):
+    """No-op in-memory state backend."""
+
+
+class FileSlackStateStore(SlackStateStore):
+    """Persist Slack state snapshots to a local JSON file."""
+
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+        self.file_path = Path(config.get("file_path", "queries/slack_state.json"))
+
+    async def load_state(self) -> Dict[str, Any]:
+        if not self.file_path.exists():
+            return {}
+
+        try:
+            return json.loads(self.file_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning(f"Failed to load Slack state file {self.file_path}: {exc}")
+            return {}
+
+    async def save_state(self, snapshot: Dict[str, Any]):
+        try:
+            self.file_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self.file_path.with_suffix(f"{self.file_path.suffix}.tmp")
+            tmp_path.write_text(
+                json.dumps(snapshot, ensure_ascii=True, sort_keys=True, indent=2),
+                encoding="utf-8",
+            )
+            tmp_path.replace(self.file_path)
+        except Exception as exc:
+            logger.warning(f"Failed to write Slack state file {self.file_path}: {exc}")
+
+
+class RedisSlackStateStore(SlackStateStore):
+    """Persist Slack state snapshots in Redis."""
+
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+        redis_config = config.get("redis", {})
+        self.redis_config = redis_config
+        self.key_prefix = redis_config.get("key_prefix", "llm_router_slack_state")
+        self.users_index_key = f"{self.key_prefix}:users"
+        self.rate_limits_index_key = f"{self.key_prefix}:rate_limits"
+        self.conversations_index_key = f"{self.key_prefix}:conversations"
+        self.active_threads_index_key = f"{self.key_prefix}:active_threads"
+        self.client = None
+
+    async def initialize(self):
+        try:
+            import redis.asyncio as redis_asyncio
+
+            redis_url = self.redis_config.get("url")
+            if redis_url and hasattr(redis_asyncio.Redis, "from_url"):
+                self.client = redis_asyncio.Redis.from_url(redis_url)
+            else:
+                self.client = redis_asyncio.Redis(
+                    host=self.redis_config.get("host", "localhost"),
+                    port=self.redis_config.get("port", 6379),
+                    db=self.redis_config.get("db", 0),
+                )
+
+            if hasattr(self.client, "ping"):
+                await self.client.ping()
+        except Exception as exc:
+            logger.error(f"Failed to initialize Redis Slack state store: {exc}")
+            raise
+
+    async def load_state(self) -> Dict[str, Any]:
+        if not self.client:
+            return {}
+
+        try:
+            users = await self._load_json_map(
+                self.users_index_key, lambda item_id: self._user_key(item_id)
+            )
+            rate_limits = await self._load_json_map(
+                self.rate_limits_index_key, lambda item_id: self._rate_limit_key(item_id)
+            )
+            conversations = await self._load_json_map(
+                self.conversations_index_key,
+                lambda item_id: self._conversation_key(item_id),
+            )
+            active_threads = await self._load_json_map(
+                self.active_threads_index_key,
+                lambda item_id: self._active_thread_key(item_id),
+            )
+            return {
+                "schema_version": STATE_SCHEMA_VERSION,
+                "users": users,
+                "rate_limits": rate_limits,
+                "conversations": conversations,
+                "active_threads": active_threads,
+            }
+        except Exception as exc:
+            logger.warning("Failed to load Slack state from Redis: %s", exc)
+            return {}
+
+    async def save_state(self, snapshot: Dict[str, Any]):
+        if not self.client:
+            return
+
+        users = snapshot.get("users", {})
+        for user_id, user_payload in users.items():
+            rate_limit_payload = snapshot.get("rate_limits", {}).get(user_id, [])
+            await self.persist_user_state(user_id, user_payload, rate_limit_payload)
+
+        conversations = snapshot.get("conversations", {})
+        for context_key, context_payload in conversations.items():
+            await self.persist_conversation_state(context_key, context_payload)
+
+        active_threads = snapshot.get("active_threads", {})
+        for thread_key, thread_payload in active_threads.items():
+            await self.persist_active_thread_state(thread_key, thread_payload)
+
+    async def shutdown(self):
+        if self.client and hasattr(self.client, "close"):
+            await self.client.close()
+
+    async def persist_user_state(
+        self, user_id: str, user_payload: Dict[str, Any], rate_limit_payload: List[float]
+    ):
+        """Persist one user's preferences/tier and rate-limit counters."""
+        if not self.client:
+            return
+
+        try:
+            if user_payload:
+                resolved_user_payload = await self._merge_user_payload(user_id, user_payload)
+                await self._set_json(self._user_key(user_id), resolved_user_payload)
+                await self._sadd(self.users_index_key, user_id)
+
+            merged_rate_limits = await self._merge_rate_limits(user_id, rate_limit_payload)
+            if merged_rate_limits:
+                await self._set_json(self._rate_limit_key(user_id), merged_rate_limits)
+                await self._sadd(self.rate_limits_index_key, user_id)
+            else:
+                await self._delete(self._rate_limit_key(user_id))
+                await self._srem(self.rate_limits_index_key, user_id)
+        except Exception as exc:
+            logger.warning("Failed to persist Slack user state to Redis: %s", exc)
+
+    async def delete_user_state(self, user_id: str):
+        """Delete one user's persisted state."""
+        if not self.client:
+            return
+
+        try:
+            await self._delete(self._user_key(user_id))
+            await self._delete(self._rate_limit_key(user_id))
+            await self._srem(self.users_index_key, user_id)
+            await self._srem(self.rate_limits_index_key, user_id)
+        except Exception as exc:
+            logger.warning("Failed to delete Slack user state from Redis: %s", exc)
+
+    async def persist_conversation_state(self, context_key: str, context_payload: Dict[str, Any]):
+        """Persist one conversation context keyed by user/channel/thread."""
+        if not self.client:
+            return
+
+        try:
+            current_payload = await self._get_json(self._conversation_key(context_key))
+            if self._is_payload_newer(current_payload, context_payload, "last_activity"):
+                return
+
+            await self._set_json(self._conversation_key(context_key), context_payload)
+            await self._sadd(self.conversations_index_key, context_key)
+        except Exception as exc:
+            logger.warning("Failed to persist Slack conversation to Redis: %s", exc)
+
+    async def delete_conversation_states(self, context_keys: List[str]):
+        """Delete one or more persisted conversation contexts."""
+        if not self.client:
+            return
+
+        try:
+            for context_key in context_keys:
+                await self._delete(self._conversation_key(context_key))
+                await self._srem(self.conversations_index_key, context_key)
+        except Exception as exc:
+            logger.warning("Failed to delete Slack conversations from Redis: %s", exc)
+
+    async def persist_active_thread_state(self, thread_key: str, last_activity: str):
+        """Persist active bot-thread tracking using one key per thread."""
+        if not self.client:
+            return
+
+        try:
+            current_payload = await self._get_json(self._active_thread_key(thread_key))
+            incoming_payload = {"last_activity": last_activity}
+            if self._is_payload_newer(current_payload, incoming_payload, "last_activity"):
+                return
+
+            await self._set_json(self._active_thread_key(thread_key), incoming_payload)
+            await self._sadd(self.active_threads_index_key, thread_key)
+        except Exception as exc:
+            logger.warning("Failed to persist Slack active thread to Redis: %s", exc)
+
+    async def delete_active_thread_states(self, thread_keys: List[str]):
+        """Delete one or more active-thread markers."""
+        if not self.client:
+            return
+
+        try:
+            for thread_key in thread_keys:
+                await self._delete(self._active_thread_key(thread_key))
+                await self._srem(self.active_threads_index_key, thread_key)
+        except Exception as exc:
+            logger.warning("Failed to delete Slack active threads from Redis: %s", exc)
+
+    def _user_key(self, user_id: str) -> str:
+        return f"{self.key_prefix}:user:{user_id}"
+
+    def _rate_limit_key(self, user_id: str) -> str:
+        return f"{self.key_prefix}:rate_limit:{user_id}"
+
+    def _conversation_key(self, context_key: str) -> str:
+        return f"{self.key_prefix}:conversation:{context_key}"
+
+    def _active_thread_key(self, thread_key: str) -> str:
+        return f"{self.key_prefix}:active_thread:{thread_key}"
+
+    async def _load_json_map(self, index_key: str, item_key_builder) -> Dict[str, Any]:
+        """Load a keyed JSON map backed by a Redis set index."""
+        results = {}
+        item_ids = await self._smembers(index_key)
+        for item_id in item_ids:
+            payload = await self._get_json(item_key_builder(item_id))
+            if payload is None:
+                await self._srem(index_key, item_id)
+                continue
+            if isinstance(payload, dict) and "last_activity" in payload and len(payload) == 1:
+                results[item_id] = payload["last_activity"]
+            else:
+                results[item_id] = payload
+        return results
+
+    async def _get_json(self, key: str) -> Optional[Any]:
+        payload = await self.client.get(key)
+        if not payload:
+            return None
+        if isinstance(payload, bytes):
+            payload = payload.decode("utf-8")
+        return json.loads(payload)
+
+    async def _set_json(self, key: str, payload: Any):
+        serialized = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+        if hasattr(self.client, "set"):
+            await self.client.set(key, serialized)
+        elif hasattr(self.client, "setex"):
+            await self.client.setex(key, 30 * 24 * 3600, serialized)
+
+    async def _delete(self, key: str):
+        if hasattr(self.client, "delete"):
+            await self.client.delete(key)
+
+    async def _sadd(self, key: str, member: str):
+        if hasattr(self.client, "sadd"):
+            await self.client.sadd(key, member)
+
+    async def _srem(self, key: str, member: str):
+        if hasattr(self.client, "srem"):
+            await self.client.srem(key, member)
+
+    async def _smembers(self, key: str) -> List[str]:
+        if not hasattr(self.client, "smembers"):
+            return []
+        members = await self.client.smembers(key)
+        normalized = []
+        for member in members or []:
+            if isinstance(member, bytes):
+                normalized.append(member.decode("utf-8"))
+            else:
+                normalized.append(str(member))
+        return normalized
+
+    async def _merge_user_payload(
+        self, user_id: str, incoming_payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        current_payload = await self._get_json(self._user_key(user_id))
+        if not isinstance(current_payload, dict):
+            return incoming_payload
+
+        if self._is_payload_newer(current_payload, incoming_payload, "updated_at"):
+            return current_payload
+
+        return incoming_payload
+
+    async def _merge_rate_limits(
+        self, user_id: str, incoming_payload: List[float]
+    ) -> List[float]:
+        current_payload = await self._get_json(self._rate_limit_key(user_id))
+        merged_values = []
+
+        if isinstance(current_payload, list):
+            merged_values.extend(float(value) for value in current_payload)
+        if incoming_payload:
+            merged_values.extend(float(value) for value in incoming_payload)
+
+        if not merged_values:
+            return []
+
+        cutoff = time.time() - 3600
+        deduped = sorted({value for value in merged_values if value > cutoff})
+        return deduped
+
+    def _is_payload_newer(
+        self, current_payload: Optional[Dict[str, Any]], incoming_payload: Dict[str, Any], field: str
+    ) -> bool:
+        """Return whether the currently stored payload is newer than the incoming one."""
+        if not isinstance(current_payload, dict):
+            return False
+
+        current_value = current_payload.get(field)
+        incoming_value = incoming_payload.get(field)
+        if not current_value or not incoming_value:
+            return False
+
+        current_ts = self._parse_timestamp(current_value)
+        incoming_ts = self._parse_timestamp(incoming_value)
+        if current_ts is None or incoming_ts is None:
+            return False
+        return current_ts > incoming_ts
+
+    def _parse_timestamp(self, value: Any) -> Optional[datetime]:
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value)
+            except ValueError:
+                return None
+        return None
+
+
+def build_slack_state_store(config: Dict[str, Any]) -> SlackStateStore:
+    """Construct the configured Slack state backend."""
+    backend = (config or {}).get("backend", "memory").lower()
+    if backend == "file":
+        return FileSlackStateStore(config)
+    if backend == "redis":
+        return RedisSlackStateStore(config)
+    return MemorySlackStateStore(config)
+
+
+def resolve_slack_state_store_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Support both nested and legacy flat Slack state configuration."""
+    resolved_config = dict((config or {}).get("state", {}) or {})
+
+    if "backend" not in resolved_config:
+        resolved_config["backend"] = (config or {}).get("state_backend", "memory")
+
+    if "file_path" not in resolved_config and (config or {}).get("state_file"):
+        resolved_config["file_path"] = config["state_file"]
+
+    legacy_redis_config = dict((config or {}).get("redis", {}) or {})
+    nested_redis_config = dict(resolved_config.get("redis", {}) or {})
+    merged_redis_config = dict(legacy_redis_config)
+    merged_redis_config.update(nested_redis_config)
+
+    state_key_prefix = merged_redis_config.get("key_prefix") or (config or {}).get(
+        "state_key_prefix"
+    )
+    if state_key_prefix:
+        merged_redis_config["key_prefix"] = state_key_prefix
+
+    if merged_redis_config:
+        resolved_config["redis"] = merged_redis_config
+
+    return resolved_config
 
 
 @dataclass
@@ -62,22 +435,6 @@ class ConversationContext:
     preferences: Dict[str, Any]
     last_activity: datetime
     session_id: str
-    _on_update: Optional[Callable[["ConversationContext"], None]] = field(
-        default=None,
-        repr=False,
-        compare=False,
-    )
-
-    def attach_update_hook(
-        self, callback: Optional[Callable[["ConversationContext"], None]]
-    ):
-        """Attach a persistence callback for context mutations."""
-        self._on_update = callback
-
-    def _notify_updated(self):
-        """Persist the context after a mutation when a callback is attached."""
-        if self._on_update is not None:
-            self._on_update(self)
 
     def add_message(self, role: str, content: str):
         """Add message to conversation history"""
@@ -90,337 +447,49 @@ class ConversationContext:
             self.conversation_history = self.conversation_history[-20:]
 
         self.last_activity = datetime.now()
-        self._notify_updated()
-
-    def to_record(self) -> Dict[str, Any]:
-        """Serialize the context for persistent storage."""
-        return {
-            "user_id": self.user_id,
-            "channel_id": self.channel_id,
-            "thread_ts": self.thread_ts,
-            "conversation_history": list(self.conversation_history),
-            "user_tier": self.user_tier.value,
-            "preferences": dict(self.preferences),
-            "last_activity": self.last_activity.isoformat(),
-            "session_id": self.session_id,
-        }
-
-    @classmethod
-    def from_record(cls, record: Dict[str, Any]) -> "ConversationContext":
-        """Deserialize a stored conversation context."""
-        tier_name = record.get("user_tier", UserTier.FREE.value)
-        try:
-            user_tier = UserTier(tier_name)
-        except ValueError:
-            user_tier = UserTier.FREE
-
-        last_activity = record.get("last_activity")
-        return cls(
-            user_id=record.get("user_id", ""),
-            channel_id=record.get("channel_id", ""),
-            thread_ts=record.get("thread_ts"),
-            conversation_history=list(record.get("conversation_history", [])),
-            user_tier=user_tier,
-            preferences=dict(record.get("preferences", {})),
-            last_activity=(
-                datetime.fromisoformat(last_activity)
-                if isinstance(last_activity, str)
-                else datetime.now()
-            ),
-            session_id=record.get("session_id", str(uuid.uuid4())),
-        )
-
-
-class SlackStateStore:
-    """Storage backend for Slack user and conversation state."""
-
-    def get_user_record(self, user_id: str) -> Dict[str, Any]:
-        raise NotImplementedError
-
-    def update_user_record(self, user_id: str, updates: Dict[str, Any]):
-        raise NotImplementedError
-
-    def list_user_records(self) -> Dict[str, Dict[str, Any]]:
-        raise NotImplementedError
-
-    def get_rate_limit_requests(self, user_id: str) -> List[float]:
-        raise NotImplementedError
-
-    def set_rate_limit_requests(self, user_id: str, requests: List[float]):
-        raise NotImplementedError
-
-    def get_conversation(self, context_key: str) -> Optional[ConversationContext]:
-        raise NotImplementedError
-
-    def set_conversation(self, context_key: str, context: ConversationContext):
-        raise NotImplementedError
-
-    def delete_conversation(self, context_key: str):
-        raise NotImplementedError
-
-    def list_conversations(self) -> Dict[str, ConversationContext]:
-        raise NotImplementedError
-
-
-class MemorySlackStateStore(SlackStateStore):
-    """In-memory Slack state store."""
-
-    def __init__(self):
-        self.users: Dict[str, Dict[str, Any]] = {}
-        self.rate_limits: Dict[str, List[float]] = {}
-        self.conversations: Dict[str, ConversationContext] = {}
-
-    def get_user_record(self, user_id: str) -> Dict[str, Any]:
-        return dict(self.users.get(user_id, {}))
-
-    def update_user_record(self, user_id: str, updates: Dict[str, Any]):
-        existing = dict(self.users.get(user_id, {}))
-        existing.update(updates)
-        self.users[user_id] = existing
-
-    def list_user_records(self) -> Dict[str, Dict[str, Any]]:
-        return {user_id: dict(record) for user_id, record in self.users.items()}
-
-    def get_rate_limit_requests(self, user_id: str) -> List[float]:
-        return list(self.rate_limits.get(user_id, []))
-
-    def set_rate_limit_requests(self, user_id: str, requests: List[float]):
-        self.rate_limits[user_id] = list(requests)
-
-    def get_conversation(self, context_key: str) -> Optional[ConversationContext]:
-        return self.conversations.get(context_key)
-
-    def set_conversation(self, context_key: str, context: ConversationContext):
-        self.conversations[context_key] = context
-
-    def delete_conversation(self, context_key: str):
-        self.conversations.pop(context_key, None)
-
-    def list_conversations(self) -> Dict[str, ConversationContext]:
-        return self.conversations
-
-
-class FileSlackStateStore(SlackStateStore):
-    """JSON-file backed Slack state store."""
-
-    def __init__(self, path: str):
-        self.path = Path(path)
-        self._lock = threading.RLock()
-        self._state = self._load_state()
-
-    def _default_state(self) -> Dict[str, Any]:
-        return {"users": {}, "rate_limits": {}, "conversations": {}}
-
-    def _load_state(self) -> Dict[str, Any]:
-        if not self.path.exists():
-            return self._default_state()
-
-        try:
-            raw_state = json.loads(self.path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid Slack state file: {self.path}") from exc
-
-        state = self._default_state()
-        if isinstance(raw_state, dict):
-            state["users"] = dict(raw_state.get("users", {}))
-            state["rate_limits"] = {
-                user_id: list(requests)
-                for user_id, requests in dict(raw_state.get("rate_limits", {})).items()
-            }
-            state["conversations"] = dict(raw_state.get("conversations", {}))
-        return state
-
-    def _persist_locked(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_suffix(f"{self.path.suffix}.tmp")
-        tmp_path.write_text(
-            json.dumps(self._state, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        tmp_path.replace(self.path)
-
-    def get_user_record(self, user_id: str) -> Dict[str, Any]:
-        with self._lock:
-            return dict(self._state["users"].get(user_id, {}))
-
-    def update_user_record(self, user_id: str, updates: Dict[str, Any]):
-        with self._lock:
-            existing = dict(self._state["users"].get(user_id, {}))
-            existing.update(updates)
-            self._state["users"][user_id] = existing
-            self._persist_locked()
-
-    def list_user_records(self) -> Dict[str, Dict[str, Any]]:
-        with self._lock:
-            return {
-                user_id: dict(record)
-                for user_id, record in self._state["users"].items()
-            }
-
-    def get_rate_limit_requests(self, user_id: str) -> List[float]:
-        with self._lock:
-            return list(self._state["rate_limits"].get(user_id, []))
-
-    def set_rate_limit_requests(self, user_id: str, requests: List[float]):
-        with self._lock:
-            self._state["rate_limits"][user_id] = list(requests)
-            self._persist_locked()
-
-    def get_conversation(self, context_key: str) -> Optional[ConversationContext]:
-        with self._lock:
-            record = self._state["conversations"].get(context_key)
-        if record is None:
-            return None
-        return ConversationContext.from_record(record)
-
-    def set_conversation(self, context_key: str, context: ConversationContext):
-        with self._lock:
-            self._state["conversations"][context_key] = context.to_record()
-            self._persist_locked()
-
-    def delete_conversation(self, context_key: str):
-        with self._lock:
-            self._state["conversations"].pop(context_key, None)
-            self._persist_locked()
-
-    def list_conversations(self) -> Dict[str, ConversationContext]:
-        with self._lock:
-            raw_conversations = dict(self._state["conversations"])
-        return {
-            context_key: ConversationContext.from_record(record)
-            for context_key, record in raw_conversations.items()
-        }
-
-
-class RedisSlackStateStore(SlackStateStore):
-    """Redis-backed Slack state store."""
-
-    def __init__(self, config: Dict[str, Any], key_prefix: str = "slack_state"):
-        try:
-            import redis as redis_sync
-        except ImportError as exc:
-            raise RuntimeError(
-                "redis package is required for Slack redis state backend"
-            ) from exc
-
-        password = config.get("password")
-        password_env = config.get("password_env")
-        if not password and password_env:
-            password = os.getenv(password_env)
-
-        self.client = redis_sync.Redis(
-            host=config.get("host", "localhost"),
-            port=int(config.get("port", 6379) or 6379),
-            db=int(config.get("db", 0) or 0),
-            username=config.get("username"),
-            password=password,
-            ssl=bool(config.get("ssl", False)),
-            decode_responses=True,
-        )
-        self.client.ping()
-
-        normalized_prefix = str(key_prefix or "slack_state").strip() or "slack_state"
-        self._users_key = f"{normalized_prefix}:users"
-        self._rate_limits_key = f"{normalized_prefix}:rate_limits"
-        self._conversations_key = f"{normalized_prefix}:conversations"
-
-    def _load_json(self, raw_value: Any, default: Any):
-        if raw_value is None:
-            return default
-
-        if isinstance(raw_value, bytes):
-            raw_value = raw_value.decode("utf-8")
-
-        try:
-            return json.loads(raw_value)
-        except (TypeError, json.JSONDecodeError):
-            return default
-
-    def get_user_record(self, user_id: str) -> Dict[str, Any]:
-        return dict(self._load_json(self.client.hget(self._users_key, user_id), {}))
-
-    def update_user_record(self, user_id: str, updates: Dict[str, Any]):
-        existing = self.get_user_record(user_id)
-        existing.update(updates)
-        self.client.hset(self._users_key, user_id, json.dumps(existing))
-
-    def list_user_records(self) -> Dict[str, Dict[str, Any]]:
-        return {
-            user_id: dict(self._load_json(record, {}))
-            for user_id, record in self.client.hgetall(self._users_key).items()
-        }
-
-    def get_rate_limit_requests(self, user_id: str) -> List[float]:
-        return list(
-            self._load_json(self.client.hget(self._rate_limits_key, user_id), [])
-        )
-
-    def set_rate_limit_requests(self, user_id: str, requests: List[float]):
-        self.client.hset(self._rate_limits_key, user_id, json.dumps(list(requests)))
-
-    def get_conversation(self, context_key: str) -> Optional[ConversationContext]:
-        record = self._load_json(
-            self.client.hget(self._conversations_key, context_key), None
-        )
-        if record is None:
-            return None
-        return ConversationContext.from_record(record)
-
-    def set_conversation(self, context_key: str, context: ConversationContext):
-        self.client.hset(
-            self._conversations_key,
-            context_key,
-            json.dumps(context.to_record()),
-        )
-
-    def delete_conversation(self, context_key: str):
-        self.client.hdel(self._conversations_key, context_key)
-
-    def list_conversations(self) -> Dict[str, ConversationContext]:
-        return {
-            context_key: ConversationContext.from_record(
-                self._load_json(record, {})
-            )
-            for context_key, record in self.client.hgetall(
-                self._conversations_key
-            ).items()
-        }
 
 
 class UserManager:
     """Manages user data and preferences"""
 
-    MAX_QUERY_HISTORY = 500
-    QUERY_HISTORY_RETENTION_DAYS = 7
-
-    def __init__(self, store: Optional[SlackStateStore] = None):
-        self.store = store or MemorySlackStateStore()
-        self._refresh_user_tier_metrics()
+    def __init__(
+        self,
+        default_tier: str = UserTier.FREE.value,
+        tier_overrides: Optional[Dict[str, str]] = None,
+    ):
+        self.default_tier = self._normalize_tier_name(default_tier)
+        self.tier_overrides = {
+            user_id: self._normalize_tier_name(tier_name)
+            for user_id, tier_name in (tier_overrides or {}).items()
+        }
+        self.users = {}  # In production, use a database
+        self.rate_limits = {}
 
     def get_user_tier(self, user_id: str) -> UserTier:
         """Get user tier from user data"""
-        user_data = self.store.get_user_record(user_id)
-        tier_name = user_data.get("tier", "free")
+        user_data = self.users.get(user_id, {})
+        tier_name = (
+            user_data.get("tier")
+            or self.tier_overrides.get(user_id)
+            or self.default_tier
+        )
 
         try:
             return UserTier(tier_name)
         except ValueError:
             return UserTier.FREE
 
-    def set_user_tier(self, user_id: str, tier: UserTier):
-        """Persist a user tier."""
-        self.store.update_user_record(user_id, {"tier": tier.value})
-        self._refresh_user_tier_metrics()
-
     def check_rate_limit(self, user_id: str, config: Dict[str, Any]) -> bool:
         """Check if user is within rate limits"""
         current_time = time.time()
         hour_window = current_time - 3600  # 1 hour window
-        rate_limit_requests = self.store.get_rate_limit_requests(user_id)
+
+        if user_id not in self.rate_limits:
+            self.rate_limits[user_id] = []
 
         # Clean old requests
-        rate_limit_requests = [
-            req_time for req_time in rate_limit_requests if req_time > hour_window
+        self.rate_limits[user_id] = [
+            req_time for req_time in self.rate_limits[user_id] if req_time > hour_window
         ]
 
         # Check limits
@@ -428,14 +497,14 @@ class UserManager:
         burst_requests = config.get("burst_requests", 5)
 
         # Check hourly limit
-        if len(rate_limit_requests) >= requests_per_hour:
+        if len(self.rate_limits[user_id]) >= requests_per_hour:
             return False
 
         # Check burst limit (last 5 minutes)
         burst_window = current_time - 300  # 5 minutes
         recent_requests = [
             req_time
-            for req_time in rate_limit_requests
+            for req_time in self.rate_limits[user_id]
             if req_time > burst_window
         ]
 
@@ -443,161 +512,86 @@ class UserManager:
             return False
 
         # Add current request
-        rate_limit_requests.append(current_time)
-        self.store.set_rate_limit_requests(user_id, rate_limit_requests)
+        self.rate_limits[user_id].append(current_time)
         return True
 
     def get_user_preferences(self, user_id: str) -> Dict[str, Any]:
         """Get user preferences"""
-        user_data = self.store.get_user_record(user_id)
-        preferences = default_user_preferences()
-        preferences.update(dict(user_data.get("preferences", {})))
-        return preferences
+        return self.users.get(user_id, {}).get(
+            "preferences",
+            {
+                "response_length": "medium",
+                "technical_level": "intermediate",
+                "preferred_models": [],
+                "threading": True,
+            },
+        )
 
     def update_user_preferences(self, user_id: str, preferences: Dict[str, Any]):
         """Update user preferences"""
-        user_data = self.store.get_user_record(user_id)
-        stored_preferences = default_user_preferences()
-        stored_preferences.update(dict(user_data.get("preferences", {})))
-        stored_preferences.update(preferences)
-        self.store.update_user_record(user_id, {"preferences": stored_preferences})
-        self._refresh_user_tier_metrics()
+        if user_id not in self.users:
+            self.users[user_id] = {}
 
-    def record_query_event(
-        self,
-        user_id: str,
-        user_tier: UserTier,
-        *,
-        query_type: str,
-        response=None,
-        success: bool,
-        latency_ms: int,
-    ):
-        """Persist a bounded per-user query history for Slack analytics fallback."""
-        user_data = self.store.get_user_record(user_id)
-        history = list(user_data.get("query_history", []))
-        event = {
-            "timestamp": datetime.now().isoformat(),
-            "query_type": query_type,
-            "success": bool(success),
-            "latency_ms": max(0, int(latency_ms or 0)),
-            "model_name": getattr(response, "model_name", None),
-            "provider": getattr(response, "provider", None),
-            "total_tokens": int(getattr(response, "total_tokens", 0) or 0),
-            "cost_usd": float(getattr(response, "cost_usd", 0.0) or 0.0),
-            "cached": bool(getattr(response, "cached", False)),
-        }
-        history.append(event)
-        history = self._prune_query_history(history)
-        self.store.update_user_record(
-            user_id,
-            {
-                "tier": user_tier.value,
-                "query_history": history,
-            },
-        )
-        self._refresh_user_tier_metrics()
+        if "preferences" not in self.users[user_id]:
+            self.users[user_id]["preferences"] = {}
 
-    def get_query_history(
-        self, user_id: str, *, hours: Optional[int] = None
-    ) -> List[Dict[str, Any]]:
-        """Return bounded query history for a user, optionally filtered by recency."""
-        user_data = self.store.get_user_record(user_id)
-        history = self._prune_query_history(list(user_data.get("query_history", [])))
-        if not history:
-            return []
+        self.users[user_id]["preferences"].update(preferences)
+        self.users[user_id]["updated_at"] = datetime.now().isoformat()
 
-        if hours is None:
-            return history
+    def ensure_user_record(self, user_id: str) -> bool:
+        """Apply configured tier defaults/overrides to the in-memory user record."""
+        if not user_id:
+            return False
 
-        cutoff = datetime.now() - timedelta(hours=hours)
-        filtered_history = []
-        for event in history:
-            event_time = self._parse_event_timestamp(event.get("timestamp"))
-            if event_time and event_time >= cutoff:
-                filtered_history.append(event)
-        return filtered_history
+        previous_tier = self.users.get(user_id, {}).get("tier")
+        resolved_tier = self.tier_overrides.get(user_id)
+        if resolved_tier is None and previous_tier is None and self.default_tier != UserTier.FREE.value:
+            resolved_tier = self.default_tier
 
-    def get_remaining_requests(self, user_id: str, config: Dict[str, Any]) -> int:
-        """Return remaining requests in the current rolling hour window."""
-        current_time = time.time()
-        hour_window = current_time - 3600
-        recent_requests = [
-            request_time
-            for request_time in self.store.get_rate_limit_requests(user_id)
-            if request_time > hour_window
-        ]
-        requests_per_hour = int(config.get("requests_per_hour", 100) or 100)
-        return max(0, requests_per_hour - len(recent_requests))
+        if resolved_tier is None:
+            return False
 
-    def _parse_event_timestamp(self, raw_timestamp: Any) -> Optional[datetime]:
-        if not isinstance(raw_timestamp, str):
-            return None
+        if user_id not in self.users:
+            self.users[user_id] = {}
+
+        if previous_tier == resolved_tier:
+            return False
+
+        self.users[user_id]["tier"] = resolved_tier
+        self.users[user_id]["updated_at"] = datetime.now().isoformat()
+        return True
+
+    def _normalize_tier_name(self, tier_name: Optional[str]) -> str:
+        """Normalize tier names used in config and persisted user state."""
+        normalized = (tier_name or UserTier.FREE.value).strip().lower()
         try:
-            return datetime.fromisoformat(raw_timestamp)
+            return UserTier(normalized).value
         except ValueError:
-            return None
-
-    def _prune_query_history(
-        self, history: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        cutoff = datetime.now() - timedelta(days=self.QUERY_HISTORY_RETENTION_DAYS)
-        retained_history = []
-        for event in history:
-            event_time = self._parse_event_timestamp(event.get("timestamp"))
-            if event_time and event_time >= cutoff:
-                retained_history.append(event)
-        return retained_history[-self.MAX_QUERY_HISTORY :]
-
-    def _refresh_user_tier_metrics(self):
-        """Synchronize per-tier user gauges from persisted Slack user records."""
-        records = self.store.list_user_records()
-        counts = {tier.value: 0 for tier in UserTier}
-        for record in records.values():
-            tier_name = record.get("tier", UserTier.FREE.value)
-            if tier_name not in counts:
-                tier_name = UserTier.FREE.value
-            counts[tier_name] += 1
-
-        for tier_name, count in counts.items():
-            USER_METRICS.users_by_tier.labels(user_tier=tier_name).set(count)
+            return UserTier.FREE.value
 
 
 class ConversationManager:
     """Manages conversation contexts and history"""
 
-    def __init__(
-        self,
-        config: Dict[str, Any],
-        store: Optional[SlackStateStore] = None,
-    ):
+    def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.store = store or MemorySlackStateStore()
+        self.conversations = {}
         self.session_timeout = timedelta(hours=2)  # Sessions expire after 2 hours
-
-    def _context_key(
-        self, user_id: str, channel_id: str, thread_ts: Optional[str] = None
-    ) -> str:
-        return f"{user_id}:{channel_id}:{thread_ts or 'main'}"
-
-    @property
-    def conversations(self) -> Dict[str, ConversationContext]:
-        """Expose current conversations for diagnostics and tests."""
-        return self.store.list_conversations()
 
     def get_or_create_context(
         self, user_id: str, channel_id: str, thread_ts: str = None
     ) -> ConversationContext:
         """Get existing conversation context or create new one"""
-        context_key = self._context_key(user_id, channel_id, thread_ts)
-        context = self.store.get_conversation(context_key)
-        if context is not None:
-            context.attach_update_hook(self.save_context)
+        context_key = f"{user_id}:{channel_id}:{thread_ts or 'main'}"
+
+        if context_key in self.conversations:
+            context = self.conversations[context_key]
             # Check if session is still valid
             if datetime.now() - context.last_activity < self.session_timeout:
                 return context
-
-            self.store.delete_conversation(context_key)
+            else:
+                # Session expired, create new one
+                del self.conversations[context_key]
 
         # Create new context
         context = ConversationContext(
@@ -610,45 +604,49 @@ class ConversationManager:
             last_activity=datetime.now(),
             session_id=str(uuid.uuid4()),
         )
-        context.attach_update_hook(self.save_context)
-        self.store.set_conversation(context_key, context)
+
+        self.conversations[context_key] = context
         return context
 
-    def save_context(self, context: ConversationContext):
-        """Persist the current context state."""
-        context.attach_update_hook(self.save_context)
-        self.store.set_conversation(
-            self._context_key(context.user_id, context.channel_id, context.thread_ts),
-            context,
-        )
-
-    def clear_context(
-        self, user_id: str, channel_id: str, thread_ts: Optional[str] = None
-    ):
-        """Delete a stored conversation context."""
-        self.store.delete_conversation(self._context_key(user_id, channel_id, thread_ts))
-
-    def cleanup_expired_sessions(self):
+    def cleanup_expired_sessions(self, return_keys: bool = False):
         """Clean up expired conversation sessions"""
         current_time = datetime.now()
         expired_keys = []
 
-        for key, context in self.store.list_conversations().items():
+        for key, context in self.conversations.items():
             if current_time - context.last_activity > self.session_timeout:
                 expired_keys.append(key)
 
         for key in expired_keys:
-            self.store.delete_conversation(key)
+            del self.conversations[key]
 
         if expired_keys:
             logger.info(f"Cleaned up {len(expired_keys)} expired conversation sessions")
+
+        if return_keys:
+            return expired_keys
+        return len(expired_keys)
+
+    def clear_contexts(
+        self, user_id: str, channel_id: str, return_keys: bool = False
+    ):
+        """Clear all contexts for a user in a channel."""
+        prefix = f"{user_id}:{channel_id}:"
+        matching_keys = [key for key in self.conversations if key.startswith(prefix)]
+
+        for key in matching_keys:
+            del self.conversations[key]
+
+        if return_keys:
+            return matching_keys
+        return len(matching_keys)
 
     def get_conversation_summary(
         self, user_id: str, channel_id: str, thread_ts: str = None
     ) -> str:
         """Get conversation summary for context"""
-        context_key = self._context_key(user_id, channel_id, thread_ts)
-        context = self.store.get_conversation(context_key)
+        context_key = f"{user_id}:{channel_id}:{thread_ts or 'main'}"
+        context = self.conversations.get(context_key)
 
         if not context or not context.conversation_history:
             return ""
@@ -663,22 +661,6 @@ class ConversationManager:
             summary_parts.append(f"{role}: {content}")
 
         return "\n".join(summary_parts)
-
-    def has_active_thread_context(self, channel_id: str, thread_ts: Optional[str]) -> bool:
-        """Return whether the bot has an active conversation in the given thread."""
-        if not thread_ts:
-            return False
-
-        current_time = datetime.now()
-        for context in self.store.list_conversations().values():
-            if context.channel_id != channel_id:
-                continue
-            if context.thread_ts != thread_ts:
-                continue
-            if current_time - context.last_activity < self.session_timeout:
-                return True
-
-        return False
 
 
 class SlackMessageHandler:
@@ -695,6 +677,24 @@ class SlackMessageHandler:
             "clear": self._handle_clear_command,
         }
 
+    def extract_prefixed_command_text(self, text: str) -> Optional[str]:
+        """Strip inline `/llm` / `!llm` prefixes while preserving the raw payload."""
+        normalized = (text or "").strip()
+        for prefix in ("/llm", "!llm"):
+            if normalized == prefix:
+                return ""
+            if normalized.startswith(f"{prefix} "):
+                return normalized[len(prefix) :].strip()
+        return None
+
+    def is_supported_command(self, command_text: str) -> bool:
+        """Return whether the first token maps to a supported Slack command."""
+        normalized = (command_text or "").strip()
+        if not normalized:
+            return True
+        command_name = normalized.split(maxsplit=1)[0].lower()
+        return command_name in self.commands
+
     async def handle_message(
         self, event: Dict[str, Any], client: AsyncWebClient
     ) -> Optional[str]:
@@ -703,81 +703,92 @@ class SlackMessageHandler:
         user_id = event.get("user")
         channel_id = event.get("channel")
         thread_ts = event.get("thread_ts") or event.get("ts")
-        allow_bare_command = event.get("type") == "app_mention"
+        attachments = list(event.get("_query_attachments", []) or [])
 
-        command_text = self._extract_command_text(text, allow_bare_command)
+        # Check if it's a command
+        if not text and not attachments:
+            return await self._handle_help_command([], user_id, channel_id, client)
+
+        command_text = self.extract_prefixed_command_text(text)
         if command_text is not None:
-            return await self._handle_command(
+            return await self._handle_command_or_query(
                 command_text,
                 user_id,
                 channel_id,
+                thread_ts,
                 client,
-                thread_ts=thread_ts,
+                attachments=attachments,
             )
 
+        if not text and attachments:
+            text = self._build_attachment_only_query(attachments)
+
         # Regular query - process through inference engine
-        return await self._handle_query(text, user_id, channel_id, thread_ts, client)
+        return await self._handle_query(
+            text,
+            user_id,
+            channel_id,
+            thread_ts,
+            client,
+            attachments=attachments,
+        )
 
-    def _extract_command_text(
-        self, text: str, allow_bare_command: bool = False
-    ) -> Optional[str]:
-        """Return normalized command text when the message should be handled as a bot command."""
-        normalized_text = text.strip()
-        if not normalized_text:
-            return None
-
-        for prefix in ("/llm ", "!llm "):
-            if normalized_text.startswith(prefix):
-                return normalized_text[len(prefix) :].strip()
-
-        if allow_bare_command:
-            command_name = normalized_text.split(maxsplit=1)[0].lower()
-            if command_name in self.commands:
-                return normalized_text
-
-        return None
+    async def _handle_command_or_query(
+        self,
+        command_text: str,
+        user_id: str,
+        channel_id: str,
+        thread_ts: Optional[str],
+        client: AsyncWebClient,
+        attachments: Optional[List[Attachment]] = None,
+    ) -> str:
+        """Handle inline `/llm` / `!llm` payloads as commands or free-form queries."""
+        return await self._handle_command(
+            command_text,
+            user_id,
+            channel_id,
+            thread_ts,
+            client,
+            attachments=attachments or [],
+        )
 
     async def _handle_command(
         self,
         command_text: str,
         user_id: str,
         channel_id: str,
+        thread_ts: Optional[str],
         client: AsyncWebClient,
-        thread_ts: Optional[str] = None,
+        attachments: Optional[List[Attachment]] = None,
     ) -> str:
-        """Handle bot commands"""
+        """Handle bot commands, falling back to a free-form query when appropriate."""
         parts = command_text.split()
         if not parts:
-            return await self._handle_help_command(
-                [], user_id, channel_id, client, thread_ts=thread_ts
-            )
+            return await self._handle_help_command([], user_id, channel_id, client)
 
         command = parts[0].lower()
         args = parts[1:] if len(parts) > 1 else []
 
         if command in self.commands:
-            return await self.commands[command](
-                args, user_id, channel_id, client, thread_ts=thread_ts
-            )
-        else:
-            return f"Unknown command: `{command}`. Type `/llm help` for available commands."
+            return await self.commands[command](args, user_id, channel_id, client)
+        return await self._handle_query(
+            command_text,
+            user_id,
+            channel_id,
+            thread_ts,
+            client,
+            attachments=attachments,
+        )
 
     async def _handle_help_command(
-        self,
-        args: List[str],
-        user_id: str,
-        channel_id: str,
-        client: AsyncWebClient,
-        thread_ts: Optional[str] = None,
+        self, args: List[str], user_id: str, channel_id: str, client: AsyncWebClient
     ) -> str:
         """Handle help command"""
         help_text = """
 🤖 *LLM Router Bot Help*
 
 *Basic Usage:*
-• Mention me in a channel to start a reply thread
-• Keep follow-up questions inside that thread
-• Use `/llm ...` for explicit commands
+Mention me in a channel, use `/llm ...`, or reply inside an active bot thread.
 
 *Commands:*
 • `/llm help` - Show this help message
@@ -801,19 +812,12 @@ class SlackMessageHandler:
 ✅ Usage analytics and cost tracking
 
 *User Tiers:*
-🆓 Free: Basic models, 100 requests/hour
-💎 Premium: All models, 500 requests/hour, priority support
-🏢 Enterprise: Custom limits, dedicated resources
+{self.bot._format_tier_limit_summary()}
         """
         return help_text.strip()
 
     async def _handle_settings_command(
-        self,
-        args: List[str],
-        user_id: str,
-        channel_id: str,
-        client: AsyncWebClient,
-        thread_ts: Optional[str] = None,
+        self, args: List[str], user_id: str, channel_id: str, client: AsyncWebClient
     ) -> str:
         """Handle settings command"""
         user_prefs = self.bot.user_manager.get_user_preferences(user_id)
@@ -858,29 +862,44 @@ class SlackMessageHandler:
             elif setting_name == "threading":
                 user_prefs["threading"] = setting_value.lower() in ["on", "true", "yes"]
             elif setting_name == "preferred_models":
-                models = [m.strip() for m in setting_value.split(",")]
+                normalized_value = setting_value.strip().lower()
+                if normalized_value in {"auto", "none", "clear"}:
+                    models = []
+                else:
+                    models = [m.strip() for m in setting_value.split(",") if m.strip()]
+                    if not models:
+                        return "Invalid preferred_models value. Use a comma-separated model list or `auto` to clear."
+
+                    available_models = set(getattr(getattr(self.bot, "router", None), "models", {}))
+                    if available_models:
+                        unknown_models = [
+                            model_name for model_name in models if model_name not in available_models
+                        ]
+                        if unknown_models:
+                            return (
+                                "Unknown model(s): "
+                                + ", ".join(f"`{model_name}`" for model_name in unknown_models)
+                            )
                 user_prefs["preferred_models"] = models
             else:
                 return f"Invalid setting: `{setting_name}` or value: `{setting_value}`"
 
             self.bot.user_manager.update_user_preferences(user_id, user_prefs)
+            persist_user_state = getattr(self.bot, "_persist_user_state", None)
+            if persist_user_state is not None:
+                await persist_user_state(user_id)
             return f"✅ Updated {setting_name} to: {setting_value}"
 
         else:
             return "Usage: `/llm settings [setting_name] [value]` or `/llm settings` to view current settings"
 
     async def _handle_status_command(
-        self,
-        args: List[str],
-        user_id: str,
-        channel_id: str,
-        client: AsyncWebClient,
-        thread_ts: Optional[str] = None,
+        self, args: List[str], user_id: str, channel_id: str, client: AsyncWebClient
     ) -> str:
         """Handle status command"""
         try:
             # Get system status
-            system_health = await self.bot.get_system_status(user_id=user_id)
+            system_health = await self.bot.get_system_status()
 
             # Get user stats
             user_stats = await self.bot.get_user_stats(user_id)
@@ -909,12 +928,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             return "❌ Error retrieving status information"
 
     async def _handle_models_command(
-        self,
-        args: List[str],
-        user_id: str,
-        channel_id: str,
-        client: AsyncWebClient,
-        thread_ts: Optional[str] = None,
+        self, args: List[str], user_id: str, channel_id: str, client: AsyncWebClient
     ) -> str:
         """Handle models command"""
         try:
@@ -957,12 +971,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             return "❌ Error retrieving model information"
 
     async def _handle_analytics_command(
-        self,
-        args: List[str],
-        user_id: str,
-        channel_id: str,
-        client: AsyncWebClient,
-        thread_ts: Optional[str] = None,
+        self, args: List[str], user_id: str, channel_id: str, client: AsyncWebClient
     ) -> str:
         """Handle analytics command"""
         user_tier = self.bot.user_manager.get_user_tier(user_id)
@@ -1008,18 +1017,20 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             return "❌ Error retrieving analytics data"
 
     async def _handle_clear_command(
-        self,
-        args: List[str],
-        user_id: str,
-        channel_id: str,
-        client: AsyncWebClient,
-        thread_ts: Optional[str] = None,
+        self, args: List[str], user_id: str, channel_id: str, client: AsyncWebClient
     ) -> str:
         """Handle clear conversation command"""
-        self.bot.conversation_manager.clear_context(user_id, channel_id, thread_ts)
-        if thread_ts:
-            return "🧹 Cleared this thread's conversation history."
-        return "🧹 Cleared your channel-level conversation history."
+        cleared_keys = self.bot.conversation_manager.clear_contexts(
+            user_id, channel_id, return_keys=True
+        )
+
+        if not cleared_keys:
+            return "🧹 No saved conversation history was found for this channel."
+
+        delete_conversations = getattr(self.bot, "_delete_conversation_states", None)
+        if delete_conversations is not None:
+            await delete_conversations(cleared_keys)
+        return "🧹 Conversation history cleared for this channel."
 
     async def _handle_query(
         self,
@@ -1028,11 +1039,9 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         channel_id: str,
         thread_ts: str,
         client: AsyncWebClient,
+        attachments: Optional[List[Attachment]] = None,
     ) -> str:
         """Handle regular query through inference engine"""
-        request_started_at = time.time()
-        query_type = self._classify_query_type(text)
-        user_tier = self.bot.user_manager.get_user_tier(user_id)
         try:
             # Get or create conversation context
             context = self.bot.conversation_manager.get_or_create_context(
@@ -1040,10 +1049,10 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             )
 
             # Get user tier and preferences
+            user_tier = self.bot.user_manager.get_user_tier(user_id)
             user_prefs = self.bot.user_manager.get_user_preferences(user_id)
             context.user_tier = user_tier
             context.preferences = user_prefs
-            self.bot.conversation_manager.save_context(context)
 
             # Build conversation context
             conversation_context = (
@@ -1053,6 +1062,18 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             )
 
             # Create query request
+            conversation_id_builder = getattr(
+                self.bot, "_conversation_context_key", None
+            )
+            if callable(conversation_id_builder):
+                conversation_id = conversation_id_builder(
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    thread_ts=thread_ts,
+                )
+            else:
+                conversation_id = f"{user_id}:{channel_id}:{thread_ts or 'main'}"
+
             query_request = QueryRequest(
                 query=text,
                 user_id=user_id,
@@ -1061,10 +1082,36 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 max_tokens=self._get_max_tokens_for_user(user_tier, user_prefs),
                 temperature=0.7,
                 priority=1 if user_tier != UserTier.FREE else 3,
+                attachments=attachments or [],
+                session_id=context.session_id,
+                conversation_id=conversation_id,
+                metadata=(
+                    self.bot._build_query_metadata(
+                        channel_id=channel_id,
+                        thread_ts=thread_ts,
+                        attachments=attachments or [],
+                        user_preferences=user_prefs,
+                    )
+                    if hasattr(self.bot, "_build_query_metadata")
+                    else {}
+                ),
             )
 
             # Process through inference engine
             response = await self.bot.inference_engine.process_query(query_request)
+
+            if getattr(response, "error", None):
+                logger.error(
+                    "Slack query failed for user %s in channel %s: %s",
+                    user_id,
+                    channel_id,
+                    response.error,
+                )
+                SLACK_METRICS.errors.labels(error_type="inference_error_response").inc()
+                error_builder = getattr(self.bot, "_build_user_safe_error_message", None)
+                if callable(error_builder):
+                    return error_builder()
+                return "❌ Sorry, I couldn't process that request right now. Please try again in a moment."
 
             # Add to conversation history
             context.add_message("user", text)
@@ -1073,52 +1120,16 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             # Update metrics
             SLACK_METRICS.messages_processed.labels(user_tier=user_tier.value).inc()
             SLACK_METRICS.response_time.observe(response.latency_ms / 1000)
-            USER_METRICS.queries_per_user.labels(user_tier=user_tier.value).inc()
-            USER_METRICS.tokens_per_user.labels(
-                user_tier=user_tier.value, token_type="input"
-            ).inc(response.token_count_input)
-            USER_METRICS.tokens_per_user.labels(
-                user_tier=user_tier.value, token_type="output"
-            ).inc(response.token_count_output)
-            USER_METRICS.cost_per_user.labels(user_tier=user_tier.value).inc(
-                response.cost_usd
-            )
-            self.bot.user_manager.record_query_event(
-                user_id,
-                user_tier,
-                query_type=query_type,
-                response=response,
-                success=not bool(response.error),
-                latency_ms=response.latency_ms,
-            )
 
             return response.response_text
 
-        except Exception:
-            logger.exception("Error processing query")
-            SLACK_METRICS.errors.labels(error_type="query_processing").inc()
-            self.bot.user_manager.record_query_event(
-                user_id,
-                user_tier,
-                query_type=query_type,
-                response=None,
-                success=False,
-                latency_ms=int((time.time() - request_started_at) * 1000),
-            )
-            return "❌ Sorry, I couldn't process that request right now. Please try again."
-
-    def _classify_query_type(self, text: str) -> str:
-        """Return the router classifier's best query type, falling back to general."""
-        router = getattr(self.bot.inference_engine, "router", None)
-        classifier = getattr(router, "classifier", None)
-        classify_query = getattr(classifier, "classify_query", None)
-        if callable(classify_query):
-            try:
-                query_type, _confidence = classify_query(text)
-                return query_type.value if hasattr(query_type, "value") else str(query_type)
-            except Exception:
-                logger.exception("Failed to classify Slack query for analytics")
-        return "general"
+        except Exception as e:
+            logger.error(f"Error processing query: {e}")
+            SLACK_METRICS.errors.labels(error_type=type(e).__name__).inc()
+            error_builder = getattr(self.bot, "_build_user_safe_error_message", None)
+            if callable(error_builder):
+                return error_builder()
+            return "❌ Sorry, I couldn't process that request right now. Please try again in a moment."
 
     def _get_max_tokens_for_user(
         self, user_tier: UserTier, preferences: Dict[str, Any]
@@ -1137,7 +1148,14 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             preferences.get("response_length", "medium"), 1.0
         )
 
-        return int(base * multiplier)
+        return min(int(base * multiplier), MAX_QUERY_TOKENS)
+
+    def _build_attachment_only_query(self, attachments: List[Attachment]) -> str:
+        """Create a fallback query when a Slack message only contains files."""
+        attachment_names = ", ".join(attachment.name for attachment in attachments[:3])
+        if attachment_names:
+            return f"Analyze the attached Slack file(s): {attachment_names}"
+        return "Analyze the attached Slack file(s)."
 
 
 class SlackBot:
@@ -1147,69 +1165,67 @@ class SlackBot:
         self,
         config: Dict[str, Any],
         inference_engine,
+        router=None,
+        monitoring_service=None,
+        analytics_service=None,
         services: Optional[Dict[str, Any]] = None,
     ):
         self.config = config
         self.inference_engine = inference_engine
-        self.services = services if services is not None else {}
-        self.started_at = datetime.now()
+        resolved_services = services or {}
+        self.services = resolved_services
+        self.router = (
+            router
+            or resolved_services.get("router")
+            or getattr(inference_engine, "router", None)
+        )
+        self.monitoring_service = monitoring_service or resolved_services.get(
+            "monitoring"
+        )
+        self.analytics_service = analytics_service or resolved_services.get("pipeline")
+
+        tier_settings = config.get("user_tiers", {})
+        default_user_tier = tier_settings.get("default", UserTier.FREE.value)
+        tier_overrides = tier_settings.get("overrides", {})
 
         # Initialize components
-        self.state_backend = config.get("state_backend", "memory")
-        self.state_store = self._build_state_store()
-        self.user_manager = UserManager(store=self.state_store)
-        self.conversation_manager = ConversationManager(
-            config,
-            store=self.state_store,
+        self.user_manager = UserManager(
+            default_tier=default_user_tier,
+            tier_overrides=tier_overrides,
         )
+        self.conversation_manager = ConversationManager(config)
         self.message_handler = SlackMessageHandler(self)
 
         # Slack clients
         self.web_client = None
         self.socket_client = None
+        self.bot_token = None
 
         # Bot configuration
         self.bot_user_id = None
         self.allowed_channels = config.get("channels", [])
-        self._allowed_channel_names = {
-            channel.lstrip("#")
-            for channel in self.allowed_channels
-            if isinstance(channel, str)
-        }
-        self._channel_name_cache: Dict[str, Optional[str]] = {}
+        self.allowed_channel_ids: Set[str] = set()
+        self.allowed_channel_names: Set[str] = set()
         self.rate_limiting = config.get("rate_limiting", {})
+        self.attachment_settings = {
+            "enabled": True,
+            "max_files": 10,
+            "max_file_size_bytes": 10_000_000,
+            "download_timeout_seconds": 30,
+        }
+        self.attachment_settings.update(config.get("attachments", {}))
+        self.state_store = build_slack_state_store(
+            resolve_slack_state_store_config(config)
+        )
+        self.state_lock = asyncio.Lock()
+        self.active_threads: Dict[str, datetime] = {}
+        self.active_thread_timeout = self.conversation_manager.session_timeout
 
         # Running state
+        self.initialized = False
         self.running = False
-
-        if self.state_backend == "memory":
-            logger.warning(
-                "Slack bot is using in-memory state for users and conversations; configure a persistent backend before horizontal scaling."
-            )
-
-    def _build_state_store(self) -> SlackStateStore:
-        """Create the configured Slack state backend."""
-        if self.state_backend == "file":
-            state_file = self.config.get("state_file", DEFAULT_SLACK_STATE_FILE)
-            return FileSlackStateStore(state_file)
-        if self.state_backend == "redis":
-            return RedisSlackStateStore(
-                dict(self.config.get("redis", {})),
-                key_prefix=self.config.get("state_key_prefix", "slack_state"),
-            )
-        return MemorySlackStateStore()
-
-    def _resolve_secret(self, value_key: str, env_key: str) -> Optional[str]:
-        """Resolve secrets from direct config values or referenced env vars."""
-        direct_value = self.config.get(value_key)
-        if direct_value:
-            return direct_value
-
-        env_var_name = self.config.get(env_key)
-        if env_var_name:
-            return os.getenv(env_var_name)
-
-        return None
+        self.started_at: Optional[datetime] = None
+        self.background_tasks: Set[asyncio.Task] = set()
 
     async def initialize(self):
         """Initialize Slack bot"""
@@ -1219,9 +1235,12 @@ class SlackBot:
             app_token = self._resolve_secret("app_token", "app_token_env")
 
             if not bot_token or not app_token:
-                raise ValueError("Slack bot_token and app_token are required")
+                raise ValueError(
+                    "Slack bot_token/app_token are required directly or via bot_token_env/app_token_env"
+                )
 
             self.web_client = AsyncWebClient(token=bot_token)
+            self.bot_token = bot_token
             self.socket_client = AsyncSocketModeClient(
                 app_token=app_token, web_client=self.web_client
             )
@@ -1234,6 +1253,10 @@ class SlackBot:
             self.socket_client.socket_mode_request_listeners.append(
                 self._handle_socket_mode_request
             )
+            await self.state_store.initialize()
+            await self._restore_state()
+            await self._resolve_allowed_channels()
+            self.initialized = True
 
             logger.info(
                 f"Slack bot initialized successfully. Bot ID: {self.bot_user_id}"
@@ -1247,13 +1270,16 @@ class SlackBot:
         """Start the Slack bot"""
         logger.info("Starting Slack bot...")
         self.running = True
+        self.started_at = datetime.now()
 
         try:
             # Start socket mode client
             await self.socket_client.connect()
 
             # Start cleanup task
-            cleanup_task = asyncio.create_task(self._cleanup_sessions_periodically())
+            self._spawn_background_task(
+                self._cleanup_sessions_periodically(), "slack_state_cleanup"
+            )
 
             # Keep the bot running
             while self.running:
@@ -1269,19 +1295,21 @@ class SlackBot:
     ):
         """Handle incoming socket mode requests"""
         try:
-            if req.type == "events_api":
-                # Handle Events API
-                event = req.payload.get("event", {})
-                await self._handle_event(event)
-
-            elif req.type == "slash_commands":
-                # Handle slash commands
-                command = req.payload
-                await self._handle_slash_command(command)
-
-            # Acknowledge the request
             response = SocketModeResponse(envelope_id=req.envelope_id)
             await client.send_socket_mode_response(response)
+
+            if req.type == "events_api":
+                event = req.payload.get("event", {})
+                self._spawn_background_task(
+                    self._handle_event(event),
+                    f"slack_event:{event.get('type', 'unknown')}",
+                )
+
+            elif req.type == "slash_commands":
+                command = req.payload
+                self._spawn_background_task(
+                    self._handle_slash_command(command), "slack_slash_command"
+                )
 
         except Exception as e:
             logger.error(f"Error handling socket mode request: {e}")
@@ -1298,54 +1326,29 @@ class SlackBot:
     async def _handle_message_event(self, event: Dict[str, Any]):
         """Handle message events"""
         # Skip bot messages
-        if event.get("bot_id") or event.get("user") == self.bot_user_id:
-            return
-
-        if event.get("subtype"):
+        if event.get("subtype") or event.get("bot_id") or event.get("user") == self.bot_user_id:
             return
 
         channel_id = event.get("channel")
-        if not await self._is_allowed_channel(event):
+        if not await self._is_channel_allowed(channel_id, event.get("channel_name")):
             return
 
-        user_id = event.get("user")
-        if not self._should_process_message_event(event):
+        thread_ts = event.get("thread_ts")
+        if not thread_ts or not self._is_active_thread(channel_id, thread_ts):
             return
 
-        # Check rate limiting
-        if not self.user_manager.check_rate_limit(user_id, self.rate_limiting):
-            await self._send_rate_limit_message(
-                channel_id,
-                user_id,
-                thread_ts=self._get_reply_thread_ts(event),
-            )
-            return
-
-        # Process message
         await self._process_message(event)
 
     async def _handle_mention_event(self, event: Dict[str, Any]):
         """Handle app mentions"""
         channel_id = event.get("channel")
-        user_id = event.get("user")
-
-        if not await self._is_allowed_channel(event):
-            return
-
-        if not self.user_manager.check_rate_limit(user_id, self.rate_limiting):
-            await self._send_rate_limit_message(
-                channel_id,
-                user_id,
-                thread_ts=self._get_reply_thread_ts(event),
-            )
+        if not await self._is_channel_allowed(channel_id, event.get("channel_name")):
             return
 
         # Remove mention from text
         text = event.get("text", "")
         mention_pattern = f"<@{self.bot_user_id}>"
         text = text.replace(mention_pattern, "").strip()
-        if not text:
-            text = "help"
 
         # Update event with cleaned text
         event["text"] = text
@@ -1353,79 +1356,79 @@ class SlackBot:
         # Process as regular message
         await self._process_message(event)
 
-    def _should_process_message_event(self, event: Dict[str, Any]) -> bool:
-        """Only accept threaded replies for active bot conversations."""
-        text = (event.get("text") or "").strip()
-        if not text:
-            return False
-
-        channel_id = event.get("channel")
-        thread_ts = event.get("thread_ts")
-        if not thread_ts:
-            return False
-
-        if event.get("parent_user_id") == self.bot_user_id:
-            return True
-
-        return self.conversation_manager.has_active_thread_context(channel_id, thread_ts)
-
-    async def _is_allowed_channel(self, event: Dict[str, Any]) -> bool:
-        """Accept configured Slack channel IDs or channel names."""
-        if not self.allowed_channels:
-            return True
-
-        channel_id = event.get("channel")
-        if channel_id in self.allowed_channels:
-            return True
-
-        channel_name = event.get("channel_name")
-        if not channel_name and channel_id in self._channel_name_cache:
-            channel_name = self._channel_name_cache[channel_id]
-
-        if not channel_name and self.web_client and channel_id:
-            try:
-                response = await self.web_client.conversations_info(channel=channel_id)
-                channel_name = response.get("channel", {}).get("name")
-            except Exception as exc:
-                logger.warning(
-                    "Failed to resolve Slack channel name for allowlist check: %s", exc
-                )
-                channel_name = None
-            self._channel_name_cache[channel_id] = channel_name
-
-        if not channel_name:
-            return False
-
-        return channel_name in self._allowed_channel_names
-
     async def _handle_slash_command(self, command: Dict[str, Any]):
         """Handle slash commands"""
         command_text = command.get("text", "")
         user_id = command.get("user_id")
         channel_id = command.get("channel_id")
-        thread_ts = command.get("thread_ts")
 
-        # Process command
+        if not await self._is_channel_allowed(channel_id, command.get("channel_name")):
+            await self._post_command_response(
+                channel_id,
+                user_id,
+                "This bot is not enabled in this channel.",
+            )
+            return
+
+        user_state_changed = self._synchronize_user_tier(user_id)
+        is_supported_command = True
+        message_handler_is_supported_command = getattr(
+            self.message_handler, "is_supported_command", None
+        )
+        if callable(message_handler_is_supported_command):
+            is_supported_command = message_handler_is_supported_command(command_text)
+        if not is_supported_command:
+            rate_limit_config = self._get_rate_limit_config_for_user(user_id)
+            if not self.user_manager.check_rate_limit(user_id, rate_limit_config):
+                await self._post_command_response(
+                    channel_id,
+                    user_id,
+                    self._build_rate_limit_message(user_id),
+                )
+                if user_state_changed:
+                    await self._persist_user_state(user_id)
+                return
+
         response_text = await self.message_handler._handle_command(
             command_text,
             user_id,
             channel_id,
+            None,
             self.web_client,
-            thread_ts=thread_ts,
         )
 
-        # Send response as ephemeral command feedback.
-        await self.web_client.chat_postEphemeral(
-            channel=channel_id,
-            user=user_id,
-            text=response_text,
-        )
+        await self._post_command_response(channel_id, user_id, response_text)
+        if not is_supported_command:
+            await self._persist_message_state(
+                user_id=user_id,
+                conversation_key=self._conversation_context_key(
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    thread_ts=None,
+                ),
+            )
+        elif user_state_changed:
+            await self._persist_user_state(user_id)
 
     async def _process_message(self, event: Dict[str, Any]):
         """Process incoming message"""
         try:
             channel_id = event.get("channel")
-            thread_ts = self._get_reply_thread_ts(event)
+            user_id = event.get("user")
+            user_state_changed = self._synchronize_user_tier(user_id)
+            user_prefs = self.user_manager.get_user_preferences(user_id)
+
+            if self._is_query_event(event):
+                rate_limit_config = self._get_rate_limit_config_for_user(user_id)
+                if not self.user_manager.check_rate_limit(user_id, rate_limit_config):
+                    await self._send_rate_limit_message(channel_id, user_id)
+                    if user_state_changed:
+                        await self._persist_user_state(user_id)
+                    return
+
+            attachments = await self._extract_query_attachments(event)
+            if attachments:
+                event["_query_attachments"] = attachments
 
             # Process message through handler
             response_text = await self.message_handler.handle_message(
@@ -1433,6 +1436,18 @@ class SlackBot:
             )
 
             if response_text:
+                # Determine if we should reply in thread
+                thread_ts = None
+                threading_enabled = user_prefs.get("threading", True)
+                if event.get("thread_ts"):
+                    thread_ts = event.get("thread_ts")
+                elif (
+                    self.config.get("response_settings", {}).get("thread_replies", True)
+                    and threading_enabled
+                    and event.get("ts")
+                ):
+                    thread_ts = event.get("ts")
+
                 # Split long responses
                 max_length = self.config.get("response_settings", {}).get(
                     "max_response_length", 2000
@@ -1440,11 +1455,12 @@ class SlackBot:
                 if len(response_text) > max_length:
                     responses = self._split_response(response_text, max_length)
 
-                    for response_part in responses:
+                    for i, response_part in enumerate(responses):
                         await self.web_client.chat_postMessage(
                             channel=channel_id,
                             text=response_part,
                             thread_ts=thread_ts,
+                            reply_broadcast=(i == 0),  # Only broadcast first message
                         )
                         await asyncio.sleep(0.5)  # Small delay between parts
                 else:
@@ -1452,19 +1468,37 @@ class SlackBot:
                         channel=channel_id, text=response_text, thread_ts=thread_ts
                     )
 
-        except Exception:
-            logger.exception("Error processing message")
+                state_changed = False
+                active_thread_key = None
+                if thread_ts:
+                    self._mark_thread_active(channel_id, thread_ts)
+                    state_changed = True
+                    active_thread_key = self._thread_key(channel_id, thread_ts)
+
+                query_event = self._is_query_event(event)
+                if query_event or user_state_changed:
+                    state_changed = True
+
+                if state_changed:
+                    conversation_key = None
+                    if query_event:
+                        conversation_key = self._conversation_context_key(
+                            user_id=user_id,
+                            channel_id=channel_id,
+                            thread_ts=event.get("thread_ts") or event.get("ts"),
+                        )
+                    await self._persist_message_state(
+                        user_id=user_id if (query_event or user_state_changed) else None,
+                        conversation_key=conversation_key,
+                        active_thread_key=active_thread_key,
+                    )
+
+        except Exception as e:
+            logger.error(f"Error processing message: {e}")
             await self.web_client.chat_postMessage(
                 channel=event.get("channel"),
-                text="❌ Sorry, I couldn't handle that message right now. Please try again.",
-                thread_ts=self._get_reply_thread_ts(event),
+                text=self._build_user_safe_error_message(),
             )
-
-    def _get_reply_thread_ts(self, event: Dict[str, Any]) -> Optional[str]:
-        """Return the Slack thread ts to reply into for this event."""
-        if self.config.get("response_settings", {}).get("thread_replies", True):
-            return event.get("thread_ts") or event.get("ts")
-        return None
 
     def _split_response(self, text: str, max_length: int) -> List[str]:
         """Split long response into multiple parts"""
@@ -1518,312 +1552,832 @@ class SlackBot:
 
         return parts
 
-    async def _send_rate_limit_message(
-        self, channel_id: str, user_id: str, thread_ts: Optional[str] = None
-    ):
+    async def _send_rate_limit_message(self, channel_id: str, user_id: str):
         """Send rate limit exceeded message"""
-        user_tier = self.user_manager.get_user_tier(user_id)
+        await self.web_client.chat_postMessage(
+            channel=channel_id,
+            text=self._build_rate_limit_message(user_id),
+        )
 
-        message = f"""
+    def _build_rate_limit_message(self, user_id: str) -> str:
+        """Build a tier-aware rate-limit message for Slack responses."""
+        user_tier = self.user_manager.get_user_tier(user_id)
+        limits = self._get_rate_limit_config_for_tier(user_tier)
+        return f"""
 🚫 *Rate Limit Exceeded*
 
 <@{user_id}>, you've reached your hourly request limit.
 
 *Your tier:* {user_tier.value.title()}
+*Hourly limit:* {limits.get('requests_per_hour', 0)}
+*Burst limit:* {limits.get('burst_requests', 0)} requests / 5 min
 *Limit resets:* At the top of each hour
-
-*Upgrade for higher limits:*
-💎 Premium: 500 requests/hour
-🏢 Enterprise: Custom limits
-        """
-
-        await self.web_client.chat_postMessage(
-            channel=channel_id,
-            text=message.strip(),
-            thread_ts=thread_ts,
-        )
+        """.strip()
 
     async def _cleanup_sessions_periodically(self):
         """Periodically clean up expired sessions"""
         while self.running:
             try:
-                self.conversation_manager.cleanup_expired_sessions()
+                expired_sessions = self.conversation_manager.cleanup_expired_sessions(
+                    return_keys=True
+                )
+                expired_threads = self._cleanup_expired_threads(return_keys=True)
+                if expired_sessions or expired_threads:
+                    await self._delete_conversation_states(expired_sessions)
+                    await self._delete_active_thread_states(expired_threads)
                 await asyncio.sleep(3600)  # Clean up every hour
             except Exception as e:
                 logger.error(f"Session cleanup error: {e}")
                 await asyncio.sleep(3600)
 
-    async def get_system_status(self, user_id: Optional[str] = None) -> Dict[str, Any]:
+    async def get_system_status(self) -> Dict[str, Any]:
         """Get system status for status command"""
-        router = getattr(self.inference_engine, "router", None)
-        monitoring = self.services.get("monitoring")
-        pipeline = self.services.get("pipeline")
-        available_models = await self.get_available_models(user_id or "")
-        service_health = {
-            "router": bool(router and getattr(router, "is_healthy", lambda: False)()),
-            "inference": bool(
-                getattr(self.inference_engine, "is_healthy", lambda: False)()
-            ),
-        }
-        if pipeline is not None:
-            service_health["pipeline"] = bool(
-                getattr(pipeline, "is_healthy", lambda: False)()
-            )
-        if monitoring is not None:
-            service_health["monitoring"] = bool(
-                getattr(monitoring, "is_healthy", lambda: False)()
-            )
+        health = {}
+        if hasattr(self.inference_engine, "get_health_status"):
+            health = self.inference_engine.get_health_status()
 
-        avg_response_time = self._get_process_local_avg_latency_ms()
-        if pipeline is not None:
-            analytics = await pipeline.get_query_analytics(hours=24)
-            if analytics:
-                avg_response_time = float(analytics.get("avg_latency", 0.0) or 0.0)
+        provider_health = health.get("providers", {})
+        available_models = list(getattr(self.router, "models", {}).keys())
+        model_stats = getattr(self.router, "model_stats", {})
+        avg_latency = 0.0
+        if model_stats:
+            avg_latency = sum(
+                stats.get("avg_latency", 0.0) for stats in model_stats.values()
+            ) / max(len(model_stats), 1)
+
+        healthy = all(
+            provider.get("status", "healthy") == "healthy"
+            for provider in provider_health.values()
+        )
+        if not provider_health:
+            healthy = self.initialized
 
         return {
-            "healthy": all(service_health.values()),
-            "available_models": [
-                model["name"] for model in available_models if model.get("available", False)
-            ],
-            "avg_response_time": avg_response_time,
-            "uptime": self._format_uptime(),
-            "services": service_health,
+            "healthy": healthy,
+            "available_models": available_models,
+            "avg_response_time": avg_latency,
+            "uptime": self._get_uptime_text(),
         }
 
     async def get_user_stats(self, user_id: str) -> Dict[str, Any]:
         """Get user statistics"""
-        recent_history = self.user_manager.get_query_history(user_id, hours=24)
-        aggregated = self._aggregate_query_history(recent_history)
-        pipeline = self.services.get("pipeline")
+        rate_limit_window = time.time() - 3600
+        recent_requests = [
+            request_time
+            for request_time in self.user_manager.rate_limits.get(user_id, [])
+            if request_time > rate_limit_window
+        ]
+        rate_limit_config = self._get_rate_limit_config_for_user(user_id)
+        remaining_requests = max(
+            0,
+            rate_limit_config.get("requests_per_hour", 100) - len(recent_requests),
+        )
 
-        if pipeline is not None:
-            pipeline_analytics = await pipeline.get_query_analytics(user_id=user_id, hours=24)
-            if pipeline_analytics:
-                aggregated.update(
-                    {
-                        "queries_24h": int(
-                            pipeline_analytics.get("total_queries", 0) or 0
-                        ),
-                        "cost_24h": float(
-                            pipeline_analytics.get("total_cost", 0.0) or 0.0
-                        ),
-                        "avg_latency": float(
-                            pipeline_analytics.get("avg_latency", 0.0) or 0.0
-                        ),
-                        "success_rate": float(
-                            pipeline_analytics.get("success_rate", 0.0) or 0.0
-                        ),
-                    }
-                )
+        analytics = {}
+        if self.analytics_service and hasattr(self.analytics_service, "get_query_analytics"):
+            analytics = await self.analytics_service.get_query_analytics(user_id, hours=24)
+        elif self.analytics_service and hasattr(self.analytics_service, "get_analytics"):
+            analytics = await self.analytics_service.get_analytics(user_id, hours=24)
 
         return {
-            "queries_24h": aggregated["queries"],
-            "cost_24h": aggregated["cost"],
-            "avg_latency": aggregated["avg_latency_ms"],
-            "success_rate": aggregated["success_rate_pct"],
-            "remaining_requests": self.user_manager.get_remaining_requests(
-                user_id, self.rate_limiting
-            ),
+            "queries_24h": analytics.get("total_queries", 0),
+            "cost_24h": analytics.get("total_cost", 0.0),
+            "avg_latency": analytics.get("avg_latency", 0.0),
+            "success_rate": analytics.get("success_rate", 0.0),
+            "remaining_requests": remaining_requests,
         }
 
     async def get_available_models(self, user_id: str) -> List[Dict[str, Any]]:
         """Get available models for user"""
-        user_tier = self.user_manager.get_user_tier(user_id)
-        router = getattr(self.inference_engine, "router", None)
-        if router is None:
+        if not self.router:
             return []
 
-        provider_health = self._provider_health_by_name()
+        user_tier = self.user_manager.get_user_tier(user_id)
+        check_user_access = getattr(self.router, "_check_user_access", None)
         models = []
-        for model_name, model_config in getattr(router, "models", {}).items():
-            check_access = getattr(router, "_check_user_access", None)
-            if callable(check_access) and not check_access(model_config, user_tier):
+        for model_name in getattr(self.router, "models", {}):
+            model_info = self.router.get_model_info(model_name)
+            if not model_info:
                 continue
 
-            model_info = (
-                router.get_model_info(model_name)
-                if hasattr(router, "get_model_info")
-                else None
-            ) or {}
-            model_stats = dict(model_info.get("stats", {}))
-            provider_name = str(getattr(model_config, "provider", "")).lower()
-            provider_is_healthy = provider_health.get(provider_name, True)
+            model_config = getattr(self.router, "models", {}).get(model_name)
+            if callable(check_user_access) and model_config is not None:
+                if not check_user_access(model_config, user_tier.value):
+                    continue
+
+            config = model_info["config"]
+            provider_name = config.get("provider", "unknown")
+            provider = getattr(self.inference_engine, "providers", {}).get(provider_name)
+            provider_health = (
+                provider.get_health_status() if provider and hasattr(provider, "get_health_status") else {}
+            )
+            available = provider is not None and provider_health.get("status", "healthy") == "healthy"
+
             models.append(
                 {
                     "name": model_name,
-                    "provider": getattr(model_config, "provider", "unknown"),
-                    "capabilities": list(getattr(model_config, "capabilities", [])),
-                    "max_tokens": int(getattr(model_config, "max_tokens", 0) or 0),
-                    "cost_per_1k_tokens": float(
-                        getattr(model_config, "cost_per_token", 0.0) or 0.0
-                    )
-                    * 1000.0,
-                    "description": self._describe_model(model_config),
-                    "available": bool(provider_is_healthy),
-                    "success_rate": model_stats.get("success_rate"),
-                    "avg_latency_ms": model_stats.get("avg_latency"),
+                    "provider": provider_name,
+                    "capabilities": config.get("capabilities", []),
+                    "max_tokens": config.get("max_tokens", 0),
+                    "cost_per_1k_tokens": config.get("cost_per_token", 0.0) * 1000,
+                    "description": ", ".join(config.get("capabilities", [])) or "General use",
+                    "available": available,
                 }
             )
 
-        return sorted(
-            models,
-            key=lambda model: (
-                not model.get("available", False),
-                float(model.get("avg_latency_ms") or float("inf")),
-                model["name"],
-            ),
-        )
+        return models
 
     async def get_user_analytics(self, user_id: str) -> Dict[str, Any]:
         """Get user analytics"""
-        recent_history = self.user_manager.get_query_history(user_id, hours=24 * 7)
-        aggregated = self._aggregate_query_history(recent_history)
-        analytics = {
-            "total_queries": aggregated["queries"],
-            "total_tokens": aggregated["total_tokens"],
-            "total_cost": aggregated["cost"],
-            "daily_avg_queries": aggregated["queries"] / 7.0,
-            "avg_latency": aggregated["avg_latency_ms"],
-            "success_rate": aggregated["success_rate_pct"],
-            "cache_hit_rate": aggregated["cache_hit_rate_pct"],
-            "model_breakdown": aggregated["model_breakdown"],
-            "query_type_breakdown": aggregated["query_type_breakdown"],
-        }
+        analytics = {}
+        if self.analytics_service and hasattr(self.analytics_service, "get_query_analytics"):
+            analytics = await self.analytics_service.get_query_analytics(user_id, hours=168)
+        elif self.analytics_service and hasattr(self.analytics_service, "get_analytics"):
+            analytics = await self.analytics_service.get_analytics(user_id, hours=168)
 
-        pipeline = self.services.get("pipeline")
-        if pipeline is not None:
-            pipeline_analytics = await pipeline.get_query_analytics(
-                user_id=user_id, hours=24 * 7
-            )
-            if pipeline_analytics:
-                analytics.update(
-                    {
-                        "total_queries": int(
-                            pipeline_analytics.get("total_queries", 0) or 0
-                        ),
-                        "total_tokens": int(
-                            pipeline_analytics.get("total_tokens", 0) or 0
-                        ),
-                        "total_cost": float(
-                            pipeline_analytics.get("total_cost", 0.0) or 0.0
-                        ),
-                        "daily_avg_queries": float(
-                            int(pipeline_analytics.get("total_queries", 0) or 0) / 7.0
-                        ),
-                        "avg_latency": float(
-                            pipeline_analytics.get("avg_latency", 0.0) or 0.0
-                        ),
-                        "success_rate": float(
-                            pipeline_analytics.get("success_rate", 0.0) or 0.0
-                        ),
-                        "model_breakdown": dict(
-                            pipeline_analytics.get("model_breakdown", {})
-                        ),
-                        "query_type_breakdown": dict(
-                            pipeline_analytics.get("query_type_breakdown", {})
-                        ),
-                    }
-                )
-
+        total_queries = analytics.get("total_queries", 0)
+        analytics.setdefault("daily_avg_queries", total_queries / 7 if total_queries else 0.0)
+        analytics.setdefault("cache_hit_rate", 0.0)
+        analytics.setdefault("model_breakdown", {})
+        analytics.setdefault("query_type_breakdown", {})
+        analytics.setdefault("total_tokens", 0)
+        analytics.setdefault("total_cost", 0.0)
+        analytics.setdefault("avg_latency", 0.0)
+        analytics.setdefault("success_rate", 0.0)
         return analytics
 
-    def _provider_health_by_name(self) -> Dict[str, bool]:
-        """Return provider health keyed by provider name."""
-        if not hasattr(self.inference_engine, "get_health_status"):
-            return {}
-
-        health_status = self.inference_engine.get_health_status()
-        providers = dict(health_status.get("providers", {}))
-        return {
-            provider_name.lower(): provider_payload.get("status") == "healthy"
-            for provider_name, provider_payload in providers.items()
-        }
-
-    def _describe_model(self, model_config: Any) -> str:
-        """Build a concise description from the actual router model config."""
-        capabilities = list(getattr(model_config, "capabilities", []))
-        capability_text = ", ".join(capabilities[:3]) if capabilities else "general"
-        return (
-            f"{getattr(model_config, 'provider', 'unknown')} model "
-            f"for {capability_text}"
-        )
-
-    def _format_uptime(self) -> str:
-        """Return a compact human-readable uptime string."""
-        delta = max(datetime.now() - self.started_at, timedelta())
-        total_seconds = int(delta.total_seconds())
-        hours, remainder = divmod(total_seconds, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        if hours > 0:
-            return f"{hours}h {minutes}m"
-        if minutes > 0:
-            return f"{minutes}m {seconds}s"
-        return f"{seconds}s"
-
-    def _get_process_local_avg_latency_ms(self) -> float:
-        """Return a best-effort local average latency when pipeline analytics are absent."""
-        inference_stats = getattr(self.inference_engine, "inference_stats", {})
-        total_requests = sum(
-            int(stats.get("total_requests", 0) or 0) for stats in inference_stats.values()
-        )
-        total_time_seconds = sum(
-            float(stats.get("total_time", 0.0) or 0.0)
-            for stats in inference_stats.values()
-        )
-        if total_requests > 0 and total_time_seconds > 0:
-            return (total_time_seconds / total_requests) * 1000.0
-        return histogram_average(INFERENCE_METRICS.request_duration) * 1000.0
-
-    def _aggregate_query_history(
-        self, history: List[Dict[str, Any]]
-    ) -> Dict[str, Any]:
-        """Aggregate persisted Slack user query history."""
-        total_queries = len(history)
-        success_count = sum(1 for event in history if event.get("success"))
-        total_latency = sum(int(event.get("latency_ms", 0) or 0) for event in history)
-        total_tokens = sum(int(event.get("total_tokens", 0) or 0) for event in history)
-        total_cost = sum(float(event.get("cost_usd", 0.0) or 0.0) for event in history)
-        cached_count = sum(1 for event in history if event.get("cached"))
-
-        model_breakdown: Dict[str, Dict[str, Any]] = {}
-        query_type_breakdown: Dict[str, int] = {}
-        for event in history:
-            model_name = event.get("model_name")
-            if model_name:
-                model_entry = model_breakdown.setdefault(
-                    model_name, {"queries": 0, "cost": 0.0}
-                )
-                model_entry["queries"] += 1
-                model_entry["cost"] += float(event.get("cost_usd", 0.0) or 0.0)
-
-            query_type = str(event.get("query_type") or "general")
-            query_type_breakdown[query_type] = (
-                query_type_breakdown.get(query_type, 0) + 1
-            )
-
-        return {
-            "queries": total_queries,
-            "total_tokens": total_tokens,
-            "cost": total_cost,
-            "avg_latency_ms": (
-                total_latency / total_queries if total_queries > 0 else 0.0
-            ),
-            "success_rate_pct": (
-                (success_count / total_queries) * 100.0 if total_queries > 0 else 0.0
-            ),
-            "cache_hit_rate_pct": (
-                (cached_count / total_queries) * 100.0 if total_queries > 0 else 0.0
-            ),
-            "model_breakdown": model_breakdown,
-            "query_type_breakdown": query_type_breakdown,
-        }
+    def is_healthy(self) -> bool:
+        """Check whether the Slack bot initialized correctly."""
+        return self.initialized and self.web_client is not None and self.socket_client is not None
 
     async def shutdown(self):
         """Shutdown the Slack bot"""
         logger.info("Shutting down Slack bot...")
         self.running = False
 
+        for task in list(self.background_tasks):
+            task.cancel()
+
+        if self.background_tasks:
+            await asyncio.gather(*self.background_tasks, return_exceptions=True)
+
         if self.socket_client:
             await self.socket_client.disconnect()
 
+        if not self._uses_granular_redis_state():
+            await self._persist_state()
+        await self.state_store.shutdown()
+
         logger.info("Slack bot shutdown complete")
+
+    def _resolve_secret(self, value_key: str, env_key: str) -> Optional[str]:
+        """Resolve a secret from config value or named environment variable."""
+        direct_value = self.config.get(value_key)
+        if direct_value:
+            return direct_value
+
+        env_name = self.config.get(env_key)
+        if env_name:
+            return os.getenv(env_name)
+
+        return None
+
+    async def _resolve_allowed_channels(self):
+        """Resolve configured channel names to Slack channel IDs when possible."""
+        self.allowed_channel_ids = set()
+        self.allowed_channel_names = set()
+
+        unresolved_names = set()
+        for channel in self.allowed_channels:
+            raw_value = (channel or "").strip().lstrip("#")
+            if not raw_value:
+                continue
+            if self._looks_like_channel_id(raw_value):
+                self.allowed_channel_ids.add(raw_value)
+            else:
+                unresolved_names.add(raw_value.lower())
+
+        if not unresolved_names or not self.web_client:
+            self.allowed_channel_names = unresolved_names
+            return
+
+        cursor = None
+        try:
+            while True:
+                response = await self.web_client.conversations_list(
+                    limit=1000,
+                    types="public_channel,private_channel",
+                    cursor=cursor,
+                )
+                for channel in response.get("channels", []):
+                    channel_name = self._normalize_channel_name(channel.get("name"))
+                    channel_id = channel.get("id")
+                    if channel_name in unresolved_names and channel_id:
+                        self.allowed_channel_ids.add(channel_id)
+                        unresolved_names.discard(channel_name)
+
+                cursor = response.get("response_metadata", {}).get("next_cursor")
+                if not cursor or not unresolved_names:
+                    break
+        except Exception as exc:
+            logger.warning(f"Failed to resolve Slack channel allowlist: {exc}")
+
+        self.allowed_channel_names = unresolved_names
+        if unresolved_names:
+            logger.warning(
+                "Unresolved Slack channels remain in allowlist: %s",
+                ", ".join(sorted(unresolved_names)),
+            )
+
+    async def _is_channel_allowed(
+        self, channel_id: Optional[str], channel_name: Optional[str] = None
+    ) -> bool:
+        """Check whether the bot is enabled in the target channel."""
+        if not self.allowed_channels:
+            return True
+
+        if channel_id and channel_id in self.allowed_channel_ids:
+            return True
+
+        normalized_name = self._normalize_channel_name(channel_name)
+        if normalized_name and normalized_name in self.allowed_channel_names:
+            return True
+
+        if (
+            channel_id
+            and self.allowed_channel_names
+            and self.web_client is not None
+            and hasattr(self.web_client, "conversations_info")
+        ):
+            try:
+                response = await self.web_client.conversations_info(channel=channel_id)
+                resolved_name = self._normalize_channel_name(
+                    response.get("channel", {}).get("name")
+                )
+                if resolved_name and resolved_name in self.allowed_channel_names:
+                    self.allowed_channel_ids.add(channel_id)
+                    return True
+            except Exception as exc:
+                logger.warning(
+                    f"Failed to resolve Slack channel info for allowlist check: {exc}"
+                )
+
+        return False
+
+    def _normalize_channel_name(self, channel_name: Optional[str]) -> str:
+        """Normalize channel names for consistent allowlist matching."""
+        if not channel_name:
+            return ""
+        return channel_name.strip().lstrip("#").lower()
+
+    def _looks_like_channel_id(self, value: str) -> bool:
+        """Return whether a configured channel resembles a Slack channel ID."""
+        return (
+            len(value) >= 9
+            and value[0] in {"C", "G", "D"}
+            and value.upper() == value
+            and value.isalnum()
+        )
+
+    def _thread_key(self, channel_id: str, thread_ts: str) -> str:
+        """Build a stable key for active thread tracking."""
+        return f"{channel_id}:{thread_ts}"
+
+    def _mark_thread_active(self, channel_id: Optional[str], thread_ts: Optional[str]):
+        """Mark a bot thread as active for follow-up replies."""
+        if not channel_id or not thread_ts:
+            return
+        self.active_threads[self._thread_key(channel_id, thread_ts)] = datetime.now()
+
+    def _is_active_thread(self, channel_id: Optional[str], thread_ts: Optional[str]) -> bool:
+        """Return whether a Slack thread is still active."""
+        if not channel_id or not thread_ts:
+            return False
+
+        key = self._thread_key(channel_id, thread_ts)
+        last_activity = self.active_threads.get(key)
+        if not last_activity:
+            return False
+
+        if datetime.now() - last_activity > self.active_thread_timeout:
+            self.active_threads.pop(key, None)
+            return False
+
+        self.active_threads[key] = datetime.now()
+        return True
+
+    def _cleanup_expired_threads(self, return_keys: bool = False):
+        """Drop inactive thread markers after the configured timeout."""
+        now = datetime.now()
+        expired_keys = [
+            key
+            for key, last_activity in self.active_threads.items()
+            if now - last_activity > self.active_thread_timeout
+        ]
+
+        for key in expired_keys:
+            del self.active_threads[key]
+
+        if return_keys:
+            return expired_keys
+        return len(expired_keys)
+
+    def clear_active_threads(self, channel_id: Optional[str] = None, return_keys: bool = False):
+        """Clear tracked active threads, optionally limited to one channel."""
+        if channel_id is None:
+            cleared_keys = list(self.active_threads.keys())
+            self.active_threads.clear()
+            if return_keys:
+                return cleared_keys
+            return len(cleared_keys)
+
+        prefix = f"{channel_id}:"
+        matching_keys = [key for key in self.active_threads if key.startswith(prefix)]
+        for key in matching_keys:
+            del self.active_threads[key]
+        if return_keys:
+            return matching_keys
+        return len(matching_keys)
+
+    def _is_supported_inline_command(self, text: str) -> bool:
+        """Return whether inline `/llm` / `!llm` text maps to a supported command."""
+        extract_command_text = getattr(
+            self.message_handler, "extract_prefixed_command_text", None
+        )
+        if not callable(extract_command_text):
+            return False
+        command_text = extract_command_text(text)
+        if command_text is None:
+            return False
+        is_supported_command = getattr(self.message_handler, "is_supported_command", None)
+        if not callable(is_supported_command):
+            return False
+        return is_supported_command(command_text)
+
+    def _is_query_text(self, text: str) -> bool:
+        """Return whether a Slack message should count against rate limits."""
+        normalized = (text or "").strip()
+        if not normalized:
+            return False
+        return not self._is_supported_inline_command(normalized)
+
+    def _is_query_event(self, event: Dict[str, Any]) -> bool:
+        """Return whether a Slack event should consume query quota."""
+        return self._is_query_text(event.get("text", "")) or bool(event.get("files"))
+
+    def _synchronize_user_tier(self, user_id: Optional[str]) -> bool:
+        """Apply configured user-tier defaults/overrides to the in-memory state."""
+        return self.user_manager.ensure_user_record(user_id or "")
+
+    def _get_rate_limit_config_for_tier(self, user_tier: UserTier) -> Dict[str, int]:
+        """Resolve rate-limit settings for a concrete tier."""
+        base_limits = {
+            "requests_per_hour": int(self.rate_limiting.get("requests_per_hour", 100) or 100),
+            "burst_requests": int(self.rate_limiting.get("burst_requests", 5) or 5),
+        }
+        tier_overrides = self.rate_limiting.get("by_tier", {}).get(user_tier.value, {})
+        if isinstance(tier_overrides, dict):
+            for key in ("requests_per_hour", "burst_requests"):
+                if key in tier_overrides:
+                    base_limits[key] = int(tier_overrides[key])
+        return base_limits
+
+    def _get_rate_limit_config_for_user(self, user_id: str) -> Dict[str, int]:
+        """Resolve rate-limit settings for the user's current tier."""
+        return self._get_rate_limit_config_for_tier(self.user_manager.get_user_tier(user_id))
+
+    def _format_tier_limit_summary(self) -> str:
+        """Render the configured tier limits for Slack help text."""
+        summaries = []
+        for tier in (UserTier.FREE, UserTier.PREMIUM, UserTier.ENTERPRISE):
+            limits = self._get_rate_limit_config_for_tier(tier)
+            summaries.append(
+                f"{self._tier_emoji(tier)} {tier.value.title()}: "
+                f"{limits['requests_per_hour']} requests/hour, "
+                f"{limits['burst_requests']} burst requests / 5 min"
+            )
+        return "\n".join(summaries)
+
+    def _tier_emoji(self, tier: UserTier) -> str:
+        if tier == UserTier.PREMIUM:
+            return "💎"
+        if tier == UserTier.ENTERPRISE:
+            return "🏢"
+        return "🆓"
+
+    async def _post_command_response(self, channel_id: str, user_id: str, text: str):
+        """Respond to a slash command, preferring ephemeral responses."""
+        max_length = self.config.get("response_settings", {}).get(
+            "max_response_length", 2000
+        )
+        responses = self._split_response(text, max_length)
+
+        if hasattr(self.web_client, "chat_postEphemeral"):
+            for response_text in responses:
+                await self.web_client.chat_postEphemeral(
+                    channel=channel_id,
+                    user=user_id,
+                    text=response_text,
+                )
+            return
+
+        for response_text in responses:
+            await self.web_client.chat_postMessage(channel=channel_id, text=response_text)
+
+    def _spawn_background_task(self, coroutine, name: str):
+        """Track background tasks so request acks stay fast without losing errors."""
+        task = asyncio.create_task(coroutine, name=name)
+        self.background_tasks.add(task)
+        task.add_done_callback(self._finalize_background_task)
+        return task
+
+    def _finalize_background_task(self, task: asyncio.Task):
+        """Log unexpected background task failures and drop completed tasks."""
+        self.background_tasks.discard(task)
+
+        if task.cancelled():
+            return
+
+        try:
+            exception = task.exception()
+        except Exception as exc:
+            logger.error(f"Failed to inspect Slack background task: {exc}")
+            return
+
+        if exception:
+            logger.error(f"Slack background task failed: {exception}")
+
+    def _get_uptime_text(self) -> str:
+        """Render a human-readable uptime string."""
+        if not self.started_at:
+            return "Not started"
+
+        uptime = datetime.now() - self.started_at
+        total_seconds = int(uptime.total_seconds())
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, _seconds = divmod(remainder, 60)
+
+        if hours:
+            return f"{hours}h {minutes}m"
+        return f"{minutes}m"
+
+    def _build_query_metadata(
+        self,
+        channel_id: str,
+        thread_ts: Optional[str],
+        attachments: List[Attachment],
+        user_preferences: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Attach Slack-specific metadata to routed queries."""
+        user_preferences = user_preferences or {}
+        preferred_models = [
+            model_name
+            for model_name in user_preferences.get("preferred_models", [])
+            if model_name
+        ]
+        response_style_instructions = self._build_response_style_instructions(
+            user_preferences
+        )
+        return {
+            "source": "slack",
+            "preferred_models": preferred_models,
+            "response_style_instructions": response_style_instructions,
+            "slack": {
+                "channel_id": channel_id,
+                "thread_ts": thread_ts,
+                "attachment_count": len(attachments),
+                "attachment_names": [attachment.name for attachment in attachments],
+                "technical_level": user_preferences.get("technical_level", "intermediate"),
+                "threading": user_preferences.get("threading", True),
+                "response_length": user_preferences.get("response_length", "medium"),
+            },
+        }
+
+    def _build_response_style_instructions(
+        self, user_preferences: Optional[Dict[str, Any]]
+    ) -> Optional[str]:
+        """Translate Slack user preferences into provider-friendly style instructions."""
+        preferences = user_preferences or {}
+        technical_level = preferences.get("technical_level", "intermediate")
+        response_length = preferences.get("response_length", "medium")
+
+        technical_guidance = {
+            "beginner": "Explain in simple terms, define jargon, and include short practical examples.",
+            "intermediate": "Assume working familiarity with the topic and balance clarity with technical depth.",
+            "expert": "Use precise technical terminology, skip foundational explanations, and focus on advanced detail.",
+        }
+        length_guidance = {
+            "short": "Keep the response concise and focused on the key answer.",
+            "medium": "Use a moderate amount of detail.",
+            "long": "Provide a thorough, detailed answer when the topic warrants it.",
+        }
+
+        instructions = []
+        if technical_level in technical_guidance:
+            instructions.append(technical_guidance[technical_level])
+        if response_length in length_guidance:
+            instructions.append(length_guidance[response_length])
+
+        if not instructions:
+            return None
+        return " ".join(instructions)
+
+    def _build_user_safe_error_message(self) -> str:
+        """Return a generic Slack-safe error message without leaking internals."""
+        return "❌ Sorry, I couldn't process that request right now. Please try again in a moment."
+
+    def _conversation_context_key(
+        self, user_id: str, channel_id: str, thread_ts: Optional[str]
+    ) -> str:
+        """Build the canonical conversation key used by the conversation manager."""
+        return f"{user_id}:{channel_id}:{thread_ts or 'main'}"
+
+    async def _extract_query_attachments(self, event: Dict[str, Any]) -> List[Attachment]:
+        """Convert Slack file payloads into QueryRequest attachments."""
+        if not self.attachment_settings.get("enabled", True):
+            return []
+
+        files = list(event.get("files", []) or [])
+        if not files:
+            return []
+
+        max_files = min(
+            int(self.attachment_settings.get("max_files", 10) or 10),
+            10,
+        )
+        attachments = []
+
+        for file_payload in files[:max_files]:
+            attachment = await self._build_attachment_from_slack_file(file_payload)
+            if attachment is not None:
+                attachments.append(attachment)
+
+        return attachments
+
+    async def _build_attachment_from_slack_file(
+        self, file_payload: Dict[str, Any]
+    ) -> Optional[Attachment]:
+        """Build a normalized attachment object from Slack file metadata."""
+        if file_payload.get("mode") == "tombstone":
+            return None
+
+        download_url = (
+            file_payload.get("url_private_download") or file_payload.get("url_private")
+        )
+        mime_type = file_payload.get("mimetype") or "application/octet-stream"
+        attachment_type = self._infer_attachment_type(mime_type)
+        name = file_payload.get("name") or file_payload.get("title") or file_payload.get("id")
+        if not name:
+            return None
+
+        size_bytes = int(file_payload.get("size") or 0)
+        content = None
+        max_file_size_bytes = int(
+            self.attachment_settings.get("max_file_size_bytes", 10_000_000) or 10_000_000
+        )
+
+        if download_url and size_bytes <= max_file_size_bytes:
+            content = await self._download_attachment_content(download_url)
+            if content is not None and size_bytes <= 0:
+                size_bytes = len(content)
+
+        if size_bytes <= 0:
+            if content:
+                size_bytes = len(content)
+            else:
+                logger.warning("Skipping Slack file without usable size metadata: %s", name)
+                return None
+
+        return Attachment(
+            id=file_payload.get("id") or str(uuid.uuid4()),
+            name=name,
+            type=attachment_type,
+            size_bytes=size_bytes,
+            mime_type=mime_type,
+            url=download_url,
+            content=content,
+        )
+
+    async def _download_attachment_content(self, download_url: str) -> Optional[bytes]:
+        """Download a private Slack file using the bot token."""
+        if not download_url or not self.bot_token:
+            return None
+
+        timeout_seconds = self.attachment_settings.get("download_timeout_seconds", 30)
+        try:
+            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                response = await client.get(
+                    download_url,
+                    headers={"Authorization": f"Bearer {self.bot_token}"},
+                )
+                if hasattr(response, "raise_for_status"):
+                    response.raise_for_status()
+                return getattr(response, "content", None)
+        except Exception as exc:
+            logger.warning(f"Failed to download Slack attachment from {download_url}: {exc}")
+            return None
+
+    def _infer_attachment_type(self, mime_type: str) -> AttachmentType:
+        """Map a MIME type to the internal attachment type enum."""
+        normalized = (mime_type or "").lower()
+        if normalized.startswith("image/"):
+            return AttachmentType.IMAGE
+        if normalized.startswith("audio/"):
+            return AttachmentType.AUDIO
+        if (
+            normalized.startswith("text/")
+            or "pdf" in normalized
+            or "document" in normalized
+            or "spreadsheet" in normalized
+            or "presentation" in normalized
+            or "json" in normalized
+            or "csv" in normalized
+        ):
+            return AttachmentType.DOCUMENT
+        return AttachmentType.FILE
+
+    def _uses_granular_redis_state(self) -> bool:
+        """Return whether the configured state backend supports granular Redis writes."""
+        return isinstance(self.state_store, RedisSlackStateStore)
+
+    async def _persist_user_state(self, user_id: str):
+        """Persist one user's settings and rate-limit counters."""
+        if not user_id:
+            return
+
+        if self._uses_granular_redis_state():
+            await self.state_store.persist_user_state(
+                user_id,
+                self.user_manager.users.get(user_id, {}),
+                self.user_manager.rate_limits.get(user_id, []),
+            )
+            return
+
+        await self._persist_state()
+
+    async def _persist_conversation_state(self, context_key: Optional[str]):
+        """Persist one conversation context."""
+        if not context_key:
+            return
+
+        if self._uses_granular_redis_state():
+            context = self.conversation_manager.conversations.get(context_key)
+            if context is None:
+                await self.state_store.delete_conversation_states([context_key])
+                return
+
+            await self.state_store.persist_conversation_state(
+                context_key,
+                self._serialize_conversation_context(context),
+            )
+            return
+
+        await self._persist_state()
+
+    async def _delete_conversation_states(self, context_keys: List[str]):
+        """Delete one or more persisted conversation contexts."""
+        if not context_keys:
+            return
+
+        if self._uses_granular_redis_state():
+            await self.state_store.delete_conversation_states(context_keys)
+            return
+
+        await self._persist_state()
+
+    async def _persist_active_thread_state(self, thread_key: Optional[str]):
+        """Persist one active bot-thread marker."""
+        if not thread_key:
+            return
+
+        if self._uses_granular_redis_state():
+            last_activity = self.active_threads.get(thread_key)
+            if last_activity is None:
+                await self.state_store.delete_active_thread_states([thread_key])
+                return
+
+            await self.state_store.persist_active_thread_state(
+                thread_key,
+                last_activity.isoformat(),
+            )
+            return
+
+        await self._persist_state()
+
+    async def _delete_active_thread_states(self, thread_keys: List[str]):
+        """Delete one or more active bot-thread markers."""
+        if not thread_keys:
+            return
+
+        if self._uses_granular_redis_state():
+            await self.state_store.delete_active_thread_states(thread_keys)
+            return
+
+        await self._persist_state()
+
+    async def _persist_message_state(
+        self,
+        user_id: Optional[str] = None,
+        conversation_key: Optional[str] = None,
+        active_thread_key: Optional[str] = None,
+    ):
+        """Persist only the pieces of state changed by a handled Slack message."""
+        if user_id:
+            await self._persist_user_state(user_id)
+        if conversation_key:
+            await self._persist_conversation_state(conversation_key)
+        if active_thread_key:
+            await self._persist_active_thread_state(active_thread_key)
+
+    async def _restore_state(self):
+        """Hydrate in-memory Slack state from the configured backend."""
+        snapshot = await self.state_store.load_state()
+        if not snapshot:
+            return
+
+        self.user_manager.users = dict(snapshot.get("users", {}))
+        self.user_manager.rate_limits = {
+            user_id: [float(value) for value in values]
+            for user_id, values in snapshot.get("rate_limits", {}).items()
+        }
+        self.conversation_manager.conversations = {
+            key: self._deserialize_conversation_context(value)
+            for key, value in snapshot.get("conversations", {}).items()
+        }
+        self.active_threads = {
+            key: self._deserialize_datetime(value)
+            for key, value in snapshot.get("active_threads", {}).items()
+        }
+
+        expired_sessions = self.conversation_manager.cleanup_expired_sessions(
+            return_keys=True
+        )
+        expired_threads = self._cleanup_expired_threads(return_keys=True)
+        if expired_sessions or expired_threads:
+            await self._delete_conversation_states(expired_sessions)
+            await self._delete_active_thread_states(expired_threads)
+
+    async def _persist_state(self):
+        """Persist the current Slack state through the configured backend."""
+        async with self.state_lock:
+            snapshot = {
+                "schema_version": STATE_SCHEMA_VERSION,
+                "saved_at": datetime.now().isoformat(),
+                "users": self.user_manager.users,
+                "rate_limits": self.user_manager.rate_limits,
+                "conversations": {
+                    key: self._serialize_conversation_context(context)
+                    for key, context in self.conversation_manager.conversations.items()
+                },
+                "active_threads": {
+                    key: value.isoformat()
+                    for key, value in self.active_threads.items()
+                },
+            }
+            await self.state_store.save_state(snapshot)
+
+    def _serialize_conversation_context(
+        self, context: ConversationContext
+    ) -> Dict[str, Any]:
+        """Serialize a conversation context to JSON-friendly data."""
+        return {
+            "user_id": context.user_id,
+            "channel_id": context.channel_id,
+            "thread_ts": context.thread_ts,
+            "conversation_history": context.conversation_history,
+            "user_tier": context.user_tier.value,
+            "preferences": context.preferences,
+            "last_activity": context.last_activity.isoformat(),
+            "session_id": context.session_id,
+        }
+
+    def _deserialize_conversation_context(
+        self, payload: Dict[str, Any]
+    ) -> ConversationContext:
+        """Restore a serialized conversation context."""
+        user_tier = payload.get("user_tier", UserTier.FREE.value)
+        try:
+            tier = UserTier(user_tier)
+        except ValueError:
+            tier = UserTier.FREE
+
+        return ConversationContext(
+            user_id=payload.get("user_id", ""),
+            channel_id=payload.get("channel_id", ""),
+            thread_ts=payload.get("thread_ts"),
+            conversation_history=list(payload.get("conversation_history", [])),
+            user_tier=tier,
+            preferences=dict(payload.get("preferences", {})),
+            last_activity=self._deserialize_datetime(payload.get("last_activity")),
+            session_id=payload.get("session_id", str(uuid.uuid4())),
+        )
+
+    def _deserialize_datetime(self, value: Optional[str]) -> datetime:
+        """Restore datetimes stored in Slack state snapshots."""
+        if not value:
+            return datetime.now()
+
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return datetime.now()

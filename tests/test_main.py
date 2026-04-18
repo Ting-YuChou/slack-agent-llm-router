@@ -185,10 +185,26 @@ class DummyMonitoring:
 
 
 class DummySlackBot:
-    def __init__(self, config, inference_engine, services=None):
+    def __init__(
+        self,
+        config,
+        inference_engine,
+        services=None,
+        router=None,
+        monitoring_service=None,
+        analytics_service=None,
+    ):
         self.config = config
         self.inference_engine = inference_engine
-        self.services = services or {}
+        resolved_services = services or {}
+        self.services = resolved_services
+        self.router = router or resolved_services.get("router")
+        self.monitoring_service = monitoring_service or resolved_services.get(
+            "monitoring"
+        )
+        self.analytics_service = analytics_service or resolved_services.get(
+            "pipeline"
+        )
 
     async def initialize(self):
         return None

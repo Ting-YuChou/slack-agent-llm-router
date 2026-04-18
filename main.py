@@ -245,6 +245,9 @@ class LLMRouterPlatform:
                 config=self.config.get("slack", {}),
                 inference_engine=self.services["inference"],
                 services=self.services,
+                router=self.services.get("router"),
+                monitoring_service=self.services.get("monitoring"),
+                analytics_service=self.services.get("pipeline"),
             )
             await self.services["slack_bot"].initialize()
 
