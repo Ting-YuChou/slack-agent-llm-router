@@ -10,7 +10,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Callable
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 import uuid
 
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
@@ -298,6 +298,61 @@ class AlertEventEntry:
             "provider": self.provider,
             "window_start_ms": self.window_start_ms,
             "window_end_ms": self.window_end_ms,
+            "payload_json": self.payload_json,
+        }
+
+
+@dataclass
+class RoutingPolicyStateEntry:
+    """Structure for persisted routing.policy_state events."""
+
+    timestamp: datetime
+    scope_type: str
+    scope_key: str
+    user_id: str = ""
+    session_id: str = ""
+    user_tier: str = ""
+    hint_reason: str = ""
+    recent_request_count: int = 0
+    recent_error_rate: float = 0.0
+    avg_latency_ms: float = 0.0
+    fast_lane_hit_rate: float = 0.0
+    dominant_query_type: str = ""
+    query_complexity: str = ""
+    requires_low_latency: bool = False
+    requires_high_reasoning: bool = False
+    route_to_fast_lane: bool = False
+    burst_protection_active: bool = False
+    enterprise_priority_active: bool = False
+    preferred_models: List[str] = field(default_factory=list)
+    avoid_models: List[str] = field(default_factory=list)
+    avoid_providers: List[str] = field(default_factory=list)
+    payload_json: str = "{}"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for database insertion."""
+        return {
+            "timestamp": self.timestamp,
+            "scope_type": self.scope_type,
+            "scope_key": self.scope_key,
+            "user_id": self.user_id,
+            "session_id": self.session_id,
+            "user_tier": self.user_tier,
+            "hint_reason": self.hint_reason,
+            "recent_request_count": self.recent_request_count,
+            "recent_error_rate": self.recent_error_rate,
+            "avg_latency_ms": self.avg_latency_ms,
+            "fast_lane_hit_rate": self.fast_lane_hit_rate,
+            "dominant_query_type": self.dominant_query_type,
+            "query_complexity": self.query_complexity,
+            "requires_low_latency": self.requires_low_latency,
+            "requires_high_reasoning": self.requires_high_reasoning,
+            "route_to_fast_lane": self.route_to_fast_lane,
+            "burst_protection_active": self.burst_protection_active,
+            "enterprise_priority_active": self.enterprise_priority_active,
+            "preferred_models": list(self.preferred_models),
+            "avoid_models": list(self.avoid_models),
+            "avoid_providers": list(self.avoid_providers),
             "payload_json": self.payload_json,
         }
 
@@ -700,6 +755,38 @@ class ClickHouseManager:
             database=self.database
         )
 
+        routing_policy_state_sql = """
+        CREATE TABLE IF NOT EXISTS {database}.routing_policy_state_events (
+            timestamp DateTime64(3),
+            scope_type String,
+            scope_key String,
+            user_id String,
+            session_id String,
+            user_tier String,
+            hint_reason String,
+            recent_request_count UInt32,
+            recent_error_rate Float32,
+            avg_latency_ms Float32,
+            fast_lane_hit_rate Float32,
+            dominant_query_type String,
+            query_complexity String,
+            requires_low_latency Boolean,
+            requires_high_reasoning Boolean,
+            route_to_fast_lane Boolean,
+            burst_protection_active Boolean,
+            enterprise_priority_active Boolean,
+            preferred_models Array(String),
+            avoid_models Array(String),
+            avoid_providers Array(String),
+            payload_json String
+        ) ENGINE = ReplacingMergeTree()
+        PARTITION BY toYYYYMMDD(timestamp)
+        ORDER BY (scope_type, scope_key, timestamp)
+        TTL toDateTime(timestamp) + INTERVAL 30 DAY
+        """.format(
+            database=self.database
+        )
+
         # Execute table creation
         tables = [
             ("query_logs", query_logs_sql),
@@ -707,6 +794,7 @@ class ClickHouseManager:
             ("model_performance", performance_sql),
             ("user_analytics", user_analytics_sql),
             ("alert_events", alert_events_sql),
+            ("routing_policy_state_events", routing_policy_state_sql),
         ]
 
         for table_name, sql in tables:
@@ -821,6 +909,27 @@ class ClickHouseManager:
             )
         except Exception as e:
             logger.error(f"Failed to batch insert alert events: {e}")
+            PIPELINE_METRICS.insertion_errors.inc()
+            raise
+
+    async def batch_insert_routing_policy_state(
+        self, state_events: List[RoutingPolicyStateEntry]
+    ):
+        """Batch insert routing.policy_state events."""
+        if not state_events:
+            return
+
+        try:
+            data = [state_event.to_dict() for state_event in state_events]
+            await self._insert_dict_rows("routing_policy_state_events", data)
+            logger.info(
+                f"Batch inserted {len(state_events)} routing policy state events"
+            )
+            PIPELINE_METRICS.records_inserted.labels(
+                table="routing_policy_state_events"
+            ).inc(len(state_events))
+        except Exception as e:
+            logger.error(f"Failed to batch insert routing policy states: {e}")
             PIPELINE_METRICS.insertion_errors.inc()
             raise
 
@@ -987,7 +1096,7 @@ class ClickHouseManager:
             LIMIT 50
             """
 
-            result = self.client.query(query)
+            result = await self._run_blocking(self.client.query, query)
             guardrails = []
             for row in result.result_rows:
                 payload = {}
@@ -1017,6 +1126,86 @@ class ClickHouseManager:
             return guardrails
         except Exception as e:
             logger.error(f"Failed to get routing guardrails: {e}")
+            return []
+
+    async def get_routing_policy_state_events(
+        self, hours: int = 24
+    ) -> List[Dict[str, Any]]:
+        """Get recent persisted routing.policy_state events for audit and tuning."""
+        try:
+            query = f"""
+            SELECT
+                timestamp,
+                scope_type,
+                scope_key,
+                user_id,
+                session_id,
+                user_tier,
+                hint_reason,
+                recent_request_count,
+                recent_error_rate,
+                avg_latency_ms,
+                fast_lane_hit_rate,
+                dominant_query_type,
+                query_complexity,
+                requires_low_latency,
+                requires_high_reasoning,
+                route_to_fast_lane,
+                burst_protection_active,
+                enterprise_priority_active,
+                preferred_models,
+                avoid_models,
+                avoid_providers,
+                payload_json
+            FROM {self.database}.routing_policy_state_events
+            WHERE timestamp >= now() - INTERVAL {hours} HOUR
+            ORDER BY timestamp DESC
+            LIMIT 50
+            """
+
+            result = await self._run_blocking(self.client.query, query)
+            state_events = []
+            for row in result.result_rows:
+                payload = {}
+                raw_payload = row[21] or "{}"
+                try:
+                    payload = json.loads(raw_payload)
+                except Exception:
+                    payload = {}
+
+                state_events.append(
+                    {
+                        "timestamp": row[0].isoformat()
+                        if hasattr(row[0], "isoformat")
+                        else str(row[0]),
+                        "scope_type": row[1],
+                        "scope_key": row[2],
+                        "user_id": row[3],
+                        "session_id": row[4],
+                        "user_tier": row[5],
+                        "hint_reason": row[6],
+                        "recent_request_count": row[7],
+                        "recent_error_rate": row[8],
+                        "avg_latency_ms": row[9],
+                        "fast_lane_hit_rate": row[10],
+                        "dominant_query_type": row[11],
+                        "query_complexity": row[12],
+                        "requires_low_latency": bool(row[13]),
+                        "requires_high_reasoning": bool(row[14]),
+                        "route_to_fast_lane": bool(row[15]),
+                        "burst_protection_active": bool(row[16]),
+                        "enterprise_priority_active": bool(row[17]),
+                        "preferred_models": list(row[18] or []),
+                        "avoid_models": list(row[19] or []),
+                        "avoid_providers": list(row[20] or []),
+                        "source": "clickhouse",
+                        "payload": payload,
+                    }
+                )
+
+            return state_events
+        except Exception as e:
+            logger.error(f"Failed to get routing policy state events: {e}")
             return []
 
     def shutdown(self):
@@ -1057,12 +1246,15 @@ class KafkaConsumerManager:
             "queries": [],
             "metrics": [],
             "analytics_model_metrics_1m": [],
+            "routing_guardrails": [],
+            "routing_policy_state": [],
             "alerts": [],
         }
         self.observers: Dict[str, List[Callable[[Dict[str, Any]], Any]]] = {
             "requests_enriched": [],
             "analytics_model_metrics_1m": [],
             "routing_guardrails": [],
+            "routing_policy_state": [],
             "alerts": [],
         }
         self.batch_size = 100
@@ -1088,6 +1280,7 @@ class KafkaConsumerManager:
                     "requests_enriched",
                     "analytics_model_metrics_1m",
                     "routing_guardrails",
+                    "routing_policy_state",
                     "alerts",
                 ]:
                     consumer = AIOKafkaConsumer(topic_name, **self.consumer_config)
@@ -1127,6 +1320,10 @@ class KafkaConsumerManager:
             elif topic_key == "routing_guardrails":
                 tasks.append(
                     asyncio.create_task(self._consume_routing_guardrails(consumer))
+                )
+            elif topic_key == "routing_policy_state":
+                tasks.append(
+                    asyncio.create_task(self._consume_routing_policy_state(consumer))
                 )
             elif topic_key == "alerts":
                 tasks.append(asyncio.create_task(self._consume_alerts(consumer)))
@@ -1313,6 +1510,37 @@ class KafkaConsumerManager:
             payload_json=json.dumps(data, default=str),
         )
 
+    def _build_routing_policy_state_entry(
+        self, data: Dict[str, Any]
+    ) -> RoutingPolicyStateEntry:
+        """Convert a routing.policy_state payload to a ClickHouse row."""
+        return RoutingPolicyStateEntry(
+            timestamp=_parse_datetime(data.get("emitted_at")),
+            scope_type=str(data.get("scope_type", "unknown") or "unknown"),
+            scope_key=str(data.get("scope_key", "") or ""),
+            user_id=str(data.get("user_id", "") or ""),
+            session_id=str(data.get("session_id", "") or ""),
+            user_tier=str(data.get("user_tier", "") or ""),
+            hint_reason=str(data.get("hint_reason", "") or ""),
+            recent_request_count=int(data.get("recent_request_count", 0) or 0),
+            recent_error_rate=float(data.get("recent_error_rate", 0.0) or 0.0),
+            avg_latency_ms=float(data.get("avg_latency_ms", 0.0) or 0.0),
+            fast_lane_hit_rate=float(data.get("fast_lane_hit_rate", 0.0) or 0.0),
+            dominant_query_type=str(data.get("dominant_query_type", "") or ""),
+            query_complexity=str(data.get("query_complexity", "") or ""),
+            requires_low_latency=bool(data.get("requires_low_latency", False)),
+            requires_high_reasoning=bool(data.get("requires_high_reasoning", False)),
+            route_to_fast_lane=bool(data.get("route_to_fast_lane", False)),
+            burst_protection_active=bool(data.get("burst_protection_active", False)),
+            enterprise_priority_active=bool(
+                data.get("enterprise_priority_active", False)
+            ),
+            preferred_models=list(data.get("preferred_models", []) or []),
+            avoid_models=list(data.get("avoid_models", []) or []),
+            avoid_providers=list(data.get("avoid_providers", []) or []),
+            payload_json=json.dumps(data, default=str),
+        )
+
     async def _consume_requests_enriched(self, consumer: AIOKafkaConsumer):
         """Consume request-side Flink enrichment events for observers."""
         try:
@@ -1376,7 +1604,8 @@ class KafkaConsumerManager:
                 try:
                     data = message.value
                     guardrail_entry = self._build_alert_event_entry(data)
-                    self.batch_processors["alerts"].append(guardrail_entry)
+                    self.batch_processors["routing_guardrails"].append(guardrail_entry)
+                    self._track_commit_offset("routing_guardrails", message)
                     await self._notify_observers("routing_guardrails", data)
 
                     PIPELINE_METRICS.messages_consumed.labels(
@@ -1387,6 +1616,26 @@ class KafkaConsumerManager:
                     PIPELINE_METRICS.consumer_errors.inc()
         except Exception as e:
             logger.error(f"routing.guardrails consumer error: {e}")
+
+    async def _consume_routing_policy_state(self, consumer: AIOKafkaConsumer):
+        """Consume routing.policy_state events for persistence and observers."""
+        try:
+            async for message in consumer:
+                try:
+                    data = message.value
+                    state_entry = self._build_routing_policy_state_entry(data)
+                    self.batch_processors["routing_policy_state"].append(state_entry)
+                    self._track_commit_offset("routing_policy_state", message)
+                    await self._notify_observers("routing_policy_state", data)
+
+                    PIPELINE_METRICS.messages_consumed.labels(
+                        topic="routing_policy_state"
+                    ).inc()
+                except Exception as e:
+                    logger.error(f"Failed to process routing policy state event: {e}")
+                    PIPELINE_METRICS.consumer_errors.inc()
+        except Exception as e:
+            logger.error(f"routing.policy_state consumer error: {e}")
 
     async def _batch_processor(self):
         """Process batches periodically"""
@@ -1485,6 +1734,13 @@ class KafkaConsumerManager:
             self.clickhouse.batch_insert_model_performance,
         )
         await self._flush_batch_topic(
+            "routing_guardrails", self.clickhouse.batch_insert_alert_events
+        )
+        await self._flush_batch_topic(
+            "routing_policy_state",
+            self.clickhouse.batch_insert_routing_policy_state,
+        )
+        await self._flush_batch_topic(
             "alerts", self.clickhouse.batch_insert_alert_events
         )
 
@@ -1515,6 +1771,7 @@ class KafkaIngestionPipeline:
             "requests_enriched": [],
             "analytics_model_metrics_1m": [],
             "routing_guardrails": [],
+            "routing_policy_state": [],
             "alerts": [],
         }
         self.running = False
@@ -1589,6 +1846,12 @@ class KafkaIngestionPipeline:
         """Get persisted routing guardrails from ClickHouse."""
         return await self.clickhouse_manager.get_routing_guardrails(hours)
 
+    async def get_routing_policy_state_events(
+        self, hours: int = 24
+    ) -> List[Dict[str, Any]]:
+        """Get persisted routing.policy_state events from ClickHouse."""
+        return await self.clickhouse_manager.get_routing_policy_state_events(hours)
+
     def register_stream_handler(
         self, topic_key: str, callback: Callable[[Dict[str, Any]], Any]
     ):
@@ -1619,6 +1882,14 @@ class KafkaIngestionPipeline:
         if callable(routing_guardrail_handler):
             self.register_stream_handler(
                 "routing_guardrails", routing_guardrail_handler
+            )
+
+        routing_policy_state_handler = getattr(
+            monitoring_service, "ingest_stream_routing_policy_state", None
+        )
+        if callable(routing_policy_state_handler):
+            self.register_stream_handler(
+                "routing_policy_state", routing_policy_state_handler
             )
 
         alert_handler = getattr(monitoring_service, "ingest_stream_alert", None)

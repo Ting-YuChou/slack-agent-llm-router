@@ -788,6 +788,20 @@ class LLMRouterPlatform:
             "recent_guardrails": [],
             "persisted_guardrails": [],
         }
+        routing_policy_state = {
+            "state_count": 0,
+            "scope_breakdown": {},
+            "query_complexity_breakdown": {},
+            "dominant_query_type_breakdown": {},
+            "burst_protection_count": 0,
+            "enterprise_priority_count": 0,
+            "route_to_fast_lane_count": 0,
+            "top_preferred_models": {},
+            "top_avoid_models": {},
+            "top_avoid_providers": {},
+            "recent_states": [],
+            "persisted_states": [],
+        }
 
         sources = {
             "overview": "process_local_metrics",
@@ -798,6 +812,7 @@ class LLMRouterPlatform:
             "alerts": "process_local_thresholds",
             "routing_features": "unavailable",
             "routing_guardrails": "unavailable",
+            "routing_policy_state": "unavailable",
             "logs": "structured_log_file",
         }
         source_authority = {
@@ -840,6 +855,10 @@ class LLMRouterPlatform:
                 dict(monitoring_dashboard.get("routing_guardrails", {}) or {})
             )
             sources["routing_guardrails"] = "monitoring_service"
+            routing_policy_state.update(
+                dict(monitoring_dashboard.get("routing_policy_state", {}) or {})
+            )
+            sources["routing_policy_state"] = "monitoring_service"
 
         if "pipeline" in self.services:
             pipeline_analytics = await self.services["pipeline"].get_query_analytics(
@@ -854,6 +873,14 @@ class LLMRouterPlatform:
             pipeline_guardrails = (
                 await get_routing_guardrails(hours=hours)
                 if callable(get_routing_guardrails)
+                else []
+            )
+            get_routing_policy_state_events = getattr(
+                self.services["pipeline"], "get_routing_policy_state_events", None
+            )
+            pipeline_policy_states = (
+                await get_routing_policy_state_events(hours=hours)
+                if callable(get_routing_policy_state_events)
                 else []
             )
 
@@ -943,6 +970,13 @@ class LLMRouterPlatform:
                 else:
                     sources["routing_guardrails"] = "clickhouse"
 
+            if pipeline_policy_states:
+                routing_policy_state["persisted_states"] = pipeline_policy_states
+                if sources["routing_policy_state"] == "monitoring_service":
+                    sources["routing_policy_state"] = "monitoring_service+clickhouse"
+                else:
+                    sources["routing_policy_state"] = "clickhouse"
+
         inference_snapshot = self._build_inference_snapshot(business_metrics)
         if sources["inference"] == "clickhouse":
             inference_snapshot = {
@@ -966,6 +1000,7 @@ class LLMRouterPlatform:
             "alerts": alerts,
             "routing_features": routing_features,
             "routing_guardrails": routing_guardrails,
+            "routing_policy_state": routing_policy_state,
             "sources": sources,
             "source_authority": source_authority,
             "observability": {

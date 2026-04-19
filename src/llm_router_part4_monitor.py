@@ -607,6 +607,7 @@ class MetricsCollector:
         self.latest_stream_metrics_by_model: Dict[str, Dict[str, Any]] = {}
         self.routing_feature_history = []
         self.routing_guardrail_history = []
+        self.routing_policy_state_history = []
         self.stream_metrics_staleness_seconds = config.get(
             "stream_metrics_staleness_seconds", 300
         )
@@ -971,6 +972,122 @@ class MetricsCollector:
             "recent_guardrails": recent_guardrails,
         }
 
+    def record_routing_policy_state(self, state_event: Dict[str, Any]):
+        """Store a consumed routing.policy_state event for dashboard use."""
+        event = dict(state_event)
+        event.setdefault(
+            "timestamp", event.get("emitted_at", datetime.now().isoformat())
+        )
+        self.routing_policy_state_history.append(event)
+        if len(self.routing_policy_state_history) > self.max_history_size:
+            self.routing_policy_state_history.pop(0)
+
+    def _recent_routing_policy_states(self, hours: int = 1) -> List[Dict[str, Any]]:
+        cutoff = datetime.now() - timedelta(hours=hours)
+        return [
+            event
+            for event in self.routing_policy_state_history
+            if _parse_event_timestamp(event.get("timestamp")) >= cutoff
+        ]
+
+    def get_routing_policy_state_summary(self, hours: int = 1) -> Dict[str, Any]:
+        """Summarize recent rolling routing policy state for dashboard use."""
+        recent_events = self._recent_routing_policy_states(hours=hours)
+        if not recent_events:
+            return {
+                "period_hours": hours,
+                "state_count": 0,
+                "scope_breakdown": {},
+                "query_complexity_breakdown": {},
+                "dominant_query_type_breakdown": {},
+                "burst_protection_count": 0,
+                "enterprise_priority_count": 0,
+                "route_to_fast_lane_count": 0,
+                "top_preferred_models": {},
+                "top_avoid_models": {},
+                "top_avoid_providers": {},
+                "recent_states": [],
+            }
+
+        scope_counts = CollectionCounter(
+            str(event.get("scope_type", "unknown")) for event in recent_events
+        )
+        complexity_counts = CollectionCounter(
+            str(event.get("query_complexity", "unknown")) for event in recent_events
+        )
+        query_type_counts = CollectionCounter(
+            str(event.get("dominant_query_type", "unknown")) for event in recent_events
+        )
+        preferred_model_counts = CollectionCounter()
+        avoid_model_counts = CollectionCounter()
+        avoid_provider_counts = CollectionCounter()
+
+        for event in recent_events:
+            preferred_model_counts.update(list(event.get("preferred_models", []) or []))
+            avoid_model_counts.update(list(event.get("avoid_models", []) or []))
+            avoid_provider_counts.update(list(event.get("avoid_providers", []) or []))
+
+        recent_states = []
+        for event in recent_events[-10:]:
+            recent_states.append(
+                {
+                    "scope_type": event.get("scope_type"),
+                    "scope_key": event.get("scope_key"),
+                    "user_tier": event.get("user_tier"),
+                    "recent_request_count": int(
+                        event.get("recent_request_count", 0) or 0
+                    ),
+                    "recent_error_rate": float(
+                        event.get("recent_error_rate", 0.0) or 0.0
+                    ),
+                    "avg_latency_ms": float(event.get("avg_latency_ms", 0.0) or 0.0),
+                    "fast_lane_hit_rate": float(
+                        event.get("fast_lane_hit_rate", 0.0) or 0.0
+                    ),
+                    "dominant_query_type": event.get("dominant_query_type"),
+                    "query_complexity": event.get("query_complexity"),
+                    "requires_low_latency": bool(
+                        event.get("requires_low_latency", False)
+                    ),
+                    "requires_high_reasoning": bool(
+                        event.get("requires_high_reasoning", False)
+                    ),
+                    "route_to_fast_lane": bool(event.get("route_to_fast_lane", False)),
+                    "burst_protection_active": bool(
+                        event.get("burst_protection_active", False)
+                    ),
+                    "enterprise_priority_active": bool(
+                        event.get("enterprise_priority_active", False)
+                    ),
+                    "preferred_models": list(event.get("preferred_models", []) or []),
+                    "avoid_models": list(event.get("avoid_models", []) or []),
+                    "avoid_providers": list(event.get("avoid_providers", []) or []),
+                    "hint_reason": event.get("hint_reason"),
+                    "timestamp": event.get("timestamp"),
+                }
+            )
+
+        return {
+            "period_hours": hours,
+            "state_count": len(recent_events),
+            "scope_breakdown": dict(scope_counts),
+            "query_complexity_breakdown": dict(complexity_counts),
+            "dominant_query_type_breakdown": dict(query_type_counts),
+            "burst_protection_count": sum(
+                1 for event in recent_events if event.get("burst_protection_active")
+            ),
+            "enterprise_priority_count": sum(
+                1 for event in recent_events if event.get("enterprise_priority_active")
+            ),
+            "route_to_fast_lane_count": sum(
+                1 for event in recent_events if event.get("route_to_fast_lane")
+            ),
+            "top_preferred_models": dict(preferred_model_counts.most_common(5)),
+            "top_avoid_models": dict(avoid_model_counts.most_common(5)),
+            "top_avoid_providers": dict(avoid_provider_counts.most_common(5)),
+            "recent_states": recent_states,
+        }
+
     def get_metrics_summary(self, hours: int = 1) -> Dict[str, Any]:
         """Get metrics summary for the specified time period"""
         cutoff_time = datetime.now() - timedelta(hours=hours)
@@ -1285,6 +1402,10 @@ class MonitoringService:
         self.metrics_collector.record_routing_guardrail(guardrail_event)
         await self.alert_manager.record_external_alert(guardrail_event)
 
+    async def ingest_stream_routing_policy_state(self, state_event: Dict[str, Any]):
+        """Consume routing.policy_state events forwarded by the pipeline."""
+        self.metrics_collector.record_routing_policy_state(state_event)
+
     async def ingest_stream_alert(self, alert_event: Dict[str, Any]):
         """Consume alert events forwarded by the pipeline."""
         await self.alert_manager.record_external_alert(alert_event)
@@ -1298,6 +1419,9 @@ class MonitoringService:
         routing_guardrails = self.metrics_collector.get_routing_guardrail_summary(
             hours=1
         )
+        routing_policy_state = self.metrics_collector.get_routing_policy_state_summary(
+            hours=1
+        )
         alert_status = self.alert_manager.get_alert_status()
         performance_report = (
             await self.performance_profiler.generate_optimization_report()
@@ -1309,6 +1433,7 @@ class MonitoringService:
             "stream_analytics": stream_analytics,
             "routing_features": routing_features,
             "routing_guardrails": routing_guardrails,
+            "routing_policy_state": routing_policy_state,
             "alert_status": alert_status,
             "performance_report": performance_report,
             "timestamp": datetime.now().isoformat(),

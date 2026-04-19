@@ -117,3 +117,34 @@ def test_checked_in_compose_config_validates():
     assert validated.pipeline.enabled is True
     assert validated.kafka.bootstrap_servers == ["kafka:29092"]
     assert validated.clickhouse.host == "clickhouse"
+
+
+def test_compose_and_default_config_keep_flink_topics_in_sync():
+    root = Path(__file__).resolve().parents[1]
+    default_config = yaml.safe_load(
+        (root / "config" / "config.yaml").read_text(encoding="utf-8")
+    )
+    compose_config = yaml.safe_load(
+        (root / "config" / "config.compose.yaml").read_text(encoding="utf-8")
+    )
+
+    expected_topic_keys = {
+        "requests_raw",
+        "inference_completed",
+        "requests_enriched",
+        "fast_lane_hints",
+        "analytics_model_metrics_1m",
+        "routing_guardrails",
+        "routing_policy_state",
+        "alerts",
+    }
+
+    default_topics = set(
+        (default_config.get("kafka", {}) or {}).get("topics", {}).keys()
+    )
+    compose_topics = set(
+        (compose_config.get("kafka", {}) or {}).get("topics", {}).keys()
+    )
+
+    assert expected_topic_keys.issubset(default_topics)
+    assert expected_topic_keys.issubset(compose_topics)

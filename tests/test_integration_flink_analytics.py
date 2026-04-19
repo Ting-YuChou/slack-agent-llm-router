@@ -145,6 +145,52 @@ def test_flink_analytics_emits_model_and_provider_routing_guardrails():
 
 
 @pytest.mark.integration
+def test_flink_analytics_guardrail_thresholds_are_configurable():
+    metric_event = build_model_metrics_window_event(
+        model_name="mistral-7b",
+        provider="vllm",
+        window_start_ms=1_710_000_000_000,
+        window_end_ms=1_710_000_060_000,
+        window_size_seconds=60,
+        request_count=8,
+        success_count=6,
+        error_count=2,
+        latency_sum_ms=16000.0,
+        tokens_per_second_sum=960.0,
+        token_count_input=200,
+        token_count_output=400,
+        total_tokens=600,
+        total_cost_usd=0.03,
+        cached_count=0,
+        timestamp=datetime(2026, 4, 8, 12, 5, 0),
+    )
+
+    model_guardrails = detect_model_routing_guardrails(
+        metric_event,
+        latency_history=[1000.0, 1100.0, 1200.0],
+        qps_history=[0.8, 0.9, 0.85],
+        error_rate_history=[0.05, 0.08, 0.07],
+        cache_hit_rate_history=[0.2, 0.25, 0.22],
+        cost_per_1k_history=[0.03, 0.031, 0.032],
+        thresholds={"high_error_rate": 0.20, "high_latency_ms": 1500},
+        timestamp=datetime(2026, 4, 8, 12, 6, 0),
+    )
+    provider_guardrails = detect_provider_routing_guardrails(
+        metric_event,
+        latency_history=[1000.0, 1200.0, 1100.0],
+        error_rate_history=[0.05, 0.06, 0.07],
+        thresholds={"high_error_rate": 0.20, "high_latency_ms": 1500},
+        timestamp=datetime(2026, 4, 8, 12, 6, 0),
+    )
+
+    assert any(g["trigger_type"] == "high_error_rate" for g in model_guardrails)
+    assert any(g["trigger_type"] == "high_latency" for g in model_guardrails)
+    assert any(
+        g["trigger_type"] == "provider_high_latency" for g in provider_guardrails
+    )
+
+
+@pytest.mark.integration
 def test_flink_analytics_builds_user_rolling_policy_state():
     policy_event = build_routing_policy_state_event(
         scope_type="user",
@@ -236,3 +282,37 @@ def test_flink_analytics_fast_lane_hit_rate_uses_actual_hits():
 
     assert policy_event["fast_lane_hit_rate"] == 0.0
     assert policy_event["route_to_fast_lane"] is False
+
+
+@pytest.mark.integration
+def test_flink_analytics_rolling_policy_uses_configurable_thresholds():
+    policy_event = build_routing_policy_state_event(
+        scope_type="user",
+        scope_key="user-rolling-3",
+        window_size_seconds=300,
+        policy_config={
+            "burst_request_count": 3,
+            "burst_min_avg_total_tokens": 200,
+            "free_high_cost_threshold_usd": 0.01,
+        },
+        events=[
+            {
+                "user_id": "user-rolling-3",
+                "user_tier": "free",
+                "query_type": "summarization",
+                "selected_model": "gpt-5",
+                "provider": "openai",
+                "status": "success",
+                "latency_ms": 450,
+                "total_tokens": 300,
+                "cost_usd": 0.02,
+                "route_to_fast_lane": True,
+                "actual_fast_lane_hit": True,
+            }
+            for _ in range(3)
+        ],
+        timestamp=datetime(2026, 4, 17, 12, 8, 0),
+    )
+
+    assert policy_event["burst_protection_active"] is True
+    assert policy_event["cost_sensitivity"] == "high"

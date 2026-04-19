@@ -120,6 +120,8 @@ kafka:
     requests_enriched: requests.enriched
     fast_lane_hints: fast_lane_hints
     analytics_model_metrics_1m: analytics.model_metrics_1m
+    routing_guardrails: routing.guardrails
+    routing_policy_state: routing.policy_state
     alerts: alerts
     errors: llm-errors
   producer:
@@ -198,6 +200,54 @@ flink:
   job_manager_port: 8081
   parallelism: 4
   checkpointing_interval_ms: 5000
+  analytics:
+    window_size_seconds: 60
+    allowed_lateness_seconds: 15
+    rolling_policy_window_seconds: 300
+    anomaly_threshold_multiplier: 2.0
+    guardrail_threshold_multiplier: 2.0
+    watermark_out_of_orderness_seconds: 15
+    model_guardrails:
+      high_error_rate: 0.3
+      high_latency_ms: 5000
+      regression_error_rate_floor: 0.15
+      regression_latency_floor_ms: 3500
+      cache_hit_baseline_min: 0.15
+      cache_hit_drop_ratio: 0.5
+      cache_hit_min_request_count: 5
+      throughput_baseline_min_qps: 0.2
+      throughput_drop_ratio: 0.4
+      throughput_min_request_count: 3
+      cost_spike_ratio: 1.75
+    provider_guardrails:
+      high_error_rate: 0.2
+      high_latency_ms: 6000
+      regression_error_rate_floor: 0.1
+      regression_latency_floor_ms: 4500
+    rolling_policy:
+      hot_request_count: 10
+      warm_request_count: 4
+      complex_total_tokens: 2400
+      complex_reasoning_tokens: 1200
+      moderate_total_tokens: 900
+      moderate_latency_ms: 2500
+      moderate_latency_min_tokens: 600
+      enterprise_priority_request_count: 4
+      burst_request_count: 10
+      burst_min_avg_total_tokens: 400
+      session_pin_min_success_count: 3
+      user_pin_min_success_count: 4
+      pin_min_share: 0.6
+      expensive_model_min_count: 3
+      expensive_model_min_share: 0.7
+      free_high_cost_threshold_usd: 0.015
+      paid_high_cost_threshold_usd: 0.03
+      enterprise_medium_cost_threshold_usd: 0.05
+      failing_model_min_count: 2
+      failing_model_min_share: 0.6
+      failing_provider_min_count: 2
+      failing_provider_min_share: 0.7
+      fast_lane_hit_rate_threshold: 0.6
 
 policy_cache:
   enabled: false

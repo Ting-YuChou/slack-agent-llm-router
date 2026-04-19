@@ -20,8 +20,26 @@ from pyflink.common.serialization import SimpleStringSchema
 from pyflink.common.typeinfo import Types
 from pyflink.datastream import StreamExecutionEnvironment
 from pyflink.datastream.connectors.kafka import FlinkKafkaConsumer, FlinkKafkaProducer
-from pyflink.datastream.functions import FilterFunction, KeyedProcessFunction, MapFunction
+from pyflink.datastream.functions import (
+    FilterFunction,
+    KeyedProcessFunction,
+    MapFunction,
+)
 from pyflink.datastream.state import ListStateDescriptor, ValueStateDescriptor
+
+try:
+    from pyflink.common.watermark_strategy import TimestampAssigner, WatermarkStrategy
+except Exception:  # pragma: no cover - optional at runtime
+    TimestampAssigner = None
+    WatermarkStrategy = None
+
+try:  # pragma: no cover - optional at runtime
+    from pyflink.common.time import Duration
+except Exception:  # pragma: no cover - optional at runtime
+    try:
+        from pyflink.common import Duration
+    except Exception:  # pragma: no cover - optional at runtime
+        Duration = None
 
 from flink.logic import (
     ALERT_EVENT,
@@ -39,6 +57,63 @@ from flink.logic import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _current_time_progress_ms(timer_service: Any, processing_time_ms: int) -> int:
+    current_watermark = getattr(timer_service, "current_watermark", None)
+    if callable(current_watermark):
+        try:
+            watermark_ms = int(current_watermark())
+            if watermark_ms >= 0:
+                return watermark_ms
+        except Exception:
+            pass
+    return processing_time_ms
+
+
+def _register_timer(timer_service: Any, timestamp_ms: int) -> str | None:
+    register_event_time = getattr(timer_service, "register_event_time_timer", None)
+    if callable(register_event_time):
+        register_event_time(int(timestamp_ms))
+        return "event"
+
+    register_processing_time = getattr(
+        timer_service, "register_processing_time_timer", None
+    )
+    if callable(register_processing_time):
+        register_processing_time(int(timestamp_ms))
+        return "processing"
+
+    return None
+
+
+def _delete_timer(timer_service: Any, timer_kind: str | None, timestamp_ms: int):
+    if timer_kind == "event":
+        delete_event_time = getattr(timer_service, "delete_event_time_timer", None)
+        if callable(delete_event_time):
+            delete_event_time(int(timestamp_ms))
+        return
+
+    delete_processing_time = getattr(
+        timer_service, "delete_processing_time_timer", None
+    )
+    if callable(delete_processing_time):
+        delete_processing_time(int(timestamp_ms))
+
+
+if TimestampAssigner is not None:  # pragma: no branch - runtime gated
+
+    class CompletionTimestampAssigner(TimestampAssigner):
+        """Assign event-time timestamps from inference.completed payloads."""
+
+        def extract_timestamp(
+            self, value: Dict[str, Any], record_timestamp: int
+        ) -> int:
+            fallback_ms = int(record_timestamp) if int(record_timestamp) > 0 else 0
+            return completion_event_timestamp_ms(value, default_ms=fallback_ms)
+
+else:  # pragma: no cover - used only when PyFlink watermark APIs are unavailable
+    CompletionTimestampAssigner = None
 
 
 class InferenceCompletedMapper(MapFunction):
@@ -91,7 +166,9 @@ class NonEmptyFieldFilter(FilterFunction):
 class ModelMetricsWindowAggregator(KeyedProcessFunction):
     """Aggregate inference completion events into event-time windows."""
 
-    def __init__(self, window_size_seconds: int = 60, allowed_lateness_seconds: int = 15):
+    def __init__(
+        self, window_size_seconds: int = 60, allowed_lateness_seconds: int = 15
+    ):
         self.window_size_seconds = window_size_seconds
         self.window_size_ms = window_size_seconds * 1000
         self.allowed_lateness_ms = allowed_lateness_seconds * 1000
@@ -103,17 +180,27 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
         self.flush_timer_state = runtime_context.get_state(
             ValueStateDescriptor("flush_timer_ms", Types.LONG())
         )
+        self.flush_timer_kind_state = runtime_context.get_state(
+            ValueStateDescriptor("flush_timer_kind", Types.STRING())
+        )
 
-    def process_element(self, value: Dict[str, Any], ctx: "KeyedProcessFunction.Context"):
+    def process_element(
+        self, value: Dict[str, Any], ctx: "KeyedProcessFunction.Context"
+    ):
         current_processing_time = ctx.timer_service().current_processing_time()
+        current_time_progress = _current_time_progress_ms(
+            ctx.timer_service(), current_processing_time
+        )
         event_timestamp_ms = completion_event_timestamp_ms(
             value,
             default_ms=current_processing_time,
         )
-        window_start_ms = (event_timestamp_ms // self.window_size_ms) * self.window_size_ms
+        window_start_ms = (
+            event_timestamp_ms // self.window_size_ms
+        ) * self.window_size_ms
         window_end_ms = window_start_ms + self.window_size_ms
 
-        if window_end_ms <= current_processing_time - self.allowed_lateness_ms:
+        if window_end_ms <= current_time_progress - self.allowed_lateness_ms:
             logger.debug(
                 "Dropping late inference.completed event for model metrics: %s",
                 value.get("request_id"),
@@ -135,7 +222,9 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
             "total_cost_usd": 0.0,
             "cached_count": 0,
         }
-        bucket["provider"] = str(value.get("provider", bucket.get("provider") or "unknown") or "unknown")
+        bucket["provider"] = str(
+            value.get("provider", bucket.get("provider") or "unknown") or "unknown"
+        )
         bucket["request_count"] += 1
         bucket["success_count"] += 1 if value.get("status") == "success" else 0
         bucket["error_count"] += 1 if value.get("status") != "success" else 0
@@ -154,7 +243,7 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
             start_ms
             for start_ms in buckets
             if start_ms + self.window_size_ms + self.allowed_lateness_ms
-            <= current_processing_time
+            <= current_time_progress
         ]
         for start_ms in sorted(ready_windows):
             yield self._build_metric_event(
@@ -201,8 +290,13 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
     ):
         existing_timer = self.flush_timer_state.value()
         if existing_timer:
-            ctx.timer_service().delete_processing_time_timer(existing_timer)
+            _delete_timer(
+                ctx.timer_service(),
+                self.flush_timer_kind_state.value(),
+                existing_timer,
+            )
             self.flush_timer_state.clear()
+            self.flush_timer_kind_state.clear()
 
         if not buckets:
             return
@@ -211,8 +305,10 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
             int(window_start_ms) + self.window_size_ms + self.allowed_lateness_ms
             for window_start_ms in buckets
         )
-        ctx.timer_service().register_processing_time_timer(next_flush_ms)
+        timer_kind = _register_timer(ctx.timer_service(), next_flush_ms)
         self.flush_timer_state.update(next_flush_ms)
+        if timer_kind:
+            self.flush_timer_kind_state.update(timer_kind)
 
     def _build_metric_event(
         self, *, model_name: str, bucket: Dict[str, Any]
@@ -257,7 +353,9 @@ class ModelMetricsAnomalyDetector(KeyedProcessFunction):
             ListStateDescriptor("error_rate_history", Types.FLOAT())
         )
 
-    def process_element(self, value: Dict[str, Any], ctx: "KeyedProcessFunction.Context"):
+    def process_element(
+        self, value: Dict[str, Any], ctx: "KeyedProcessFunction.Context"
+    ):
         latency_history = list(self.latency_history_state.get())
         qps_history = list(self.qps_history_state.get())
         error_rate_history = list(self.error_rate_history_state.get())
@@ -284,9 +382,15 @@ class ModelMetricsAnomalyDetector(KeyedProcessFunction):
 class ModelRoutingGuardrailDetector(KeyedProcessFunction):
     """Emit model-scoped routing guardrails from recent metrics windows."""
 
-    def __init__(self, threshold_multiplier: float = 2.0, history_size: int = 10):
+    def __init__(
+        self,
+        threshold_multiplier: float = 2.0,
+        history_size: int = 10,
+        thresholds: Dict[str, Any] | None = None,
+    ):
         self.threshold_multiplier = threshold_multiplier
         self.history_size = history_size
+        self.thresholds = dict(thresholds or {})
 
     def open(self, runtime_context):
         self.latency_history_state = runtime_context.get_list_state(
@@ -305,7 +409,9 @@ class ModelRoutingGuardrailDetector(KeyedProcessFunction):
             ListStateDescriptor("guardrail_cost_per_1k_history", Types.FLOAT())
         )
 
-    def process_element(self, value: Dict[str, Any], ctx: "KeyedProcessFunction.Context"):
+    def process_element(
+        self, value: Dict[str, Any], ctx: "KeyedProcessFunction.Context"
+    ):
         latency_history = list(self.latency_history_state.get())
         qps_history = list(self.qps_history_state.get())
         error_rate_history = list(self.error_rate_history_state.get())
@@ -320,13 +426,16 @@ class ModelRoutingGuardrailDetector(KeyedProcessFunction):
             cache_hit_rate_history=cache_hit_rate_history,
             cost_per_1k_history=cost_per_1k_history,
             threshold_multiplier=self.threshold_multiplier,
+            thresholds=self.thresholds,
         )
         for guardrail in guardrails:
             yield guardrail
 
         total_tokens = max(0, int(value.get("total_tokens", 0) or 0))
         total_cost_usd = float(value.get("total_cost_usd", 0.0) or 0.0)
-        cost_per_1k = (total_cost_usd * 1000.0 / total_tokens) if total_tokens > 0 else 0.0
+        cost_per_1k = (
+            (total_cost_usd * 1000.0 / total_tokens) if total_tokens > 0 else 0.0
+        )
 
         latency_history.append(float(value.get("avg_latency_ms", 0.0) or 0.0))
         qps_history.append(float(value.get("queries_per_second", 0.0) or 0.0))
@@ -346,9 +455,15 @@ class ModelRoutingGuardrailDetector(KeyedProcessFunction):
 class ProviderRoutingGuardrailDetector(KeyedProcessFunction):
     """Emit provider-scoped routing guardrails from recent metrics windows."""
 
-    def __init__(self, threshold_multiplier: float = 2.0, history_size: int = 10):
+    def __init__(
+        self,
+        threshold_multiplier: float = 2.0,
+        history_size: int = 10,
+        thresholds: Dict[str, Any] | None = None,
+    ):
         self.threshold_multiplier = threshold_multiplier
         self.history_size = history_size
+        self.thresholds = dict(thresholds or {})
 
     def open(self, runtime_context):
         self.latency_history_state = runtime_context.get_list_state(
@@ -358,7 +473,9 @@ class ProviderRoutingGuardrailDetector(KeyedProcessFunction):
             ListStateDescriptor("provider_guardrail_error_rate_history", Types.FLOAT())
         )
 
-    def process_element(self, value: Dict[str, Any], ctx: "KeyedProcessFunction.Context"):
+    def process_element(
+        self, value: Dict[str, Any], ctx: "KeyedProcessFunction.Context"
+    ):
         latency_history = list(self.latency_history_state.get())
         error_rate_history = list(self.error_rate_history_state.get())
 
@@ -367,6 +484,7 @@ class ProviderRoutingGuardrailDetector(KeyedProcessFunction):
             latency_history=latency_history,
             error_rate_history=error_rate_history,
             threshold_multiplier=self.threshold_multiplier,
+            thresholds=self.thresholds,
         )
         for guardrail in guardrails:
             yield guardrail
@@ -381,10 +499,16 @@ class ProviderRoutingGuardrailDetector(KeyedProcessFunction):
 class RollingScopePolicyEmitter(KeyedProcessFunction):
     """Emit rolling routing policy state for a user or session scope."""
 
-    def __init__(self, scope_type: str, window_size_seconds: int = 300):
+    def __init__(
+        self,
+        scope_type: str,
+        window_size_seconds: int = 300,
+        policy_config: Dict[str, Any] | None = None,
+    ):
         self.scope_type = scope_type
         self.window_size_seconds = window_size_seconds
         self.window_size_ms = window_size_seconds * 1000
+        self.policy_config = dict(policy_config or {})
 
     def open(self, runtime_context):
         self.recent_events_state = runtime_context.get_list_state(
@@ -396,10 +520,20 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
         self.cleanup_timer_state = runtime_context.get_state(
             ValueStateDescriptor(f"{self.scope_type}_cleanup_timer_ms", Types.LONG())
         )
+        self.cleanup_timer_kind_state = runtime_context.get_state(
+            ValueStateDescriptor(
+                f"{self.scope_type}_cleanup_timer_kind", Types.STRING()
+            )
+        )
 
-    def process_element(self, value: Dict[str, Any], ctx: "KeyedProcessFunction.Context"):
+    def process_element(
+        self, value: Dict[str, Any], ctx: "KeyedProcessFunction.Context"
+    ):
         current_processing_time = ctx.timer_service().current_processing_time()
-        cutoff_ms = current_processing_time - self.window_size_ms
+        current_time_progress = _current_time_progress_ms(
+            ctx.timer_service(), current_processing_time
+        )
+        cutoff_ms = current_time_progress - self.window_size_ms
         event_timestamp_ms = completion_event_timestamp_ms(
             value,
             default_ms=current_processing_time,
@@ -429,15 +563,11 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
                 "latency_ms": value.get("latency_ms"),
                 "total_tokens": value.get("total_tokens"),
                 "cost_usd": value.get("cost_usd"),
-                "actual_fast_lane_hit": bool(
-                    value.get("actual_fast_lane_hit", False)
-                ),
+                "actual_fast_lane_hit": bool(value.get("actual_fast_lane_hit", False)),
                 "route_to_fast_lane": bool(value.get("route_to_fast_lane", False)),
             }
         )
-        self.recent_events_state.update(
-            [json.dumps(event) for event in recent_events]
-        )
+        self.recent_events_state.update([json.dumps(event) for event in recent_events])
         self._schedule_next_cleanup(ctx, recent_events)
 
         yield build_routing_policy_state_event(
@@ -445,6 +575,7 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
             scope_key=str(ctx.get_current_key()),
             events=recent_events,
             window_size_seconds=self.window_size_seconds,
+            policy_config=self.policy_config,
         )
 
     def on_timer(self, timestamp: int, ctx: "KeyedProcessFunction.OnTimerContext"):
@@ -454,6 +585,7 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
             cutoff_ms,
         )
         self.cleanup_timer_state.clear()
+        self.cleanup_timer_kind_state.clear()
         if recent_events:
             self.recent_events_state.update(
                 [json.dumps(event) for event in recent_events]
@@ -467,8 +599,13 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
     ):
         existing_timer = self.cleanup_timer_state.value()
         if existing_timer:
-            ctx.timer_service().delete_processing_time_timer(existing_timer)
+            _delete_timer(
+                ctx.timer_service(),
+                self.cleanup_timer_kind_state.value(),
+                existing_timer,
+            )
             self.cleanup_timer_state.clear()
+            self.cleanup_timer_kind_state.clear()
 
         if not recent_events:
             return
@@ -477,10 +614,15 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
             int(event.get("event_timestamp_ms", 0) or 0) for event in recent_events
         )
         next_cleanup_ms = oldest_event_ms + self.window_size_ms + 1000
-        current_processing_time = ctx.timer_service().current_processing_time()
-        next_cleanup_ms = max(current_processing_time + 1000, next_cleanup_ms)
-        ctx.timer_service().register_processing_time_timer(next_cleanup_ms)
+        timer_service = ctx.timer_service()
+        register_event_time = getattr(timer_service, "register_event_time_timer", None)
+        if not callable(register_event_time):
+            current_processing_time = timer_service.current_processing_time()
+            next_cleanup_ms = max(current_processing_time + 1000, next_cleanup_ms)
+        timer_kind = _register_timer(timer_service, next_cleanup_ms)
         self.cleanup_timer_state.update(next_cleanup_ms)
+        if timer_kind:
+            self.cleanup_timer_kind_state.update(timer_kind)
 
     @staticmethod
     def _prune_recent_events(
@@ -493,11 +635,42 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
         ]
 
 
+def _analytics_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    flink_section = (
+        config.get("flink", {}) if isinstance(config.get("flink"), dict) else {}
+    )
+    nested_config = (
+        flink_section.get("analytics", {})
+        if isinstance(flink_section.get("analytics"), dict)
+        else {}
+    )
+    direct_config = (
+        config.get("analytics", {}) if isinstance(config.get("analytics"), dict) else {}
+    )
+    merged = dict(nested_config)
+    merged.update(direct_config)
+    return merged
+
+
 def create_flink_job(config: Dict[str, Any]):
     """Create and configure the Flink analytics job."""
     env = StreamExecutionEnvironment.get_execution_environment()
-    env.set_parallelism(config.get("parallelism", 4))
-    env.enable_checkpointing(config.get("checkpoint_interval_ms", 60000))
+    flink_section = (
+        config.get("flink", {}) if isinstance(config.get("flink"), dict) else {}
+    )
+    analytics_config = _analytics_config(config)
+    parallelism = int(config.get("parallelism", flink_section.get("parallelism", 4)))
+    checkpoint_interval_ms = int(
+        config.get(
+            "checkpoint_interval_ms",
+            config.get(
+                "checkpointing_interval_ms",
+                flink_section.get("checkpointing_interval_ms", 60000),
+            ),
+        )
+    )
+    env.set_parallelism(parallelism)
+    env.enable_checkpointing(checkpoint_interval_ms)
 
     kafka_topics = config.get("kafka", {}).get("topics", {})
     kafka_props = {
@@ -507,9 +680,7 @@ def create_flink_job(config: Dict[str, Any]):
         "group.id": config.get("kafka", {}).get(
             "consumer_group", "flink-inference-analytics"
         ),
-        "auto.offset.reset": config.get("kafka", {}).get(
-            "auto_offset_reset", "latest"
-        ),
+        "auto.offset.reset": config.get("kafka", {}).get("auto_offset_reset", "latest"),
     }
 
     completion_consumer = FlinkKafkaConsumer(
@@ -554,8 +725,36 @@ def create_flink_job(config: Dict[str, Any]):
         EventTypeFilter(INFERENCE_COMPLETED_EVENT)
     )
 
-    window_size_seconds = int(config.get("window_size_seconds", 60))
-    allowed_lateness_seconds = int(config.get("allowed_lateness_seconds", 15))
+    window_size_seconds = int(
+        config.get(
+            "window_size_seconds",
+            analytics_config.get("window_size_seconds", 60),
+        )
+    )
+    allowed_lateness_seconds = int(
+        config.get(
+            "allowed_lateness_seconds",
+            analytics_config.get("allowed_lateness_seconds", 15),
+        )
+    )
+    watermark_out_of_orderness_seconds = int(
+        analytics_config.get(
+            "watermark_out_of_orderness_seconds", allowed_lateness_seconds
+        )
+    )
+    if (
+        WatermarkStrategy is not None
+        and Duration is not None
+        and CompletionTimestampAssigner is not None
+    ):
+        valid_completions_stream = (
+            valid_completions_stream.assign_timestamps_and_watermarks(
+                WatermarkStrategy.for_bounded_out_of_orderness(
+                    Duration.of_seconds(watermark_out_of_orderness_seconds)
+                ).with_timestamp_assigner(CompletionTimestampAssigner())
+            )
+        )
+
     metrics_stream = valid_completions_stream.key_by(
         lambda event: event.get("selected_model", "unknown")
     ).process(
@@ -569,50 +768,79 @@ def create_flink_job(config: Dict[str, Any]):
         lambda event: event.get("model_name", "unknown")
     ).process(
         ModelMetricsAnomalyDetector(
-            threshold_multiplier=float(config.get("anomaly_threshold_multiplier", 2.0))
+            threshold_multiplier=float(
+                config.get(
+                    "anomaly_threshold_multiplier",
+                    analytics_config.get("anomaly_threshold_multiplier", 2.0),
+                )
+            )
         ),
         output_type=Types.PICKLED_BYTE_ARRAY(),
+    )
+    model_guardrail_thresholds = dict(
+        analytics_config.get("model_guardrails", {}) or {}
     )
     model_guardrail_stream = metrics_stream.key_by(
         lambda event: event.get("model_name", "unknown")
     ).process(
         ModelRoutingGuardrailDetector(
-            threshold_multiplier=float(config.get("guardrail_threshold_multiplier", 2.0))
+            threshold_multiplier=float(
+                config.get(
+                    "guardrail_threshold_multiplier",
+                    analytics_config.get("guardrail_threshold_multiplier", 2.0),
+                )
+            ),
+            thresholds=model_guardrail_thresholds,
         ),
         output_type=Types.PICKLED_BYTE_ARRAY(),
+    )
+    provider_guardrail_thresholds = dict(
+        analytics_config.get("provider_guardrails", {}) or {}
     )
     provider_guardrail_stream = metrics_stream.key_by(
         lambda event: event.get("provider", "unknown")
     ).process(
         ProviderRoutingGuardrailDetector(
-            threshold_multiplier=float(config.get("guardrail_threshold_multiplier", 2.0))
+            threshold_multiplier=float(
+                config.get(
+                    "guardrail_threshold_multiplier",
+                    analytics_config.get("guardrail_threshold_multiplier", 2.0),
+                )
+            ),
+            thresholds=provider_guardrail_thresholds,
         ),
         output_type=Types.PICKLED_BYTE_ARRAY(),
     )
     rolling_policy_window_seconds = int(
-        config.get("rolling_policy_window_seconds", 300)
+        config.get(
+            "rolling_policy_window_seconds",
+            analytics_config.get("rolling_policy_window_seconds", 300),
+        )
     )
-    user_policy_state_stream = valid_completions_stream.filter(
-        NonEmptyFieldFilter("user_id")
-    ).key_by(
-        lambda event: event.get("user_id", "unknown")
-    ).process(
-        RollingScopePolicyEmitter(
-            scope_type="user",
-            window_size_seconds=rolling_policy_window_seconds,
-        ),
-        output_type=Types.PICKLED_BYTE_ARRAY(),
+    rolling_policy_config = dict(analytics_config.get("rolling_policy", {}) or {})
+    user_policy_state_stream = (
+        valid_completions_stream.filter(NonEmptyFieldFilter("user_id"))
+        .key_by(lambda event: event.get("user_id", "unknown"))
+        .process(
+            RollingScopePolicyEmitter(
+                scope_type="user",
+                window_size_seconds=rolling_policy_window_seconds,
+                policy_config=rolling_policy_config,
+            ),
+            output_type=Types.PICKLED_BYTE_ARRAY(),
+        )
     )
-    session_policy_state_stream = valid_completions_stream.filter(
-        NonEmptyFieldFilter("session_id")
-    ).key_by(
-        lambda event: event.get("session_id", "unknown")
-    ).process(
-        RollingScopePolicyEmitter(
-            scope_type="session",
-            window_size_seconds=rolling_policy_window_seconds,
-        ),
-        output_type=Types.PICKLED_BYTE_ARRAY(),
+    session_policy_state_stream = (
+        valid_completions_stream.filter(NonEmptyFieldFilter("session_id"))
+        .key_by(lambda event: event.get("session_id", "unknown"))
+        .process(
+            RollingScopePolicyEmitter(
+                scope_type="session",
+                window_size_seconds=rolling_policy_window_seconds,
+                policy_config=rolling_policy_config,
+            ),
+            output_type=Types.PICKLED_BYTE_ARRAY(),
+        )
     )
 
     metrics_stream.map(
@@ -653,11 +881,14 @@ def main():
     config = {
         "parallelism": 4,
         "checkpoint_interval_ms": 60000,
-        "window_size_seconds": 60,
-        "allowed_lateness_seconds": 15,
-        "rolling_policy_window_seconds": 300,
-        "anomaly_threshold_multiplier": 2.0,
-        "guardrail_threshold_multiplier": 2.0,
+        "analytics": {
+            "window_size_seconds": 60,
+            "allowed_lateness_seconds": 15,
+            "rolling_policy_window_seconds": 300,
+            "anomaly_threshold_multiplier": 2.0,
+            "guardrail_threshold_multiplier": 2.0,
+            "watermark_out_of_orderness_seconds": 15,
+        },
         "kafka": {
             "bootstrap_servers": ["localhost:9092"],
             "consumer_group": "flink-inference-analytics",

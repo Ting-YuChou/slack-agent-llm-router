@@ -26,6 +26,7 @@ def _write_config(tmp_path: Path, overrides=None) -> Path:
                 "requests_enriched": "requests.enriched",
                 "fast_lane_hints": "fast_lane_hints",
                 "routing_guardrails": "routing.guardrails",
+                "routing_policy_state": "routing.policy_state",
                 "alerts": "alerts",
             },
         },
@@ -135,6 +136,20 @@ class DummyPipeline:
             }
         ]
 
+    async def get_routing_policy_state_events(self, hours=24):
+        return [
+            {
+                "timestamp": "2026-04-18T00:00:00Z",
+                "scope_type": "session",
+                "scope_key": "session-1",
+                "recent_request_count": 4,
+                "recent_error_rate": 0.0,
+                "avg_latency_ms": 180.0,
+                "query_complexity": "moderate",
+                "source": "clickhouse",
+            }
+        ]
+
     async def shutdown(self):
         return None
 
@@ -169,7 +184,26 @@ class DummyMonitoring:
                         "trigger_count": 2,
                     }
                 ]
-            }
+            },
+            "routing_policy_state": {
+                "state_count": 1,
+                "scope_breakdown": {"session": 1},
+                "query_complexity_breakdown": {"moderate": 1},
+                "dominant_query_type_breakdown": {"analysis": 1},
+                "burst_protection_count": 0,
+                "enterprise_priority_count": 0,
+                "route_to_fast_lane_count": 1,
+                "top_preferred_models": {"mistral-7b": 1},
+                "top_avoid_models": {},
+                "top_avoid_providers": {},
+                "recent_states": [
+                    {
+                        "scope_type": "session",
+                        "scope_key": "session-1",
+                        "query_complexity": "moderate",
+                    }
+                ],
+            },
         }
 
     async def ingest_stream_model_metrics(self, metric_event):
@@ -775,6 +809,14 @@ class TestApiApp:
         assert body["overview"]["total_requests"] == 12
         assert body["model_performance"][0]["model_name"] == "gpt-5"
         assert any(alert["source"] == "monitoring_service" for alert in body["alerts"])
+        assert body["routing_policy_state"]["state_count"] == 1
+        assert (
+            body["routing_policy_state"]["persisted_states"][0]["scope_type"]
+            == "session"
+        )
+        assert (
+            body["sources"]["routing_policy_state"] == "monitoring_service+clickhouse"
+        )
 
     def test_dashboard_logs_endpoint_reads_structured_logs(
         self, tmp_path, patched_platform_deps

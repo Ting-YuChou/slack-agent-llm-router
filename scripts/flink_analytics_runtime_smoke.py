@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -34,11 +35,15 @@ def run_compose(args):
 def create_topics(
     inference_completed_topic: str,
     analytics_metrics_topic: str,
+    routing_guardrails_topic: str,
+    routing_policy_state_topic: str,
     alerts_topic: str,
 ):
     for topic in (
         inference_completed_topic,
         analytics_metrics_topic,
+        routing_guardrails_topic,
+        routing_policy_state_topic,
         alerts_topic,
     ):
         run_compose(
@@ -113,6 +118,72 @@ async def wait_for_metrics_event(topic: str, group_id: str, timeout: float) -> d
         await consumer.stop()
 
 
+async def wait_for_guardrail_events(topic: str, group_id: str, timeout: float) -> dict:
+    consumer = AIOKafkaConsumer(
+        topic,
+        bootstrap_servers="localhost:9092",
+        group_id=group_id,
+        auto_offset_reset="earliest",
+        enable_auto_commit=True,
+        value_deserializer=lambda data: json.loads(data.decode("utf-8")),
+    )
+    await consumer.start()
+    deadline = time.monotonic() + timeout
+    matched = {}
+    try:
+        while time.monotonic() < deadline:
+            batch = await consumer.getmany(timeout_ms=1000)
+            for records in batch.values():
+                for record in records:
+                    value = record.value
+                    if value.get("event_type") != "routing.guardrails":
+                        continue
+                    scope_type = str(value.get("scope_type", "") or "")
+                    if scope_type in {"model", "provider"}:
+                        matched[scope_type] = value
+                        if {"model", "provider"} <= set(matched):
+                            return matched
+        raise TimeoutError(
+            f"Timed out waiting for routing.guardrails model/provider events on topic {topic}"
+        )
+    finally:
+        await consumer.stop()
+
+
+async def wait_for_policy_state_events(
+    topic: str, group_id: str, timeout: float
+) -> dict:
+    consumer = AIOKafkaConsumer(
+        topic,
+        bootstrap_servers="localhost:9092",
+        group_id=group_id,
+        auto_offset_reset="earliest",
+        enable_auto_commit=True,
+        value_deserializer=lambda data: json.loads(data.decode("utf-8")),
+    )
+    await consumer.start()
+    deadline = time.monotonic() + timeout
+    matched = {}
+    try:
+        while time.monotonic() < deadline:
+            batch = await consumer.getmany(timeout_ms=1000)
+            for records in batch.values():
+                for record in records:
+                    value = record.value
+                    if value.get("event_type") != "routing.policy_state":
+                        continue
+                    scope_type = str(value.get("scope_type", "") or "")
+                    if scope_type in {"user", "session"}:
+                        matched[scope_type] = value
+                        if {"user", "session"} <= set(matched):
+                            return matched
+        raise TimeoutError(
+            f"Timed out waiting for routing.policy_state user/session events on topic {topic}"
+        )
+    finally:
+        await consumer.stop()
+
+
 async def produce_completion_events(topic: str, suffix: str):
     producer = AIOKafkaProducer(
         bootstrap_servers="localhost:9092",
@@ -122,19 +193,27 @@ async def produce_completion_events(topic: str, suffix: str):
     )
     await producer.start()
     try:
+        base_time = datetime.now(timezone.utc)
+        session_id = f"runtime-session-{suffix}"
         for index in range(3):
             request_id = f"analytics-runtime-{suffix}-{index}"
+            completion_timestamp = (
+                base_time + timedelta(milliseconds=index * 200)
+            ).isoformat()
             await producer.send_and_wait(
                 topic,
                 key=request_id,
                 value={
                     "event_type": "inference.completed",
                     "event_version": "1.0",
-                    "emitted_at": "2026-04-08T12:00:00+00:00",
+                    "emitted_at": completion_timestamp,
+                    "completion_timestamp": completion_timestamp,
                     "request_id": request_id,
                     "query_id": request_id,
                     "user_id": "runtime-user",
                     "user_tier": "free",
+                    "session_id": session_id,
+                    "query_type": "analysis",
                     "selected_model": "mistral-7b",
                     "provider": "vllm",
                     "status": "success",
@@ -145,8 +224,41 @@ async def produce_completion_events(topic: str, suffix: str):
                     "tokens_per_second": 100.0 + (index * 10),
                     "cost_usd": 0.0,
                     "cached_response": False,
+                    "route_to_fast_lane": True,
+                    "actual_fast_lane_hit": True,
                 },
             )
+        await asyncio.sleep(3.5)
+        sentinel_request_id = f"analytics-runtime-{suffix}-sentinel"
+        sentinel_completion_timestamp = datetime.now(timezone.utc).isoformat()
+        await producer.send_and_wait(
+            topic,
+            key=sentinel_request_id,
+            value={
+                "event_type": "inference.completed",
+                "event_version": "1.0",
+                "emitted_at": sentinel_completion_timestamp,
+                "completion_timestamp": sentinel_completion_timestamp,
+                "request_id": sentinel_request_id,
+                "query_id": sentinel_request_id,
+                "user_id": "runtime-user",
+                "user_tier": "free",
+                "session_id": session_id,
+                "query_type": "analysis",
+                "selected_model": "mistral-7b",
+                "provider": "vllm",
+                "status": "success",
+                "latency_ms": 180,
+                "token_count_input": 10,
+                "token_count_output": 20,
+                "total_tokens": 30,
+                "tokens_per_second": 120.0,
+                "cost_usd": 0.0,
+                "cached_response": False,
+                "route_to_fast_lane": True,
+                "actual_fast_lane_hit": True,
+            },
+        )
     finally:
         await producer.stop()
 
@@ -155,13 +267,26 @@ async def run_smoke(timeout_seconds: float):
     suffix = uuid.uuid4().hex[:8]
     inference_completed_topic = f"flink-runtime-inference-completed-{suffix}"
     analytics_metrics_topic = f"flink-runtime-model-metrics-{suffix}"
+    routing_guardrails_topic = f"flink-runtime-routing-guardrails-{suffix}"
+    routing_policy_state_topic = f"flink-runtime-routing-policy-state-{suffix}"
     alerts_topic = f"flink-runtime-analytics-alerts-{suffix}"
     group_id = f"flink-runtime-analytics-group-{suffix}"
     config = {
         "parallelism": 1,
         "checkpoint_interval_ms": 10000,
-        "window_size_seconds": 5,
-        "anomaly_threshold_multiplier": 2.0,
+        "analytics": {
+            "window_size_seconds": 2,
+            "allowed_lateness_seconds": 1,
+            "anomaly_threshold_multiplier": 2.0,
+            "guardrail_threshold_multiplier": 2.0,
+            "watermark_out_of_orderness_seconds": 0,
+            "model_guardrails": {
+                "high_latency_ms": 100,
+            },
+            "provider_guardrails": {
+                "high_latency_ms": 100,
+            },
+        },
         "kafka": {
             "bootstrap_servers": ["kafka:29092"],
             "consumer_group": group_id,
@@ -169,27 +294,55 @@ async def run_smoke(timeout_seconds: float):
             "topics": {
                 "inference_completed": inference_completed_topic,
                 "analytics_model_metrics_1m": analytics_metrics_topic,
+                "routing_guardrails": routing_guardrails_topic,
+                "routing_policy_state": routing_policy_state_topic,
                 "alerts": alerts_topic,
             },
         },
     }
 
-    create_topics(inference_completed_topic, analytics_metrics_topic, alerts_topic)
+    create_topics(
+        inference_completed_topic,
+        analytics_metrics_topic,
+        routing_guardrails_topic,
+        routing_policy_state_topic,
+        alerts_topic,
+    )
     job_id = submit_flink_job(config)
     try:
         await asyncio.sleep(8)
-        consumer_task = asyncio.create_task(
+        metrics_task = asyncio.create_task(
             wait_for_metrics_event(
                 analytics_metrics_topic,
-                f"{group_id}-consumer",
+                f"{group_id}-metrics-consumer",
+                timeout_seconds,
+            )
+        )
+        guardrails_task = asyncio.create_task(
+            wait_for_guardrail_events(
+                routing_guardrails_topic,
+                f"{group_id}-guardrails-consumer",
+                timeout_seconds,
+            )
+        )
+        policy_state_task = asyncio.create_task(
+            wait_for_policy_state_events(
+                routing_policy_state_topic,
+                f"{group_id}-policy-state-consumer",
                 timeout_seconds,
             )
         )
         await produce_completion_events(inference_completed_topic, suffix)
-        result = await consumer_task
+        result, guardrails, policy_states = await asyncio.gather(
+            metrics_task,
+            guardrails_task,
+            policy_state_task,
+        )
         print(
             f"Flink analytics runtime smoke test passed: metrics topic {analytics_metrics_topic} "
-            f"received aggregate for model={result.get('model_name')}"
+            f"received aggregate for model={result.get('model_name')}; "
+            f"guardrails topic {routing_guardrails_topic} emitted scopes={','.join(sorted(guardrails))}; "
+            f"policy topic {routing_policy_state_topic} emitted scopes={','.join(sorted(policy_states))}"
         )
     finally:
         cancel_flink_job(job_id)
