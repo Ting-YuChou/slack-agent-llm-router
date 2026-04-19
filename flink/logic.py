@@ -175,6 +175,53 @@ HIGH_REASONING_QUERY_TYPES = {
     "math",
 }
 
+DEFAULT_MODEL_GUARDRAIL_CONFIG = {
+    "high_error_rate": 0.30,
+    "high_latency_ms": 5000,
+    "regression_error_rate_floor": 0.15,
+    "regression_latency_floor_ms": 3500,
+    "cache_hit_baseline_min": 0.15,
+    "cache_hit_drop_ratio": 0.5,
+    "cache_hit_min_request_count": 5,
+    "throughput_baseline_min_qps": 0.20,
+    "throughput_drop_ratio": 0.4,
+    "throughput_min_request_count": 3,
+    "cost_spike_ratio": 1.75,
+}
+
+DEFAULT_PROVIDER_GUARDRAIL_CONFIG = {
+    "high_error_rate": 0.20,
+    "high_latency_ms": 6000,
+    "regression_error_rate_floor": 0.10,
+    "regression_latency_floor_ms": 4500,
+}
+
+DEFAULT_ROLLING_POLICY_CONFIG = {
+    "hot_request_count": 10,
+    "warm_request_count": 4,
+    "complex_total_tokens": 2400,
+    "complex_reasoning_tokens": 1200,
+    "moderate_total_tokens": 900,
+    "moderate_latency_ms": 2500,
+    "moderate_latency_min_tokens": 600,
+    "enterprise_priority_request_count": 4,
+    "burst_request_count": 10,
+    "burst_min_avg_total_tokens": 400,
+    "session_pin_min_success_count": 3,
+    "user_pin_min_success_count": 4,
+    "pin_min_share": 0.60,
+    "expensive_model_min_count": 3,
+    "expensive_model_min_share": 0.70,
+    "free_high_cost_threshold_usd": 0.015,
+    "paid_high_cost_threshold_usd": 0.030,
+    "enterprise_medium_cost_threshold_usd": 0.050,
+    "failing_model_min_count": 2,
+    "failing_model_min_share": 0.60,
+    "failing_provider_min_count": 2,
+    "failing_provider_min_share": 0.70,
+    "fast_lane_hit_rate_threshold": 0.60,
+}
+
 
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
@@ -188,6 +235,17 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _merged_config(
+    defaults: Dict[str, Any], overrides: Dict[str, Any] | None
+) -> Dict[str, Any]:
+    merged = dict(defaults)
+    if overrides:
+        for key, value in overrides.items():
+            if value is not None:
+                merged[key] = value
+    return merged
 
 
 def _coerce_list(value: Any) -> list[str]:
@@ -427,7 +485,10 @@ def build_routing_features(data: Dict[str, Any]) -> Dict[str, Any]:
     context = str(data.get("context", "") or "")
     attachments = data.get("attachments") or []
     attachments_count = _safe_int(
-        data.get("attachments_count", len(attachments) if isinstance(attachments, list) else 0)
+        data.get(
+            "attachments_count",
+            len(attachments) if isinstance(attachments, list) else 0,
+        )
     )
     attachment_bytes = 0
     if isinstance(attachments, list):
@@ -445,9 +506,8 @@ def build_routing_features(data: Dict[str, Any]) -> Dict[str, Any]:
         or _safe_int(data.get("max_tokens")) >= 4096
     )
     attachment_heavy = attachments_count >= 3 or attachment_bytes >= 5_000_000
-    code_heavy = (
-        query_type in {"code_generation", "code_analysis"}
-        or any(keyword in query_text.lower() for keyword in CODE_KEYWORDS)
+    code_heavy = query_type in {"code_generation", "code_analysis"} or any(
+        keyword in query_text.lower() for keyword in CODE_KEYWORDS
     )
     query_complexity = calculate_query_complexity(
         query_type=query_type,
@@ -497,7 +557,10 @@ def build_routing_features(data: Dict[str, Any]) -> Dict[str, Any]:
         "requires_high_reasoning": requires_high_reasoning,
         "preferred_models": _coerce_list(metadata.get("preferred_models")),
         "avoid_models": _coerce_list(metadata.get("avoid_models")),
-        "avoid_providers": [provider.lower() for provider in _coerce_list(metadata.get("avoid_providers"))],
+        "avoid_providers": [
+            provider.lower()
+            for provider in _coerce_list(metadata.get("avoid_providers"))
+        ],
     }
 
 
@@ -801,10 +864,12 @@ def detect_model_routing_guardrails(
     cost_per_1k_history: list[float],
     threshold_multiplier: float = 2.0,
     minimum_history: int = 3,
+    thresholds: Dict[str, Any] | None = None,
     timestamp: datetime | None = None,
 ) -> list[Dict[str, Any]]:
     """Detect model-level routing guardrails from recent aggregate history."""
     guardrails: list[Dict[str, Any]] = []
+    config = _merged_config(DEFAULT_MODEL_GUARDRAIL_CONFIG, thresholds)
 
     model_name = str(metric_event.get("model_name", "unknown") or "unknown")
     current_latency = float(metric_event.get("avg_latency_ms", 0.0) or 0.0)
@@ -813,8 +878,29 @@ def detect_model_routing_guardrails(
     current_cache_hit_rate = float(metric_event.get("cache_hit_rate", 0.0) or 0.0)
     request_count = max(0, int(metric_event.get("request_count", 0) or 0))
     current_cost_per_1k = _cost_per_1k_tokens(metric_event)
+    high_error_rate_threshold = _safe_float(config.get("high_error_rate"), 0.30)
+    high_latency_ms = _safe_float(config.get("high_latency_ms"), 5000)
+    regression_error_floor = _safe_float(
+        config.get("regression_error_rate_floor"), 0.15
+    )
+    regression_latency_floor_ms = _safe_float(
+        config.get("regression_latency_floor_ms"), 3500
+    )
+    cache_hit_baseline_min = _safe_float(config.get("cache_hit_baseline_min"), 0.15)
+    cache_hit_drop_ratio = _safe_float(config.get("cache_hit_drop_ratio"), 0.5)
+    cache_hit_min_request_count = _safe_int(
+        config.get("cache_hit_min_request_count"), 5
+    )
+    throughput_baseline_min_qps = _safe_float(
+        config.get("throughput_baseline_min_qps"), 0.20
+    )
+    throughput_drop_ratio = _safe_float(config.get("throughput_drop_ratio"), 0.4)
+    throughput_min_request_count = _safe_int(
+        config.get("throughput_min_request_count"), 3
+    )
+    cost_spike_ratio = _safe_float(config.get("cost_spike_ratio"), 1.75)
 
-    if current_error_rate >= 0.30:
+    if current_error_rate >= high_error_rate_threshold:
         guardrails.append(
             build_routing_guardrail_event(
                 metric_event,
@@ -829,7 +915,7 @@ def detect_model_routing_guardrails(
             )
         )
 
-    if current_latency >= 5000:
+    if current_latency >= high_latency_ms:
         guardrails.append(
             build_routing_guardrail_event(
                 metric_event,
@@ -846,7 +932,9 @@ def detect_model_routing_guardrails(
 
     if len(error_rate_history) >= minimum_history:
         avg_error_rate = sum(error_rate_history) / len(error_rate_history)
-        if avg_error_rate >= 0 and current_error_rate > max(0.15, avg_error_rate * threshold_multiplier):
+        if avg_error_rate >= 0 and current_error_rate > max(
+            regression_error_floor, avg_error_rate * threshold_multiplier
+        ):
             guardrails.append(
                 build_routing_guardrail_event(
                     metric_event,
@@ -863,7 +951,9 @@ def detect_model_routing_guardrails(
 
     if len(latency_history) >= minimum_history:
         avg_latency = sum(latency_history) / len(latency_history)
-        if avg_latency > 0 and current_latency > max(3500, avg_latency * threshold_multiplier):
+        if avg_latency > 0 and current_latency > max(
+            regression_latency_floor_ms, avg_latency * threshold_multiplier
+        ):
             guardrails.append(
                 build_routing_guardrail_event(
                     metric_event,
@@ -881,9 +971,9 @@ def detect_model_routing_guardrails(
     if len(cache_hit_rate_history) >= minimum_history:
         avg_cache_hit_rate = sum(cache_hit_rate_history) / len(cache_hit_rate_history)
         if (
-            avg_cache_hit_rate > 0.15
-            and request_count >= 5
-            and current_cache_hit_rate < avg_cache_hit_rate * 0.5
+            avg_cache_hit_rate > cache_hit_baseline_min
+            and request_count >= cache_hit_min_request_count
+            and current_cache_hit_rate < avg_cache_hit_rate * cache_hit_drop_ratio
         ):
             guardrails.append(
                 build_routing_guardrail_event(
@@ -902,7 +992,11 @@ def detect_model_routing_guardrails(
 
     if len(qps_history) >= minimum_history:
         avg_qps = sum(qps_history) / len(qps_history)
-        if avg_qps > 0.20 and request_count >= 3 and current_qps < avg_qps * 0.4:
+        if (
+            avg_qps > throughput_baseline_min_qps
+            and request_count >= throughput_min_request_count
+            and current_qps < avg_qps * throughput_drop_ratio
+        ):
             guardrails.append(
                 build_routing_guardrail_event(
                     metric_event,
@@ -920,7 +1014,10 @@ def detect_model_routing_guardrails(
 
     if len(cost_per_1k_history) >= minimum_history:
         avg_cost_per_1k = sum(cost_per_1k_history) / len(cost_per_1k_history)
-        if avg_cost_per_1k > 0 and current_cost_per_1k > avg_cost_per_1k * 1.75:
+        if (
+            avg_cost_per_1k > 0
+            and current_cost_per_1k > avg_cost_per_1k * cost_spike_ratio
+        ):
             guardrails.append(
                 build_routing_guardrail_event(
                     metric_event,
@@ -946,16 +1043,26 @@ def detect_provider_routing_guardrails(
     error_rate_history: list[float],
     threshold_multiplier: float = 2.0,
     minimum_history: int = 3,
+    thresholds: Dict[str, Any] | None = None,
     timestamp: datetime | None = None,
 ) -> list[Dict[str, Any]]:
     """Detect provider-level routing guardrails from recent aggregate history."""
     guardrails: list[Dict[str, Any]] = []
+    config = _merged_config(DEFAULT_PROVIDER_GUARDRAIL_CONFIG, thresholds)
 
     provider = str(metric_event.get("provider", "unknown") or "unknown")
     current_latency = float(metric_event.get("avg_latency_ms", 0.0) or 0.0)
     current_error_rate = float(metric_event.get("error_rate", 0.0) or 0.0)
+    high_error_rate_threshold = _safe_float(config.get("high_error_rate"), 0.20)
+    high_latency_ms = _safe_float(config.get("high_latency_ms"), 6000)
+    regression_error_floor = _safe_float(
+        config.get("regression_error_rate_floor"), 0.10
+    )
+    regression_latency_floor_ms = _safe_float(
+        config.get("regression_latency_floor_ms"), 4500
+    )
 
-    if current_error_rate >= 0.20:
+    if current_error_rate >= high_error_rate_threshold:
         guardrails.append(
             build_routing_guardrail_event(
                 metric_event,
@@ -970,7 +1077,7 @@ def detect_provider_routing_guardrails(
             )
         )
 
-    if current_latency >= 6000:
+    if current_latency >= high_latency_ms:
         guardrails.append(
             build_routing_guardrail_event(
                 metric_event,
@@ -987,7 +1094,9 @@ def detect_provider_routing_guardrails(
 
     if len(error_rate_history) >= minimum_history:
         avg_error_rate = sum(error_rate_history) / len(error_rate_history)
-        if avg_error_rate > 0 and current_error_rate > max(0.10, avg_error_rate * threshold_multiplier):
+        if avg_error_rate > 0 and current_error_rate > max(
+            regression_error_floor, avg_error_rate * threshold_multiplier
+        ):
             guardrails.append(
                 build_routing_guardrail_event(
                     metric_event,
@@ -1004,7 +1113,9 @@ def detect_provider_routing_guardrails(
 
     if len(latency_history) >= minimum_history:
         avg_latency = sum(latency_history) / len(latency_history)
-        if avg_latency > 0 and current_latency > max(4500, avg_latency * threshold_multiplier):
+        if avg_latency > 0 and current_latency > max(
+            regression_latency_floor_ms, avg_latency * threshold_multiplier
+        ):
             guardrails.append(
                 build_routing_guardrail_event(
                     metric_event,
@@ -1022,10 +1133,12 @@ def detect_provider_routing_guardrails(
     return guardrails
 
 
-def _derive_hotness_from_request_count(request_count: int) -> str:
-    if request_count >= 10:
+def _derive_hotness_from_request_count(
+    request_count: int, *, hot_request_count: int = 10, warm_request_count: int = 4
+) -> str:
+    if request_count >= hot_request_count:
         return "hot"
-    if request_count >= 4:
+    if request_count >= warm_request_count:
         return "warm"
     return "cold"
 
@@ -1035,14 +1148,31 @@ def _derive_complexity_from_rolling_state(
     dominant_query_type: str,
     avg_total_tokens: float,
     avg_latency_ms: float,
+    policy_config: Dict[str, Any] | None = None,
 ) -> str:
-    if avg_total_tokens >= 2400 or (
-        dominant_query_type in HIGH_REASONING_QUERY_TYPES and avg_total_tokens >= 1200
+    config = _merged_config(DEFAULT_ROLLING_POLICY_CONFIG, policy_config)
+    complex_total_tokens = _safe_float(config.get("complex_total_tokens"), 2400)
+    complex_reasoning_tokens = _safe_float(config.get("complex_reasoning_tokens"), 1200)
+    moderate_total_tokens = _safe_float(config.get("moderate_total_tokens"), 900)
+    moderate_latency_ms = _safe_float(config.get("moderate_latency_ms"), 2500)
+    moderate_latency_min_tokens = _safe_float(
+        config.get("moderate_latency_min_tokens"), 600
+    )
+
+    if avg_total_tokens >= complex_total_tokens or (
+        dominant_query_type in HIGH_REASONING_QUERY_TYPES
+        and avg_total_tokens >= complex_reasoning_tokens
     ):
         return "complex"
-    if avg_total_tokens >= 900 or dominant_query_type in HIGH_REASONING_QUERY_TYPES:
+    if (
+        avg_total_tokens >= moderate_total_tokens
+        or dominant_query_type in HIGH_REASONING_QUERY_TYPES
+    ):
         return "moderate"
-    if avg_latency_ms >= 2500 and avg_total_tokens >= 600:
+    if (
+        avg_latency_ms >= moderate_latency_ms
+        and avg_total_tokens >= moderate_latency_min_tokens
+    ):
         return "moderate"
     return "simple"
 
@@ -1074,6 +1204,7 @@ def build_routing_policy_state_event(
     scope_key: str,
     events: list[Dict[str, Any]],
     window_size_seconds: int = 300,
+    policy_config: Dict[str, Any] | None = None,
     timestamp: datetime | None = None,
 ) -> Dict[str, Any]:
     """Derive rolling user/session routing policy state from recent completions."""
@@ -1088,15 +1219,15 @@ def build_routing_policy_state_event(
     success_count = sum(1 for event in events if event.get("status") == "success")
     error_count = request_count - success_count
     recent_error_rate = error_count / request_count if request_count > 0 else 0.0
-    avg_total_tokens = sum(
-        _safe_int(event.get("total_tokens")) for event in events
-    ) / request_count
-    avg_cost_usd = sum(
-        _safe_float(event.get("cost_usd")) for event in events
-    ) / request_count
-    avg_latency_ms = sum(
-        _safe_float(event.get("latency_ms")) for event in events
-    ) / request_count
+    avg_total_tokens = (
+        sum(_safe_int(event.get("total_tokens")) for event in events) / request_count
+    )
+    avg_cost_usd = (
+        sum(_safe_float(event.get("cost_usd")) for event in events) / request_count
+    )
+    avg_latency_ms = (
+        sum(_safe_float(event.get("latency_ms")) for event in events) / request_count
+    )
     fast_lane_hits = sum(
         1 for event in events if bool(event.get("actual_fast_lane_hit", False))
     )
@@ -1112,6 +1243,7 @@ def build_routing_policy_state_event(
     user_tier = str(latest_event.get("user_tier", "free") or "free").lower()
     user_id = latest_event.get("user_id")
     session_id = latest_event.get("session_id")
+    config = _merged_config(DEFAULT_ROLLING_POLICY_CONFIG, policy_config)
 
     for event in events:
         query_type = str(event.get("query_type", "general") or "general").lower()
@@ -1119,7 +1251,9 @@ def build_routing_policy_state_event(
 
         selected_model = str(event.get("selected_model", "") or "")
         if selected_model:
-            model_all_counts[selected_model] = model_all_counts.get(selected_model, 0) + 1
+            model_all_counts[selected_model] = (
+                model_all_counts.get(selected_model, 0) + 1
+            )
             if event.get("status") == "success":
                 model_success_counts[selected_model] = (
                     model_success_counts.get(selected_model, 0) + 1
@@ -1131,23 +1265,37 @@ def build_routing_policy_state_event(
 
         provider = str(event.get("provider", "") or "").lower()
         if provider and event.get("status") != "success":
-            failed_provider_counts[provider] = failed_provider_counts.get(provider, 0) + 1
+            failed_provider_counts[provider] = (
+                failed_provider_counts.get(provider, 0) + 1
+            )
 
     dominant_query_type = _dominant_key(query_type_counts) or "general"
-    session_hotness = _derive_hotness_from_request_count(request_count)
+    session_hotness = _derive_hotness_from_request_count(
+        request_count,
+        hot_request_count=_safe_int(config.get("hot_request_count"), 10),
+        warm_request_count=_safe_int(config.get("warm_request_count"), 4),
+    )
     query_complexity = _derive_complexity_from_rolling_state(
         dominant_query_type=dominant_query_type,
         avg_total_tokens=avg_total_tokens,
         avg_latency_ms=avg_latency_ms,
+        policy_config=config,
     )
     requires_high_reasoning = (
         dominant_query_type in HIGH_REASONING_QUERY_TYPES
         or query_complexity == "complex"
     )
 
-    enterprise_priority_active = user_tier == "enterprise" and request_count >= 4
+    enterprise_priority_active = (
+        user_tier == "enterprise"
+        and request_count
+        >= _safe_int(config.get("enterprise_priority_request_count"), 4)
+    )
     burst_protection_active = (
-        user_tier != "enterprise" and request_count >= 10 and avg_total_tokens >= 400
+        user_tier != "enterprise"
+        and request_count >= _safe_int(config.get("burst_request_count"), 10)
+        and avg_total_tokens
+        >= _safe_float(config.get("burst_min_avg_total_tokens"), 400)
     )
 
     preferred_models: list[str] = []
@@ -1156,8 +1304,12 @@ def build_routing_policy_state_event(
 
     pinned_model = _dominant_key(
         model_success_counts,
-        minimum_count=3 if scope_type == "session" else 4,
-        minimum_share=0.60,
+        minimum_count=(
+            _safe_int(config.get("session_pin_min_success_count"), 3)
+            if scope_type == "session"
+            else _safe_int(config.get("user_pin_min_success_count"), 4)
+        ),
+        minimum_share=_safe_float(config.get("pin_min_share"), 0.60),
     )
     if pinned_model and recent_error_rate <= 0.15:
         if scope_type == "session":
@@ -1165,8 +1317,16 @@ def build_routing_policy_state_event(
         elif enterprise_priority_active:
             preferred_models.append(pinned_model)
 
-    expensive_model = _dominant_key(model_all_counts, minimum_count=3, minimum_share=0.70)
-    high_cost_threshold = 0.015 if user_tier == "free" else 0.030
+    expensive_model = _dominant_key(
+        model_all_counts,
+        minimum_count=_safe_int(config.get("expensive_model_min_count"), 3),
+        minimum_share=_safe_float(config.get("expensive_model_min_share"), 0.70),
+    )
+    high_cost_threshold = (
+        _safe_float(config.get("free_high_cost_threshold_usd"), 0.015)
+        if user_tier == "free"
+        else _safe_float(config.get("paid_high_cost_threshold_usd"), 0.030)
+    )
     if (
         scope_type == "user"
         and user_tier != "enterprise"
@@ -1177,12 +1337,22 @@ def build_routing_policy_state_event(
     ):
         avoid_models.append(expensive_model)
 
-    failing_model = _dominant_key(failed_model_counts, minimum_count=2, minimum_share=0.60)
-    if failing_model and failing_model not in preferred_models and failing_model not in avoid_models:
+    failing_model = _dominant_key(
+        failed_model_counts,
+        minimum_count=_safe_int(config.get("failing_model_min_count"), 2),
+        minimum_share=_safe_float(config.get("failing_model_min_share"), 0.60),
+    )
+    if (
+        failing_model
+        and failing_model not in preferred_models
+        and failing_model not in avoid_models
+    ):
         avoid_models.append(failing_model)
 
     failing_provider = _dominant_key(
-        failed_provider_counts, minimum_count=2, minimum_share=0.70
+        failed_provider_counts,
+        minimum_count=_safe_int(config.get("failing_provider_min_count"), 2),
+        minimum_share=_safe_float(config.get("failing_provider_min_share"), 0.70),
     )
     if failing_provider:
         avoid_providers.append(failing_provider)
@@ -1196,13 +1366,18 @@ def build_routing_policy_state_event(
         burst_protection_active or avg_cost_usd >= high_cost_threshold
     ):
         cost_sensitivity = "high"
-    elif user_tier == "enterprise" and avg_cost_usd >= 0.050:
+    elif user_tier == "enterprise" and avg_cost_usd >= _safe_float(
+        config.get("enterprise_medium_cost_threshold_usd"), 0.050
+    ):
         cost_sensitivity = "medium"
 
-    error_sensitivity = "high" if (user_tier == "enterprise" or recent_error_rate >= 0.20) else "medium"
+    error_sensitivity = (
+        "high" if (user_tier == "enterprise" or recent_error_rate >= 0.20) else "medium"
+    )
     requires_low_latency = (
         burst_protection_active
-        or fast_lane_hit_rate >= 0.60
+        or fast_lane_hit_rate
+        >= _safe_float(config.get("fast_lane_hit_rate_threshold"), 0.60)
         or (session_hotness == "hot" and not requires_high_reasoning)
     )
     route_to_fast_lane = (
@@ -1215,7 +1390,11 @@ def build_routing_policy_state_event(
     if burst_protection_active:
         hint_reasons.append("burst_protection")
     if preferred_models:
-        hint_reasons.append("session_model_pinning" if scope_type == "session" else "stable_model_preference")
+        hint_reasons.append(
+            "session_model_pinning"
+            if scope_type == "session"
+            else "stable_model_preference"
+        )
     if avoid_models or avoid_providers:
         hint_reasons.append("recent_failure_avoidance")
     if enterprise_priority_active:
@@ -1263,7 +1442,9 @@ def build_routing_policy_state_event(
         "preferred_models": preferred_models,
         "avoid_models": avoid_models,
         "avoid_providers": avoid_providers,
-        "hint_reason": ",".join(hint_reasons) if hint_reasons else "rolling_policy_state",
+        "hint_reason": ",".join(hint_reasons)
+        if hint_reasons
+        else "rolling_policy_state",
     }
 
 

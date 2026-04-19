@@ -312,6 +312,102 @@ class TestClickHouseManager:
                 column_names=expected_columns,
             )
 
+    @pytest.mark.asyncio
+    async def test_get_routing_guardrails_uses_run_blocking(self, pipeline_config):
+        with patch(
+            "src.llm_router_part3_pipeline.clickhouse_connect.get_client"
+        ) as mock_get_client:
+            client = MagicMock()
+            client.query.return_value.result_rows = [[1]]
+            mock_get_client.return_value = client
+
+            manager = ClickHouseManager(pipeline_config["clickhouse"])
+            await manager.initialize()
+            manager._run_blocking = AsyncMock(
+                return_value=SimpleNamespace(
+                    result_rows=[
+                        [
+                            datetime(2026, 4, 19, tzinfo=timezone.utc),
+                            "high_latency",
+                            "warning",
+                            "Latency regressed",
+                            "gpt-5",
+                            "openai",
+                            json.dumps(
+                                {
+                                    "scope_type": "model",
+                                    "scope_key": "gpt-5",
+                                    "guardrail_action": "warn",
+                                }
+                            ),
+                        ]
+                    ]
+                )
+            )
+
+            guardrails = await manager.get_routing_guardrails(hours=6)
+
+            manager._run_blocking.assert_awaited_once()
+            func_arg, query_arg = manager._run_blocking.await_args.args
+            assert func_arg == client.query
+            assert "FROM test_db.alert_events" in query_arg
+            assert "routing.guardrails" in query_arg
+            assert guardrails[0]["guardrail_action"] == "warn"
+            assert guardrails[0]["source"] == "clickhouse"
+
+    @pytest.mark.asyncio
+    async def test_get_routing_policy_state_events_uses_run_blocking(
+        self, pipeline_config
+    ):
+        with patch(
+            "src.llm_router_part3_pipeline.clickhouse_connect.get_client"
+        ) as mock_get_client:
+            client = MagicMock()
+            client.query.return_value.result_rows = [[1]]
+            mock_get_client.return_value = client
+
+            manager = ClickHouseManager(pipeline_config["clickhouse"])
+            await manager.initialize()
+            manager._run_blocking = AsyncMock(
+                return_value=SimpleNamespace(
+                    result_rows=[
+                        [
+                            datetime(2026, 4, 19, tzinfo=timezone.utc),
+                            "user",
+                            "user-1",
+                            "user-1",
+                            "session-1",
+                            "premium",
+                            "burst_protection",
+                            5,
+                            0.2,
+                            420.0,
+                            0.75,
+                            "analysis",
+                            "complex",
+                            True,
+                            False,
+                            True,
+                            True,
+                            False,
+                            ["gpt-5"],
+                            ["mistral-7b"],
+                            ["vllm"],
+                            json.dumps({"policy_source": "rolling_state"}),
+                        ]
+                    ]
+                )
+            )
+
+            state_events = await manager.get_routing_policy_state_events(hours=6)
+
+            manager._run_blocking.assert_awaited_once()
+            func_arg, query_arg = manager._run_blocking.await_args.args
+            assert func_arg == client.query
+            assert "FROM test_db.routing_policy_state_events" in query_arg
+            assert state_events[0]["preferred_models"] == ["gpt-5"]
+            assert state_events[0]["payload"]["policy_source"] == "rolling_state"
+
 
 class TestKafkaConsumerManager:
     def test_deserialize_message_returns_json_payload(self, pipeline_config):
@@ -380,6 +476,35 @@ class TestKafkaConsumerManager:
         assert consumer.clickhouse.batch_insert_query_logs.await_count == 1
         assert consumer.awaiting_commit_offsets["queries"] == {}
 
+    @pytest.mark.asyncio
+    async def test_flush_pending_batches_commits_routing_guardrail_offsets(
+        self, pipeline_config
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        consumer.clickhouse.batch_insert_alert_events = AsyncMock()
+        consumer.consumers["routing_guardrails"] = AsyncMock()
+        tp = TopicPartition("routing.guardrails", 0)
+        consumer.batch_processors["routing_guardrails"].append(
+            AlertEventEntry(
+                timestamp=datetime.now(timezone.utc),
+                alert_type="provider_high_latency",
+                severity="error",
+                description="Provider latency exceeded threshold",
+                source_event_type="routing.guardrails",
+            )
+        )
+        consumer.pending_commit_offsets["routing_guardrails"][tp] = 5
+
+        await consumer.flush_pending_batches()
+
+        consumer.clickhouse.batch_insert_alert_events.assert_awaited_once()
+        consumer.consumers["routing_guardrails"].commit.assert_awaited_once_with(
+            {tp: 5}
+        )
+        assert consumer.batch_processors["routing_guardrails"] == []
+        assert consumer.pending_commit_offsets["routing_guardrails"] == {}
+        assert consumer.awaiting_commit_offsets["routing_guardrails"] == {}
+
 
 class TestKafkaIngestionPipeline:
     @pytest.mark.asyncio
@@ -438,6 +563,9 @@ class TestKafkaIngestionPipeline:
             async def ingest_stream_routing_guardrail(self, guardrail_event):
                 return guardrail_event
 
+            async def ingest_stream_routing_policy_state(self, state_event):
+                return state_event
+
             async def ingest_stream_alert(self, alert_event):
                 return alert_event
 
@@ -446,4 +574,5 @@ class TestKafkaIngestionPipeline:
         assert len(pipeline._stream_handlers["requests_enriched"]) == 1
         assert len(pipeline._stream_handlers["analytics_model_metrics_1m"]) == 1
         assert len(pipeline._stream_handlers["routing_guardrails"]) == 1
+        assert len(pipeline._stream_handlers["routing_policy_state"]) == 1
         assert len(pipeline._stream_handlers["alerts"]) == 1

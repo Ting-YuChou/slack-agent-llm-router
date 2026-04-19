@@ -26,10 +26,10 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
     menu_items={
-        'Get Help': None,
-        'Report a bug': None,
-        'About': "LLM Router Analytics Platform v2.1.0"
-    }
+        "Get Help": None,
+        "Report a bug": None,
+        "About": "LLM Router Analytics Platform v2.1.0",
+    },
 )
 
 # ============================================================================
@@ -47,6 +47,7 @@ TIME_RANGE_TO_HOURS = {
 }
 MAX_HISTORY_POINTS = 60
 
+
 class DashboardAPI:
     """Professional API client for dashboard data"""
 
@@ -54,7 +55,9 @@ class DashboardAPI:
         self.base_url = (base_url or DEFAULT_API_BASE_URL).rstrip("/")
         self.timeout = 10.0
 
-    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _get(
+        self, path: str, params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """Perform a GET request and normalize failures."""
         try:
             with httpx.Client(timeout=self.timeout) as client:
@@ -92,6 +95,9 @@ def build_empty_dashboard_payload(error: Optional[str] = None) -> Dict[str, Any]
         "analytics": {},
         "model_performance": [],
         "alerts": [],
+        "routing_features": {},
+        "routing_guardrails": {},
+        "routing_policy_state": {},
         "sources": {},
         "capabilities": {},
         "timestamp": time.time(),
@@ -171,9 +177,11 @@ def update_live_history(data: Dict[str, Any]):
     )
     st.session_state.dashboard_history = history[-MAX_HISTORY_POINTS:]
 
+
 # ============================================================================
 # CHART CREATION FUNCTIONS
 # ============================================================================
+
 
 def create_professional_line_chart(
     x_values: List[Any],
@@ -185,38 +193,31 @@ def create_professional_line_chart(
     """Create professional line chart with gradient fill."""
     fig = go.Figure()
 
-    fig.add_trace(go.Scatter(
-        x=x_values,
-        y=y_values,
-        mode='lines+markers',
-        line=dict(color=color, width=3, shape='spline'),
-        fill='tozeroy',
-        fillcolor=f'rgba({int(color[1:3], 16)}, {int(color[3:5], 16)}, {int(color[5:7], 16)}, 0.1)',
-        marker=dict(size=7),
-        name=title,
-        showlegend=False
-    ))
+    fig.add_trace(
+        go.Scatter(
+            x=x_values,
+            y=y_values,
+            mode="lines+markers",
+            line=dict(color=color, width=3, shape="spline"),
+            fill="tozeroy",
+            fillcolor=f"rgba({int(color[1:3], 16)}, {int(color[3:5], 16)}, {int(color[5:7], 16)}, 0.1)",
+            marker=dict(size=7),
+            name=title,
+            showlegend=False,
+        )
+    )
 
     fig.update_layout(
         title=dict(text=title, font=dict(size=18, family="Inter", weight=600)),
-        xaxis=dict(
-            title=x_title,
-            showgrid=True,
-            gridcolor='#f1f5f9',
-            showline=False
-        ),
-        yaxis=dict(
-            showgrid=True,
-            gridcolor='#f1f5f9',
-            showline=False
-        ),
-        plot_bgcolor='transparent',
-        paper_bgcolor='transparent',
-        font=dict(family="Inter", size=12, color='#475569'),
+        xaxis=dict(title=x_title, showgrid=True, gridcolor="#f1f5f9", showline=False),
+        yaxis=dict(showgrid=True, gridcolor="#f1f5f9", showline=False),
+        plot_bgcolor="transparent",
+        paper_bgcolor="transparent",
+        font=dict(family="Inter", size=12, color="#475569"),
         margin=dict(t=60, r=20, b=40, l=60),
-        height=320
+        height=320,
     )
-    
+
     return fig
 
 
@@ -237,55 +238,64 @@ def create_professional_bar_chart(
 
     fig.update_layout(
         title=dict(text=title, font=dict(size=18, family="Inter", weight=600)),
-        plot_bgcolor='transparent',
-        paper_bgcolor='transparent',
-        font=dict(family="Inter", size=12, color='#475569'),
+        plot_bgcolor="transparent",
+        paper_bgcolor="transparent",
+        font=dict(family="Inter", size=12, color="#475569"),
         showlegend=False,
         margin=dict(t=60, r=20, b=40, l=40),
         height=320,
     )
     fig.update_xaxes(showgrid=False)
-    fig.update_yaxes(showgrid=True, gridcolor='#f1f5f9')
+    fig.update_yaxes(showgrid=True, gridcolor="#f1f5f9")
     return fig
 
-def create_professional_pie_chart(values: List[float], labels: List[str], title: str) -> go.Figure:
+
+def create_professional_pie_chart(
+    values: List[float], labels: List[str], title: str
+) -> go.Figure:
     """Create professional donut chart"""
-    colors = ['#3b82f6', '#8b5cf6', '#10b981', '#f59e0b', '#ef4444']
-    
-    fig = go.Figure(data=[go.Pie(
-        labels=labels,
-        values=values,
-        hole=0.4,
-        marker=dict(
-            colors=colors[:len(values)],
-            line=dict(color='#ffffff', width=2)
-        ),
-        textinfo='label+percent',
-        textposition='outside',
-        textfont=dict(family="Inter", size=11)
-    )])
-    
+    colors = ["#3b82f6", "#8b5cf6", "#10b981", "#f59e0b", "#ef4444"]
+
+    fig = go.Figure(
+        data=[
+            go.Pie(
+                labels=labels,
+                values=values,
+                hole=0.4,
+                marker=dict(
+                    colors=colors[: len(values)], line=dict(color="#ffffff", width=2)
+                ),
+                textinfo="label+percent",
+                textposition="outside",
+                textfont=dict(family="Inter", size=11),
+            )
+        ]
+    )
+
     fig.update_layout(
         title=dict(text=title, font=dict(size=18, family="Inter", weight=600)),
-        plot_bgcolor='transparent',
-        paper_bgcolor='transparent',
-        font=dict(family="Inter", size=11, color='#475569'),
+        plot_bgcolor="transparent",
+        paper_bgcolor="transparent",
+        font=dict(family="Inter", size=11, color="#475569"),
         showlegend=False,
         margin=dict(t=60, r=20, b=20, l=20),
-        height=320
+        height=320,
     )
-    
+
     return fig
+
 
 # ============================================================================
 # PAGE COMPONENTS
 # ============================================================================
 
+
 def render_sidebar():
     """Render professional sidebar"""
     with st.sidebar:
         # Logo section
-        st.markdown("""
+        st.markdown(
+            """
         <div style="text-align: center; margin-bottom: 2rem;">
             <div style="display: flex; align-items: center; justify-content: center; gap: 12px; margin-bottom: 8px;">
                 <div style="width: 32px; height: 32px; background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); 
@@ -295,28 +305,41 @@ def render_sidebar():
             </div>
             <div style="font-size: 13px; color: #94a3b8; font-weight: 500;">Analytics Platform</div>
         </div>
-        """, unsafe_allow_html=True)
-        
+        """,
+            unsafe_allow_html=True,
+        )
+
         # Navigation
         st.markdown("**NAVIGATION**")
-        
+
         page = st.radio(
             "Select View",
-            ["📊 Overview", "🤖 Models", "⚡ Performance", "🧭 Routing", "👥 Users", "💰 Costs", "🚨 Alerts", "📋 Logs"],
-            label_visibility="collapsed"
+            [
+                "📊 Overview",
+                "🤖 Models",
+                "⚡ Performance",
+                "🧭 Routing",
+                "👥 Users",
+                "💰 Costs",
+                "🚨 Alerts",
+                "📋 Logs",
+            ],
+            label_visibility="collapsed",
         )
-        
+
         st.markdown("---")
-        
+
         # Time range selector
         time_range = st.selectbox(
             "Time Range",
             ["Last Hour", "Last 6 Hours", "Last 24 Hours", "Last 7 Days"],
-            index=2
+            index=2,
         )
-        
-        st.caption("Dashboard responses are cached for 30 seconds. Use Refresh Now to fetch a new snapshot.")
-        
+
+        st.caption(
+            "Dashboard responses are cached for 30 seconds. Use Refresh Now to fetch a new snapshot."
+        )
+
         # Manual refresh button
         if st.button("🔄 Refresh Now", use_container_width=True):
             st.cache_data.clear()
@@ -352,7 +375,8 @@ def render_sidebar_status(data: Dict[str, Any]):
 
     with st.sidebar:
         st.markdown("---")
-        st.markdown(f"""
+        st.markdown(
+            f"""
         <div style="background: #f1f5f9; padding: 20px; border-radius: 12px;">
             <div style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 8px;">
                 <span style="color: #94a3b8; font-weight: 500;">System Status</span>
@@ -375,20 +399,26 @@ def render_sidebar_status(data: Dict[str, Any]):
                 <span style="font-weight: 600; color: #0f172a;">{pipeline_state}</span>
             </div>
         </div>
-        """, unsafe_allow_html=True)
+        """,
+            unsafe_allow_html=True,
+        )
         st.caption(f"API: `{DEFAULT_API_BASE_URL}`")
+
 
 def render_header():
     """Render professional header"""
     col1, col2 = st.columns([3, 1])
-    
+
     with col1:
         st.title("🚀 System Overview")
-        st.markdown("**Real-time monitoring and analytics for your LLM infrastructure**")
-    
+        st.markdown(
+            "**Real-time monitoring and analytics for your LLM infrastructure**"
+        )
+
     with col2:
         current_time = datetime.now().strftime("%H:%M:%S")
-        st.markdown(f"""
+        st.markdown(
+            f"""
         <div style="text-align: right;">
             <div style="display: inline-flex; align-items: center; gap: 8px; padding: 8px 16px; 
                        background: white; border: 1px solid #e2e8f0; border-radius: 8px; 
@@ -398,31 +428,36 @@ def render_header():
                 <span>Live • Updated {current_time}</span>
             </div>
         </div>
-        """, unsafe_allow_html=True)
+        """,
+            unsafe_allow_html=True,
+        )
+
 
 def render_key_metrics(data: Dict[str, Any]):
     """Render key metrics cards"""
-    metrics = data.get('overview', {})
+    metrics = data.get("overview", {})
 
     col1, col2, col3, col4, col5 = st.columns(5)
 
     with col1:
         st.metric(
             "Requests",
-            format_optional_number(metrics.get('total_requests'), decimals=0),
+            format_optional_number(metrics.get("total_requests"), decimals=0),
         )
 
     with col2:
         st.metric(
             "Avg Response Time",
-            format_optional_number(metrics.get('avg_latency_ms'), decimals=0, suffix="ms"),
+            format_optional_number(
+                metrics.get("avg_latency_ms"), decimals=0, suffix="ms"
+            ),
         )
 
     with col3:
         st.metric(
             "Success Rate",
             format_optional_number(
-                safe_number(metrics.get('success_rate')) * 100,
+                safe_number(metrics.get("success_rate")) * 100,
                 decimals=1,
                 suffix="%",
             ),
@@ -431,18 +466,19 @@ def render_key_metrics(data: Dict[str, Any]):
     with col4:
         st.metric(
             "Cost",
-            format_optional_number(metrics.get('total_cost'), decimals=2, prefix="$"),
+            format_optional_number(metrics.get("total_cost"), decimals=2, prefix="$"),
         )
 
     with col5:
         st.metric(
             "Cache Hit Rate",
             format_optional_number(
-                safe_number(metrics.get('cache_hit_rate')) * 100,
+                safe_number(metrics.get("cache_hit_rate")) * 100,
                 decimals=1,
                 suffix="%",
             ),
         )
+
 
 def render_charts(data: Dict[str, Any]):
     """Render performance charts"""
@@ -499,74 +535,80 @@ def render_charts(data: Dict[str, Any]):
                 )
                 st.plotly_chart(fig_latency, use_container_width=True)
             else:
-                st.info("Per-model latency is available when ClickHouse analytics are enabled.")
+                st.info(
+                    "Per-model latency is available when ClickHouse analytics are enabled."
+                )
         else:
             st.info("No live latency data available yet.")
+
 
 def render_model_performance(data: Dict[str, Any]):
     """Render model performance table"""
     st.markdown("### 🤖 Model Performance")
-    st.markdown("**Live performance metrics across the models visible to this dashboard**")
+    st.markdown(
+        "**Live performance metrics across the models visible to this dashboard**"
+    )
     st.caption(
         f"Source: `{data.get('sources', {}).get('model_performance', 'unavailable')}`"
     )
 
-    model_data = data.get('model_performance', [])
+    model_data = data.get("model_performance", [])
     if model_data:
         df = pd.DataFrame(model_data)
-        df['requests'] = df['requests'].apply(
+        df["requests"] = df["requests"].apply(
             lambda value: format_optional_number(value, decimals=0)
         )
-        df['success_rate'] = df['success_rate'].apply(
+        df["success_rate"] = df["success_rate"].apply(
             lambda value: format_optional_number(value, decimals=1, suffix="%")
         )
-        df['avg_latency_ms'] = df['avg_latency_ms'].apply(
+        df["avg_latency_ms"] = df["avg_latency_ms"].apply(
             lambda value: format_optional_number(value, decimals=0, suffix="ms")
         )
-        df['tokens_per_second'] = df['tokens_per_second'].apply(
+        df["tokens_per_second"] = df["tokens_per_second"].apply(
             lambda value: format_optional_number(value, decimals=1)
         )
-        df['error_count'] = df['error_count'].apply(
+        df["error_count"] = df["error_count"].apply(
             lambda value: format_optional_number(value, decimals=0)
         )
-        df['total_cost'] = df['total_cost'].apply(
+        df["total_cost"] = df["total_cost"].apply(
             lambda value: format_optional_number(value, decimals=2, prefix="$")
         )
         df = df.rename(
             columns={
-                'model_name': 'Model',
-                'requests': 'Requests',
-                'success_rate': 'Success Rate',
-                'avg_latency_ms': 'Avg Latency',
-                'tokens_per_second': 'Tokens / Sec',
-                'error_count': 'Errors',
-                'total_cost': 'Cost',
-                'source': 'Source',
+                "model_name": "Model",
+                "requests": "Requests",
+                "success_rate": "Success Rate",
+                "avg_latency_ms": "Avg Latency",
+                "tokens_per_second": "Tokens / Sec",
+                "error_count": "Errors",
+                "total_cost": "Cost",
+                "source": "Source",
             }
         )
         st.dataframe(df, use_container_width=True, hide_index=True)
     else:
         st.info("No model performance data is currently available.")
 
+
 def render_analytics_charts(data: Dict[str, Any]):
     """Render analytics pie charts"""
     st.markdown("### 📊 Distribution Analytics")
     st.caption(f"Source: `{data.get('sources', {}).get('analytics', 'unavailable')}`")
 
-    analytics = data.get('analytics', {})
+    analytics = data.get("analytics", {})
 
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        primary_breakdown = analytics.get('query_type_breakdown') or analytics.get(
-            'model_request_distribution', {}
+        primary_breakdown = analytics.get("query_type_breakdown") or analytics.get(
+            "model_request_distribution", {}
         )
         if primary_breakdown:
             fig = create_professional_pie_chart(
                 list(primary_breakdown.values()),
                 list(primary_breakdown.keys()),
                 "Query Distribution"
-                if analytics.get('query_type_breakdown')
+                if analytics.get("query_type_breakdown")
                 else "Model Request Mix",
             )
             st.plotly_chart(fig, use_container_width=True)
@@ -574,28 +616,25 @@ def render_analytics_charts(data: Dict[str, Any]):
             st.info("No query distribution data available.")
 
     with col2:
-        cost_data = analytics.get('model_cost_breakdown', {})
+        cost_data = analytics.get("model_cost_breakdown", {})
         if cost_data:
             fig = create_professional_pie_chart(
-                list(cost_data.values()),
-                list(cost_data.keys()),
-                "Cost Breakdown"
+                list(cost_data.values()), list(cost_data.keys()), "Cost Breakdown"
             )
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No model cost data available.")
 
     with col3:
-        user_data = analytics.get('user_tier_distribution', {})
+        user_data = analytics.get("user_tier_distribution", {})
         if user_data:
             fig = create_professional_pie_chart(
-                list(user_data.values()),
-                list(user_data.keys()),
-                "User Tiers"
+                list(user_data.values()), list(user_data.keys()), "User Tiers"
             )
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No user tier data available.")
+
 
 def render_alerts(data: Dict[str, Any]):
     """Render system alerts"""
@@ -669,7 +708,10 @@ def render_routing_features(data: Dict[str, Any]):
             st.markdown(f"**{title}**")
             if breakdown:
                 chart = pd.DataFrame(
-                    {"Category": list(breakdown.keys()), "Count": list(breakdown.values())}
+                    {
+                        "Category": list(breakdown.keys()),
+                        "Count": list(breakdown.values()),
+                    }
                 )
                 st.bar_chart(chart.set_index("Category"))
             else:
@@ -701,7 +743,9 @@ def render_routing_features(data: Dict[str, Any]):
     recent_requests = routing_features.get("recent_requests", [])
     if recent_requests:
         st.markdown("**Recent Routing Feature Events**")
-        st.dataframe(pd.DataFrame(recent_requests), use_container_width=True, hide_index=True)
+        st.dataframe(
+            pd.DataFrame(recent_requests), use_container_width=True, hide_index=True
+        )
 
 
 def render_routing_guardrails(data: Dict[str, Any]):
@@ -767,12 +811,117 @@ def render_routing_guardrails(data: Dict[str, Any]):
 
     if recent_guardrails:
         st.markdown("**Recent Guardrails**")
-        st.dataframe(pd.DataFrame(recent_guardrails), use_container_width=True, hide_index=True)
+        st.dataframe(
+            pd.DataFrame(recent_guardrails), use_container_width=True, hide_index=True
+        )
 
     if persisted_guardrails:
         st.markdown("**Persisted Guardrails**")
         st.dataframe(
             pd.DataFrame(persisted_guardrails),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+def render_routing_policy_state(data: Dict[str, Any]):
+    """Render rolling routing policy state summaries and persisted audit events."""
+    st.markdown("### 🧩 Routing Policy State")
+    st.caption(
+        f"Source: `{data.get('sources', {}).get('routing_policy_state', 'unavailable')}`"
+    )
+
+    routing_policy_state = data.get("routing_policy_state", {}) or {}
+    recent_states = routing_policy_state.get("recent_states", []) or []
+    persisted_states = routing_policy_state.get("persisted_states", []) or []
+    total_count = int(routing_policy_state.get("state_count", 0) or 0)
+
+    if total_count <= 0 and not persisted_states:
+        st.info("No rolling routing policy state is currently visible.")
+        return
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("State Events", total_count)
+    with col2:
+        st.metric(
+            "Burst Protection",
+            int(routing_policy_state.get("burst_protection_count", 0) or 0),
+        )
+    with col3:
+        st.metric(
+            "Enterprise Priority",
+            int(routing_policy_state.get("enterprise_priority_count", 0) or 0),
+        )
+    with col4:
+        st.metric(
+            "Fast Lane Routes",
+            int(routing_policy_state.get("route_to_fast_lane_count", 0) or 0),
+        )
+
+    breakdown_col1, breakdown_col2, breakdown_col3 = st.columns(3)
+    breakdowns = [
+        ("Scope", routing_policy_state.get("scope_breakdown", {})),
+        (
+            "Complexity",
+            routing_policy_state.get("query_complexity_breakdown", {}),
+        ),
+        (
+            "Dominant Query Type",
+            routing_policy_state.get("dominant_query_type_breakdown", {}),
+        ),
+    ]
+
+    for column, (title, breakdown) in zip(
+        [breakdown_col1, breakdown_col2, breakdown_col3], breakdowns
+    ):
+        with column:
+            st.markdown(f"**{title}**")
+            if breakdown:
+                st.bar_chart(
+                    pd.DataFrame(
+                        {
+                            "Category": list(breakdown.keys()),
+                            "Count": list(breakdown.values()),
+                        }
+                    ).set_index("Category")
+                )
+            else:
+                st.info(f"No {title.lower()} data available.")
+
+    preference_col1, preference_col2, preference_col3 = st.columns(3)
+    preference_sections = [
+        ("Preferred Models", routing_policy_state.get("top_preferred_models", {})),
+        ("Avoid Models", routing_policy_state.get("top_avoid_models", {})),
+        ("Avoid Providers", routing_policy_state.get("top_avoid_providers", {})),
+    ]
+
+    for column, (title, items) in zip(
+        [preference_col1, preference_col2, preference_col3], preference_sections
+    ):
+        with column:
+            st.markdown(f"**{title}**")
+            if items:
+                st.dataframe(
+                    pd.DataFrame(
+                        {"Name": list(items.keys()), "Count": list(items.values())}
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.info(f"No {title.lower()} data available.")
+
+    if recent_states:
+        st.markdown("**Recent Rolling Policy State**")
+        st.dataframe(
+            pd.DataFrame(recent_states), use_container_width=True, hide_index=True
+        )
+
+    if persisted_states:
+        st.markdown("**Persisted Policy State Audit Trail**")
+        st.dataframe(
+            pd.DataFrame(persisted_states),
             use_container_width=True,
             hide_index=True,
         )
@@ -812,11 +961,23 @@ def render_logs_page():
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        log_level = st.selectbox("Log Level", ["ALL", "ERROR", "WARNING", "INFO", "DEBUG"])
+        log_level = st.selectbox(
+            "Log Level", ["ALL", "ERROR", "WARNING", "INFO", "DEBUG"]
+        )
     with col2:
         component = st.selectbox(
             "Component",
-            ["ALL", "api", "main", "inference", "router", "pipeline", "monitoring", "slack", "bot"],
+            [
+                "ALL",
+                "api",
+                "main",
+                "inference",
+                "router",
+                "pipeline",
+                "monitoring",
+                "slack",
+                "bot",
+            ],
         )
     with col3:
         log_count = st.slider("Number of logs", 10, 100, 50)
@@ -844,7 +1005,8 @@ def render_logs_page():
         timestamp = log.get("timestamp") or "-"
         request_id = log.get("request_id") or "-"
 
-        st.markdown(f"""
+        st.markdown(
+            f"""
         <div style="border-left: 4px solid {level_color}; padding: 12px; margin: 8px 0;
                    background: #f8fafc; font-family: monospace; font-size: 13px; border-radius: 4px;">
             <strong>{timestamp}</strong>
@@ -853,11 +1015,15 @@ def render_logs_page():
             {log.get('message', '')}<br>
             <small style="color: #94a3b8;">Request ID: {request_id}</small>
         </div>
-        """, unsafe_allow_html=True)
+        """,
+            unsafe_allow_html=True,
+        )
+
 
 # ============================================================================
 # MAIN APPLICATION
 # ============================================================================
+
 
 def main():
     """Main application function"""
@@ -891,6 +1057,8 @@ def main():
         st.markdown("---")
         render_routing_features(data)
         st.markdown("---")
+        render_routing_policy_state(data)
+        st.markdown("---")
         render_routing_guardrails(data)
         st.markdown("---")
         render_alerts(data)
@@ -910,11 +1078,15 @@ def main():
     elif page == "🧭 Routing":
         render_routing_features(data)
         st.markdown("---")
+        render_routing_policy_state(data)
+        st.markdown("---")
         render_routing_guardrails(data)
 
     elif page == "👥 Users":
         st.markdown("### 👥 User Analytics")
-        st.info("Live user distribution and engagement metrics from the dashboard backend.")
+        st.info(
+            "Live user distribution and engagement metrics from the dashboard backend."
+        )
         render_analytics_charts(data)
 
     elif page == "💰 Costs":
@@ -929,6 +1101,7 @@ def main():
 
     elif page == "📋 Logs":
         render_logs_page()
+
 
 if __name__ == "__main__":
     main()

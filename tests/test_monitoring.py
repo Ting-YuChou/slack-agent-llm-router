@@ -290,6 +290,28 @@ class TestMonitoringService:
                 "description": "Provider latency exceeded threshold",
             }
         )
+        await service.ingest_stream_routing_policy_state(
+            {
+                "event_type": "routing.policy_state",
+                "emitted_at": datetime.now().isoformat(),
+                "scope_type": "session",
+                "scope_key": "session-1",
+                "user_tier": "premium",
+                "recent_request_count": 4,
+                "recent_error_rate": 0.0,
+                "avg_latency_ms": 180.0,
+                "fast_lane_hit_rate": 0.75,
+                "dominant_query_type": "analysis",
+                "query_complexity": "moderate",
+                "requires_low_latency": True,
+                "requires_high_reasoning": False,
+                "route_to_fast_lane": True,
+                "preferred_models": ["mistral-7b"],
+                "avoid_models": [],
+                "avoid_providers": [],
+                "hint_reason": "session_model_pinning",
+            }
+        )
 
         dashboard = await service.get_dashboard_data()
 
@@ -297,3 +319,5 @@ class TestMonitoringService:
         assert dashboard["current_metrics"]["streaming"]["request_count"] == 3
         assert dashboard["routing_features"]["request_count"] == 1
         assert dashboard["routing_guardrails"]["guardrail_count"] == 1
+        assert dashboard["routing_policy_state"]["state_count"] == 1
+        assert dashboard["routing_policy_state"]["scope_breakdown"]["session"] == 1

@@ -438,6 +438,7 @@ class FlinkConfig(ConfigModel):
     job_manager_port: int = Field(8081, ge=1, le=65535)
     parallelism: int = Field(4, ge=1)
     checkpointing_interval_ms: int = Field(5000, ge=1)
+    analytics: Dict[str, Any] = Field(default_factory=dict)
 
 
 class PolicyCacheConfig(ConfigModel):
