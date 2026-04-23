@@ -818,6 +818,42 @@ class TestApiApp:
             body["sources"]["routing_policy_state"] == "monitoring_service+clickhouse"
         )
 
+    def test_dashboard_endpoint_supports_pipeline_get_analytics_fallback(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(tmp_path)
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+
+        class AnalyticsOnlyPipeline:
+            async def get_analytics(self, user_id=None, hours=24):
+                return {
+                    "total_queries": 4,
+                    "total_tokens": 80,
+                    "total_cost": 0.4,
+                    "avg_latency": 120.0,
+                    "success_rate": 75.0,
+                    "model_breakdown": {"gpt-5": {"queries": 4, "cost": 0.4}},
+                    "query_type_breakdown": {"analysis": 4},
+                }
+
+            async def get_model_performance(self, hours=24):
+                return []
+
+            async def get_routing_policy_state_events(self, hours=24):
+                return []
+
+        platform.services["pipeline"] = AnalyticsOnlyPipeline()
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.get("/dashboard", params={"hours": 6})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["sources"]["overview"] == "clickhouse"
+        assert body["overview"]["total_requests"] == 4
+        assert body["analytics"]["query_type_breakdown"]["analysis"] == 4
+
     def test_dashboard_logs_endpoint_reads_structured_logs(
         self, tmp_path, patched_platform_deps
     ):

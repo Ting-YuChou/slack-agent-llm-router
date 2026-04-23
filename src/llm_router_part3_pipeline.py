@@ -59,6 +59,11 @@ def _parse_datetime(
     return default or datetime.now(timezone.utc)
 
 
+def _escape_clickhouse_literal(value: Any) -> str:
+    """Escape a value for safe interpolation inside a ClickHouse string literal."""
+    return str(value).replace("\\", "\\\\").replace("'", "\\'")
+
+
 def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
     """Build the pre-inference event emitted by the API request path."""
     attachments = [
@@ -747,9 +752,18 @@ class ClickHouseManager:
             window_start_ms UInt64,
             window_end_ms UInt64,
             payload_json String
-        ) ENGINE = ReplacingMergeTree()
+        ) ENGINE = MergeTree()
         PARTITION BY toYYYYMMDD(timestamp)
-        ORDER BY (severity, alert_type, timestamp)
+        ORDER BY (
+            timestamp,
+            source_event_type,
+            severity,
+            alert_type,
+            request_id,
+            query_id,
+            model_name,
+            provider
+        )
         TTL toDateTime(timestamp) + INTERVAL 30 DAY
         """.format(
             database=self.database
@@ -803,6 +817,9 @@ class ClickHouseManager:
                 logger.info(f"Table {table_name} created/verified")
             except Exception as e:
                 logger.error(f"Failed to create table {table_name}: {e}")
+                raise RuntimeError(
+                    f"Failed to create required ClickHouse table {table_name}"
+                ) from e
 
         alter_statements = [
             f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS provider String DEFAULT ''",
@@ -938,62 +955,78 @@ class ClickHouseManager:
     ) -> Dict[str, Any]:
         """Get query analytics for dashboard"""
         try:
-            base_query = f"""
-            SELECT 
+            time_window_hours = max(int(hours), 0)
+            where_clauses = [
+                f"timestamp >= now() - INTERVAL {time_window_hours} HOUR"
+            ]
+            if user_id:
+                escaped_user_id = _escape_clickhouse_literal(user_id)
+                where_clauses.append(f"user_id = '{escaped_user_id}'")
+            where_sql = " AND ".join(where_clauses)
+
+            overall_query = f"""
+            SELECT
                 count() as total_queries,
-                sum(token_count_input + token_count_output) as total_tokens,
-                sum(cost_usd) as total_cost,
-                avg(latency_ms) as avg_latency,
-                countIf(status = 'success') * 100.0 / count() as success_rate,
+                ifNull(sum(token_count_input + token_count_output), 0) as total_tokens,
+                ifNull(sum(cost_usd), 0.0) as total_cost,
+                ifNull(avg(latency_ms), 0.0) as avg_latency,
+                if(count() = 0, 0.0, countIf(status = 'success') * 100.0 / count()) as success_rate
+            FROM {self.database}.query_logs
+            WHERE {where_sql}
+            """
+            model_breakdown_query = f"""
+            SELECT
                 selected_model,
-                query_type
-            FROM {self.database}.query_logs 
-            WHERE timestamp >= now() - INTERVAL {hours} HOUR
+                count() as total_queries,
+                ifNull(sum(cost_usd), 0.0) as total_cost
+            FROM {self.database}.query_logs
+            WHERE {where_sql}
+            GROUP BY selected_model
+            """
+            query_type_breakdown_query = f"""
+            SELECT
+                query_type,
+                count() as total_queries
+            FROM {self.database}.query_logs
+            WHERE {where_sql}
+            GROUP BY query_type
             """
 
-            if user_id:
-                base_query += f" AND user_id = '{user_id}'"
+            overall_result = await self._run_blocking(self.client.query, overall_query)
+            model_result = await self._run_blocking(
+                self.client.query, model_breakdown_query
+            )
+            query_type_result = await self._run_blocking(
+                self.client.query, query_type_breakdown_query
+            )
 
-            # Overall stats
-            overall_query = base_query + " GROUP BY selected_model, query_type"
-            result = await self._run_blocking(self.client.query, overall_query)
-
-            # Process results
+            overall_row = (
+                overall_result.result_rows[0]
+                if overall_result.result_rows
+                else [0, 0, 0.0, 0.0, 0.0]
+            )
             analytics = {
-                "total_queries": 0,
-                "total_tokens": 0,
-                "total_cost": 0.0,
-                "avg_latency": 0.0,
-                "success_rate": 0.0,
+                "total_queries": int(overall_row[0] or 0),
+                "total_tokens": int(overall_row[1] or 0),
+                "total_cost": float(overall_row[2] or 0.0),
+                "avg_latency": float(overall_row[3] or 0.0),
+                "success_rate": float(overall_row[4] or 0.0),
                 "model_breakdown": {},
                 "query_type_breakdown": {},
             }
 
-            for row in result.result_rows:
-                analytics["total_queries"] += row[0]
-                analytics["total_tokens"] += row[1]
-                analytics["total_cost"] += row[2]
-
-                model = row[5]
-                query_type = row[6]
-
+            for row in model_result.result_rows:
+                model = row[0]
                 if model not in analytics["model_breakdown"]:
                     analytics["model_breakdown"][model] = {"queries": 0, "cost": 0.0}
-                analytics["model_breakdown"][model]["queries"] += row[0]
-                analytics["model_breakdown"][model]["cost"] += row[2]
+                analytics["model_breakdown"][model]["queries"] += int(row[1] or 0)
+                analytics["model_breakdown"][model]["cost"] += float(row[2] or 0.0)
 
+            for row in query_type_result.result_rows:
+                query_type = row[0]
                 if query_type not in analytics["query_type_breakdown"]:
                     analytics["query_type_breakdown"][query_type] = 0
-                analytics["query_type_breakdown"][query_type] += row[0]
-
-            # Calculate averages
-            if analytics["total_queries"] > 0:
-                analytics["avg_latency"] = sum(
-                    row[3] for row in result.result_rows
-                ) / len(result.result_rows)
-                analytics["success_rate"] = sum(
-                    row[4] for row in result.result_rows
-                ) / len(result.result_rows)
+                analytics["query_type_breakdown"][query_type] += int(row[1] or 0)
 
             return analytics
 
@@ -1007,7 +1040,7 @@ class ClickHouseManager:
             query = f"""
             SELECT 
                 model_name,
-                any(provider) as provider,
+                provider,
                 sum(requests_count) as requests,
                 sum(success_count) * 100.0 / nullIf(sum(requests_count), 0) as success_rate,
                 sum(avg_latency_ms * requests_count) / nullIf(sum(requests_count), 0) as avg_latency,
@@ -1016,8 +1049,8 @@ class ClickHouseManager:
                 sum(total_cost_usd) as total_cost
             FROM {self.database}.model_performance
             WHERE timestamp >= now() - INTERVAL {hours} HOUR
-            GROUP BY model_name
-            ORDER BY requests DESC
+            GROUP BY model_name, provider
+            ORDER BY requests DESC, model_name ASC, provider ASC
             """
 
             result = await self._run_blocking(self.client.query, query)
@@ -1837,6 +1870,12 @@ class KafkaIngestionPipeline:
     ) -> Dict[str, Any]:
         """Get analytics from ClickHouse"""
         return await self.clickhouse_manager.get_query_analytics(user_id, hours)
+
+    async def get_query_analytics(
+        self, user_id: str = None, hours: int = 24
+    ) -> Dict[str, Any]:
+        """Backward-compatible alias for dashboard analytics lookups."""
+        return await self.get_analytics(user_id, hours)
 
     async def get_model_performance(self, hours: int = 24) -> List[Dict[str, Any]]:
         """Get model performance from ClickHouse"""

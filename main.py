@@ -861,8 +861,17 @@ class LLMRouterPlatform:
             sources["routing_policy_state"] = "monitoring_service"
 
         if "pipeline" in self.services:
-            pipeline_analytics = await self.services["pipeline"].get_query_analytics(
-                hours=hours
+            get_pipeline_analytics = getattr(
+                self.services["pipeline"], "get_query_analytics", None
+            )
+            if not callable(get_pipeline_analytics):
+                get_pipeline_analytics = getattr(
+                    self.services["pipeline"], "get_analytics", None
+                )
+            pipeline_analytics = (
+                await get_pipeline_analytics(hours=hours)
+                if callable(get_pipeline_analytics)
+                else {}
             )
             pipeline_models = await self.services["pipeline"].get_model_performance(
                 hours=hours

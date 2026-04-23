@@ -313,6 +313,128 @@ class TestClickHouseManager:
             )
 
     @pytest.mark.asyncio
+    async def test_get_query_analytics_uses_weighted_overall_aggregation(
+        self, pipeline_config
+    ):
+        with patch(
+            "src.llm_router_part3_pipeline.clickhouse_connect.get_client"
+        ) as mock_get_client:
+            client = MagicMock()
+            client.query.return_value.result_rows = [[1]]
+            mock_get_client.return_value = client
+
+            manager = ClickHouseManager(pipeline_config["clickhouse"])
+            await manager.initialize()
+            manager._run_blocking = AsyncMock(
+                side_effect=[
+                    SimpleNamespace(result_rows=[[10, 200, 3.5, 140.0, 80.0]]),
+                    SimpleNamespace(
+                        result_rows=[
+                            ["gpt-5", 8, 2.5],
+                            ["mistral-7b", 2, 1.0],
+                        ]
+                    ),
+                    SimpleNamespace(
+                        result_rows=[
+                            ["analysis", 6],
+                            ["general", 4],
+                        ]
+                    ),
+                ]
+            )
+
+            analytics = await manager.get_query_analytics(hours=6)
+
+            assert manager._run_blocking.await_count == 3
+            overall_query = manager._run_blocking.await_args_list[0].args[1]
+            assert "GROUP BY selected_model, query_type" not in overall_query
+            assert analytics == {
+                "total_queries": 10,
+                "total_tokens": 200,
+                "total_cost": 3.5,
+                "avg_latency": 140.0,
+                "success_rate": 80.0,
+                "model_breakdown": {
+                    "gpt-5": {"queries": 8, "cost": 2.5},
+                    "mistral-7b": {"queries": 2, "cost": 1.0},
+                },
+                "query_type_breakdown": {"analysis": 6, "general": 4},
+            }
+
+    @pytest.mark.asyncio
+    async def test_get_model_performance_groups_by_provider(self, pipeline_config):
+        with patch(
+            "src.llm_router_part3_pipeline.clickhouse_connect.get_client"
+        ) as mock_get_client:
+            client = MagicMock()
+            client.query.return_value.result_rows = [[1]]
+            mock_get_client.return_value = client
+
+            manager = ClickHouseManager(pipeline_config["clickhouse"])
+            await manager.initialize()
+            manager._run_blocking = AsyncMock(
+                return_value=SimpleNamespace(
+                    result_rows=[
+                        ["gpt-5", "openai", 7, 99.5, 412.0, 155.0, 0, 1.25],
+                        ["gpt-5", "azure", 3, 97.0, 430.0, 150.0, 1, 0.55],
+                    ]
+                )
+            )
+
+            performance = await manager.get_model_performance(hours=6)
+
+            query_arg = manager._run_blocking.await_args.args[1]
+            assert "GROUP BY model_name, provider" in query_arg
+            assert performance == [
+                {
+                    "model_name": "gpt-5",
+                    "provider": "openai",
+                    "requests": 7,
+                    "success_rate": 99.5,
+                    "avg_latency_ms": 412.0,
+                    "tokens_per_second": 155.0,
+                    "error_count": 0,
+                    "total_cost": 1.25,
+                },
+                {
+                    "model_name": "gpt-5",
+                    "provider": "azure",
+                    "requests": 3,
+                    "success_rate": 97.0,
+                    "avg_latency_ms": 430.0,
+                    "tokens_per_second": 150.0,
+                    "error_count": 1,
+                    "total_cost": 0.55,
+                },
+            ]
+
+    @pytest.mark.asyncio
+    async def test_initialize_raises_when_required_table_creation_fails(
+        self, pipeline_config
+    ):
+        with patch(
+            "src.llm_router_part3_pipeline.clickhouse_connect.get_client"
+        ) as mock_get_client:
+            client = MagicMock()
+            client.query.return_value.result_rows = [[1]]
+
+            def fail_model_performance_table(sql):
+                if "CREATE TABLE IF NOT EXISTS test_db.model_performance" in sql:
+                    raise RuntimeError("boom")
+                return None
+
+            client.command.side_effect = fail_model_performance_table
+            mock_get_client.return_value = client
+
+            manager = ClickHouseManager(pipeline_config["clickhouse"])
+
+            with pytest.raises(
+                RuntimeError,
+                match="Failed to create required ClickHouse table model_performance",
+            ):
+                await manager.initialize()
+
+    @pytest.mark.asyncio
     async def test_get_routing_guardrails_uses_run_blocking(self, pipeline_config):
         with patch(
             "src.llm_router_part3_pipeline.clickhouse_connect.get_client"
@@ -549,6 +671,20 @@ class TestKafkaIngestionPipeline:
         pipeline.producer_manager.produce_query_log.assert_awaited_once_with(
             request, response, decision
         )
+
+    @pytest.mark.asyncio
+    async def test_get_query_analytics_alias_delegates_to_clickhouse(self, pipeline_config):
+        pipeline = KafkaIngestionPipeline(pipeline_config)
+        pipeline.clickhouse_manager.get_query_analytics = AsyncMock(
+            return_value={"total_queries": 3}
+        )
+
+        analytics = await pipeline.get_query_analytics(hours=6)
+
+        pipeline.clickhouse_manager.get_query_analytics.assert_awaited_once_with(
+            None, 6
+        )
+        assert analytics == {"total_queries": 3}
 
     def test_attach_monitoring_service_registers_stream_handlers(self, pipeline_config):
         pipeline = KafkaIngestionPipeline(pipeline_config)
