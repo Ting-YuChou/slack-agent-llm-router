@@ -159,11 +159,25 @@ kafka:
     batch_size: 16384
     linger_ms: 5
     compression_type: gzip
+    request_timeout_ms: 40000
+    retry_backoff_ms: 100
+    send_timeout_seconds: 40
+    enable_idempotence: true
+    wait_for_ack: true
+    raise_on_failure: false
+    health_failure_threshold: 5
   consumer:
     group_id: llm-router-consumer
     auto_offset_reset: latest
     enable_auto_commit: false
     max_poll_records: 500
+    dlq_enabled: true
+    supervisor_initial_backoff_seconds: 1
+    supervisor_max_backoff_seconds: 30
+  dlq:
+    enabled: true
+    topic_suffix: .dlq
+    send_timeout_seconds: 10
   enabled: false
 clickhouse:
   host: localhost

@@ -347,6 +347,13 @@ class KafkaProducerConfig(ConfigModel):
     batch_size: int = Field(16_384, ge=1)
     linger_ms: int = Field(5, ge=0)
     compression_type: str = "gzip"
+    request_timeout_ms: int = Field(40_000, ge=1)
+    retry_backoff_ms: int = Field(100, ge=0)
+    send_timeout_seconds: float = Field(40.0, gt=0)
+    enable_idempotence: bool = True
+    wait_for_ack: bool = True
+    raise_on_failure: bool = False
+    health_failure_threshold: int = Field(5, ge=1)
 
 
 class KafkaConsumerConfig(ConfigModel):
@@ -354,13 +361,24 @@ class KafkaConsumerConfig(ConfigModel):
     auto_offset_reset: str = "latest"
     enable_auto_commit: bool = False
     max_poll_records: int = Field(500, ge=1)
+    dlq_enabled: bool = True
+    supervisor_initial_backoff_seconds: float = Field(1.0, gt=0)
+    supervisor_max_backoff_seconds: float = Field(30.0, gt=0)
+
+
+class KafkaDlqConfig(ConfigModel):
+    enabled: bool = True
+    topic_suffix: str = ".dlq"
+    send_timeout_seconds: float = Field(10.0, gt=0)
 
 
 class KafkaConfig(ConfigModel):
     bootstrap_servers: List[str] = Field(default_factory=list)
     topics: Dict[str, str] = Field(default_factory=dict)
+    dead_letter_topics: Dict[str, str] = Field(default_factory=dict)
     producer: KafkaProducerConfig = Field(default_factory=KafkaProducerConfig)
     consumer: KafkaConsumerConfig = Field(default_factory=KafkaConsumerConfig)
+    dlq: KafkaDlqConfig = Field(default_factory=KafkaDlqConfig)
     enabled: bool = False
 
 

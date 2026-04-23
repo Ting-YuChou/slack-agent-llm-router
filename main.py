@@ -528,6 +528,13 @@ class LLMRouterPlatform:
         """Build readiness response payload."""
         service_status = self._get_service_status()
         required_services = ["router", "inference"]
+        for optional_required in (
+            "event_producer",
+            "pipeline",
+            "policy_materializer",
+        ):
+            if optional_required in self.services:
+                required_services.append(optional_required)
         missing_services = [
             service_name
             for service_name in required_services

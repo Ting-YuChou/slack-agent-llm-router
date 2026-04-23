@@ -107,6 +107,63 @@ class TestKafkaProducerManager:
             producer.start.assert_awaited_once()
             assert manager.producer is producer
 
+    @pytest.mark.asyncio
+    async def test_initialize_maps_reliability_producer_config(self, pipeline_config):
+        config = {
+            **pipeline_config,
+            "producer": {
+                "acks": "1",
+                "enable_idempotence": True,
+                "linger_ms": 25,
+                "batch_size": 32768,
+                "request_timeout_ms": 12000,
+                "retry_backoff_ms": 250,
+            },
+        }
+        with patch(
+            "src.llm_router_part3_pipeline.AIOKafkaProducer"
+        ) as mock_producer_cls:
+            producer = AsyncMock()
+            mock_producer_cls.return_value = producer
+
+            manager = KafkaProducerManager(config)
+            await manager.initialize()
+
+            kwargs = mock_producer_cls.call_args.kwargs
+            assert kwargs["acks"] == "all"
+            assert kwargs["enable_idempotence"] is True
+            assert kwargs["linger_ms"] == 25
+            assert kwargs["max_batch_size"] == 32768
+            assert kwargs["request_timeout_ms"] == 12000
+            assert kwargs["retry_backoff_ms"] == 250
+
+    @pytest.mark.asyncio
+    async def test_send_message_waits_for_ack_and_retries(self, pipeline_config):
+        config = {
+            **pipeline_config,
+            "producer": {
+                "retries": 1,
+                "retry_backoff_ms": 0,
+                "send_timeout_seconds": 1,
+            },
+        }
+        manager = KafkaProducerManager(config)
+        manager.producer = AsyncMock()
+        manager.producer.send_and_wait = AsyncMock(
+            side_effect=[RuntimeError("temporary"), object()]
+        )
+
+        sent = await manager._send_message(
+            "queries",
+            "llm-queries",
+            key="u1",
+            value={"hello": "world"},
+        )
+
+        assert sent is True
+        assert manager.producer.send_and_wait.await_count == 2
+        assert manager.consecutive_failures == 0
+
     def test_serialize_message_handles_datetime(self, pipeline_config):
         manager = KafkaProducerManager(pipeline_config)
         payload = {
@@ -128,7 +185,7 @@ class TestKafkaProducerManager:
 
         await manager.produce_request_raw(request)
 
-        send_kwargs = manager.producer.send.await_args.kwargs
+        send_kwargs = manager.producer.send_and_wait.await_args.kwargs
         assert send_kwargs["topic"] == "requests.raw"
         assert send_kwargs["key"] == "u1"
         assert send_kwargs["value"]["event_type"] == "requests.raw"
@@ -172,7 +229,7 @@ class TestKafkaProducerManager:
 
         await manager.produce_inference_completed(request, response, routing_decision)
 
-        send_kwargs = manager.producer.send.await_args.kwargs
+        send_kwargs = manager.producer.send_and_wait.await_args.kwargs
         assert send_kwargs["topic"] == "inference.completed"
         assert send_kwargs["key"] == request.request_id
         assert send_kwargs["value"]["event_type"] == "inference.completed"
@@ -206,7 +263,7 @@ class TestKafkaProducerManager:
 
         await manager.produce_query_log(request, response, SimpleNamespace())
 
-        send_kwargs = manager.producer.send.await_args.kwargs
+        send_kwargs = manager.producer.send_and_wait.await_args.kwargs
         assert send_kwargs["topic"] == "test-queries"
         assert send_kwargs["value"]["query_id"] == request.request_id
         assert send_kwargs["value"]["query_type"] == "general"
@@ -616,6 +673,69 @@ class TestKafkaConsumerManager:
             {TopicPartition("requests.enriched", 0): 5}
         )
         assert seen == ["req-1"]
+
+    @pytest.mark.asyncio
+    async def test_consume_query_poison_message_goes_to_dlq_and_commits(
+        self, pipeline_config
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        consumer.dlq_producer = AsyncMock()
+        message = SimpleNamespace(
+            value=b"{not-json",
+            key=b"bad-key",
+            topic="test-queries",
+            partition=0,
+            offset=12,
+        )
+        kafka_consumer = AsyncMessageConsumer([message])
+        consumer.consumers["queries"] = kafka_consumer
+
+        await consumer._consume_queries(kafka_consumer)
+
+        dlq_kwargs = consumer.dlq_producer.send_and_wait.await_args.kwargs
+        assert dlq_kwargs["topic"] == "test-queries.dlq"
+        assert dlq_kwargs["key"] == "test-queries:0:12"
+        assert dlq_kwargs["value"]["source_offset"] == 12
+        assert dlq_kwargs["value"]["source_key"] == "bad-key"
+        assert dlq_kwargs["value"]["error_type"] == "JSONDecodeError"
+        kafka_consumer.commit.assert_awaited_once_with(
+            {TopicPartition("test-queries", 0): 13}
+        )
+
+    @pytest.mark.asyncio
+    async def test_consume_query_records_kafka_metadata_for_idempotency(
+        self, pipeline_config
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        payload = {
+            "query_id": "query-1",
+            "timestamp": "2026-04-19T00:00:00+00:00",
+            "user_id": "user-1",
+            "user_tier": "premium",
+            "query_text": "hello",
+            "query_type": "general",
+            "selected_model": "gpt-5",
+            "token_count_input": 1,
+            "token_count_output": 2,
+            "latency_ms": 10,
+            "cost_usd": 0.01,
+            "status": "success",
+        }
+        message = SimpleNamespace(
+            value=json.dumps(payload).encode("utf-8"),
+            topic="test-queries",
+            partition=2,
+            offset=8,
+        )
+        kafka_consumer = AsyncMessageConsumer([message])
+
+        await consumer._consume_queries(kafka_consumer)
+
+        entry = consumer.batch_processors["queries"][0]
+        assert entry.event_id == "test-queries:2:8"
+        assert entry.kafka_topic == "test-queries"
+        assert entry.kafka_partition == 2
+        assert entry.kafka_offset == 8
 
     @pytest.mark.asyncio
     async def test_flush_pending_batches_commits_offsets_after_clickhouse_write(

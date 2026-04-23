@@ -64,6 +64,27 @@ def _escape_clickhouse_literal(value: Any) -> str:
     return str(value).replace("\\", "\\\\").replace("'", "\\'")
 
 
+def _decode_kafka_key(key: Any) -> str:
+    """Decode a Kafka key for diagnostic payloads."""
+    if key is None:
+        return ""
+    if isinstance(key, bytes):
+        return key.decode("utf-8", errors="replace")
+    return str(key)
+
+
+def _json_safe_payload(value: Any) -> Any:
+    """Return a JSON-safe representation of an arbitrary Kafka payload."""
+    if isinstance(value, bytes):
+        try:
+            return json.loads(value.decode("utf-8"))
+        except Exception:
+            return value.decode("utf-8", errors="replace")
+    if isinstance(value, (dict, list, str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
 def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
     """Build the pre-inference event emitted by the API request path."""
     attachments = [
@@ -171,10 +192,15 @@ class QueryLogEntry:
     context_compressed: bool = False
     compression_ratio: float = 0.0
     cached_response: bool = False
+    event_id: str = ""
+    kafka_topic: str = ""
+    kafka_partition: int = -1
+    kafka_offset: int = -1
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion"""
         return {
+            "event_id": self.event_id or self.query_id,
             "query_id": self.query_id,
             "timestamp": self.timestamp,
             "user_id": self.user_id,
@@ -195,6 +221,9 @@ class QueryLogEntry:
             "context_compressed": self.context_compressed,
             "compression_ratio": self.compression_ratio,
             "cached_response": self.cached_response,
+            "kafka_topic": self.kafka_topic,
+            "kafka_partition": self.kafka_partition,
+            "kafka_offset": self.kafka_offset,
         }
 
 
@@ -207,15 +236,26 @@ class MetricEntry:
     metric_name: str
     metric_value: float
     labels: Dict[str, str]
+    event_id: str = ""
+    kafka_topic: str = ""
+    kafka_partition: int = -1
+    kafka_offset: int = -1
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion"""
+        event_id = self.event_id or (
+            f"{self.service}:{self.metric_name}:{self.timestamp.isoformat()}"
+        )
         return {
+            "event_id": event_id,
             "timestamp": self.timestamp,
             "service": self.service,
             "metric_name": self.metric_name,
             "metric_value": self.metric_value,
             "labels": self.labels,  # ClickHouse Map type
+            "kafka_topic": self.kafka_topic,
+            "kafka_partition": self.kafka_partition,
+            "kafka_offset": self.kafka_offset,
         }
 
 
@@ -242,10 +282,18 @@ class ModelPerformanceEntry:
     cached_count: int
     gpu_utilization: float = 0.0
     memory_usage_gb: float = 0.0
+    event_id: str = ""
+    kafka_topic: str = ""
+    kafka_partition: int = -1
+    kafka_offset: int = -1
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion."""
+        event_id = self.event_id or (
+            f"{self.model_name}:{self.provider}:{self.window_start_ms}:{self.window_end_ms}"
+        )
         return {
+            "event_id": event_id,
             "timestamp": self.timestamp,
             "model_name": self.model_name,
             "provider": self.provider,
@@ -265,6 +313,9 @@ class ModelPerformanceEntry:
             "cached_count": self.cached_count,
             "gpu_utilization": self.gpu_utilization,
             "memory_usage_gb": self.memory_usage_gb,
+            "kafka_topic": self.kafka_topic,
+            "kafka_partition": self.kafka_partition,
+            "kafka_offset": self.kafka_offset,
         }
 
 
@@ -286,10 +337,20 @@ class AlertEventEntry:
     window_start_ms: int = 0
     window_end_ms: int = 0
     payload_json: str = "{}"
+    event_id: str = ""
+    kafka_topic: str = ""
+    kafka_partition: int = -1
+    kafka_offset: int = -1
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion."""
+        event_id = self.event_id or (
+            f"{self.source_event_type}:{self.alert_type}:{self.request_id}:"
+            f"{self.query_id}:{self.model_name}:{self.provider}:"
+            f"{self.window_start_ms}:{self.window_end_ms}:{self.timestamp.isoformat()}"
+        )
         return {
+            "event_id": event_id,
             "timestamp": self.timestamp,
             "alert_type": self.alert_type,
             "severity": self.severity,
@@ -304,6 +365,9 @@ class AlertEventEntry:
             "window_start_ms": self.window_start_ms,
             "window_end_ms": self.window_end_ms,
             "payload_json": self.payload_json,
+            "kafka_topic": self.kafka_topic,
+            "kafka_partition": self.kafka_partition,
+            "kafka_offset": self.kafka_offset,
         }
 
 
@@ -333,10 +397,18 @@ class RoutingPolicyStateEntry:
     avoid_models: List[str] = field(default_factory=list)
     avoid_providers: List[str] = field(default_factory=list)
     payload_json: str = "{}"
+    event_id: str = ""
+    kafka_topic: str = ""
+    kafka_partition: int = -1
+    kafka_offset: int = -1
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion."""
+        event_id = self.event_id or (
+            f"{self.scope_type}:{self.scope_key}:{self.timestamp.isoformat()}"
+        )
         return {
+            "event_id": event_id,
             "timestamp": self.timestamp,
             "scope_type": self.scope_type,
             "scope_key": self.scope_key,
@@ -359,6 +431,9 @@ class RoutingPolicyStateEntry:
             "avoid_models": list(self.avoid_models),
             "avoid_providers": list(self.avoid_providers),
             "payload_json": self.payload_json,
+            "kafka_topic": self.kafka_topic,
+            "kafka_partition": self.kafka_partition,
+            "kafka_offset": self.kafka_offset,
         }
 
 
@@ -370,16 +445,40 @@ class KafkaProducerManager:
         self.bootstrap_servers = config.get("bootstrap_servers", ["localhost:9092"])
         self.producer = None
         self.topics = config.get("topics", {})
+        producer_config = config.get("producer", {})
+        self.wait_for_ack = producer_config.get("wait_for_ack", True)
+        self.retries = int(producer_config.get("retries", 3) or 0)
+        self.retry_backoff_ms = int(producer_config.get("retry_backoff_ms", 100) or 0)
+        self.send_timeout_seconds = float(
+            producer_config.get(
+                "send_timeout_seconds",
+                producer_config.get("request_timeout_ms", 40000) / 1000,
+            )
+        )
+        self.raise_on_failure = bool(producer_config.get("raise_on_failure", False))
+        self.consecutive_failures = 0
+        self.last_error: Optional[str] = None
 
         # Producer configuration
+        enable_idempotence = bool(producer_config.get("enable_idempotence", True))
+        acks = producer_config.get("acks", "all")
+        if enable_idempotence and acks != "all":
+            logger.warning("Kafka idempotent producer requires acks=all; overriding")
+            acks = "all"
+
         self.producer_config = {
             "bootstrap_servers": self.bootstrap_servers,
             "value_serializer": self._serialize_message,
             "key_serializer": lambda x: x.encode("utf-8") if x else None,
-            "acks": config.get("producer", {}).get("acks", "all"),
-            "compression_type": config.get("producer", {}).get(
-                "compression_type", "gzip"
+            "acks": acks,
+            "compression_type": producer_config.get("compression_type", "gzip"),
+            "linger_ms": int(producer_config.get("linger_ms", 5) or 0),
+            "max_batch_size": int(producer_config.get("batch_size", 16384) or 16384),
+            "request_timeout_ms": int(
+                producer_config.get("request_timeout_ms", 40000) or 40000
             ),
+            "retry_backoff_ms": self.retry_backoff_ms,
+            "enable_idempotence": enable_idempotence,
         }
 
     async def initialize(self):
@@ -394,7 +493,13 @@ class KafkaProducerManager:
 
     def is_healthy(self) -> bool:
         """Return whether the Kafka producer has been initialized."""
-        return self.producer is not None
+        failure_threshold = int(
+            self.config.get("producer", {}).get("health_failure_threshold", 5) or 5
+        )
+        return (
+            self.producer is not None
+            and self.consecutive_failures < failure_threshold
+        )
 
     def _topic_name(self, topic_key: str, default_topic: str) -> str:
         """Resolve a logical topic key to the configured Kafka topic name."""
@@ -407,18 +512,64 @@ class KafkaProducerManager:
         *,
         key: Optional[str],
         value: Dict[str, Any],
-    ):
+    ) -> bool:
         """Send a JSON-serializable message to Kafka and update metrics."""
-        try:
-            await self.producer.send(
-                topic=self._topic_name(topic_key, default_topic),
-                key=key,
-                value=value,
+        topic_name = self._topic_name(topic_key, default_topic)
+        last_error: Optional[Exception] = None
+
+        for attempt in range(self.retries + 1):
+            started_at = time.perf_counter()
+            try:
+                await self._send_once(topic_name, key=key, value=value)
+                PIPELINE_METRICS.messages_produced.labels(topic=topic_key).inc()
+                PIPELINE_METRICS.producer_ack_latency.labels(topic=topic_key).observe(
+                    time.perf_counter() - started_at
+                )
+                self.consecutive_failures = 0
+                self.last_error = None
+                return True
+            except Exception as e:
+                last_error = e
+                if attempt >= self.retries:
+                    break
+                backoff_seconds = (self.retry_backoff_ms / 1000.0) * (2**attempt)
+                if backoff_seconds > 0:
+                    await asyncio.sleep(min(backoff_seconds, 5.0))
+
+        self.consecutive_failures += 1
+        self.last_error = str(last_error) if last_error else "unknown producer error"
+        logger.error(f"Failed to produce {topic_key} message: {self.last_error}")
+        PIPELINE_METRICS.producer_errors.inc()
+        if self.raise_on_failure and last_error is not None:
+            raise last_error
+        return False
+
+    async def _send_once(
+        self,
+        topic: str,
+        *,
+        key: Optional[str],
+        value: Dict[str, Any],
+    ):
+        """Send one message and wait for the configured delivery guarantee."""
+        if self.producer is None:
+            raise RuntimeError("Kafka producer has not been initialized")
+
+        if self.wait_for_ack:
+            send_and_wait = getattr(self.producer, "send_and_wait", None)
+            if callable(send_and_wait):
+                return await asyncio.wait_for(
+                    send_and_wait(topic=topic, key=key, value=value),
+                    timeout=self.send_timeout_seconds,
+                )
+
+        send_result = await self.producer.send(topic=topic, key=key, value=value)
+        if self.wait_for_ack and inspect.isawaitable(send_result):
+            return await asyncio.wait_for(
+                send_result,
+                timeout=self.send_timeout_seconds,
             )
-            PIPELINE_METRICS.messages_produced.labels(topic=topic_key).inc()
-        except Exception as e:
-            logger.error(f"Failed to produce {topic_key} message: {e}")
-            PIPELINE_METRICS.producer_errors.inc()
+        return send_result
 
     async def produce_request_raw(self, query_request: QueryRequest):
         """Produce a pre-inference API request event."""
@@ -647,6 +798,7 @@ class ClickHouseManager:
         # Query logs table
         query_logs_sql = """
         CREATE TABLE IF NOT EXISTS {database}.query_logs (
+            event_id String,
             query_id String,
             timestamp DateTime64(3),
             user_id String,
@@ -662,10 +814,13 @@ class ClickHouseManager:
             error_message String,
             context_compressed Boolean,
             compression_ratio Float32,
-            cached_response Boolean
-        ) ENGINE = MergeTree()
+            cached_response Boolean,
+            kafka_topic String DEFAULT '',
+            kafka_partition Int32 DEFAULT -1,
+            kafka_offset Int64 DEFAULT -1
+        ) ENGINE = ReplacingMergeTree()
         PARTITION BY toYYYYMM(timestamp)
-        ORDER BY (timestamp, user_id, query_id)
+        ORDER BY event_id
         TTL toDateTime(timestamp) + INTERVAL 90 DAY
         """.format(
             database=self.database
@@ -674,14 +829,18 @@ class ClickHouseManager:
         # System metrics table
         metrics_sql = """
         CREATE TABLE IF NOT EXISTS {database}.system_metrics (
+            event_id String,
             timestamp DateTime64(3),
             service String,
             metric_name String,
             metric_value Float64,
-            labels Map(String, String)
+            labels Map(String, String),
+            kafka_topic String DEFAULT '',
+            kafka_partition Int32 DEFAULT -1,
+            kafka_offset Int64 DEFAULT -1
         ) ENGINE = ReplacingMergeTree()
         PARTITION BY toYYYYMMDD(timestamp)
-        ORDER BY (service, metric_name, timestamp)
+        ORDER BY event_id
         TTL toDateTime(timestamp) + INTERVAL 30 DAY
         """.format(
             database=self.database
@@ -690,6 +849,7 @@ class ClickHouseManager:
         # Model performance table
         performance_sql = """
         CREATE TABLE IF NOT EXISTS {database}.model_performance (
+            event_id String,
             timestamp DateTime64(3),
             model_name String,
             provider String DEFAULT '',
@@ -708,10 +868,13 @@ class ClickHouseManager:
             cache_hit_rate Float32 DEFAULT 0,
             cached_count UInt32 DEFAULT 0,
             gpu_utilization Float32,
-            memory_usage_gb Float32
+            memory_usage_gb Float32,
+            kafka_topic String DEFAULT '',
+            kafka_partition Int32 DEFAULT -1,
+            kafka_offset Int64 DEFAULT -1
         ) ENGINE = ReplacingMergeTree()
         PARTITION BY toYYYYMMDD(timestamp)
-        ORDER BY (model_name, timestamp)
+        ORDER BY event_id
         TTL toDateTime(timestamp) + INTERVAL 60 DAY
         """.format(
             database=self.database
@@ -739,6 +902,7 @@ class ClickHouseManager:
 
         alert_events_sql = """
         CREATE TABLE IF NOT EXISTS {database}.alert_events (
+            event_id String,
             timestamp DateTime64(3),
             alert_type String,
             severity String,
@@ -752,19 +916,13 @@ class ClickHouseManager:
             provider String,
             window_start_ms UInt64,
             window_end_ms UInt64,
-            payload_json String
-        ) ENGINE = MergeTree()
+            payload_json String,
+            kafka_topic String DEFAULT '',
+            kafka_partition Int32 DEFAULT -1,
+            kafka_offset Int64 DEFAULT -1
+        ) ENGINE = ReplacingMergeTree()
         PARTITION BY toYYYYMMDD(timestamp)
-        ORDER BY (
-            timestamp,
-            source_event_type,
-            severity,
-            alert_type,
-            request_id,
-            query_id,
-            model_name,
-            provider
-        )
+        ORDER BY event_id
         TTL toDateTime(timestamp) + INTERVAL 30 DAY
         """.format(
             database=self.database
@@ -772,6 +930,7 @@ class ClickHouseManager:
 
         routing_policy_state_sql = """
         CREATE TABLE IF NOT EXISTS {database}.routing_policy_state_events (
+            event_id String,
             timestamp DateTime64(3),
             scope_type String,
             scope_key String,
@@ -793,10 +952,13 @@ class ClickHouseManager:
             preferred_models Array(String),
             avoid_models Array(String),
             avoid_providers Array(String),
-            payload_json String
+            payload_json String,
+            kafka_topic String DEFAULT '',
+            kafka_partition Int32 DEFAULT -1,
+            kafka_offset Int64 DEFAULT -1
         ) ENGINE = ReplacingMergeTree()
         PARTITION BY toYYYYMMDD(timestamp)
-        ORDER BY (scope_type, scope_key, timestamp)
+        ORDER BY event_id
         TTL toDateTime(timestamp) + INTERVAL 30 DAY
         """.format(
             database=self.database
@@ -823,6 +985,15 @@ class ClickHouseManager:
                 ) from e
 
         alter_statements = [
+            f"ALTER TABLE {self.database}.query_logs ADD COLUMN IF NOT EXISTS event_id String DEFAULT query_id",
+            f"ALTER TABLE {self.database}.query_logs ADD COLUMN IF NOT EXISTS kafka_topic String DEFAULT ''",
+            f"ALTER TABLE {self.database}.query_logs ADD COLUMN IF NOT EXISTS kafka_partition Int32 DEFAULT -1",
+            f"ALTER TABLE {self.database}.query_logs ADD COLUMN IF NOT EXISTS kafka_offset Int64 DEFAULT -1",
+            f"ALTER TABLE {self.database}.system_metrics ADD COLUMN IF NOT EXISTS event_id String DEFAULT concat(service, ':', metric_name, ':', toString(timestamp))",
+            f"ALTER TABLE {self.database}.system_metrics ADD COLUMN IF NOT EXISTS kafka_topic String DEFAULT ''",
+            f"ALTER TABLE {self.database}.system_metrics ADD COLUMN IF NOT EXISTS kafka_partition Int32 DEFAULT -1",
+            f"ALTER TABLE {self.database}.system_metrics ADD COLUMN IF NOT EXISTS kafka_offset Int64 DEFAULT -1",
+            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS event_id String DEFAULT concat(model_name, ':', toString(timestamp))",
             f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS provider String DEFAULT ''",
             f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS window_start_ms UInt64 DEFAULT 0",
             f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS window_end_ms UInt64 DEFAULT 0",
@@ -832,6 +1003,17 @@ class ClickHouseManager:
             f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS queries_per_second Float32 DEFAULT 0",
             f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS cache_hit_rate Float32 DEFAULT 0",
             f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS cached_count UInt32 DEFAULT 0",
+            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS kafka_topic String DEFAULT ''",
+            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS kafka_partition Int32 DEFAULT -1",
+            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS kafka_offset Int64 DEFAULT -1",
+            f"ALTER TABLE {self.database}.alert_events ADD COLUMN IF NOT EXISTS event_id String DEFAULT concat(source_event_type, ':', alert_type, ':', request_id, ':', query_id, ':', model_name, ':', provider, ':', toString(timestamp))",
+            f"ALTER TABLE {self.database}.alert_events ADD COLUMN IF NOT EXISTS kafka_topic String DEFAULT ''",
+            f"ALTER TABLE {self.database}.alert_events ADD COLUMN IF NOT EXISTS kafka_partition Int32 DEFAULT -1",
+            f"ALTER TABLE {self.database}.alert_events ADD COLUMN IF NOT EXISTS kafka_offset Int64 DEFAULT -1",
+            f"ALTER TABLE {self.database}.routing_policy_state_events ADD COLUMN IF NOT EXISTS event_id String DEFAULT concat(scope_type, ':', scope_key, ':', toString(timestamp))",
+            f"ALTER TABLE {self.database}.routing_policy_state_events ADD COLUMN IF NOT EXISTS kafka_topic String DEFAULT ''",
+            f"ALTER TABLE {self.database}.routing_policy_state_events ADD COLUMN IF NOT EXISTS kafka_partition Int32 DEFAULT -1",
+            f"ALTER TABLE {self.database}.routing_policy_state_events ADD COLUMN IF NOT EXISTS kafka_offset Int64 DEFAULT -1",
         ]
 
         for sql in alter_statements:
@@ -1258,22 +1440,36 @@ class KafkaConsumerManager:
         self.bootstrap_servers = config.get("bootstrap_servers", ["localhost:9092"])
         self.topics = config.get("topics", {})
         self.consumers = {}
+        self.topic_names_by_key: Dict[str, str] = {}
+        consumer_section = config.get("consumer", {})
+        dlq_section = config.get("dlq", {})
 
         # Consumer configuration
         self.consumer_config = {
             "bootstrap_servers": self.bootstrap_servers,
-            "group_id": config.get("consumer", {}).get(
-                "group_id", "llm-router-consumer"
-            ),
-            "auto_offset_reset": config.get("consumer", {}).get(
-                "auto_offset_reset", "latest"
-            ),
-            "enable_auto_commit": config.get("consumer", {}).get(
-                "enable_auto_commit", False
-            ),
-            "max_poll_records": config.get("consumer", {}).get("max_poll_records", 500),
-            "value_deserializer": self._deserialize_message,
+            "group_id": consumer_section.get("group_id", "llm-router-consumer"),
+            "auto_offset_reset": consumer_section.get("auto_offset_reset", "latest"),
+            "enable_auto_commit": consumer_section.get("enable_auto_commit", False),
+            "max_poll_records": consumer_section.get("max_poll_records", 500),
         }
+        self.supervisor_initial_backoff_seconds = float(
+            consumer_section.get("supervisor_initial_backoff_seconds", 1.0)
+        )
+        self.supervisor_max_backoff_seconds = float(
+            consumer_section.get("supervisor_max_backoff_seconds", 30.0)
+        )
+        self.dlq_enabled = bool(
+            dlq_section.get("enabled", consumer_section.get("dlq_enabled", True))
+        )
+        self.dlq_topic_suffix = str(dlq_section.get("topic_suffix", ".dlq"))
+        self.dead_letter_topics = dict(config.get("dead_letter_topics", {}) or {})
+        self.dlq_send_timeout_seconds = float(
+            dlq_section.get("send_timeout_seconds", 10.0)
+        )
+        self.dlq_producer: Optional[AIOKafkaProducer] = None
+        self.consumer_task_status: Dict[str, Dict[str, Any]] = {}
+        self.last_consumed_at: Dict[str, float] = {}
+        self.consumer_restart_counts: Dict[str, int] = {}
 
         # Batch processing
         self.batch_processors = {
@@ -1304,6 +1500,16 @@ class KafkaConsumerManager:
     async def initialize(self):
         """Initialize Kafka consumers"""
         try:
+            if self.dlq_enabled:
+                self.dlq_producer = AIOKafkaProducer(
+                    bootstrap_servers=self.bootstrap_servers,
+                    value_serializer=self._serialize_message,
+                    key_serializer=lambda x: x.encode("utf-8") if x else None,
+                    acks="all",
+                    enable_idempotence=True,
+                )
+                await self.dlq_producer.start()
+
             # Create consumer for each topic
             for topic_key, topic_name in self.topics.items():
                 if topic_key in [
@@ -1320,6 +1526,13 @@ class KafkaConsumerManager:
                     consumer = AIOKafkaConsumer(topic_name, **self.consumer_config)
                     await consumer.start()
                     self.consumers[topic_key] = consumer
+                    self.topic_names_by_key[topic_key] = topic_name
+                    self.consumer_task_status[topic_key] = {
+                        "running": False,
+                        "last_error": None,
+                        "last_started_at": None,
+                        "last_stopped_at": None,
+                    }
                     logger.info(f"Consumer for topic {topic_name} initialized")
 
             logger.info(f"Kafka consumers initialized for {len(self.consumers)} topics")
@@ -1333,34 +1546,13 @@ class KafkaConsumerManager:
         self.running = True
         tasks = []
 
-        # Start consumer tasks
         for topic_key, consumer in self.consumers.items():
-            if topic_key == "queries":
-                tasks.append(asyncio.create_task(self._consume_queries(consumer)))
-            elif topic_key == "responses":
-                tasks.append(asyncio.create_task(self._consume_responses(consumer)))
-            elif topic_key == "metrics":
-                tasks.append(asyncio.create_task(self._consume_metrics(consumer)))
-            elif topic_key == "errors":
-                tasks.append(asyncio.create_task(self._consume_errors(consumer)))
-            elif topic_key == "requests_enriched":
-                tasks.append(
-                    asyncio.create_task(self._consume_requests_enriched(consumer))
+            tasks.append(
+                asyncio.create_task(
+                    self._supervise_consumer(topic_key, consumer),
+                    name=f"kafka_consumer_{topic_key}",
                 )
-            elif topic_key == "analytics_model_metrics_1m":
-                tasks.append(
-                    asyncio.create_task(self._consume_analytics_model_metrics(consumer))
-                )
-            elif topic_key == "routing_guardrails":
-                tasks.append(
-                    asyncio.create_task(self._consume_routing_guardrails(consumer))
-                )
-            elif topic_key == "routing_policy_state":
-                tasks.append(
-                    asyncio.create_task(self._consume_routing_policy_state(consumer))
-                )
-            elif topic_key == "alerts":
-                tasks.append(asyncio.create_task(self._consume_alerts(consumer)))
+            )
 
         # Start batch processor
         tasks.append(asyncio.create_task(self._batch_processor()))
@@ -1368,12 +1560,94 @@ class KafkaConsumerManager:
         # Wait for all tasks
         await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def _supervise_consumer(
+        self, topic_key: str, consumer: AIOKafkaConsumer
+    ):
+        """Restart a topic consumer loop when it exits unexpectedly."""
+        backoff_seconds = self.supervisor_initial_backoff_seconds
+        while self.running:
+            self.consumer_task_status.setdefault(topic_key, {})
+            self.consumer_task_status[topic_key].update(
+                {
+                    "running": True,
+                    "last_error": None,
+                    "last_started_at": time.time(),
+                }
+            )
+            try:
+                await self._run_consumer(topic_key, consumer)
+                if not self.running:
+                    break
+                raise RuntimeError("consumer loop exited unexpectedly")
+            except asyncio.CancelledError:
+                self.consumer_task_status[topic_key].update(
+                    {"running": False, "last_stopped_at": time.time()}
+                )
+                raise
+            except Exception as e:
+                self.consumer_task_status[topic_key].update(
+                    {
+                        "running": False,
+                        "last_error": str(e),
+                        "last_stopped_at": time.time(),
+                    }
+                )
+                self.consumer_restart_counts[topic_key] = (
+                    self.consumer_restart_counts.get(topic_key, 0) + 1
+                )
+                PIPELINE_METRICS.consumer_restarts.labels(topic=topic_key).inc()
+                logger.error(
+                    "Kafka consumer for %s stopped; restarting in %.1fs: %s",
+                    topic_key,
+                    backoff_seconds,
+                    e,
+                )
+                await asyncio.sleep(backoff_seconds)
+                backoff_seconds = min(
+                    max(backoff_seconds * 2, self.supervisor_initial_backoff_seconds),
+                    self.supervisor_max_backoff_seconds,
+                )
+                consumer = await self._restart_consumer(topic_key)
+
+    async def _restart_consumer(self, topic_key: str) -> AIOKafkaConsumer:
+        """Recreate a Kafka consumer after a task-level failure."""
+        old_consumer = self.consumers.get(topic_key)
+        if old_consumer is not None:
+            try:
+                await old_consumer.stop()
+            except Exception as e:
+                logger.warning(f"Failed to stop unhealthy {topic_key} consumer: {e}")
+
+        topic_name = self.topic_names_by_key.get(topic_key) or self.topics[topic_key]
+        consumer = AIOKafkaConsumer(topic_name, **self.consumer_config)
+        await consumer.start()
+        self.consumers[topic_key] = consumer
+        return consumer
+
+    async def _run_consumer(self, topic_key: str, consumer: AIOKafkaConsumer):
+        """Dispatch to the topic-specific consumer implementation."""
+        handlers = {
+            "queries": self._consume_queries,
+            "responses": self._consume_responses,
+            "metrics": self._consume_metrics,
+            "errors": self._consume_errors,
+            "requests_enriched": self._consume_requests_enriched,
+            "analytics_model_metrics_1m": self._consume_analytics_model_metrics,
+            "routing_guardrails": self._consume_routing_guardrails,
+            "routing_policy_state": self._consume_routing_policy_state,
+            "alerts": self._consume_alerts,
+        }
+        handler = handlers.get(topic_key)
+        if handler is None:
+            raise RuntimeError(f"No Kafka consumer handler for topic key {topic_key}")
+        await handler(consumer)
+
     async def _consume_queries(self, consumer: AIOKafkaConsumer):
         """Consume query log messages"""
         try:
             async for message in consumer:
                 try:
-                    data = message.value
+                    data = self._decode_message_value(message)
                     query_log = QueryLogEntry(
                         query_id=data["query_id"],
                         timestamp=datetime.fromisoformat(
@@ -1393,46 +1667,61 @@ class KafkaConsumerManager:
                         context_compressed=data.get("context_compressed", False),
                         compression_ratio=data.get("compression_ratio", 0.0),
                         cached_response=data.get("cached_response", False),
+                        **self._kafka_event_metadata(message),
                     )
 
                     # Add to batch
                     self.batch_processors["queries"].append(query_log)
                     self._track_commit_offset("queries", message)
+                    self._record_successful_consume("queries", consumer, message)
 
                     PIPELINE_METRICS.messages_consumed.labels(topic="queries").inc()
 
                 except Exception as e:
-                    logger.error(f"Failed to process query message: {e}")
-                    PIPELINE_METRICS.consumer_errors.inc()
+                    await self._handle_processing_failure(
+                        "queries",
+                        message,
+                        e,
+                        stage="consume",
+                        batched=True,
+                    )
 
         except Exception as e:
             logger.error(f"Query consumer error: {e}")
+            raise
 
     async def _consume_responses(self, consumer: AIOKafkaConsumer):
         """Consume response log messages"""
         try:
             async for message in consumer:
                 try:
-                    data = message.value
+                    data = self._decode_message_value(message)
                     # Process response data (for future analytics)
                     logger.debug(f"Processed response: {data.get('query_id')}")
                     await self._commit_processed_message("responses", message)
+                    self._record_successful_consume("responses", consumer, message)
 
                     PIPELINE_METRICS.messages_consumed.labels(topic="responses").inc()
 
                 except Exception as e:
-                    logger.error(f"Failed to process response message: {e}")
-                    PIPELINE_METRICS.consumer_errors.inc()
+                    await self._handle_processing_failure(
+                        "responses",
+                        message,
+                        e,
+                        stage="consume",
+                        batched=False,
+                    )
 
         except Exception as e:
             logger.error(f"Response consumer error: {e}")
+            raise
 
     async def _consume_metrics(self, consumer: AIOKafkaConsumer):
         """Consume system metrics messages"""
         try:
             async for message in consumer:
                 try:
-                    data = message.value
+                    data = self._decode_message_value(message)
                     metric_entry = MetricEntry(
                         timestamp=datetime.fromisoformat(
                             data["timestamp"].replace("Z", "+00:00")
@@ -1441,38 +1730,53 @@ class KafkaConsumerManager:
                         metric_name=data["metric_name"],
                         metric_value=data["metric_value"],
                         labels=data.get("labels", {}),
+                        **self._kafka_event_metadata(message),
                     )
 
                     # Add to batch
                     self.batch_processors["metrics"].append(metric_entry)
                     self._track_commit_offset("metrics", message)
+                    self._record_successful_consume("metrics", consumer, message)
 
                     PIPELINE_METRICS.messages_consumed.labels(topic="metrics").inc()
 
                 except Exception as e:
-                    logger.error(f"Failed to process metric message: {e}")
-                    PIPELINE_METRICS.consumer_errors.inc()
+                    await self._handle_processing_failure(
+                        "metrics",
+                        message,
+                        e,
+                        stage="consume",
+                        batched=True,
+                    )
 
         except Exception as e:
             logger.error(f"Metrics consumer error: {e}")
+            raise
 
     async def _consume_errors(self, consumer: AIOKafkaConsumer):
         """Consume error messages"""
         try:
             async for message in consumer:
                 try:
-                    data = message.value
+                    data = self._decode_message_value(message)
                     logger.error(f"System error logged: {data}")
                     await self._commit_processed_message("errors", message)
+                    self._record_successful_consume("errors", consumer, message)
 
                     PIPELINE_METRICS.messages_consumed.labels(topic="errors").inc()
 
                 except Exception as e:
-                    logger.error(f"Failed to process error message: {e}")
-                    PIPELINE_METRICS.consumer_errors.inc()
+                    await self._handle_processing_failure(
+                        "errors",
+                        message,
+                        e,
+                        stage="consume",
+                        batched=False,
+                    )
 
         except Exception as e:
             logger.error(f"Error consumer error: {e}")
+            raise
 
     def register_observer(
         self, topic_key: str, callback: Callable[[Dict[str, Any]], Any]
@@ -1490,8 +1794,165 @@ class KafkaConsumerManager:
             except Exception as e:
                 logger.warning(f"Observer for {topic_key} failed: {e}")
 
+    def _decode_message_value(self, message: Any) -> Dict[str, Any]:
+        """Decode a Kafka message payload without letting poison pills kill a task."""
+        value = getattr(message, "value", None)
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, bytes):
+            return json.loads(value.decode("utf-8"))
+        if isinstance(value, str):
+            return json.loads(value)
+        raise ValueError(f"Unsupported Kafka message payload type: {type(value)}")
+
+    def _kafka_event_metadata(self, message: Any) -> Dict[str, Any]:
+        """Build stable idempotency metadata from Kafka coordinates."""
+        topic = str(getattr(message, "topic", "") or "")
+        partition = int(getattr(message, "partition", -1))
+        offset = int(getattr(message, "offset", -1))
+        event_id = f"{topic}:{partition}:{offset}" if topic and offset >= 0 else ""
+        return {
+            "event_id": event_id,
+            "kafka_topic": topic,
+            "kafka_partition": partition,
+            "kafka_offset": offset,
+        }
+
+    def _dead_letter_topic(self, topic_key: str, message: Any) -> str:
+        """Resolve the DLQ topic for a failed source message."""
+        if topic_key in self.dead_letter_topics:
+            return self.dead_letter_topics[topic_key]
+        configured_key = f"{topic_key}_dlq"
+        if configured_key in self.topics:
+            return self.topics[configured_key]
+        source_topic = (
+            getattr(message, "topic", None)
+            or self.topic_names_by_key.get(topic_key)
+            or topic_key
+        )
+        return f"{source_topic}{self.dlq_topic_suffix}"
+
+    async def _publish_dead_letter(
+        self,
+        topic_key: str,
+        message: Any,
+        error: Exception,
+        *,
+        stage: str,
+    ) -> bool:
+        """Publish a poison message to DLQ before committing past it."""
+        if not self.dlq_enabled or self.dlq_producer is None:
+            logger.error(
+                "DLQ disabled or unavailable for failed %s message; offset retained",
+                topic_key,
+            )
+            return False
+
+        metadata = self._kafka_event_metadata(message)
+        payload = {
+            "event_type": "dead_letter",
+            "event_version": EVENT_SCHEMA_VERSION,
+            "emitted_at": _isoformat_utc(),
+            "source_topic_key": topic_key,
+            "source_topic": metadata["kafka_topic"],
+            "source_partition": metadata["kafka_partition"],
+            "source_offset": metadata["kafka_offset"],
+            "source_key": _decode_kafka_key(getattr(message, "key", None)),
+            "failure_stage": stage,
+            "error_type": type(error).__name__,
+            "error_message": str(error)[:2000],
+            "payload": _json_safe_payload(getattr(message, "value", None)),
+        }
+        topic = self._dead_letter_topic(topic_key, message)
+        key = metadata["event_id"] or str(uuid.uuid4())
+        send_and_wait = getattr(self.dlq_producer, "send_and_wait", None)
+        if callable(send_and_wait):
+            await asyncio.wait_for(
+                send_and_wait(topic=topic, key=key, value=payload),
+                timeout=self.dlq_send_timeout_seconds,
+            )
+        else:
+            await asyncio.wait_for(
+                self.dlq_producer.send(topic=topic, key=key, value=payload),
+                timeout=self.dlq_send_timeout_seconds,
+            )
+        PIPELINE_METRICS.dead_letter_messages.labels(topic=topic_key).inc()
+        return True
+
+    async def _handle_processing_failure(
+        self,
+        topic_key: str,
+        message: Any,
+        error: Exception,
+        *,
+        stage: str,
+        batched: bool,
+    ):
+        """DLQ and commit a bad message after preserving earlier valid records."""
+        logger.error(f"Failed to process {topic_key} message: {error}")
+        PIPELINE_METRICS.consumer_errors.inc()
+
+        if batched:
+            await self.flush_pending_batches()
+
+        if await self._publish_dead_letter(topic_key, message, error, stage=stage):
+            await self._commit_processed_message(topic_key, message)
+
+    def _record_successful_consume(
+        self, topic_key: str, consumer: AIOKafkaConsumer, message: Any
+    ):
+        """Update consumer observability after a message is handled."""
+        now = time.time()
+        self.last_consumed_at[topic_key] = now
+        PIPELINE_METRICS.last_consumed_timestamp.labels(topic=topic_key).set(now)
+
+        topic = getattr(message, "topic", None)
+        partition = getattr(message, "partition", None)
+        offset = getattr(message, "offset", None)
+        if topic is None or partition is None or offset is None:
+            return
+
+        highwater = getattr(consumer, "highwater", None)
+        if not callable(highwater):
+            return
+
+        try:
+            latest_offset = highwater(TopicPartition(topic, partition))
+            if latest_offset is None:
+                return
+            lag = max(0, int(latest_offset) - int(offset) - 1)
+            PIPELINE_METRICS.consumer_lag.labels(
+                topic=topic,
+                partition=str(partition),
+            ).set(lag)
+        except Exception as e:
+            logger.debug(f"Failed to update Kafka consumer lag: {e}")
+
+    def is_healthy(self) -> bool:
+        """Return whether all configured consumer supervisors are running."""
+        if not self.consumers:
+            return False
+        for status in self.consumer_task_status.values():
+            if status.get("last_error"):
+                return False
+        return True
+
+    def get_health_status(self) -> Dict[str, Any]:
+        """Return consumer task and DLQ health details."""
+        return {
+            "healthy": self.is_healthy(),
+            "topics": dict(self.consumer_task_status),
+            "last_consumed_at": dict(self.last_consumed_at),
+            "restart_counts": dict(self.consumer_restart_counts),
+            "dlq_enabled": self.dlq_enabled,
+            "dlq_producer_healthy": (not self.dlq_enabled)
+            or self.dlq_producer is not None,
+        }
+
     def _build_model_performance_entry(
-        self, data: Dict[str, Any]
+        self,
+        data: Dict[str, Any],
+        kafka_metadata: Optional[Dict[str, Any]] = None,
     ) -> ModelPerformanceEntry:
         """Convert a Flink analytics window event to a ClickHouse row."""
         window_end_ms = int(data.get("window_end_ms", 0) or 0)
@@ -1520,9 +1981,14 @@ class KafkaConsumerManager:
             queries_per_second=float(data.get("queries_per_second", 0.0) or 0.0),
             cache_hit_rate=float(data.get("cache_hit_rate", 0.0) or 0.0),
             cached_count=int(data.get("cached_count", 0) or 0),
+            **(kafka_metadata or {}),
         )
 
-    def _build_alert_event_entry(self, data: Dict[str, Any]) -> AlertEventEntry:
+    def _build_alert_event_entry(
+        self,
+        data: Dict[str, Any],
+        kafka_metadata: Optional[Dict[str, Any]] = None,
+    ) -> AlertEventEntry:
         """Convert an alert event payload to a ClickHouse row."""
         event_type = str(data.get("event_type", "") or "")
         return AlertEventEntry(
@@ -1542,10 +2008,13 @@ class KafkaConsumerManager:
             window_start_ms=int(data.get("window_start_ms", 0) or 0),
             window_end_ms=int(data.get("window_end_ms", 0) or 0),
             payload_json=json.dumps(data, default=str),
+            **(kafka_metadata or {}),
         )
 
     def _build_routing_policy_state_entry(
-        self, data: Dict[str, Any]
+        self,
+        data: Dict[str, Any],
+        kafka_metadata: Optional[Dict[str, Any]] = None,
     ) -> RoutingPolicyStateEntry:
         """Convert a routing.policy_state payload to a ClickHouse row."""
         return RoutingPolicyStateEntry(
@@ -1573,6 +2042,7 @@ class KafkaConsumerManager:
             avoid_models=list(data.get("avoid_models", []) or []),
             avoid_providers=list(data.get("avoid_providers", []) or []),
             payload_json=json.dumps(data, default=str),
+            **(kafka_metadata or {}),
         )
 
     async def _consume_requests_enriched(self, consumer: AIOKafkaConsumer):
@@ -1580,97 +2050,152 @@ class KafkaConsumerManager:
         try:
             async for message in consumer:
                 try:
-                    data = message.value
+                    data = self._decode_message_value(message)
                     await self._notify_observers("requests_enriched", data)
                     await self._commit_processed_message("requests_enriched", message)
+                    self._record_successful_consume(
+                        "requests_enriched", consumer, message
+                    )
                     PIPELINE_METRICS.messages_consumed.labels(
                         topic="requests_enriched"
                     ).inc()
                 except Exception as e:
-                    logger.error(f"Failed to process requests.enriched event: {e}")
-                    PIPELINE_METRICS.consumer_errors.inc()
+                    await self._handle_processing_failure(
+                        "requests_enriched",
+                        message,
+                        e,
+                        stage="consume",
+                        batched=False,
+                    )
         except Exception as e:
             logger.error(f"requests.enriched consumer error: {e}")
+            raise
 
     async def _consume_analytics_model_metrics(self, consumer: AIOKafkaConsumer):
         """Consume Flink model metrics window events."""
         try:
             async for message in consumer:
                 try:
-                    data = message.value
-                    metric_entry = self._build_model_performance_entry(data)
+                    data = self._decode_message_value(message)
+                    metric_entry = self._build_model_performance_entry(
+                        data,
+                        kafka_metadata=self._kafka_event_metadata(message),
+                    )
                     self.batch_processors["analytics_model_metrics_1m"].append(
                         metric_entry
                     )
                     self._track_commit_offset("analytics_model_metrics_1m", message)
                     await self._notify_observers("analytics_model_metrics_1m", data)
+                    self._record_successful_consume(
+                        "analytics_model_metrics_1m", consumer, message
+                    )
 
                     PIPELINE_METRICS.messages_consumed.labels(
                         topic="analytics_model_metrics_1m"
                     ).inc()
                 except Exception as e:
-                    logger.error(f"Failed to process model metrics event: {e}")
-                    PIPELINE_METRICS.consumer_errors.inc()
+                    await self._handle_processing_failure(
+                        "analytics_model_metrics_1m",
+                        message,
+                        e,
+                        stage="consume",
+                        batched=True,
+                    )
         except Exception as e:
             logger.error(f"Analytics model metrics consumer error: {e}")
+            raise
 
     async def _consume_alerts(self, consumer: AIOKafkaConsumer):
         """Consume Flink and platform alert events."""
         try:
             async for message in consumer:
                 try:
-                    data = message.value
-                    alert_entry = self._build_alert_event_entry(data)
+                    data = self._decode_message_value(message)
+                    alert_entry = self._build_alert_event_entry(
+                        data,
+                        kafka_metadata=self._kafka_event_metadata(message),
+                    )
                     self.batch_processors["alerts"].append(alert_entry)
                     self._track_commit_offset("alerts", message)
                     await self._notify_observers("alerts", data)
+                    self._record_successful_consume("alerts", consumer, message)
 
                     PIPELINE_METRICS.messages_consumed.labels(topic="alerts").inc()
                 except Exception as e:
-                    logger.error(f"Failed to process alert event: {e}")
-                    PIPELINE_METRICS.consumer_errors.inc()
+                    await self._handle_processing_failure(
+                        "alerts",
+                        message,
+                        e,
+                        stage="consume",
+                        batched=True,
+                    )
         except Exception as e:
             logger.error(f"Alert consumer error: {e}")
+            raise
 
     async def _consume_routing_guardrails(self, consumer: AIOKafkaConsumer):
         """Consume routing guardrail events for persistence and observers."""
         try:
             async for message in consumer:
                 try:
-                    data = message.value
-                    guardrail_entry = self._build_alert_event_entry(data)
+                    data = self._decode_message_value(message)
+                    guardrail_entry = self._build_alert_event_entry(
+                        data,
+                        kafka_metadata=self._kafka_event_metadata(message),
+                    )
                     self.batch_processors["routing_guardrails"].append(guardrail_entry)
                     self._track_commit_offset("routing_guardrails", message)
                     await self._notify_observers("routing_guardrails", data)
+                    self._record_successful_consume(
+                        "routing_guardrails", consumer, message
+                    )
 
                     PIPELINE_METRICS.messages_consumed.labels(
                         topic="routing_guardrails"
                     ).inc()
                 except Exception as e:
-                    logger.error(f"Failed to process routing guardrail event: {e}")
-                    PIPELINE_METRICS.consumer_errors.inc()
+                    await self._handle_processing_failure(
+                        "routing_guardrails",
+                        message,
+                        e,
+                        stage="consume",
+                        batched=True,
+                    )
         except Exception as e:
             logger.error(f"routing.guardrails consumer error: {e}")
+            raise
 
     async def _consume_routing_policy_state(self, consumer: AIOKafkaConsumer):
         """Consume routing.policy_state events for persistence and observers."""
         try:
             async for message in consumer:
                 try:
-                    data = message.value
-                    state_entry = self._build_routing_policy_state_entry(data)
+                    data = self._decode_message_value(message)
+                    state_entry = self._build_routing_policy_state_entry(
+                        data,
+                        kafka_metadata=self._kafka_event_metadata(message),
+                    )
                     self.batch_processors["routing_policy_state"].append(state_entry)
                     self._track_commit_offset("routing_policy_state", message)
                     await self._notify_observers("routing_policy_state", data)
+                    self._record_successful_consume(
+                        "routing_policy_state", consumer, message
+                    )
 
                     PIPELINE_METRICS.messages_consumed.labels(
                         topic="routing_policy_state"
                     ).inc()
                 except Exception as e:
-                    logger.error(f"Failed to process routing policy state event: {e}")
-                    PIPELINE_METRICS.consumer_errors.inc()
+                    await self._handle_processing_failure(
+                        "routing_policy_state",
+                        message,
+                        e,
+                        stage="consume",
+                        batched=True,
+                    )
         except Exception as e:
             logger.error(f"routing.policy_state consumer error: {e}")
+            raise
 
     async def _batch_processor(self):
         """Process batches periodically"""
@@ -1785,12 +2310,18 @@ class KafkaConsumerManager:
         """Deserialize message from JSON bytes"""
         return json.loads(message.decode("utf-8"))
 
+    def _serialize_message(self, message: Any) -> bytes:
+        """Serialize consumer-side DLQ payloads as JSON bytes."""
+        return json.dumps(message, default=str).encode("utf-8")
+
     async def shutdown(self):
         """Shutdown all consumers"""
         self.running = False
         await self.flush_pending_batches()
         for consumer in self.consumers.values():
             await consumer.stop()
+        if self.dlq_producer:
+            await self.dlq_producer.stop()
         logger.info("Kafka consumers shutdown complete")
 
 
@@ -1944,17 +2475,36 @@ class KafkaIngestionPipeline:
 
     def get_health_status(self) -> Dict[str, Any]:
         """Get pipeline health status"""
+        consumer_health = {"healthy": False}
+        if self.consumer_manager:
+            get_consumer_health = getattr(
+                self.consumer_manager, "get_health_status", None
+            )
+            consumer_health = (
+                get_consumer_health()
+                if callable(get_consumer_health)
+                else {"healthy": bool(getattr(self.consumer_manager, "consumers", {}))}
+            )
         return {
             "pipeline_running": self.running,
-            "producer_healthy": self.producer_manager.producer is not None,
-            "consumer_healthy": bool(
-                self.consumer_manager and self.consumer_manager.consumers
-            ),
+            "producer_healthy": self.producer_manager.is_healthy(),
+            "producer_last_error": self.producer_manager.last_error,
+            "consumer_healthy": bool(consumer_health.get("healthy")),
+            "consumer_status": consumer_health,
             "clickhouse_healthy": self.clickhouse_manager.client is not None,
             "total_consumers": len(self.consumer_manager.consumers)
             if self.consumer_manager
             else 0,
         }
+
+    def is_healthy(self) -> bool:
+        """Return whether the pipeline can produce, consume, and persist events."""
+        health = self.get_health_status()
+        return bool(
+            health["producer_healthy"]
+            and health["consumer_healthy"]
+            and health["clickhouse_healthy"]
+        )
 
     async def shutdown(self):
         """Shutdown the pipeline"""

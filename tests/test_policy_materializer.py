@@ -78,3 +78,35 @@ async def test_policy_materializer_commits_offsets_after_successful_materializat
 
     getattr(policy_cache, cache_method).assert_awaited_once_with(payload)
     consumer.commit.assert_awaited_once_with({TopicPartition(topic_name, 0): 8})
+
+
+@pytest.mark.asyncio
+async def test_policy_materializer_skips_invalid_json_with_manual_commit():
+    policy_cache = SimpleNamespace(
+        config={"consumer": {"enable_auto_commit": False}},
+        enabled=True,
+        materialize_request_enriched=AsyncMock(),
+        materialize_fast_lane_hint=AsyncMock(),
+        materialize_routing_guardrail=AsyncMock(),
+        materialize_routing_policy_state=AsyncMock(),
+    )
+    materializer = PolicyMaterializer(
+        {
+            "bootstrap_servers": ["localhost:9092"],
+            "consumer": {"enable_auto_commit": False},
+        },
+        policy_cache,
+    )
+    materializer.running = True
+    message = SimpleNamespace(
+        value=b"{not-json",
+        topic="requests.enriched",
+        partition=0,
+        offset=3,
+    )
+    consumer = AsyncMessageConsumer([message])
+
+    await materializer._consume_requests_enriched(consumer)
+
+    policy_cache.materialize_request_enriched.assert_not_awaited()
+    consumer.commit.assert_awaited_once_with({TopicPartition("requests.enriched", 0): 4})

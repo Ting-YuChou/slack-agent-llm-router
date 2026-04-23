@@ -220,6 +220,9 @@ if _missing("aiokafka"):
         async def send(self, *args, **kwargs):
             return None
 
+        async def send_and_wait(self, *args, **kwargs):
+            return None
+
     class _Consumer:
         def __init__(self, *args, **kwargs):
             pass
