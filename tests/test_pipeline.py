@@ -70,6 +70,19 @@ def sample_query_log():
     )
 
 
+class AsyncMessageConsumer:
+    def __init__(self, messages):
+        self._messages = list(messages)
+        self.commit = AsyncMock()
+
+    def __aiter__(self):
+        async def iterator():
+            for message in self._messages:
+                yield message
+
+        return iterator()
+
+
 class TestQueryLogEntry:
     def test_to_dict_serializes_enums(self, sample_query_log):
         payload = sample_query_log.to_dict()
@@ -171,6 +184,32 @@ class TestKafkaProducerManager:
         assert send_kwargs["value"]["route_to_fast_lane"] is True
         assert send_kwargs["value"]["actual_fast_lane_hit"] is True
         assert send_kwargs["value"]["policy_source"] == "session+user"
+
+    @pytest.mark.asyncio
+    async def test_produce_query_log_uses_request_id_and_fallback_query_type(
+        self, pipeline_config
+    ):
+        manager = KafkaProducerManager(pipeline_config)
+        manager.producer = AsyncMock()
+        request = QueryRequest(query="hello", user_id="u1", user_tier=UserTier.FREE)
+        response = InferenceResponse(
+            response_text="world",
+            model_name="gpt-5",
+            provider="openai",
+            token_count_input=3,
+            token_count_output=5,
+            total_tokens=8,
+            latency_ms=12,
+            tokens_per_second=120.0,
+            cost_usd=0.01,
+        )
+
+        await manager.produce_query_log(request, response, SimpleNamespace())
+
+        send_kwargs = manager.producer.send.await_args.kwargs
+        assert send_kwargs["topic"] == "test-queries"
+        assert send_kwargs["value"]["query_id"] == request.request_id
+        assert send_kwargs["value"]["query_type"] == "general"
 
 
 class TestClickHouseManager:
@@ -550,6 +589,33 @@ class TestKafkaConsumerManager:
         await consumer._notify_observers("alerts", {"event_type": "alerts"})
 
         assert seen == ["alerts"]
+
+    @pytest.mark.asyncio
+    async def test_consume_requests_enriched_commits_offsets_after_observer_delivery(
+        self, pipeline_config
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        seen = []
+
+        async def handler(payload):
+            seen.append(payload["request_id"])
+
+        message = SimpleNamespace(
+            value={"event_type": "requests.enriched", "request_id": "req-1"},
+            topic="requests.enriched",
+            partition=0,
+            offset=4,
+        )
+        kafka_consumer = AsyncMessageConsumer([message])
+        consumer.consumers["requests_enriched"] = kafka_consumer
+        consumer.register_observer("requests_enriched", handler)
+
+        await consumer._consume_requests_enriched(kafka_consumer)
+
+        kafka_consumer.commit.assert_awaited_once_with(
+            {TopicPartition("requests.enriched", 0): 5}
+        )
+        assert seen == ["req-1"]
 
     @pytest.mark.asyncio
     async def test_flush_pending_batches_commits_offsets_after_clickhouse_write(

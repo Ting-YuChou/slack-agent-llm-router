@@ -254,6 +254,7 @@ class DummyEventProducer:
         self.config = config
         self.request_events = []
         self.completion_events = []
+        self.metric_events = []
 
     async def initialize(self):
         return None
@@ -265,6 +266,16 @@ class DummyEventProducer:
         self, request, response, routing_decision=None
     ):
         self.completion_events.append((request, response, routing_decision))
+
+    async def produce_metric(self, service, metric_name, metric_value, labels=None):
+        self.metric_events.append(
+            {
+                "service": service,
+                "metric_name": metric_name,
+                "metric_value": metric_value,
+                "labels": labels or {},
+            }
+        )
 
     async def shutdown(self):
         return None
@@ -729,6 +740,10 @@ class TestApiApp:
         assert response.status_code == 200
         assert len(producer.request_events) == 1
         assert producer.request_events[0].query == "hello"
+        assert [event["metric_name"] for event in producer.metric_events] == [
+            "requests_total",
+            "request_duration_seconds",
+        ]
 
     def test_metrics_endpoint_returns_503_when_monitoring_disabled(
         self, tmp_path, patched_platform_deps

@@ -2,6 +2,11 @@ from datetime import datetime
 
 import pytest
 
+from flink.analytics_job import (
+    ModelMetricsWindowAggregator,
+    _model_provider_stream_key,
+    _split_model_provider_stream_key,
+)
 from flink.logic import (
     build_model_metrics_window_event,
     build_routing_policy_state_event,
@@ -56,6 +61,39 @@ def test_flink_analytics_builds_windowed_model_metrics():
     assert metric_event["success_rate"] == pytest.approx(2 / 3)
     assert metric_event["error_rate"] == pytest.approx(1 / 3)
     assert metric_event["cache_hit_rate"] == pytest.approx(1 / 3)
+
+
+@pytest.mark.integration
+def test_flink_analytics_keeps_same_model_name_separate_across_providers():
+    openai_key = _model_provider_stream_key("gpt-5", "openai")
+    azure_key = _model_provider_stream_key("gpt-5", "azure")
+
+    assert openai_key != azure_key
+    assert _split_model_provider_stream_key(openai_key) == ("gpt-5", "openai")
+    assert _split_model_provider_stream_key(azure_key) == ("gpt-5", "azure")
+
+    aggregator = ModelMetricsWindowAggregator()
+    bucket = {
+        "window_start_ms": 1_710_000_000_000,
+        "request_count": 4,
+        "success_count": 4,
+        "error_count": 0,
+        "latency_sum_ms": 800.0,
+        "tokens_per_second_sum": 400.0,
+        "token_count_input": 100,
+        "token_count_output": 200,
+        "total_tokens": 300,
+        "total_cost_usd": 0.04,
+        "cached_count": 1,
+    }
+
+    openai_metric = aggregator._build_metric_event(model_name=openai_key, bucket=bucket)
+    azure_metric = aggregator._build_metric_event(model_name=azure_key, bucket=bucket)
+
+    assert openai_metric["model_name"] == "gpt-5"
+    assert openai_metric["provider"] == "openai"
+    assert azure_metric["model_name"] == "gpt-5"
+    assert azure_metric["provider"] == "azure"
 
 
 @pytest.mark.integration

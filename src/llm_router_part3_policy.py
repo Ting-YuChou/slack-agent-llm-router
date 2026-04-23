@@ -15,6 +15,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from aiokafka import AIOKafkaConsumer
+from aiokafka.structs import TopicPartition
 import redis.asyncio as redis
 
 
@@ -704,6 +705,21 @@ class PolicyMaterializer:
 
         await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def _commit_processed_message(
+        self, consumer: AIOKafkaConsumer, message: Any
+    ):
+        """Commit a processed Kafka message when manual commits are enabled."""
+        if self.consumer_config.get("enable_auto_commit", True):
+            return
+
+        topic = getattr(message, "topic", None)
+        partition = getattr(message, "partition", None)
+        offset = getattr(message, "offset", None)
+        if topic is None or partition is None or offset is None:
+            return
+
+        await consumer.commit({TopicPartition(topic, partition): int(offset) + 1})
+
     async def _consume_requests_enriched(self, consumer: AIOKafkaConsumer):
         try:
             async for message in consumer:
@@ -711,6 +727,7 @@ class PolicyMaterializer:
                     break
                 try:
                     await self.policy_cache.materialize_request_enriched(message.value)
+                    await self._commit_processed_message(consumer, message)
                 except Exception as e:
                     logger.warning(
                         f"Failed to materialize requests.enriched message: {e}"
@@ -725,6 +742,7 @@ class PolicyMaterializer:
                     break
                 try:
                     await self.policy_cache.materialize_fast_lane_hint(message.value)
+                    await self._commit_processed_message(consumer, message)
                 except Exception as e:
                     logger.warning(
                         f"Failed to materialize fast_lane_hints message: {e}"
@@ -739,6 +757,7 @@ class PolicyMaterializer:
                     break
                 try:
                     await self.policy_cache.materialize_routing_guardrail(message.value)
+                    await self._commit_processed_message(consumer, message)
                 except Exception as e:
                     logger.warning(
                         f"Failed to materialize routing_guardrails message: {e}"
@@ -755,6 +774,7 @@ class PolicyMaterializer:
                     await self.policy_cache.materialize_routing_policy_state(
                         message.value
                     )
+                    await self._commit_processed_message(consumer, message)
                 except Exception as e:
                     logger.warning(
                         f"Failed to materialize routing_policy_state message: {e}"

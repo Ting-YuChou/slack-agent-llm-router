@@ -451,18 +451,19 @@ class KafkaProducerManager:
         self,
         query_request: QueryRequest,
         inference_response: InferenceResponse,
-        routing_decision: Any,
+        routing_decision: Optional[Any] = None,
     ):
         """Produce query log message"""
+        query_type = getattr(routing_decision, "query_type", "general")
         query_log = QueryLogEntry(
-            query_id=str(uuid.uuid4()),
-            timestamp=datetime.now(timezone.utc),
+            query_id=query_request.request_id,
+            timestamp=_parse_datetime(inference_response.timestamp),
             user_id=query_request.user_id,
             user_tier=query_request.user_tier,
             query_text=query_request.query,
-            query_type=routing_decision.query_type.value
-            if hasattr(routing_decision.query_type, "value")
-            else str(routing_decision.query_type),
+            query_type=query_type.value
+            if hasattr(query_type, "value")
+            else str(query_type),
             selected_model=inference_response.model_name,
             token_count_input=inference_response.token_count_input,
             token_count_output=inference_response.token_count_output,
@@ -1581,6 +1582,7 @@ class KafkaConsumerManager:
                 try:
                     data = message.value
                     await self._notify_observers("requests_enriched", data)
+                    await self._commit_processed_message("requests_enriched", message)
                     PIPELINE_METRICS.messages_consumed.labels(
                         topic="requests_enriched"
                     ).inc()

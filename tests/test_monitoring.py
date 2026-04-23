@@ -204,8 +204,47 @@ class TestMetricsCollector:
 
         assert summary["request_count"] == 4
         assert summary["error_rate"] == pytest.approx(0.25)
-        assert summary["models"]["gpt-5"]["avg_latency_ms"] == 250.0
+        assert summary["models"]["gpt-5@openai"]["avg_latency_ms"] == 250.0
         assert summary["sample_count"] == 1
+
+    def test_record_stream_model_metrics_keeps_same_model_separate_by_provider(self):
+        collector = MetricsCollector({"stream_metrics_staleness_seconds": 300})
+        collector.record_stream_model_metrics(
+            {
+                "event_type": "analytics.model_metrics_1m",
+                "emitted_at": datetime.now().isoformat(),
+                "model_name": "gpt-5",
+                "provider": "openai",
+                "request_count": 4,
+                "error_count": 1,
+                "avg_latency_ms": 250.0,
+                "queries_per_second": 0.2,
+                "cache_hit_rate": 0.5,
+                "cached_count": 2,
+                "window_end_ms": 1_710_000_060_000,
+            }
+        )
+        collector.record_stream_model_metrics(
+            {
+                "event_type": "analytics.model_metrics_1m",
+                "emitted_at": datetime.now().isoformat(),
+                "model_name": "gpt-5",
+                "provider": "azure",
+                "request_count": 6,
+                "error_count": 0,
+                "avg_latency_ms": 120.0,
+                "queries_per_second": 0.3,
+                "cache_hit_rate": 0.0,
+                "cached_count": 0,
+                "window_end_ms": 1_710_000_060_000,
+            }
+        )
+
+        summary = collector.get_stream_metrics_summary(hours=1)
+
+        assert summary["request_count"] == 10
+        assert summary["models"]["gpt-5@openai"]["request_count"] == 4
+        assert summary["models"]["gpt-5@azure"]["request_count"] == 6
 
     def test_routing_feature_and_guardrail_summaries(self):
         collector = MetricsCollector({"stream_metrics_staleness_seconds": 300})
@@ -315,7 +354,10 @@ class TestMonitoringService:
 
         dashboard = await service.get_dashboard_data()
 
-        assert dashboard["stream_analytics"]["models"]["gpt-5"]["request_count"] == 3
+        assert (
+            dashboard["stream_analytics"]["models"]["gpt-5@openai"]["request_count"]
+            == 3
+        )
         assert dashboard["current_metrics"]["streaming"]["request_count"] == 3
         assert dashboard["routing_features"]["request_count"] == 1
         assert dashboard["routing_guardrails"]["guardrail_count"] == 1

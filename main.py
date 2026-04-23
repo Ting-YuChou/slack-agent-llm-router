@@ -364,7 +364,34 @@ class LLMRouterPlatform:
         server = uvicorn.Server(config)
         await server.serve()
 
-    def _record_api_metrics(
+    async def _publish_system_metric_event(
+        self,
+        *,
+        service: str,
+        metric_name: str,
+        metric_value: float,
+        labels: Optional[Dict[str, str]] = None,
+    ):
+        """Best-effort publication of API-side metrics into the analytics pipeline."""
+        producer = self.services.get("event_producer")
+        if producer is None:
+            return
+
+        publish_method = getattr(producer, "produce_metric", None)
+        if publish_method is None:
+            return
+
+        try:
+            await publish_method(
+                service=service,
+                metric_name=metric_name,
+                metric_value=metric_value,
+                labels=labels or {},
+            )
+        except Exception as exc:
+            self.logger.warning(f"Failed to publish system metric event: {exc}")
+
+    async def _record_api_metrics(
         self,
         endpoint: str,
         method: str,
@@ -396,6 +423,35 @@ class LLMRouterPlatform:
                     component="api",
                     error_type=error_type,
                 ).inc()
+
+        metric_labels = {
+            "endpoint": endpoint,
+            "method": method,
+            "status": str(status_code),
+        }
+        await self._publish_system_metric_event(
+            service="api",
+            metric_name="requests_total",
+            metric_value=1.0,
+            labels=metric_labels,
+        )
+        await self._publish_system_metric_event(
+            service="api",
+            metric_name="request_duration_seconds",
+            metric_value=duration_seconds,
+            labels=metric_labels,
+        )
+        if error_type:
+            await self._publish_system_metric_event(
+                service="api",
+                metric_name="errors_total",
+                metric_value=1.0,
+                labels={
+                    "component": "api",
+                    "error_type": error_type,
+                    **metric_labels,
+                },
+            )
 
     def _security_config(self) -> Dict[str, Any]:
         """Return security configuration."""
@@ -1222,7 +1278,7 @@ class LLMRouterPlatform:
                     },
                 )
             finally:
-                self._record_api_metrics(
+                await self._record_api_metrics(
                     endpoint=endpoint,
                     method=method,
                     status_code=status_code,
