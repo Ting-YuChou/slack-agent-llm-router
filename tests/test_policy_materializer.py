@@ -62,7 +62,10 @@ async def test_policy_materializer_commits_offsets_after_successful_materializat
         materialize_routing_policy_state=AsyncMock(),
     )
     materializer = PolicyMaterializer(
-        {"bootstrap_servers": ["localhost:9092"], "consumer": {"enable_auto_commit": False}},
+        {
+            "bootstrap_servers": ["localhost:9092"],
+            "consumer": {"enable_auto_commit": False},
+        },
         policy_cache,
     )
     materializer.running = True
@@ -109,4 +112,6 @@ async def test_policy_materializer_skips_invalid_json_with_manual_commit():
     await materializer._consume_requests_enriched(consumer)
 
     policy_cache.materialize_request_enriched.assert_not_awaited()
-    consumer.commit.assert_awaited_once_with({TopicPartition("requests.enriched", 0): 4})
+    consumer.commit.assert_awaited_once_with(
+        {TopicPartition("requests.enriched", 0): 4}
+    )

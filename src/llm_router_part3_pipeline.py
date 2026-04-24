@@ -497,8 +497,7 @@ class KafkaProducerManager:
             self.config.get("producer", {}).get("health_failure_threshold", 5) or 5
         )
         return (
-            self.producer is not None
-            and self.consecutive_failures < failure_threshold
+            self.producer is not None and self.consecutive_failures < failure_threshold
         )
 
     def _topic_name(self, topic_key: str, default_topic: str) -> str:
@@ -1139,9 +1138,7 @@ class ClickHouseManager:
         """Get query analytics for dashboard"""
         try:
             time_window_hours = max(int(hours), 0)
-            where_clauses = [
-                f"timestamp >= now() - INTERVAL {time_window_hours} HOUR"
-            ]
+            where_clauses = [f"timestamp >= now() - INTERVAL {time_window_hours} HOUR"]
             if user_id:
                 escaped_user_id = _escape_clickhouse_literal(user_id)
                 where_clauses.append(f"user_id = '{escaped_user_id}'")
@@ -1560,9 +1557,7 @@ class KafkaConsumerManager:
         # Wait for all tasks
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _supervise_consumer(
-        self, topic_key: str, consumer: AIOKafkaConsumer
-    ):
+    async def _supervise_consumer(self, topic_key: str, consumer: AIOKafkaConsumer):
         """Restart a topic consumer loop when it exits unexpectedly."""
         backoff_seconds = self.supervisor_initial_backoff_seconds
         while self.running:

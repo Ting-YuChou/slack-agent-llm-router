@@ -706,9 +706,7 @@ class PolicyMaterializer:
 
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _supervise_consumer(
-        self, topic_key: str, consumer: AIOKafkaConsumer
-    ):
+    async def _supervise_consumer(self, topic_key: str, consumer: AIOKafkaConsumer):
         """Restart policy materializer consumers after task-level failures."""
         backoff_seconds = self.supervisor_initial_backoff_seconds
         while self.running:
@@ -782,9 +780,7 @@ class PolicyMaterializer:
             raise RuntimeError(f"No policy materializer handler for {topic_key}")
         await handler(consumer)
 
-    async def _commit_processed_message(
-        self, consumer: AIOKafkaConsumer, message: Any
-    ):
+    async def _commit_processed_message(self, consumer: AIOKafkaConsumer, message: Any):
         """Commit a processed Kafka message when manual commits are enabled."""
         if self.consumer_config.get("enable_auto_commit", True):
             return
@@ -818,9 +814,7 @@ class PolicyMaterializer:
                     await self.policy_cache.materialize_request_enriched(payload)
                     await self._commit_processed_message(consumer, message)
                 except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning(
-                        f"Skipping invalid requests.enriched message: {e}"
-                    )
+                    logger.warning(f"Skipping invalid requests.enriched message: {e}")
                     await self._commit_processed_message(consumer, message)
                 except Exception as e:
                     logger.warning(
@@ -860,9 +854,7 @@ class PolicyMaterializer:
                     await self.policy_cache.materialize_routing_guardrail(payload)
                     await self._commit_processed_message(consumer, message)
                 except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning(
-                        f"Skipping invalid routing_guardrails message: {e}"
-                    )
+                    logger.warning(f"Skipping invalid routing_guardrails message: {e}")
                     await self._commit_processed_message(consumer, message)
                 except Exception as e:
                     logger.warning(
@@ -879,9 +871,7 @@ class PolicyMaterializer:
                     break
                 try:
                     payload = self._decode_message_value(message)
-                    await self.policy_cache.materialize_routing_policy_state(
-                        payload
-                    )
+                    await self.policy_cache.materialize_routing_policy_state(payload)
                     await self._commit_processed_message(consumer, message)
                 except (json.JSONDecodeError, ValueError) as e:
                     logger.warning(
@@ -907,8 +897,7 @@ class PolicyMaterializer:
         if not self.consumers:
             return False
         return not any(
-            status.get("last_error")
-            for status in self.consumer_task_status.values()
+            status.get("last_error") for status in self.consumer_task_status.values()
         )
 
     def get_health_status(self) -> Dict[str, Any]:

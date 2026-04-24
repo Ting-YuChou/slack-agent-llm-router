@@ -859,7 +859,9 @@ class TestKafkaIngestionPipeline:
         )
 
     @pytest.mark.asyncio
-    async def test_get_query_analytics_alias_delegates_to_clickhouse(self, pipeline_config):
+    async def test_get_query_analytics_alias_delegates_to_clickhouse(
+        self, pipeline_config
+    ):
         pipeline = KafkaIngestionPipeline(pipeline_config)
         pipeline.clickhouse_manager.get_query_analytics = AsyncMock(
             return_value={"total_queries": 3}
