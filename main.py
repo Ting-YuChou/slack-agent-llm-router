@@ -364,7 +364,34 @@ class LLMRouterPlatform:
         server = uvicorn.Server(config)
         await server.serve()
 
-    def _record_api_metrics(
+    async def _publish_system_metric_event(
+        self,
+        *,
+        service: str,
+        metric_name: str,
+        metric_value: float,
+        labels: Optional[Dict[str, str]] = None,
+    ):
+        """Best-effort publication of API-side metrics into the analytics pipeline."""
+        producer = self.services.get("event_producer")
+        if producer is None:
+            return
+
+        publish_method = getattr(producer, "produce_metric", None)
+        if publish_method is None:
+            return
+
+        try:
+            await publish_method(
+                service=service,
+                metric_name=metric_name,
+                metric_value=metric_value,
+                labels=labels or {},
+            )
+        except Exception as exc:
+            self.logger.warning(f"Failed to publish system metric event: {exc}")
+
+    async def _record_api_metrics(
         self,
         endpoint: str,
         method: str,
@@ -396,6 +423,35 @@ class LLMRouterPlatform:
                     component="api",
                     error_type=error_type,
                 ).inc()
+
+        metric_labels = {
+            "endpoint": endpoint,
+            "method": method,
+            "status": str(status_code),
+        }
+        await self._publish_system_metric_event(
+            service="api",
+            metric_name="requests_total",
+            metric_value=1.0,
+            labels=metric_labels,
+        )
+        await self._publish_system_metric_event(
+            service="api",
+            metric_name="request_duration_seconds",
+            metric_value=duration_seconds,
+            labels=metric_labels,
+        )
+        if error_type:
+            await self._publish_system_metric_event(
+                service="api",
+                metric_name="errors_total",
+                metric_value=1.0,
+                labels={
+                    "component": "api",
+                    "error_type": error_type,
+                    **metric_labels,
+                },
+            )
 
     def _security_config(self) -> Dict[str, Any]:
         """Return security configuration."""
@@ -472,6 +528,13 @@ class LLMRouterPlatform:
         """Build readiness response payload."""
         service_status = self._get_service_status()
         required_services = ["router", "inference"]
+        for optional_required in (
+            "event_producer",
+            "pipeline",
+            "policy_materializer",
+        ):
+            if optional_required in self.services:
+                required_services.append(optional_required)
         missing_services = [
             service_name
             for service_name in required_services
@@ -861,8 +924,17 @@ class LLMRouterPlatform:
             sources["routing_policy_state"] = "monitoring_service"
 
         if "pipeline" in self.services:
-            pipeline_analytics = await self.services["pipeline"].get_query_analytics(
-                hours=hours
+            get_pipeline_analytics = getattr(
+                self.services["pipeline"], "get_query_analytics", None
+            )
+            if not callable(get_pipeline_analytics):
+                get_pipeline_analytics = getattr(
+                    self.services["pipeline"], "get_analytics", None
+                )
+            pipeline_analytics = (
+                await get_pipeline_analytics(hours=hours)
+                if callable(get_pipeline_analytics)
+                else {}
             )
             pipeline_models = await self.services["pipeline"].get_model_performance(
                 hours=hours
@@ -1213,7 +1285,7 @@ class LLMRouterPlatform:
                     },
                 )
             finally:
-                self._record_api_metrics(
+                await self._record_api_metrics(
                     endpoint=endpoint,
                     method=method,
                     status_code=status_code,

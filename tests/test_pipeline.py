@@ -70,6 +70,19 @@ def sample_query_log():
     )
 
 
+class AsyncMessageConsumer:
+    def __init__(self, messages):
+        self._messages = list(messages)
+        self.commit = AsyncMock()
+
+    def __aiter__(self):
+        async def iterator():
+            for message in self._messages:
+                yield message
+
+        return iterator()
+
+
 class TestQueryLogEntry:
     def test_to_dict_serializes_enums(self, sample_query_log):
         payload = sample_query_log.to_dict()
@@ -94,6 +107,63 @@ class TestKafkaProducerManager:
             producer.start.assert_awaited_once()
             assert manager.producer is producer
 
+    @pytest.mark.asyncio
+    async def test_initialize_maps_reliability_producer_config(self, pipeline_config):
+        config = {
+            **pipeline_config,
+            "producer": {
+                "acks": "1",
+                "enable_idempotence": True,
+                "linger_ms": 25,
+                "batch_size": 32768,
+                "request_timeout_ms": 12000,
+                "retry_backoff_ms": 250,
+            },
+        }
+        with patch(
+            "src.llm_router_part3_pipeline.AIOKafkaProducer"
+        ) as mock_producer_cls:
+            producer = AsyncMock()
+            mock_producer_cls.return_value = producer
+
+            manager = KafkaProducerManager(config)
+            await manager.initialize()
+
+            kwargs = mock_producer_cls.call_args.kwargs
+            assert kwargs["acks"] == "all"
+            assert kwargs["enable_idempotence"] is True
+            assert kwargs["linger_ms"] == 25
+            assert kwargs["max_batch_size"] == 32768
+            assert kwargs["request_timeout_ms"] == 12000
+            assert kwargs["retry_backoff_ms"] == 250
+
+    @pytest.mark.asyncio
+    async def test_send_message_waits_for_ack_and_retries(self, pipeline_config):
+        config = {
+            **pipeline_config,
+            "producer": {
+                "retries": 1,
+                "retry_backoff_ms": 0,
+                "send_timeout_seconds": 1,
+            },
+        }
+        manager = KafkaProducerManager(config)
+        manager.producer = AsyncMock()
+        manager.producer.send_and_wait = AsyncMock(
+            side_effect=[RuntimeError("temporary"), object()]
+        )
+
+        sent = await manager._send_message(
+            "queries",
+            "llm-queries",
+            key="u1",
+            value={"hello": "world"},
+        )
+
+        assert sent is True
+        assert manager.producer.send_and_wait.await_count == 2
+        assert manager.consecutive_failures == 0
+
     def test_serialize_message_handles_datetime(self, pipeline_config):
         manager = KafkaProducerManager(pipeline_config)
         payload = {
@@ -115,7 +185,7 @@ class TestKafkaProducerManager:
 
         await manager.produce_request_raw(request)
 
-        send_kwargs = manager.producer.send.await_args.kwargs
+        send_kwargs = manager.producer.send_and_wait.await_args.kwargs
         assert send_kwargs["topic"] == "requests.raw"
         assert send_kwargs["key"] == "u1"
         assert send_kwargs["value"]["event_type"] == "requests.raw"
@@ -159,7 +229,7 @@ class TestKafkaProducerManager:
 
         await manager.produce_inference_completed(request, response, routing_decision)
 
-        send_kwargs = manager.producer.send.await_args.kwargs
+        send_kwargs = manager.producer.send_and_wait.await_args.kwargs
         assert send_kwargs["topic"] == "inference.completed"
         assert send_kwargs["key"] == request.request_id
         assert send_kwargs["value"]["event_type"] == "inference.completed"
@@ -171,6 +241,32 @@ class TestKafkaProducerManager:
         assert send_kwargs["value"]["route_to_fast_lane"] is True
         assert send_kwargs["value"]["actual_fast_lane_hit"] is True
         assert send_kwargs["value"]["policy_source"] == "session+user"
+
+    @pytest.mark.asyncio
+    async def test_produce_query_log_uses_request_id_and_fallback_query_type(
+        self, pipeline_config
+    ):
+        manager = KafkaProducerManager(pipeline_config)
+        manager.producer = AsyncMock()
+        request = QueryRequest(query="hello", user_id="u1", user_tier=UserTier.FREE)
+        response = InferenceResponse(
+            response_text="world",
+            model_name="gpt-5",
+            provider="openai",
+            token_count_input=3,
+            token_count_output=5,
+            total_tokens=8,
+            latency_ms=12,
+            tokens_per_second=120.0,
+            cost_usd=0.01,
+        )
+
+        await manager.produce_query_log(request, response, SimpleNamespace())
+
+        send_kwargs = manager.producer.send_and_wait.await_args.kwargs
+        assert send_kwargs["topic"] == "test-queries"
+        assert send_kwargs["value"]["query_id"] == request.request_id
+        assert send_kwargs["value"]["query_type"] == "general"
 
 
 class TestClickHouseManager:
@@ -313,6 +409,128 @@ class TestClickHouseManager:
             )
 
     @pytest.mark.asyncio
+    async def test_get_query_analytics_uses_weighted_overall_aggregation(
+        self, pipeline_config
+    ):
+        with patch(
+            "src.llm_router_part3_pipeline.clickhouse_connect.get_client"
+        ) as mock_get_client:
+            client = MagicMock()
+            client.query.return_value.result_rows = [[1]]
+            mock_get_client.return_value = client
+
+            manager = ClickHouseManager(pipeline_config["clickhouse"])
+            await manager.initialize()
+            manager._run_blocking = AsyncMock(
+                side_effect=[
+                    SimpleNamespace(result_rows=[[10, 200, 3.5, 140.0, 80.0]]),
+                    SimpleNamespace(
+                        result_rows=[
+                            ["gpt-5", 8, 2.5],
+                            ["mistral-7b", 2, 1.0],
+                        ]
+                    ),
+                    SimpleNamespace(
+                        result_rows=[
+                            ["analysis", 6],
+                            ["general", 4],
+                        ]
+                    ),
+                ]
+            )
+
+            analytics = await manager.get_query_analytics(hours=6)
+
+            assert manager._run_blocking.await_count == 3
+            overall_query = manager._run_blocking.await_args_list[0].args[1]
+            assert "GROUP BY selected_model, query_type" not in overall_query
+            assert analytics == {
+                "total_queries": 10,
+                "total_tokens": 200,
+                "total_cost": 3.5,
+                "avg_latency": 140.0,
+                "success_rate": 80.0,
+                "model_breakdown": {
+                    "gpt-5": {"queries": 8, "cost": 2.5},
+                    "mistral-7b": {"queries": 2, "cost": 1.0},
+                },
+                "query_type_breakdown": {"analysis": 6, "general": 4},
+            }
+
+    @pytest.mark.asyncio
+    async def test_get_model_performance_groups_by_provider(self, pipeline_config):
+        with patch(
+            "src.llm_router_part3_pipeline.clickhouse_connect.get_client"
+        ) as mock_get_client:
+            client = MagicMock()
+            client.query.return_value.result_rows = [[1]]
+            mock_get_client.return_value = client
+
+            manager = ClickHouseManager(pipeline_config["clickhouse"])
+            await manager.initialize()
+            manager._run_blocking = AsyncMock(
+                return_value=SimpleNamespace(
+                    result_rows=[
+                        ["gpt-5", "openai", 7, 99.5, 412.0, 155.0, 0, 1.25],
+                        ["gpt-5", "azure", 3, 97.0, 430.0, 150.0, 1, 0.55],
+                    ]
+                )
+            )
+
+            performance = await manager.get_model_performance(hours=6)
+
+            query_arg = manager._run_blocking.await_args.args[1]
+            assert "GROUP BY model_name, provider" in query_arg
+            assert performance == [
+                {
+                    "model_name": "gpt-5",
+                    "provider": "openai",
+                    "requests": 7,
+                    "success_rate": 99.5,
+                    "avg_latency_ms": 412.0,
+                    "tokens_per_second": 155.0,
+                    "error_count": 0,
+                    "total_cost": 1.25,
+                },
+                {
+                    "model_name": "gpt-5",
+                    "provider": "azure",
+                    "requests": 3,
+                    "success_rate": 97.0,
+                    "avg_latency_ms": 430.0,
+                    "tokens_per_second": 150.0,
+                    "error_count": 1,
+                    "total_cost": 0.55,
+                },
+            ]
+
+    @pytest.mark.asyncio
+    async def test_initialize_raises_when_required_table_creation_fails(
+        self, pipeline_config
+    ):
+        with patch(
+            "src.llm_router_part3_pipeline.clickhouse_connect.get_client"
+        ) as mock_get_client:
+            client = MagicMock()
+            client.query.return_value.result_rows = [[1]]
+
+            def fail_model_performance_table(sql):
+                if "CREATE TABLE IF NOT EXISTS test_db.model_performance" in sql:
+                    raise RuntimeError("boom")
+                return None
+
+            client.command.side_effect = fail_model_performance_table
+            mock_get_client.return_value = client
+
+            manager = ClickHouseManager(pipeline_config["clickhouse"])
+
+            with pytest.raises(
+                RuntimeError,
+                match="Failed to create required ClickHouse table model_performance",
+            ):
+                await manager.initialize()
+
+    @pytest.mark.asyncio
     async def test_get_routing_guardrails_uses_run_blocking(self, pipeline_config):
         with patch(
             "src.llm_router_part3_pipeline.clickhouse_connect.get_client"
@@ -428,6 +646,96 @@ class TestKafkaConsumerManager:
         await consumer._notify_observers("alerts", {"event_type": "alerts"})
 
         assert seen == ["alerts"]
+
+    @pytest.mark.asyncio
+    async def test_consume_requests_enriched_commits_offsets_after_observer_delivery(
+        self, pipeline_config
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        seen = []
+
+        async def handler(payload):
+            seen.append(payload["request_id"])
+
+        message = SimpleNamespace(
+            value={"event_type": "requests.enriched", "request_id": "req-1"},
+            topic="requests.enriched",
+            partition=0,
+            offset=4,
+        )
+        kafka_consumer = AsyncMessageConsumer([message])
+        consumer.consumers["requests_enriched"] = kafka_consumer
+        consumer.register_observer("requests_enriched", handler)
+
+        await consumer._consume_requests_enriched(kafka_consumer)
+
+        kafka_consumer.commit.assert_awaited_once_with(
+            {TopicPartition("requests.enriched", 0): 5}
+        )
+        assert seen == ["req-1"]
+
+    @pytest.mark.asyncio
+    async def test_consume_query_poison_message_goes_to_dlq_and_commits(
+        self, pipeline_config
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        consumer.dlq_producer = AsyncMock()
+        message = SimpleNamespace(
+            value=b"{not-json",
+            key=b"bad-key",
+            topic="test-queries",
+            partition=0,
+            offset=12,
+        )
+        kafka_consumer = AsyncMessageConsumer([message])
+        consumer.consumers["queries"] = kafka_consumer
+
+        await consumer._consume_queries(kafka_consumer)
+
+        dlq_kwargs = consumer.dlq_producer.send_and_wait.await_args.kwargs
+        assert dlq_kwargs["topic"] == "test-queries.dlq"
+        assert dlq_kwargs["key"] == "test-queries:0:12"
+        assert dlq_kwargs["value"]["source_offset"] == 12
+        assert dlq_kwargs["value"]["source_key"] == "bad-key"
+        assert dlq_kwargs["value"]["error_type"] == "JSONDecodeError"
+        kafka_consumer.commit.assert_awaited_once_with(
+            {TopicPartition("test-queries", 0): 13}
+        )
+
+    @pytest.mark.asyncio
+    async def test_consume_query_records_kafka_metadata_for_idempotency(
+        self, pipeline_config
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        payload = {
+            "query_id": "query-1",
+            "timestamp": "2026-04-19T00:00:00+00:00",
+            "user_id": "user-1",
+            "user_tier": "premium",
+            "query_text": "hello",
+            "query_type": "general",
+            "selected_model": "gpt-5",
+            "token_count_input": 1,
+            "token_count_output": 2,
+            "latency_ms": 10,
+            "cost_usd": 0.01,
+            "status": "success",
+        }
+        message = SimpleNamespace(
+            value=json.dumps(payload).encode("utf-8"),
+            topic="test-queries",
+            partition=2,
+            offset=8,
+        )
+        kafka_consumer = AsyncMessageConsumer([message])
+
+        await consumer._consume_queries(kafka_consumer)
+
+        entry = consumer.batch_processors["queries"][0]
+        assert entry.event_id == "test-queries:2:8"
+        assert entry.kafka_topic == "test-queries"
+        assert entry.kafka_partition == 2
+        assert entry.kafka_offset == 8
 
     @pytest.mark.asyncio
     async def test_flush_pending_batches_commits_offsets_after_clickhouse_write(
@@ -549,6 +857,22 @@ class TestKafkaIngestionPipeline:
         pipeline.producer_manager.produce_query_log.assert_awaited_once_with(
             request, response, decision
         )
+
+    @pytest.mark.asyncio
+    async def test_get_query_analytics_alias_delegates_to_clickhouse(
+        self, pipeline_config
+    ):
+        pipeline = KafkaIngestionPipeline(pipeline_config)
+        pipeline.clickhouse_manager.get_query_analytics = AsyncMock(
+            return_value={"total_queries": 3}
+        )
+
+        analytics = await pipeline.get_query_analytics(hours=6)
+
+        pipeline.clickhouse_manager.get_query_analytics.assert_awaited_once_with(
+            None, 6
+        )
+        assert analytics == {"total_queries": 3}
 
     def test_attach_monitoring_service_registers_stream_handlers(self, pipeline_config):
         pipeline = KafkaIngestionPipeline(pipeline_config)

@@ -1115,7 +1115,7 @@ class InferenceEngine:
                 logger.info(f"Cache hit for request {request_id}")
                 cached_response["cached"] = True
                 response = InferenceResponse(**cached_response)
-                await self._publish_inference_completed_event(
+                await self._publish_analytics_events(
                     request,
                     response,
                     routing_decision=routing_decision,
@@ -1176,7 +1176,7 @@ class InferenceEngine:
                 model=model_name, provider=response.provider
             ).observe(inference_time)
 
-            await self._publish_inference_completed_event(
+            await self._publish_analytics_events(
                 request,
                 response,
                 routing_decision=routing_decision,
@@ -1221,7 +1221,7 @@ class InferenceEngine:
                 cached=False,
                 error="inference_failed",
             )
-            await self._publish_inference_completed_event(
+            await self._publish_analytics_events(
                 request,
                 error_response,
                 routing_decision=routing_decision
@@ -1495,6 +1495,43 @@ class InferenceEngine:
             await publish_method(request, response, routing_decision)
         except Exception as exc:
             logger.warning(f"Failed to publish inference completion event: {exc}")
+
+    async def _publish_query_log_event(
+        self,
+        request: QueryRequest,
+        response: InferenceResponse,
+        routing_decision: Optional[Any] = None,
+    ):
+        """Best-effort publication of query log events for ClickHouse analytics."""
+        if not self.event_producer:
+            return
+
+        publish_method = getattr(self.event_producer, "produce_query_log", None)
+        if publish_method is None:
+            return
+
+        try:
+            await publish_method(request, response, routing_decision)
+        except Exception as exc:
+            logger.warning(f"Failed to publish query log event: {exc}")
+
+    async def _publish_analytics_events(
+        self,
+        request: QueryRequest,
+        response: InferenceResponse,
+        routing_decision: Optional[Any] = None,
+    ):
+        """Best-effort publication of post-inference analytics events."""
+        await self._publish_inference_completed_event(
+            request,
+            response,
+            routing_decision=routing_decision,
+        )
+        await self._publish_query_log_event(
+            request,
+            response,
+            routing_decision=routing_decision,
+        )
 
     async def _update_stats(
         self, model_name: str, response: InferenceResponse, inference_time: float

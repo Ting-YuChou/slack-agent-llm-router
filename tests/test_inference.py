@@ -377,6 +377,7 @@ class TestInferenceEngine:
 
         event_producer = AsyncMock()
         event_producer.produce_inference_completed = AsyncMock()
+        event_producer.produce_query_log = AsyncMock()
 
         engine = InferenceEngine(
             inference_config,
@@ -393,6 +394,7 @@ class TestInferenceEngine:
         await engine.process_query(sample_query_request)
 
         event_producer.produce_inference_completed.assert_awaited_once()
+        event_producer.produce_query_log.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_process_query_returns_cached_response(
@@ -444,6 +446,7 @@ class TestInferenceEngine:
 
         event_producer = AsyncMock()
         event_producer.produce_inference_completed = AsyncMock()
+        event_producer.produce_query_log = AsyncMock()
 
         engine = InferenceEngine(
             inference_config,
@@ -456,6 +459,7 @@ class TestInferenceEngine:
 
         assert response.provider == "error"
         event_producer.produce_inference_completed.assert_awaited_once()
+        event_producer.produce_query_log.assert_awaited_once()
         published_response = event_producer.produce_inference_completed.await_args.args[
             1
         ]

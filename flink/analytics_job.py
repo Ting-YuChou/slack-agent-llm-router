@@ -16,16 +16,71 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from pyflink.common.serialization import SimpleStringSchema
-from pyflink.common.typeinfo import Types
-from pyflink.datastream import StreamExecutionEnvironment
-from pyflink.datastream.connectors.kafka import FlinkKafkaConsumer, FlinkKafkaProducer
-from pyflink.datastream.functions import (
-    FilterFunction,
-    KeyedProcessFunction,
-    MapFunction,
-)
-from pyflink.datastream.state import ListStateDescriptor, ValueStateDescriptor
+try:  # pragma: no cover - optional in unit-test environments
+    from pyflink.common.serialization import SimpleStringSchema
+    from pyflink.common.typeinfo import Types
+    from pyflink.datastream import StreamExecutionEnvironment
+    from pyflink.datastream.connectors.kafka import (
+        FlinkKafkaConsumer,
+        FlinkKafkaProducer,
+    )
+    from pyflink.datastream.functions import (
+        FilterFunction,
+        KeyedProcessFunction,
+        MapFunction,
+    )
+    from pyflink.datastream.state import ListStateDescriptor, ValueStateDescriptor
+except Exception:  # pragma: no cover - used only when PyFlink is unavailable
+    SimpleStringSchema = None
+
+    class _Types:
+        @staticmethod
+        def FLOAT():
+            return None
+
+        @staticmethod
+        def LONG():
+            return None
+
+        @staticmethod
+        def STRING():
+            return None
+
+        @staticmethod
+        def PICKLED_BYTE_ARRAY():
+            return None
+
+    Types = _Types()
+
+    class StreamExecutionEnvironment:
+        @staticmethod
+        def get_execution_environment():
+            raise ModuleNotFoundError("pyflink is required to execute analytics_job")
+
+    class FlinkKafkaConsumer:  # pragma: no cover - placeholder for imports
+        def __init__(self, *args, **kwargs):
+            raise ModuleNotFoundError("pyflink is required to execute analytics_job")
+
+    class FlinkKafkaProducer:  # pragma: no cover - placeholder for imports
+        def __init__(self, *args, **kwargs):
+            raise ModuleNotFoundError("pyflink is required to execute analytics_job")
+
+    class FilterFunction:  # pragma: no cover - placeholder base class
+        pass
+
+    class KeyedProcessFunction:  # pragma: no cover - placeholder base class
+        pass
+
+    class MapFunction:  # pragma: no cover - placeholder base class
+        pass
+
+    class ListStateDescriptor:  # pragma: no cover - placeholder descriptor
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class ValueStateDescriptor:  # pragma: no cover - placeholder descriptor
+        def __init__(self, *args, **kwargs):
+            pass
 
 try:
     from pyflink.common.watermark_strategy import TimestampAssigner, WatermarkStrategy
@@ -163,6 +218,25 @@ class NonEmptyFieldFilter(FilterFunction):
         return bool(value.get(self.field_name))
 
 
+def _model_provider_stream_key(
+    model_name: Any,
+    provider: Any,
+) -> str:
+    """Build a stable Flink key for model-provider aggregates."""
+    resolved_model = str(model_name or "unknown")
+    resolved_provider = str(provider or "unknown")
+    return f"{resolved_model}\0{resolved_provider}"
+
+
+def _split_model_provider_stream_key(stream_key: Any) -> tuple[str, str]:
+    """Recover model and provider from the Flink composite key."""
+    raw_key = str(stream_key or "")
+    if "\0" in raw_key:
+        model_name, provider = raw_key.split("\0", 1)
+        return model_name or "unknown", provider or "unknown"
+    return raw_key or "unknown", "unknown"
+
+
 class ModelMetricsWindowAggregator(KeyedProcessFunction):
     """Aggregate inference completion events into event-time windows."""
 
@@ -210,7 +284,6 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
         buckets = self._read_buckets()
         bucket = buckets.get(window_start_ms) or {
             "window_start_ms": window_start_ms,
-            "provider": str(value.get("provider", "unknown") or "unknown"),
             "request_count": 0,
             "success_count": 0,
             "error_count": 0,
@@ -222,9 +295,6 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
             "total_cost_usd": 0.0,
             "cached_count": 0,
         }
-        bucket["provider"] = str(
-            value.get("provider", bucket.get("provider") or "unknown") or "unknown"
-        )
         bucket["request_count"] += 1
         bucket["success_count"] += 1 if value.get("status") == "success" else 0
         bucket["error_count"] += 1 if value.get("status") != "success" else 0
@@ -313,10 +383,11 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
     def _build_metric_event(
         self, *, model_name: str, bucket: Dict[str, Any]
     ) -> Dict[str, Any]:
+        resolved_model_name, provider = _split_model_provider_stream_key(model_name)
         window_start_ms = int(bucket.get("window_start_ms", 0) or 0)
         return build_model_metrics_window_event(
-            model_name=model_name,
-            provider=str(bucket.get("provider", "unknown") or "unknown"),
+            model_name=resolved_model_name,
+            provider=provider,
             window_start_ms=window_start_ms,
             window_end_ms=window_start_ms + self.window_size_ms,
             window_size_seconds=self.window_size_seconds,
@@ -756,7 +827,10 @@ def create_flink_job(config: Dict[str, Any]):
         )
 
     metrics_stream = valid_completions_stream.key_by(
-        lambda event: event.get("selected_model", "unknown")
+        lambda event: _model_provider_stream_key(
+            event.get("selected_model", "unknown"),
+            event.get("provider", "unknown"),
+        )
     ).process(
         ModelMetricsWindowAggregator(
             window_size_seconds=window_size_seconds,

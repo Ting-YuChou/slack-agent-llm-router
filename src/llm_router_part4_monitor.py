@@ -10,7 +10,7 @@ import logging
 import time
 import psutil
 import GPUtil
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,13 +40,25 @@ logger = logging.getLogger(__name__)
 def _parse_event_timestamp(value: Any) -> datetime:
     """Parse event timestamps emitted by the streaming pipeline."""
     if isinstance(value, datetime):
-        return value
-    if isinstance(value, str) and value:
+        parsed = value
+    elif isinstance(value, str) and value:
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             logger.debug(f"Failed to parse event timestamp: {value}")
-    return datetime.now()
+            parsed = datetime.now()
+    else:
+        parsed = datetime.now()
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _stream_model_provider_key(model_name: Any, provider: Any) -> str:
+    """Build a stable key for per-provider stream model metrics."""
+    model = str(model_name or "unknown")
+    resolved_provider = str(provider or "unknown")
+    return f"{model}@{resolved_provider}"
 
 
 @dataclass
@@ -604,7 +616,7 @@ class MetricsCollector:
         self.metrics_history = []
         self.max_history_size = 1000
         self.stream_metrics_history = []
-        self.latest_stream_metrics_by_model: Dict[str, Dict[str, Any]] = {}
+        self.latest_stream_metrics_by_key: Dict[str, Dict[str, Any]] = {}
         self.routing_feature_history = []
         self.routing_guardrail_history = []
         self.routing_policy_state_history = []
@@ -724,12 +736,14 @@ class MetricsCollector:
             "timestamp", event.get("emitted_at", datetime.now().isoformat())
         )
         model_name = str(event.get("model_name", "unknown"))
+        provider = str(event.get("provider", "unknown"))
+        model_provider_key = _stream_model_provider_key(model_name, provider)
 
         self.stream_metrics_history.append(event)
         if len(self.stream_metrics_history) > self.max_history_size:
             self.stream_metrics_history.pop(0)
 
-        self.latest_stream_metrics_by_model[model_name] = event
+        self.latest_stream_metrics_by_key[model_provider_key] = event
 
     def _recent_stream_metrics(self, hours: int = 1) -> List[Dict[str, Any]]:
         """Return stream metrics still within the configured freshness window."""
@@ -748,7 +762,7 @@ class MetricsCollector:
         )
         return [
             metric
-            for metric in self.latest_stream_metrics_by_model.values()
+            for metric in self.latest_stream_metrics_by_key.values()
             if _parse_event_timestamp(metric.get("timestamp")) >= cutoff
         ]
 
@@ -780,7 +794,10 @@ class MetricsCollector:
         latest_models = {}
         for metric in fresh_metrics:
             model_name = str(metric.get("model_name", "unknown"))
-            latest_models[model_name] = {
+            provider = str(metric.get("provider", "unknown"))
+            model_provider_key = _stream_model_provider_key(model_name, provider)
+            latest_models[model_provider_key] = {
+                "model_name": model_name,
                 "provider": metric.get("provider"),
                 "request_count": int(metric.get("request_count", 0) or 0),
                 "avg_latency_ms": float(metric.get("avg_latency_ms", 0.0) or 0.0),

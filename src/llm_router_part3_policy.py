@@ -15,8 +15,10 @@ import time
 from typing import Any, Dict, List, Optional
 
 from aiokafka import AIOKafkaConsumer
+from aiokafka.structs import TopicPartition
 import redis.asyncio as redis
 
+from src.utils.metrics import PIPELINE_METRICS
 
 logger = logging.getLogger(__name__)
 
@@ -636,9 +638,23 @@ class PolicyMaterializer:
             "max_poll_records": materializer_config.get(
                 "max_poll_records", consumer_config.get("max_poll_records", 500)
             ),
-            "value_deserializer": self._deserialize_message,
         }
         self.consumers: Dict[str, AIOKafkaConsumer] = {}
+        self.topic_names_by_key: Dict[str, str] = {}
+        self.consumer_task_status: Dict[str, Dict[str, Any]] = {}
+        self.consumer_restart_counts: Dict[str, int] = {}
+        self.supervisor_initial_backoff_seconds = float(
+            materializer_config.get(
+                "supervisor_initial_backoff_seconds",
+                consumer_config.get("supervisor_initial_backoff_seconds", 1.0),
+            )
+        )
+        self.supervisor_max_backoff_seconds = float(
+            materializer_config.get(
+                "supervisor_max_backoff_seconds",
+                consumer_config.get("supervisor_max_backoff_seconds", 30.0),
+            )
+        )
         self.running = False
 
     async def initialize(self):
@@ -664,6 +680,13 @@ class PolicyMaterializer:
             consumer = AIOKafkaConsumer(topic_name, **self.consumer_config)
             await consumer.start()
             self.consumers[topic_key] = consumer
+            self.topic_names_by_key[topic_key] = topic_name
+            self.consumer_task_status[topic_key] = {
+                "running": False,
+                "last_error": None,
+                "last_started_at": None,
+                "last_stopped_at": None,
+            }
             logger.info(f"Policy materializer consumer initialized: {topic_name}")
 
     async def start(self):
@@ -673,36 +696,113 @@ class PolicyMaterializer:
 
         self.running = True
         tasks = []
-        if "requests_enriched" in self.consumers:
+        for topic_key, consumer in self.consumers.items():
             tasks.append(
                 asyncio.create_task(
-                    self._consume_requests_enriched(self.consumers["requests_enriched"])
-                )
-            )
-        if "fast_lane_hints" in self.consumers:
-            tasks.append(
-                asyncio.create_task(
-                    self._consume_fast_lane_hints(self.consumers["fast_lane_hints"])
-                )
-            )
-        if "routing_guardrails" in self.consumers:
-            tasks.append(
-                asyncio.create_task(
-                    self._consume_routing_guardrails(
-                        self.consumers["routing_guardrails"]
-                    )
-                )
-            )
-        if "routing_policy_state" in self.consumers:
-            tasks.append(
-                asyncio.create_task(
-                    self._consume_routing_policy_state(
-                        self.consumers["routing_policy_state"]
-                    )
+                    self._supervise_consumer(topic_key, consumer),
+                    name=f"policy_materializer_{topic_key}",
                 )
             )
 
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _supervise_consumer(self, topic_key: str, consumer: AIOKafkaConsumer):
+        """Restart policy materializer consumers after task-level failures."""
+        backoff_seconds = self.supervisor_initial_backoff_seconds
+        while self.running:
+            self.consumer_task_status.setdefault(topic_key, {})
+            self.consumer_task_status[topic_key].update(
+                {
+                    "running": True,
+                    "last_error": None,
+                    "last_started_at": time.time(),
+                }
+            )
+            try:
+                await self._run_consumer(topic_key, consumer)
+                if not self.running:
+                    break
+                raise RuntimeError("policy materializer consumer exited unexpectedly")
+            except asyncio.CancelledError:
+                self.consumer_task_status[topic_key].update(
+                    {"running": False, "last_stopped_at": time.time()}
+                )
+                raise
+            except Exception as e:
+                self.consumer_task_status[topic_key].update(
+                    {
+                        "running": False,
+                        "last_error": str(e),
+                        "last_stopped_at": time.time(),
+                    }
+                )
+                self.consumer_restart_counts[topic_key] = (
+                    self.consumer_restart_counts.get(topic_key, 0) + 1
+                )
+                PIPELINE_METRICS.consumer_restarts.labels(topic=topic_key).inc()
+                logger.error(
+                    "Policy materializer consumer for %s stopped; restarting in %.1fs: %s",
+                    topic_key,
+                    backoff_seconds,
+                    e,
+                )
+                await asyncio.sleep(backoff_seconds)
+                backoff_seconds = min(
+                    max(backoff_seconds * 2, self.supervisor_initial_backoff_seconds),
+                    self.supervisor_max_backoff_seconds,
+                )
+                consumer = await self._restart_consumer(topic_key)
+
+    async def _restart_consumer(self, topic_key: str) -> AIOKafkaConsumer:
+        old_consumer = self.consumers.get(topic_key)
+        if old_consumer is not None:
+            try:
+                await old_consumer.stop()
+            except Exception as e:
+                logger.warning(
+                    f"Failed to stop unhealthy policy consumer {topic_key}: {e}"
+                )
+        topic_name = self.topic_names_by_key.get(topic_key) or self.topics[topic_key]
+        consumer = AIOKafkaConsumer(topic_name, **self.consumer_config)
+        await consumer.start()
+        self.consumers[topic_key] = consumer
+        return consumer
+
+    async def _run_consumer(self, topic_key: str, consumer: AIOKafkaConsumer):
+        handlers = {
+            "requests_enriched": self._consume_requests_enriched,
+            "fast_lane_hints": self._consume_fast_lane_hints,
+            "routing_guardrails": self._consume_routing_guardrails,
+            "routing_policy_state": self._consume_routing_policy_state,
+        }
+        handler = handlers.get(topic_key)
+        if handler is None:
+            raise RuntimeError(f"No policy materializer handler for {topic_key}")
+        await handler(consumer)
+
+    async def _commit_processed_message(self, consumer: AIOKafkaConsumer, message: Any):
+        """Commit a processed Kafka message when manual commits are enabled."""
+        if self.consumer_config.get("enable_auto_commit", True):
+            return
+
+        topic = getattr(message, "topic", None)
+        partition = getattr(message, "partition", None)
+        offset = getattr(message, "offset", None)
+        if topic is None or partition is None or offset is None:
+            return
+
+        await consumer.commit({TopicPartition(topic, partition): int(offset) + 1})
+
+    @staticmethod
+    def _decode_message_value(message: Any) -> Dict[str, Any]:
+        value = getattr(message, "value", None)
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, bytes):
+            return json.loads(value.decode("utf-8"))
+        if isinstance(value, str):
+            return json.loads(value)
+        raise ValueError(f"Unsupported Kafka message payload type: {type(value)}")
 
     async def _consume_requests_enriched(self, consumer: AIOKafkaConsumer):
         try:
@@ -710,13 +810,19 @@ class PolicyMaterializer:
                 if not self.running:
                     break
                 try:
-                    await self.policy_cache.materialize_request_enriched(message.value)
+                    payload = self._decode_message_value(message)
+                    await self.policy_cache.materialize_request_enriched(payload)
+                    await self._commit_processed_message(consumer, message)
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.warning(f"Skipping invalid requests.enriched message: {e}")
+                    await self._commit_processed_message(consumer, message)
                 except Exception as e:
                     logger.warning(
                         f"Failed to materialize requests.enriched message: {e}"
                     )
         except Exception as e:
             logger.error(f"requests.enriched consumer error: {e}")
+            raise
 
     async def _consume_fast_lane_hints(self, consumer: AIOKafkaConsumer):
         try:
@@ -724,13 +830,19 @@ class PolicyMaterializer:
                 if not self.running:
                     break
                 try:
-                    await self.policy_cache.materialize_fast_lane_hint(message.value)
+                    payload = self._decode_message_value(message)
+                    await self.policy_cache.materialize_fast_lane_hint(payload)
+                    await self._commit_processed_message(consumer, message)
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.warning(f"Skipping invalid fast_lane_hints message: {e}")
+                    await self._commit_processed_message(consumer, message)
                 except Exception as e:
                     logger.warning(
                         f"Failed to materialize fast_lane_hints message: {e}"
                     )
         except Exception as e:
             logger.error(f"fast_lane_hints consumer error: {e}")
+            raise
 
     async def _consume_routing_guardrails(self, consumer: AIOKafkaConsumer):
         try:
@@ -738,13 +850,19 @@ class PolicyMaterializer:
                 if not self.running:
                     break
                 try:
-                    await self.policy_cache.materialize_routing_guardrail(message.value)
+                    payload = self._decode_message_value(message)
+                    await self.policy_cache.materialize_routing_guardrail(payload)
+                    await self._commit_processed_message(consumer, message)
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.warning(f"Skipping invalid routing_guardrails message: {e}")
+                    await self._commit_processed_message(consumer, message)
                 except Exception as e:
                     logger.warning(
                         f"Failed to materialize routing_guardrails message: {e}"
                     )
         except Exception as e:
             logger.error(f"routing_guardrails consumer error: {e}")
+            raise
 
     async def _consume_routing_policy_state(self, consumer: AIOKafkaConsumer):
         try:
@@ -752,15 +870,21 @@ class PolicyMaterializer:
                 if not self.running:
                     break
                 try:
-                    await self.policy_cache.materialize_routing_policy_state(
-                        message.value
+                    payload = self._decode_message_value(message)
+                    await self.policy_cache.materialize_routing_policy_state(payload)
+                    await self._commit_processed_message(consumer, message)
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.warning(
+                        f"Skipping invalid routing_policy_state message: {e}"
                     )
+                    await self._commit_processed_message(consumer, message)
                 except Exception as e:
                     logger.warning(
                         f"Failed to materialize routing_policy_state message: {e}"
                     )
         except Exception as e:
             logger.error(f"routing_policy_state consumer error: {e}")
+            raise
 
     @staticmethod
     def _deserialize_message(message: bytes) -> Dict[str, Any]:
@@ -768,7 +892,21 @@ class PolicyMaterializer:
 
     def is_healthy(self) -> bool:
         """Return whether the materializer is configured and ready."""
-        return not self.policy_cache.enabled or bool(self.consumers)
+        if not self.policy_cache.enabled:
+            return True
+        if not self.consumers:
+            return False
+        return not any(
+            status.get("last_error") for status in self.consumer_task_status.values()
+        )
+
+    def get_health_status(self) -> Dict[str, Any]:
+        """Return materializer consumer supervisor status."""
+        return {
+            "healthy": self.is_healthy(),
+            "topics": dict(self.consumer_task_status),
+            "restart_counts": dict(self.consumer_restart_counts),
+        }
 
     async def shutdown(self):
         """Shutdown Kafka consumers. The shared cache is owned by the platform."""

@@ -254,6 +254,7 @@ class DummyEventProducer:
         self.config = config
         self.request_events = []
         self.completion_events = []
+        self.metric_events = []
 
     async def initialize(self):
         return None
@@ -265,6 +266,16 @@ class DummyEventProducer:
         self, request, response, routing_decision=None
     ):
         self.completion_events.append((request, response, routing_decision))
+
+    async def produce_metric(self, service, metric_name, metric_value, labels=None):
+        self.metric_events.append(
+            {
+                "service": service,
+                "metric_name": metric_name,
+                "metric_value": metric_value,
+                "labels": labels or {},
+            }
+        )
 
     async def shutdown(self):
         return None
@@ -729,6 +740,10 @@ class TestApiApp:
         assert response.status_code == 200
         assert len(producer.request_events) == 1
         assert producer.request_events[0].query == "hello"
+        assert [event["metric_name"] for event in producer.metric_events] == [
+            "requests_total",
+            "request_duration_seconds",
+        ]
 
     def test_metrics_endpoint_returns_503_when_monitoring_disabled(
         self, tmp_path, patched_platform_deps
@@ -817,6 +832,42 @@ class TestApiApp:
         assert (
             body["sources"]["routing_policy_state"] == "monitoring_service+clickhouse"
         )
+
+    def test_dashboard_endpoint_supports_pipeline_get_analytics_fallback(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(tmp_path)
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+
+        class AnalyticsOnlyPipeline:
+            async def get_analytics(self, user_id=None, hours=24):
+                return {
+                    "total_queries": 4,
+                    "total_tokens": 80,
+                    "total_cost": 0.4,
+                    "avg_latency": 120.0,
+                    "success_rate": 75.0,
+                    "model_breakdown": {"gpt-5": {"queries": 4, "cost": 0.4}},
+                    "query_type_breakdown": {"analysis": 4},
+                }
+
+            async def get_model_performance(self, hours=24):
+                return []
+
+            async def get_routing_policy_state_events(self, hours=24):
+                return []
+
+        platform.services["pipeline"] = AnalyticsOnlyPipeline()
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.get("/dashboard", params={"hours": 6})
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["sources"]["overview"] == "clickhouse"
+        assert body["overview"]["total_requests"] == 4
+        assert body["analytics"]["query_type_breakdown"]["analysis"] == 4
 
     def test_dashboard_logs_endpoint_reads_structured_logs(
         self, tmp_path, patched_platform_deps

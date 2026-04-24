@@ -352,14 +352,51 @@ class PipelineMetrics:
             "llm_router_kafka_producer_errors_total", "Kafka producer errors"
         )
 
+        self.producer_ack_latency = Histogram(
+            "llm_router_kafka_producer_ack_latency_seconds",
+            "Kafka producer send-to-ack latency",
+            ["topic"],
+            buckets=[
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                1.0,
+                2.5,
+                5.0,
+                float("inf"),
+            ],
+        )
+
         self.consumer_errors = Counter(
             "llm_router_kafka_consumer_errors_total", "Kafka consumer errors"
+        )
+
+        self.consumer_restarts = Counter(
+            "llm_router_kafka_consumer_restarts_total",
+            "Kafka consumer task restarts",
+            ["topic"],
+        )
+
+        self.dead_letter_messages = Counter(
+            "llm_router_kafka_dead_letter_messages_total",
+            "Kafka messages published to dead-letter topics",
+            ["topic"],
         )
 
         self.consumer_lag = Gauge(
             "llm_router_kafka_consumer_lag",
             "Kafka consumer lag",
             ["topic", "partition"],
+        )
+
+        self.last_consumed_timestamp = Gauge(
+            "llm_router_kafka_last_consumed_timestamp_seconds",
+            "Unix timestamp of the latest successfully consumed Kafka message",
+            ["topic"],
         )
 
         # ClickHouse metrics
