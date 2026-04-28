@@ -416,6 +416,59 @@ class SlackRateLimitingConfig(ConfigModel):
     burst_requests: int = Field(5, ge=1)
 
 
+class SlackMemorySearchConfig(ConfigModel):
+    max_results: int = Field(5, ge=1)
+    max_context_chars: int = Field(2000, ge=1)
+    max_item_chars: int = Field(500, ge=1)
+    keyword_weight: float = Field(0.45, ge=0.0)
+    vector_weight: float = Field(0.45, ge=0.0)
+    recency_weight: float = Field(0.05, ge=0.0)
+    importance_weight: float = Field(0.05, ge=0.0)
+
+
+class SlackMemoryEmbeddingConfig(ConfigModel):
+    provider: str = "none"
+    model: str = "text-embedding-3-small"
+    dimensions: int = Field(1536, ge=1)
+    timeout: int = Field(10, ge=1)
+    api_key: Optional[str] = None
+    api_key_env: Optional[str] = "OPENAI_API_KEY"
+    base_url: Optional[str] = None
+    url: Optional[str] = None
+
+
+class SlackMemoryRedisConfig(ConfigModel):
+    host: str = "localhost"
+    port: int = Field(6379, ge=1, le=65535)
+    db: int = Field(3, ge=0)
+    url: Optional[str] = None
+    password_env: Optional[str] = None
+    key_prefix: str = "slack_memory"
+    dedicated_service_recommended: bool = True
+
+
+class SlackMemoryConfig(ConfigModel):
+    enabled: bool = False
+    backend: str = "memory"
+    key_prefix: str = "slack_memory"
+    max_items_per_user: int = Field(500, ge=1)
+    ttl_days: Optional[int] = Field(None, ge=1)
+    retention_days: Optional[int] = Field(None, ge=1)
+    search: SlackMemorySearchConfig = Field(default_factory=SlackMemorySearchConfig)
+    embedding: SlackMemoryEmbeddingConfig = Field(
+        default_factory=SlackMemoryEmbeddingConfig
+    )
+    redis: SlackMemoryRedisConfig = Field(default_factory=SlackMemoryRedisConfig)
+
+    @field_validator("backend")
+    @classmethod
+    def validate_backend(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"memory", "redis_stack"}:
+            raise ValueError("memory backend must be one of: memory, redis_stack")
+        return normalized
+
+
 class SlackConfig(ConfigModel):
     enabled: bool = False
     bot_token: Optional[str] = None
@@ -435,6 +488,7 @@ class SlackConfig(ConfigModel):
     state_file: str = "data/slack_state.json"
     state_key_prefix: str = "slack_state"
     redis: Dict[str, Any] = Field(default_factory=dict)
+    memory: SlackMemoryConfig = Field(default_factory=SlackMemoryConfig)
 
     @field_validator("state_backend")
     @classmethod

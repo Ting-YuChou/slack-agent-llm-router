@@ -401,6 +401,33 @@ class TestBatchProcessor:
         assert response_b.response_text == "second"
 
 
+class TestResponseCache:
+    def test_cache_key_ignores_memory_analytics_metadata(self, sample_query_request):
+        cache = ResponseCache({"enabled": True})
+        base_request = sample_query_request.model_copy(
+            update={
+                "metadata": {
+                    "source": "slack",
+                    "memory_hit_count": 1,
+                    "memory_match_sources": ["hybrid"],
+                }
+            }
+        )
+        equivalent_request = sample_query_request.model_copy(
+            update={
+                "metadata": {
+                    "source": "slack",
+                    "memory_hit_count": 2,
+                    "memory_match_sources": ["keyword"],
+                }
+            }
+        )
+
+        assert cache.generate_cache_key(base_request, "gpt-5") == cache.generate_cache_key(
+            equivalent_request, "gpt-5"
+        )
+
+
 class TestInferenceEngine:
     @pytest.mark.asyncio
     async def test_initialize_skips_vllm_when_endpoint_not_configured(self):

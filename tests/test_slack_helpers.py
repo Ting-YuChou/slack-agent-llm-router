@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from src.memory import HashEmbeddingProvider, InMemoryMemoryStore, MemoryManager
 from slack.bot_real import (
     ConversationContext,
     ConversationManager,
@@ -247,6 +248,143 @@ class TestSlackMessageHandler:
         response = await handler._handle_query("hello", "u1", "c1", None, client=None)
 
         assert response == "safe error"
+
+    @pytest.mark.asyncio
+    async def test_memory_commands_save_list_and_forget_user_memory(self):
+        memory_manager = MemoryManager(
+            {
+                "enabled": True,
+                "search": {"max_results": 5},
+                "embedding": {"provider": "hash", "dimensions": 16},
+            },
+            store=InMemoryMemoryStore(),
+            embedding_provider=HashEmbeddingProvider(dimensions=16),
+        )
+        await memory_manager.initialize()
+        bot = SimpleNamespace(
+            memory_manager=memory_manager,
+            _memory_scope=SlackBot._memory_scope,
+            _build_memory_metadata=SlackBot._build_memory_metadata,
+        )
+        bot._memory_scope = bot._memory_scope.__get__(bot, SimpleNamespace)
+        bot._build_memory_metadata = bot._build_memory_metadata.__get__(
+            bot, SimpleNamespace
+        )
+        handler = SlackMessageHandler(bot)
+
+        saved = await handler._handle_command(
+            "remember prefer concise answers",
+            "u1",
+            "c1",
+            "t1",
+            client=None,
+            team_id="T1",
+        )
+        listed = await handler._handle_command(
+            "memories concise",
+            "u1",
+            "c1",
+            "t1",
+            client=None,
+            team_id="T1",
+        )
+        memory_id = listed.split("`")[1]
+        deleted = await handler._handle_command(
+            f"forget {memory_id}",
+            "u1",
+            "c1",
+            "t1",
+            client=None,
+            team_id="T1",
+        )
+
+        assert "Saved memory" in saved
+        assert "prefer concise answers" in listed
+        assert "Forgot memory" in deleted
+
+    @pytest.mark.asyncio
+    async def test_handle_query_injects_memory_only_when_hits_exist(
+        self, inference_response_factory
+    ):
+        memory_manager = MemoryManager(
+            {
+                "enabled": True,
+                "search": {"max_results": 5},
+                "embedding": {"provider": "hash", "dimensions": 16},
+            },
+            store=InMemoryMemoryStore(),
+            embedding_provider=HashEmbeddingProvider(dimensions=16),
+        )
+        await memory_manager.initialize()
+        await memory_manager.remember(
+            "T1:u1",
+            "Prefer Python examples for API explanations",
+            metadata={"source": "slack"},
+        )
+        inference_engine = SimpleNamespace(
+            process_query=AsyncMock(
+                return_value=inference_response_factory(
+                    response_text="hello from model"
+                )
+            )
+        )
+        bot = SimpleNamespace(
+            user_manager=UserManager(),
+            conversation_manager=ConversationManager({}),
+            inference_engine=inference_engine,
+            memory_manager=memory_manager,
+            _memory_scope=SlackBot._memory_scope,
+            _build_query_metadata=SlackBot._build_query_metadata,
+            _conversation_context_key=SlackBot._conversation_context_key,
+            _build_response_style_instructions=SlackBot._build_response_style_instructions,
+            _build_user_safe_error_message=lambda: "safe error",
+        )
+        for method_name in (
+            "_memory_scope",
+            "_build_query_metadata",
+            "_conversation_context_key",
+            "_build_response_style_instructions",
+        ):
+            setattr(
+                bot,
+                method_name,
+                getattr(bot, method_name).__get__(bot, SimpleNamespace),
+            )
+        handler = SlackMessageHandler(bot)
+
+        await handler._handle_query(
+            "explain Python API",
+            "u1",
+            "c1",
+            None,
+            client=None,
+            team_id="T1",
+        )
+        hit_request = inference_engine.process_query.await_args.args[0]
+
+        inference_engine.process_query.reset_mock()
+        await handler._handle_query(
+            "totally unrelated topic",
+            "u1",
+            "c1",
+            None,
+            client=None,
+            team_id="T1",
+        )
+        miss_request = inference_engine.process_query.await_args.args[0]
+
+        assert "Long-term user memory:" in hit_request.context
+        assert "Prefer Python examples" in hit_request.context
+        assert "memory_hit_count" not in hit_request.metadata
+        assert "Long-term user memory:" not in miss_request.context
+        assert "user: explain Python API" in miss_request.context
+
+    def test_extract_team_id_and_memory_scope(self):
+        bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
+
+        assert bot._extract_team_id({"team_id": "T1"}) == "T1"
+        assert bot._extract_team_id({"authorizations": [{"team_id": "T2"}]}) == "T2"
+        assert bot._memory_scope("T1", "U1") == "T1:U1"
 
 
 class TestSlackBot:

@@ -214,6 +214,33 @@ slack:
     port: 6379
     db: 2
     password_env: REDIS_PASSWORD
+  memory:
+    enabled: false
+    backend: redis_stack
+    key_prefix: slack_memory
+    max_items_per_user: 500
+    retention_days: 365
+    search:
+      max_results: 5
+      max_context_chars: 2000
+      max_item_chars: 500
+      keyword_weight: 0.45
+      vector_weight: 0.45
+      recency_weight: 0.05
+      importance_weight: 0.05
+    embedding:
+      provider: openai
+      model: text-embedding-3-small
+      dimensions: 1536
+      timeout: 10
+      api_key_env: OPENAI_API_KEY
+    redis:
+      host: redis-stack
+      port: 6379
+      db: 0
+      key_prefix: slack_memory
+      password_env: REDIS_PASSWORD
+      dedicated_service_recommended: true
 
 streamlit:
   enabled: false

@@ -20,6 +20,7 @@ from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
 import httpx
 
+from src.memory import MemoryManager, build_memory_scope
 from src.utils.schema import Attachment, AttachmentType, QueryRequest, UserTier
 from src.utils.metrics import SLACK_METRICS
 
@@ -698,6 +699,9 @@ class SlackMessageHandler:
             "models": self._handle_models_command,
             "analytics": self._handle_analytics_command,
             "clear": self._handle_clear_command,
+            "remember": self._handle_remember_command,
+            "memories": self._handle_memories_command,
+            "forget": self._handle_forget_command,
         }
 
     def extract_prefixed_command_text(self, text: str) -> Optional[str]:
@@ -726,6 +730,7 @@ class SlackMessageHandler:
         user_id = event.get("user")
         channel_id = event.get("channel")
         thread_ts = event.get("thread_ts") or event.get("ts")
+        team_id = self.bot._extract_team_id(event)
         attachments = list(event.get("_query_attachments", []) or [])
 
         # Check if it's a command
@@ -741,6 +746,7 @@ class SlackMessageHandler:
                 thread_ts,
                 client,
                 attachments=attachments,
+                team_id=team_id,
             )
 
         if not text and attachments:
@@ -754,6 +760,7 @@ class SlackMessageHandler:
             thread_ts,
             client,
             attachments=attachments,
+            team_id=team_id,
         )
 
     async def _handle_command_or_query(
@@ -764,6 +771,7 @@ class SlackMessageHandler:
         thread_ts: Optional[str],
         client: AsyncWebClient,
         attachments: Optional[List[Attachment]] = None,
+        team_id: Optional[str] = None,
     ) -> str:
         """Handle inline `/llm` / `!llm` payloads as commands or free-form queries."""
         return await self._handle_command(
@@ -773,6 +781,7 @@ class SlackMessageHandler:
             thread_ts,
             client,
             attachments=attachments or [],
+            team_id=team_id,
         )
 
     async def _handle_command(
@@ -783,6 +792,7 @@ class SlackMessageHandler:
         thread_ts: Optional[str],
         client: AsyncWebClient,
         attachments: Optional[List[Attachment]] = None,
+        team_id: Optional[str] = None,
     ) -> str:
         """Handle bot commands, falling back to a free-form query when appropriate."""
         parts = command_text.split()
@@ -793,6 +803,15 @@ class SlackMessageHandler:
         args = parts[1:] if len(parts) > 1 else []
 
         if command in self.commands:
+            if command in {"remember", "memories", "forget"}:
+                return await self.commands[command](
+                    args,
+                    user_id,
+                    channel_id,
+                    client,
+                    team_id=team_id,
+                    thread_ts=thread_ts,
+                )
             return await self.commands[command](args, user_id, channel_id, client)
         return await self._handle_query(
             command_text,
@@ -801,6 +820,7 @@ class SlackMessageHandler:
             thread_ts,
             client,
             attachments=attachments,
+            team_id=team_id,
         )
 
     async def _handle_help_command(
@@ -820,6 +840,9 @@ Mention me in a channel, use `/llm ...`, or reply inside an active bot thread.
 • `/llm models` - List available models and their capabilities
 • `/llm analytics` - Show usage analytics (premium users)
 • `/llm clear` - Clear conversation history
+• `/llm remember <text>` - Save an explicit long-term memory
+• `/llm memories [query]` - List or search your memories
+• `/llm forget <memory_id|all>` - Delete saved memories
 
 *Examples:*
 • "Write a Python function to calculate fibonacci numbers"
@@ -1058,6 +1081,111 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             await delete_conversations(cleared_keys)
         return "🧹 Conversation history cleared for this channel."
 
+    async def _handle_remember_command(
+        self,
+        args: List[str],
+        user_id: str,
+        channel_id: str,
+        client: AsyncWebClient,
+        team_id: Optional[str] = None,
+        thread_ts: Optional[str] = None,
+    ) -> str:
+        """Store an explicit long-term memory for this Slack user."""
+        memory_manager = getattr(self.bot, "memory_manager", None)
+        if not memory_manager or not getattr(memory_manager, "enabled", False):
+            return "Memory is not enabled for this Slack bot."
+
+        text = " ".join(args).strip()
+        if not text:
+            return "Usage: `/llm remember <something useful to remember>`"
+
+        scope = self.bot._memory_scope(team_id, user_id)
+        metadata = self.bot._build_memory_metadata(
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+        )
+        try:
+            item = await memory_manager.remember(scope, text, metadata=metadata)
+        except ValueError as exc:
+            return f"Could not save memory: {exc}"
+        except Exception:
+            logger.exception("Failed to save Slack memory")
+            return "Could not save memory right now."
+
+        if item is None:
+            return "Could not save an empty memory."
+        return f"Saved memory `{item.memory_id}`."
+
+    async def _handle_memories_command(
+        self,
+        args: List[str],
+        user_id: str,
+        channel_id: str,
+        client: AsyncWebClient,
+        team_id: Optional[str] = None,
+        thread_ts: Optional[str] = None,
+    ) -> str:
+        """List or search this Slack user's long-term memories."""
+        memory_manager = getattr(self.bot, "memory_manager", None)
+        if not memory_manager or not getattr(memory_manager, "enabled", False):
+            return "Memory is not enabled for this Slack bot."
+
+        scope = self.bot._memory_scope(team_id, user_id)
+        query = " ".join(args).strip()
+        try:
+            if query:
+                results = await memory_manager.search(scope, query, metadata={"source": "slack"})
+                items = [result.item for result in results]
+            else:
+                items = await memory_manager.list_memories(scope, limit=10)
+        except Exception:
+            logger.exception("Failed to read Slack memories")
+            return "Could not read memories right now."
+
+        if not items:
+            return "No memories found."
+
+        lines = ["Your memories:"]
+        for item in items[:10]:
+            preview = " ".join(item.text.split())
+            if len(preview) > 120:
+                preview = preview[:120].rstrip() + "..."
+            lines.append(f"- `{item.memory_id}` {preview}")
+        return "\n".join(lines)
+
+    async def _handle_forget_command(
+        self,
+        args: List[str],
+        user_id: str,
+        channel_id: str,
+        client: AsyncWebClient,
+        team_id: Optional[str] = None,
+        thread_ts: Optional[str] = None,
+    ) -> str:
+        """Delete one or all long-term memories for this Slack user."""
+        memory_manager = getattr(self.bot, "memory_manager", None)
+        if not memory_manager or not getattr(memory_manager, "enabled", False):
+            return "Memory is not enabled for this Slack bot."
+
+        if not args:
+            return "Usage: `/llm forget <memory_id>` or `/llm forget all`"
+
+        scope = self.bot._memory_scope(team_id, user_id)
+        target = " ".join(args).strip()
+        try:
+            if target.lower() == "all":
+                deleted_count = await memory_manager.forget_all(scope)
+                return f"Forgot {deleted_count} memories."
+
+            deleted = await memory_manager.forget(scope, target)
+        except Exception:
+            logger.exception("Failed to delete Slack memory")
+            return "Could not delete memory right now."
+
+        if not deleted:
+            return f"No memory found for `{target}`."
+        return f"Forgot memory `{target}`."
+
     async def _handle_query(
         self,
         text: str,
@@ -1066,6 +1194,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         thread_ts: str,
         client: AsyncWebClient,
         attachments: Optional[List[Attachment]] = None,
+        team_id: Optional[str] = None,
     ) -> str:
         """Handle regular query through inference engine"""
         try:
@@ -1086,6 +1215,23 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                     user_id, channel_id, thread_ts
                 )
             )
+            request_context = conversation_context
+            memory_manager = getattr(self.bot, "memory_manager", None)
+            if memory_manager and getattr(memory_manager, "enabled", False):
+                scope = self.bot._memory_scope(team_id, user_id)
+                try:
+                    memory_results = await memory_manager.search(
+                        scope,
+                        text,
+                        metadata={"source": "slack"},
+                    )
+                    request_context = memory_manager.build_context(
+                        memory_results,
+                        conversation_context,
+                    )
+                except Exception:
+                    logger.exception("Failed to search Slack memory")
+                    request_context = conversation_context
 
             # Create query request
             conversation_id_builder = getattr(
@@ -1104,7 +1250,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 query=text,
                 user_id=user_id,
                 user_tier=user_tier,
-                context=conversation_context,
+                context=request_context,
                 max_tokens=self._get_max_tokens_for_user(user_tier, user_prefs),
                 temperature=0.7,
                 priority=1 if user_tier != UserTier.FREE else 3,
@@ -1117,6 +1263,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                         thread_ts=thread_ts,
                         attachments=attachments or [],
                         user_preferences=user_prefs,
+                        team_id=team_id,
                     )
                     if hasattr(self.bot, "_build_query_metadata")
                     else {}
@@ -1222,6 +1369,7 @@ class SlackBot:
             tier_overrides=tier_overrides,
         )
         self.conversation_manager = ConversationManager(config)
+        self.memory_manager = MemoryManager(config.get("memory", {}))
         self.message_handler = SlackMessageHandler(self)
 
         # Slack clients
@@ -1283,6 +1431,8 @@ class SlackBot:
             )
             await self.state_store.initialize()
             await self._restore_state()
+            await self.memory_manager.initialize()
+            self._warn_if_memory_uses_shared_redis()
             await self._resolve_allowed_channels()
             self.initialized = True
 
@@ -1328,6 +1478,9 @@ class SlackBot:
 
             if req.type == "events_api":
                 event = req.payload.get("event", {})
+                team_id = self._extract_team_id(req.payload)
+                if team_id and "_team_id" not in event:
+                    event["_team_id"] = team_id
                 self._spawn_background_task(
                     self._handle_event(event),
                     f"slack_event:{event.get('type', 'unknown')}",
@@ -1393,6 +1546,7 @@ class SlackBot:
         command_text = command.get("text", "")
         user_id = command.get("user_id")
         channel_id = command.get("channel_id")
+        team_id = self._extract_team_id(command)
 
         if not await self._is_channel_allowed(channel_id, command.get("channel_name")):
             await self._post_command_response(
@@ -1427,6 +1581,7 @@ class SlackBot:
             channel_id,
             None,
             self.web_client,
+            team_id=team_id,
         )
 
         await self._post_command_response(channel_id, user_id, response_text)
@@ -1787,6 +1942,7 @@ class SlackBot:
         if not self._uses_granular_redis_state():
             await self._persist_state()
         await self.state_store.shutdown()
+        await self.memory_manager.shutdown()
 
         logger.info("Slack bot shutdown complete")
 
@@ -2099,6 +2255,7 @@ class SlackBot:
         thread_ts: Optional[str],
         attachments: List[Attachment],
         user_preferences: Optional[Dict[str, Any]] = None,
+        team_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Attach Slack-specific metadata to routed queries."""
         user_preferences = user_preferences or {}
@@ -2112,9 +2269,11 @@ class SlackBot:
         )
         return {
             "source": "slack",
+            "workspace_id": team_id or "default",
             "preferred_models": preferred_models,
             "response_style_instructions": response_style_instructions,
             "slack": {
+                "team_id": team_id,
                 "channel_id": channel_id,
                 "thread_ts": thread_ts,
                 "attachment_count": len(attachments),
@@ -2159,6 +2318,66 @@ class SlackBot:
     def _build_user_safe_error_message(self) -> str:
         """Return a generic Slack-safe error message without leaking internals."""
         return "❌ Sorry, I couldn't process that request right now. Please try again in a moment."
+
+    def _extract_team_id(self, payload: Dict[str, Any]) -> Optional[str]:
+        """Extract Slack team/workspace id from event or command payloads."""
+        if not payload:
+            return None
+        for key in ("team_id", "team"):
+            value = payload.get(key)
+            if value:
+                return str(value)
+
+        authorizations = payload.get("authorizations") or []
+        if authorizations and isinstance(authorizations[0], dict):
+            value = authorizations[0].get("team_id")
+            if value:
+                return str(value)
+
+        event_context = payload.get("event_context")
+        if isinstance(event_context, str) and event_context:
+            parts = event_context.split("-")
+            if len(parts) > 1 and parts[1].startswith("T"):
+                return parts[1]
+        return None
+
+    def _memory_scope(self, team_id: Optional[str], user_id: str) -> str:
+        """Build the per-workspace/per-user long-term memory scope."""
+        return build_memory_scope(team_id, user_id)
+
+    def _build_memory_metadata(
+        self,
+        channel_id: Optional[str],
+        thread_ts: Optional[str],
+    ) -> Dict[str, Any]:
+        """Build stable metadata stored with explicit Slack memories."""
+        metadata = {"source": "slack"}
+        if channel_id:
+            metadata["channel_id"] = channel_id
+        if thread_ts:
+            metadata["thread_ts"] = thread_ts
+        return metadata
+
+    def _warn_if_memory_uses_shared_redis(self):
+        """Warn when Redis Stack memory is likely sharing the response cache DB."""
+        memory_config = self.config.get("memory", {}) or {}
+        if not memory_config.get("enabled"):
+            return
+        if str(memory_config.get("backend", "")).lower() != "redis_stack":
+            return
+
+        memory_redis = dict(memory_config.get("redis", {}) or {})
+        if memory_redis.get("url"):
+            return
+        db = int(memory_redis.get("db", 3))
+        host = memory_redis.get("host", "localhost")
+        if db == 0:
+            logger.warning(
+                "Slack memory Redis is configured for DB 0 on %s. "
+                "Use a dedicated Redis Stack service or at least a separate DB/prefix "
+                "to avoid evicting response cache entries.",
+                host,
+            )
 
     def _conversation_context_key(
         self, user_id: str, channel_id: str, thread_ts: Optional[str]

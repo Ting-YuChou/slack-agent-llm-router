@@ -89,6 +89,11 @@ def test_platform_config_rejects_unknown_slack_state_backend():
         PlatformConfig(slack={"state_backend": "sqlite"})
 
 
+def test_platform_config_rejects_unknown_slack_memory_backend():
+    with pytest.raises(ValidationError):
+        PlatformConfig(slack={"memory": {"backend": "sqlite"}})
+
+
 def test_platform_config_defaults_file_state_path():
     config = PlatformConfig(slack={"state_backend": "file"})
 
@@ -107,6 +112,23 @@ def test_platform_config_accepts_redis_slack_state_backend():
     assert config.slack.state_backend == "redis"
     assert config.slack.state_key_prefix == "slack_state_test"
     assert config.slack.redis["db"] == 5
+
+
+def test_platform_config_accepts_slack_memory_config():
+    config = PlatformConfig(
+        slack={
+            "memory": {
+                "enabled": True,
+                "backend": "redis_stack",
+                "redis": {"host": "redis-stack", "db": 3},
+                "embedding": {"provider": "openai", "dimensions": 1536},
+            }
+        }
+    )
+
+    assert config.slack.memory.enabled is True
+    assert config.slack.memory.backend == "redis_stack"
+    assert config.slack.memory.redis.db == 3
 
 
 def test_checked_in_compose_config_validates():

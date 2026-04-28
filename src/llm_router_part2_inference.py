@@ -295,6 +295,13 @@ class ContextCompressor:
 class ResponseCache:
     """Intelligent response caching system"""
 
+    ANALYTICS_METADATA_KEYS = {
+        "memory_hit_count",
+        "memory_hit_ids",
+        "memory_match_sources",
+        "memory_search_debug",
+    }
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.enabled = config.get("enabled", True)
@@ -392,7 +399,7 @@ class ResponseCache:
             "priority": request.priority,
             "session_id": request.session_id,
             "conversation_id": request.conversation_id,
-            "metadata": request.metadata,
+            "metadata": self._cacheable_metadata(request.metadata or {}),
             "attachments": attachment_signatures,
         }
         if self.scope != "shared":
@@ -400,6 +407,14 @@ class ResponseCache:
         return hashlib.sha256(
             json.dumps(key_payload, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
+
+    def _cacheable_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Drop analytics-only fields that should not fragment response cache keys."""
+        return {
+            key: value
+            for key, value in metadata.items()
+            if key not in self.ANALYTICS_METADATA_KEYS
+        }
 
 
 class BaseInferenceProvider(ABC):

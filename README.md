@@ -84,6 +84,39 @@ Persisted Slack state includes:
 - conversation history
 - active bot thread tracking
 
+Slack per-user memory:
+
+- disabled by default; enable with `slack.memory.enabled: true`
+- stores only explicit `/llm remember <text>` entries in the first version
+- retrieves memories with hybrid keyword + Redis Stack vector search before a Slack query
+- scopes memory by `team_id:user_id` when Slack provides the workspace ID
+- falls back to keyword-only search if embedding generation fails
+
+Memory commands:
+
+- `/llm remember <text>` saves a long-term memory for the current Slack user
+- `/llm memories [query]` lists or searches the user's saved memories
+- `/llm forget <memory_id>` deletes one memory
+- `/llm forget all` deletes all memories for the current user
+
+Memory storage should not share the response-cache Redis DB. The default runtime
+separates Redis usage as response cache DB 0, policy cache DB 1, Slack state DB 2,
+and memory DB 3. For production, prefer a dedicated Redis Stack service/instance
+for `slack.memory.redis` so vector/hash memory data cannot evict response cache
+entries through Redis `maxmemory` policy.
+
+Redis Stack smoke test:
+
+```bash
+make smoke-redis-stack-memory
+```
+
+This starts the dedicated `redis-stack` Docker service, creates a RediSearch vector
+index through the real `RedisStackMemoryStore`, writes explicit memories, performs
+hybrid retrieval, verifies deterministic context formatting, and deletes the smoke
+test data/index. The service maps to host port `6380` so it does not collide with
+the regular response-cache Redis on `6379`.
+
 ## Quick Start
 
 ### Prerequisites
