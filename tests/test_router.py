@@ -76,6 +76,28 @@ class TestModelRouter:
         assert decision.query_type == QueryType.CODE_GENERATION
         assert "Rule-based selection" in decision.routing_reason
 
+    @pytest.mark.asyncio
+    async def test_build_query_context_counts_context_tokens(self, router_config):
+        router = ModelRouter(router_config)
+        router.classifier.classify_query = lambda _query: (QueryType.ANALYSIS, 0.95)
+        counted_prompts = []
+
+        def count_tokens(prompt, _model="default"):
+            counted_prompts.append(prompt)
+            return len(prompt.split())
+
+        router.token_counter.count_tokens = count_tokens
+        request = QueryRequest(
+            query="Analyze",
+            user_id="u1",
+            context="one two three four five",
+        )
+
+        context = await router._build_query_context(request)
+
+        assert context["token_count"] > len(request.query.split())
+        assert "Context: one two three four five" in counted_prompts[0]
+
     def test_capability_access_and_stats(self, router_config):
         router = ModelRouter(router_config)
         model = router.models["mistral-7b"]

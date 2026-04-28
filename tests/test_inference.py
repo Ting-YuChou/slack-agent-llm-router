@@ -45,6 +45,7 @@ class TestOpenAIProvider:
             mock_response.usage.input_tokens = 12
             mock_response.usage.output_tokens = 18
             mock_response.usage.total_tokens = 30
+            mock_response.usage.prompt_tokens_details.cached_tokens = 4
 
             mock_client = AsyncMock()
             mock_client.responses.create.return_value = mock_response
@@ -58,8 +59,45 @@ class TestOpenAIProvider:
             assert response.response_text == "Use a simple helper."
             assert response.provider == "openai"
             assert response.total_tokens == 30
+            assert response.provider_cached_input_tokens == 4
             assert response.tokens_per_second > 0
             assert response.cached is False
+
+    @pytest.mark.asyncio
+    async def test_generate_response_sends_openai_prompt_cache_hints(
+        self, sample_query_request
+    ):
+        with patch("src.llm_router_part2_inference.openai.AsyncOpenAI") as mock_openai:
+            mock_response = MagicMock()
+            mock_response.output_text = "Cached prefix answer"
+            mock_response.usage.input_tokens = 1200
+            mock_response.usage.output_tokens = 20
+            mock_response.usage.total_tokens = 1220
+            mock_response.usage.prompt_tokens_details.cached_tokens = 1024
+
+            mock_client = AsyncMock()
+            mock_client.responses.create.return_value = mock_response
+            mock_openai.return_value = mock_client
+
+            provider = OpenAIProvider(
+                {
+                    "api_key": "test-key",
+                    "prompt_cache": {
+                        "enabled": True,
+                        "key_strategy": "conversation",
+                        "retention": "24h",
+                    },
+                }
+            )
+            await provider.initialize()
+
+            response = await provider.generate_response(sample_query_request, "gpt-5")
+
+            kwargs = mock_client.responses.create.await_args.kwargs
+            assert "prompt_cache_key" in kwargs
+            assert kwargs["prompt_cache_retention"] == "24h"
+            assert "user" not in kwargs
+            assert response.provider_cached_input_tokens == 1024
 
     @pytest.mark.asyncio
     async def test_generate_response_includes_attachment_text_in_prompt(
@@ -161,6 +199,48 @@ class TestAnthropicProvider:
             assert response.total_tokens == 30
             assert response.tokens_per_second > 0
 
+    @pytest.mark.asyncio
+    async def test_generate_response_uses_anthropic_cache_control(
+        self, sample_query_request
+    ):
+        with patch(
+            "src.llm_router_part2_inference.anthropic.AsyncAnthropic"
+        ) as mock_anthropic:
+            mock_response = MagicMock()
+            mock_response.content = [MagicMock(text="Anthropic cached answer")]
+            mock_response.usage.input_tokens = 9
+            mock_response.usage.output_tokens = 21
+            mock_response.usage.cache_creation_input_tokens = 5
+            mock_response.usage.cache_read_input_tokens = 7
+
+            mock_client = AsyncMock()
+            mock_client.messages.create.return_value = mock_response
+            mock_anthropic.return_value = mock_client
+
+            provider = AnthropicProvider(
+                {
+                    "api_key": "test-key",
+                    "prompt_cache": {
+                        "enabled": True,
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                }
+            )
+            await provider.initialize()
+
+            response = await provider.generate_response(
+                sample_query_request, "claude-sonnet-4-6"
+            )
+
+            messages = mock_client.messages.create.await_args.kwargs["messages"]
+            content = messages[0]["content"]
+            assert content[0]["cache_control"] == {"type": "ephemeral"}
+            assert "Previous discussion context" in content[0]["text"]
+            assert content[1]["text"].startswith("Query:")
+            assert response.token_count_input == 21
+            assert response.provider_cache_creation_input_tokens == 5
+            assert response.provider_cache_read_input_tokens == 7
+
 
 class TestVLLMProvider:
     def test_uses_explicit_base_url_when_configured(self):
@@ -196,6 +276,15 @@ class TestResponseCache:
         key_b = cache.generate_cache_key(request_b, "gpt-5")
 
         assert key_a != key_b
+
+    def test_generate_cache_key_can_use_shared_scope(self):
+        cache = ResponseCache({"enabled": True, "scope": "shared"})
+        request_a = QueryRequest(query="hello", user_id="u1", user_tier=UserTier.FREE)
+        request_b = QueryRequest(query="hello", user_id="u2", user_tier=UserTier.FREE)
+
+        assert cache.generate_cache_key(request_a, "gpt-5") == cache.generate_cache_key(
+            request_b, "gpt-5"
+        )
 
     @pytest.mark.asyncio
     async def test_initialize_uses_configured_redis_connection(self):
@@ -430,6 +519,84 @@ class TestInferenceEngine:
         assert response.cached is True
         assert response.response_text == "from cache"
         engine.cache.cache_response.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_process_query_checks_cache_after_context_compression(
+        self,
+        inference_config,
+        sample_query_request,
+    ):
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="gpt-5")
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+
+        engine = InferenceEngine(inference_config, router)
+        engine.context_compressor.compress_context = AsyncMock(return_value="short ctx")
+        seen_contexts = []
+        engine.cache.generate_cache_key = MagicMock(
+            side_effect=lambda request, _model: seen_contexts.append(request.context)
+            or "compressed-key"
+        )
+        engine.cache.get_cached_response = AsyncMock(
+            return_value={
+                "response_text": "from compressed cache",
+                "model_name": "gpt-5",
+                "provider": "openai",
+                "token_count_input": 3,
+                "token_count_output": 7,
+                "total_tokens": 10,
+                "latency_ms": 5,
+                "tokens_per_second": 200.0,
+                "cost_usd": 0.0,
+                "cached": False,
+            }
+        )
+
+        request = sample_query_request.model_copy(update={"context": "x" * 32})
+        response = await engine.process_query(request)
+
+        assert response.cached is True
+        assert seen_contexts == ["short ctx"]
+
+    @pytest.mark.asyncio
+    async def test_stream_query_serves_cached_response(
+        self,
+        inference_config,
+        sample_query_request,
+    ):
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="gpt-5")
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+
+        engine = InferenceEngine(
+            {**inference_config, "stream_cache_chunk_chars": 4},
+            router,
+        )
+        provider = AsyncMock()
+        engine.providers = {"openai": provider}
+        engine.cache.get_cached_response = AsyncMock(
+            return_value={
+                "response_text": "from cache",
+                "model_name": "gpt-5",
+                "provider": "openai",
+                "token_count_input": 3,
+                "token_count_output": 7,
+                "total_tokens": 10,
+                "latency_ms": 5,
+                "tokens_per_second": 200.0,
+                "cost_usd": 0.0,
+                "cached": False,
+            }
+        )
+
+        chunks = [chunk async for chunk in engine.stream_query(sample_query_request)]
+
+        assert "".join(chunks) == "from cache"
+        provider.stream_response.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_process_query_publishes_error_completion_event_when_provider_missing(
