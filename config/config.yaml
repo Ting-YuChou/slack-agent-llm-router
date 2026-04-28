@@ -114,10 +114,23 @@ inference:
     base_url: https://api.openai.com/v1
     timeout: 60
     max_retries: 3
+    prompt_cache:
+      enabled: true
+      key_strategy: conversation
+      retention: in-memory
+      pricing:
+        cached_input_multiplier: 0.5
   anthropic:
     base_url: https://api.anthropic.com
     timeout: 60
     max_retries: 3
+    prompt_cache:
+      enabled: true
+      cache_control:
+        type: ephemeral
+      pricing:
+        cache_creation_input_multiplier: 1.25
+        cache_read_input_multiplier: 0.1
   compression:
     enabled: true
     max_context_tokens: 100000

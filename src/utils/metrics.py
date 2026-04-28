@@ -290,6 +290,18 @@ class InferenceMetrics:
 
         self.cache_size = Gauge("llm_router_cache_size_bytes", "Cache size in bytes")
 
+        self.provider_cache_tokens = Counter(
+            "llm_router_provider_cache_tokens_total",
+            "Provider-side prompt cache tokens",
+            ["model", "provider", "cache_type"],  # cached, read, creation
+        )
+
+        self.provider_cache_requests = Counter(
+            "llm_router_provider_cache_requests_total",
+            "Provider-side prompt cache request outcomes",
+            ["model", "provider", "outcome"],  # hit, write, miss
+        )
+
         # Context compression metrics
         self.context_compressions = Counter(
             "llm_router_context_compressions_total",

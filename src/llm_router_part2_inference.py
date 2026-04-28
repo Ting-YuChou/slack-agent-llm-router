@@ -35,6 +35,41 @@ from src.utils.schema import (
 logger = logging.getLogger(__name__)
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    """Coerce SDK usage values without treating mocks or missing fields as tokens."""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return max(int(value), 0)
+    if isinstance(value, str):
+        try:
+            return max(int(float(value)), 0)
+        except ValueError:
+            return default
+    return default
+
+
+def _usage_value(usage: Any, field_name: str, default: int = 0) -> int:
+    """Read a usage field from either SDK objects or dictionaries."""
+    if isinstance(usage, dict):
+        return _safe_int(usage.get(field_name), default)
+    return _safe_int(getattr(usage, field_name, None), default)
+
+
+def _nested_usage_value(
+    usage: Any, parent_name: str, field_name: str, default: int = 0
+) -> int:
+    """Read nested provider usage fields like prompt_tokens_details.cached_tokens."""
+    parent = (
+        usage.get(parent_name)
+        if isinstance(usage, dict)
+        else getattr(usage, parent_name, None)
+    )
+    if isinstance(parent, dict):
+        return _safe_int(parent.get(field_name), default)
+    return _safe_int(getattr(parent, field_name, None), default)
+
+
 @dataclass
 class InferenceContext:
     """Context information for inference requests"""
@@ -267,6 +302,7 @@ class ResponseCache:
         self.ttl = config.get("ttl", 3600)  # 1 hour
         self.max_size = config.get("max_size", "1GB")
         self.redis_config = dict(config.get("redis", {}))
+        self.scope = str(config.get("scope", "user")).lower()
         self.redis_client = None
 
     async def initialize(self):
@@ -346,8 +382,8 @@ class ResponseCache:
             )
 
         key_payload = {
+            "cache_scope": self.scope,
             "model_name": model_name,
-            "user_id": request.user_id,
             "user_tier": request.user_tier.value,
             "query": request.query,
             "context": request.context,
@@ -359,6 +395,8 @@ class ResponseCache:
             "metadata": request.metadata,
             "attachments": attachment_signatures,
         }
+        if self.scope != "shared":
+            key_payload["user_id"] = request.user_id
         return hashlib.sha256(
             json.dumps(key_payload, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
@@ -410,6 +448,12 @@ class BaseInferenceProvider(ABC):
 
     def _build_prompt(self, request: QueryRequest) -> str:
         """Build a provider prompt that includes context plus extracted attachment content."""
+        cacheable_sections, query_section = self._build_prompt_sections(request)
+        prompt_sections = [*cacheable_sections, query_section]
+        return "\n\n".join(section for section in prompt_sections if section)
+
+    def _build_prompt_sections(self, request: QueryRequest) -> Tuple[List[str], str]:
+        """Split prompt into a stable prefix and a volatile user query section."""
         prompt_sections = []
 
         response_style_instructions = (request.metadata or {}).get(
@@ -420,14 +464,24 @@ class BaseInferenceProvider(ABC):
                 f"Response style instructions:\n{response_style_instructions}"
             )
 
-        prompt = request.query
         attachment_prompt = self._build_attachment_prompt(request)
         if attachment_prompt:
-            prompt = f"{prompt}\n\n{attachment_prompt}"
+            prompt_sections.append(attachment_prompt)
         if request.context:
             prompt_sections.append(f"Context: {request.context}")
-        prompt_sections.append(f"Query: {prompt}")
-        return "\n\n".join(prompt_sections)
+        return prompt_sections, f"Query: {request.query}"
+
+    def _prompt_cache_config(self) -> Dict[str, Any]:
+        """Return provider prompt-cache config without assuming it exists."""
+        return dict(self.config.get("prompt_cache", {}) or {})
+
+    def _prompt_cache_enabled(self) -> bool:
+        """Return whether provider-side prompt cache hints should be sent."""
+        return bool(self._prompt_cache_config().get("enabled", False))
+
+    def _prompt_cache_pricing(self) -> Dict[str, float]:
+        """Return pricing multipliers for provider-side prompt cache accounting."""
+        return dict(self._prompt_cache_config().get("pricing", {}) or {})
 
     def _build_attachment_prompt(self, request: QueryRequest) -> str:
         """Render attachment metadata and extracted text into the provider prompt."""
@@ -535,27 +589,34 @@ class OpenAIProvider(BaseInferenceProvider):
 
         try:
             prompt = self._build_prompt(request)
-            response = await self.client.responses.create(
-                model=model_name,
-                input=prompt,
-                instructions=None,
-                max_output_tokens=request.max_tokens,
-                temperature=request.temperature,
-                user=request.user_id,
+            request_kwargs = self._build_response_request_kwargs(
+                request,
+                model_name,
+                prompt,
             )
+            response = await self.client.responses.create(**request_kwargs)
 
             usage = response.usage
             generated_text = response.output_text
+            cached_tokens = _nested_usage_value(
+                usage, "prompt_tokens_details", "cached_tokens"
+            )
+            input_tokens = _usage_value(usage, "input_tokens")
+            output_tokens = _usage_value(usage, "output_tokens")
+            total_tokens = _usage_value(
+                usage, "total_tokens", input_tokens + output_tokens
+            )
 
             return InferenceResponse(
                 response_text=generated_text,
                 model_name=model_name,
-                token_count_input=usage.input_tokens,
-                token_count_output=usage.output_tokens,
-                total_tokens=usage.total_tokens,
+                token_count_input=input_tokens,
+                token_count_output=output_tokens,
+                total_tokens=total_tokens,
+                provider_cached_input_tokens=cached_tokens,
                 latency_ms=int((time.time() - start_time) * 1000),
                 tokens_per_second=(
-                    usage.output_tokens / max(time.time() - start_time, 1e-6)
+                    output_tokens / max(time.time() - start_time, 1e-6)
                 ),
                 cost_usd=self._calculate_cost(usage, model_name),
                 provider="openai",
@@ -572,14 +633,12 @@ class OpenAIProvider(BaseInferenceProvider):
         """Stream response using OpenAI API"""
         try:
             prompt = self._build_prompt(request)
-            async with self.client.responses.stream(
-                model=model_name,
-                input=prompt,
-                instructions=None,
-                max_output_tokens=request.max_tokens,
-                temperature=request.temperature,
-                user=request.user_id,
-            ) as stream:
+            request_kwargs = self._build_response_request_kwargs(
+                request,
+                model_name,
+                prompt,
+            )
+            async with self.client.responses.stream(**request_kwargs) as stream:
                 async for event in stream:
                     if event.type == "response.output_text.delta":
                         yield event.delta
@@ -587,6 +646,63 @@ class OpenAIProvider(BaseInferenceProvider):
         except Exception as e:
             logger.error(f"OpenAI streaming error: {e}")
             yield f"Error: {str(e)}"
+
+    def _build_response_request_kwargs(
+        self, request: QueryRequest, model_name: str, prompt: str
+    ) -> Dict[str, Any]:
+        """Build OpenAI Responses API kwargs, including optional prompt-cache hints."""
+        request_kwargs: Dict[str, Any] = {
+            "model": model_name,
+            "input": prompt,
+            "instructions": None,
+            "max_output_tokens": request.max_tokens,
+            "temperature": request.temperature,
+        }
+
+        prompt_cache_key = self._build_prompt_cache_key(request)
+        if prompt_cache_key:
+            request_kwargs["prompt_cache_key"] = prompt_cache_key
+            retention = self._prompt_cache_config().get("retention")
+            if retention:
+                request_kwargs["prompt_cache_retention"] = retention
+        else:
+            request_kwargs["user"] = request.user_id
+
+        return request_kwargs
+
+    def _build_prompt_cache_key(self, request: QueryRequest) -> Optional[str]:
+        """Build a stable, non-PII key that helps OpenAI route similar prompts."""
+        config = self._prompt_cache_config()
+        if not bool(config.get("enabled", False)):
+            return None
+
+        strategy = str(config.get("key_strategy", "conversation")).lower()
+        if strategy == "none":
+            return None
+
+        namespace = str(config.get("namespace", "llm-router"))
+        parts = [namespace, strategy]
+        if strategy == "shared":
+            parts.append(str((request.metadata or {}).get("workspace_id", "shared")))
+        elif strategy == "session":
+            parts.extend(
+                [
+                    request.user_id,
+                    request.session_id or request.conversation_id or "default",
+                ]
+            )
+        elif strategy == "user":
+            parts.append(request.user_id)
+        else:
+            parts.extend(
+                [
+                    request.user_id,
+                    request.conversation_id or request.session_id or "default",
+                ]
+            )
+
+        digest = hashlib.sha256(":".join(parts).encode("utf-8")).hexdigest()
+        return f"{namespace}-{strategy}-{digest[:40]}"
 
     def _calculate_cost(self, usage, model_name: str) -> float:
         """Calculate cost based on usage"""
@@ -600,8 +716,22 @@ class OpenAIProvider(BaseInferenceProvider):
             model_name, {"input": 0.001 / 1000, "output": 0.002 / 1000}
         )
 
-        input_cost = usage.input_tokens * model_pricing["input"]
-        output_cost = usage.output_tokens * model_pricing["output"]
+        input_tokens = _usage_value(usage, "input_tokens")
+        output_tokens = _usage_value(usage, "output_tokens")
+        cached_tokens = min(
+            _nested_usage_value(usage, "prompt_tokens_details", "cached_tokens"),
+            input_tokens,
+        )
+        uncached_tokens = max(input_tokens - cached_tokens, 0)
+        cached_multiplier = float(
+            self._prompt_cache_pricing().get("cached_input_multiplier", 0.5)
+        )
+
+        input_cost = (
+            uncached_tokens * model_pricing["input"]
+            + cached_tokens * model_pricing["input"] * cached_multiplier
+        )
+        output_cost = output_tokens * model_pricing["output"]
 
         return input_cost + output_cost
 
@@ -636,30 +766,43 @@ class AnthropicProvider(BaseInferenceProvider):
         start_time = time.time()
 
         try:
-            prompt = self._build_prompt(request)
+            messages = self._build_messages(request)
 
             # Make API call
             response = await self.client.messages.create(
                 model=model_name,
                 max_tokens=request.max_tokens,
                 temperature=request.temperature,
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
             )
 
             # Extract response data
             generated_text = response.content[0].text
+            usage = response.usage
+            uncached_input_tokens = _usage_value(usage, "input_tokens")
+            cache_creation_tokens = _usage_value(
+                usage, "cache_creation_input_tokens"
+            )
+            cache_read_tokens = _usage_value(usage, "cache_read_input_tokens")
+            total_input_tokens = (
+                uncached_input_tokens + cache_creation_tokens + cache_read_tokens
+            )
+            output_tokens = _usage_value(usage, "output_tokens")
 
             return InferenceResponse(
                 response_text=generated_text,
                 model_name=model_name,
-                token_count_input=response.usage.input_tokens,
-                token_count_output=response.usage.output_tokens,
-                total_tokens=response.usage.input_tokens + response.usage.output_tokens,
+                token_count_input=total_input_tokens,
+                token_count_output=output_tokens,
+                total_tokens=total_input_tokens + output_tokens,
+                provider_cached_input_tokens=cache_read_tokens,
+                provider_cache_creation_input_tokens=cache_creation_tokens,
+                provider_cache_read_input_tokens=cache_read_tokens,
                 latency_ms=int((time.time() - start_time) * 1000),
                 tokens_per_second=(
-                    response.usage.output_tokens / max(time.time() - start_time, 1e-6)
+                    output_tokens / max(time.time() - start_time, 1e-6)
                 ),
-                cost_usd=self._calculate_cost(response.usage, model_name),
+                cost_usd=self._calculate_cost(usage, model_name),
                 provider="anthropic",
                 cached=False,
             )
@@ -673,13 +816,13 @@ class AnthropicProvider(BaseInferenceProvider):
     ) -> AsyncIterator[str]:
         """Stream response using Anthropic API"""
         try:
-            prompt = self._build_prompt(request)
+            messages = self._build_messages(request)
 
             async with self.client.messages.stream(
                 model=model_name,
                 max_tokens=request.max_tokens,
                 temperature=request.temperature,
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
             ) as stream:
                 async for text in stream.text_stream:
                     yield text
@@ -687,6 +830,28 @@ class AnthropicProvider(BaseInferenceProvider):
         except Exception as e:
             logger.error(f"Anthropic streaming error: {e}")
             yield f"Error: {str(e)}"
+
+    def _build_messages(self, request: QueryRequest) -> List[Dict[str, Any]]:
+        """Build Anthropic messages with an optional cache breakpoint."""
+        cacheable_sections, query_section = self._build_prompt_sections(request)
+        if not self._prompt_cache_enabled() or not cacheable_sections:
+            return [{"role": "user", "content": self._build_prompt(request)}]
+
+        cache_control = dict(
+            self._prompt_cache_config().get(
+                "cache_control",
+                {"type": "ephemeral"},
+            )
+        )
+        content = [
+            {
+                "type": "text",
+                "text": "\n\n".join(cacheable_sections),
+                "cache_control": cache_control,
+            },
+            {"type": "text", "text": query_section},
+        ]
+        return [{"role": "user", "content": content}]
 
     def _calculate_cost(self, usage, model_name: str) -> float:
         """Calculate cost based on usage"""
@@ -700,8 +865,26 @@ class AnthropicProvider(BaseInferenceProvider):
             model_name, {"input": 0.003 / 1000, "output": 0.015 / 1000}
         )
 
-        input_cost = usage.input_tokens * model_pricing["input"]
-        output_cost = usage.output_tokens * model_pricing["output"]
+        uncached_input_tokens = _usage_value(usage, "input_tokens")
+        cache_creation_tokens = _usage_value(usage, "cache_creation_input_tokens")
+        cache_read_tokens = _usage_value(usage, "cache_read_input_tokens")
+        output_tokens = _usage_value(usage, "output_tokens")
+        pricing_config = self._prompt_cache_pricing()
+        cache_creation_multiplier = float(
+            pricing_config.get("cache_creation_input_multiplier", 1.25)
+        )
+        cache_read_multiplier = float(
+            pricing_config.get("cache_read_input_multiplier", 0.1)
+        )
+
+        input_cost = (
+            uncached_input_tokens * model_pricing["input"]
+            + cache_creation_tokens
+            * model_pricing["input"]
+            * cache_creation_multiplier
+            + cache_read_tokens * model_pricing["input"] * cache_read_multiplier
+        )
+        output_cost = output_tokens * model_pricing["output"]
 
         return input_cost + output_cost
 
@@ -1093,6 +1276,37 @@ class InferenceEngine:
         """Return whether the inference engine is ready to process requests."""
         return self._initialized and bool(self.providers)
 
+    async def _compress_request_context_if_needed(self, request: QueryRequest) -> bool:
+        """Canonicalize long context before cache keys are generated."""
+        if not (
+            request.context
+            and len(request.context) > self.context_compressor.max_context_tokens
+        ):
+            return False
+
+        original_length = len(request.context)
+        target_length = int(original_length * self.context_compressor.compression_ratio)
+        request.context = await self.context_compressor.compress_context(
+            request.context,
+            target_length,
+        )
+        logger.info(
+            f"Compressed context from {original_length} to {len(request.context)} chars"
+        )
+        return True
+
+    async def _get_cached_inference_response(
+        self, request: QueryRequest, model_name: str
+    ) -> Optional[InferenceResponse]:
+        """Return an app-cache hit for a model, clearly separated from provider cache."""
+        cache_key = self.cache.generate_cache_key(request, model_name)
+        cached_response = await self.cache.get_cached_response(cache_key)
+        if not cached_response:
+            return None
+
+        cached_response["cached"] = True
+        return InferenceResponse(**cached_response)
+
     async def process_query(self, request: QueryRequest) -> InferenceResponse:
         """Process query through the complete inference pipeline"""
         start_time = time.time()
@@ -1107,38 +1321,19 @@ class InferenceEngine:
             routing_decision = await self.router.route_query(request)
             model_name = routing_decision.selected_model
 
-            # Step 2: Check cache
-            cache_key = self.cache.generate_cache_key(request, model_name)
-            cached_response = await self.cache.get_cached_response(cache_key)
+            # Step 2: Context compression before cache lookup keeps keys stable.
+            compressed_context = await self._compress_request_context_if_needed(request)
 
-            if cached_response:
+            # Step 3: Check full-response cache.
+            response = await self._get_cached_inference_response(request, model_name)
+            if response:
                 logger.info(f"Cache hit for request {request_id}")
-                cached_response["cached"] = True
-                response = InferenceResponse(**cached_response)
                 await self._publish_analytics_events(
                     request,
                     response,
                     routing_decision=routing_decision,
                 )
                 return response
-
-            # Step 3: Context compression if needed
-            compressed_context = False
-            if (
-                request.context
-                and len(request.context) > self.context_compressor.max_context_tokens
-            ):
-                original_length = len(request.context)
-                target_length = int(
-                    original_length * self.context_compressor.compression_ratio
-                )
-                request.context = await self.context_compressor.compress_context(
-                    request.context, target_length
-                )
-                compressed_context = True
-                logger.info(
-                    f"Compressed context from {original_length} to {len(request.context)} chars"
-                )
 
             # Step 4: Generate response, falling back to local models for cloud outages
             (
@@ -1162,6 +1357,7 @@ class InferenceEngine:
             # Step 7: Update metrics and stats
             inference_time = time.time() - start_time
             await self._update_stats(model_name, response, inference_time)
+            self._record_provider_cache_metrics(model_name, response)
 
             # Step 8: Update router stats
             self.router.update_model_stats(
@@ -1236,6 +1432,21 @@ class InferenceEngine:
             # Route query
             routing_decision = await self.router.route_query(request)
             model_name = routing_decision.selected_model
+            await self._compress_request_context_if_needed(request)
+
+            cached_response = await self._get_cached_inference_response(
+                request,
+                model_name,
+            )
+            if cached_response:
+                await self._publish_analytics_events(
+                    request,
+                    cached_response,
+                    routing_decision=routing_decision,
+                )
+                async for chunk in self._stream_cached_response(cached_response):
+                    yield chunk
+                return
 
             # Get provider
             provider = self._get_provider_for_model(model_name)
@@ -1250,6 +1461,15 @@ class InferenceEngine:
         except Exception:
             logger.exception("Streaming failed")
             yield "Error: Request processing failed"
+
+    async def _stream_cached_response(
+        self, response: InferenceResponse
+    ) -> AsyncIterator[str]:
+        """Yield cached full responses in deterministic chunks for streaming clients."""
+        chunk_size = int(self.config.get("stream_cache_chunk_chars", 512) or 512)
+        chunk_size = max(chunk_size, 1)
+        for index in range(0, len(response.response_text), chunk_size):
+            yield response.response_text[index : index + chunk_size]
 
     def _get_provider_for_model(
         self, model_name: str
@@ -1295,15 +1515,11 @@ class InferenceEngine:
             last_exception = exc
             for fallback_model in fallback_models:
                 fallback_started_at = time.time()
-                fallback_cache_key = self.cache.generate_cache_key(
-                    request, fallback_model
+                response = await self._get_cached_inference_response(
+                    request,
+                    fallback_model,
                 )
-                cached_response = await self.cache.get_cached_response(
-                    fallback_cache_key
-                )
-                if cached_response:
-                    cached_response["cached"] = True
-                    response = InferenceResponse(**cached_response)
+                if response:
                     return (
                         response,
                         fallback_model,
@@ -1556,6 +1772,48 @@ class InferenceEngine:
 
         if response.error:
             stats["error_count"] += 1
+
+    def _record_provider_cache_metrics(
+        self, model_name: str, response: InferenceResponse
+    ):
+        """Record provider-side prompt cache usage separately from Redis hits."""
+        if response.cached or response.provider == "error":
+            return
+
+        cached_tokens = int(response.provider_cached_input_tokens or 0)
+        read_tokens = int(response.provider_cache_read_input_tokens or 0)
+        creation_tokens = int(response.provider_cache_creation_input_tokens or 0)
+
+        if cached_tokens and cached_tokens != read_tokens:
+            INFERENCE_METRICS.provider_cache_tokens.labels(
+                model=model_name,
+                provider=response.provider,
+                cache_type="cached",
+            ).inc(cached_tokens)
+        if read_tokens:
+            INFERENCE_METRICS.provider_cache_tokens.labels(
+                model=model_name,
+                provider=response.provider,
+                cache_type="read",
+            ).inc(read_tokens)
+        if creation_tokens:
+            INFERENCE_METRICS.provider_cache_tokens.labels(
+                model=model_name,
+                provider=response.provider,
+                cache_type="creation",
+            ).inc(creation_tokens)
+
+        if read_tokens or cached_tokens:
+            outcome = "hit"
+        elif creation_tokens:
+            outcome = "write"
+        else:
+            outcome = "miss"
+        INFERENCE_METRICS.provider_cache_requests.labels(
+            model=model_name,
+            provider=response.provider,
+            outcome=outcome,
+        ).inc()
 
     def get_health_status(self) -> Dict[str, Any]:
         """Get overall health status"""

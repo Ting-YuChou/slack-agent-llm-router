@@ -313,6 +313,19 @@ class TokenCounter:
 class ModelRouter:
     """Main router class for intelligent model selection"""
 
+    ATTACHMENT_PROMPT_CHAR_LIMIT = 12_000
+    ATTACHMENT_PREVIEW_CHAR_LIMIT = 4_000
+    TEXT_MIME_MARKERS = (
+        "text/",
+        "json",
+        "csv",
+        "xml",
+        "yaml",
+        "yml",
+        "markdown",
+        "javascript",
+    )
+
     def __init__(self, config: Dict[str, Any], policy_cache: Optional[Any] = None):
         self.config = config
         self.policy_cache = policy_cache
@@ -474,8 +487,8 @@ class ModelRouter:
             request.query
         )
 
-        # Count tokens
-        token_count = self.token_counter.count_tokens(request.query)
+        # Count the approximate provider prompt, not just the user query.
+        token_count = self._estimate_request_token_count(request)
 
         # Build context
         context = {
@@ -501,6 +514,94 @@ class ModelRouter:
             context["query_complexity"] = policy_context["query_complexity"]
 
         return context
+
+    def _estimate_request_token_count(self, request: QueryRequest) -> int:
+        """Approximate the prompt shape used by inference providers for routing."""
+        prompt_parts = []
+        response_style_instructions = (request.metadata or {}).get(
+            "response_style_instructions"
+        )
+        if response_style_instructions:
+            prompt_parts.append(
+                f"Response style instructions:\n{response_style_instructions}"
+            )
+
+        attachment_prompt = self._estimate_attachment_prompt(request)
+        if attachment_prompt:
+            prompt_parts.append(attachment_prompt)
+
+        if request.context:
+            prompt_parts.append(f"Context: {request.context}")
+        prompt_parts.append(f"Query: {request.query}")
+
+        return self.token_counter.count_tokens("\n\n".join(prompt_parts))
+
+    def _estimate_attachment_prompt(self, request: QueryRequest) -> str:
+        """Mirror inference attachment excerpts closely enough for routing decisions."""
+        if not request.attachments:
+            return ""
+
+        sections = [
+            "Use the following attachment data when it is relevant to the user's request:"
+        ]
+        remaining_chars = self.ATTACHMENT_PROMPT_CHAR_LIMIT
+        for index, attachment in enumerate(request.attachments, start=1):
+            sections.append(
+                f"[Attachment {index}] {attachment.name} "
+                f"({attachment.mime_type}, {attachment.size_bytes} bytes)"
+            )
+
+            if not self._is_text_attachment(attachment) or not attachment.content:
+                sections.append(
+                    "Binary attachment metadata only. No text could be extracted automatically."
+                )
+                continue
+
+            text = self._decode_attachment_text(attachment.content)
+            if not text:
+                continue
+
+            excerpt_limit = min(self.ATTACHMENT_PREVIEW_CHAR_LIMIT, remaining_chars)
+            if excerpt_limit <= 0:
+                sections.append(
+                    "Additional extracted text omitted because the prompt limit was reached."
+                )
+                break
+
+            excerpt = text[:excerpt_limit]
+            if len(text) > excerpt_limit:
+                excerpt = f"{excerpt}\n...[truncated]"
+            sections.append(f"Content excerpt:\n{excerpt}")
+            remaining_chars -= len(excerpt)
+
+        return "\n\n".join(sections)
+
+    def _is_text_attachment(self, attachment: Any) -> bool:
+        mime_type = (getattr(attachment, "mime_type", "") or "").lower()
+        attachment_type = getattr(attachment, "type", None)
+        attachment_type_value = getattr(attachment_type, "value", attachment_type)
+        if attachment_type_value != "document":
+            return False
+        return mime_type.startswith("text/") or any(
+            marker in mime_type for marker in self.TEXT_MIME_MARKERS
+        )
+
+    def _decode_attachment_text(self, content: bytes) -> Optional[str]:
+        for encoding in ("utf-8", "utf-8-sig", "latin-1"):
+            try:
+                decoded = content.decode(encoding).strip()
+            except UnicodeDecodeError:
+                continue
+            if not decoded:
+                return None
+            printable = sum(
+                1
+                for character in decoded
+                if character.isprintable() or character in "\n\r\t"
+            )
+            if printable / max(len(decoded), 1) >= 0.85:
+                return decoded
+        return None
 
     async def _get_policy_context(self, request: QueryRequest) -> Dict[str, Any]:
         """Load request/user-level routing hints from the shared policy cache."""

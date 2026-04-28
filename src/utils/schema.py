@@ -102,6 +102,9 @@ class InferenceResponse(BaseModel):
     token_count_input: int = Field(ge=0)
     token_count_output: int = Field(ge=0)
     total_tokens: int = Field(ge=0)
+    provider_cached_input_tokens: int = Field(default=0, ge=0)
+    provider_cache_creation_input_tokens: int = Field(default=0, ge=0)
+    provider_cache_read_input_tokens: int = Field(default=0, ge=0)
 
     # Performance metrics
     latency_ms: int = Field(ge=0)
