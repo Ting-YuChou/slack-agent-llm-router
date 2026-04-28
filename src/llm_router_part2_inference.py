@@ -615,9 +615,7 @@ class OpenAIProvider(BaseInferenceProvider):
                 total_tokens=total_tokens,
                 provider_cached_input_tokens=cached_tokens,
                 latency_ms=int((time.time() - start_time) * 1000),
-                tokens_per_second=(
-                    output_tokens / max(time.time() - start_time, 1e-6)
-                ),
+                tokens_per_second=(output_tokens / max(time.time() - start_time, 1e-6)),
                 cost_usd=self._calculate_cost(usage, model_name),
                 provider="openai",
                 cached=False,
@@ -780,9 +778,7 @@ class AnthropicProvider(BaseInferenceProvider):
             generated_text = response.content[0].text
             usage = response.usage
             uncached_input_tokens = _usage_value(usage, "input_tokens")
-            cache_creation_tokens = _usage_value(
-                usage, "cache_creation_input_tokens"
-            )
+            cache_creation_tokens = _usage_value(usage, "cache_creation_input_tokens")
             cache_read_tokens = _usage_value(usage, "cache_read_input_tokens")
             total_input_tokens = (
                 uncached_input_tokens + cache_creation_tokens + cache_read_tokens
@@ -799,9 +795,7 @@ class AnthropicProvider(BaseInferenceProvider):
                 provider_cache_creation_input_tokens=cache_creation_tokens,
                 provider_cache_read_input_tokens=cache_read_tokens,
                 latency_ms=int((time.time() - start_time) * 1000),
-                tokens_per_second=(
-                    output_tokens / max(time.time() - start_time, 1e-6)
-                ),
+                tokens_per_second=(output_tokens / max(time.time() - start_time, 1e-6)),
                 cost_usd=self._calculate_cost(usage, model_name),
                 provider="anthropic",
                 cached=False,
@@ -879,9 +873,7 @@ class AnthropicProvider(BaseInferenceProvider):
 
         input_cost = (
             uncached_input_tokens * model_pricing["input"]
-            + cache_creation_tokens
-            * model_pricing["input"]
-            * cache_creation_multiplier
+            + cache_creation_tokens * model_pricing["input"] * cache_creation_multiplier
             + cache_read_tokens * model_pricing["input"] * cache_read_multiplier
         )
         output_cost = output_tokens * model_pricing["output"]
