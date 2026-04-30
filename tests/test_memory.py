@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -8,6 +9,7 @@ from src.memory import (
     MemoryItem,
     MemoryManager,
     MemorySearchResult,
+    RedisStackMemoryStore,
     build_memory_scope,
     tokenize,
 )
@@ -108,6 +110,77 @@ async def test_embedding_failure_falls_back_to_keyword_only():
     assert item.embedding is None
     assert [result.item.memory_id for result in results] == [item.memory_id]
     assert results[0].match_source == "keyword"
+
+
+@pytest.mark.asyncio
+async def test_visibility_filter_allows_global_and_same_channel_only():
+    manager = MemoryManager(
+        {"enabled": True, "search": {"max_results": 5}},
+        store=InMemoryMemoryStore(),
+        embedding_provider=FailingEmbeddingProvider(),
+    )
+    await manager.initialize()
+    await manager.remember(
+        "T1:U1",
+        "Use Python examples in C1",
+        metadata={"source": "slack", "visibility": "channel", "channel_id": "C1"},
+    )
+    await manager.remember(
+        "T1:U1",
+        "Use concise answers everywhere",
+        metadata={"source": "slack", "visibility": "global"},
+    )
+
+    same_channel = await manager.search(
+        "T1:U1",
+        "Use Python concise examples",
+        {"source": "slack", "visibility_scope": "channel_or_global", "channel_id": "C1"},
+    )
+    other_channel = await manager.search(
+        "T1:U1",
+        "Use Python concise examples",
+        {"source": "slack", "visibility_scope": "channel_or_global", "channel_id": "C2"},
+    )
+
+    assert {result.item.text for result in same_channel} == {
+        "Use Python examples in C1",
+        "Use concise answers everywhere",
+    }
+    assert [result.item.text for result in other_channel] == [
+        "Use concise answers everywhere"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_redis_keyword_search_rescores_by_token_overlap():
+    store = RedisStackMemoryStore({"embedding": {"dimensions": 16}})
+    store.client = object()
+    weak = MemoryItem(
+        scope="T1:U1",
+        text="billing only",
+        keywords=["billing"],
+        memory_id="weak",
+    )
+    strong = MemoryItem(
+        scope="T1:U1",
+        text="billing clickhouse analytics",
+        keywords=["billing", "clickhouse", "analytics"],
+        memory_id="strong",
+    )
+    store._search = AsyncMock(
+        return_value=[
+            MemorySearchResult(item=weak, score=1.0, match_source="keyword"),
+            MemorySearchResult(item=strong, score=1.0, match_source="keyword"),
+        ]
+    )
+
+    results = await store.keyword_search(
+        "T1:U1", ["billing", "clickhouse", "analytics"], {}, limit=5
+    )
+
+    assert [result.item.memory_id for result in results] == ["strong", "weak"]
+    assert results[0].score == 1.0
+    assert results[1].score == pytest.approx(1 / 3)
 
 
 def test_context_format_is_deterministic_and_excludes_scores():

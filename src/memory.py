@@ -182,7 +182,9 @@ class MemoryStore(Protocol):
     async def get(self, scope: str, memory_id: str) -> Optional[MemoryItem]:
         """Fetch one memory item."""
 
-    async def list(self, scope: str, limit: int = 50) -> List[MemoryItem]:
+    async def list(
+        self, scope: str, limit: int = 50, filters: Optional[Dict[str, Any]] = None
+    ) -> List[MemoryItem]:
         """List memory items for one scope."""
 
     async def delete(self, scope: str, memory_id: str) -> bool:
@@ -289,11 +291,39 @@ def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
     return max(0.0, dot / (left_norm * right_norm))
 
 
+def _keyword_score(tokens: Sequence[str], item: MemoryItem) -> float:
+    token_set = set(tokens)
+    if not token_set:
+        return 0.0
+    overlap = token_set.intersection(item.keywords)
+    return len(overlap) / len(token_set)
+
+
 def _matches_filters(item: MemoryItem, filters: Dict[str, Any]) -> bool:
     now = datetime.now()
     if item.is_expired(now):
         return False
-    for key in ("channel_id", "thread_ts", "source"):
+
+    visibility = str(item.metadata.get("visibility") or "channel").lower()
+    visibility_scope = filters.get("visibility_scope")
+    if visibility_scope == "channel_or_global":
+        channel_id = filters.get("channel_id")
+        if visibility == "global":
+            pass
+        elif visibility == "channel" and channel_id:
+            if item.metadata.get("channel_id") != channel_id:
+                return False
+        else:
+            return False
+    elif filters.get("visibility"):
+        if visibility != str(filters["visibility"]).lower():
+            return False
+
+    exact_filter_keys = ("thread_ts", "source")
+    if visibility_scope != "channel_or_global":
+        exact_filter_keys = ("channel_id", "thread_ts", "source")
+
+    for key in exact_filter_keys:
         expected = filters.get(key)
         if expected and item.metadata.get(key) != expected:
             return False
@@ -328,9 +358,14 @@ class InMemoryMemoryStore:
             return None
         return item
 
-    async def list(self, scope: str, limit: int = 50) -> List[MemoryItem]:
+    async def list(
+        self, scope: str, limit: int = 50, filters: Optional[Dict[str, Any]] = None
+    ) -> List[MemoryItem]:
+        filters = filters or {}
         memories = [
-            item for item in self.items.get(scope, {}).values() if not item.is_expired()
+            item
+            for item in self.items.get(scope, {}).values()
+            if _matches_filters(item, filters)
         ]
         memories.sort(key=lambda item: (-item.importance, item.created_at, item.memory_id))
         return memories[:limit]
@@ -346,15 +381,13 @@ class InMemoryMemoryStore:
     async def keyword_search(
         self, scope: str, tokens: Sequence[str], filters: Dict[str, Any], limit: int
     ) -> List[MemorySearchResult]:
-        token_set = set(tokens)
         results = []
         for item in self.items.get(scope, {}).values():
             if not _matches_filters(item, filters):
                 continue
-            overlap = token_set.intersection(item.keywords)
-            if not overlap:
+            score = _keyword_score(tokens, item)
+            if score <= 0:
                 continue
-            score = len(overlap) / max(len(token_set), 1)
             results.append(MemorySearchResult(item=item, score=score, match_source="keyword"))
         results.sort(key=lambda result: (-result.score, -result.item.importance, result.item.created_at, result.item.memory_id))
         return results[:limit]
@@ -447,6 +480,8 @@ class RedisStackMemoryStore:
                 "TAG",
                 "source",
                 "TAG",
+                "visibility",
+                "TAG",
                 "created_at",
                 "NUMERIC",
                 "SORTABLE",
@@ -490,6 +525,7 @@ class RedisStackMemoryStore:
             "channel_id": item.metadata.get("channel_id", ""),
             "thread_ts": item.metadata.get("thread_ts", ""),
             "source": item.metadata.get("source", ""),
+            "visibility": item.metadata.get("visibility", "channel"),
             "created_at": _timestamp(item.created_at),
             "updated_at": _timestamp(item.updated_at),
             "expires_at": _timestamp(item.expires_at),
@@ -514,15 +550,18 @@ class RedisStackMemoryStore:
             return None
         return item
 
-    async def list(self, scope: str, limit: int = 50) -> List[MemoryItem]:
+    async def list(
+        self, scope: str, limit: int = 50, filters: Optional[Dict[str, Any]] = None
+    ) -> List[MemoryItem]:
         if not self.client:
             return []
+        filters = filters or {}
         memory_ids = await self.client.smembers(self._user_index_key(scope))
         items = []
         for raw_id in memory_ids:
             memory_id = self._decode(raw_id)
             item = await self.get(scope, memory_id)
-            if item:
+            if item and _matches_filters(item, filters):
                 items.append(item)
         items.sort(key=lambda item: (-item.importance, item.created_at, item.memory_id))
         return items[:limit]
@@ -553,7 +592,28 @@ class RedisStackMemoryStore:
         query = self._build_filter_query(scope, filters)
         token_query = "|".join(_escape_redis_tag(token) for token in tokens)
         query = f"{query} (@keywords:{{{token_query}}})"
-        return await self._search(query, limit=limit, source="keyword")
+        results = await self._search(query, limit=limit, source="keyword")
+        rescored = []
+        for result in results:
+            score = _keyword_score(tokens, result.item)
+            if score <= 0:
+                continue
+            rescored.append(
+                MemorySearchResult(
+                    item=result.item,
+                    score=score,
+                    match_source=result.match_source,
+                )
+            )
+        rescored.sort(
+            key=lambda result: (
+                -result.score,
+                -result.item.importance,
+                result.item.created_at,
+                result.item.memory_id,
+            )
+        )
+        return rescored[:limit]
 
     async def vector_search(
         self, scope: str, embedding: Sequence[float], filters: Dict[str, Any], limit: int
@@ -605,10 +665,31 @@ class RedisStackMemoryStore:
 
     def _build_filter_query(self, scope: str, filters: Dict[str, Any]) -> str:
         parts = [f"@scope:{{{_escape_redis_tag(scope)}}}"]
-        for key in ("channel_id", "thread_ts", "source"):
+        for key in ("thread_ts", "source"):
             value = filters.get(key)
             if value:
                 parts.append(f"@{key}:{{{_escape_redis_tag(str(value))}}}")
+        visibility_scope = filters.get("visibility_scope")
+        if visibility_scope == "channel_or_global":
+            channel_id = filters.get("channel_id")
+            if channel_id:
+                parts.append(
+                    "(@visibility:{global}|"
+                    f"(@visibility:{{channel}} @channel_id:{{{_escape_redis_tag(str(channel_id))}}}))"
+                )
+            else:
+                parts.append("@visibility:{global}")
+        elif filters.get("visibility"):
+            parts.append(
+                f"@visibility:{{{_escape_redis_tag(str(filters['visibility']))}}}"
+            )
+            channel_id = filters.get("channel_id")
+            if channel_id and str(filters["visibility"]).lower() == "channel":
+                parts.append(f"@channel_id:{{{_escape_redis_tag(str(channel_id))}}}")
+        else:
+            channel_id = filters.get("channel_id")
+            if channel_id:
+                parts.append(f"@channel_id:{{{_escape_redis_tag(str(channel_id))}}}")
         now_ts = int(time.time())
         parts.append(f"(@expires_at:[0 0]|@expires_at:[{now_ts} +inf])")
         return " ".join(parts)
@@ -746,7 +827,9 @@ class MemoryManager:
         if not normalized_text:
             return None
 
-        existing_count = len(await self.store.list(scope, limit=self.max_items_per_user + 1))
+        existing_count = len(
+            await self.store.list(scope, limit=self.max_items_per_user + 1)
+        )
         if existing_count >= self.max_items_per_user:
             raise ValueError("Memory limit reached for this user")
 
@@ -769,10 +852,16 @@ class MemoryManager:
         await self.store.add(item)
         return item
 
-    async def list_memories(self, scope: str, limit: int = 20) -> List[MemoryItem]:
+    async def list_memories(
+        self,
+        scope: str,
+        limit: int = 20,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[MemoryItem]:
         if not self.enabled:
             return []
-        return await self.store.list(scope, limit=limit)
+        filters = self._search_filters(metadata)
+        return await self.store.list(scope, limit=limit, filters=filters)
 
     async def forget(self, scope: str, memory_id: str) -> bool:
         if not self.enabled:
@@ -789,11 +878,7 @@ class MemoryManager:
     ) -> List[MemorySearchResult]:
         if not self.enabled:
             return []
-        filters = {
-            key: value
-            for key, value in (metadata or {}).items()
-            if key in {"channel_id", "thread_ts", "source"} and value
-        }
+        filters = self._search_filters(metadata)
         tokens = tokenize(query)
         candidate_limit = max(self.max_results * 3, self.max_results)
         keyword_results = await self.store.keyword_search(
@@ -876,6 +961,20 @@ class MemoryManager:
             )
         )
         return merged
+
+    def _search_filters(self, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        allowed_keys = {
+            "channel_id",
+            "thread_ts",
+            "source",
+            "visibility",
+            "visibility_scope",
+        }
+        return {
+            key: value
+            for key, value in (metadata or {}).items()
+            if key in allowed_keys and value
+        }
 
     async def _safe_embed(self, text: str) -> Optional[List[float]]:
         try:

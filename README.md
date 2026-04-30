@@ -116,12 +116,18 @@ Slack per-user memory:
 - stores only explicit `/llm remember <text>` entries in the first version
 - retrieves memories with hybrid keyword + Redis Stack vector search before a Slack query
 - scopes memory by `team_id:user_id` when Slack provides the workspace ID
+- stores memories as channel-scoped by default; use `--global` for cross-channel preferences
+- injects only global memories plus memories saved in the current channel
 - falls back to keyword-only search if embedding generation fails
+- memory management commands should be used as Slack slash commands so responses stay ephemeral
 
 Memory commands:
 
-- `/llm remember <text>` saves a long-term memory for the current Slack user
-- `/llm memories [query]` lists or searches the user's saved memories
+- `/llm remember <text>` saves a channel-scoped long-term memory for the current Slack user
+- `/llm remember --global <text>` saves a cross-channel user preference memory
+- `/llm memories [query]` lists or searches current-channel and global memories
+- `/llm memories --global [query]` lists or searches global memories only
+- `/llm memories --all [query]` lists or searches all memories for the current user
 - `/llm forget <memory_id>` deletes one memory
 - `/llm forget all` deletes all memories for the current user
 
@@ -129,7 +135,8 @@ Memory storage should not share the response-cache Redis DB. The default runtime
 separates Redis usage as response cache DB 0, policy cache DB 1, Slack state DB 2,
 and memory DB 3. For production, prefer a dedicated Redis Stack service/instance
 for `slack.memory.redis` so vector/hash memory data cannot evict response cache
-entries through Redis `maxmemory` policy.
+entries through Redis `maxmemory` policy. Host-run config uses `localhost:6380`
+for Redis Stack; compose config uses the internal `redis-stack:6379` service.
 
 Redis Stack smoke test:
 
