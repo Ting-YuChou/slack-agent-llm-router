@@ -83,7 +83,9 @@ async def test_hybrid_search_uses_vector_when_keywords_do_not_overlap():
     )
     await manager.store.add(item)
 
-    results = await manager.search("T1:U1", "concise deployment help", {"source": "slack"})
+    results = await manager.search(
+        "T1:U1", "concise deployment help", {"source": "slack"}
+    )
 
     assert results
     assert results[0].item.memory_id == item.memory_id
@@ -134,12 +136,20 @@ async def test_visibility_filter_allows_global_and_same_channel_only():
     same_channel = await manager.search(
         "T1:U1",
         "Use Python concise examples",
-        {"source": "slack", "visibility_scope": "channel_or_global", "channel_id": "C1"},
+        {
+            "source": "slack",
+            "visibility_scope": "channel_or_global",
+            "channel_id": "C1",
+        },
     )
     other_channel = await manager.search(
         "T1:U1",
         "Use Python concise examples",
-        {"source": "slack", "visibility_scope": "channel_or_global", "channel_id": "C2"},
+        {
+            "source": "slack",
+            "visibility_scope": "channel_or_global",
+            "channel_id": "C2",
+        },
     )
 
     assert {result.item.text for result in same_channel} == {

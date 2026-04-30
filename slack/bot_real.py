@@ -1225,9 +1225,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         )
         try:
             if query:
-                results = await memory_manager.search(
-                    scope, query, metadata=metadata
-                )
+                results = await memory_manager.search(scope, query, metadata=metadata)
                 items = [result.item for result in results]
             else:
                 items = await memory_manager.list_memories(

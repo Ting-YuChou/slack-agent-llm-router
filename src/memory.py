@@ -163,7 +163,9 @@ class LocalHttpEmbeddingProvider:
         if self.model:
             payload["model"] = self.model
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(str(self.url).rstrip("/") + "/embeddings", json=payload)
+            response = await client.post(
+                str(self.url).rstrip("/") + "/embeddings", json=payload
+            )
             response.raise_for_status()
             data = response.json()
         return list(data["data"][0]["embedding"])
@@ -199,7 +201,11 @@ class MemoryStore(Protocol):
         """Search by keywords and metadata."""
 
     async def vector_search(
-        self, scope: str, embedding: Sequence[float], filters: Dict[str, Any], limit: int
+        self,
+        scope: str,
+        embedding: Sequence[float],
+        filters: Dict[str, Any],
+        limit: int,
     ) -> List[MemorySearchResult]:
         """Search by vector similarity and metadata."""
 
@@ -214,7 +220,9 @@ def build_embedding_provider(config: Dict[str, Any]) -> EmbeddingProvider:
         return OpenAIEmbeddingProvider(config)
     if provider in {"local_http", "http"}:
         return LocalHttpEmbeddingProvider(config)
-    logger.warning("Unknown embedding provider '%s'; using keyword-only memory", provider)
+    logger.warning(
+        "Unknown embedding provider '%s'; using keyword-only memory", provider
+    )
     return NoOpEmbeddingProvider()
 
 
@@ -367,7 +375,9 @@ class InMemoryMemoryStore:
             for item in self.items.get(scope, {}).values()
             if _matches_filters(item, filters)
         ]
-        memories.sort(key=lambda item: (-item.importance, item.created_at, item.memory_id))
+        memories.sort(
+            key=lambda item: (-item.importance, item.created_at, item.memory_id)
+        )
         return memories[:limit]
 
     async def delete(self, scope: str, memory_id: str) -> bool:
@@ -388,12 +398,25 @@ class InMemoryMemoryStore:
             score = _keyword_score(tokens, item)
             if score <= 0:
                 continue
-            results.append(MemorySearchResult(item=item, score=score, match_source="keyword"))
-        results.sort(key=lambda result: (-result.score, -result.item.importance, result.item.created_at, result.item.memory_id))
+            results.append(
+                MemorySearchResult(item=item, score=score, match_source="keyword")
+            )
+        results.sort(
+            key=lambda result: (
+                -result.score,
+                -result.item.importance,
+                result.item.created_at,
+                result.item.memory_id,
+            )
+        )
         return results[:limit]
 
     async def vector_search(
-        self, scope: str, embedding: Sequence[float], filters: Dict[str, Any], limit: int
+        self,
+        scope: str,
+        embedding: Sequence[float],
+        filters: Dict[str, Any],
+        limit: int,
     ) -> List[MemorySearchResult]:
         results = []
         for item in self.items.get(scope, {}).values():
@@ -402,8 +425,17 @@ class InMemoryMemoryStore:
             score = _cosine_similarity(embedding, item.embedding)
             if score <= 0:
                 continue
-            results.append(MemorySearchResult(item=item, score=score, match_source="vector"))
-        results.sort(key=lambda result: (-result.score, -result.item.importance, result.item.created_at, result.item.memory_id))
+            results.append(
+                MemorySearchResult(item=item, score=score, match_source="vector")
+            )
+        results.sort(
+            key=lambda result: (
+                -result.score,
+                -result.item.importance,
+                result.item.created_at,
+                result.item.memory_id,
+            )
+        )
         return results[:limit]
 
 
@@ -431,7 +463,9 @@ class RedisStackMemoryStore:
         if password_env:
             password = os.getenv(str(password_env))
         if redis_url and hasattr(redis_asyncio.Redis, "from_url"):
-            self.client = redis_asyncio.Redis.from_url(redis_url, decode_responses=False)
+            self.client = redis_asyncio.Redis.from_url(
+                redis_url, decode_responses=False
+            )
         else:
             self.client = redis_asyncio.Redis(
                 host=self.redis_config.get("host", "localhost"),
@@ -616,7 +650,11 @@ class RedisStackMemoryStore:
         return rescored[:limit]
 
     async def vector_search(
-        self, scope: str, embedding: Sequence[float], filters: Dict[str, Any], limit: int
+        self,
+        scope: str,
+        embedding: Sequence[float],
+        filters: Dict[str, Any],
+        limit: int,
     ) -> List[MemorySearchResult]:
         if not self.client or not embedding:
             return []
@@ -694,7 +732,9 @@ class RedisStackMemoryStore:
         parts.append(f"(@expires_at:[0 0]|@expires_at:[{now_ts} +inf])")
         return " ".join(parts)
 
-    async def _search(self, query: str, limit: int, source: str) -> List[MemorySearchResult]:
+    async def _search(
+        self, query: str, limit: int, source: str
+    ) -> List[MemorySearchResult]:
         try:
             raw_results = await self.client.execute_command(
                 "FT.SEARCH",
@@ -721,7 +761,9 @@ class RedisStackMemoryStore:
             return []
         return self._parse_search_results(raw_results, source=source)
 
-    def _parse_search_results(self, raw_results: Any, source: str) -> List[MemorySearchResult]:
+    def _parse_search_results(
+        self, raw_results: Any, source: str
+    ) -> List[MemorySearchResult]:
         if not raw_results or len(raw_results) < 2:
             return []
         parsed = []
@@ -740,7 +782,9 @@ class RedisStackMemoryStore:
                     score = 0.0
             else:
                 score = 1.0
-            parsed.append(MemorySearchResult(item=item, score=score, match_source=source))
+            parsed.append(
+                MemorySearchResult(item=item, score=score, match_source=source)
+            )
         return parsed
 
     def _deserialize(self, payload: Dict[Any, Any]) -> MemoryItem:
@@ -761,12 +805,18 @@ class RedisStackMemoryStore:
             memory_id=self._decode(decoded.get("memory_id", "")),
             keywords=keywords,
             metadata=metadata,
-            created_at=_coerce_datetime(float(self._decode(decoded.get("created_at", "0"))))
+            created_at=_coerce_datetime(
+                float(self._decode(decoded.get("created_at", "0")))
+            )
             or datetime.now(),
-            updated_at=_coerce_datetime(float(self._decode(decoded.get("updated_at", "0"))))
+            updated_at=_coerce_datetime(
+                float(self._decode(decoded.get("updated_at", "0")))
+            )
             or datetime.now(),
             importance=float(self._decode(decoded.get("importance", "0.5"))),
-            expires_at=_coerce_datetime(float(self._decode(decoded.get("expires_at", "0"))))
+            expires_at=_coerce_datetime(
+                float(self._decode(decoded.get("expires_at", "0")))
+            )
             if float(self._decode(decoded.get("expires_at", "0"))) > 0
             else None,
             embedding=_bytes_to_vector(decoded.get("embedding")),
@@ -790,7 +840,9 @@ class MemoryManager:
         self.config = config or {}
         self.enabled = bool(self.config.get("enabled", False))
         self.max_items_per_user = int(self.config.get("max_items_per_user", 500))
-        self.retention_days = self.config.get("retention_days") or self.config.get("ttl_days")
+        self.retention_days = self.config.get("retention_days") or self.config.get(
+            "ttl_days"
+        )
         self.search_config = dict(self.config.get("search", {}) or {})
         self.max_results = int(self.search_config.get("max_results", 5))
         self.max_context_chars = int(self.search_config.get("max_context_chars", 2000))
@@ -798,7 +850,9 @@ class MemoryManager:
         self.keyword_weight = float(self.search_config.get("keyword_weight", 0.45))
         self.vector_weight = float(self.search_config.get("vector_weight", 0.45))
         self.recency_weight = float(self.search_config.get("recency_weight", 0.05))
-        self.importance_weight = float(self.search_config.get("importance_weight", 0.05))
+        self.importance_weight = float(
+            self.search_config.get("importance_weight", 0.05)
+        )
         self.store = store or build_memory_store(self.config)
         self.embedding_provider = embedding_provider or build_embedding_provider(
             dict(self.config.get("embedding", {}) or {})
@@ -950,7 +1004,9 @@ class MemoryManager:
                 + self.recency_weight * _recency_score(item, now)
                 + self.importance_weight * item.importance
             )
-            merged.append(MemorySearchResult(item=item, score=score, match_source=source))
+            merged.append(
+                MemorySearchResult(item=item, score=score, match_source=source)
+            )
 
         merged.sort(
             key=lambda result: (
@@ -983,5 +1039,7 @@ class MemoryManager:
                 timeout=float(self.config.get("embedding", {}).get("timeout", 10)),
             )
         except Exception as exc:
-            logger.info("Memory embedding unavailable; falling back to keyword-only: %s", exc)
+            logger.info(
+                "Memory embedding unavailable; falling back to keyword-only: %s", exc
+            )
             return None
