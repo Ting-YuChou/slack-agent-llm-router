@@ -30,7 +30,11 @@ from src.utils.schema import (
     QueryRequest,
     InferenceResponse,
     ModelConfig,
+    QueryType,
+    ToolCall,
+    ToolPolicy,
 )
+from src.tools import ToolRegistry, WebSearchTool, WebSearchResult
 
 logger = logging.getLogger(__name__)
 
@@ -295,6 +299,13 @@ class ContextCompressor:
 class ResponseCache:
     """Intelligent response caching system"""
 
+    ANALYTICS_METADATA_KEYS = {
+        "memory_hit_count",
+        "memory_hit_ids",
+        "memory_match_sources",
+        "memory_search_debug",
+    }
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.enabled = config.get("enabled", True)
@@ -390,9 +401,14 @@ class ResponseCache:
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
             "priority": request.priority,
+            "tool_policy": request.tool_policy.value,
+            "allowed_tools": request.allowed_tools,
+            "web_search_options": request.web_search_options.model_dump(mode="json")
+            if request.web_search_options
+            else None,
             "session_id": request.session_id,
             "conversation_id": request.conversation_id,
-            "metadata": request.metadata,
+            "metadata": self._cacheable_metadata(request.metadata or {}),
             "attachments": attachment_signatures,
         }
         if self.scope != "shared":
@@ -400,6 +416,14 @@ class ResponseCache:
         return hashlib.sha256(
             json.dumps(key_payload, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
+
+    def _cacheable_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Drop analytics-only fields that should not fragment response cache keys."""
+        return {
+            key: value
+            for key, value in metadata.items()
+            if key not in self.ANALYTICS_METADATA_KEYS
+        }
 
 
 class BaseInferenceProvider(ABC):
@@ -469,6 +493,9 @@ class BaseInferenceProvider(ABC):
             prompt_sections.append(attachment_prompt)
         if request.context:
             prompt_sections.append(f"Context: {request.context}")
+        web_search_context = (request.metadata or {}).get("web_search_context")
+        if web_search_context:
+            prompt_sections.append(str(web_search_context))
         return prompt_sections, f"Query: {request.query}"
 
     def _prompt_cache_config(self) -> Dict[str, Any]:
@@ -654,19 +681,27 @@ class OpenAIProvider(BaseInferenceProvider):
             "input": prompt,
             "instructions": None,
             "max_output_tokens": request.max_tokens,
-            "temperature": request.temperature,
         }
+        if self._supports_reasoning_effort(model_name):
+            request_kwargs["reasoning"] = {"effort": "minimal"}
+        if self._supports_temperature(model_name):
+            request_kwargs["temperature"] = request.temperature
 
         prompt_cache_key = self._build_prompt_cache_key(request)
         if prompt_cache_key:
             request_kwargs["prompt_cache_key"] = prompt_cache_key
-            retention = self._prompt_cache_config().get("retention")
-            if retention:
-                request_kwargs["prompt_cache_retention"] = retention
         else:
             request_kwargs["user"] = request.user_id
 
         return request_kwargs
+
+    def _supports_temperature(self, model_name: str) -> bool:
+        """Some reasoning models only support their default sampling settings."""
+        return not model_name.startswith("gpt-5")
+
+    def _supports_reasoning_effort(self, model_name: str) -> bool:
+        """Keep GPT-5 short-answer requests from spending the full budget reasoning."""
+        return model_name.startswith("gpt-5")
 
     def _build_prompt_cache_key(self, request: QueryRequest) -> Optional[str]:
         """Build a stable, non-PII key that helps OpenAI route similar prompts."""
@@ -774,8 +809,12 @@ class AnthropicProvider(BaseInferenceProvider):
                 messages=messages,
             )
 
-            # Extract response data
-            generated_text = response.content[0].text
+            # Extract all text blocks so future provider tool-use blocks do not break parsing.
+            generated_text = "\n".join(
+                str(getattr(block, "text", ""))
+                for block in response.content
+                if getattr(block, "text", None)
+            )
             usage = response.usage
             uncached_input_tokens = _usage_value(usage, "input_tokens")
             cache_creation_tokens = _usage_value(usage, "cache_creation_input_tokens")
@@ -1182,6 +1221,11 @@ class BatchProcessor:
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
             "priority": request.priority,
+            "tool_policy": request.tool_policy.value,
+            "allowed_tools": request.allowed_tools,
+            "web_search_options": request.web_search_options.model_dump(mode="json")
+            if request.web_search_options
+            else None,
             "session_id": request.session_id,
             "conversation_id": request.conversation_id,
             "metadata": request.metadata,
@@ -1220,6 +1264,8 @@ class InferenceEngine:
         self.context_compressor = ContextCompressor(config.get("compression", {}))
         self.cache = ResponseCache(config.get("cache", {}))
         self.batch_processor = BatchProcessor(config.get("batching", {}))
+        self.tool_registry = ToolRegistry()
+        self.web_search_tool: Optional[WebSearchTool] = None
 
         # Performance tracking
         self.inference_stats = {}
@@ -1234,6 +1280,12 @@ class InferenceEngine:
 
         # Initialize cache
         await self.cache.initialize()
+
+        tools_config = dict(self.config.get("tools", {}) or {})
+        web_search_config = dict(tools_config.get("web_search", {}) or {})
+        if web_search_config:
+            self.web_search_tool = WebSearchTool(web_search_config)
+            self.tool_registry.register(self.web_search_tool)
 
         # Initialize providers based on configuration
         if "openai" in self.config:
@@ -1291,6 +1343,8 @@ class InferenceEngine:
         self, request: QueryRequest, model_name: str
     ) -> Optional[InferenceResponse]:
         """Return an app-cache hit for a model, clearly separated from provider cache."""
+        if self._response_cache_bypassed(request):
+            return None
         cache_key = self.cache.generate_cache_key(request, model_name)
         cached_response = await self.cache.get_cached_response(cache_key)
         if not cached_response:
@@ -1298,6 +1352,10 @@ class InferenceEngine:
 
         cached_response["cached"] = True
         return InferenceResponse(**cached_response)
+
+    def _response_cache_bypassed(self, request: QueryRequest) -> bool:
+        metadata = request.metadata or {}
+        return bool(metadata.get("web_search_cache_bypass", False))
 
     async def process_query(self, request: QueryRequest) -> InferenceResponse:
         """Process query through the complete inference pipeline"""
@@ -1316,7 +1374,13 @@ class InferenceEngine:
             # Step 2: Context compression before cache lookup keeps keys stable.
             compressed_context = await self._compress_request_context_if_needed(request)
 
-            # Step 3: Check full-response cache.
+            # Step 3: Optionally enrich current-info requests with web search.
+            web_search_result = await self._run_web_search_if_needed(
+                request,
+                routing_decision,
+            )
+
+            # Step 4: Check full-response cache.
             response = await self._get_cached_inference_response(request, model_name)
             if response:
                 logger.info(f"Cache hit for request {request_id}")
@@ -1327,7 +1391,7 @@ class InferenceEngine:
                 )
                 return response
 
-            # Step 4: Generate response, falling back to local models for cloud outages
+            # Step 5: Generate response, falling back to local models for cloud outages
             (
                 response,
                 model_name,
@@ -1337,9 +1401,10 @@ class InferenceEngine:
                 routing_decision,
             )
             response.compressed_context = compressed_context
+            self._attach_web_search_result(response, web_search_result)
 
             # Step 6: Cache response
-            if not response.cached:
+            if not response.cached and not self._response_cache_bypassed(request):
                 cache_key = self.cache.generate_cache_key(request, model_name)
                 await self.cache.cache_response(
                     cache_key,
@@ -1418,6 +1483,77 @@ class InferenceEngine:
             )
             return error_response
 
+    async def _run_web_search_if_needed(
+        self,
+        request: QueryRequest,
+        routing_decision: Any,
+    ) -> Optional[WebSearchResult]:
+        if not self._should_run_web_search(request, routing_decision):
+            return None
+
+        request.metadata = dict(request.metadata or {})
+        if self.web_search_tool is None:
+            result = WebSearchResult(
+                tool_call=ToolCall(
+                    name="web_search",
+                    provider="none",
+                    arguments={"query": request.query},
+                    error="web_search_not_configured",
+                ),
+                blocked_reason="web_search_not_configured",
+            )
+        else:
+            result = await self.web_search_tool.search(
+                request.query,
+                user_id=request.user_id,
+                options=request.web_search_options,
+            )
+
+        if result.context:
+            request.metadata["web_search_context"] = result.context
+            request.metadata["web_search_result_count"] = len(result.sources)
+            if result.tool_call and result.tool_call.provider:
+                request.metadata["web_search_provider"] = result.tool_call.provider
+        elif result.blocked_reason:
+            request.metadata["web_search_blocked_reason"] = result.blocked_reason
+            request.metadata["web_search_cache_bypass"] = True
+        return result
+
+    def _should_run_web_search(
+        self,
+        request: QueryRequest,
+        routing_decision: Any,
+    ) -> bool:
+        metadata = request.metadata or {}
+        if request.tool_policy == ToolPolicy.DISABLED:
+            return False
+        allowed_tools = set(request.allowed_tools or [])
+        if allowed_tools and "web_search" not in allowed_tools:
+            return False
+        if request.tool_policy == ToolPolicy.REQUIRED:
+            return True
+        if metadata.get("enable_web_search") is True:
+            return True
+        if metadata.get("web_search_auto") is False:
+            return False
+        query_type = getattr(routing_decision, "query_type", None)
+        query_type_value = (
+            query_type.value if hasattr(query_type, "value") else query_type
+        )
+        return query_type_value == QueryType.WEB_RESEARCH.value
+
+    def _attach_web_search_result(
+        self,
+        response: InferenceResponse,
+        result: Optional[WebSearchResult],
+    ) -> None:
+        if result is None:
+            return
+        response.sources = list(result.sources)
+        if result.tool_call:
+            response.tool_calls = [result.tool_call]
+            response.tool_latency_ms = result.tool_call.latency_ms
+
     async def stream_query(self, request: QueryRequest) -> AsyncIterator[str]:
         """Stream query response"""
         try:
@@ -1425,6 +1561,7 @@ class InferenceEngine:
             routing_decision = await self.router.route_query(request)
             model_name = routing_decision.selected_model
             await self._compress_request_context_if_needed(request)
+            await self._run_web_search_if_needed(request, routing_decision)
 
             cached_response = await self._get_cached_inference_response(
                 request,
@@ -1818,6 +1955,9 @@ class InferenceEngine:
             "providers": provider_health,
             "cache_enabled": self.cache.enabled,
             "compression_enabled": self.context_compressor.config.get("enabled", True),
+            "web_search_enabled": bool(
+                self.web_search_tool and self.web_search_tool.enabled
+            ),
             "stats": self.inference_stats,
         }
 
@@ -1826,6 +1966,7 @@ class InferenceEngine:
         logger.info("Shutting down inference engine...")
 
         await self.batch_processor.shutdown()
+        await self.tool_registry.close()
 
         # Close HTTP clients
         for provider in self.providers.values():

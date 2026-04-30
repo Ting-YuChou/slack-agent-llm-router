@@ -53,6 +53,8 @@ router:
         - reasoning
         - coding
         - analysis
+        - tool_use
+        - web_search
     claude-sonnet-4-6:
       provider: anthropic
       api_key_env: ANTHROPIC_API_KEY
@@ -63,6 +65,8 @@ router:
         - reasoning
         - writing
         - analysis
+        - tool_use
+        - web_search
   routing_rules:
     - condition: user_tier == 'enterprise'
       models:
@@ -78,6 +82,11 @@ router:
         - claude-sonnet-4-6
         - gpt-5
       fallback: claude-sonnet-4-6
+    - condition: query_type == 'web_research'
+      models:
+        - gpt-5
+        - claude-sonnet-4-6
+      fallback: gpt-5
 
 inference:
   openai:
@@ -120,6 +129,22 @@ inference:
     enabled: true
     max_batch_size: 32
     max_wait_time_ms: 50
+
+tools:
+  web_search:
+    enabled: false
+    provider: tavily
+    api_key_env: TAVILY_API_KEY
+    base_url: https://api.tavily.com
+    timeout_seconds: 5
+    max_results: 5
+    per_user_rate_limit: 20
+    cache_ttl_seconds: 300
+    search_depth: basic
+    include_answer: false
+    max_results_per_domain: 2
+    blocked_domains: []
+    freshness_days: 14
 
 kafka:
   bootstrap_servers:
@@ -214,6 +239,33 @@ slack:
     port: 6379
     db: 2
     password_env: REDIS_PASSWORD
+  memory:
+    enabled: false
+    backend: redis_stack
+    key_prefix: slack_memory
+    max_items_per_user: 500
+    retention_days: 365
+    search:
+      max_results: 5
+      max_context_chars: 2000
+      max_item_chars: 500
+      keyword_weight: 0.45
+      vector_weight: 0.45
+      recency_weight: 0.05
+      importance_weight: 0.05
+    embedding:
+      provider: openai
+      model: text-embedding-3-small
+      dimensions: 1536
+      timeout: 10
+      api_key_env: OPENAI_API_KEY
+    redis:
+      host: redis-stack
+      port: 6379
+      db: 0
+      key_prefix: slack_memory
+      password_env: REDIS_PASSWORD
+      dedicated_service_recommended: true
 
 streamlit:
   enabled: false

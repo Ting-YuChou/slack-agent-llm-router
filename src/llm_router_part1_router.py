@@ -20,6 +20,7 @@ from src.utils.schema import (
     QueryRequest,
     QueryType,
     RoutingDecision,
+    ToolPolicy,
     UserTier,
 )
 
@@ -116,6 +117,13 @@ class QueryClassifier:
                 r"\b(because|therefore|hence|thus)\b",
                 r"why.*is.*that|how.*can.*we.*conclude",
                 r"\b(premise|conclusion|argument)\b",
+            ],
+            QueryType.WEB_RESEARCH: [
+                r"\b(latest|today|current|recent|news|breaking|now)\b",
+                r"\b(price|stock|release|launched|announced|update)\b.*\b(today|latest|current|recent|now|202[0-9])\b",
+                r"\b(search|look up|web|internet|online)\b",
+                r"\b(what happened|what is happening)\b",
+                r"(查詢網頁|搜尋|最新|現在|今天|新聞|即時)",
             ],
         }
 
@@ -243,13 +251,39 @@ class QueryClassifier:
                 "explain",
                 "understand",
             ],
+            QueryType.WEB_RESEARCH: [
+                "latest",
+                "today",
+                "current",
+                "recent",
+                "news",
+                "search",
+                "web",
+                "internet",
+                "online",
+                "price",
+                "release",
+                "now",
+                "最新",
+                "現在",
+                "今天",
+                "新聞",
+                "搜尋",
+                "查詢網頁",
+            ],
         }
 
-        query_words = set(query.lower().split())
+        query_lower = query.lower()
+        query_words = set(query_lower.split())
         scores = {}
 
         for query_type, type_keywords in keywords.items():
-            matches = len(query_words.intersection(type_keywords))
+            matches = 0
+            for keyword in type_keywords:
+                if " " in keyword or any(ord(char) > 127 for char in keyword):
+                    matches += 1 if keyword.lower() in query_lower else 0
+                else:
+                    matches += 1 if keyword.lower() in query_words else 0
             if matches > 0:
                 scores[query_type] = matches / len(type_keywords)
 
@@ -401,7 +435,9 @@ class ModelRouter:
 
         for model_name, model_config in models_config.items():
             try:
-                self.models[model_name] = ModelConfig(name=model_name, **model_config)
+                model_payload = dict(model_config)
+                model_payload.setdefault("name", model_name)
+                self.models[model_name] = ModelConfig(**model_payload)
                 logger.debug(f"Loaded model configuration: {model_name}")
             except Exception as e:
                 logger.error(f"Failed to load model {model_name}: {e}")
@@ -489,6 +525,15 @@ class ModelRouter:
 
         # Count the approximate provider prompt, not just the user query.
         token_count = self._estimate_request_token_count(request)
+        metadata = request.metadata or {}
+        web_search_allowed = self._web_search_allowed(request)
+        needs_web_search = self._request_needs_web_search(
+            request,
+            query_type,
+            web_search_allowed,
+        )
+        if needs_web_search:
+            query_type = QueryType.WEB_RESEARCH
 
         # Build context
         context = {
@@ -503,6 +548,14 @@ class ModelRouter:
             "classification_confidence": classification_confidence,
             "context_length": len(request.context) if request.context else 0,
             "has_attachments": bool(request.attachments),
+            "tool_policy": request.tool_policy.value,
+            "allowed_tools": list(request.allowed_tools or []),
+            "needs_web_search": needs_web_search,
+            "web_search_allowed": web_search_allowed,
+            "web_search_confidence": classification_confidence
+            if needs_web_search
+            else 0.0,
+            "web_search_blocked_reason": metadata.get("web_search_blocked_reason"),
             "timestamp": time.time(),
         }
 
@@ -514,6 +567,29 @@ class ModelRouter:
             context["query_complexity"] = policy_context["query_complexity"]
 
         return context
+
+    def _web_search_allowed(self, request: QueryRequest) -> bool:
+        if request.tool_policy == ToolPolicy.DISABLED:
+            return False
+        allowed_tools = set(request.allowed_tools or [])
+        return not allowed_tools or "web_search" in allowed_tools
+
+    def _request_needs_web_search(
+        self,
+        request: QueryRequest,
+        query_type: QueryType,
+        web_search_allowed: bool,
+    ) -> bool:
+        metadata = request.metadata or {}
+        if not web_search_allowed:
+            return False
+        if request.tool_policy == ToolPolicy.REQUIRED:
+            return True
+        if metadata.get("enable_web_search") is True:
+            return True
+        if metadata.get("web_search_auto") is False:
+            return False
+        return query_type == QueryType.WEB_RESEARCH
 
     def _estimate_request_token_count(self, request: QueryRequest) -> int:
         """Approximate the prompt shape used by inference providers for routing."""
@@ -969,6 +1045,13 @@ class ModelRouter:
             "creative_writing": ["writing", "creative", "general"],
             "math": ["reasoning", "analysis", "general"],
             "translation": ["translation", "general"],
+            "web_research": [
+                "web_search",
+                "tool_use",
+                "reasoning",
+                "analysis",
+                "general",
+            ],
         }
 
         required_capabilities = capability_mapping.get(query_type, ["general"])

@@ -345,6 +345,19 @@ class TestPlatformInitialization:
         with pytest.raises(SystemExit):
             main.LLMRouterPlatform(config_path=str(config_path))
 
+    def test_web_search_enabled_can_be_overridden_by_env(
+        self, tmp_path, monkeypatch, patched_platform_deps
+    ):
+        monkeypatch.setenv("LLM_ROUTER_WEB_SEARCH_ENABLED", "true")
+        config_path = _write_config(
+            tmp_path,
+            overrides={"tools": {"web_search": {"enabled": False}}},
+        )
+
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+
+        assert platform.config["tools"]["web_search"]["enabled"] is True
+
     @pytest.mark.asyncio
     async def test_initialize_services_skips_disabled_background_services(
         self, tmp_path, patched_platform_deps

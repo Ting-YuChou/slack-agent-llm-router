@@ -1,10 +1,10 @@
 PYTHON ?= python
 DOCKER_COMPOSE ?= docker compose
 
-.PHONY: up down api api-dev workers loadtest-api smoke smoke-kafka smoke-flink smoke-flink-runtime smoke-flink-analytics smoke-flink-analytics-runtime integration integration-kafka integration-flink integration-flink-runtime integration-flink-analytics integration-flink-analytics-runtime
+.PHONY: up down api api-dev workers loadtest-api smoke smoke-kafka smoke-web-search smoke-redis-stack-memory smoke-flink smoke-flink-runtime smoke-flink-analytics smoke-flink-analytics-runtime integration integration-kafka integration-flink integration-flink-runtime integration-flink-analytics integration-flink-analytics-runtime
 
 up:
-	$(DOCKER_COMPOSE) up -d --build kafka clickhouse flink-jobmanager flink-taskmanager
+	$(DOCKER_COMPOSE) up -d --build redis-stack kafka clickhouse flink-jobmanager flink-taskmanager
 
 down:
 	$(DOCKER_COMPOSE) down
@@ -25,6 +25,13 @@ smoke: up smoke-kafka smoke-flink smoke-flink-runtime smoke-flink-analytics smok
 
 smoke-kafka:
 	$(PYTHON) scripts/integration_smoke.py
+
+smoke-web-search:
+	$(PYTHON) scripts/web_search_smoke.py
+
+smoke-redis-stack-memory:
+	$(DOCKER_COMPOSE) up -d redis-stack
+	$(PYTHON) scripts/redis_stack_memory_smoke.py
 
 smoke-flink:
 	$(PYTHON) scripts/flink_smoke.py

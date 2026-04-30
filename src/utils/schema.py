@@ -25,6 +25,13 @@ class QueryType(str, Enum):
     TRANSLATION = "translation"
     MATH = "math"
     REASONING = "reasoning"
+    WEB_RESEARCH = "web_research"
+
+
+class ToolPolicy(str, Enum):
+    DISABLED = "disabled"
+    AUTO = "auto"
+    REQUIRED = "required"
 
 
 class AttachmentType(str, Enum):
@@ -53,6 +60,33 @@ class Attachment(BaseModel):
         return v
 
 
+class WebSearchOptions(BaseModel):
+    max_results: Optional[int] = Field(None, ge=1, le=10)
+    search_depth: Optional[str] = Field(None, pattern=r"^(basic|advanced)$")
+    include_answer: Optional[bool] = None
+    topic: Optional[str] = Field(None, pattern=r"^(general|news)$")
+    days: Optional[int] = Field(None, ge=1)
+
+
+class ResponseSource(BaseModel):
+    title: str = ""
+    url: str
+    snippet: str = ""
+    source_domain: Optional[str] = None
+    published_at: Optional[str] = None
+    score: Optional[float] = Field(None, ge=0.0)
+    rank: int = Field(ge=1)
+
+
+class ToolCall(BaseModel):
+    name: str
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+    provider: Optional[str] = None
+    result_count: int = Field(default=0, ge=0)
+    latency_ms: int = Field(default=0, ge=0)
+    error: Optional[str] = None
+
+
 class QueryRequest(BaseModel):
     # Required fields
     query: str = Field(..., min_length=1, max_length=50000)
@@ -71,6 +105,11 @@ class QueryRequest(BaseModel):
 
     # File handling
     attachments: List[Attachment] = Field(default_factory=list)
+
+    # Tool handling
+    tool_policy: ToolPolicy = ToolPolicy.AUTO
+    allowed_tools: List[str] = Field(default_factory=list)
+    web_search_options: Optional[WebSearchOptions] = None
 
     # Additional metadata
     session_id: Optional[str] = None
@@ -116,6 +155,11 @@ class InferenceResponse(BaseModel):
     # System flags
     cached: bool = False
     compressed_context: bool = False
+
+    # Tool output
+    sources: List[ResponseSource] = Field(default_factory=list)
+    tool_calls: List[ToolCall] = Field(default_factory=list)
+    tool_latency_ms: int = Field(default=0, ge=0)
 
     # Quality metrics
     quality_score: Optional[float] = Field(None, ge=0.0, le=1.0)
@@ -198,6 +242,8 @@ class ModelConfig(BaseModel):
             "general",
             "math",
             "translation",
+            "tool_use",
+            "web_search",
         }
         for cap in v:
             if cap not in valid_capabilities:
@@ -344,6 +390,35 @@ class InferenceConfig(ConfigModel):
     batching: BatchingConfig = Field(default_factory=BatchingConfig)
 
 
+class WebSearchToolConfig(ConfigModel):
+    enabled: bool = False
+    provider: str = "tavily"
+    api_key_env: str = "TAVILY_API_KEY"
+    api_key: Optional[str] = None
+    base_url: str = "https://api.tavily.com"
+    timeout_seconds: float = Field(5.0, gt=0)
+    max_results: int = Field(5, ge=1, le=10)
+    cache_ttl_seconds: int = Field(300, ge=0)
+    per_user_rate_limit: int = Field(20, ge=1)
+    search_depth: str = Field("basic", pattern=r"^(basic|advanced)$")
+    include_answer: bool = False
+    max_results_per_domain: int = Field(2, ge=1)
+    blocked_domains: List[str] = Field(default_factory=list)
+    freshness_days: Optional[int] = Field(14, ge=1)
+
+    @field_validator("provider")
+    @classmethod
+    def validate_provider(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized != "tavily":
+            raise ValueError("web_search provider must be tavily")
+        return normalized
+
+
+class ToolsConfig(ConfigModel):
+    web_search: WebSearchToolConfig = Field(default_factory=WebSearchToolConfig)
+
+
 class KafkaProducerConfig(ConfigModel):
     acks: str = "all"
     retries: int = Field(3, ge=0)
@@ -416,6 +491,59 @@ class SlackRateLimitingConfig(ConfigModel):
     burst_requests: int = Field(5, ge=1)
 
 
+class SlackMemorySearchConfig(ConfigModel):
+    max_results: int = Field(5, ge=1)
+    max_context_chars: int = Field(2000, ge=1)
+    max_item_chars: int = Field(500, ge=1)
+    keyword_weight: float = Field(0.45, ge=0.0)
+    vector_weight: float = Field(0.45, ge=0.0)
+    recency_weight: float = Field(0.05, ge=0.0)
+    importance_weight: float = Field(0.05, ge=0.0)
+
+
+class SlackMemoryEmbeddingConfig(ConfigModel):
+    provider: str = "none"
+    model: str = "text-embedding-3-small"
+    dimensions: int = Field(1536, ge=1)
+    timeout: int = Field(10, ge=1)
+    api_key: Optional[str] = None
+    api_key_env: Optional[str] = "OPENAI_API_KEY"
+    base_url: Optional[str] = None
+    url: Optional[str] = None
+
+
+class SlackMemoryRedisConfig(ConfigModel):
+    host: str = "localhost"
+    port: int = Field(6379, ge=1, le=65535)
+    db: int = Field(3, ge=0)
+    url: Optional[str] = None
+    password_env: Optional[str] = None
+    key_prefix: str = "slack_memory"
+    dedicated_service_recommended: bool = True
+
+
+class SlackMemoryConfig(ConfigModel):
+    enabled: bool = False
+    backend: str = "memory"
+    key_prefix: str = "slack_memory"
+    max_items_per_user: int = Field(500, ge=1)
+    ttl_days: Optional[int] = Field(None, ge=1)
+    retention_days: Optional[int] = Field(None, ge=1)
+    search: SlackMemorySearchConfig = Field(default_factory=SlackMemorySearchConfig)
+    embedding: SlackMemoryEmbeddingConfig = Field(
+        default_factory=SlackMemoryEmbeddingConfig
+    )
+    redis: SlackMemoryRedisConfig = Field(default_factory=SlackMemoryRedisConfig)
+
+    @field_validator("backend")
+    @classmethod
+    def validate_backend(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"memory", "redis_stack"}:
+            raise ValueError("memory backend must be one of: memory, redis_stack")
+        return normalized
+
+
 class SlackConfig(ConfigModel):
     enabled: bool = False
     bot_token: Optional[str] = None
@@ -435,6 +563,7 @@ class SlackConfig(ConfigModel):
     state_file: str = "data/slack_state.json"
     state_key_prefix: str = "slack_state"
     redis: Dict[str, Any] = Field(default_factory=dict)
+    memory: SlackMemoryConfig = Field(default_factory=SlackMemoryConfig)
 
     @field_validator("state_backend")
     @classmethod
@@ -570,6 +699,7 @@ class PlatformConfig(ConfigModel):
     streamlit: StreamlitConfig = Field(default_factory=StreamlitConfig)
     flink: FlinkConfig = Field(default_factory=FlinkConfig)
     policy_cache: PolicyCacheConfig = Field(default_factory=PolicyCacheConfig)
+    tools: ToolsConfig = Field(default_factory=ToolsConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     performance: PerformanceConfig = Field(default_factory=PerformanceConfig)
     development: DevelopmentConfig = Field(default_factory=DevelopmentConfig)

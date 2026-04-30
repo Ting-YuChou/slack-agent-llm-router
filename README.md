@@ -7,6 +7,7 @@ Multi-model LLM router with a FastAPI API, Slack bot integration, Kafka/ClickHou
 - Routes requests across `gpt-5`, `claude-sonnet-4-6`, and optional local `vLLM` models
 - Exposes a protected API for query routing and dashboard access
 - Supports Slack bot interactions through `app_mention`, slash commands, and active reply threads
+- Can enrich current-info answers with Tavily-backed `web_search` results and structured sources
 - Persists analytics and request events through Kafka and ClickHouse when the pipeline is enabled
 - Supports Redis-backed cache and Slack state for multi-process durability
 
@@ -50,6 +51,31 @@ curl -X POST http://localhost:8080/route \
   -d '{"query": "Summarize this design", "user_id": "test-user"}'
 ```
 
+Web search example, when `tools.web_search.enabled` is true and `TAVILY_API_KEY` is set:
+
+```bash
+curl -X POST http://localhost:8080/route \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-api-key" \
+  -d '{
+    "query": "What is the latest OpenAI news today?",
+    "user_id": "test-user",
+    "tool_policy": "required",
+    "allowed_tools": ["web_search"],
+    "web_search_options": {"max_results": 3}
+  }'
+```
+
+Successful web-search responses include `sources[]` and a `web_search` entry in
+`tool_calls[]`. If Tavily is not configured or a search fails, the request still
+falls back to a normal model answer and records the structured tool error.
+Search results are deduplicated by normalized URL, capped per source domain, and
+can exclude configured `blocked_domains`. Current-info queries automatically ask
+Tavily for fresher/news-oriented results.
+The follow-up designs for constrained URL reading and multi-tool orchestration live
+in [docs/tools/url_fetch_design.md](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/docs/tools/url_fetch_design.md)
+and [docs/tools/tool_runner_roadmap.md](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/docs/tools/tool_runner_roadmap.md).
+
 ## Slack Behavior
 
 The Slack bot no longer replies to every channel message.
@@ -84,6 +110,46 @@ Persisted Slack state includes:
 - conversation history
 - active bot thread tracking
 
+Slack per-user memory:
+
+- disabled by default; enable with `slack.memory.enabled: true`
+- stores only explicit `/llm remember <text>` entries in the first version
+- retrieves memories with hybrid keyword + Redis Stack vector search before a Slack query
+- scopes memory by `team_id:user_id` when Slack provides the workspace ID
+- stores memories as channel-scoped by default; use `--global` for cross-channel preferences
+- injects only global memories plus memories saved in the current channel
+- falls back to keyword-only search if embedding generation fails
+- memory management commands should be used as Slack slash commands so responses stay ephemeral
+
+Memory commands:
+
+- `/llm remember <text>` saves a channel-scoped long-term memory for the current Slack user
+- `/llm remember --global <text>` saves a cross-channel user preference memory
+- `/llm memories [query]` lists or searches current-channel and global memories
+- `/llm memories --global [query]` lists or searches global memories only
+- `/llm memories --all [query]` lists or searches all memories for the current user
+- `/llm forget <memory_id>` deletes one memory
+- `/llm forget all` deletes all memories for the current user
+
+Memory storage should not share the response-cache Redis DB. The default runtime
+separates Redis usage as response cache DB 0, policy cache DB 1, Slack state DB 2,
+and memory DB 3. For production, prefer a dedicated Redis Stack service/instance
+for `slack.memory.redis` so vector/hash memory data cannot evict response cache
+entries through Redis `maxmemory` policy. Host-run config uses `localhost:6380`
+for Redis Stack; compose config uses the internal `redis-stack:6379` service.
+
+Redis Stack smoke test:
+
+```bash
+make smoke-redis-stack-memory
+```
+
+This starts the dedicated `redis-stack` Docker service, creates a RediSearch vector
+index through the real `RedisStackMemoryStore`, writes explicit memories, performs
+hybrid retrieval, verifies deterministic context formatting, and deletes the smoke
+test data/index. The service maps to host port `6380` so it does not collide with
+the regular response-cache Redis on `6379`.
+
 ## Quick Start
 
 ### Prerequisites
@@ -109,6 +175,8 @@ Minimum useful env vars:
 export LLM_ROUTER_API_KEYS=dev-api-key
 export OPENAI_API_KEY=your_openai_key
 export ANTHROPIC_API_KEY=your_anthropic_key
+export TAVILY_API_KEY=your_tavily_key
+export LLM_ROUTER_WEB_SEARCH_ENABLED=true
 export SLACK_BOT_TOKEN=xoxb-your-slack-token
 export SLACK_APP_TOKEN=xapp-your-slack-app-token
 ```
@@ -141,6 +209,20 @@ docker compose config
 ```
 
 Compose uses [config/config.compose.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.compose.yaml).
+Set `LLM_ROUTER_WEB_SEARCH_ENABLED=true` plus `TAVILY_API_KEY` in `.env` to enable
+Tavily web search without editing the checked-in config.
+
+After the API is healthy, smoke test the web-search path:
+
+```bash
+make smoke-web-search
+```
+
+To verify graceful fallback with web search disabled or without a Tavily key, run:
+
+```bash
+python scripts/web_search_smoke.py --expect tool-error
+```
 
 ### Option 2: Host-Run API / Workers
 

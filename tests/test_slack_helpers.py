@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from src.memory import HashEmbeddingProvider, InMemoryMemoryStore, MemoryManager
 from slack.bot_real import (
     ConversationContext,
     ConversationManager,
@@ -13,7 +14,18 @@ from slack.bot_real import (
     SlackMessageHandler,
     UserManager,
 )
-from src.utils.schema import Attachment, AttachmentType, UserTier
+from src.utils.schema import (
+    Attachment,
+    AttachmentType,
+    ResponseSource,
+    ToolPolicy,
+    UserTier,
+)
+
+
+class FailingEmbeddingProvider:
+    async def embed(self, text):
+        raise RuntimeError("embedding unavailable")
 
 
 class TestUserManager:
@@ -220,9 +232,60 @@ class TestSlackMessageHandler:
 
         request = inference_engine.process_query.await_args.args[0]
         assert request.metadata["preferred_models"] == ["gpt-5"]
+        assert request.metadata["web_search_auto"] is True
         assert "advanced detail" in request.metadata["response_style_instructions"]
         assert request.session_id is not None
         assert request.conversation_id == "u1:c1:main"
+
+    @pytest.mark.asyncio
+    async def test_web_command_requires_web_search(self, inference_response_factory):
+        inference_engine = SimpleNamespace(
+            process_query=AsyncMock(
+                return_value=inference_response_factory(
+                    response_text="answer [1]",
+                    sources=[
+                        ResponseSource(
+                            title="Example",
+                            url="https://example.com/news",
+                            snippet="snippet",
+                            rank=1,
+                        )
+                    ],
+                )
+            )
+        )
+        bot = SimpleNamespace(
+            user_manager=UserManager(),
+            conversation_manager=ConversationManager({}),
+            inference_engine=inference_engine,
+            _build_query_metadata=SlackBot._build_query_metadata,
+            _conversation_context_key=SlackBot._conversation_context_key,
+            _build_response_style_instructions=SlackBot._build_response_style_instructions,
+        )
+        bot._build_query_metadata = bot._build_query_metadata.__get__(
+            bot, SimpleNamespace
+        )
+        bot._conversation_context_key = bot._conversation_context_key.__get__(
+            bot, SimpleNamespace
+        )
+        bot._build_response_style_instructions = (
+            bot._build_response_style_instructions.__get__(bot, SimpleNamespace)
+        )
+        handler = SlackMessageHandler(bot)
+
+        response = await handler._handle_command_or_query(
+            "web latest AI news",
+            "u1",
+            "c1",
+            None,
+            client=None,
+        )
+
+        request = inference_engine.process_query.await_args.args[0]
+        assert request.tool_policy == ToolPolicy.REQUIRED
+        assert request.allowed_tools == ["web_search"]
+        assert "Sources:" in response
+        assert "https://example.com/news" in response
 
     @pytest.mark.asyncio
     async def test_handle_query_returns_safe_error_when_engine_returns_error_response(
@@ -247,6 +310,210 @@ class TestSlackMessageHandler:
         response = await handler._handle_query("hello", "u1", "c1", None, client=None)
 
         assert response == "safe error"
+
+    @pytest.mark.asyncio
+    async def test_memory_commands_save_list_and_forget_user_memory(self):
+        memory_manager = MemoryManager(
+            {
+                "enabled": True,
+                "search": {"max_results": 5},
+                "embedding": {"provider": "hash", "dimensions": 16},
+            },
+            store=InMemoryMemoryStore(),
+            embedding_provider=HashEmbeddingProvider(dimensions=16),
+        )
+        await memory_manager.initialize()
+        bot = SimpleNamespace(
+            memory_manager=memory_manager,
+            _memory_scope=SlackBot._memory_scope,
+            _build_memory_metadata=SlackBot._build_memory_metadata,
+        )
+        bot._memory_scope = bot._memory_scope.__get__(bot, SimpleNamespace)
+        bot._build_memory_metadata = bot._build_memory_metadata.__get__(
+            bot, SimpleNamespace
+        )
+        handler = SlackMessageHandler(bot)
+
+        saved = await handler._handle_command(
+            "remember prefer concise answers",
+            "u1",
+            "c1",
+            "t1",
+            client=None,
+            team_id="T1",
+            command_surface="slash",
+        )
+        global_saved = await handler._handle_command(
+            "remember --global prefer terse summaries",
+            "u1",
+            "c1",
+            "t1",
+            client=None,
+            team_id="T1",
+            command_surface="slash",
+        )
+        stored_memories = await memory_manager.list_memories("T1:u1", limit=10)
+        channel_memory = next(
+            item for item in stored_memories if item.text == "prefer concise answers"
+        )
+        global_memory = next(
+            item for item in stored_memories if item.text == "prefer terse summaries"
+        )
+        listed = await handler._handle_command(
+            "memories concise",
+            "u1",
+            "c1",
+            "t1",
+            client=None,
+            team_id="T1",
+            command_surface="slash",
+        )
+        memory_id = listed.split("`")[1]
+        deleted = await handler._handle_command(
+            f"forget {memory_id}",
+            "u1",
+            "c1",
+            "t1",
+            client=None,
+            team_id="T1",
+            command_surface="slash",
+        )
+
+        assert "Saved memory" in saved
+        assert "Saved memory" in global_saved
+        assert "prefer concise answers" in listed
+        assert "Forgot memory" in deleted
+        assert channel_memory.metadata["visibility"] == "channel"
+        assert channel_memory.metadata["channel_id"] == "c1"
+        assert global_memory.metadata["visibility"] == "global"
+        assert "channel_id" not in global_memory.metadata
+
+    @pytest.mark.asyncio
+    async def test_inline_memory_commands_return_public_safe_hint(self):
+        memory_manager = MemoryManager(
+            {"enabled": True},
+            store=InMemoryMemoryStore(),
+            embedding_provider=HashEmbeddingProvider(dimensions=16),
+        )
+        await memory_manager.initialize()
+        await memory_manager.remember(
+            "T1:u1",
+            "secret memory content",
+            metadata={"source": "slack", "visibility": "channel", "channel_id": "c1"},
+        )
+        bot = SimpleNamespace(
+            memory_manager=memory_manager,
+            _memory_scope=SlackBot._memory_scope,
+            _build_memory_metadata=SlackBot._build_memory_metadata,
+        )
+        bot._memory_scope = bot._memory_scope.__get__(bot, SimpleNamespace)
+        bot._build_memory_metadata = bot._build_memory_metadata.__get__(
+            bot, SimpleNamespace
+        )
+        handler = SlackMessageHandler(bot)
+
+        response = await handler._handle_command(
+            "memories secret",
+            "u1",
+            "c1",
+            "t1",
+            client=None,
+            team_id="T1",
+        )
+
+        assert "slash commands" in response
+        assert "secret memory content" not in response
+
+    @pytest.mark.asyncio
+    async def test_handle_query_injects_memory_only_when_hits_exist(
+        self, inference_response_factory
+    ):
+        memory_manager = MemoryManager(
+            {
+                "enabled": True,
+                "search": {"max_results": 5},
+                "embedding": {"provider": "none"},
+            },
+            store=InMemoryMemoryStore(),
+            embedding_provider=FailingEmbeddingProvider(),
+        )
+        await memory_manager.initialize()
+        await memory_manager.remember(
+            "T1:u1",
+            "Prefer Python examples for API explanations",
+            metadata={"source": "slack", "visibility": "channel", "channel_id": "c1"},
+        )
+        await memory_manager.remember(
+            "T1:u1",
+            "Prefer concise answers everywhere",
+            metadata={"source": "slack", "visibility": "global"},
+        )
+        inference_engine = SimpleNamespace(
+            process_query=AsyncMock(
+                return_value=inference_response_factory(
+                    response_text="hello from model"
+                )
+            )
+        )
+        bot = SimpleNamespace(
+            user_manager=UserManager(),
+            conversation_manager=ConversationManager({}),
+            inference_engine=inference_engine,
+            memory_manager=memory_manager,
+            _memory_scope=SlackBot._memory_scope,
+            _build_query_metadata=SlackBot._build_query_metadata,
+            _conversation_context_key=SlackBot._conversation_context_key,
+            _build_response_style_instructions=SlackBot._build_response_style_instructions,
+            _build_user_safe_error_message=lambda: "safe error",
+        )
+        for method_name in (
+            "_memory_scope",
+            "_build_query_metadata",
+            "_conversation_context_key",
+            "_build_response_style_instructions",
+        ):
+            setattr(
+                bot,
+                method_name,
+                getattr(bot, method_name).__get__(bot, SimpleNamespace),
+            )
+        handler = SlackMessageHandler(bot)
+
+        await handler._handle_query(
+            "explain concise Python API",
+            "u1",
+            "c1",
+            None,
+            client=None,
+            team_id="T1",
+        )
+        hit_request = inference_engine.process_query.await_args.args[0]
+
+        inference_engine.process_query.reset_mock()
+        await handler._handle_query(
+            "Python API concise",
+            "u1",
+            "c2",
+            None,
+            client=None,
+            team_id="T1",
+        )
+        other_channel_request = inference_engine.process_query.await_args.args[0]
+
+        assert "Long-term user memory:" in hit_request.context
+        assert "Prefer Python examples" in hit_request.context
+        assert "Prefer concise answers everywhere" in hit_request.context
+        assert "memory_hit_count" not in hit_request.metadata
+        assert "Long-term user memory:" in other_channel_request.context
+        assert "Prefer Python examples" not in other_channel_request.context
+        assert "Prefer concise answers everywhere" in other_channel_request.context
+
+    def test_extract_team_id_and_memory_scope(self):
+        bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
+
+        assert bot._extract_team_id({"team_id": "T1"}) == "T1"
+        assert bot._extract_team_id({"authorizations": [{"team_id": "T2"}]}) == "T2"
+        assert bot._memory_scope("T1", "U1") == "T1:U1"
 
 
 class TestSlackBot:
@@ -310,6 +577,50 @@ class TestSlackBot:
         assert created_clients["socket_client"].app_token == "xapp-test"
         assert bot.allowed_channel_ids == {"C123"}
         assert bot.is_healthy() is True
+
+    @pytest.mark.asyncio
+    async def test_initialize_disables_memory_when_optional_backend_fails(
+        self, monkeypatch
+    ):
+        class DummyWebClient:
+            def __init__(self, token):
+                self.token = token
+                self.auth_test = AsyncMock(return_value={"user_id": "B123"})
+
+        class DummySocketClient:
+            def __init__(self, app_token, web_client):
+                self.app_token = app_token
+                self.web_client = web_client
+                self.socket_mode_request_listeners = []
+
+            async def disconnect(self):
+                return None
+
+        async def fail_memory_initialize(self):
+            raise RuntimeError("redis stack unavailable")
+
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test")
+        monkeypatch.setattr("slack.bot_real.AsyncWebClient", DummyWebClient)
+        monkeypatch.setattr("slack.bot_real.AsyncSocketModeClient", DummySocketClient)
+        monkeypatch.setattr(
+            "slack.bot_real.MemoryManager.initialize", fail_memory_initialize
+        )
+
+        bot = SlackBot(
+            {
+                "bot_token_env": "SLACK_BOT_TOKEN",
+                "app_token_env": "SLACK_APP_TOKEN",
+                "channels": [],
+                "memory": {"enabled": True},
+            },
+            inference_engine=SimpleNamespace(),
+        )
+
+        await bot.initialize()
+
+        assert bot.initialized is True
+        assert bot.memory_manager.enabled is False
 
     @pytest.mark.asyncio
     async def test_message_event_ignores_non_thread_messages(self):
@@ -408,6 +719,10 @@ class TestSlackBot:
             text="ok",
         )
         bot.web_client.chat_postMessage.assert_not_awaited()
+        assert (
+            bot.message_handler._handle_command.await_args.kwargs["command_surface"]
+            == "slash"
+        )
 
     @pytest.mark.asyncio
     async def test_slash_command_routes_free_form_query(
