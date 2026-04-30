@@ -11,7 +11,10 @@ from src.utils.schema import (
     ModelConfig,
     PlatformConfig,
     QueryRequest,
+    ResponseSource,
     SystemMetric,
+    ToolCall,
+    ToolPolicy,
 )
 
 
@@ -46,6 +49,19 @@ def test_query_request_rejects_too_many_attachments():
         QueryRequest(query="hello", user_id="u1", attachments=attachments)
 
 
+def test_query_request_accepts_web_search_tool_options():
+    request = QueryRequest(
+        query="latest AI news",
+        user_id="u1",
+        tool_policy=ToolPolicy.REQUIRED,
+        allowed_tools=["web_search"],
+        web_search_options={"max_results": 3, "search_depth": "basic"},
+    )
+
+    assert request.tool_policy == ToolPolicy.REQUIRED
+    assert request.web_search_options.max_results == 3
+
+
 def test_inference_response_auto_calculates_total_tokens_when_zero():
     response = InferenceResponse(
         response_text="ok",
@@ -62,6 +78,36 @@ def test_inference_response_auto_calculates_total_tokens_when_zero():
     assert response.total_tokens == 24
 
 
+def test_inference_response_accepts_sources_and_tool_calls():
+    response = InferenceResponse(
+        response_text="ok [1]",
+        model_name="gpt-5",
+        provider="openai",
+        token_count_input=11,
+        token_count_output=13,
+        total_tokens=24,
+        latency_ms=20,
+        tokens_per_second=650.0,
+        cost_usd=0.01,
+        sources=[
+            ResponseSource(
+                title="Example",
+                url="https://example.com",
+                snippet="snippet",
+                score=0.8,
+                rank=1,
+            )
+        ],
+        tool_calls=[
+            ToolCall(name="web_search", provider="tavily", result_count=1, latency_ms=5)
+        ],
+    )
+
+    assert response.sources[0].url == "https://example.com"
+    assert response.sources[0].score == 0.8
+    assert response.tool_calls[0].name == "web_search"
+
+
 def test_model_config_rejects_unknown_capability():
     with pytest.raises(ValidationError):
         ModelConfig(
@@ -72,6 +118,19 @@ def test_model_config_rejects_unknown_capability():
             priority=1,
             capabilities=["unknown-capability"],
         )
+
+
+def test_model_config_accepts_tool_capabilities():
+    model = ModelConfig(
+        name="gpt-5",
+        provider="openai",
+        max_tokens=1000,
+        cost_per_token=0.0,
+        priority=1,
+        capabilities=["general", "tool_use", "web_search"],
+    )
+
+    assert "web_search" in model.capabilities
 
 
 def test_system_metric_name_validation():
@@ -129,6 +188,23 @@ def test_platform_config_accepts_slack_memory_config():
     assert config.slack.memory.enabled is True
     assert config.slack.memory.backend == "redis_stack"
     assert config.slack.memory.redis.db == 3
+
+
+def test_platform_config_accepts_tavily_web_search_config():
+    config = PlatformConfig(
+        tools={
+            "web_search": {
+                "enabled": True,
+                "provider": "tavily",
+                "api_key_env": "TAVILY_API_KEY",
+                "max_results_per_domain": 1,
+            }
+        }
+    )
+
+    assert config.tools.web_search.enabled is True
+    assert config.tools.web_search.provider == "tavily"
+    assert config.tools.web_search.max_results_per_domain == 1
 
 
 def test_checked_in_compose_config_validates():

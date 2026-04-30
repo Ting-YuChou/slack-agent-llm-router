@@ -8,7 +8,7 @@ from src.llm_router_part1_router import (
     RoutingRule,
     TokenCounter,
 )
-from src.utils.schema import QueryRequest, QueryType, UserTier
+from src.utils.schema import QueryRequest, QueryType, ToolPolicy, UserTier
 
 
 class TestQueryClassifier:
@@ -21,6 +21,17 @@ class TestQueryClassifier:
         )
 
         assert query_type == QueryType.CODE_GENERATION
+        assert confidence > 0.1
+
+    def test_classify_web_research_query(self):
+        classifier = QueryClassifier()
+        classifier._is_initialized = True
+
+        query_type, confidence = classifier.classify_query(
+            "What is the latest AI news today?"
+        )
+
+        assert query_type == QueryType.WEB_RESEARCH
         assert confidence > 0.1
 
 
@@ -98,6 +109,23 @@ class TestModelRouter:
         assert context["token_count"] > len(request.query.split())
         assert "Context: one two three four five" in counted_prompts[0]
 
+    @pytest.mark.asyncio
+    async def test_build_query_context_marks_required_web_search(self, router_config):
+        router = ModelRouter(router_config)
+        router.classifier.classify_query = lambda _query: (QueryType.GENERAL, 0.5)
+        router.token_counter.count_tokens = lambda _query, _model="default": 128
+        request = QueryRequest(
+            query="Check the web",
+            user_id="u1",
+            tool_policy=ToolPolicy.REQUIRED,
+            allowed_tools=["web_search"],
+        )
+
+        context = await router._build_query_context(request)
+
+        assert context["query_type"] == "web_research"
+        assert context["needs_web_search"] is True
+
     def test_capability_access_and_stats(self, router_config):
         router = ModelRouter(router_config)
         model = router.models["mistral-7b"]
@@ -115,6 +143,19 @@ class TestModelRouter:
         assert info["stats"]["total_requests"] == 2
         assert info["stats"]["successful_requests"] == 1
         assert info["stats"]["avg_latency"] == 300
+
+    def test_load_models_accepts_already_named_config(self, router_config):
+        named_config = {
+            **router_config,
+            "models": {
+                model_name: {"name": model_name, **model_config}
+                for model_name, model_config in router_config["models"].items()
+            },
+        }
+
+        router = ModelRouter(named_config)
+
+        assert router.models["gpt-5"].name == "gpt-5"
 
     def test_fallback_when_no_model_matches(self, router_config):
         router = ModelRouter(router_config)

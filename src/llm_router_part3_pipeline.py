@@ -112,6 +112,11 @@ def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
         "max_tokens": query_request.max_tokens,
         "temperature": query_request.temperature,
         "priority": query_request.priority,
+        "tool_policy": _enum_value(query_request.tool_policy),
+        "allowed_tools": list(query_request.allowed_tools or []),
+        "web_search_options": query_request.web_search_options.model_dump(mode="json")
+        if query_request.web_search_options
+        else None,
         "session_id": query_request.session_id,
         "conversation_id": query_request.conversation_id,
         "metadata": query_request.metadata or {},
@@ -134,6 +139,21 @@ def build_inference_completed_event(
     )
     policy_source = getattr(routing_decision, "policy_source", None)
     hint_reason = getattr(routing_decision, "hint_reason", None)
+    tool_calls = list(getattr(inference_response, "tool_calls", []) or [])
+    sources = list(getattr(inference_response, "sources", []) or [])
+    web_search_call = next(
+        (
+            tool_call
+            for tool_call in tool_calls
+            if getattr(tool_call, "name", "") == "web_search"
+        ),
+        None,
+    )
+    source_domains = [
+        domain
+        for domain in (getattr(source, "source_domain", None) for source in sources)
+        if domain
+    ]
 
     return {
         "event_type": "inference.completed",
@@ -176,6 +196,18 @@ def build_inference_completed_event(
         "policy_source": policy_source,
         "hint_reason": hint_reason,
         "fallback_models": list(getattr(routing_decision, "fallback_models", []) or []),
+        "tools_used": [getattr(tool_call, "name", "") for tool_call in tool_calls],
+        "web_search_result_count": len(sources),
+        "web_search_latency_ms": getattr(web_search_call, "latency_ms", 0)
+        if web_search_call
+        else 0,
+        "web_search_provider": getattr(web_search_call, "provider", None)
+        if web_search_call
+        else None,
+        "web_search_blocked_reason": (
+            getattr(web_search_call, "error", None) if web_search_call else None
+        ),
+        "source_domains": source_domains,
     }
 
 

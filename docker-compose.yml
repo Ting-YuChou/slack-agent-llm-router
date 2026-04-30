@@ -7,6 +7,8 @@ x-router-app: &router-app
     LLM_ROUTER_API_KEYS: ${LLM_ROUTER_API_KEYS:-dev-api-key}
     OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+    LLM_ROUTER_WEB_SEARCH_ENABLED: ${LLM_ROUTER_WEB_SEARCH_ENABLED:-false}
     REDIS_PASSWORD: ${REDIS_PASSWORD:-}
   volumes:
     - ./logs:/app/logs

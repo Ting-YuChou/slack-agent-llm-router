@@ -58,6 +58,7 @@ from slack.bot import SlackBot
 DEFAULT_CONFIG_PATH = "config/config.yaml"
 CONFIG_ENV_VAR = "LLM_ROUTER_CONFIG"
 DEFAULT_API_KEY_ENV_VAR = "LLM_ROUTER_API_KEYS"
+WEB_SEARCH_ENABLED_ENV_VAR = "LLM_ROUTER_WEB_SEARCH_ENABLED"
 PUBLIC_ENDPOINTS = {"/live", "/ready", "/health"}
 
 
@@ -76,6 +77,17 @@ def get_api_worker_count(config: Dict[str, Any], dev: bool = False) -> int:
         return max(1, int(workers))
     except (TypeError, ValueError):
         return 1
+
+
+def _env_flag_enabled(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
 
 
 class LLMRouterPlatform:
@@ -102,6 +114,7 @@ class LLMRouterPlatform:
         try:
             with open(self.config_path, "r", encoding="utf-8") as f:
                 raw_config = yaml.safe_load(f) or {}
+            self._apply_env_overrides(raw_config)
             validated = PlatformConfig.model_validate(raw_config)
             return validated.model_dump(mode="json")
         except FileNotFoundError:
@@ -117,6 +130,14 @@ class LLMRouterPlatform:
                 "Invalid configuration in %s: %s", self.config_path, e
             )
             sys.exit(1)
+
+    def _apply_env_overrides(self, raw_config: Dict[str, Any]):
+        """Apply small runtime toggles that are convenient for Docker Compose."""
+        web_search_enabled = _env_flag_enabled(os.getenv(WEB_SEARCH_ENABLED_ENV_VAR))
+        if web_search_enabled is not None:
+            tools_config = raw_config.setdefault("tools", {})
+            web_search_config = tools_config.setdefault("web_search", {})
+            web_search_config["enabled"] = web_search_enabled
 
     def _log_configuration_warnings(self):
         """Log high-risk runtime configuration warnings."""
@@ -210,7 +231,10 @@ class LLMRouterPlatform:
         await self.services["router"].initialize()
 
         self.services["inference"] = InferenceEngine(
-            config=self.config.get("inference", {}),
+            config={
+                **dict(self.config.get("inference", {}) or {}),
+                "tools": dict(self.config.get("tools", {}) or {}),
+            },
             router=self.services["router"],
             event_producer=self.services.get("event_producer"),
         )

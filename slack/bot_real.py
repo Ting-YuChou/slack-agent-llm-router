@@ -21,7 +21,13 @@ from slack_sdk.socket_mode.response import SocketModeResponse
 import httpx
 
 from src.memory import MemoryManager, build_memory_scope
-from src.utils.schema import Attachment, AttachmentType, QueryRequest, UserTier
+from src.utils.schema import (
+    Attachment,
+    AttachmentType,
+    QueryRequest,
+    ToolPolicy,
+    UserTier,
+)
 from src.utils.metrics import SLACK_METRICS
 
 logger = logging.getLogger(__name__)
@@ -546,6 +552,7 @@ class UserManager:
                 "technical_level": "intermediate",
                 "preferred_models": [],
                 "threading": True,
+                "web_search_auto": True,
             },
         )
 
@@ -699,6 +706,7 @@ class SlackMessageHandler:
             "models": self._handle_models_command,
             "analytics": self._handle_analytics_command,
             "clear": self._handle_clear_command,
+            "web": self._handle_web_command,
             "remember": self._handle_remember_command,
             "memories": self._handle_memories_command,
             "forget": self._handle_forget_command,
@@ -803,6 +811,16 @@ class SlackMessageHandler:
         args = parts[1:] if len(parts) > 1 else []
 
         if command in self.commands:
+            if command == "web":
+                return await self._handle_web_command(
+                    args,
+                    user_id,
+                    channel_id,
+                    client,
+                    thread_ts=thread_ts,
+                    attachments=attachments,
+                    team_id=team_id,
+                )
             if command in {"remember", "memories", "forget"}:
                 return await self.commands[command](
                     args,
@@ -823,6 +841,32 @@ class SlackMessageHandler:
             team_id=team_id,
         )
 
+    async def _handle_web_command(
+        self,
+        args: List[str],
+        user_id: str,
+        channel_id: str,
+        client: AsyncWebClient,
+        thread_ts: Optional[str] = None,
+        attachments: Optional[List[Attachment]] = None,
+        team_id: Optional[str] = None,
+    ) -> str:
+        """Handle `/llm web <query>` by requiring the web_search tool."""
+        query = " ".join(args).strip()
+        if not query:
+            return "Usage: `/llm web <query>`"
+        return await self._handle_query(
+            query,
+            user_id,
+            channel_id,
+            thread_ts,
+            client,
+            attachments=attachments,
+            team_id=team_id,
+            tool_policy=ToolPolicy.REQUIRED,
+            allowed_tools=["web_search"],
+        )
+
     async def _handle_help_command(
         self, args: List[str], user_id: str, channel_id: str, client: AsyncWebClient
     ) -> str:
@@ -840,6 +884,7 @@ Mention me in a channel, use `/llm ...`, or reply inside an active bot thread.
 • `/llm models` - List available models and their capabilities
 • `/llm analytics` - Show usage analytics (premium users)
 • `/llm clear` - Clear conversation history
+• `/llm web <query>` - Search the web before answering
 • `/llm remember <text>` - Save an explicit long-term memory
 • `/llm memories [query]` - List or search your memories
 • `/llm forget <memory_id|all>` - Delete saved memories
@@ -878,12 +923,14 @@ Mention me in a channel, use `/llm ...`, or reply inside an active bot thread.
 *Response Length:* {user_prefs.get('response_length', 'medium')}
 *Technical Level:* {user_prefs.get('technical_level', 'intermediate')}
 *Threading:* {'Enabled' if user_prefs.get('threading', True) else 'Disabled'}
+*Auto Web Search:* {'Enabled' if user_prefs.get('web_search_auto', True) else 'Disabled'}
 *Preferred Models:* {', '.join(user_prefs.get('preferred_models', [])) or 'Auto-select'}
 
 *Update Settings:*
 • `/llm settings response_length short|medium|long`
 • `/llm settings technical_level beginner|intermediate|expert`
 • `/llm settings threading on|off`
+• `/llm settings web_search_auto on|off`
 • `/llm settings preferred_models model1,model2`
             """
             return settings_text.strip()
@@ -907,6 +954,12 @@ Mention me in a channel, use `/llm ...`, or reply inside an active bot thread.
                 user_prefs["technical_level"] = setting_value
             elif setting_name == "threading":
                 user_prefs["threading"] = setting_value.lower() in ["on", "true", "yes"]
+            elif setting_name == "web_search_auto":
+                user_prefs["web_search_auto"] = setting_value.lower() in [
+                    "on",
+                    "true",
+                    "yes",
+                ]
             elif setting_name == "preferred_models":
                 normalized_value = setting_value.strip().lower()
                 if normalized_value in {"auto", "none", "clear"}:
@@ -1134,7 +1187,9 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         query = " ".join(args).strip()
         try:
             if query:
-                results = await memory_manager.search(scope, query, metadata={"source": "slack"})
+                results = await memory_manager.search(
+                    scope, query, metadata={"source": "slack"}
+                )
                 items = [result.item for result in results]
             else:
                 items = await memory_manager.list_memories(scope, limit=10)
@@ -1195,6 +1250,8 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         client: AsyncWebClient,
         attachments: Optional[List[Attachment]] = None,
         team_id: Optional[str] = None,
+        tool_policy: ToolPolicy = ToolPolicy.AUTO,
+        allowed_tools: Optional[List[str]] = None,
     ) -> str:
         """Handle regular query through inference engine"""
         try:
@@ -1255,6 +1312,8 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 temperature=0.7,
                 priority=1 if user_tier != UserTier.FREE else 3,
                 attachments=attachments or [],
+                tool_policy=tool_policy,
+                allowed_tools=allowed_tools or [],
                 session_id=context.session_id,
                 conversation_id=conversation_id,
                 metadata=(
@@ -1296,7 +1355,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             SLACK_METRICS.messages_processed.labels(user_tier=user_tier.value).inc()
             SLACK_METRICS.response_time.observe(response.latency_ms / 1000)
 
-            return response.response_text
+            return self._format_response_with_sources(response)
 
         except Exception as e:
             logger.error(f"Error processing query: {e}")
@@ -1305,6 +1364,23 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             if callable(error_builder):
                 return error_builder()
             return "❌ Sorry, I couldn't process that request right now. Please try again in a moment."
+
+    def _format_response_with_sources(self, response: Any) -> str:
+        """Append compact source links for web-search enriched answers."""
+        response_text = getattr(response, "response_text", "") or ""
+        sources = list(getattr(response, "sources", []) or [])
+        if not sources:
+            return response_text
+
+        lines = [response_text.rstrip(), "", "Sources:"]
+        for source in sources[:5]:
+            title = getattr(source, "title", "") or getattr(source, "url", "")
+            url = getattr(source, "url", "")
+            rank = getattr(source, "rank", len(lines))
+            if not url:
+                continue
+            lines.append(f"[{rank}] {title} - {url}")
+        return "\n".join(lines).strip()
 
     def _get_max_tokens_for_user(
         self, user_tier: UserTier, preferences: Dict[str, Any]
@@ -2272,6 +2348,7 @@ class SlackBot:
             "workspace_id": team_id or "default",
             "preferred_models": preferred_models,
             "response_style_instructions": response_style_instructions,
+            "web_search_auto": user_preferences.get("web_search_auto", True),
             "slack": {
                 "team_id": team_id,
                 "channel_id": channel_id,

@@ -17,7 +17,13 @@ from src.llm_router_part3_pipeline import (
     ModelPerformanceEntry,
     QueryLogEntry,
 )
-from src.utils.schema import InferenceResponse, QueryRequest, UserTier
+from src.utils.schema import (
+    InferenceResponse,
+    QueryRequest,
+    ResponseSource,
+    ToolCall,
+    UserTier,
+)
 
 
 @pytest.fixture
@@ -215,6 +221,23 @@ class TestKafkaProducerManager:
             latency_ms=12,
             tokens_per_second=120.0,
             cost_usd=0.01,
+            sources=[
+                ResponseSource(
+                    title="Example",
+                    url="https://example.com/news",
+                    snippet="snippet",
+                    source_domain="example.com",
+                    rank=1,
+                )
+            ],
+            tool_calls=[
+                ToolCall(
+                    name="web_search",
+                    provider="tavily",
+                    result_count=1,
+                    latency_ms=9,
+                )
+            ],
         )
         routing_decision = SimpleNamespace(
             query_type=SimpleNamespace(value="analysis"),
@@ -241,6 +264,11 @@ class TestKafkaProducerManager:
         assert send_kwargs["value"]["route_to_fast_lane"] is True
         assert send_kwargs["value"]["actual_fast_lane_hit"] is True
         assert send_kwargs["value"]["policy_source"] == "session+user"
+        assert send_kwargs["value"]["tools_used"] == ["web_search"]
+        assert send_kwargs["value"]["web_search_result_count"] == 1
+        assert send_kwargs["value"]["web_search_latency_ms"] == 9
+        assert send_kwargs["value"]["web_search_provider"] == "tavily"
+        assert send_kwargs["value"]["source_domains"] == ["example.com"]
 
     @pytest.mark.asyncio
     async def test_produce_query_log_uses_request_id_and_fallback_query_type(

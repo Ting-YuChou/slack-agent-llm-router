@@ -12,7 +12,16 @@ from src.llm_router_part2_inference import (
     ResponseCache,
     vLLMProvider,
 )
-from src.utils.schema import Attachment, AttachmentType, QueryRequest, UserTier
+from src.utils.schema import (
+    Attachment,
+    AttachmentType,
+    QueryRequest,
+    QueryType,
+    ResponseSource,
+    ToolCall,
+    ToolPolicy,
+    UserTier,
+)
 
 
 @pytest.fixture
@@ -95,9 +104,23 @@ class TestOpenAIProvider:
 
             kwargs = mock_client.responses.create.await_args.kwargs
             assert "prompt_cache_key" in kwargs
-            assert kwargs["prompt_cache_retention"] == "24h"
+            assert "prompt_cache_retention" not in kwargs
+            assert "temperature" not in kwargs
+            assert kwargs["reasoning"] == {"effort": "minimal"}
             assert "user" not in kwargs
             assert response.provider_cached_input_tokens == 1024
+
+    def test_openai_request_kwargs_include_temperature_for_supported_models(
+        self, sample_query_request
+    ):
+        provider = OpenAIProvider({"api_key": "test-key"})
+
+        kwargs = provider._build_response_request_kwargs(
+            sample_query_request, "gpt-4.1", "Prompt"
+        )
+
+        assert kwargs["temperature"] == sample_query_request.temperature
+        assert "reasoning" not in kwargs
 
     @pytest.mark.asyncio
     async def test_generate_response_includes_attachment_text_in_prompt(
@@ -423,9 +446,20 @@ class TestResponseCache:
             }
         )
 
-        assert cache.generate_cache_key(base_request, "gpt-5") == cache.generate_cache_key(
-            equivalent_request, "gpt-5"
+        assert cache.generate_cache_key(
+            base_request, "gpt-5"
+        ) == cache.generate_cache_key(equivalent_request, "gpt-5")
+
+    def test_cache_key_includes_tool_policy(self, sample_query_request):
+        cache = ResponseCache({"enabled": True})
+        auto_request = sample_query_request.model_copy()
+        required_request = sample_query_request.model_copy(
+            update={"tool_policy": ToolPolicy.REQUIRED}
         )
+
+        assert cache.generate_cache_key(
+            auto_request, "gpt-5"
+        ) != cache.generate_cache_key(required_request, "gpt-5")
 
 
 class TestInferenceEngine:
@@ -511,6 +545,106 @@ class TestInferenceEngine:
 
         event_producer.produce_inference_completed.assert_awaited_once()
         event_producer.produce_query_log.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_process_query_runs_web_search_before_provider_call(
+        self,
+        inference_config,
+        sample_query_request,
+        inference_response_factory,
+    ):
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(
+                selected_model="gpt-5",
+                query_type=QueryType.WEB_RESEARCH,
+            )
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+        router.update_model_stats = MagicMock()
+
+        source = ResponseSource(
+            title="Example",
+            url="https://example.com/news",
+            snippet="Fresh context",
+            source_domain="example.com",
+            rank=1,
+        )
+        tool_call = ToolCall(
+            name="web_search",
+            provider="tavily",
+            result_count=1,
+            latency_ms=8,
+        )
+        web_search_result = SimpleNamespace(
+            sources=[source],
+            tool_call=tool_call,
+            context="Web search results:\n[1] Example",
+            blocked_reason=None,
+        )
+
+        engine = InferenceEngine(inference_config, router)
+        engine.providers = {"openai": AsyncMock()}
+
+        async def generate_response(request, _model_name):
+            assert "Web search results" in request.metadata["web_search_context"]
+            return inference_response_factory(response_text="answer [1]")
+
+        engine.providers["openai"].generate_response = AsyncMock(
+            side_effect=generate_response
+        )
+        engine.web_search_tool = SimpleNamespace(
+            search=AsyncMock(return_value=web_search_result)
+        )
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+        engine.cache.cache_response = AsyncMock()
+
+        request = sample_query_request.model_copy(
+            update={"tool_policy": ToolPolicy.REQUIRED, "allowed_tools": ["web_search"]}
+        )
+        response = await engine.process_query(request)
+
+        assert response.sources == [source]
+        assert response.tool_calls == [tool_call]
+        assert response.tool_latency_ms == 8
+
+    @pytest.mark.asyncio
+    async def test_process_query_attaches_structured_web_search_error(
+        self,
+        inference_config,
+        sample_query_request,
+        inference_response_factory,
+    ):
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(
+                selected_model="gpt-5",
+                query_type=QueryType.WEB_RESEARCH,
+            )
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+        router.update_model_stats = MagicMock()
+
+        engine = InferenceEngine(inference_config, router)
+        engine.providers = {"openai": AsyncMock()}
+        engine.providers["openai"].generate_response = AsyncMock(
+            return_value=inference_response_factory(response_text="answer without web")
+        )
+        engine.web_search_tool = None
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+        engine.cache.cache_response = AsyncMock()
+
+        request = sample_query_request.model_copy(
+            update={"tool_policy": ToolPolicy.REQUIRED, "allowed_tools": ["web_search"]}
+        )
+        response = await engine.process_query(request)
+
+        assert response.sources == []
+        assert response.tool_calls[0].error == "web_search_not_configured"
+        assert (
+            request.metadata["web_search_blocked_reason"] == "web_search_not_configured"
+        )
+        engine.cache.cache_response.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_process_query_returns_cached_response(

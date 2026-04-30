@@ -14,7 +14,13 @@ from slack.bot_real import (
     SlackMessageHandler,
     UserManager,
 )
-from src.utils.schema import Attachment, AttachmentType, UserTier
+from src.utils.schema import (
+    Attachment,
+    AttachmentType,
+    ResponseSource,
+    ToolPolicy,
+    UserTier,
+)
 
 
 class TestUserManager:
@@ -221,9 +227,60 @@ class TestSlackMessageHandler:
 
         request = inference_engine.process_query.await_args.args[0]
         assert request.metadata["preferred_models"] == ["gpt-5"]
+        assert request.metadata["web_search_auto"] is True
         assert "advanced detail" in request.metadata["response_style_instructions"]
         assert request.session_id is not None
         assert request.conversation_id == "u1:c1:main"
+
+    @pytest.mark.asyncio
+    async def test_web_command_requires_web_search(self, inference_response_factory):
+        inference_engine = SimpleNamespace(
+            process_query=AsyncMock(
+                return_value=inference_response_factory(
+                    response_text="answer [1]",
+                    sources=[
+                        ResponseSource(
+                            title="Example",
+                            url="https://example.com/news",
+                            snippet="snippet",
+                            rank=1,
+                        )
+                    ],
+                )
+            )
+        )
+        bot = SimpleNamespace(
+            user_manager=UserManager(),
+            conversation_manager=ConversationManager({}),
+            inference_engine=inference_engine,
+            _build_query_metadata=SlackBot._build_query_metadata,
+            _conversation_context_key=SlackBot._conversation_context_key,
+            _build_response_style_instructions=SlackBot._build_response_style_instructions,
+        )
+        bot._build_query_metadata = bot._build_query_metadata.__get__(
+            bot, SimpleNamespace
+        )
+        bot._conversation_context_key = bot._conversation_context_key.__get__(
+            bot, SimpleNamespace
+        )
+        bot._build_response_style_instructions = (
+            bot._build_response_style_instructions.__get__(bot, SimpleNamespace)
+        )
+        handler = SlackMessageHandler(bot)
+
+        response = await handler._handle_command_or_query(
+            "web latest AI news",
+            "u1",
+            "c1",
+            None,
+            client=None,
+        )
+
+        request = inference_engine.process_query.await_args.args[0]
+        assert request.tool_policy == ToolPolicy.REQUIRED
+        assert request.allowed_tools == ["web_search"]
+        assert "Sources:" in response
+        assert "https://example.com/news" in response
 
     @pytest.mark.asyncio
     async def test_handle_query_returns_safe_error_when_engine_returns_error_response(
