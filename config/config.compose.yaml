@@ -179,6 +179,23 @@ rag:
     db: 0
     key_prefix: rag
     password_env: REDIS_PASSWORD
+  ingestion_queue:
+    enabled: false
+    stream_key: rag:ingestion:stream
+    group_name: rag-ingestion-workers
+    dead_letter_stream_key: rag:ingestion:dead_letter
+    retry_zset_key: rag:ingestion:retry
+    consumer_count: 1
+    concurrency: 1
+    block_ms: 5000
+    pending_idle_ms: 300000
+    max_attempts: 3
+    retry_backoff_seconds: 30
+    stream_maxlen: 10000
+  storage:
+    staging_dir: /app/data/rag/uploads
+    cleanup_completed_files: false
+    completed_file_ttl_seconds: 86400
   retrieval:
     top_k: 5
     candidate_count: 30

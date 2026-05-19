@@ -220,6 +220,29 @@ class RagQueryRequest(BaseModel):
         return v.strip()
 
 
+class RagBatchDocument(BaseModel):
+    filename: str = Field(..., min_length=1)
+    content_base64: Optional[str] = None
+    storage_ref: Optional[str] = None
+    document_id: Optional[str] = None
+    knowledge_base_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_content_source(self):
+        if not self.content_base64 and not self.storage_ref:
+            raise ValueError(
+                "each batch document requires content_base64 or storage_ref"
+            )
+        return self
+
+
+class RagBatchRequest(BaseModel):
+    knowledge_base_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    documents: List[RagBatchDocument] = Field(..., min_length=1, max_length=1000)
+
+
 class RoutingDecision(BaseModel):
     # Core routing decision
     selected_model: str = Field(..., min_length=1)
@@ -801,6 +824,27 @@ class RagIntentGateConfig(ConfigModel):
     exclude_terms: List[str] = Field(default_factory=list)
 
 
+class RagIngestionQueueConfig(ConfigModel):
+    enabled: bool = False
+    stream_key: str = "rag:ingestion:stream"
+    group_name: str = "rag-ingestion-workers"
+    dead_letter_stream_key: str = "rag:ingestion:dead_letter"
+    retry_zset_key: str = "rag:ingestion:retry"
+    consumer_count: int = Field(1, ge=1)
+    concurrency: int = Field(1, ge=1)
+    block_ms: int = Field(5000, ge=1)
+    pending_idle_ms: int = Field(300000, ge=1)
+    max_attempts: int = Field(3, ge=1)
+    retry_backoff_seconds: float = Field(30.0, ge=0.0)
+    stream_maxlen: int = Field(10000, ge=0)
+
+
+class RagStorageConfig(ConfigModel):
+    staging_dir: str = "data/rag/uploads"
+    cleanup_completed_files: bool = False
+    completed_file_ttl_seconds: int = Field(86400, ge=0)
+
+
 class RagConfig(ConfigModel):
     enabled: bool = False
     backend: str = "redis_stack"
@@ -813,6 +857,10 @@ class RagConfig(ConfigModel):
     retrieval: RagRetrievalConfig = Field(default_factory=RagRetrievalConfig)
     rerank: RagRerankConfig = Field(default_factory=RagRerankConfig)
     intent_gate: RagIntentGateConfig = Field(default_factory=RagIntentGateConfig)
+    ingestion_queue: RagIngestionQueueConfig = Field(
+        default_factory=RagIngestionQueueConfig
+    )
+    storage: RagStorageConfig = Field(default_factory=RagStorageConfig)
 
     @field_validator("backend")
     @classmethod

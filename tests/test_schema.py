@@ -241,12 +241,17 @@ def test_platform_config_accepts_rag_config():
                 "model": "BAAI/bge-m3",
                 "dimensions": 1024,
             },
+            "ingestion_queue": {"enabled": True, "concurrency": 2},
+            "storage": {"staging_dir": "data/rag/uploads"},
         }
     )
 
     assert config.rag.enabled is True
     assert config.rag.backend == "memory"
     assert config.rag.default_knowledge_base_ids == ["school"]
+    assert config.rag.ingestion_queue.enabled is True
+    assert config.rag.ingestion_queue.concurrency == 2
+    assert config.rag.storage.staging_dir == "data/rag/uploads"
 
 
 def test_checked_in_compose_config_validates():

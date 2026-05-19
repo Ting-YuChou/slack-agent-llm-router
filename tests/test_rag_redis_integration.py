@@ -7,6 +7,26 @@ from src.rag.chunker import DocumentChunk
 from src.rag.vector_store import RedisStackRagVectorStore
 
 
+async def _redis_stack_client_or_skip():
+    redis_asyncio = pytest.importorskip("redis.asyncio")
+    client = redis_asyncio.Redis(
+        host=os.getenv("RAG_REDIS_HOST", "localhost"),
+        port=int(os.getenv("RAG_REDIS_PORT", "6380")),
+        db=int(os.getenv("RAG_REDIS_DB", "0")),
+        decode_responses=False,
+    )
+    try:
+        await client.ping()
+        await client.execute_command("FT._LIST")
+    except Exception as exc:
+        if hasattr(client, "aclose"):
+            await client.aclose()
+        elif hasattr(client, "close"):
+            await client.close()
+        pytest.skip(f"Redis Stack is not available: {exc}")
+    return client
+
+
 def _chunk(chunk_id: str, document_id: str, text: str) -> DocumentChunk:
     return DocumentChunk(
         chunk_id=chunk_id,
@@ -23,21 +43,11 @@ def _chunk(chunk_id: str, document_id: str, text: str) -> DocumentChunk:
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_redis_rag_store_reindex_delete_keyword_and_vector_search():
-    redis_asyncio = pytest.importorskip("redis.asyncio")
-    probe = redis_asyncio.Redis(
-        host=os.getenv("RAG_REDIS_HOST", "localhost"),
-        port=int(os.getenv("RAG_REDIS_PORT", "6380")),
-        db=int(os.getenv("RAG_REDIS_DB", "0")),
-        decode_responses=False,
-    )
-    try:
-        await probe.ping()
-        await probe.execute_command("FT._LIST")
-    except Exception as exc:
-        pytest.skip(f"Redis Stack is not available: {exc}")
-    finally:
-        if hasattr(probe, "close"):
-            await probe.close()
+    probe = await _redis_stack_client_or_skip()
+    if hasattr(probe, "aclose"):
+        await probe.aclose()
+    elif hasattr(probe, "close"):
+        await probe.close()
 
     key_prefix = f"ragtest:{uuid.uuid4().hex}"
     store = RedisStackRagVectorStore(
@@ -132,3 +142,43 @@ async def test_redis_rag_store_reindex_delete_keyword_and_vector_search():
             except Exception:
                 pass
         await store.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_redis_stream_group_ack_and_pending_autoclaim():
+    client = await _redis_stack_client_or_skip()
+    stream = f"ragtest:{uuid.uuid4().hex}:stream"
+    group = "rag-workers"
+    try:
+        await client.xgroup_create(stream, group, id="0", mkstream=True)
+        message_id = await client.xadd(stream, {"job_id": "job-1"})
+        first_read = await client.xreadgroup(
+            group,
+            "worker-1",
+            {stream: ">"},
+            count=1,
+            block=100,
+        )
+        claimed = await client.xautoclaim(
+            stream,
+            group,
+            "worker-2",
+            0,
+            "0-0",
+            count=1,
+        )
+        acked = await client.xack(stream, group, message_id)
+        pending = await client.xpending(stream, group)
+
+        assert first_read
+        assert claimed[1][0][0] == message_id
+        assert acked == 1
+        pending_count = pending["pending"] if isinstance(pending, dict) else pending[0]
+        assert pending_count == 0
+    finally:
+        await client.delete(stream)
+        if hasattr(client, "aclose"):
+            await client.aclose()
+        elif hasattr(client, "close"):
+            await client.close()

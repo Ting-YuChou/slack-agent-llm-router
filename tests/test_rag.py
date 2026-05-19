@@ -1,3 +1,5 @@
+import base64
+
 import pytest
 
 from src.memory import HashEmbeddingProvider
@@ -15,6 +17,105 @@ from src.rag.vector_store import InMemoryRagVectorStore, RagSearchResult
 class FailingEmbeddingProvider:
     async def embed(self, _text):
         raise RuntimeError("embedding endpoint down")
+
+
+class FailingParser:
+    def parse_bytes(self, **_kwargs):
+        raise RuntimeError("parser exploded")
+
+
+class FakeStreamRedis:
+    def __init__(self):
+        self.values = {}
+        self.sets = {}
+        self.streams = {}
+        self.groups = set()
+        self.acked = []
+        self.zsets = {}
+
+    async def get(self, key):
+        return self.values.get(key)
+
+    async def setex(self, key, _ttl, value):
+        self.values[key] = value
+
+    async def delete(self, key):
+        self.values.pop(key, None)
+        self.sets.pop(key, None)
+
+    async def sadd(self, key, member):
+        self.sets.setdefault(key, set()).add(member)
+
+    async def smembers(self, key):
+        return set(self.sets.get(key, set()))
+
+    async def xgroup_create(self, stream, group, id="0", mkstream=True):
+        self.groups.add((stream, group))
+        self.streams.setdefault(stream, [])
+
+    async def xadd(self, stream, fields, **_kwargs):
+        entries = self.streams.setdefault(stream, [])
+        message_id = f"{len(entries) + 1}-0"
+        entries.append((message_id, dict(fields)))
+        return message_id
+
+    async def xack(self, stream, group, message_id):
+        self.acked.append((stream, group, message_id))
+        return 1
+
+    async def zadd(self, key, mapping):
+        self.zsets.setdefault(key, {}).update(mapping)
+
+    async def zrangebyscore(self, key, minimum, maximum):
+        values = self.zsets.get(key, {})
+        return [
+            member
+            for member, score in values.items()
+            if float(minimum) <= float(score) <= float(maximum)
+        ]
+
+    async def zrem(self, key, member):
+        self.zsets.setdefault(key, {}).pop(member, None)
+
+    async def xreadgroup(self, group, consumer, streams, count=1, block=0):
+        stream = next(iter(streams.keys()))
+        entries = self.streams.get(stream, [])[:count]
+        return [(stream, entries)] if entries else []
+
+    async def xautoclaim(
+        self, stream, group, consumer, min_idle_time, start_id, count=1
+    ):
+        return ("0-0", self.streams.get(stream, [])[:count], [])
+
+
+def _queued_rag_service(tmp_path, *, parser=None, max_attempts=3):
+    service = RagService(
+        {
+            "enabled": True,
+            "backend": "memory",
+            "parser": {"provider": "text"},
+            "chunking": {"chunk_size_tokens": 80},
+            "embedding": {"provider": "hash", "dimensions": 16},
+            "ingestion_queue": {
+                "enabled": True,
+                "max_attempts": max_attempts,
+                "retry_backoff_seconds": 0,
+            },
+            "storage": {"staging_dir": str(tmp_path / "rag_uploads")},
+            "retrieval": {
+                "top_k": 5,
+                "candidate_count": 10,
+                "keyword_weight": 1.0,
+                "vector_weight": 0.0,
+                "recency_weight": 0.0,
+            },
+        },
+        parser=parser or TextDocumentParser(),
+        vector_store=InMemoryRagVectorStore(),
+        embedding_provider=HashEmbeddingProvider(dimensions=16),
+    )
+    service.vector_store.client = FakeStreamRedis()
+    return service
 
 
 def test_chunker_preserves_layout_and_section_metadata():
@@ -278,6 +379,184 @@ async def test_embedding_failure_completes_with_warning_and_keyword_index():
     assert job.status == "completed_with_warnings"
     assert job.warnings
     assert results
+
+
+@pytest.mark.asyncio
+async def test_queue_ingestion_stages_file_creates_job_and_xadds_stream(tmp_path):
+    service = _queued_rag_service(tmp_path)
+    await service.initialize()
+
+    job = await service.queue_document_ingestion(
+        content=b"Tuition deadline is May 1.",
+        filename="../../handbook.md",
+        knowledge_base_id="school",
+        document_id="doc-1",
+    )
+
+    staged_path = service.load_staged_content(job.storage_ref)
+    messages = service.vector_store.client.streams[service.stream_key]
+
+    assert staged_path == b"Tuition deadline is May 1."
+    assert ".." not in job.storage_ref
+    assert job.status == "queued"
+    assert messages[0][1]["job_id"] == job.job_id
+    assert messages[0][1]["storage_ref"] == job.storage_ref
+
+
+@pytest.mark.asyncio
+async def test_worker_success_marks_completed_and_acks_stream_message(tmp_path):
+    service = _queued_rag_service(tmp_path)
+    await service.initialize()
+    job = await service.queue_document_ingestion(
+        content=b"Tuition deadline is May 1.",
+        filename="handbook.md",
+        knowledge_base_id="school",
+        document_id="doc-1",
+    )
+    message_id, fields = service.vector_store.client.streams[service.stream_key][0]
+
+    completed = await service.process_stream_message(message_id, fields, "worker-1")
+
+    assert completed.status == "completed"
+    assert completed.attempts == 1
+    assert service.vector_store.client.acked == [
+        (service.stream_key, service.group_name, message_id)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_terminal_pending_job_is_acked_without_reprocessing(tmp_path):
+    service = _queued_rag_service(tmp_path)
+    await service.initialize()
+    job = await service.queue_document_ingestion(
+        content=b"Tuition deadline is May 1.",
+        filename="handbook.md",
+        knowledge_base_id="school",
+        document_id="doc-1",
+    )
+    job.status = "completed"
+    await service._save_job(job)
+    message_id, fields = service.vector_store.client.streams[service.stream_key][0]
+
+    returned = await service.process_stream_message(message_id, fields, "worker-1")
+
+    assert returned.status == "completed"
+    assert service.vector_store.client.acked[-1] == (
+        service.stream_key,
+        service.group_name,
+        message_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_worker_failure_under_max_attempts_moves_job_to_retry_zset(tmp_path):
+    service = _queued_rag_service(tmp_path, parser=FailingParser(), max_attempts=2)
+    await service.initialize()
+    job = await service.queue_document_ingestion(
+        content=b"broken pdf",
+        filename="handbook.pdf",
+        knowledge_base_id="school",
+        document_id="doc-1",
+    )
+    message_id, fields = service.vector_store.client.streams[service.stream_key][0]
+
+    failed = await service.process_stream_message(message_id, fields, "worker-1")
+
+    assert failed.status == "retrying"
+    assert failed.attempts == 1
+    assert job.job_id in service.vector_store.client.zsets[service.retry_zset_key]
+    assert service.vector_store.client.acked[-1] == (
+        service.stream_key,
+        service.group_name,
+        message_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_promoter_requeues_due_jobs(tmp_path):
+    service = _queued_rag_service(tmp_path, parser=FailingParser(), max_attempts=2)
+    await service.initialize()
+    job = await service.queue_document_ingestion(
+        content=b"broken pdf",
+        filename="handbook.pdf",
+        knowledge_base_id="school",
+        document_id="doc-1",
+    )
+    message_id, fields = service.vector_store.client.streams[service.stream_key][0]
+    await service.process_stream_message(message_id, fields, "worker-1")
+
+    promoted = await service.promote_due_retries()
+    requeued = await service.get_job(job.job_id)
+
+    assert promoted == 1
+    assert requeued.status == "queued"
+    assert len(service.vector_store.client.streams[service.stream_key]) == 2
+
+
+@pytest.mark.asyncio
+async def test_worker_exhausts_retries_to_dead_letter_stream(tmp_path):
+    service = _queued_rag_service(tmp_path, parser=FailingParser(), max_attempts=1)
+    await service.initialize()
+    job = await service.queue_document_ingestion(
+        content=b"broken pdf",
+        filename="handbook.pdf",
+        knowledge_base_id="school",
+        document_id="doc-1",
+    )
+    message_id, fields = service.vector_store.client.streams[service.stream_key][0]
+
+    dead = await service.process_stream_message(message_id, fields, "worker-1")
+
+    assert dead.status == "dead_lettered"
+    assert dead.attempts == 1
+    dlq = service.vector_store.client.streams[service.dead_letter_stream_key]
+    assert dlq[0][1]["job_id"] == job.job_id
+    assert "parser exploded" in dlq[0][1]["error"]
+
+
+@pytest.mark.asyncio
+async def test_batch_progress_tracks_queued_and_completed_jobs(tmp_path):
+    service = _queued_rag_service(tmp_path)
+    await service.initialize()
+
+    batch = await service.create_batch(
+        knowledge_base_id="school",
+        documents=[
+            {
+                "filename": "one.md",
+                "document_id": "doc-1",
+                "content_base64": base64.b64encode(b"One tuition rule").decode(),
+            },
+            {
+                "filename": "two.md",
+                "document_id": "doc-2",
+                "content_base64": base64.b64encode(b"Two tuition rule").decode(),
+            },
+        ],
+    )
+    before = await service.get_batch(batch.batch_id)
+    message_id, fields = service.vector_store.client.streams[service.stream_key][0]
+    await service.process_stream_message(message_id, fields, "worker-1")
+    after = await service.get_batch(batch.batch_id)
+
+    assert before["total"] == 2
+    assert before["status_counts"]["queued"] == 2
+    assert after["status_counts"]["completed"] == 1
+    assert after["status_counts"]["queued"] == 1
+
+
+@pytest.mark.asyncio
+async def test_queue_rejects_storage_ref_outside_staging_dir(tmp_path):
+    service = _queued_rag_service(tmp_path)
+    await service.initialize()
+
+    with pytest.raises(ValueError, match="storage_ref"):
+        await service.queue_document_ingestion(
+            storage_ref="/tmp/not-in-rag-staging.pdf",
+            filename="handbook.pdf",
+            knowledge_base_id="school",
+            document_id="doc-1",
+        )
 
 
 def test_docling_parser_extracts_table_text_and_layout_metadata():

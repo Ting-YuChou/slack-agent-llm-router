@@ -52,7 +52,7 @@ from src.utils.metrics import (
     sum_metric_by_label,
     sum_metric_values,
 )
-from src.utils.schema import PlatformConfig, QueryRequest, RagQueryRequest
+from src.utils.schema import PlatformConfig, QueryRequest, RagBatchRequest, RagQueryRequest
 from slack.bot import SlackBot
 
 
@@ -1398,15 +1398,16 @@ class LLMRouterPlatform:
             try:
                 payload = await self._parse_rag_document_request(request)
                 job = await rag_service.queue_document_ingestion(**payload)
-                background_tasks.add_task(
-                    rag_service.process_ingestion_job,
-                    job.job_id,
-                    content=payload["content"],
-                    filename=payload["filename"],
-                    knowledge_base_id=job.knowledge_base_id,
-                    metadata=payload.get("metadata"),
-                    document_id=job.document_id,
-                )
+                if not getattr(rag_service, "queue_enabled", False):
+                    background_tasks.add_task(
+                        rag_service.process_ingestion_job,
+                        job.job_id,
+                        content=payload["content"],
+                        filename=payload["filename"],
+                        knowledge_base_id=job.knowledge_base_id,
+                        metadata=payload.get("metadata"),
+                        document_id=job.document_id,
+                    )
                 return job.to_dict()
             except ValueError as exc:
                 return JSONResponse(
@@ -1438,6 +1439,73 @@ class LLMRouterPlatform:
                     content={"error": "rag_job_not_found"},
                 )
             return job.to_dict()
+
+        @app.post("/rag/jobs/{job_id}/retry")
+        async def retry_rag_job(job_id: str):
+            rag_service = self._get_rag_service()
+            if rag_service is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "rag_disabled"},
+                )
+            try:
+                job = await rag_service.retry_job(job_id)
+            except ValueError as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_rag_retry", "message": str(exc)},
+                )
+            if job is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": "rag_job_not_found"},
+                )
+            return job.to_dict()
+
+        @app.post("/rag/batches")
+        async def create_rag_batch(batch_request: RagBatchRequest):
+            rag_service = self._get_rag_service()
+            if rag_service is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "rag_disabled"},
+                )
+            try:
+                batch = await rag_service.create_batch(
+                    documents=[
+                        document.model_dump(mode="python")
+                        for document in batch_request.documents
+                    ],
+                    knowledge_base_id=batch_request.knowledge_base_id,
+                    metadata=batch_request.metadata,
+                )
+            except ValueError as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_rag_batch", "message": str(exc)},
+                )
+            except RuntimeError as exc:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "rag_batch_unavailable", "message": str(exc)},
+                )
+            return batch.to_dict()
+
+        @app.get("/rag/batches/{batch_id}")
+        async def get_rag_batch(batch_id: str):
+            rag_service = self._get_rag_service()
+            if rag_service is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "rag_disabled"},
+                )
+            batch = await rag_service.get_batch(batch_id)
+            if batch is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": "rag_batch_not_found"},
+                )
+            return batch
 
         @app.post("/rag/query")
         async def query_rag_documents(query_data: RagQueryRequest):
@@ -1633,6 +1701,23 @@ def start_workers(config: str):
     """Start only enabled background services."""
     platform = LLMRouterPlatform(config_path=config)
     asyncio.run(platform.run(include_api=False, include_background=True))
+
+
+@cli.command()
+@click.option("--config", default=DEFAULT_CONFIG_PATH, help="Configuration file path")
+def start_rag_workers(config: str):
+    """Start Redis Streams RAG ingestion workers."""
+
+    async def _run():
+        platform = LLMRouterPlatform(config_path=config)
+        rag_service = RagService(config=dict(platform.config.get("rag", {})))
+        await rag_service.initialize()
+        try:
+            await rag_service.run_ingestion_workers()
+        finally:
+            await rag_service.shutdown()
+
+    asyncio.run(_run())
 
 
 @cli.command()

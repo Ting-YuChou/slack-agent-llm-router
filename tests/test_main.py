@@ -325,8 +325,12 @@ class DummyRagService:
     def __init__(self, config):
         self.config = config
         self.enabled = bool(config.get("enabled", False))
+        self.queue_enabled = bool(
+            config.get("ingestion_queue", {}).get("enabled", False)
+        )
         self.jobs = {}
         self.deleted = []
+        self.batches = {}
 
     async def initialize(self):
         return None
@@ -368,6 +372,43 @@ class DummyRagService:
 
     async def get_job(self, job_id):
         return self.jobs.get(job_id)
+
+    async def retry_job(self, job_id):
+        job = self.jobs.get(job_id)
+        if job:
+            job.status = "queued"
+        return job
+
+    async def create_batch(self, documents, knowledge_base_id=None, metadata=None):
+        jobs = []
+        for index, payload in enumerate(documents, start=1):
+            job = SimpleNamespace(
+                job_id=f"job-{index}",
+                document_id=payload.get("document_id") or f"doc-{index}",
+                filename=payload["filename"],
+                knowledge_base_id=knowledge_base_id or "default",
+                status="queued",
+                chunks_indexed=0,
+                error=None,
+                warnings=[],
+                to_dict=lambda: {},
+            )
+            self.jobs[job.job_id] = job
+            jobs.append(job)
+        batch = {
+            "batch_id": "batch-1",
+            "knowledge_base_id": knowledge_base_id or "default",
+            "total": len(jobs),
+            "status": "running",
+            "status_counts": {"queued": len(jobs)},
+            "job_ids": [job.job_id for job in jobs],
+            "jobs": [job.__dict__ for job in jobs],
+        }
+        self.batches["batch-1"] = batch
+        return SimpleNamespace(to_dict=lambda: batch)
+
+    async def get_batch(self, batch_id):
+        return self.batches.get(batch_id)
 
     async def retrieve(self, query, **_kwargs):
         return []
@@ -871,6 +912,37 @@ class TestApiApp:
         assert job_response.status_code == 200
         assert job_response.json()["job_id"] == "job-1"
         assert job_response.json()["status"] == "completed"
+
+    def test_rag_batch_endpoints_create_and_report_progress(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(
+            tmp_path,
+            overrides={"rag": {"enabled": True, "backend": "memory"}},
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        platform.services["rag"] = DummyRagService({"enabled": True})
+        app = platform._create_fastapi_app()
+
+        payload = {
+            "knowledge_base_id": "school",
+            "documents": [
+                {
+                    "filename": "one.pdf",
+                    "content_base64": base64.b64encode(b"%PDF-1.7").decode("ascii"),
+                    "document_id": "doc-1",
+                }
+            ],
+        }
+        with TestClient(app) as client:
+            create_response = client.post("/rag/batches", json=payload)
+            get_response = client.get("/rag/batches/batch-1")
+
+        assert create_response.status_code == 200
+        assert create_response.json()["batch_id"] == "batch-1"
+        assert create_response.json()["total"] == 1
+        assert get_response.status_code == 200
+        assert get_response.json()["status_counts"]["queued"] == 1
 
     def test_rag_query_and_delete_endpoints_require_rag_service(
         self, tmp_path, patched_platform_deps
