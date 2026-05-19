@@ -11,6 +11,7 @@ from src.utils.schema import (
     ModelConfig,
     PlatformConfig,
     QueryRequest,
+    RagPolicy,
     ResponseSource,
     SystemMetric,
     ToolCall,
@@ -62,6 +63,20 @@ def test_query_request_accepts_web_search_tool_options():
     assert request.web_search_options.max_results == 3
 
 
+def test_query_request_accepts_rag_options():
+    request = QueryRequest(
+        query="When is tuition due?",
+        user_id="u1",
+        rag_policy=RagPolicy.REQUIRED,
+        knowledge_base_ids=["school"],
+        rag_options={"max_results": 4, "candidate_count": 20, "min_score": 0.1},
+    )
+
+    assert request.rag_policy == RagPolicy.REQUIRED
+    assert request.knowledge_base_ids == ["school"]
+    assert request.rag_options.max_results == 4
+
+
 def test_inference_response_auto_calculates_total_tokens_when_zero():
     response = InferenceResponse(
         response_text="ok",
@@ -96,6 +111,11 @@ def test_inference_response_accepts_sources_and_tool_calls():
                 snippet="snippet",
                 score=0.8,
                 rank=1,
+                source_type="rag",
+                document_id="doc-1",
+                page=3,
+                bbox=[0, 0, 10, 10],
+                chunk_id="chunk-1",
             )
         ],
         tool_calls=[
@@ -105,6 +125,7 @@ def test_inference_response_accepts_sources_and_tool_calls():
 
     assert response.sources[0].url == "https://example.com"
     assert response.sources[0].score == 0.8
+    assert response.sources[0].chunk_id == "chunk-1"
     assert response.tool_calls[0].name == "web_search"
 
 
@@ -205,6 +226,25 @@ def test_platform_config_accepts_tavily_web_search_config():
     assert config.tools.web_search.enabled is True
     assert config.tools.web_search.provider == "tavily"
     assert config.tools.web_search.max_results_per_domain == 1
+
+
+def test_platform_config_accepts_rag_config():
+    config = PlatformConfig(
+        rag={
+            "enabled": True,
+            "backend": "memory",
+            "default_knowledge_base_ids": ["school"],
+            "embedding": {
+                "provider": "local_http",
+                "model": "BAAI/bge-m3",
+                "dimensions": 1024,
+            },
+        }
+    )
+
+    assert config.rag.enabled is True
+    assert config.rag.backend == "memory"
+    assert config.rag.default_knowledge_base_ids == ["school"]
 
 
 def test_checked_in_compose_config_validates():

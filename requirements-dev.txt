@@ -26,6 +26,7 @@ redis==5.0.8
 aiokafka==0.10.0
 clickhouse-connect==0.8.18
 slack-sdk==3.35.0
+python-multipart>=0.0.20
 
 pandas==2.3.3
 plotly==6.3.1
@@ -37,3 +38,5 @@ sentence-transformers==5.1.2
 scikit-learn==1.7.2
 torch==2.9.0
 gputil==1.4.0
+docling>=2.50.0
+langchain-text-splitters>=0.3.11

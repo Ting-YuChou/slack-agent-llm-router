@@ -174,6 +174,50 @@ tools:
     max_results_per_domain: 2
     blocked_domains: []
     freshness_days: 14
+rag:
+  enabled: false
+  backend: redis_stack
+  auto_retrieve: true
+  default_knowledge_base_ids: []
+  parser:
+    provider: docling
+    allow_cloud_fallback: false
+    max_file_size_bytes: 100000000
+    timeout_seconds: 300
+    ocr_enabled: true
+  chunking:
+    strategy: hybrid
+    chunk_size_tokens: 900
+    chunk_overlap_tokens: 120
+    repeat_table_headers: true
+    max_chunk_chars: 6000
+  embedding:
+    provider: local_http
+    model: BAAI/bge-m3
+    dimensions: 1024
+    timeout: 30
+    url: http://127.0.0.1:8002/v1
+    api_key_env: OPENAI_API_KEY
+  redis:
+    host: localhost
+    port: 6380
+    db: 0
+    key_prefix: rag
+    password_env: REDIS_PASSWORD
+  retrieval:
+    top_k: 5
+    candidate_count: 30
+    min_score: 0.0
+    keyword_weight: 0.35
+    vector_weight: 0.6
+    recency_weight: 0.05
+    max_context_chars: 6000
+  rerank:
+    enabled: false
+    provider: none
+    model: BAAI/bge-reranker-v2-m3
+    top_n: 8
+    timeout: 30
 kafka:
   bootstrap_servers:
   - localhost:9092

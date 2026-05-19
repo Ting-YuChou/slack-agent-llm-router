@@ -34,6 +34,12 @@ class ToolPolicy(str, Enum):
     REQUIRED = "required"
 
 
+class RagPolicy(str, Enum):
+    DISABLED = "disabled"
+    AUTO = "auto"
+    REQUIRED = "required"
+
+
 class AttachmentType(str, Enum):
     FILE = "file"
     IMAGE = "image"
@@ -76,6 +82,11 @@ class ResponseSource(BaseModel):
     published_at: Optional[str] = None
     score: Optional[float] = Field(None, ge=0.0)
     rank: int = Field(ge=1)
+    source_type: Optional[str] = None
+    document_id: Optional[str] = None
+    page: Optional[int] = Field(None, ge=1)
+    bbox: Optional[List[float]] = None
+    chunk_id: Optional[str] = None
 
 
 class ToolCall(BaseModel):
@@ -110,6 +121,11 @@ class QueryRequest(BaseModel):
     tool_policy: ToolPolicy = ToolPolicy.AUTO
     allowed_tools: List[str] = Field(default_factory=list)
     web_search_options: Optional[WebSearchOptions] = None
+
+    # RAG handling
+    rag_policy: RagPolicy = RagPolicy.AUTO
+    knowledge_base_ids: List[str] = Field(default_factory=list)
+    rag_options: Optional["RagOptions"] = None
 
     # Additional metadata
     session_id: Optional[str] = None
@@ -177,6 +193,30 @@ class InferenceResponse(BaseModel):
         if self.total_tokens == 0:
             self.total_tokens = self.token_count_input + self.token_count_output
         return self
+
+
+class RagOptions(BaseModel):
+    max_results: Optional[int] = Field(None, ge=1, le=20)
+    candidate_count: Optional[int] = Field(None, ge=1, le=100)
+    min_score: Optional[float] = Field(None, ge=0.0, le=1.0)
+    include_debug: bool = False
+
+
+class RagQueryRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=50000)
+    user_id: str = Field(..., min_length=1)
+    knowledge_base_ids: List[str] = Field(default_factory=list)
+    max_results: int = Field(5, ge=1, le=20)
+    candidate_count: int = Field(30, ge=1, le=100)
+    min_score: float = Field(0.0, ge=0.0, le=1.0)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("query")
+    @classmethod
+    def validate_rag_query(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Query cannot be empty or whitespace only")
+        return v.strip()
 
 
 class RoutingDecision(BaseModel):
@@ -687,6 +727,90 @@ class PipelineConfig(ConfigModel):
     enabled: bool = False
 
 
+class RagParserConfig(ConfigModel):
+    provider: str = "docling"
+    allow_cloud_fallback: bool = False
+    max_file_size_bytes: int = Field(100_000_000, ge=1)
+    timeout_seconds: int = Field(300, ge=1)
+    ocr_enabled: bool = True
+
+    @field_validator("provider")
+    @classmethod
+    def validate_provider(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"docling", "text"}:
+            raise ValueError("rag parser provider must be one of: docling, text")
+        return normalized
+
+
+class RagChunkingConfig(ConfigModel):
+    strategy: str = "hybrid"
+    chunk_size_tokens: int = Field(900, ge=100, le=4000)
+    chunk_overlap_tokens: int = Field(120, ge=0, le=1000)
+    repeat_table_headers: bool = True
+    max_chunk_chars: int = Field(6000, ge=500)
+
+
+class RagEmbeddingConfig(ConfigModel):
+    provider: str = "local_http"
+    model: str = "BAAI/bge-m3"
+    dimensions: int = Field(1024, ge=1)
+    timeout: int = Field(30, ge=1)
+    api_key: Optional[str] = None
+    api_key_env: Optional[str] = "OPENAI_API_KEY"
+    base_url: Optional[str] = None
+    url: Optional[str] = "http://127.0.0.1:8002/v1"
+
+
+class RagRedisConfig(ConfigModel):
+    host: str = "localhost"
+    port: int = Field(6380, ge=1, le=65535)
+    db: int = Field(0, ge=0)
+    url: Optional[str] = None
+    password_env: Optional[str] = None
+    key_prefix: str = "rag"
+
+
+class RagRetrievalConfig(ConfigModel):
+    top_k: int = Field(5, ge=1, le=20)
+    candidate_count: int = Field(30, ge=1, le=100)
+    min_score: float = Field(0.0, ge=0.0, le=1.0)
+    keyword_weight: float = Field(0.35, ge=0.0)
+    vector_weight: float = Field(0.6, ge=0.0)
+    recency_weight: float = Field(0.05, ge=0.0)
+    max_context_chars: int = Field(6000, ge=500)
+
+
+class RagRerankConfig(ConfigModel):
+    enabled: bool = False
+    provider: str = "none"
+    model: str = "BAAI/bge-reranker-v2-m3"
+    top_n: int = Field(8, ge=1, le=50)
+    timeout: int = Field(30, ge=1)
+    url: Optional[str] = None
+
+
+class RagConfig(ConfigModel):
+    enabled: bool = False
+    backend: str = "redis_stack"
+    auto_retrieve: bool = True
+    default_knowledge_base_ids: List[str] = Field(default_factory=list)
+    parser: RagParserConfig = Field(default_factory=RagParserConfig)
+    chunking: RagChunkingConfig = Field(default_factory=RagChunkingConfig)
+    embedding: RagEmbeddingConfig = Field(default_factory=RagEmbeddingConfig)
+    redis: RagRedisConfig = Field(default_factory=RagRedisConfig)
+    retrieval: RagRetrievalConfig = Field(default_factory=RagRetrievalConfig)
+    rerank: RagRerankConfig = Field(default_factory=RagRerankConfig)
+
+    @field_validator("backend")
+    @classmethod
+    def validate_backend(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"memory", "redis_stack"}:
+            raise ValueError("rag backend must be one of: memory, redis_stack")
+        return normalized
+
+
 class PlatformConfig(ConfigModel):
     api: ApiConfig = Field(default_factory=ApiConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
@@ -700,6 +824,7 @@ class PlatformConfig(ConfigModel):
     flink: FlinkConfig = Field(default_factory=FlinkConfig)
     policy_cache: PolicyCacheConfig = Field(default_factory=PolicyCacheConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    rag: RagConfig = Field(default_factory=RagConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     performance: PerformanceConfig = Field(default_factory=PerformanceConfig)
     development: DevelopmentConfig = Field(default_factory=DevelopmentConfig)
