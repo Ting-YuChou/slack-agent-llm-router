@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Any, AsyncIterator, Union, Tuple
+from typing import Dict, List, Optional, Any, AsyncIterator, Union, Tuple, Sequence
 import hashlib
 
 import httpx
@@ -1517,10 +1517,12 @@ class InferenceEngine:
                     rag_result,
                     start_time,
                 )
-                await self._publish_analytics_events(
+                await self._finalize_successful_response(
                     request,
                     response,
-                    routing_decision=routing_decision,
+                    model_name,
+                    routing_decision,
+                    start_time,
                 )
                 return response
 
@@ -1562,28 +1564,12 @@ class InferenceEngine:
                     response.model_dump(mode="json"),
                 )
 
-            # Step 8: Update metrics and stats
-            inference_time = time.time() - start_time
-            await self._update_stats(model_name, response, inference_time)
-            self._record_provider_cache_metrics(model_name, response)
-
-            # Step 9: Update router stats
-            self.router.update_model_stats(
-                model_name=model_name, success=True, latency_ms=response.latency_ms
-            )
-
-            INFERENCE_METRICS.requests_total.labels(
-                model=model_name, provider=response.provider
-            ).inc()
-
-            INFERENCE_METRICS.request_duration.labels(
-                model=model_name, provider=response.provider
-            ).observe(inference_time)
-
-            await self._publish_analytics_events(
+            await self._finalize_successful_response(
                 request,
                 response,
-                routing_decision=routing_decision,
+                model_name,
+                routing_decision,
+                start_time,
             )
             return response
 
@@ -1633,6 +1619,36 @@ class InferenceEngine:
                 else None,
             )
             return error_response
+
+    async def _finalize_successful_response(
+        self,
+        request: QueryRequest,
+        response: InferenceResponse,
+        model_name: str,
+        routing_decision: Any,
+        started_at: float,
+    ) -> None:
+        inference_time = time.time() - started_at
+        await self._update_stats(model_name, response, inference_time)
+        self._record_provider_cache_metrics(model_name, response)
+        self.router.update_model_stats(
+            model_name=model_name,
+            success=True,
+            latency_ms=response.latency_ms,
+        )
+        INFERENCE_METRICS.requests_total.labels(
+            model=model_name,
+            provider=response.provider,
+        ).inc()
+        INFERENCE_METRICS.request_duration.labels(
+            model=model_name,
+            provider=response.provider,
+        ).observe(inference_time)
+        await self._publish_analytics_events(
+            request,
+            response,
+            routing_decision=routing_decision,
+        )
 
     async def _run_web_search_if_needed(
         self,
@@ -1709,6 +1725,9 @@ class InferenceEngine:
             request.metadata["rag_chunk_ids"] = [
                 result.chunk.chunk_id for result in results
             ]
+            request.metadata["rag_index_versions"] = [
+                result.index_version or "" for result in results
+            ]
             request.metadata["rag_match_sources"] = [
                 result.match_source for result in results
             ]
@@ -1761,18 +1780,32 @@ class InferenceEngine:
         }:
             return False
 
-        strong_match = any(term.lower() in lowered for term in RAG_AUTO_STRONG_TERMS)
+        strong_terms = self._rag_intent_terms("strong_terms", RAG_AUTO_STRONG_TERMS)
+        context_terms = self._rag_intent_terms("context_terms", RAG_AUTO_CONTEXT_TERMS)
+        school_terms = self._rag_intent_terms(
+            "school_context_terms", RAG_AUTO_SCHOOL_CONTEXT_TERMS
+        )
+        exclude_terms = self._rag_intent_terms("exclude_terms", RAG_AUTO_EXCLUDE_TERMS)
+
+        strong_match = any(str(term).lower() in lowered for term in strong_terms)
         context_match = any(
-            term.lower() in lowered for term in RAG_AUTO_CONTEXT_TERMS
-        ) and any(term.lower() in lowered for term in RAG_AUTO_SCHOOL_CONTEXT_TERMS)
+            str(term).lower() in lowered for term in context_terms
+        ) and any(str(term).lower() in lowered for term in school_terms)
 
         if not (strong_match or context_match):
             return False
 
-        if any(term in lowered for term in RAG_AUTO_EXCLUDE_TERMS):
+        if any(str(term).lower() in lowered for term in exclude_terms):
             return False
 
         return True
+
+    def _rag_intent_terms(self, key: str, default: Sequence[str]) -> Sequence[str]:
+        intent_config = dict(getattr(self.rag_service, "intent_gate_config", {}) or {})
+        configured = intent_config.get(key)
+        if isinstance(configured, (list, tuple, set)) and configured:
+            return [str(term) for term in configured]
+        return default
 
     def _build_required_rag_no_hit_response(
         self,
@@ -1852,6 +1885,7 @@ class InferenceEngine:
 
     async def stream_query(self, request: QueryRequest) -> AsyncIterator[str]:
         """Stream query response"""
+        start_time = time.time()
         try:
             # Route query
             routing_decision = await self.router.route_query(request)
@@ -1859,6 +1893,19 @@ class InferenceEngine:
             await self._compress_request_context_if_needed(request)
             rag_result = await self._run_rag_if_needed(request, routing_decision)
             if rag_result and rag_result.required_no_hits:
+                response = self._build_required_rag_no_hit_response(
+                    request,
+                    model_name,
+                    rag_result,
+                    start_time,
+                )
+                await self._finalize_successful_response(
+                    request,
+                    response,
+                    model_name,
+                    routing_decision,
+                    start_time,
+                )
                 yield "文件庫沒有足夠資訊可以回答這個問題。"
                 return
             await self._run_web_search_if_needed(request, routing_decision)

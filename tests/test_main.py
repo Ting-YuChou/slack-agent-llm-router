@@ -332,28 +332,41 @@ class DummyRagService:
         return None
 
     async def ingest_document(self, **payload):
+        job = await self.queue_document_ingestion(**payload)
+        job.status = "completed"
+        self.jobs[job.job_id] = job
+        return job
+
+    async def queue_document_ingestion(self, **payload):
         job = SimpleNamespace(
             job_id="job-1",
             document_id=payload.get("document_id") or "doc-1",
             filename=payload["filename"],
             knowledge_base_id=payload.get("knowledge_base_id") or "default",
-            status="completed",
+            status="queued",
             chunks_indexed=2,
             error=None,
+            warnings=[],
             to_dict=lambda: {
                 "job_id": "job-1",
                 "document_id": payload.get("document_id") or "doc-1",
                 "filename": payload["filename"],
                 "knowledge_base_id": payload.get("knowledge_base_id") or "default",
-                "status": "completed",
+                "status": job.status,
                 "chunks_indexed": 2,
                 "error": None,
+                "warnings": [],
             },
         )
         self.jobs[job.job_id] = job
         return job
 
-    def get_job(self, job_id):
+    async def process_ingestion_job(self, job_id, **_payload):
+        job = self.jobs[job_id]
+        job.status = "completed"
+        return job
+
+    async def get_job(self, job_id):
         return self.jobs.get(job_id)
 
     async def retrieve(self, query, **_kwargs):
@@ -853,10 +866,11 @@ class TestApiApp:
             job_response = client.get("/rag/jobs/job-1")
 
         assert response.status_code == 200
-        assert response.json()["status"] == "completed"
+        assert response.json()["status"] == "queued"
         assert response.json()["knowledge_base_id"] == "school"
         assert job_response.status_code == 200
         assert job_response.json()["job_id"] == "job-1"
+        assert job_response.json()["status"] == "completed"
 
     def test_rag_query_and_delete_endpoints_require_rag_service(
         self, tmp_path, patched_platform_deps

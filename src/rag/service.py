@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import binascii
+import json
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -20,15 +21,16 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class IngestionJob:
-    """In-memory ingestion job record surfaced by the API."""
+    """Ingestion job record surfaced by the API."""
 
     job_id: str
     document_id: str
     filename: str
     knowledge_base_id: str
-    status: str = "pending"
+    status: str = "queued"
     chunks_indexed: int = 0
     error: Optional[str] = None
+    warnings: List[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
 
@@ -41,9 +43,25 @@ class IngestionJob:
             "status": self.status,
             "chunks_indexed": self.chunks_indexed,
             "error": self.error,
+            "warnings": list(self.warnings),
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
         }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "IngestionJob":
+        return cls(
+            job_id=str(payload["job_id"]),
+            document_id=str(payload["document_id"]),
+            filename=str(payload["filename"]),
+            knowledge_base_id=str(payload["knowledge_base_id"]),
+            status=str(payload.get("status") or "queued"),
+            chunks_indexed=int(payload.get("chunks_indexed") or 0),
+            error=payload.get("error"),
+            warnings=list(payload.get("warnings") or []),
+            created_at=_parse_datetime(payload.get("created_at")),
+            updated_at=_parse_datetime(payload.get("updated_at")),
+        )
 
 
 class RagService:
@@ -67,6 +85,9 @@ class RagService:
         self.chunking_config = dict(self.config.get("chunking", {}) or {})
         self.embedding_config = dict(self.config.get("embedding", {}) or {})
         self.retrieval_config = dict(self.config.get("retrieval", {}) or {})
+        self.redis_config = dict(self.config.get("redis", {}) or {})
+        self.intent_gate_config = dict(self.config.get("intent_gate", {}) or {})
+        self.job_ttl_seconds = int(self.config.get("job_ttl_seconds", 86400))
         self.parser = parser or build_document_parser(self.parser_config)
         self.chunker = build_chunker(self.chunking_config)
         self.embedding_provider = embedding_provider or build_embedding_provider(
@@ -100,6 +121,32 @@ class RagService:
         metadata: Optional[Dict[str, Any]] = None,
         document_id: Optional[str] = None,
     ) -> IngestionJob:
+        job = await self.queue_document_ingestion(
+            content=content,
+            filename=filename,
+            knowledge_base_id=knowledge_base_id,
+            metadata=metadata,
+            document_id=document_id,
+        )
+        return await self.process_ingestion_job(
+            job.job_id,
+            content=content,
+            filename=filename,
+            knowledge_base_id=job.knowledge_base_id,
+            metadata=metadata,
+            document_id=job.document_id,
+            raise_on_error=True,
+        )
+
+    async def queue_document_ingestion(
+        self,
+        *,
+        content: bytes,
+        filename: str,
+        knowledge_base_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        document_id: Optional[str] = None,
+    ) -> IngestionJob:
         if not self.enabled:
             raise RuntimeError("RAG service is disabled")
         max_size = int(self.parser_config.get("max_file_size_bytes", 100_000_000))
@@ -114,36 +161,65 @@ class RagService:
             filename=filename,
             knowledge_base_id=resolved_kb_id,
         )
-        self.jobs[job.job_id] = job
+        await self._save_job(job)
+        return job
 
+    async def process_ingestion_job(
+        self,
+        job_id: str,
+        *,
+        content: bytes,
+        filename: str,
+        knowledge_base_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        document_id: str,
+        raise_on_error: bool = False,
+    ) -> IngestionJob:
+        job = await self.get_job(job_id)
+        if job is None:
+            job = IngestionJob(
+                job_id=job_id,
+                document_id=document_id,
+                filename=filename,
+                knowledge_base_id=knowledge_base_id,
+            )
         try:
             job.status = "running"
             job.updated_at = datetime.now()
-            parsed = self.parser.parse_bytes(
+            await self._save_job(job)
+            parsed = await asyncio.to_thread(
+                self.parser.parse_bytes,
                 content=content,
                 filename=filename,
-                document_id=resolved_document_id,
+                document_id=document_id,
                 metadata={
                     **dict(metadata or {}),
-                    "knowledge_base_id": resolved_kb_id,
+                    "knowledge_base_id": knowledge_base_id,
                 },
             )
             chunks = self.chunker.chunk(parsed)
-            embeddings = await self._embed_chunks(chunks)
+            if not chunks:
+                raise ValueError("Document parsing produced no indexable text chunks")
+            embeddings, warnings = await self._embed_chunks(chunks)
+            job.warnings = warnings
             job.chunks_indexed = await self.vector_store.upsert_chunks(
                 chunks,
                 embeddings,
-                knowledge_base_id=resolved_kb_id,
+                knowledge_base_id=knowledge_base_id,
             )
-            job.status = "completed"
+            job.status = "completed_with_warnings" if warnings else "completed"
             job.updated_at = datetime.now()
+            await self._save_job(job)
             return job
         except Exception as exc:
             job.status = "failed"
             job.error = str(exc)
             job.updated_at = datetime.now()
+            await self._save_job(job)
             logger.exception("RAG ingestion failed for %s", filename)
-            raise
+            if raise_on_error:
+                raise
+            return job
 
     async def retrieve(
         self,
@@ -180,11 +256,13 @@ class RagService:
         if not results:
             return ""
         max_context_chars = int(self.retrieval_config.get("max_context_chars", 6000))
-        remaining = max_context_chars
         lines = [
             "School document search results (trusted indexed school documents):",
             "Answer only from these sources when they are relevant. Cite sources inline as [S1], [S2], etc. If the sources do not contain the answer, say the school document library does not have enough information.",
         ]
+        remaining = max_context_chars - len("\n\n".join(lines)) - 2
+        if remaining <= 0:
+            return "\n\n".join(lines)[:max_context_chars]
         for index, result in enumerate(results, start=1):
             chunk = result.chunk
             title = str(
@@ -198,11 +276,16 @@ class RagService:
                 else f"pp. {chunk.page_start}-{chunk.page_end}"
             )
             text = " ".join(chunk.text.split())
-            entry = (
+            source_header = (
                 f"[S{index}] {title} ({page}, kb={result.knowledge_base_id})\n"
                 f"Chunk: {chunk.chunk_id}\n"
-                f"Content: {text}"
             )
+            budget = remaining - len(source_header) - len("Content: ") - 2
+            if budget <= 0:
+                break
+            if len(text) > budget:
+                text = text[: max(budget - 3, 0)].rstrip() + "..."
+            entry = source_header + f"Content: {text}"
             if len(entry) + 2 > remaining:
                 break
             lines.append(entry)
@@ -232,6 +315,7 @@ class RagService:
                     page=chunk.page_start,
                     bbox=chunk.bboxes[0] if chunk.bboxes else None,
                     chunk_id=chunk.chunk_id,
+                    index_version=result.index_version,
                 )
             )
         return sources
@@ -251,7 +335,15 @@ class RagService:
             error=None if results else "rag_no_hits",
         )
 
-    def get_job(self, job_id: str) -> Optional[IngestionJob]:
+    async def get_job(self, job_id: str) -> Optional[IngestionJob]:
+        client = self._job_client()
+        if client:
+            raw = await client.get(self._job_key(job_id))
+            if raw:
+                try:
+                    return IngestionJob.from_dict(json.loads(_decode(raw)))
+                except Exception:
+                    logger.warning("Failed to decode RAG ingestion job %s", job_id)
         return self.jobs.get(job_id)
 
     async def delete_document(
@@ -277,17 +369,28 @@ class RagService:
                 "section_path": result.chunk.section_path,
                 "snippet": " ".join(result.chunk.text.split())[:1000],
                 "metadata": result.chunk.metadata,
+                "index_version": result.index_version,
             }
             for index, result in enumerate(results, start=1)
         ]
 
     async def _embed_chunks(
         self, chunks: Sequence[DocumentChunk]
-    ) -> List[Optional[List[float]]]:
+    ) -> tuple[List[Optional[List[float]]], List[str]]:
         embeddings = []
+        failures = 0
         for chunk in chunks:
-            embeddings.append(await self._safe_embed(chunk.text))
-        return embeddings
+            embedding = await self._safe_embed(chunk.text)
+            if embedding is None:
+                failures += 1
+            embeddings.append(embedding)
+        warnings = []
+        if failures:
+            warnings.append(
+                f"Embedding unavailable for {failures} of {len(chunks)} chunks; "
+                "indexed affected chunks for keyword-only retrieval."
+            )
+        return embeddings, warnings
 
     async def _safe_embed(self, text: str) -> Optional[List[float]]:
         try:
@@ -312,9 +415,47 @@ class RagService:
             return self.default_knowledge_base_ids[0]
         return "default"
 
+    async def _save_job(self, job: IngestionJob) -> None:
+        self.jobs[job.job_id] = job
+        client = self._job_client()
+        if not client:
+            return
+        await client.setex(
+            self._job_key(job.job_id),
+            self.job_ttl_seconds,
+            json.dumps(job.to_dict(), sort_keys=True),
+        )
+
+    def _job_client(self) -> Optional[Any]:
+        client = getattr(self.vector_store, "client", None)
+        if client and hasattr(client, "get") and hasattr(client, "setex"):
+            return client
+        return None
+
+    def _job_key(self, job_id: str) -> str:
+        key_prefix = str(self.redis_config.get("key_prefix") or "rag")
+        return f"{key_prefix}:jobs:{job_id}"
+
 
 def decode_base64_document(payload: str) -> bytes:
     try:
         return base64.b64decode(payload.encode("utf-8"), validate=True)
     except (binascii.Error, ValueError) as exc:
         raise ValueError("content_base64 must be valid base64") from exc
+
+
+def _decode(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def _parse_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if value:
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError:
+            pass
+    return datetime.now()

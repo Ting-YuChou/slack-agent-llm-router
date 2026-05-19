@@ -87,6 +87,7 @@ class ResponseSource(BaseModel):
     page: Optional[int] = Field(None, ge=1)
     bbox: Optional[List[float]] = None
     chunk_id: Optional[str] = None
+    index_version: Optional[str] = None
 
 
 class ToolCall(BaseModel):
@@ -733,6 +734,9 @@ class RagParserConfig(ConfigModel):
     max_file_size_bytes: int = Field(100_000_000, ge=1)
     timeout_seconds: int = Field(300, ge=1)
     ocr_enabled: bool = True
+    ocr_languages: List[str] = Field(default_factory=list)
+    table_structure_enabled: bool = True
+    converter_kwargs: Dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("provider")
     @classmethod
@@ -790,6 +794,13 @@ class RagRerankConfig(ConfigModel):
     url: Optional[str] = None
 
 
+class RagIntentGateConfig(ConfigModel):
+    strong_terms: List[str] = Field(default_factory=list)
+    context_terms: List[str] = Field(default_factory=list)
+    school_context_terms: List[str] = Field(default_factory=list)
+    exclude_terms: List[str] = Field(default_factory=list)
+
+
 class RagConfig(ConfigModel):
     enabled: bool = False
     backend: str = "redis_stack"
@@ -801,6 +812,7 @@ class RagConfig(ConfigModel):
     redis: RagRedisConfig = Field(default_factory=RagRedisConfig)
     retrieval: RagRetrievalConfig = Field(default_factory=RagRetrievalConfig)
     rerank: RagRerankConfig = Field(default_factory=RagRerankConfig)
+    intent_gate: RagIntentGateConfig = Field(default_factory=RagIntentGateConfig)
 
     @field_validator("backend")
     @classmethod

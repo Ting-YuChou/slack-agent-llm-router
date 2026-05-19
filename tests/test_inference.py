@@ -770,6 +770,12 @@ class TestInferenceEngine:
         assert response.finish_reason == "rag_no_hits"
         assert "文件庫沒有足夠資訊" in response.response_text
         engine.providers["openai"].generate_response.assert_not_called()
+        router.update_model_stats.assert_called_once_with(
+            model_name="gpt-5",
+            success=True,
+            latency_ms=response.latency_ms,
+        )
+        assert engine.inference_stats["gpt-5"]["total_requests"] == 1
 
     def test_rag_auto_gate_only_runs_for_school_document_intent(
         self,
@@ -778,14 +784,25 @@ class TestInferenceEngine:
         router = MagicMock()
         rag_service = SimpleNamespace(enabled=True, auto_retrieve=True)
         engine = InferenceEngine(inference_config, router, rag_service=rag_service)
+        rag_service.intent_gate_config = {
+            "strong_terms": ["registrar"],
+            "exclude_terms": ["ignore-rag"],
+        }
         routing_decision = SimpleNamespace(query_type=QueryType.GENERAL)
 
+        assert (
+            engine._should_run_rag(
+                QueryRequest(query="How do I contact the registrar?", user_id="u1"),
+                routing_decision,
+            )
+            is True
+        )
         assert (
             engine._should_run_rag(
                 QueryRequest(query="When is tuition due?", user_id="u1"),
                 routing_decision,
             )
-            is True
+            is False
         )
         assert (
             engine._should_run_rag(

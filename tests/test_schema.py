@@ -116,12 +116,14 @@ def test_inference_response_accepts_sources_and_tool_calls():
                 page=3,
                 bbox=[0, 0, 10, 10],
                 chunk_id="chunk-1",
+                index_version="v1",
             )
         ],
         tool_calls=[
             ToolCall(name="web_search", provider="tavily", result_count=1, latency_ms=5)
         ],
     )
+    assert response.sources[0].index_version == "v1"
 
     assert response.sources[0].url == "https://example.com"
     assert response.sources[0].score == 0.8

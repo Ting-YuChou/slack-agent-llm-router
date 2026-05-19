@@ -1,6 +1,7 @@
 """Vector stores for school-document RAG chunks."""
 
 import array
+import hashlib
 import json
 import logging
 import math
@@ -23,6 +24,7 @@ class StoredRagChunk:
     chunk: DocumentChunk
     knowledge_base_id: str
     embedding: Optional[List[float]] = None
+    index_version: str = ""
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
 
@@ -35,6 +37,8 @@ class RagSearchResult:
     score: float
     match_source: str
     knowledge_base_id: str
+    index_version: Optional[str] = None
+    updated_at: Optional[datetime] = None
 
 
 class InMemoryRagVectorStore:
@@ -57,13 +61,20 @@ class InMemoryRagVectorStore:
         *,
         knowledge_base_id: str,
     ) -> int:
+        if not chunks:
+            return 0
         now = datetime.now()
+        document_id = chunks[0].document_id
+        await self.delete_document(document_id, knowledge_base_id)
+        index_version = _new_index_version()
         for chunk, embedding in zip(chunks, embeddings):
-            existing = self.items.get(chunk.chunk_id)
-            self.items[chunk.chunk_id] = StoredRagChunk(
+            storage_id = self._storage_id(knowledge_base_id, chunk.chunk_id)
+            existing = self.items.get(storage_id)
+            self.items[storage_id] = StoredRagChunk(
                 chunk=chunk,
                 knowledge_base_id=knowledge_base_id,
                 embedding=list(embedding) if embedding else None,
+                index_version=index_version,
                 created_at=existing.created_at if existing else now,
                 updated_at=now,
             )
@@ -73,15 +84,15 @@ class InMemoryRagVectorStore:
         self, document_id: str, knowledge_base_id: Optional[str] = None
     ) -> int:
         delete_ids = [
-            chunk_id
-            for chunk_id, item in self.items.items()
+            storage_id
+            for storage_id, item in self.items.items()
             if item.chunk.document_id == document_id
             and (
                 knowledge_base_id is None or item.knowledge_base_id == knowledge_base_id
             )
         ]
-        for chunk_id in delete_ids:
-            self.items.pop(chunk_id, None)
+        for storage_id in delete_ids:
+            self.items.pop(storage_id, None)
         return len(delete_ids)
 
     async def search(
@@ -100,7 +111,7 @@ class InMemoryRagVectorStore:
         tokens = tokenize(query)
         allowed_kbs = set(knowledge_base_ids or [])
         results: Dict[str, Tuple[StoredRagChunk, float, str]] = {}
-        for item in self.items.values():
+        for storage_id, item in self.items.items():
             if allowed_kbs and item.knowledge_base_id not in allowed_kbs:
                 continue
             keyword_score = _keyword_score(tokens, item.chunk.text)
@@ -121,7 +132,7 @@ class InMemoryRagVectorStore:
                 source = "keyword"
             elif vector_score > 0 and keyword_score <= 0:
                 source = "vector"
-            results[item.chunk.chunk_id] = (item, score, source)
+            results[storage_id] = (item, score, source)
 
         ranked = sorted(results.values(), key=lambda value: -value[1])[
             : max(candidate_count, limit)
@@ -132,9 +143,14 @@ class InMemoryRagVectorStore:
                 score=score,
                 match_source=source,
                 knowledge_base_id=item.knowledge_base_id,
+                index_version=item.index_version,
+                updated_at=item.updated_at,
             )
             for item, score, source in ranked[:limit]
         ]
+
+    def _storage_id(self, knowledge_base_id: str, chunk_id: str) -> str:
+        return f"{knowledge_base_id}:{chunk_id}"
 
 
 class RedisStackRagVectorStore:
@@ -199,6 +215,8 @@ class RedisStackRagVectorStore:
                 "TAG",
                 "chunk_id",
                 "TAG",
+                "index_version",
+                "TAG",
                 "text",
                 "TEXT",
                 "keywords",
@@ -210,6 +228,11 @@ class RedisStackRagVectorStore:
                 "SORTABLE",
                 "page_end",
                 "NUMERIC",
+                "created_at",
+                "NUMERIC",
+                "updated_at",
+                "NUMERIC",
+                "SORTABLE",
                 "embedding",
                 "VECTOR",
                 "HNSW",
@@ -233,15 +256,19 @@ class RedisStackRagVectorStore:
         *,
         knowledge_base_id: str,
     ) -> int:
-        if not self.client:
+        if not self.client or not chunks:
             return 0
         now_ts = time.time()
+        document_id = chunks[0].document_id
+        await self.delete_document(document_id, knowledge_base_id)
+        index_version = _new_index_version()
         count = 0
         for chunk, embedding in zip(chunks, embeddings):
             mapping: Dict[str, Any] = {
                 "knowledge_base_id": knowledge_base_id,
                 "document_id": chunk.document_id,
                 "chunk_id": chunk.chunk_id,
+                "index_version": index_version,
                 "text": chunk.text,
                 "keywords": ",".join(tokenize(chunk.text)),
                 "block_types": ",".join(chunk.block_types),
@@ -258,9 +285,14 @@ class RedisStackRagVectorStore:
                 if len(embedding) != self.dimensions:
                     raise ValueError("Embedding dimensions do not match RAG index")
                 mapping["embedding"] = _vector_to_bytes(embedding)
-            await self.client.hset(self._chunk_key(chunk.chunk_id), mapping=mapping)
+            await self.client.hset(
+                self._chunk_key(chunk.chunk_id, knowledge_base_id), mapping=mapping
+            )
             await self.client.sadd(
-                self._document_key(chunk.document_id), chunk.chunk_id
+                self._document_key(chunk.document_id, knowledge_base_id), chunk.chunk_id
+            )
+            await self.client.sadd(
+                self._document_kbs_key(chunk.document_id), knowledge_base_id
             )
             count += 1
         return count
@@ -270,19 +302,59 @@ class RedisStackRagVectorStore:
     ) -> int:
         if not self.client:
             return 0
-        chunk_ids = await self.client.smembers(self._document_key(document_id))
+        if knowledge_base_id:
+            return await self._delete_document_for_kb(document_id, knowledge_base_id)
+
+        kb_ids = await self.client.smembers(self._document_kbs_key(document_id))
+        count = 0
+        for raw_kb_id in kb_ids:
+            count += await self._delete_document_for_kb(document_id, _decode(raw_kb_id))
+
+        count += await self._delete_legacy_document_chunks(document_id, None)
+        await self.client.delete(self._document_kbs_key(document_id))
+        return count
+
+    async def _delete_document_for_kb(
+        self, document_id: str, knowledge_base_id: str
+    ) -> int:
+        chunk_ids = await self.client.smembers(
+            self._document_key(document_id, knowledge_base_id)
+        )
         count = 0
         for raw_chunk_id in chunk_ids:
             chunk_id = _decode(raw_chunk_id)
-            if knowledge_base_id:
-                payload = await self.client.hgetall(self._chunk_key(chunk_id))
-                if payload:
-                    item = self._deserialize(payload)
-                    if item.knowledge_base_id != knowledge_base_id:
-                        continue
-            deleted = await self.client.delete(self._chunk_key(chunk_id))
+            deleted = await self.client.delete(
+                self._chunk_key(chunk_id, knowledge_base_id)
+            )
             count += int(bool(deleted))
-        await self.client.delete(self._document_key(document_id))
+        await self.client.delete(self._document_key(document_id, knowledge_base_id))
+
+        remaining_kbs = await self.client.smembers(self._document_kbs_key(document_id))
+        await self.client.srem(self._document_kbs_key(document_id), knowledge_base_id)
+        if not [kb for kb in remaining_kbs if _decode(kb) != knowledge_base_id]:
+            await self.client.delete(self._document_kbs_key(document_id))
+
+        count += await self._delete_legacy_document_chunks(
+            document_id, knowledge_base_id
+        )
+        return count
+
+    async def _delete_legacy_document_chunks(
+        self, document_id: str, knowledge_base_id: Optional[str]
+    ) -> int:
+        chunk_ids = await self.client.smembers(self._legacy_document_key(document_id))
+        count = 0
+        for raw_chunk_id in chunk_ids:
+            chunk_id = _decode(raw_chunk_id)
+            payload = await self.client.hgetall(self._legacy_chunk_key(chunk_id))
+            if knowledge_base_id and payload:
+                item = self._deserialize(payload)
+                if item.knowledge_base_id != knowledge_base_id:
+                    continue
+            deleted = await self.client.delete(self._legacy_chunk_key(chunk_id))
+            count += int(bool(deleted))
+        if not knowledge_base_id:
+            await self.client.delete(self._legacy_document_key(document_id))
         return count
 
     async def search(
@@ -320,14 +392,24 @@ class RedisStackRagVectorStore:
         tokens = tokenize(query)
         if not self.client or not tokens:
             return []
-        token_query = "|".join(_escape_tag(token) for token in tokens)
         filter_query = self._filter_query(knowledge_base_ids)
+        text_query = "|".join(_escape_text_token(token) for token in tokens)
         redis_query = (
+            f"{filter_query} @text:({text_query})"
+            if filter_query != "*"
+            else f"@text:({text_query})"
+        )
+        results = await self._search(redis_query, limit, "keyword", tokens=tokens)
+        if results:
+            return results
+
+        token_query = "|".join(_escape_tag(token) for token in tokens)
+        fallback_query = (
             f"{filter_query} @keywords:{{{token_query}}}"
             if filter_query != "*"
             else f"@keywords:{{{token_query}}}"
         )
-        return await self._search(redis_query, limit, "keyword")
+        return await self._search(fallback_query, limit, "keyword", tokens=tokens)
 
     async def _vector_search(
         self,
@@ -340,10 +422,9 @@ class RedisStackRagVectorStore:
         if len(embedding) != self.dimensions:
             logger.warning("Skipping RAG vector search due to dimension mismatch")
             return []
-        redis_query = (
-            f"({self._filter_query(knowledge_base_ids)})"
-            f"=>[KNN {limit} @embedding $vec AS distance]"
-        )
+        filter_query = self._filter_query(knowledge_base_ids)
+        base_query = "*" if filter_query == "*" else f"({filter_query})"
+        redis_query = f"{base_query}=>[KNN {limit} @embedding $vec AS distance]"
         try:
             raw_results = await self.client.execute_command(
                 "FT.SEARCH",
@@ -360,7 +441,7 @@ class RedisStackRagVectorStore:
                 "0",
                 str(limit),
                 "RETURN",
-                "15",
+                "16",
                 "knowledge_base_id",
                 "document_id",
                 "chunk_id",
@@ -375,6 +456,7 @@ class RedisStackRagVectorStore:
                 "created_at",
                 "updated_at",
                 "embedding",
+                "index_version",
                 "distance",
                 "DIALECT",
                 "2",
@@ -385,7 +467,11 @@ class RedisStackRagVectorStore:
         return self._parse_results(raw_results, "vector")
 
     async def _search(
-        self, query: str, limit: int, source: str
+        self,
+        query: str,
+        limit: int,
+        source: str,
+        tokens: Optional[Sequence[str]] = None,
     ) -> List[RagSearchResult]:
         try:
             raw_results = await self.client.execute_command(
@@ -396,10 +482,11 @@ class RedisStackRagVectorStore:
                 "0",
                 str(limit),
                 "RETURN",
-                "14",
+                "15",
                 "knowledge_base_id",
                 "document_id",
                 "chunk_id",
+                "index_version",
                 "text",
                 "metadata",
                 "section_path",
@@ -415,9 +502,14 @@ class RedisStackRagVectorStore:
         except Exception as exc:
             logger.warning("Redis RAG keyword search failed: %s", exc)
             return []
-        return self._parse_results(raw_results, source)
+        return self._parse_results(raw_results, source, tokens=tokens)
 
-    def _parse_results(self, raw_results: Any, source: str) -> List[RagSearchResult]:
+    def _parse_results(
+        self,
+        raw_results: Any,
+        source: str,
+        tokens: Optional[Sequence[str]] = None,
+    ) -> List[RagSearchResult]:
         if not raw_results or len(raw_results) < 2:
             return []
         parsed = []
@@ -435,12 +527,18 @@ class RedisStackRagVectorStore:
                     score = max(0.0, 1.0 - float(_decode(distance)))
                 except ValueError:
                     score = 0.0
+            elif tokens:
+                score = _keyword_score(tokens, item.chunk.text)
+                if score <= 0:
+                    continue
             parsed.append(
                 RagSearchResult(
                     chunk=item.chunk,
                     score=score,
                     match_source=source,
                     knowledge_base_id=item.knowledge_base_id,
+                    index_version=item.index_version,
+                    updated_at=item.updated_at,
                 )
             )
         return parsed
@@ -472,6 +570,7 @@ class RedisStackRagVectorStore:
             chunk=chunk,
             knowledge_base_id=_decode(decoded.get("knowledge_base_id", "")),
             embedding=_bytes_to_vector(decoded.get("embedding")),
+            index_version=_decode(decoded.get("index_version", "")),
             created_at=datetime.fromtimestamp(
                 float(_decode(decoded.get("created_at", "0")) or 0)
             ),
@@ -489,11 +588,20 @@ class RedisStackRagVectorStore:
     def _chunk_prefix(self) -> str:
         return f"{self.key_prefix}:chunk:"
 
-    def _chunk_key(self, chunk_id: str) -> str:
+    def _chunk_key(self, chunk_id: str, knowledge_base_id: str) -> str:
+        return f"{self._chunk_prefix()}{knowledge_base_id}:{chunk_id}"
+
+    def _legacy_chunk_key(self, chunk_id: str) -> str:
         return f"{self._chunk_prefix()}{chunk_id}"
 
-    def _document_key(self, document_id: str) -> str:
+    def _document_key(self, document_id: str, knowledge_base_id: str) -> str:
+        return f"{self.key_prefix}:document:{knowledge_base_id}:{document_id}:chunks"
+
+    def _legacy_document_key(self, document_id: str) -> str:
         return f"{self.key_prefix}:document:{document_id}:chunks"
+
+    def _document_kbs_key(self, document_id: str) -> str:
+        return f"{self.key_prefix}:document:{document_id}:knowledge_bases"
 
 
 def build_vector_store(config: Dict[str, Any]):
@@ -558,7 +666,8 @@ def _merge_results(
 
     merged = []
     for result, score, source in by_id.values():
-        score = score + recency_weight
+        if result.updated_at:
+            score = score + recency_weight * _recency_score(result.updated_at)
         if score < min_score:
             continue
         merged.append(
@@ -567,6 +676,8 @@ def _merge_results(
                 score=score,
                 match_source=source,
                 knowledge_base_id=result.knowledge_base_id,
+                index_version=result.index_version,
+                updated_at=result.updated_at,
             )
         )
     merged.sort(key=lambda item: -item.score)
@@ -578,6 +689,18 @@ def _escape_tag(value: Any) -> str:
     return "".join(
         f"\\{char}" if char in special_chars else char for char in str(value)
     )
+
+
+def _escape_text_token(value: Any) -> str:
+    special_chars = set(",.<>[]{}\"':;!@#$%^&*()-+=~|\\/")
+    return "".join(
+        f"\\{char}" if char in special_chars else char for char in str(value)
+    )
+
+
+def _new_index_version() -> str:
+    payload = f"{time.time_ns()}:{os.getpid()}".encode("utf-8")
+    return hashlib.sha1(payload).hexdigest()[:16]
 
 
 def _vector_to_bytes(values: Sequence[float]) -> bytes:

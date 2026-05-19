@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 import click
 import uvicorn
 import yaml
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -1385,7 +1385,10 @@ class LLMRouterPlatform:
                     active_requests.labels(endpoint=endpoint).dec()
 
         @app.post("/rag/documents")
-        async def ingest_rag_document(request: Request):
+        async def ingest_rag_document(
+            request: Request,
+            background_tasks: BackgroundTasks,
+        ):
             rag_service = self._get_rag_service()
             if rag_service is None:
                 return JSONResponse(
@@ -1394,7 +1397,16 @@ class LLMRouterPlatform:
                 )
             try:
                 payload = await self._parse_rag_document_request(request)
-                job = await rag_service.ingest_document(**payload)
+                job = await rag_service.queue_document_ingestion(**payload)
+                background_tasks.add_task(
+                    rag_service.process_ingestion_job,
+                    job.job_id,
+                    content=payload["content"],
+                    filename=payload["filename"],
+                    knowledge_base_id=job.knowledge_base_id,
+                    metadata=payload.get("metadata"),
+                    document_id=job.document_id,
+                )
                 return job.to_dict()
             except ValueError as exc:
                 return JSONResponse(
@@ -1419,7 +1431,7 @@ class LLMRouterPlatform:
                     status_code=503,
                     content={"error": "rag_disabled"},
                 )
-            job = rag_service.get_job(job_id)
+            job = await rag_service.get_job(job_id)
             if job is None:
                 return JSONResponse(
                     status_code=404,

@@ -157,6 +157,9 @@ rag:
     max_file_size_bytes: 100000000
     timeout_seconds: 300
     ocr_enabled: true
+    ocr_languages: []
+    table_structure_enabled: true
+    converter_kwargs: {}
   chunking:
     strategy: hybrid
     chunk_size_tokens: 900
@@ -190,6 +193,120 @@ rag:
     model: BAAI/bge-reranker-v2-m3
     top_n: 8
     timeout: 30
+  intent_gate:
+    strong_terms:
+      - academic calendar
+      - admissions
+      - advisor
+      - attendance
+      - campus
+      - catalog
+      - class schedule
+      - curriculum
+      - degree
+      - department
+      - dorm
+      - enrollment
+      - exam
+      - faculty
+      - financial aid
+      - graduation
+      - handbook
+      - library
+      - major
+      - office hours
+      - prerequisite
+      - scholarship
+      - school
+      - semester
+      - syllabus
+      - transcript
+      - tuition
+      - university
+      - 學生
+      - 學校
+      - 校園
+      - 校曆
+      - 課程
+      - 選課
+      - 註冊
+      - 入學
+      - 招生
+      - 學費
+      - 獎學金
+      - 助學金
+      - 退費
+      - 宿舍
+      - 圖書館
+      - 系所
+      - 學院
+      - 教授
+      - 老師
+      - 辦公室時間
+      - 成績單
+      - 畢業
+      - 學位
+      - 主修
+      - 先修
+      - 考試
+      - 期中
+      - 期末
+      - 手冊
+      - 大綱
+      - 文件
+      - PDF
+    context_terms:
+      - course
+      - document
+      - file
+      - form
+      - handbook
+      - policy
+      - program
+      - registration
+      - schedule
+      - pdf
+      - 規定
+      - 政策
+      - 文件
+      - 表格
+      - 手冊
+    school_context_terms:
+      - academic
+      - campus
+      - class
+      - college
+      - course
+      - department
+      - faculty
+      - school
+      - student
+      - university
+      - 學校
+      - 學生
+      - 校園
+      - 課程
+      - 系所
+      - 學院
+      - 大學
+    exclude_terms:
+      - breaking
+      - current
+      - latest
+      - news
+      - now
+      - price
+      - release
+      - stock
+      - today
+      - web
+      - 最新
+      - 今天
+      - 現在
+      - 新聞
+      - 即時
+      - 搜尋
+      - 查詢網頁
 
 kafka:
   bootstrap_servers:

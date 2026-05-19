@@ -127,7 +127,9 @@ class DoclingParser(DocumentParser):
         with tempfile.NamedTemporaryFile(suffix=suffix or ".pdf") as temp_file:
             temp_file.write(content)
             temp_file.flush()
-            result = DocumentConverter().convert(source=temp_file.name)
+            result = self._build_converter(DocumentConverter).convert(
+                source=temp_file.name
+            )
 
         document = getattr(result, "document", result)
         blocks = self._extract_blocks(document, resolved_doc_id)
@@ -194,6 +196,12 @@ class DoclingParser(DocumentParser):
         blocks.sort(key=lambda block: (block.page, block.reading_order))
         return blocks
 
+    def _build_converter(self, converter_cls: Any) -> Any:
+        kwargs = dict(self.config.get("converter_kwargs") or {})
+        if kwargs:
+            return converter_cls(**kwargs)
+        return converter_cls()
+
 
 def build_document_parser(config: Dict[str, Any]) -> DocumentParser:
     provider = str(config.get("provider", "docling")).lower()
@@ -230,6 +238,8 @@ def _guess_block_type(text: str) -> str:
 
 
 def _safe_export_dict(document: Any) -> Dict[str, Any]:
+    if isinstance(document, dict):
+        return document
     for method_name in ("export_to_dict", "model_dump", "dict"):
         method = getattr(document, method_name, None)
         if not callable(method):
@@ -254,14 +264,84 @@ def _safe_export_markdown(document: Any) -> str:
 
 
 def _extract_text(raw: Dict[str, Any]) -> str:
+    table_text = _extract_table_text(raw)
+    if table_text:
+        return table_text
     for key in ("text", "orig", "content"):
         value = raw.get(key)
         if isinstance(value, str) and value.strip():
             return " ".join(value.split())
     if isinstance(raw.get("data"), dict):
-        value = raw["data"].get("text")
-        if isinstance(value, str) and value.strip():
-            return " ".join(value.split())
+        for key in ("text", "content", "markdown"):
+            value = raw["data"].get(key)
+            if isinstance(value, str) and value.strip():
+                return " ".join(value.split())
+        collected = _collect_text_values(raw["data"])
+        if collected:
+            return " ".join(collected)
+    return ""
+
+
+def _extract_table_text(raw: Dict[str, Any]) -> str:
+    data = raw.get("data") if isinstance(raw.get("data"), dict) else raw
+    cells = data.get("table_cells") or data.get("cells")
+    if isinstance(cells, list):
+        rows: Dict[int, Dict[int, str]] = {}
+        for index, cell in enumerate(cells):
+            cell_payload = _as_dict(cell)
+            if not cell_payload:
+                continue
+            text = _first_text_value(cell_payload)
+            if not text:
+                continue
+            row = _safe_int(
+                _first_present(
+                    cell_payload,
+                    "start_row_offset_idx",
+                    "row",
+                    "row_index",
+                ),
+                index,
+            )
+            col = _safe_int(
+                _first_present(
+                    cell_payload,
+                    "start_col_offset_idx",
+                    "col",
+                    "column",
+                    "column_index",
+                ),
+                0,
+            )
+            rows.setdefault(row, {})[col] = text
+        if rows:
+            rendered = []
+            for row_index in sorted(rows):
+                row = rows[row_index]
+                rendered.append(" | ".join(row[col] for col in sorted(row)))
+            return "\n".join(rendered)
+
+    rows_value = data.get("rows") or data.get("grid")
+    if isinstance(rows_value, list):
+        rendered_rows = []
+        for row in rows_value:
+            if isinstance(row, list):
+                values = [
+                    _first_text_value(_as_dict(cell))
+                    if not isinstance(cell, str)
+                    else cell
+                    for cell in row
+                ]
+                values = [value for value in values if value]
+                if values:
+                    rendered_rows.append(" | ".join(values))
+            elif isinstance(row, dict):
+                values = _collect_text_values(row)
+                if values:
+                    rendered_rows.append(" | ".join(values))
+        if rendered_rows:
+            return "\n".join(rendered_rows)
+
     return ""
 
 
@@ -286,12 +366,12 @@ def _extract_page_bbox(raw: Dict[str, Any]) -> tuple[int, Optional[List[float]]]
     provenance = raw.get("prov")
     first_prov = None
     if isinstance(provenance, list) and provenance:
-        first_prov = provenance[0]
+        first_prov = _as_dict(provenance[0])
     elif isinstance(provenance, dict):
         first_prov = provenance
 
     source = first_prov if isinstance(first_prov, dict) else raw
-    page = int(source.get("page_no") or source.get("page") or 1)
+    page = _safe_int(source.get("page_no") or source.get("page"), 1)
     bbox = _normalize_bbox(source.get("bbox") or source.get("box"))
     return max(page, 1), bbox
 
@@ -308,10 +388,93 @@ def _normalize_bbox(value: Any) -> Optional[List[float]]:
         for keys in candidates:
             if all(key in value for key in keys):
                 return [_safe_float(value[key]) or 0.0 for key in keys]
+    object_payload = _as_dict(value)
+    if object_payload and object_payload is not value:
+        return _normalize_bbox(object_payload)
+    for method_name in ("as_tuple", "to_tuple"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            try:
+                return _normalize_bbox(method())
+            except Exception:
+                logger.debug("Docling bbox %s failed", method_name, exc_info=True)
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        numbers = [_safe_float(item) for item in value[:4]]
+        numbers = [_safe_float(item) for item in list(value)[:4]]
         if len(numbers) == 4 and all(number is not None for number in numbers):
             return [float(number) for number in numbers if number is not None]
+    return None
+
+
+def _as_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    for method_name in ("model_dump", "dict"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            try:
+                payload = method()
+                if isinstance(payload, dict):
+                    return payload
+            except Exception:
+                logger.debug(
+                    "Docling object %s export failed", method_name, exc_info=True
+                )
+    payload = {
+        key: getattr(value, key)
+        for key in (
+            "l",
+            "t",
+            "r",
+            "b",
+            "left",
+            "top",
+            "right",
+            "bottom",
+            "x0",
+            "y0",
+            "x1",
+            "y1",
+            "page_no",
+            "page",
+            "bbox",
+            "text",
+        )
+        if hasattr(value, key)
+    }
+    return payload
+
+
+def _first_text_value(payload: Dict[str, Any]) -> str:
+    for key in ("text", "orig", "content", "markdown"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return " ".join(value.split())
+    return ""
+
+
+def _collect_text_values(value: Any) -> List[str]:
+    if isinstance(value, str):
+        stripped = " ".join(value.split())
+        return [stripped] if stripped else []
+    if isinstance(value, dict):
+        collected: List[str] = []
+        for key, nested in value.items():
+            if key in {"self_ref", "parent", "children", "prov", "bbox", "label"}:
+                continue
+            collected.extend(_collect_text_values(nested))
+        return collected
+    if isinstance(value, list):
+        collected = []
+        for nested in value:
+            collected.extend(_collect_text_values(nested))
+        return collected
+    return []
+
+
+def _first_present(payload: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in payload and payload[key] is not None:
+            return payload[key]
     return None
 
 
@@ -322,3 +485,12 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
