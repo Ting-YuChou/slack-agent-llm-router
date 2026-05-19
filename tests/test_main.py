@@ -1,3 +1,4 @@
+import base64
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -66,10 +67,11 @@ class DummyRouter:
 
 
 class DummyInferenceEngine:
-    def __init__(self, config, router, event_producer=None):
+    def __init__(self, config, router, event_producer=None, rag_service=None):
         self.config = config
         self.router = router
         self.event_producer = event_producer
+        self.rag_service = rag_service
         self.response = InferenceResponse(
             response_text="ok",
             model_name="gpt-5",
@@ -319,6 +321,115 @@ class DummyPolicyMaterializer:
         return True
 
 
+class DummyRagService:
+    def __init__(self, config):
+        self.config = config
+        self.enabled = bool(config.get("enabled", False))
+        self.queue_enabled = bool(
+            config.get("ingestion_queue", {}).get("enabled", False)
+        )
+        self.jobs = {}
+        self.deleted = []
+        self.batches = {}
+
+    async def initialize(self):
+        return None
+
+    async def ingest_document(self, **payload):
+        job = await self.queue_document_ingestion(**payload)
+        job.status = "completed"
+        self.jobs[job.job_id] = job
+        return job
+
+    async def queue_document_ingestion(self, **payload):
+        job = SimpleNamespace(
+            job_id="job-1",
+            document_id=payload.get("document_id") or "doc-1",
+            filename=payload["filename"],
+            knowledge_base_id=payload.get("knowledge_base_id") or "default",
+            status="queued",
+            chunks_indexed=2,
+            error=None,
+            warnings=[],
+            to_dict=lambda: {
+                "job_id": "job-1",
+                "document_id": payload.get("document_id") or "doc-1",
+                "filename": payload["filename"],
+                "knowledge_base_id": payload.get("knowledge_base_id") or "default",
+                "status": job.status,
+                "chunks_indexed": 2,
+                "error": None,
+                "warnings": [],
+            },
+        )
+        self.jobs[job.job_id] = job
+        return job
+
+    async def process_ingestion_job(self, job_id, **_payload):
+        job = self.jobs[job_id]
+        job.status = "completed"
+        return job
+
+    async def get_job(self, job_id):
+        return self.jobs.get(job_id)
+
+    async def retry_job(self, job_id):
+        job = self.jobs.get(job_id)
+        if job:
+            job.status = "queued"
+        return job
+
+    async def create_batch(self, documents, knowledge_base_id=None, metadata=None):
+        jobs = []
+        for index, payload in enumerate(documents, start=1):
+            job = SimpleNamespace(
+                job_id=f"job-{index}",
+                document_id=payload.get("document_id") or f"doc-{index}",
+                filename=payload["filename"],
+                knowledge_base_id=knowledge_base_id or "default",
+                status="queued",
+                chunks_indexed=0,
+                error=None,
+                warnings=[],
+                to_dict=lambda: {},
+            )
+            self.jobs[job.job_id] = job
+            jobs.append(job)
+        batch = {
+            "batch_id": "batch-1",
+            "knowledge_base_id": knowledge_base_id or "default",
+            "total": len(jobs),
+            "status": "running",
+            "status_counts": {"queued": len(jobs)},
+            "job_ids": [job.job_id for job in jobs],
+            "jobs": [job.__dict__ for job in jobs],
+        }
+        self.batches["batch-1"] = batch
+        return SimpleNamespace(to_dict=lambda: batch)
+
+    async def get_batch(self, batch_id):
+        return self.batches.get(batch_id)
+
+    async def retrieve(self, query, **_kwargs):
+        return []
+
+    def serialize_results(self, results):
+        return list(results)
+
+    def build_context(self, results):
+        return ""
+
+    async def delete_document(self, document_id, knowledge_base_id=None):
+        self.deleted.append((document_id, knowledge_base_id))
+        return 2
+
+    async def shutdown(self):
+        return None
+
+    def is_healthy(self):
+        return True
+
+
 @pytest.fixture
 def patched_platform_deps(monkeypatch):
     monkeypatch.setattr(main, "setup_logging", lambda **_kwargs: None)
@@ -330,6 +441,7 @@ def patched_platform_deps(monkeypatch):
     monkeypatch.setattr(main, "PolicyMaterializer", DummyPolicyMaterializer)
     monkeypatch.setattr(main, "MonitoringService", DummyMonitoring)
     monkeypatch.setattr(main, "SlackBot", DummySlackBot)
+    monkeypatch.setattr(main, "RagService", DummyRagService)
 
 
 class TestPlatformInitialization:
@@ -458,6 +570,21 @@ class TestPlatformInitialization:
             platform.services["router"].policy_cache
             is platform.services["policy_cache"]
         )
+
+    @pytest.mark.asyncio
+    async def test_initialize_services_adds_rag_when_enabled(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(
+            tmp_path,
+            overrides={"rag": {"enabled": True, "backend": "memory"}},
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+
+        await platform._initialize_services(include_api=True, include_background=False)
+
+        assert "rag" in platform.services
+        assert platform.services["inference"].rag_service is platform.services["rag"]
 
     @pytest.mark.asyncio
     async def test_workers_only_mode_skips_core_services_when_not_needed(
@@ -757,6 +884,84 @@ class TestApiApp:
             "requests_total",
             "request_duration_seconds",
         ]
+
+    def test_rag_document_endpoint_ingests_base64_json(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(
+            tmp_path,
+            overrides={"rag": {"enabled": True, "backend": "memory"}},
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        platform.services["rag"] = DummyRagService({"enabled": True})
+        app = platform._create_fastapi_app()
+
+        payload = {
+            "filename": "handbook.pdf",
+            "content_base64": base64.b64encode(b"%PDF-1.7").decode("ascii"),
+            "knowledge_base_id": "school",
+            "metadata": {"title": "Handbook"},
+        }
+        with TestClient(app) as client:
+            response = client.post("/rag/documents", json=payload)
+            job_response = client.get("/rag/jobs/job-1")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "queued"
+        assert response.json()["knowledge_base_id"] == "school"
+        assert job_response.status_code == 200
+        assert job_response.json()["job_id"] == "job-1"
+        assert job_response.json()["status"] == "completed"
+
+    def test_rag_batch_endpoints_create_and_report_progress(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(
+            tmp_path,
+            overrides={"rag": {"enabled": True, "backend": "memory"}},
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        platform.services["rag"] = DummyRagService({"enabled": True})
+        app = platform._create_fastapi_app()
+
+        payload = {
+            "knowledge_base_id": "school",
+            "documents": [
+                {
+                    "filename": "one.pdf",
+                    "content_base64": base64.b64encode(b"%PDF-1.7").decode("ascii"),
+                    "document_id": "doc-1",
+                }
+            ],
+        }
+        with TestClient(app) as client:
+            create_response = client.post("/rag/batches", json=payload)
+            get_response = client.get("/rag/batches/batch-1")
+
+        assert create_response.status_code == 200
+        assert create_response.json()["batch_id"] == "batch-1"
+        assert create_response.json()["total"] == 1
+        assert get_response.status_code == 200
+        assert get_response.json()["status_counts"]["queued"] == 1
+
+    def test_rag_query_and_delete_endpoints_require_rag_service(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(tmp_path)
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            query_response = client.post(
+                "/rag/query",
+                json={"query": "tuition", "user_id": "u1"},
+            )
+            delete_response = client.delete("/rag/documents/doc-1")
+
+        assert query_response.status_code == 503
+        assert query_response.json()["error"] == "rag_disabled"
+        assert delete_response.status_code == 503
+        assert delete_response.json()["error"] == "rag_disabled"
 
     def test_metrics_endpoint_returns_503_when_monitoring_disabled(
         self, tmp_path, patched_platform_deps

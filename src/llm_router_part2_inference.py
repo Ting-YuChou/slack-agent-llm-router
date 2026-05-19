@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Any, AsyncIterator, Union, Tuple
+from typing import Dict, List, Optional, Any, AsyncIterator, Union, Tuple, Sequence
 import hashlib
 
 import httpx
@@ -31,12 +31,134 @@ from src.utils.schema import (
     InferenceResponse,
     ModelConfig,
     QueryType,
+    RagPolicy,
     ToolCall,
     ToolPolicy,
 )
 from src.tools import ToolRegistry, WebSearchTool, WebSearchResult
 
 logger = logging.getLogger(__name__)
+
+RAG_AUTO_STRONG_TERMS = {
+    "academic calendar",
+    "admissions",
+    "advisor",
+    "attendance",
+    "campus",
+    "catalog",
+    "class schedule",
+    "curriculum",
+    "degree",
+    "department",
+    "dorm",
+    "enrollment",
+    "exam",
+    "faculty",
+    "financial aid",
+    "graduation",
+    "handbook",
+    "library",
+    "major",
+    "office hours",
+    "prerequisite",
+    "scholarship",
+    "school",
+    "semester",
+    "syllabus",
+    "transcript",
+    "tuition",
+    "university",
+    "學生",
+    "學校",
+    "校園",
+    "校曆",
+    "課程",
+    "選課",
+    "註冊",
+    "入學",
+    "招生",
+    "學費",
+    "獎學金",
+    "助學金",
+    "退費",
+    "宿舍",
+    "圖書館",
+    "系所",
+    "學院",
+    "教授",
+    "老師",
+    "辦公室時間",
+    "成績單",
+    "畢業",
+    "學位",
+    "主修",
+    "先修",
+    "考試",
+    "期中",
+    "期末",
+    "手冊",
+    "大綱",
+    "文件",
+    "PDF",
+}
+
+RAG_AUTO_CONTEXT_TERMS = {
+    "course",
+    "document",
+    "file",
+    "form",
+    "handbook",
+    "policy",
+    "program",
+    "registration",
+    "schedule",
+    "pdf",
+    "規定",
+    "政策",
+    "文件",
+    "表格",
+    "手冊",
+}
+
+RAG_AUTO_SCHOOL_CONTEXT_TERMS = {
+    "academic",
+    "campus",
+    "class",
+    "college",
+    "course",
+    "department",
+    "faculty",
+    "school",
+    "student",
+    "university",
+    "學校",
+    "學生",
+    "校園",
+    "課程",
+    "系所",
+    "學院",
+    "大學",
+}
+
+RAG_AUTO_EXCLUDE_TERMS = {
+    "breaking",
+    "current",
+    "latest",
+    "news",
+    "now",
+    "price",
+    "release",
+    "stock",
+    "today",
+    "web",
+    "最新",
+    "今天",
+    "現在",
+    "新聞",
+    "即時",
+    "搜尋",
+    "查詢網頁",
+}
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -304,6 +426,10 @@ class ResponseCache:
         "memory_hit_ids",
         "memory_match_sources",
         "memory_search_debug",
+        "rag_context",
+        "rag_hit_count",
+        "rag_match_sources",
+        "rag_search_debug",
     }
 
     def __init__(self, config: Dict[str, Any]):
@@ -493,6 +619,9 @@ class BaseInferenceProvider(ABC):
             prompt_sections.append(attachment_prompt)
         if request.context:
             prompt_sections.append(f"Context: {request.context}")
+        rag_context = (request.metadata or {}).get("rag_context")
+        if rag_context:
+            prompt_sections.append(str(rag_context))
         web_search_context = (request.metadata or {}).get("web_search_context")
         if web_search_context:
             prompt_sections.append(str(web_search_context))
@@ -1256,10 +1385,12 @@ class InferenceEngine:
         config: Dict[str, Any],
         router: ModelRouter,
         event_producer: Optional[Any] = None,
+        rag_service: Optional[Any] = None,
     ):
         self.config = config
         self.router = router
         self.event_producer = event_producer
+        self.rag_service = rag_service
         self.providers = {}
         self.context_compressor = ContextCompressor(config.get("compression", {}))
         self.cache = ResponseCache(config.get("cache", {}))
@@ -1355,7 +1486,10 @@ class InferenceEngine:
 
     def _response_cache_bypassed(self, request: QueryRequest) -> bool:
         metadata = request.metadata or {}
-        return bool(metadata.get("web_search_cache_bypass", False))
+        return bool(
+            metadata.get("web_search_cache_bypass", False)
+            or metadata.get("rag_cache_bypass", False)
+        )
 
     async def process_query(self, request: QueryRequest) -> InferenceResponse:
         """Process query through the complete inference pipeline"""
@@ -1374,13 +1508,31 @@ class InferenceEngine:
             # Step 2: Context compression before cache lookup keeps keys stable.
             compressed_context = await self._compress_request_context_if_needed(request)
 
-            # Step 3: Optionally enrich current-info requests with web search.
+            # Step 3: Optionally enrich school-document requests with RAG context.
+            rag_result = await self._run_rag_if_needed(request, routing_decision)
+            if rag_result and rag_result.required_no_hits:
+                response = self._build_required_rag_no_hit_response(
+                    request,
+                    model_name,
+                    rag_result,
+                    start_time,
+                )
+                await self._finalize_successful_response(
+                    request,
+                    response,
+                    model_name,
+                    routing_decision,
+                    start_time,
+                )
+                return response
+
+            # Step 4: Optionally enrich current-info requests with web search.
             web_search_result = await self._run_web_search_if_needed(
                 request,
                 routing_decision,
             )
 
-            # Step 4: Check full-response cache.
+            # Step 5: Check full-response cache.
             response = await self._get_cached_inference_response(request, model_name)
             if response:
                 logger.info(f"Cache hit for request {request_id}")
@@ -1391,7 +1543,7 @@ class InferenceEngine:
                 )
                 return response
 
-            # Step 5: Generate response, falling back to local models for cloud outages
+            # Step 6: Generate response, falling back to local models for cloud outages
             (
                 response,
                 model_name,
@@ -1401,9 +1553,10 @@ class InferenceEngine:
                 routing_decision,
             )
             response.compressed_context = compressed_context
+            self._attach_rag_result(response, rag_result)
             self._attach_web_search_result(response, web_search_result)
 
-            # Step 6: Cache response
+            # Step 7: Cache response
             if not response.cached and not self._response_cache_bypassed(request):
                 cache_key = self.cache.generate_cache_key(request, model_name)
                 await self.cache.cache_response(
@@ -1411,28 +1564,12 @@ class InferenceEngine:
                     response.model_dump(mode="json"),
                 )
 
-            # Step 7: Update metrics and stats
-            inference_time = time.time() - start_time
-            await self._update_stats(model_name, response, inference_time)
-            self._record_provider_cache_metrics(model_name, response)
-
-            # Step 8: Update router stats
-            self.router.update_model_stats(
-                model_name=model_name, success=True, latency_ms=response.latency_ms
-            )
-
-            INFERENCE_METRICS.requests_total.labels(
-                model=model_name, provider=response.provider
-            ).inc()
-
-            INFERENCE_METRICS.request_duration.labels(
-                model=model_name, provider=response.provider
-            ).observe(inference_time)
-
-            await self._publish_analytics_events(
+            await self._finalize_successful_response(
                 request,
                 response,
-                routing_decision=routing_decision,
+                model_name,
+                routing_decision,
+                start_time,
             )
             return response
 
@@ -1483,6 +1620,36 @@ class InferenceEngine:
             )
             return error_response
 
+    async def _finalize_successful_response(
+        self,
+        request: QueryRequest,
+        response: InferenceResponse,
+        model_name: str,
+        routing_decision: Any,
+        started_at: float,
+    ) -> None:
+        inference_time = time.time() - started_at
+        await self._update_stats(model_name, response, inference_time)
+        self._record_provider_cache_metrics(model_name, response)
+        self.router.update_model_stats(
+            model_name=model_name,
+            success=True,
+            latency_ms=response.latency_ms,
+        )
+        INFERENCE_METRICS.requests_total.labels(
+            model=model_name,
+            provider=response.provider,
+        ).inc()
+        INFERENCE_METRICS.request_duration.labels(
+            model=model_name,
+            provider=response.provider,
+        ).observe(inference_time)
+        await self._publish_analytics_events(
+            request,
+            response,
+            routing_decision=routing_decision,
+        )
+
     async def _run_web_search_if_needed(
         self,
         request: QueryRequest,
@@ -1519,6 +1686,156 @@ class InferenceEngine:
             request.metadata["web_search_cache_bypass"] = True
         return result
 
+    async def _run_rag_if_needed(
+        self,
+        request: QueryRequest,
+        routing_decision: Any,
+    ) -> Optional[SimpleNamespace]:
+        if not self._should_run_rag(request, routing_decision):
+            return None
+
+        request.metadata = dict(request.metadata or {})
+        started_at = time.time()
+        options = request.rag_options
+        max_results = options.max_results if options and options.max_results else None
+        candidate_count = (
+            options.candidate_count if options and options.candidate_count else None
+        )
+        min_score = (
+            options.min_score if options and options.min_score is not None else None
+        )
+        results = await self.rag_service.retrieve(
+            request.query,
+            knowledge_base_ids=request.knowledge_base_ids,
+            max_results=max_results,
+            candidate_count=candidate_count,
+            min_score=min_score,
+        )
+        latency_ms = int((time.time() - started_at) * 1000)
+        tool_call = self.rag_service.tool_call_from_results(
+            request.query,
+            results,
+            latency_ms,
+        )
+        sources = self.rag_service.sources_from_results(results)
+
+        if results:
+            request.metadata["rag_context"] = self.rag_service.build_context(results)
+            request.metadata["rag_hit_count"] = len(results)
+            request.metadata["rag_chunk_ids"] = [
+                result.chunk.chunk_id for result in results
+            ]
+            request.metadata["rag_index_versions"] = [
+                result.index_version or "" for result in results
+            ]
+            request.metadata["rag_match_sources"] = [
+                result.match_source for result in results
+            ]
+        else:
+            request.metadata["rag_hit_count"] = 0
+            request.metadata["rag_no_hits"] = True
+            request.metadata["rag_cache_bypass"] = True
+
+        return SimpleNamespace(
+            results=results,
+            sources=sources,
+            tool_call=tool_call,
+            latency_ms=latency_ms,
+            required_no_hits=request.rag_policy == RagPolicy.REQUIRED and not results,
+        )
+
+    def _should_run_rag(self, request: QueryRequest, routing_decision: Any) -> bool:
+        if not self.rag_service or not getattr(self.rag_service, "enabled", False):
+            return False
+        if request.rag_policy == RagPolicy.DISABLED:
+            return False
+        if request.rag_policy == RagPolicy.REQUIRED:
+            return True
+        metadata = request.metadata or {}
+        if metadata.get("enable_rag") is True:
+            return True
+        if metadata.get("rag_auto") is False:
+            return False
+        if request.knowledge_base_ids:
+            return True
+        if not bool(getattr(self.rag_service, "auto_retrieve", False)):
+            return False
+        return self._looks_like_school_document_query(request, routing_decision)
+
+    def _looks_like_school_document_query(
+        self, request: QueryRequest, routing_decision: Any
+    ) -> bool:
+        """Conservative intent gate for automatic school-document retrieval."""
+        query = request.query or ""
+        lowered = query.lower()
+
+        query_type = getattr(routing_decision, "query_type", None)
+        query_type_value = (
+            query_type.value if hasattr(query_type, "value") else str(query_type or "")
+        )
+        if query_type_value in {
+            QueryType.CODE_GENERATION.value,
+            QueryType.CODE_ANALYSIS.value,
+            QueryType.WEB_RESEARCH.value,
+        }:
+            return False
+
+        strong_terms = self._rag_intent_terms("strong_terms", RAG_AUTO_STRONG_TERMS)
+        context_terms = self._rag_intent_terms("context_terms", RAG_AUTO_CONTEXT_TERMS)
+        school_terms = self._rag_intent_terms(
+            "school_context_terms", RAG_AUTO_SCHOOL_CONTEXT_TERMS
+        )
+        exclude_terms = self._rag_intent_terms("exclude_terms", RAG_AUTO_EXCLUDE_TERMS)
+
+        strong_match = any(str(term).lower() in lowered for term in strong_terms)
+        context_match = any(
+            str(term).lower() in lowered for term in context_terms
+        ) and any(str(term).lower() in lowered for term in school_terms)
+
+        if not (strong_match or context_match):
+            return False
+
+        if any(str(term).lower() in lowered for term in exclude_terms):
+            return False
+
+        return True
+
+    def _rag_intent_terms(self, key: str, default: Sequence[str]) -> Sequence[str]:
+        intent_config = dict(getattr(self.rag_service, "intent_gate_config", {}) or {})
+        configured = intent_config.get(key)
+        if isinstance(configured, (list, tuple, set)) and configured:
+            return [str(term) for term in configured]
+        return default
+
+    def _build_required_rag_no_hit_response(
+        self,
+        request: QueryRequest,
+        model_name: str,
+        rag_result: SimpleNamespace,
+        started_at: float,
+    ) -> InferenceResponse:
+        input_tokens = (
+            self.router.token_counter.count_tokens(request.query)
+            if hasattr(self.router, "token_counter")
+            else len(request.query.split())
+        )
+        response_text = "文件庫沒有足夠資訊可以回答這個問題。"
+        return InferenceResponse(
+            response_text=response_text,
+            model_name=model_name,
+            provider="rag",
+            token_count_input=input_tokens,
+            token_count_output=len(response_text.split()),
+            total_tokens=input_tokens + len(response_text.split()),
+            latency_ms=int((time.time() - started_at) * 1000),
+            tokens_per_second=0.0,
+            cost_usd=0.0,
+            cached=False,
+            tool_calls=[rag_result.tool_call],
+            tool_latency_ms=rag_result.latency_ms,
+            finish_reason="rag_no_hits",
+        )
+
     def _should_run_web_search(
         self,
         request: QueryRequest,
@@ -1549,18 +1866,48 @@ class InferenceEngine:
     ) -> None:
         if result is None:
             return
-        response.sources = list(result.sources)
+        response.sources = [*response.sources, *list(result.sources)]
         if result.tool_call:
-            response.tool_calls = [result.tool_call]
-            response.tool_latency_ms = result.tool_call.latency_ms
+            response.tool_calls = [*response.tool_calls, result.tool_call]
+            response.tool_latency_ms += result.tool_call.latency_ms
+
+    def _attach_rag_result(
+        self,
+        response: InferenceResponse,
+        result: Optional[SimpleNamespace],
+    ) -> None:
+        if result is None:
+            return
+        response.sources = [*response.sources, *list(result.sources)]
+        if result.tool_call:
+            response.tool_calls = [*response.tool_calls, result.tool_call]
+            response.tool_latency_ms += result.latency_ms
 
     async def stream_query(self, request: QueryRequest) -> AsyncIterator[str]:
         """Stream query response"""
+        start_time = time.time()
         try:
             # Route query
             routing_decision = await self.router.route_query(request)
             model_name = routing_decision.selected_model
             await self._compress_request_context_if_needed(request)
+            rag_result = await self._run_rag_if_needed(request, routing_decision)
+            if rag_result and rag_result.required_no_hits:
+                response = self._build_required_rag_no_hit_response(
+                    request,
+                    model_name,
+                    rag_result,
+                    start_time,
+                )
+                await self._finalize_successful_response(
+                    request,
+                    response,
+                    model_name,
+                    routing_decision,
+                    start_time,
+                )
+                yield "文件庫沒有足夠資訊可以回答這個問題。"
+                return
             await self._run_web_search_if_needed(request, routing_decision)
 
             cached_response = await self._get_cached_inference_response(
@@ -1958,6 +2305,7 @@ class InferenceEngine:
             "web_search_enabled": bool(
                 self.web_search_tool and self.web_search_tool.enabled
             ),
+            "rag_enabled": bool(self.rag_service and self.rag_service.enabled),
             "stats": self.inference_stats,
         }
 

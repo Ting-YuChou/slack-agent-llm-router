@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 import click
 import uvicorn
 import yaml
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -41,6 +41,7 @@ from src.llm_router_part2_inference import InferenceEngine
 from src.llm_router_part3_policy import PolicyMaterializer, RoutingPolicyCache
 from src.llm_router_part3_pipeline import KafkaIngestionPipeline, KafkaProducerManager
 from src.llm_router_part4_monitor import MonitoringService
+from src.rag.service import RagService, decode_base64_document
 from src.utils.logger import security_logger, setup_logging
 from src.utils.metrics import (
     INFERENCE_METRICS,
@@ -51,7 +52,7 @@ from src.utils.metrics import (
     sum_metric_by_label,
     sum_metric_values,
 )
-from src.utils.schema import PlatformConfig, QueryRequest
+from src.utils.schema import PlatformConfig, QueryRequest, RagBatchRequest, RagQueryRequest
 from slack.bot import SlackBot
 
 
@@ -206,6 +207,10 @@ class LLMRouterPlatform:
         """Return whether Flink routing hints should be materialized into shared cache."""
         return bool(self.config.get("policy_cache", {}).get("enabled", False))
 
+    def _rag_enabled(self) -> bool:
+        """Return whether school-document RAG is enabled."""
+        return bool(self.config.get("rag", {}).get("enabled", False))
+
     def _build_policy_cache_config(self) -> Dict[str, Any]:
         """Build shared policy cache config."""
         return dict(self.config.get("policy_cache", {}))
@@ -230,6 +235,10 @@ class LLMRouterPlatform:
         )
         await self.services["router"].initialize()
 
+        if self._rag_enabled():
+            self.services["rag"] = RagService(config=dict(self.config.get("rag", {})))
+            await self.services["rag"].initialize()
+
         self.services["inference"] = InferenceEngine(
             config={
                 **dict(self.config.get("inference", {}) or {}),
@@ -237,6 +246,7 @@ class LLMRouterPlatform:
             },
             router=self.services["router"],
             event_producer=self.services.get("event_producer"),
+            rag_service=self.services.get("rag"),
         )
         await self.services["inference"].initialize()
 
@@ -556,6 +566,7 @@ class LLMRouterPlatform:
             "event_producer",
             "pipeline",
             "policy_materializer",
+            "rag",
         ):
             if optional_required in self.services:
                 required_services.append(optional_required)
@@ -825,6 +836,60 @@ class LLMRouterPlatform:
                 }
             )
         return normalized
+
+    def _get_rag_service(self):
+        return self.services.get("rag")
+
+    async def _parse_rag_document_request(self, request: Request) -> Dict[str, Any]:
+        content_type = request.headers.get("content-type", "").lower()
+        if "application/json" in content_type:
+            payload = await request.json()
+            filename = str(payload.get("filename") or "").strip()
+            encoded = payload.get("content_base64")
+            if not filename or not encoded:
+                raise ValueError("filename and content_base64 are required")
+            metadata = payload.get("metadata") or {}
+            if not isinstance(metadata, dict):
+                raise ValueError("metadata must be an object")
+            return {
+                "filename": filename,
+                "content": decode_base64_document(str(encoded)),
+                "knowledge_base_id": payload.get("knowledge_base_id"),
+                "metadata": metadata,
+                "document_id": payload.get("document_id"),
+            }
+
+        if "multipart/form-data" in content_type:
+            try:
+                form = await request.form()
+            except Exception as exc:
+                raise ValueError(
+                    "multipart form parsing failed; ensure python-multipart is installed"
+                ) from exc
+            upload = form.get("file")
+            if upload is None or not hasattr(upload, "read"):
+                raise ValueError("multipart upload requires a file field")
+            raw_metadata = form.get("metadata") or "{}"
+            try:
+                metadata = (
+                    json.loads(str(raw_metadata))
+                    if isinstance(raw_metadata, str)
+                    else dict(raw_metadata)
+                )
+            except Exception as exc:
+                raise ValueError("metadata must be valid JSON") from exc
+            filename = str(
+                getattr(upload, "filename", "") or form.get("filename") or ""
+            )
+            return {
+                "filename": filename or "document.pdf",
+                "content": await upload.read(),
+                "knowledge_base_id": form.get("knowledge_base_id"),
+                "metadata": metadata,
+                "document_id": form.get("document_id"),
+            }
+
+        raise ValueError("Use application/json or multipart/form-data")
 
     async def _build_dashboard_payload(self, hours: int = 24) -> Dict[str, Any]:
         """Build a dashboard-friendly live snapshot."""
@@ -1319,6 +1384,172 @@ class LLMRouterPlatform:
                 if active_requests is not None:
                     active_requests.labels(endpoint=endpoint).dec()
 
+        @app.post("/rag/documents")
+        async def ingest_rag_document(
+            request: Request,
+            background_tasks: BackgroundTasks,
+        ):
+            rag_service = self._get_rag_service()
+            if rag_service is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "rag_disabled"},
+                )
+            try:
+                payload = await self._parse_rag_document_request(request)
+                job = await rag_service.queue_document_ingestion(**payload)
+                if not getattr(rag_service, "queue_enabled", False):
+                    background_tasks.add_task(
+                        rag_service.process_ingestion_job,
+                        job.job_id,
+                        content=payload["content"],
+                        filename=payload["filename"],
+                        knowledge_base_id=job.knowledge_base_id,
+                        metadata=payload.get("metadata"),
+                        document_id=job.document_id,
+                    )
+                return job.to_dict()
+            except ValueError as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_rag_document", "message": str(exc)},
+                )
+            except Exception:
+                self.logger.exception("RAG document ingestion failed")
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": "rag_ingestion_failed",
+                        "message": "Document ingestion failed",
+                    },
+                )
+
+        @app.get("/rag/jobs/{job_id}")
+        async def get_rag_job(job_id: str):
+            rag_service = self._get_rag_service()
+            if rag_service is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "rag_disabled"},
+                )
+            job = await rag_service.get_job(job_id)
+            if job is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": "rag_job_not_found"},
+                )
+            return job.to_dict()
+
+        @app.post("/rag/jobs/{job_id}/retry")
+        async def retry_rag_job(job_id: str):
+            rag_service = self._get_rag_service()
+            if rag_service is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "rag_disabled"},
+                )
+            try:
+                job = await rag_service.retry_job(job_id)
+            except ValueError as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_rag_retry", "message": str(exc)},
+                )
+            if job is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": "rag_job_not_found"},
+                )
+            return job.to_dict()
+
+        @app.post("/rag/batches")
+        async def create_rag_batch(batch_request: RagBatchRequest):
+            rag_service = self._get_rag_service()
+            if rag_service is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "rag_disabled"},
+                )
+            try:
+                batch = await rag_service.create_batch(
+                    documents=[
+                        document.model_dump(mode="python")
+                        for document in batch_request.documents
+                    ],
+                    knowledge_base_id=batch_request.knowledge_base_id,
+                    metadata=batch_request.metadata,
+                )
+            except ValueError as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_rag_batch", "message": str(exc)},
+                )
+            except RuntimeError as exc:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "rag_batch_unavailable", "message": str(exc)},
+                )
+            return batch.to_dict()
+
+        @app.get("/rag/batches/{batch_id}")
+        async def get_rag_batch(batch_id: str):
+            rag_service = self._get_rag_service()
+            if rag_service is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "rag_disabled"},
+                )
+            batch = await rag_service.get_batch(batch_id)
+            if batch is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": "rag_batch_not_found"},
+                )
+            return batch
+
+        @app.post("/rag/query")
+        async def query_rag_documents(query_data: RagQueryRequest):
+            rag_service = self._get_rag_service()
+            if rag_service is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "rag_disabled"},
+                )
+            results = await rag_service.retrieve(
+                query_data.query,
+                knowledge_base_ids=query_data.knowledge_base_ids,
+                max_results=query_data.max_results,
+                candidate_count=query_data.candidate_count,
+                min_score=query_data.min_score,
+            )
+            return {
+                "query": query_data.query,
+                "result_count": len(results),
+                "results": rag_service.serialize_results(results),
+                "context": rag_service.build_context(results),
+            }
+
+        @app.delete("/rag/documents/{document_id}")
+        async def delete_rag_document(
+            document_id: str,
+            knowledge_base_id: Optional[str] = None,
+        ):
+            rag_service = self._get_rag_service()
+            if rag_service is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "rag_disabled"},
+                )
+            deleted_chunks = await rag_service.delete_document(
+                document_id,
+                knowledge_base_id=knowledge_base_id,
+            )
+            return {
+                "document_id": document_id,
+                "knowledge_base_id": knowledge_base_id,
+                "deleted_chunks": deleted_chunks,
+            }
+
         # Metrics endpoint
         @app.get("/metrics")
         async def get_metrics():
@@ -1470,6 +1701,23 @@ def start_workers(config: str):
     """Start only enabled background services."""
     platform = LLMRouterPlatform(config_path=config)
     asyncio.run(platform.run(include_api=False, include_background=True))
+
+
+@cli.command()
+@click.option("--config", default=DEFAULT_CONFIG_PATH, help="Configuration file path")
+def start_rag_workers(config: str):
+    """Start Redis Streams RAG ingestion workers."""
+
+    async def _run():
+        platform = LLMRouterPlatform(config_path=config)
+        rag_service = RagService(config=dict(platform.config.get("rag", {})))
+        await rag_service.initialize()
+        try:
+            await rag_service.run_ingestion_workers()
+        finally:
+            await rag_service.shutdown()
+
+    asyncio.run(_run())
 
 
 @cli.command()

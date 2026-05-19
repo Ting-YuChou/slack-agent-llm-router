@@ -17,11 +17,14 @@ from src.utils.schema import (
     AttachmentType,
     QueryRequest,
     QueryType,
+    RagPolicy,
     ResponseSource,
     ToolCall,
     ToolPolicy,
     UserTier,
 )
+from src.rag.chunker import DocumentChunk
+from src.rag.vector_store import RagSearchResult
 
 
 @pytest.fixture
@@ -645,6 +648,217 @@ class TestInferenceEngine:
             request.metadata["web_search_blocked_reason"] == "web_search_not_configured"
         )
         engine.cache.cache_response.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_process_query_injects_rag_context_before_cache_and_provider(
+        self,
+        inference_config,
+        sample_query_request,
+        inference_response_factory,
+    ):
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="gpt-5")
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+        router.update_model_stats = MagicMock()
+
+        chunk = DocumentChunk(
+            chunk_id="chunk-1",
+            document_id="doc-1",
+            text="Tuition payment is due on May 1.",
+            page_start=2,
+            page_end=2,
+            block_ids=["b1"],
+            block_types=["text"],
+            metadata={"title": "School Handbook"},
+        )
+        rag_result = RagSearchResult(
+            chunk=chunk,
+            score=0.9,
+            match_source="hybrid",
+            knowledge_base_id="school",
+        )
+        source = ResponseSource(
+            title="School Handbook",
+            url="rag://school/doc-1#chunk-1",
+            rank=1,
+            source_type="rag",
+            document_id="doc-1",
+            page=2,
+            chunk_id="chunk-1",
+        )
+        tool_call = ToolCall(
+            name="rag_search",
+            provider="memory",
+            result_count=1,
+            latency_ms=4,
+        )
+        rag_service = SimpleNamespace(
+            enabled=True,
+            auto_retrieve=True,
+            retrieve=AsyncMock(return_value=[rag_result]),
+            build_context=MagicMock(
+                return_value="School document search results:\n[S1] May 1"
+            ),
+            sources_from_results=MagicMock(return_value=[source]),
+            tool_call_from_results=MagicMock(return_value=tool_call),
+        )
+        engine = InferenceEngine(inference_config, router, rag_service=rag_service)
+        engine.providers = {"openai": AsyncMock()}
+
+        async def generate_response(request, _model_name):
+            assert "School document search results" in request.metadata["rag_context"]
+            assert request.metadata["rag_chunk_ids"] == ["chunk-1"]
+            return inference_response_factory(
+                response_text="Tuition is due May 1 [S1]."
+            )
+
+        engine.providers["openai"].generate_response = AsyncMock(
+            side_effect=generate_response
+        )
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+        engine.cache.cache_response = AsyncMock()
+
+        request = sample_query_request.model_copy(
+            update={"knowledge_base_ids": ["school"]}
+        )
+        response = await engine.process_query(request)
+
+        assert response.sources == [source]
+        assert response.tool_calls == [tool_call]
+        engine.cache.get_cached_response.assert_awaited_once()
+        assert request.metadata["rag_chunk_ids"] == ["chunk-1"]
+
+    @pytest.mark.asyncio
+    async def test_required_rag_no_hits_returns_grounded_no_answer(
+        self,
+        inference_config,
+        sample_query_request,
+    ):
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="gpt-5")
+        )
+        router.update_model_stats = MagicMock()
+        router.token_counter.count_tokens.return_value = 5
+        rag_service = SimpleNamespace(
+            enabled=True,
+            auto_retrieve=True,
+            retrieve=AsyncMock(return_value=[]),
+            sources_from_results=MagicMock(return_value=[]),
+            tool_call_from_results=MagicMock(
+                return_value=ToolCall(
+                    name="rag_search",
+                    provider="memory",
+                    result_count=0,
+                    latency_ms=3,
+                    error="rag_no_hits",
+                )
+            ),
+        )
+        engine = InferenceEngine(inference_config, router, rag_service=rag_service)
+        engine.providers = {"openai": AsyncMock()}
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+
+        request = sample_query_request.model_copy(
+            update={"rag_policy": RagPolicy.REQUIRED}
+        )
+        response = await engine.process_query(request)
+
+        assert response.provider == "rag"
+        assert response.finish_reason == "rag_no_hits"
+        assert "文件庫沒有足夠資訊" in response.response_text
+        engine.providers["openai"].generate_response.assert_not_called()
+        router.update_model_stats.assert_called_once_with(
+            model_name="gpt-5",
+            success=True,
+            latency_ms=response.latency_ms,
+        )
+        assert engine.inference_stats["gpt-5"]["total_requests"] == 1
+
+    def test_rag_auto_gate_only_runs_for_school_document_intent(
+        self,
+        inference_config,
+    ):
+        router = MagicMock()
+        rag_service = SimpleNamespace(enabled=True, auto_retrieve=True)
+        engine = InferenceEngine(inference_config, router, rag_service=rag_service)
+        rag_service.intent_gate_config = {
+            "strong_terms": ["registrar"],
+            "exclude_terms": ["ignore-rag"],
+        }
+        routing_decision = SimpleNamespace(query_type=QueryType.GENERAL)
+
+        assert (
+            engine._should_run_rag(
+                QueryRequest(query="How do I contact the registrar?", user_id="u1"),
+                routing_decision,
+            )
+            is True
+        )
+        assert (
+            engine._should_run_rag(
+                QueryRequest(query="When is tuition due?", user_id="u1"),
+                routing_decision,
+            )
+            is False
+        )
+        assert (
+            engine._should_run_rag(
+                QueryRequest(query="What is the company policy?", user_id="u1"),
+                routing_decision,
+            )
+            is False
+        )
+        assert (
+            engine._should_run_rag(
+                QueryRequest(query="How does Python async await work?", user_id="u1"),
+                routing_decision,
+            )
+            is False
+        )
+
+    def test_rag_explicit_triggers_bypass_auto_intent_gate(self, inference_config):
+        router = MagicMock()
+        rag_service = SimpleNamespace(enabled=True, auto_retrieve=False)
+        engine = InferenceEngine(inference_config, router, rag_service=rag_service)
+        routing_decision = SimpleNamespace(query_type=QueryType.CODE_GENERATION)
+
+        assert (
+            engine._should_run_rag(
+                QueryRequest(
+                    query="Find this in the uploaded docs",
+                    user_id="u1",
+                    knowledge_base_ids=["school"],
+                ),
+                routing_decision,
+            )
+            is True
+        )
+        assert (
+            engine._should_run_rag(
+                QueryRequest(
+                    query="Find this in the uploaded docs",
+                    user_id="u1",
+                    rag_policy=RagPolicy.REQUIRED,
+                ),
+                routing_decision,
+            )
+            is True
+        )
+        assert (
+            engine._should_run_rag(
+                QueryRequest(
+                    query="When is tuition due?",
+                    user_id="u1",
+                    rag_policy=RagPolicy.DISABLED,
+                    knowledge_base_ids=["school"],
+                ),
+                routing_decision,
+            )
+            is False
+        )
 
     @pytest.mark.asyncio
     async def test_process_query_returns_cached_response(

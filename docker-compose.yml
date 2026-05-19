@@ -119,6 +119,15 @@ services:
       clickhouse:
         condition: service_healthy
 
+  rag-workers:
+    <<: *router-app
+    container_name: slack-llm-router-rag-workers
+    profiles: ["rag"]
+    command: ["python", "main.py", "start-rag-workers", "--config", "config/config.compose.yaml"]
+    depends_on:
+      redis-stack:
+        condition: service_healthy
+
   flink-jobmanager:
     build:
       context: .
