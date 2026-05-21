@@ -4,6 +4,7 @@ from src.rag.parser import DocumentBlock, ParsedDocument
 from src.rag.reranker import Reranker
 from src.rag.service import RagService
 from src.rag.vector_store import RagSearchResult
+from src.rag.visual import VisualFigureResult, VisualProcessor
 
 __all__ = [
     "DocumentBlock",
@@ -11,4 +12,6 @@ __all__ = [
     "RagSearchResult",
     "Reranker",
     "RagService",
+    "VisualFigureResult",
+    "VisualProcessor",
 ]

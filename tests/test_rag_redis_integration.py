@@ -319,6 +319,116 @@ async def test_redis_rag_store_persists_and_cleans_table_sidecars():
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_redis_rag_store_indexes_visual_chunks_and_cleans_sidecars():
+    probe = await _redis_stack_client_or_skip()
+    if hasattr(probe, "aclose"):
+        await probe.aclose()
+    elif hasattr(probe, "close"):
+        await probe.close()
+
+    key_prefix = f"ragtest:{uuid.uuid4().hex}"
+    store = RedisStackRagVectorStore(
+        {
+            "backend": "redis_stack",
+            "embedding": {"dimensions": 4},
+            "visual": {
+                "enabled": True,
+                "embedding": {"enabled": True, "dimensions": 4},
+            },
+            "redis": {
+                "host": os.getenv("RAG_REDIS_HOST", "localhost"),
+                "port": int(os.getenv("RAG_REDIS_PORT", "6380")),
+                "db": int(os.getenv("RAG_REDIS_DB", "0")),
+                "key_prefix": key_prefix,
+            },
+        }
+    )
+    figure = {
+        "figure_id": "figure-1",
+        "page": 2,
+        "bbox": [10, 20, 110, 120],
+        "image_ref": "data/rag/assets/school/doc-fig/figures/figure-1.png",
+        "visual": {
+            "caption": "A diagram explaining registration steps.",
+            "ocr_text": "Registration flow text inside the diagram.",
+            "visual_embedding_provider": "fake_visual",
+            "visual_embedding": [1.0, 0.0, 0.0, 0.0],
+        },
+    }
+
+    try:
+        await store.initialize()
+        await store.upsert_chunks(
+            [
+                _chunk(
+                    "figure-chunk",
+                    "doc-fig",
+                    "Caption: A diagram explaining registration steps.",
+                    block_types=["figure"],
+                    metadata={
+                        "is_figure": True,
+                        "figure_id": "figure-1",
+                        "image_ref": figure["image_ref"],
+                        "figure_caption": figure["visual"]["caption"],
+                        "figure_ocr_text": figure["visual"]["ocr_text"],
+                        "visual_embedding_provider": "fake_visual",
+                        "figure_sidecar": figure,
+                    },
+                )
+            ],
+            [[0.0, 1.0, 0.0, 0.0]],
+            visual_embeddings=[[1.0, 0.0, 0.0, 0.0]],
+            knowledge_base_id="school",
+        )
+
+        figure_key = store._figure_key("school", "doc-fig", "figure-1")
+        visual_key = store._visual_chunk_key("figure-chunk", "school")
+        figure_payload = await store.client.hgetall(figure_key)
+        visual_payload = await store.client.hgetall(visual_key)
+        results = await store.search(
+            "registration diagram",
+            None,
+            knowledge_base_ids=["school"],
+            limit=3,
+            candidate_count=10,
+            keyword_weight=0.0,
+            vector_weight=0.0,
+            recency_weight=0.0,
+            min_score=0.0,
+            visual_embedding=[1.0, 0.0, 0.0, 0.0],
+            visual_weight=1.0,
+            visual_min_score=0.0,
+        )
+
+        await store.upsert_chunks(
+            [_chunk("replacement", "doc-fig", "replacement text")],
+            [[0.0, 1.0, 0.0, 0.0]],
+            visual_embeddings=[None],
+            knowledge_base_id="school",
+        )
+        figure_exists_after_reindex = await store.client.exists(figure_key)
+        visual_exists_after_reindex = await store.client.exists(visual_key)
+
+        assert figure_payload
+        assert visual_payload
+        assert json.loads(figure_payload[b"figure_json"])["figure_id"] == "figure-1"
+        assert results
+        assert results[0].chunk.metadata["is_figure"] is True
+        assert results[0].match_source == "visual"
+        assert figure_exists_after_reindex == 0
+        assert visual_exists_after_reindex == 0
+    finally:
+        if store.client:
+            for index_name in (store.index_name, store.visual_index_name):
+                try:
+                    await store.client.execute_command("FT.DROPINDEX", index_name, "DD")
+                except Exception:
+                    pass
+        await store.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_redis_stream_group_ack_and_pending_autoclaim():
     client = await _redis_stack_client_or_skip()
     stream = f"ragtest:{uuid.uuid4().hex}:stream"

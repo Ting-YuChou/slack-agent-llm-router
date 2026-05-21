@@ -212,6 +212,37 @@ rag:
     model: BAAI/bge-reranker-v2-m3
     top_n: 8
     timeout: 30
+  visual:
+    enabled: false
+    required: false
+    crop_dpi: 180
+    min_crop_pixels: 64
+    max_crops_per_document: 50
+    ocr:
+      enabled: false
+      provider: paddleocr_vl
+      model: PaddlePaddle/PaddleOCR-VL
+      url:
+      timeout: 30
+    caption:
+      enabled: false
+      provider: qwen2_5_vl
+      model: Qwen/Qwen2.5-VL-7B-Instruct
+      url:
+      timeout: 30
+    embedding:
+      enabled: false
+      provider: nomic_multimodal
+      model: nomic-ai/nomic-embed-multimodal-3b
+      url:
+      dimensions: 1024
+      timeout: 30
+    retrieval:
+      top_k: 5
+      weight: 0.4
+      min_score: 0.0
+    storage:
+      assets_dir: data/rag/assets
   intent_gate:
     strong_terms:
       - academic calendar

@@ -16,6 +16,7 @@ from src.rag.vector_store import (
     RagSearchResult,
     RedisStackRagVectorStore,
 )
+from src.rag.visual import VisualFigureResult
 
 
 class FailingEmbeddingProvider:
@@ -36,6 +37,89 @@ class ReverseReranker:
 class FailingReranker:
     async def rerank(self, _query, _results):
         raise RuntimeError("reranker unavailable")
+
+
+class FigureParser:
+    def parse_bytes(self, **kwargs):
+        document_id = kwargs.get("document_id") or "doc-figure"
+        return ParsedDocument(
+            document_id=document_id,
+            filename=kwargs.get("filename", "figures.pdf"),
+            content_hash="hash",
+            blocks=[
+                DocumentBlock(
+                    doc_id=document_id,
+                    page=2,
+                    bbox=[10, 20, 110, 120],
+                    block_type="figure",
+                    text="",
+                    reading_order=1,
+                    asset_ref="#/pictures/0",
+                    metadata={
+                        "figure": {
+                            "figure_id": "pictures-0",
+                            "page": 2,
+                            "bbox": [10, 20, 110, 120],
+                            "asset_ref": "#/pictures/0",
+                        }
+                    },
+                )
+            ],
+        )
+
+
+class FakeFigureCropper:
+    def __init__(self):
+        self.deleted = []
+
+    def crop_figures(self, *, parsed_document, knowledge_base_id, **_kwargs):
+        for block in parsed_document.blocks:
+            if block.block_type != "figure":
+                continue
+            figure = block.metadata.setdefault("figure", {})
+            figure.update(
+                {
+                    "figure_id": figure.get("figure_id") or "pictures-0",
+                    "image_ref": (
+                        "data/rag/assets/"
+                        f"{knowledge_base_id}/{parsed_document.document_id}/figures/pictures-0.png"
+                    ),
+                    "content_hash": "image-hash",
+                    "width": 320,
+                    "height": 240,
+                    "crop_scope": "bbox",
+                    "crop_status": "completed",
+                }
+            )
+        return []
+
+    def delete_document_assets(self, document_id, knowledge_base_id):
+        self.deleted.append((document_id, knowledge_base_id))
+
+
+class FakeVisualProcessor:
+    def __init__(self, *, include_text=True):
+        self.include_text = include_text
+
+    async def process_figure(self, _figure):
+        if not self.include_text:
+            return VisualFigureResult(
+                visual_embedding=[1.0, 0.0],
+                visual_embedding_provider="fake_visual",
+            )
+        return VisualFigureResult(
+            ocr_text="Registration flow text inside the diagram.",
+            caption="A diagram explaining registration steps.",
+            diagram_summary="Students select classes, confirm enrollment, then pay fees.",
+            chart_summary="",
+            visual_embedding=[1.0, 0.0],
+            ocr_provider="fake_ocr",
+            caption_provider="fake_caption",
+            visual_embedding_provider="fake_visual",
+        )
+
+    async def embed_query(self, _query):
+        return [1.0, 0.0]
 
 
 class FakeStreamRedis:
@@ -373,6 +457,51 @@ def test_large_table_chunks_preserve_row_column_relationships():
     assert all("Winter '26 =" in chunk.text for chunk in row_chunks)
 
 
+def test_chunker_emits_image_chunk_from_figure_metadata():
+    chunks = StructureAwareChunker({"chunk_size_tokens": 20}).chunk(
+        ParsedDocument(
+            document_id="doc-figure",
+            filename="figures.pdf",
+            content_hash="hash",
+            blocks=[
+                DocumentBlock(
+                    doc_id="doc-figure",
+                    page=2,
+                    bbox=[10, 20, 110, 120],
+                    block_type="figure",
+                    text=(
+                        "Caption: A diagram explaining registration steps.\n"
+                        "OCR text: Registration flow text inside the diagram."
+                    ),
+                    reading_order=1,
+                    asset_ref="#/pictures/0",
+                    metadata={
+                        "figure": {
+                            "figure_id": "pictures-0",
+                            "page": 2,
+                            "bbox": [10, 20, 110, 120],
+                            "image_ref": "data/rag/assets/school/doc/figures/pictures-0.png",
+                            "visual": {
+                                "caption": "A diagram explaining registration steps.",
+                                "ocr_text": "Registration flow text inside the diagram.",
+                                "visual_embedding": [1.0, 0.0],
+                                "visual_embedding_provider": "fake_visual",
+                            },
+                        }
+                    },
+                )
+            ],
+        )
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].metadata["is_figure"] is True
+    assert chunks[0].metadata["figure_id"] == "pictures-0"
+    assert chunks[0].metadata["image_ref"].endswith("pictures-0.png")
+    assert chunks[0].metadata["visual_embedding"] == [1.0, 0.0]
+    assert "registration steps" in chunks[0].text
+
+
 @pytest.mark.asyncio
 async def test_rag_service_ingests_retrieves_formats_and_deletes_document():
     service = RagService(
@@ -620,6 +749,112 @@ def test_rag_context_formats_table_row_column_values():
     assert "Fall '25 = Nov 30 Sun" in context
     assert "Winter '26 = Mar 6 Fri" in context
     assert "Spring '26 = May 29 Fri" in context
+
+
+@pytest.mark.asyncio
+async def test_image_aware_rag_ingests_and_retrieves_figure_chunk():
+    cropper = FakeFigureCropper()
+    service = RagService(
+        {
+            "enabled": True,
+            "backend": "memory",
+            "parser": {"provider": "docling"},
+            "chunking": {"chunk_size_tokens": 80},
+            "embedding": {"provider": "hash", "dimensions": 16},
+            "retrieval": {
+                "top_k": 3,
+                "candidate_count": 5,
+                "keyword_weight": 0.0,
+                "vector_weight": 0.0,
+                "recency_weight": 0.0,
+            },
+            "visual": {
+                "enabled": True,
+                "embedding": {"enabled": True, "dimensions": 2},
+                "retrieval": {"weight": 1.0, "min_score": 0.0},
+                "storage": {"assets_dir": "data/rag/assets"},
+            },
+        },
+        parser=FigureParser(),
+        vector_store=InMemoryRagVectorStore(),
+        embedding_provider=HashEmbeddingProvider(dimensions=16),
+        visual_processor=FakeVisualProcessor(),
+        figure_cropper=cropper,
+    )
+    await service.initialize()
+
+    job = await service.ingest_document(
+        content=b"%PDF fake",
+        filename="figures.pdf",
+        knowledge_base_id="school",
+        document_id="doc-figure",
+    )
+    results = await service.retrieve(
+        "find the registration diagram",
+        knowledge_base_ids=["school"],
+    )
+    context = service.build_context(results)
+    sources = service.sources_from_results(results)
+    deleted = await service.delete_document("doc-figure", knowledge_base_id="school")
+
+    assert job.status == "completed"
+    assert job.chunks_indexed == 1
+    assert results
+    assert results[0].match_source == "visual"
+    assert results[0].chunk.metadata["is_figure"] is True
+    assert "Caption: A diagram explaining registration steps." in context
+    assert "OCR text: Registration flow text inside the diagram." in context
+    assert sources[0].figure_id == "pictures-0"
+    assert sources[0].image_ref.endswith("pictures-0.png")
+    assert deleted == 1
+    assert cropper.deleted == [("doc-figure", "school")]
+
+
+@pytest.mark.asyncio
+async def test_image_only_visual_chunk_is_indexable_without_caption_or_ocr():
+    service = RagService(
+        {
+            "enabled": True,
+            "backend": "memory",
+            "parser": {"provider": "docling"},
+            "chunking": {"chunk_size_tokens": 80},
+            "embedding": {"provider": "hash", "dimensions": 16},
+            "retrieval": {
+                "top_k": 1,
+                "candidate_count": 5,
+                "keyword_weight": 0.0,
+                "vector_weight": 0.0,
+                "recency_weight": 0.0,
+            },
+            "visual": {
+                "enabled": True,
+                "embedding": {"enabled": True, "dimensions": 2},
+                "retrieval": {"weight": 1.0, "min_score": 0.0},
+            },
+        },
+        parser=FigureParser(),
+        vector_store=InMemoryRagVectorStore(),
+        embedding_provider=HashEmbeddingProvider(dimensions=16),
+        visual_processor=FakeVisualProcessor(include_text=False),
+        figure_cropper=FakeFigureCropper(),
+    )
+    await service.initialize()
+
+    job = await service.ingest_document(
+        content=b"%PDF fake",
+        filename="figures.pdf",
+        knowledge_base_id="school",
+        document_id="doc-figure",
+    )
+    results = await service.retrieve(
+        "visual-only figure", knowledge_base_ids=["school"]
+    )
+
+    assert job.status == "completed"
+    assert job.chunks_indexed == 1
+    assert results
+    assert results[0].chunk.metadata["is_figure"] is True
+    assert results[0].match_source == "visual"
 
 
 @pytest.mark.asyncio
@@ -1113,3 +1348,5 @@ def test_docling_parser_extracts_table_text_and_layout_metadata():
     assert blocks[0].bbox == [1.0, 2.0, 3.0, 4.0]
     assert blocks[1].bbox == [10.0, 20.0, 30.0, 40.0]
     assert blocks[2].asset_ref == "#/pictures/0"
+    assert blocks[2].metadata["figure"]["figure_id"] == "pictures-0"
+    assert blocks[2].metadata["figure"]["bbox"] == [5.0, 6.0, 7.0, 8.0]

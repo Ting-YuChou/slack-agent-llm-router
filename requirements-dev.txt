@@ -40,3 +40,4 @@ torch==2.9.0
 gputil==1.4.0
 docling>=2.50.0
 langchain-text-splitters>=0.3.11
+PyMuPDF>=1.24.0

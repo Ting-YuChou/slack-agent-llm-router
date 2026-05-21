@@ -20,6 +20,12 @@ from src.rag.chunker import DocumentChunk, build_chunker
 from src.rag.parser import build_document_parser
 from src.rag.reranker import Reranker, build_reranker
 from src.rag.vector_store import RagSearchResult, build_vector_store
+from src.rag.visual import (
+    FigureCropper,
+    VisualProcessor,
+    build_visual_processor,
+    compose_figure_text,
+)
 from src.utils.schema import ResponseSource, ToolCall
 
 logger = logging.getLogger(__name__)
@@ -165,6 +171,8 @@ class RagService:
         vector_store: Optional[Any] = None,
         embedding_provider: Optional[EmbeddingProvider] = None,
         reranker: Optional[Reranker] = None,
+        visual_processor: Optional[VisualProcessor] = None,
+        figure_cropper: Optional[FigureCropper] = None,
     ):
         self.config = dict(config or {})
         self.enabled = bool(self.config.get("enabled", False))
@@ -177,6 +185,7 @@ class RagService:
         self.embedding_config = dict(self.config.get("embedding", {}) or {})
         self.retrieval_config = dict(self.config.get("retrieval", {}) or {})
         self.rerank_config = dict(self.config.get("rerank", {}) or {})
+        self.visual_config = dict(self.config.get("visual", {}) or {})
         self.redis_config = dict(self.config.get("redis", {}) or {})
         self.intent_gate_config = dict(self.config.get("intent_gate", {}) or {})
         self.queue_config = dict(self.config.get("ingestion_queue", {}) or {})
@@ -219,6 +228,10 @@ class RagService:
             self.embedding_config
         )
         self.reranker = reranker or build_reranker(self.rerank_config)
+        self.visual_processor = visual_processor or build_visual_processor(
+            self.visual_config
+        )
+        self.figure_cropper = figure_cropper or FigureCropper(self.visual_config)
         self.vector_store = vector_store or build_vector_store(self.config)
         self.jobs: Dict[str, IngestionJob] = {}
         self.batches: Dict[str, IngestionBatch] = {}
@@ -231,6 +244,8 @@ class RagService:
         if self.queue_enabled:
             self.staging_dir.mkdir(parents=True, exist_ok=True)
             await self._ensure_stream_group()
+        if self._visual_enabled() and hasattr(self.figure_cropper, "assets_dir"):
+            self.figure_cropper.assets_dir.mkdir(parents=True, exist_ok=True)
         self._initialized = True
 
     async def shutdown(self):
@@ -358,17 +373,28 @@ class RagService:
                     "knowledge_base_id": knowledge_base_id,
                 },
             )
+            visual_warnings = await self._process_visual_blocks(
+                content=content,
+                filename=filename,
+                parsed=parsed,
+                knowledge_base_id=knowledge_base_id,
+            )
             chunks = self.chunker.chunk(parsed)
             if not chunks:
                 raise ValueError("Document parsing produced no indexable text chunks")
             embeddings, warnings = await self._embed_chunks(chunks)
-            job.warnings = warnings
+            (
+                visual_embeddings,
+                visual_embedding_warnings,
+            ) = await self._embed_visual_chunks(chunks)
+            job.warnings = [*visual_warnings, *warnings, *visual_embedding_warnings]
             job.chunks_indexed = await self.vector_store.upsert_chunks(
                 chunks,
                 embeddings,
                 knowledge_base_id=knowledge_base_id,
+                visual_embeddings=visual_embeddings,
             )
-            job.status = "completed_with_warnings" if warnings else "completed"
+            job.status = "completed_with_warnings" if job.warnings else "completed"
             job.error = None
             job.last_error = None
             job.updated_at = datetime.now()
@@ -399,11 +425,13 @@ class RagService:
         if not self.enabled:
             return []
         embedding = await self._safe_embed(query)
+        visual_embedding = await self._safe_visual_query_embed(query)
         effective_kbs = self._effective_knowledge_base_ids(knowledge_base_ids)
         top_k = int(max_results or self.retrieval_config.get("top_k", 5))
         first_stage_candidate_count = int(
             candidate_count or self.retrieval_config.get("candidate_count", 30)
         )
+        visual_retrieval = dict(self.visual_config.get("retrieval", {}) or {})
         rerank_top_n = int(self.rerank_config.get("top_n", top_k))
         rerank_enabled = self._rerank_enabled()
         first_stage_limit = (
@@ -424,6 +452,12 @@ class RagService:
                 min_score
                 if min_score is not None
                 else self.retrieval_config.get("min_score", 0.0)
+            ),
+            visual_embedding=visual_embedding,
+            visual_weight=float(visual_retrieval.get("weight", 0.4)),
+            visual_min_score=float(visual_retrieval.get("min_score", 0.0)),
+            visual_candidate_count=int(
+                visual_retrieval.get("top_k", first_stage_candidate_count)
             ),
         )
         if rerank_enabled:
@@ -472,6 +506,28 @@ class RagService:
 
     def _context_text_for_chunk(self, chunk: DocumentChunk) -> str:
         metadata = dict(chunk.metadata or {})
+        if metadata.get("is_figure"):
+            parts = []
+            if chunk.section_path:
+                parts.append(f"Section: {' > '.join(chunk.section_path)}")
+            if metadata.get("figure_id"):
+                parts.append(f"Figure: {metadata.get('figure_id')}")
+            if metadata.get("image_ref"):
+                parts.append(f"Image: {metadata.get('image_ref')}")
+            if metadata.get("bbox"):
+                parts.append(f"Bounding box: {metadata.get('bbox')}")
+            for key, title in (
+                ("figure_caption", "Caption"),
+                ("figure_ocr_text", "OCR text"),
+                ("figure_chart_summary", "Chart summary"),
+                ("figure_diagram_summary", "Diagram summary"),
+            ):
+                value = metadata.get(key)
+                if isinstance(value, str) and value.strip():
+                    parts.append(f"{title}: {' '.join(value.split())}")
+            if chunk.text.strip():
+                parts.append("Text: " + " ".join(chunk.text.split()))
+            return "\n".join(parts)
         if metadata.get("is_table_row"):
             values = dict(metadata.get("table_row_values") or {})
             value_text = "; ".join(
@@ -522,6 +578,8 @@ class RagService:
                     bbox=chunk.bboxes[0] if chunk.bboxes else None,
                     chunk_id=chunk.chunk_id,
                     index_version=result.index_version,
+                    figure_id=chunk.metadata.get("figure_id"),
+                    image_ref=chunk.metadata.get("image_ref"),
                 )
             )
         return sources
@@ -560,7 +618,18 @@ class RagService:
     ) -> int:
         if not self.enabled:
             raise RuntimeError("RAG service is disabled")
-        return await self.vector_store.delete_document(document_id, knowledge_base_id)
+        deleted = await self.vector_store.delete_document(
+            document_id, knowledge_base_id
+        )
+        if self._visual_enabled():
+            if knowledge_base_id:
+                self.figure_cropper.delete_document_assets(
+                    document_id, knowledge_base_id
+                )
+            else:
+                for kb_id in self._effective_knowledge_base_ids(None):
+                    self.figure_cropper.delete_document_assets(document_id, kb_id)
+        return deleted
 
     async def create_batch(
         self,
@@ -895,6 +964,9 @@ class RagService:
         embeddings = []
         failures = 0
         for chunk in chunks:
+            if chunk.metadata.get("is_figure") and not chunk.text.strip():
+                embeddings.append(None)
+                continue
             embedding = await self._safe_embed(chunk.text)
             if embedding is None:
                 failures += 1
@@ -907,6 +979,72 @@ class RagService:
             )
         return embeddings, warnings
 
+    async def _process_visual_blocks(
+        self,
+        *,
+        content: bytes,
+        filename: str,
+        parsed: Any,
+        knowledge_base_id: str,
+    ) -> List[str]:
+        if not self._visual_enabled():
+            return []
+        warnings = await asyncio.to_thread(
+            self.figure_cropper.crop_figures,
+            content=content,
+            filename=filename,
+            parsed_document=parsed,
+            knowledge_base_id=knowledge_base_id,
+        )
+        figure_blocks = [
+            block
+            for block in getattr(parsed, "blocks", [])
+            if getattr(block, "block_type", "") == "figure"
+            and isinstance(getattr(block, "metadata", None), dict)
+            and isinstance(block.metadata.get("figure"), dict)
+        ]
+        for block in figure_blocks:
+            figure = block.metadata["figure"]
+            try:
+                result = await self.visual_processor.process_figure(figure)
+            except Exception as exc:
+                warning = (
+                    f"Visual processing failed for {figure.get('figure_id')}: {exc}"
+                )
+                warnings.append(warning)
+                figure.setdefault("visual", {})["warnings"] = [warning]
+                continue
+            figure["visual"] = result.to_metadata()
+            warnings.extend(result.warnings)
+            block.text = compose_figure_text(block)
+        if warnings and self.visual_config.get("required", False):
+            raise RuntimeError("; ".join(warnings))
+        return warnings
+
+    async def _embed_visual_chunks(
+        self, chunks: Sequence[DocumentChunk]
+    ) -> tuple[List[Optional[List[float]]], List[str]]:
+        visual_embeddings: List[Optional[List[float]]] = []
+        failures = 0
+        for chunk in chunks:
+            embedding = chunk.metadata.get("visual_embedding")
+            if isinstance(embedding, list):
+                try:
+                    visual_embeddings.append([float(value) for value in embedding])
+                    continue
+                except (TypeError, ValueError):
+                    pass
+            if chunk.metadata.get("is_figure"):
+                failures += 1
+            visual_embeddings.append(None)
+        warnings = []
+        if failures and self._visual_embedding_enabled():
+            warnings.append(
+                f"Visual embedding unavailable for {failures} figure chunks; "
+                "indexed affected chunks for OCR/caption text retrieval only."
+            )
+        return visual_embeddings, warnings
+
     async def _safe_embed(self, text: str) -> Optional[List[float]]:
         try:
             return await asyncio.wait_for(
@@ -916,6 +1054,29 @@ class RagService:
         except Exception as exc:
             logger.info("RAG embedding unavailable; using keyword-only search: %s", exc)
             return None
+
+    async def _safe_visual_query_embed(self, query: str) -> Optional[List[float]]:
+        if not self._visual_embedding_enabled():
+            return None
+        try:
+            visual_embedding_config = dict(
+                self.visual_config.get("embedding", {}) or {}
+            )
+            return await asyncio.wait_for(
+                self.visual_processor.embed_query(query),
+                timeout=float(visual_embedding_config.get("timeout", 30)),
+            )
+        except Exception as exc:
+            logger.info("RAG visual embedding unavailable: %s", exc)
+            return None
+
+    def _visual_enabled(self) -> bool:
+        return bool(self.visual_config.get("enabled", False))
+
+    def _visual_embedding_enabled(self) -> bool:
+        return self._visual_enabled() and bool(
+            dict(self.visual_config.get("embedding", {}) or {}).get("enabled", False)
+        )
 
     def _rerank_enabled(self) -> bool:
         return bool(self.rerank_config.get("enabled", False))

@@ -192,6 +192,13 @@ class DoclingParser(DocumentParser):
             }
             if table_metadata:
                 block_metadata["table"] = table_metadata
+            if block_type == "figure":
+                block_metadata["figure"] = _extract_figure_metadata(
+                    raw,
+                    page=page,
+                    bbox=bbox,
+                    fallback_index=index,
+                )
             blocks.append(
                 DocumentBlock(
                     doc_id=document_id,
@@ -554,6 +561,26 @@ def _table_text_from_metadata(table: Optional[Dict[str, Any]]) -> str:
         str(table.get("rowwise_text") or "").strip(),
     ]
     return "\n\n".join(part for part in parts if part)
+
+
+def _extract_figure_metadata(
+    raw: Dict[str, Any],
+    *,
+    page: int,
+    bbox: Optional[List[float]],
+    fallback_index: int,
+) -> Dict[str, Any]:
+    asset_ref = str(raw.get("self_ref") or raw.get("id") or "").strip()
+    figure_id = asset_ref.strip("#/").replace("/", "-") if asset_ref else ""
+    if not figure_id:
+        figure_id = f"figure-{fallback_index or 1}"
+    return {
+        "figure_id": figure_id,
+        "page": page,
+        "bbox": bbox,
+        "asset_ref": asset_ref or None,
+        "raw_label": str(raw.get("label") or "figure"),
+    }
 
 
 def _normalize_block_type(value: Any) -> str:

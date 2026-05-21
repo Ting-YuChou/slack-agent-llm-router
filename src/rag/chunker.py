@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from src.rag.parser import DocumentBlock, ParsedDocument
+from src.rag.visual import compose_figure_text
 
 
 @dataclass
@@ -27,7 +28,7 @@ class StructureAwareChunker:
     """Chunk text on parser block boundaries while preserving layout metadata."""
 
     HEADER_BLOCK_TYPES = {"section_header", "title", "heading"}
-    STANDALONE_BLOCK_TYPES = {"table"}
+    STANDALONE_BLOCK_TYPES = {"figure", "table"}
 
     def __init__(self, config: Dict[str, Any]):
         self.config = dict(config or {})
@@ -44,7 +45,7 @@ class StructureAwareChunker:
         for block in sorted(
             document.blocks, key=lambda item: (item.page, item.reading_order)
         ):
-            if not block.text.strip():
+            if not block.text.strip() and not self._has_indexable_metadata(block):
                 continue
 
             if block.block_type in self.HEADER_BLOCK_TYPES:
@@ -63,6 +64,12 @@ class StructureAwareChunker:
                 )
                 if table_chunks:
                     chunks.extend(table_chunks)
+                    continue
+                figure_chunks = self._build_figure_chunks(
+                    document, block, current_section
+                )
+                if figure_chunks:
+                    chunks.extend(figure_chunks)
                     continue
                 chunks.extend(self._split_large_block(document, block, current_section))
                 continue
@@ -96,6 +103,55 @@ class StructureAwareChunker:
             chunks.append(self._build_chunk(document, current_blocks, current_section))
 
         return chunks
+
+    def _build_figure_chunks(
+        self,
+        document: ParsedDocument,
+        block: DocumentBlock,
+        section_path: List[str],
+    ) -> List[DocumentChunk]:
+        figure = (
+            block.metadata.get("figure") if isinstance(block.metadata, dict) else None
+        )
+        if block.block_type != "figure" or not isinstance(figure, dict):
+            return []
+
+        figure_id = str(figure.get("figure_id") or self._block_id(block))
+        figure["section_path"] = list(section_path)
+        visual = dict(figure.get("visual") or {})
+        text = block.text.strip() or compose_figure_text(block)
+        if not text and visual.get("visual_embedding") is None:
+            return []
+        base_metadata = {
+            **dict(document.metadata or {}),
+            "filename": document.filename,
+            "content_hash": document.content_hash,
+            "is_figure": True,
+            "figure_id": figure_id,
+            "image_ref": figure.get("image_ref"),
+            "ocr_provider": visual.get("ocr_provider"),
+            "caption_provider": visual.get("caption_provider"),
+            "visual_embedding_provider": visual.get("visual_embedding_provider"),
+            "bbox": figure.get("bbox") or block.bbox,
+            "page": figure.get("page") or block.page,
+            "figure_caption": visual.get("caption"),
+            "figure_ocr_text": visual.get("ocr_text"),
+            "figure_chart_summary": visual.get("chart_summary"),
+            "figure_diagram_summary": visual.get("diagram_summary"),
+            "figure_sidecar": figure,
+        }
+        if visual.get("visual_embedding") is not None:
+            base_metadata["visual_embedding"] = list(visual["visual_embedding"])
+        return [
+            self._chunk_from_table_parts(
+                document=document,
+                block=block,
+                block_ids=[f"{self._block_id(block)}:{figure_id}"],
+                text=text[: self.max_chunk_chars],
+                section_path=section_path,
+                metadata=base_metadata,
+            )
+        ]
 
     def _build_table_chunks(
         self,
@@ -327,6 +383,21 @@ class StructureAwareChunker:
 
     def _estimate_tokens(self, text: str) -> int:
         return max(1, len(text.split()))
+
+    def _has_indexable_metadata(self, block: DocumentBlock) -> bool:
+        if block.block_type != "figure" or not isinstance(block.metadata, dict):
+            return False
+        figure = block.metadata.get("figure")
+        if not isinstance(figure, dict):
+            return False
+        visual = figure.get("visual")
+        return isinstance(visual, dict) and bool(
+            visual.get("visual_embedding")
+            or visual.get("ocr_text")
+            or visual.get("caption")
+            or visual.get("chart_summary")
+            or visual.get("diagram_summary")
+        )
 
 
 def build_chunker(config: Dict[str, Any]) -> StructureAwareChunker:
