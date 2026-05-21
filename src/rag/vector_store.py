@@ -16,6 +16,13 @@ from src.rag.chunker import DocumentChunk
 
 logger = logging.getLogger(__name__)
 
+SIDECAR_METADATA_KEYS = {
+    "figure_sidecar",
+    "table_sidecar",
+    "table_row_sidecar",
+    "visual_embedding",
+}
+
 
 @dataclass
 class StoredRagChunk:
@@ -24,6 +31,7 @@ class StoredRagChunk:
     chunk: DocumentChunk
     knowledge_base_id: str
     embedding: Optional[List[float]] = None
+    visual_embedding: Optional[List[float]] = None
     index_version: str = ""
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
@@ -46,6 +54,7 @@ class InMemoryRagVectorStore:
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = dict(config or {})
+        self.retrieval_config = dict(self.config.get("retrieval", {}) or {})
         self.items: Dict[str, StoredRagChunk] = {}
 
     async def initialize(self):
@@ -60,6 +69,7 @@ class InMemoryRagVectorStore:
         embeddings: Sequence[Optional[Sequence[float]]],
         *,
         knowledge_base_id: str,
+        visual_embeddings: Optional[Sequence[Optional[Sequence[float]]]] = None,
     ) -> int:
         if not chunks:
             return 0
@@ -67,13 +77,17 @@ class InMemoryRagVectorStore:
         document_id = chunks[0].document_id
         await self.delete_document(document_id, knowledge_base_id)
         index_version = _new_index_version()
-        for chunk, embedding in zip(chunks, embeddings):
+        visual_embeddings = visual_embeddings or [None] * len(chunks)
+        for chunk, embedding, visual_embedding in zip(
+            chunks, embeddings, visual_embeddings
+        ):
             storage_id = self._storage_id(knowledge_base_id, chunk.chunk_id)
             existing = self.items.get(storage_id)
             self.items[storage_id] = StoredRagChunk(
                 chunk=chunk,
                 knowledge_base_id=knowledge_base_id,
                 embedding=list(embedding) if embedding else None,
+                visual_embedding=list(visual_embedding) if visual_embedding else None,
                 index_version=index_version,
                 created_at=existing.created_at if existing else now,
                 updated_at=now,
@@ -107,31 +121,60 @@ class InMemoryRagVectorStore:
         vector_weight: float,
         recency_weight: float,
         min_score: float,
+        visual_embedding: Optional[Sequence[float]] = None,
+        visual_weight: float = 0.0,
+        visual_min_score: float = 0.0,
+        visual_candidate_count: Optional[int] = None,
     ) -> List[RagSearchResult]:
         tokens = tokenize(query)
         allowed_kbs = set(knowledge_base_ids or [])
+        searchable_items = [
+            (storage_id, item)
+            for storage_id, item in self.items.items()
+            if not allowed_kbs or item.knowledge_base_id in allowed_kbs
+        ]
+        keyword_scores = _bm25_scores(
+            tokens,
+            [(storage_id, item.chunk.text) for storage_id, item in searchable_items],
+        )
         results: Dict[str, Tuple[StoredRagChunk, float, str]] = {}
-        for storage_id, item in self.items.items():
-            if allowed_kbs and item.knowledge_base_id not in allowed_kbs:
-                continue
-            keyword_score = _keyword_score(tokens, item.chunk.text)
+        for storage_id, item in searchable_items:
+            keyword_score = keyword_scores.get(storage_id, 0.0)
             vector_score = (
                 _cosine_similarity(embedding, item.embedding)
                 if embedding and item.embedding
                 else 0.0
             )
+            visual_score = (
+                _cosine_similarity(visual_embedding, item.visual_embedding)
+                if visual_embedding and item.visual_embedding
+                else 0.0
+            )
             score = (
                 keyword_weight * keyword_score
                 + vector_weight * vector_score
+                + visual_weight * visual_score
                 + recency_weight * _recency_score(item.updated_at)
             )
-            if score <= 0 or score < min_score:
+            effective_min_score = (
+                min(min_score, visual_min_score)
+                if visual_score > 0 and visual_min_score > 0
+                else min_score
+            )
+            if score <= 0 or score < effective_min_score:
                 continue
+            weighted_keyword = keyword_weight * keyword_score
+            weighted_vector = vector_weight * vector_score
+            weighted_visual = visual_weight * visual_score
             source = "hybrid"
-            if keyword_score > 0 and vector_score <= 0:
+            if weighted_visual > 0 and weighted_keyword <= 0 and weighted_vector <= 0:
+                source = "visual"
+            elif weighted_keyword > 0 and weighted_vector <= 0 and weighted_visual <= 0:
                 source = "keyword"
-            elif vector_score > 0 and keyword_score <= 0:
+            elif weighted_vector > 0 and weighted_keyword <= 0 and weighted_visual <= 0:
                 source = "vector"
+            elif weighted_visual > 0:
+                source = "hybrid_visual"
             results[storage_id] = (item, score, source)
 
         ranked = sorted(results.values(), key=lambda value: -value[1])[
@@ -160,9 +203,18 @@ class RedisStackRagVectorStore:
         self.config = dict(config or {})
         self.redis_config = dict(self.config.get("redis", {}) or {})
         self.embedding_config = dict(self.config.get("embedding", {}) or {})
+        self.retrieval_config = dict(self.config.get("retrieval", {}) or {})
+        self.visual_config = dict(self.config.get("visual", {}) or {})
+        self.visual_embedding_config = dict(
+            self.visual_config.get("embedding", {}) or {}
+        )
         self.key_prefix = self.redis_config.get("key_prefix", "rag")
         self.index_name = f"{self.key_prefix}:idx:chunks"
+        self.visual_index_name = f"{self.key_prefix}:idx:visual_chunks"
         self.dimensions = int(self.embedding_config.get("dimensions", 1024))
+        self.visual_dimensions = int(
+            self.visual_embedding_config.get("dimensions", 1024)
+        )
         self.client = None
 
     async def initialize(self):
@@ -187,6 +239,8 @@ class RedisStackRagVectorStore:
             )
         await self.client.ping()
         await self._ensure_index()
+        if self._visual_enabled():
+            await self._ensure_visual_index()
 
     async def shutdown(self):
         if self.client and hasattr(self.client, "close"):
@@ -249,12 +303,66 @@ class RedisStackRagVectorStore:
                 "RAG Redis backend requires Redis Stack RediSearch/vector support"
             ) from exc
 
+    async def _ensure_visual_index(self):
+        try:
+            await self.client.execute_command("FT.INFO", self.visual_index_name)
+            return
+        except Exception:
+            pass
+
+        try:
+            await self.client.execute_command(
+                "FT.CREATE",
+                self.visual_index_name,
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                self._visual_chunk_prefix(),
+                "SCHEMA",
+                "knowledge_base_id",
+                "TAG",
+                "document_id",
+                "TAG",
+                "chunk_id",
+                "TAG",
+                "index_version",
+                "TAG",
+                "text",
+                "TEXT",
+                "block_types",
+                "TAG",
+                "page_start",
+                "NUMERIC",
+                "SORTABLE",
+                "page_end",
+                "NUMERIC",
+                "updated_at",
+                "NUMERIC",
+                "SORTABLE",
+                "visual_embedding",
+                "VECTOR",
+                "HNSW",
+                "6",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                str(self.visual_dimensions),
+                "DISTANCE_METRIC",
+                "COSINE",
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "RAG visual Redis backend requires Redis Stack vector support"
+            ) from exc
+
     async def upsert_chunks(
         self,
         chunks: Sequence[DocumentChunk],
         embeddings: Sequence[Optional[Sequence[float]]],
         *,
         knowledge_base_id: str,
+        visual_embeddings: Optional[Sequence[Optional[Sequence[float]]]] = None,
     ) -> int:
         if not self.client or not chunks:
             return 0
@@ -263,7 +371,10 @@ class RedisStackRagVectorStore:
         await self.delete_document(document_id, knowledge_base_id)
         index_version = _new_index_version()
         count = 0
-        for chunk, embedding in zip(chunks, embeddings):
+        visual_embeddings = visual_embeddings or [None] * len(chunks)
+        for chunk, embedding, visual_embedding in zip(
+            chunks, embeddings, visual_embeddings
+        ):
             mapping: Dict[str, Any] = {
                 "knowledge_base_id": knowledge_base_id,
                 "document_id": chunk.document_id,
@@ -272,7 +383,9 @@ class RedisStackRagVectorStore:
                 "text": chunk.text,
                 "keywords": ",".join(tokenize(chunk.text)),
                 "block_types": ",".join(chunk.block_types),
-                "metadata": json.dumps(chunk.metadata, sort_keys=True),
+                "metadata": json.dumps(
+                    _metadata_for_chunk_storage(chunk.metadata), sort_keys=True
+                ),
                 "section_path": json.dumps(chunk.section_path),
                 "block_ids": json.dumps(chunk.block_ids),
                 "bboxes": json.dumps(chunk.bboxes),
@@ -293,6 +406,25 @@ class RedisStackRagVectorStore:
             )
             await self.client.sadd(
                 self._document_kbs_key(chunk.document_id), knowledge_base_id
+            )
+            await self._upsert_table_sidecars_from_chunk(
+                chunk,
+                knowledge_base_id=knowledge_base_id,
+                index_version=index_version,
+                updated_at=now_ts,
+            )
+            await self._upsert_figure_sidecars_from_chunk(
+                chunk,
+                knowledge_base_id=knowledge_base_id,
+                index_version=index_version,
+                updated_at=now_ts,
+            )
+            await self._upsert_visual_chunk(
+                chunk,
+                visual_embedding,
+                knowledge_base_id=knowledge_base_id,
+                index_version=index_version,
+                updated_at=now_ts,
             )
             count += 1
         return count
@@ -328,6 +460,9 @@ class RedisStackRagVectorStore:
             )
             count += int(bool(deleted))
         await self.client.delete(self._document_key(document_id, knowledge_base_id))
+        await self._delete_table_sidecars(document_id, knowledge_base_id)
+        await self._delete_figure_sidecars(document_id, knowledge_base_id)
+        count += await self._delete_visual_chunks(document_id, knowledge_base_id)
 
         remaining_kbs = await self.client.smembers(self._document_kbs_key(document_id))
         await self.client.srem(self._document_kbs_key(document_id), knowledge_base_id)
@@ -369,6 +504,10 @@ class RedisStackRagVectorStore:
         vector_weight: float,
         recency_weight: float,
         min_score: float,
+        visual_embedding: Optional[Sequence[float]] = None,
+        visual_weight: float = 0.0,
+        visual_min_score: float = 0.0,
+        visual_candidate_count: Optional[int] = None,
     ) -> List[RagSearchResult]:
         keyword_results = await self._keyword_search(
             query, knowledge_base_ids, candidate_count
@@ -376,13 +515,21 @@ class RedisStackRagVectorStore:
         vector_results = await self._vector_search(
             embedding, knowledge_base_ids, candidate_count
         )
+        visual_results = await self._visual_search(
+            visual_embedding,
+            knowledge_base_ids,
+            int(visual_candidate_count or candidate_count),
+        )
         merged = _merge_results(
             keyword_results,
             vector_results,
+            visual_results,
             keyword_weight=keyword_weight,
             vector_weight=vector_weight,
+            visual_weight=visual_weight,
             recency_weight=recency_weight,
             min_score=min_score,
+            visual_min_score=visual_min_score,
         )
         return merged[:limit]
 
@@ -399,7 +546,7 @@ class RedisStackRagVectorStore:
             if filter_query != "*"
             else f"@text:({text_query})"
         )
-        results = await self._search(redis_query, limit, "keyword", tokens=tokens)
+        results = await self._keyword_text_search(redis_query, limit)
         if results:
             return results
 
@@ -410,6 +557,31 @@ class RedisStackRagVectorStore:
             else f"@keywords:{{{token_query}}}"
         )
         return await self._search(fallback_query, limit, "keyword", tokens=tokens)
+
+    async def _keyword_text_search(
+        self, query: str, limit: int
+    ) -> List[RagSearchResult]:
+        for scorer in self._keyword_scorer_candidates():
+            try:
+                return await self._search(
+                    query,
+                    limit,
+                    "keyword",
+                    with_scores=True,
+                    scorer=scorer,
+                    normalize_scores=self._keyword_normalization() == "max",
+                    raise_on_error=scorer is not None,
+                )
+            except Exception as exc:
+                logger.debug("Redis RAG keyword scorer %s failed: %s", scorer, exc)
+                continue
+        return await self._search(
+            query,
+            limit,
+            "keyword",
+            with_scores=True,
+            normalize_scores=self._keyword_normalization() == "max",
+        )
 
     async def _vector_search(
         self,
@@ -466,18 +638,78 @@ class RedisStackRagVectorStore:
             return []
         return self._parse_results(raw_results, "vector")
 
+    async def _visual_search(
+        self,
+        visual_embedding: Optional[Sequence[float]],
+        knowledge_base_ids: Sequence[str],
+        limit: int,
+    ) -> List[RagSearchResult]:
+        if not self.client or not visual_embedding or not self._visual_enabled():
+            return []
+        if len(visual_embedding) != self.visual_dimensions:
+            logger.warning("Skipping RAG visual search due to dimension mismatch")
+            return []
+        filter_query = self._filter_query(knowledge_base_ids)
+        base_query = "*" if filter_query == "*" else f"({filter_query})"
+        redis_query = f"{base_query}=>[KNN {limit} @visual_embedding $vec AS distance]"
+        try:
+            raw_results = await self.client.execute_command(
+                "FT.SEARCH",
+                self.visual_index_name,
+                redis_query,
+                "PARAMS",
+                "2",
+                "vec",
+                _vector_to_bytes(visual_embedding),
+                "SORTBY",
+                "distance",
+                "ASC",
+                "LIMIT",
+                "0",
+                str(limit),
+                "RETURN",
+                "15",
+                "knowledge_base_id",
+                "document_id",
+                "chunk_id",
+                "text",
+                "metadata",
+                "section_path",
+                "block_ids",
+                "block_types",
+                "bboxes",
+                "page_start",
+                "page_end",
+                "created_at",
+                "updated_at",
+                "index_version",
+                "distance",
+                "DIALECT",
+                "2",
+            )
+        except Exception as exc:
+            logger.warning("Redis RAG visual search failed: %s", exc)
+            return []
+        return self._parse_results(raw_results, "visual")
+
     async def _search(
         self,
         query: str,
         limit: int,
         source: str,
         tokens: Optional[Sequence[str]] = None,
+        with_scores: bool = False,
+        scorer: Optional[str] = None,
+        normalize_scores: bool = False,
+        raise_on_error: bool = False,
     ) -> List[RagSearchResult]:
-        try:
-            raw_results = await self.client.execute_command(
-                "FT.SEARCH",
-                self.index_name,
-                query,
+        command: List[Any] = ["FT.SEARCH", self.index_name, query]
+        if with_scores:
+            command.append("WITHSCORES")
+        if scorer:
+            command.extend(["SCORER", scorer])
+        command.extend(
+            [
                 "LIMIT",
                 "0",
                 str(limit),
@@ -498,24 +730,44 @@ class RedisStackRagVectorStore:
                 "created_at",
                 "updated_at",
                 "embedding",
-            )
+            ]
+        )
+        try:
+            raw_results = await self.client.execute_command(*command)
         except Exception as exc:
+            if raise_on_error:
+                raise
             logger.warning("Redis RAG keyword search failed: %s", exc)
             return []
-        return self._parse_results(raw_results, source, tokens=tokens)
+        return self._parse_results(
+            raw_results,
+            source,
+            tokens=tokens,
+            with_scores=with_scores,
+            normalize_scores=normalize_scores,
+        )
 
     def _parse_results(
         self,
         raw_results: Any,
         source: str,
         tokens: Optional[Sequence[str]] = None,
+        with_scores: bool = False,
+        normalize_scores: bool = False,
     ) -> List[RagSearchResult]:
         if not raw_results or len(raw_results) < 2:
             return []
         parsed = []
         entries = raw_results[1:]
-        for index in range(0, len(entries), 2):
-            fields = entries[index + 1]
+        index = 0
+        while index < len(entries):
+            index += 1
+            raw_score = None
+            if with_scores:
+                raw_score = entries[index]
+                index += 1
+            fields = entries[index]
+            index += 1
             payload = {}
             for field_index in range(0, len(fields), 2):
                 payload[_decode(fields[field_index])] = fields[field_index + 1]
@@ -527,8 +779,13 @@ class RedisStackRagVectorStore:
                     score = max(0.0, 1.0 - float(_decode(distance)))
                 except ValueError:
                     score = 0.0
+            elif raw_score is not None:
+                try:
+                    score = max(0.0, float(_decode(raw_score)))
+                except ValueError:
+                    score = 0.0
             elif tokens:
-                score = _keyword_score(tokens, item.chunk.text)
+                score = _keyword_overlap_score(tokens, item.chunk.text)
                 if score <= 0:
                     continue
             parsed.append(
@@ -541,6 +798,8 @@ class RedisStackRagVectorStore:
                     updated_at=item.updated_at,
                 )
             )
+        if normalize_scores:
+            parsed = _normalize_result_scores(parsed)
         return parsed
 
     def _deserialize(self, payload: Dict[Any, Any]) -> StoredRagChunk:
@@ -591,6 +850,12 @@ class RedisStackRagVectorStore:
     def _chunk_key(self, chunk_id: str, knowledge_base_id: str) -> str:
         return f"{self._chunk_prefix()}{knowledge_base_id}:{chunk_id}"
 
+    def _visual_chunk_prefix(self) -> str:
+        return f"{self.key_prefix}:visual_chunk:"
+
+    def _visual_chunk_key(self, chunk_id: str, knowledge_base_id: str) -> str:
+        return f"{self._visual_chunk_prefix()}{knowledge_base_id}:{chunk_id}"
+
     def _legacy_chunk_key(self, chunk_id: str) -> str:
         return f"{self._chunk_prefix()}{chunk_id}"
 
@@ -603,6 +868,268 @@ class RedisStackRagVectorStore:
     def _document_kbs_key(self, document_id: str) -> str:
         return f"{self.key_prefix}:document:{document_id}:knowledge_bases"
 
+    def _document_tables_key(self, document_id: str, knowledge_base_id: str) -> str:
+        return f"{self.key_prefix}:tables:{knowledge_base_id}:{document_id}"
+
+    def _document_visual_key(self, document_id: str, knowledge_base_id: str) -> str:
+        return f"{self.key_prefix}:document:{knowledge_base_id}:{document_id}:visual_chunks"
+
+    def _document_figures_key(self, document_id: str, knowledge_base_id: str) -> str:
+        return f"{self.key_prefix}:figures:{knowledge_base_id}:{document_id}"
+
+    def _figure_key(
+        self, knowledge_base_id: str, document_id: str, figure_id: str
+    ) -> str:
+        return f"{self.key_prefix}:figure:{knowledge_base_id}:{document_id}:{figure_id}"
+
+    def _table_key(
+        self, knowledge_base_id: str, document_id: str, table_id: str
+    ) -> str:
+        return f"{self.key_prefix}:table:{knowledge_base_id}:{document_id}:{table_id}"
+
+    def _table_rows_key(
+        self, knowledge_base_id: str, document_id: str, table_id: str
+    ) -> str:
+        return (
+            f"{self.key_prefix}:table_rows:{knowledge_base_id}:{document_id}:{table_id}"
+        )
+
+    def _table_row_key(
+        self,
+        knowledge_base_id: str,
+        document_id: str,
+        table_id: str,
+        row_id: str,
+    ) -> str:
+        return (
+            f"{self.key_prefix}:table_row:"
+            f"{knowledge_base_id}:{document_id}:{table_id}:{row_id}"
+        )
+
+    async def _upsert_table_sidecars_from_chunk(
+        self,
+        chunk: DocumentChunk,
+        *,
+        knowledge_base_id: str,
+        index_version: str,
+        updated_at: float,
+    ) -> None:
+        metadata = dict(chunk.metadata or {})
+        table_id = str(metadata.get("table_id") or "")
+        if not table_id:
+            return
+        table_sidecar = metadata.get("table_sidecar")
+        if isinstance(table_sidecar, dict):
+            await self.client.hset(
+                self._table_key(knowledge_base_id, chunk.document_id, table_id),
+                mapping={
+                    "knowledge_base_id": knowledge_base_id,
+                    "document_id": chunk.document_id,
+                    "table_id": table_id,
+                    "index_version": index_version,
+                    "updated_at": updated_at,
+                    "table_json": json.dumps(table_sidecar, sort_keys=True),
+                },
+            )
+            await self.client.sadd(
+                self._document_tables_key(chunk.document_id, knowledge_base_id),
+                table_id,
+            )
+
+        row_sidecar = metadata.get("table_row_sidecar")
+        row_id = str(metadata.get("table_row_id") or "")
+        if isinstance(row_sidecar, dict) and row_id:
+            await self.client.sadd(
+                self._document_tables_key(chunk.document_id, knowledge_base_id),
+                table_id,
+            )
+            await self.client.hset(
+                self._table_row_key(
+                    knowledge_base_id,
+                    chunk.document_id,
+                    table_id,
+                    row_id,
+                ),
+                mapping={
+                    "knowledge_base_id": knowledge_base_id,
+                    "document_id": chunk.document_id,
+                    "table_id": table_id,
+                    "row_id": row_id,
+                    "index_version": index_version,
+                    "updated_at": updated_at,
+                    "row_json": json.dumps(row_sidecar, sort_keys=True),
+                },
+            )
+            await self.client.sadd(
+                self._table_rows_key(knowledge_base_id, chunk.document_id, table_id),
+                row_id,
+            )
+
+    async def _upsert_figure_sidecars_from_chunk(
+        self,
+        chunk: DocumentChunk,
+        *,
+        knowledge_base_id: str,
+        index_version: str,
+        updated_at: float,
+    ) -> None:
+        metadata = dict(chunk.metadata or {})
+        figure_id = str(metadata.get("figure_id") or "")
+        figure_sidecar = metadata.get("figure_sidecar")
+        if not figure_id or not isinstance(figure_sidecar, dict):
+            return
+        await self.client.hset(
+            self._figure_key(knowledge_base_id, chunk.document_id, figure_id),
+            mapping={
+                "knowledge_base_id": knowledge_base_id,
+                "document_id": chunk.document_id,
+                "figure_id": figure_id,
+                "index_version": index_version,
+                "updated_at": updated_at,
+                "figure_json": json.dumps(
+                    _figure_sidecar_for_storage(figure_sidecar), sort_keys=True
+                ),
+            },
+        )
+        await self.client.sadd(
+            self._document_figures_key(chunk.document_id, knowledge_base_id),
+            figure_id,
+        )
+
+    async def _upsert_visual_chunk(
+        self,
+        chunk: DocumentChunk,
+        visual_embedding: Optional[Sequence[float]],
+        *,
+        knowledge_base_id: str,
+        index_version: str,
+        updated_at: float,
+    ) -> None:
+        if not self._visual_enabled() or not visual_embedding:
+            return
+        if len(visual_embedding) != self.visual_dimensions:
+            raise ValueError(
+                "Visual embedding dimensions do not match RAG visual index"
+            )
+        now_ts = updated_at
+        mapping: Dict[str, Any] = {
+            "knowledge_base_id": knowledge_base_id,
+            "document_id": chunk.document_id,
+            "chunk_id": chunk.chunk_id,
+            "index_version": index_version,
+            "text": chunk.text,
+            "block_types": ",".join(chunk.block_types),
+            "metadata": json.dumps(
+                _metadata_for_chunk_storage(chunk.metadata), sort_keys=True
+            ),
+            "section_path": json.dumps(chunk.section_path),
+            "block_ids": json.dumps(chunk.block_ids),
+            "bboxes": json.dumps(chunk.bboxes),
+            "page_start": int(chunk.page_start),
+            "page_end": int(chunk.page_end),
+            "created_at": now_ts,
+            "updated_at": now_ts,
+            "visual_embedding": _vector_to_bytes(visual_embedding),
+        }
+        await self.client.hset(
+            self._visual_chunk_key(chunk.chunk_id, knowledge_base_id), mapping=mapping
+        )
+        await self.client.sadd(
+            self._document_visual_key(chunk.document_id, knowledge_base_id),
+            chunk.chunk_id,
+        )
+
+    async def _delete_table_sidecars(
+        self, document_id: str, knowledge_base_id: str
+    ) -> None:
+        table_ids = await self.client.smembers(
+            self._document_tables_key(document_id, knowledge_base_id)
+        )
+        for raw_table_id in table_ids:
+            table_id = _decode(raw_table_id)
+            row_ids = await self.client.smembers(
+                self._table_rows_key(knowledge_base_id, document_id, table_id)
+            )
+            if row_ids:
+                await self.client.delete(
+                    *[
+                        self._table_row_key(
+                            knowledge_base_id,
+                            document_id,
+                            table_id,
+                            _decode(row_id),
+                        )
+                        for row_id in row_ids
+                    ]
+                )
+            await self.client.delete(
+                self._table_rows_key(knowledge_base_id, document_id, table_id),
+                self._table_key(knowledge_base_id, document_id, table_id),
+            )
+        await self.client.delete(
+            self._document_tables_key(document_id, knowledge_base_id)
+        )
+
+    async def _delete_figure_sidecars(
+        self, document_id: str, knowledge_base_id: str
+    ) -> None:
+        figure_ids = await self.client.smembers(
+            self._document_figures_key(document_id, knowledge_base_id)
+        )
+        for raw_figure_id in figure_ids:
+            await self.client.delete(
+                self._figure_key(
+                    knowledge_base_id,
+                    document_id,
+                    _decode(raw_figure_id),
+                )
+            )
+        await self.client.delete(
+            self._document_figures_key(document_id, knowledge_base_id)
+        )
+
+    async def _delete_visual_chunks(
+        self, document_id: str, knowledge_base_id: str
+    ) -> int:
+        chunk_ids = await self.client.smembers(
+            self._document_visual_key(document_id, knowledge_base_id)
+        )
+        count = 0
+        for raw_chunk_id in chunk_ids:
+            chunk_id = _decode(raw_chunk_id)
+            deleted = await self.client.delete(
+                self._visual_chunk_key(chunk_id, knowledge_base_id)
+            )
+            count += int(bool(deleted))
+        await self.client.delete(
+            self._document_visual_key(document_id, knowledge_base_id)
+        )
+        return count
+
+    def _keyword_scorer_candidates(self) -> List[Optional[str]]:
+        configured = str(
+            self.retrieval_config.get("keyword_scorer") or "BM25STD"
+        ).strip()
+        candidates: List[Optional[str]] = []
+        for scorer in [configured, "BM25", None]:
+            if scorer and scorer.upper() == "DEFAULT":
+                scorer = None
+            if scorer not in candidates:
+                candidates.append(scorer)
+        return candidates
+
+    def _keyword_normalization(self) -> str:
+        return (
+            str(self.retrieval_config.get("keyword_score_normalization") or "max")
+            .strip()
+            .lower()
+        )
+
+    def _visual_enabled(self) -> bool:
+        return bool(self.visual_config.get("enabled", False)) and bool(
+            self.visual_embedding_config.get("enabled", False)
+        )
+
 
 def build_vector_store(config: Dict[str, Any]):
     backend = str(config.get("backend", "redis_stack")).lower()
@@ -611,12 +1138,102 @@ def build_vector_store(config: Dict[str, Any]):
     return RedisStackRagVectorStore(config)
 
 
-def _keyword_score(tokens: Sequence[str], text: str) -> float:
+def _keyword_overlap_score(tokens: Sequence[str], text: str) -> float:
     token_set = set(tokens)
     if not token_set:
         return 0.0
     text_tokens = set(tokenize(text))
     return len(token_set.intersection(text_tokens)) / len(token_set)
+
+
+def _metadata_for_chunk_storage(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in dict(metadata or {}).items()
+        if key not in SIDECAR_METADATA_KEYS
+    }
+
+
+def _figure_sidecar_for_storage(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(metadata or {})
+    visual = dict(payload.get("visual") or {})
+    visual.pop("visual_embedding", None)
+    if visual:
+        payload["visual"] = visual
+    return payload
+
+
+def _bm25_scores(
+    query_tokens: Sequence[str],
+    documents: Sequence[Tuple[str, str]],
+    *,
+    k1: float = 1.5,
+    b: float = 0.75,
+) -> Dict[str, float]:
+    if not query_tokens or not documents:
+        return {}
+    tokenized_documents = [(doc_id, tokenize(text)) for doc_id, text in documents]
+    document_count = len(tokenized_documents)
+    lengths = [len(tokens) for _doc_id, tokens in tokenized_documents]
+    avg_length = sum(lengths) / document_count if document_count else 0.0
+    if avg_length <= 0:
+        return {}
+
+    query_terms = list(dict.fromkeys(query_tokens))
+    document_frequency: Dict[str, int] = {term: 0 for term in query_terms}
+    for _doc_id, doc_tokens in tokenized_documents:
+        token_set = set(doc_tokens)
+        for term in query_terms:
+            if term in token_set:
+                document_frequency[term] += 1
+
+    scores: Dict[str, float] = {}
+    for doc_id, doc_tokens in tokenized_documents:
+        if not doc_tokens:
+            continue
+        term_counts: Dict[str, int] = {}
+        for token in doc_tokens:
+            if token in document_frequency:
+                term_counts[token] = term_counts.get(token, 0) + 1
+        score = 0.0
+        doc_length = len(doc_tokens)
+        for term in query_terms:
+            term_frequency = term_counts.get(term, 0)
+            if term_frequency <= 0:
+                continue
+            df = document_frequency.get(term, 0)
+            idf = math.log(1.0 + (document_count - df + 0.5) / (df + 0.5))
+            denominator = term_frequency + k1 * (1.0 - b + b * doc_length / avg_length)
+            score += idf * (term_frequency * (k1 + 1.0)) / denominator
+        if score > 0:
+            scores[doc_id] = score
+    return _normalize_scores(scores)
+
+
+def _normalize_scores(scores: Dict[str, float]) -> Dict[str, float]:
+    max_score = max(scores.values(), default=0.0)
+    if max_score <= 0:
+        return {key: 0.0 for key in scores}
+    return {key: max(0.0, value / max_score) for key, value in scores.items()}
+
+
+def _normalize_result_scores(
+    results: Sequence[RagSearchResult],
+) -> List[RagSearchResult]:
+    max_score = max((result.score for result in results), default=0.0)
+    if max_score <= 0:
+        return list(results)
+    return [
+        RagSearchResult(
+            chunk=result.chunk,
+            score=max(0.0, result.score / max_score),
+            match_source=result.match_source,
+            knowledge_base_id=result.knowledge_base_id,
+            index_version=result.index_version,
+            updated_at=result.updated_at,
+        )
+        for result in results
+    ]
 
 
 def _cosine_similarity(
@@ -640,22 +1257,27 @@ def _recency_score(updated_at: datetime) -> float:
 def _merge_results(
     keyword_results: Sequence[RagSearchResult],
     vector_results: Sequence[RagSearchResult],
+    visual_results: Sequence[RagSearchResult] = (),
     *,
     keyword_weight: float,
     vector_weight: float,
+    visual_weight: float = 0.0,
     recency_weight: float,
     min_score: float,
+    visual_min_score: float = 0.0,
 ) -> List[RagSearchResult]:
     by_id: Dict[str, Tuple[RagSearchResult, float, str]] = {}
 
     def add(result: RagSearchResult, weight: float):
+        if weight <= 0:
+            return
         chunk_id = result.chunk.chunk_id
         existing = by_id.get(chunk_id)
         source = result.match_source
         score = result.score * weight
         if existing:
             result = existing[0]
-            source = "hybrid"
+            source = "hybrid_visual" if "visual" in {source, existing[2]} else "hybrid"
             score += existing[1]
         by_id[chunk_id] = (result, score, source)
 
@@ -663,12 +1285,19 @@ def _merge_results(
         add(result, keyword_weight)
     for result in vector_results:
         add(result, vector_weight)
+    for result in visual_results:
+        add(result, visual_weight)
 
     merged = []
     for result, score, source in by_id.values():
         if result.updated_at:
             score = score + recency_weight * _recency_score(result.updated_at)
-        if score < min_score:
+        threshold = (
+            min(visual_min_score, min_score)
+            if source in {"visual", "hybrid_visual"} and visual_min_score > 0
+            else min_score
+        )
+        if score < threshold:
             continue
         merged.append(
             RagSearchResult(

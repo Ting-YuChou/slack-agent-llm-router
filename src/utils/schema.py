@@ -88,6 +88,8 @@ class ResponseSource(BaseModel):
     bbox: Optional[List[float]] = None
     chunk_id: Optional[str] = None
     index_version: Optional[str] = None
+    figure_id: Optional[str] = None
+    image_ref: Optional[str] = None
 
 
 class ToolCall(BaseModel):
@@ -802,6 +804,8 @@ class RagRetrievalConfig(ConfigModel):
     top_k: int = Field(5, ge=1, le=20)
     candidate_count: int = Field(30, ge=1, le=100)
     min_score: float = Field(0.0, ge=0.0, le=1.0)
+    keyword_scorer: str = "BM25STD"
+    keyword_score_normalization: str = "max"
     keyword_weight: float = Field(0.35, ge=0.0)
     vector_weight: float = Field(0.6, ge=0.0)
     recency_weight: float = Field(0.05, ge=0.0)
@@ -810,7 +814,7 @@ class RagRetrievalConfig(ConfigModel):
 
 class RagRerankConfig(ConfigModel):
     enabled: bool = False
-    provider: str = "none"
+    provider: str = "sentence_transformers"
     model: str = "BAAI/bge-reranker-v2-m3"
     top_n: int = Field(8, ge=1, le=50)
     timeout: int = Field(30, ge=1)
@@ -845,6 +849,57 @@ class RagStorageConfig(ConfigModel):
     completed_file_ttl_seconds: int = Field(86400, ge=0)
 
 
+class RagVisualProviderConfig(ConfigModel):
+    enabled: bool = False
+    provider: str = ""
+    model: str = ""
+    url: Optional[str] = None
+    timeout: int = Field(30, ge=1)
+
+
+class RagVisualEmbeddingConfig(RagVisualProviderConfig):
+    provider: str = "nomic_multimodal"
+    model: str = "nomic-ai/nomic-embed-multimodal-3b"
+    dimensions: int = Field(1024, ge=1)
+
+
+class RagVisualRetrievalConfig(ConfigModel):
+    top_k: int = Field(5, ge=1, le=20)
+    weight: float = Field(0.4, ge=0.0)
+    min_score: float = Field(0.0, ge=0.0, le=1.0)
+
+
+class RagVisualStorageConfig(ConfigModel):
+    assets_dir: str = "data/rag/assets"
+
+
+class RagVisualConfig(ConfigModel):
+    enabled: bool = False
+    required: bool = False
+    crop_dpi: int = Field(180, ge=72, le=600)
+    min_crop_pixels: int = Field(64, ge=1)
+    max_crops_per_document: int = Field(50, ge=0)
+    ocr: RagVisualProviderConfig = Field(
+        default_factory=lambda: RagVisualProviderConfig(
+            provider="paddleocr_vl",
+            model="PaddlePaddle/PaddleOCR-VL",
+        )
+    )
+    caption: RagVisualProviderConfig = Field(
+        default_factory=lambda: RagVisualProviderConfig(
+            provider="qwen2_5_vl",
+            model="Qwen/Qwen2.5-VL-7B-Instruct",
+        )
+    )
+    embedding: RagVisualEmbeddingConfig = Field(
+        default_factory=RagVisualEmbeddingConfig
+    )
+    retrieval: RagVisualRetrievalConfig = Field(
+        default_factory=RagVisualRetrievalConfig
+    )
+    storage: RagVisualStorageConfig = Field(default_factory=RagVisualStorageConfig)
+
+
 class RagConfig(ConfigModel):
     enabled: bool = False
     backend: str = "redis_stack"
@@ -856,6 +911,7 @@ class RagConfig(ConfigModel):
     redis: RagRedisConfig = Field(default_factory=RagRedisConfig)
     retrieval: RagRetrievalConfig = Field(default_factory=RagRetrievalConfig)
     rerank: RagRerankConfig = Field(default_factory=RagRerankConfig)
+    visual: RagVisualConfig = Field(default_factory=RagVisualConfig)
     intent_gate: RagIntentGateConfig = Field(default_factory=RagIntentGateConfig)
     ingestion_queue: RagIngestionQueueConfig = Field(
         default_factory=RagIngestionQueueConfig

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from src.rag.parser import DocumentBlock, ParsedDocument
+from src.rag.visual import compose_figure_text
 
 
 @dataclass
@@ -27,7 +28,7 @@ class StructureAwareChunker:
     """Chunk text on parser block boundaries while preserving layout metadata."""
 
     HEADER_BLOCK_TYPES = {"section_header", "title", "heading"}
-    STANDALONE_BLOCK_TYPES = {"table"}
+    STANDALONE_BLOCK_TYPES = {"figure", "table"}
 
     def __init__(self, config: Dict[str, Any]):
         self.config = dict(config or {})
@@ -44,7 +45,7 @@ class StructureAwareChunker:
         for block in sorted(
             document.blocks, key=lambda item: (item.page, item.reading_order)
         ):
-            if not block.text.strip():
+            if not block.text.strip() and not self._has_indexable_metadata(block):
                 continue
 
             if block.block_type in self.HEADER_BLOCK_TYPES:
@@ -58,6 +59,18 @@ class StructureAwareChunker:
                     )
                     current_blocks = []
                     current_tokens = 0
+                table_chunks = self._build_table_chunks(
+                    document, block, current_section
+                )
+                if table_chunks:
+                    chunks.extend(table_chunks)
+                    continue
+                figure_chunks = self._build_figure_chunks(
+                    document, block, current_section
+                )
+                if figure_chunks:
+                    chunks.extend(figure_chunks)
+                    continue
                 chunks.extend(self._split_large_block(document, block, current_section))
                 continue
 
@@ -90,6 +103,187 @@ class StructureAwareChunker:
             chunks.append(self._build_chunk(document, current_blocks, current_section))
 
         return chunks
+
+    def _build_figure_chunks(
+        self,
+        document: ParsedDocument,
+        block: DocumentBlock,
+        section_path: List[str],
+    ) -> List[DocumentChunk]:
+        figure = (
+            block.metadata.get("figure") if isinstance(block.metadata, dict) else None
+        )
+        if block.block_type != "figure" or not isinstance(figure, dict):
+            return []
+
+        figure_id = str(figure.get("figure_id") or self._block_id(block))
+        figure["section_path"] = list(section_path)
+        visual = dict(figure.get("visual") or {})
+        text = block.text.strip() or compose_figure_text(block)
+        if not text and visual.get("visual_embedding") is None:
+            return []
+        base_metadata = {
+            **dict(document.metadata or {}),
+            "filename": document.filename,
+            "content_hash": document.content_hash,
+            "is_figure": True,
+            "figure_id": figure_id,
+            "image_ref": figure.get("image_ref"),
+            "ocr_provider": visual.get("ocr_provider"),
+            "caption_provider": visual.get("caption_provider"),
+            "visual_embedding_provider": visual.get("visual_embedding_provider"),
+            "bbox": figure.get("bbox") or block.bbox,
+            "page": figure.get("page") or block.page,
+            "figure_caption": visual.get("caption"),
+            "figure_ocr_text": visual.get("ocr_text"),
+            "figure_chart_summary": visual.get("chart_summary"),
+            "figure_diagram_summary": visual.get("diagram_summary"),
+            "figure_sidecar": figure,
+        }
+        if visual.get("visual_embedding") is not None:
+            base_metadata["visual_embedding"] = list(visual["visual_embedding"])
+        return [
+            self._chunk_from_table_parts(
+                document=document,
+                block=block,
+                block_ids=[f"{self._block_id(block)}:{figure_id}"],
+                text=text[: self.max_chunk_chars],
+                section_path=section_path,
+                metadata=base_metadata,
+            )
+        ]
+
+    def _build_table_chunks(
+        self,
+        document: ParsedDocument,
+        block: DocumentBlock,
+        section_path: List[str],
+    ) -> List[DocumentChunk]:
+        table = (
+            block.metadata.get("table") if isinstance(block.metadata, dict) else None
+        )
+        if not isinstance(table, dict) or not table.get("rows"):
+            return []
+
+        table_id = str(table.get("table_id") or self._block_id(block))
+        columns = [str(column) for column in table.get("columns") or []]
+        base_metadata = {
+            **dict(document.metadata or {}),
+            "filename": document.filename,
+            "content_hash": document.content_hash,
+            "table_id": table_id,
+            "table_columns": columns,
+        }
+        chunks = [
+            self._table_summary_chunk(
+                document,
+                block,
+                section_path,
+                table=table,
+                table_id=table_id,
+                base_metadata=base_metadata,
+            )
+        ]
+        for row in table.get("rows") or []:
+            if not isinstance(row, dict):
+                continue
+            row_text = self._table_row_text(table, row, section_path)
+            if not row_text.strip():
+                continue
+            row_id = str(row.get("row_id") or f"r{row.get('row_index', len(chunks))}")
+            metadata = {
+                **base_metadata,
+                "is_table_row": True,
+                "is_table_summary": False,
+                "table_row_id": row_id,
+                "table_row_label": str(row.get("label") or ""),
+                "table_row_values": dict(row.get("values") or {}),
+                "table_row_sidecar": row,
+            }
+            block_id = f"{self._block_id(block)}:{row_id}"
+            chunks.append(
+                self._chunk_from_table_parts(
+                    document=document,
+                    block=block,
+                    block_ids=[block_id],
+                    text=row_text,
+                    section_path=section_path,
+                    metadata=metadata,
+                )
+            )
+        return chunks
+
+    def _table_summary_chunk(
+        self,
+        document: ParsedDocument,
+        block: DocumentBlock,
+        section_path: List[str],
+        *,
+        table: Dict[str, Any],
+        table_id: str,
+        base_metadata: Dict[str, Any],
+    ) -> DocumentChunk:
+        text = str(table.get("markdown") or block.text).strip()
+        if len(text) > self.max_chunk_chars:
+            text = text[: self.max_chunk_chars]
+        metadata = {
+            **base_metadata,
+            "is_table_summary": True,
+            "is_table_row": False,
+            "table_sidecar": table,
+        }
+        return self._chunk_from_table_parts(
+            document=document,
+            block=block,
+            block_ids=[f"{self._block_id(block)}:{table_id}:summary"],
+            text=text,
+            section_path=section_path,
+            metadata=metadata,
+        )
+
+    def _table_row_text(
+        self,
+        table: Dict[str, Any],
+        row: Dict[str, Any],
+        section_path: List[str],
+    ) -> str:
+        section = " > ".join(section_path)
+        columns = ", ".join(str(column) for column in table.get("columns") or [])
+        row_label = str(row.get("label") or "").strip()
+        semantic = str(row.get("semantic_text") or "").strip()
+        parts = []
+        if section:
+            parts.append(f"Section: {section}")
+        if columns:
+            parts.append(f"Table columns: {columns}")
+        if row_label:
+            parts.append(f"Row: {row_label}")
+        if semantic:
+            parts.append(semantic)
+        return "\n".join(parts)
+
+    def _chunk_from_table_parts(
+        self,
+        *,
+        document: ParsedDocument,
+        block: DocumentBlock,
+        block_ids: List[str],
+        text: str,
+        section_path: List[str],
+        metadata: Dict[str, Any],
+    ) -> DocumentChunk:
+        return DocumentChunk(
+            chunk_id=self._chunk_id(document.document_id, block_ids, text),
+            document_id=document.document_id,
+            text=text[: self.max_chunk_chars],
+            page_start=block.page,
+            page_end=block.page,
+            block_ids=block_ids,
+            block_types=[block.block_type],
+            bboxes=[block.bbox] if block.bbox else [],
+            section_path=list(section_path),
+            metadata=metadata,
+        )
 
     def _build_chunk(
         self,
@@ -189,6 +383,21 @@ class StructureAwareChunker:
 
     def _estimate_tokens(self, text: str) -> int:
         return max(1, len(text.split()))
+
+    def _has_indexable_metadata(self, block: DocumentBlock) -> bool:
+        if block.block_type != "figure" or not isinstance(block.metadata, dict):
+            return False
+        figure = block.metadata.get("figure")
+        if not isinstance(figure, dict):
+            return False
+        visual = figure.get("visual")
+        return isinstance(visual, dict) and bool(
+            visual.get("visual_embedding")
+            or visual.get("ocr_text")
+            or visual.get("caption")
+            or visual.get("chart_summary")
+            or visual.get("diagram_summary")
+        )
 
 
 def build_chunker(config: Dict[str, Any]) -> StructureAwareChunker:
