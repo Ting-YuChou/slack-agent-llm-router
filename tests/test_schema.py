@@ -241,6 +241,10 @@ def test_platform_config_accepts_rag_config():
                 "model": "BAAI/bge-m3",
                 "dimensions": 1024,
             },
+            "retrieval": {
+                "keyword_scorer": "BM25STD",
+                "keyword_score_normalization": "max",
+            },
             "ingestion_queue": {"enabled": True, "concurrency": 2},
             "storage": {"staging_dir": "data/rag/uploads"},
         }
@@ -249,6 +253,8 @@ def test_platform_config_accepts_rag_config():
     assert config.rag.enabled is True
     assert config.rag.backend == "memory"
     assert config.rag.default_knowledge_base_ids == ["school"]
+    assert config.rag.retrieval.keyword_scorer == "BM25STD"
+    assert config.rag.retrieval.keyword_score_normalization == "max"
     assert config.rag.ingestion_queue.enabled is True
     assert config.rag.ingestion_queue.concurrency == 2
     assert config.rag.storage.staging_dir == "data/rag/uploads"

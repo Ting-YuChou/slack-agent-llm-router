@@ -200,13 +200,15 @@ rag:
     top_k: 5
     candidate_count: 30
     min_score: 0.0
+    keyword_scorer: BM25STD
+    keyword_score_normalization: max
     keyword_weight: 0.35
     vector_weight: 0.6
     recency_weight: 0.05
     max_context_chars: 6000
   rerank:
     enabled: false
-    provider: none
+    provider: sentence_transformers
     model: BAAI/bge-reranker-v2-m3
     top_n: 8
     timeout: 30

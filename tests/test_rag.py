@@ -3,7 +3,7 @@ import base64
 import pytest
 
 from src.memory import HashEmbeddingProvider
-from src.rag.chunker import StructureAwareChunker
+from src.rag.chunker import DocumentChunk, StructureAwareChunker
 from src.rag.parser import (
     DoclingParser,
     DocumentBlock,
@@ -11,7 +11,11 @@ from src.rag.parser import (
     TextDocumentParser,
 )
 from src.rag.service import RagService
-from src.rag.vector_store import InMemoryRagVectorStore, RagSearchResult
+from src.rag.vector_store import (
+    InMemoryRagVectorStore,
+    RagSearchResult,
+    RedisStackRagVectorStore,
+)
 
 
 class FailingEmbeddingProvider:
@@ -22,6 +26,16 @@ class FailingEmbeddingProvider:
 class FailingParser:
     def parse_bytes(self, **_kwargs):
         raise RuntimeError("parser exploded")
+
+
+class ReverseReranker:
+    async def rerank(self, _query, results):
+        return list(reversed(results))
+
+
+class FailingReranker:
+    async def rerank(self, _query, _results):
+        raise RuntimeError("reranker unavailable")
 
 
 class FakeStreamRedis:
@@ -88,6 +102,53 @@ class FakeStreamRedis:
         return ("0-0", self.streams.get(stream, [])[:count], [])
 
 
+class FakeSearchRedis:
+    def __init__(self):
+        self.commands = []
+
+    async def execute_command(self, *command):
+        self.commands.append(command)
+        query = command[2]
+        if "@text:" in query:
+            return [0]
+        return [
+            1,
+            b"rag:chunk:school:chunk-1",
+            [
+                b"knowledge_base_id",
+                b"school",
+                b"document_id",
+                b"doc-1",
+                b"chunk_id",
+                b"chunk-1",
+                b"index_version",
+                b"v1",
+                b"text",
+                b"Tuition fallback keyword",
+                b"metadata",
+                b"{}",
+                b"section_path",
+                b"[]",
+                b"block_ids",
+                b"[]",
+                b"block_types",
+                b"text",
+                b"bboxes",
+                b"[]",
+                b"page_start",
+                b"1",
+                b"page_end",
+                b"1",
+                b"created_at",
+                b"1",
+                b"updated_at",
+                b"1",
+                b"embedding",
+                b"",
+            ],
+        ]
+
+
 def _queued_rag_service(tmp_path, *, parser=None, max_attempts=3):
     service = RagService(
         {
@@ -116,6 +177,47 @@ def _queued_rag_service(tmp_path, *, parser=None, max_attempts=3):
     )
     service.vector_store.client = FakeStreamRedis()
     return service
+
+
+def _raw_redis_chunk_fields(
+    *,
+    chunk_id=b"chunk-1",
+    document_id=b"doc-1",
+    text=b"Tuition deadline",
+    index_version=b"v1",
+):
+    return [
+        b"knowledge_base_id",
+        b"school",
+        b"document_id",
+        document_id,
+        b"chunk_id",
+        chunk_id,
+        b"index_version",
+        index_version,
+        b"text",
+        text,
+        b"metadata",
+        b'{"filename": "handbook.pdf"}',
+        b"section_path",
+        b"[]",
+        b"block_ids",
+        b"[]",
+        b"block_types",
+        b"text",
+        b"bboxes",
+        b"[]",
+        b"page_start",
+        b"1",
+        b"page_end",
+        b"1",
+        b"created_at",
+        b"1",
+        b"updated_at",
+        b"1",
+        b"embedding",
+        b"",
+    ]
 
 
 def test_chunker_preserves_layout_and_section_metadata():
@@ -153,6 +255,122 @@ def test_chunker_preserves_layout_and_section_metadata():
     assert chunks[0].section_path == ["Tuition Deadlines"]
     assert chunks[0].bboxes == [[0, 0, 100, 20], [0, 30, 100, 80]]
     assert chunks[0].metadata["title"] == "School Handbook"
+
+
+def test_chunker_emits_table_summary_and_row_chunks():
+    table = {
+        "table_id": "table-1",
+        "columns": ["Item", "Fall '25", "Winter '26", "Spring '26"],
+        "header_rows": [0],
+        "rows": [
+            {
+                "row_id": "r1",
+                "row_index": 1,
+                "label": "UNDERGRAD/GRAD GRADE CHANGE OPTION",
+                "values": {
+                    "Fall '25": "Nov 30 Sun",
+                    "Winter '26": "Mar 6 Fri",
+                    "Spring '26": "May 29 Fri",
+                },
+                "cells": [],
+                "semantic_text": (
+                    "UNDERGRAD/GRAD GRADE CHANGE OPTION: "
+                    "Fall '25 = Nov 30 Sun; Winter '26 = Mar 6 Fri; "
+                    "Spring '26 = May 29 Fri"
+                ),
+            }
+        ],
+        "markdown": (
+            "Item | Fall '25 | Winter '26 | Spring '26\n"
+            "UNDERGRAD/GRAD GRADE CHANGE OPTION | Nov 30 Sun | "
+            "Mar 6 Fri | May 29 Fri"
+        ),
+    }
+    chunks = StructureAwareChunker({"chunk_size_tokens": 20}).chunk(
+        ParsedDocument(
+            document_id="doc-1",
+            filename="calendar.pdf",
+            content_hash="hash",
+            blocks=[
+                DocumentBlock(
+                    doc_id="doc-1",
+                    page=1,
+                    bbox=None,
+                    block_type="section_header",
+                    text="Academic Calendar",
+                    reading_order=1,
+                ),
+                DocumentBlock(
+                    doc_id="doc-1",
+                    page=1,
+                    bbox=[0, 0, 100, 100],
+                    block_type="table",
+                    text=table["markdown"],
+                    reading_order=2,
+                    metadata={"table": table},
+                ),
+            ],
+        )
+    )
+
+    table_chunks = [
+        chunk for chunk in chunks if chunk.metadata.get("table_id") == "table-1"
+    ]
+    assert len(table_chunks) == 2
+    assert table_chunks[0].metadata["is_table_summary"] is True
+    assert table_chunks[1].metadata["is_table_row"] is True
+    assert table_chunks[1].metadata["table_row_values"]["Fall '25"] == "Nov 30 Sun"
+    assert "Winter '26 = Mar 6 Fri" in table_chunks[1].text
+    assert table_chunks[1].section_path == ["Academic Calendar"]
+
+
+def test_large_table_chunks_preserve_row_column_relationships():
+    rows = []
+    for index in range(1, 8):
+        rows.append(
+            {
+                "row_id": f"r{index}",
+                "row_index": index,
+                "label": f"Deadline {index}",
+                "values": {"Fall '25": f"Nov {index}", "Winter '26": f"Mar {index}"},
+                "cells": [],
+                "semantic_text": (
+                    f"Deadline {index}: Fall '25 = Nov {index}; "
+                    f"Winter '26 = Mar {index}"
+                ),
+            }
+        )
+    table = {
+        "table_id": "table-large",
+        "columns": ["Item", "Fall '25", "Winter '26"],
+        "header_rows": [0],
+        "rows": rows,
+        "markdown": "Item | Fall '25 | Winter '26",
+    }
+
+    chunks = StructureAwareChunker({"chunk_size_tokens": 5}).chunk(
+        ParsedDocument(
+            document_id="doc-1",
+            filename="calendar.pdf",
+            content_hash="hash",
+            blocks=[
+                DocumentBlock(
+                    doc_id="doc-1",
+                    page=1,
+                    bbox=None,
+                    block_type="table",
+                    text=table["markdown"],
+                    reading_order=1,
+                    metadata={"table": table},
+                )
+            ],
+        )
+    )
+
+    row_chunks = [chunk for chunk in chunks if chunk.metadata.get("is_table_row")]
+    assert len(row_chunks) == 7
+    assert all("Fall '25 =" in chunk.text for chunk in row_chunks)
+    assert all("Winter '26 =" in chunk.text for chunk in row_chunks)
 
 
 @pytest.mark.asyncio
@@ -346,6 +564,64 @@ def test_rag_context_truncates_oversized_first_source():
     assert len(context) <= 520
 
 
+def test_rag_context_formats_table_row_column_values():
+    service = RagService(
+        {
+            "enabled": True,
+            "backend": "memory",
+            "retrieval": {"max_context_chars": 2000},
+        },
+        vector_store=InMemoryRagVectorStore(),
+        embedding_provider=HashEmbeddingProvider(dimensions=16),
+    )
+    chunk = DocumentChunk(
+        chunk_id="table-1-r1",
+        document_id="calendar",
+        text=(
+            "Section: Academic Calendar\n"
+            "Table columns: Item, Fall '25, Winter '26, Spring '26\n"
+            "UNDERGRAD/GRAD GRADE CHANGE OPTION: Fall '25 = Nov 30 Sun; "
+            "Winter '26 = Mar 6 Fri; Spring '26 = May 29 Fri"
+        ),
+        page_start=1,
+        page_end=1,
+        block_ids=["table-1:r1"],
+        block_types=["table"],
+        section_path=["Academic Calendar"],
+        metadata={
+            "filename": "calendar.pdf",
+            "table_id": "table-1",
+            "table_columns": ["Item", "Fall '25", "Winter '26", "Spring '26"],
+            "is_table_row": True,
+            "table_row_id": "r1",
+            "table_row_label": "UNDERGRAD/GRAD GRADE CHANGE OPTION",
+            "table_row_values": {
+                "Fall '25": "Nov 30 Sun",
+                "Winter '26": "Mar 6 Fri",
+                "Spring '26": "May 29 Fri",
+            },
+        },
+    )
+
+    context = service.build_context(
+        [
+            RagSearchResult(
+                chunk=chunk,
+                score=0.95,
+                match_source="hybrid",
+                knowledge_base_id="school",
+                index_version="v1",
+            )
+        ]
+    )
+
+    assert "[S1]" in context
+    assert "Table row: UNDERGRAD/GRAD GRADE CHANGE OPTION" in context
+    assert "Fall '25 = Nov 30 Sun" in context
+    assert "Winter '26 = Mar 6 Fri" in context
+    assert "Spring '26 = May 29 Fri" in context
+
+
 @pytest.mark.asyncio
 async def test_embedding_failure_completes_with_warning_and_keyword_index():
     service = RagService(
@@ -379,6 +655,201 @@ async def test_embedding_failure_completes_with_warning_and_keyword_index():
     assert job.status == "completed_with_warnings"
     assert job.warnings
     assert results
+
+
+@pytest.mark.asyncio
+async def test_in_memory_keyword_search_uses_bm25_term_frequency():
+    service = RagService(
+        {
+            "enabled": True,
+            "backend": "memory",
+            "parser": {"provider": "text"},
+            "chunking": {"chunk_size_tokens": 80},
+            "embedding": {"provider": "hash", "dimensions": 16},
+            "retrieval": {
+                "top_k": 2,
+                "candidate_count": 2,
+                "keyword_weight": 1.0,
+                "vector_weight": 0.0,
+                "recency_weight": 0.0,
+            },
+        },
+        parser=TextDocumentParser(),
+        vector_store=InMemoryRagVectorStore(),
+        embedding_provider=HashEmbeddingProvider(dimensions=16),
+    )
+    await service.initialize()
+    await service.ingest_document(
+        content=(
+            b"Tuition deadline appears once in a longer administrative paragraph "
+            b"with registration billing residency transcript calendar policy text."
+        ),
+        filename="one.md",
+        knowledge_base_id="school",
+        document_id="doc-1",
+    )
+    await service.ingest_document(
+        content=b"Tuition deadline deadline deadline.",
+        filename="two.md",
+        knowledge_base_id="school",
+        document_id="doc-2",
+    )
+
+    results = await service.retrieve("deadline", knowledge_base_ids=["school"])
+
+    assert [result.chunk.document_id for result in results] == ["doc-2", "doc-1"]
+    assert results[0].score == pytest.approx(1.0)
+    assert 0 < results[1].score < 1.0
+
+
+def test_redis_withscores_results_parse_and_normalize_bm25_scores():
+    store = RedisStackRagVectorStore(
+        {
+            "backend": "redis_stack",
+            "embedding": {"dimensions": 4},
+            "retrieval": {"keyword_scorer": "BM25STD"},
+        }
+    )
+    raw_results = [
+        2,
+        b"rag:chunk:school:chunk-1",
+        b"4.0",
+        _raw_redis_chunk_fields(
+            chunk_id=b"chunk-1",
+            document_id=b"doc-1",
+            text=b"Tuition deadline deadline",
+            index_version=b"v1",
+        ),
+        b"rag:chunk:school:chunk-2",
+        b"2.0",
+        _raw_redis_chunk_fields(
+            chunk_id=b"chunk-2",
+            document_id=b"doc-2",
+            text=b"Tuition deadline",
+            index_version=b"v2",
+        ),
+    ]
+
+    parsed = store._parse_results(
+        raw_results,
+        "keyword",
+        with_scores=True,
+        normalize_scores=True,
+    )
+
+    assert [result.chunk.chunk_id for result in parsed] == ["chunk-1", "chunk-2"]
+    assert parsed[0].score == pytest.approx(1.0)
+    assert parsed[1].score == pytest.approx(0.5)
+    assert parsed[0].index_version == "v1"
+    assert parsed[1].chunk.document_id == "doc-2"
+
+
+@pytest.mark.asyncio
+async def test_redis_keyword_search_falls_back_to_tag_keywords():
+    store = RedisStackRagVectorStore(
+        {
+            "backend": "redis_stack",
+            "embedding": {"dimensions": 4},
+            "retrieval": {"keyword_scorer": "BM25STD"},
+        }
+    )
+    store.client = FakeSearchRedis()
+
+    results = await store._keyword_search("tuition", ["school"], 5)
+
+    assert len(results) == 1
+    assert results[0].chunk.chunk_id == "chunk-1"
+    assert any("WITHSCORES" in command for command in store.client.commands)
+    assert any("@keywords" in command[2] for command in store.client.commands)
+
+
+@pytest.mark.asyncio
+async def test_rag_retrieve_applies_configured_reranker_to_candidates():
+    service = RagService(
+        {
+            "enabled": True,
+            "backend": "memory",
+            "parser": {"provider": "text"},
+            "chunking": {"chunk_size_tokens": 80},
+            "embedding": {"provider": "hash", "dimensions": 16},
+            "retrieval": {
+                "top_k": 1,
+                "candidate_count": 3,
+                "keyword_weight": 1.0,
+                "vector_weight": 0.0,
+                "recency_weight": 0.0,
+            },
+            "rerank": {"enabled": True, "provider": "test", "top_n": 3},
+        },
+        parser=TextDocumentParser(),
+        vector_store=InMemoryRagVectorStore(),
+        embedding_provider=HashEmbeddingProvider(dimensions=16),
+        reranker=ReverseReranker(),
+    )
+    await service.initialize()
+    for index in range(1, 4):
+        await service.ingest_document(
+            content=f"Tuition policy alpha document {index}.".encode(),
+            filename=f"handbook-{index}.md",
+            knowledge_base_id="school",
+            document_id=f"doc-{index}",
+        )
+
+    results = await service.retrieve(
+        "alpha",
+        knowledge_base_ids=["school"],
+        max_results=1,
+        candidate_count=3,
+    )
+
+    assert [result.chunk.document_id for result in results] == ["doc-3"]
+
+
+@pytest.mark.asyncio
+async def test_rag_retrieve_falls_back_when_reranker_fails():
+    service = RagService(
+        {
+            "enabled": True,
+            "backend": "memory",
+            "parser": {"provider": "text"},
+            "chunking": {"chunk_size_tokens": 80},
+            "embedding": {"provider": "hash", "dimensions": 16},
+            "retrieval": {
+                "top_k": 1,
+                "candidate_count": 2,
+                "keyword_weight": 1.0,
+                "vector_weight": 0.0,
+                "recency_weight": 0.0,
+            },
+            "rerank": {"enabled": True, "provider": "test", "top_n": 2},
+        },
+        parser=TextDocumentParser(),
+        vector_store=InMemoryRagVectorStore(),
+        embedding_provider=HashEmbeddingProvider(dimensions=16),
+        reranker=FailingReranker(),
+    )
+    await service.initialize()
+    await service.ingest_document(
+        content=b"Tuition policy alpha first.",
+        filename="one.md",
+        knowledge_base_id="school",
+        document_id="doc-1",
+    )
+    await service.ingest_document(
+        content=b"Tuition policy alpha second.",
+        filename="two.md",
+        knowledge_base_id="school",
+        document_id="doc-2",
+    )
+
+    results = await service.retrieve(
+        "alpha",
+        knowledge_base_ids=["school"],
+        max_results=1,
+        candidate_count=2,
+    )
+
+    assert [result.chunk.document_id for result in results] == ["doc-1"]
 
 
 @pytest.mark.asyncio
@@ -577,24 +1048,34 @@ def test_docling_parser_extracts_table_text_and_layout_metadata():
                     "data": {
                         "table_cells": [
                             {
-                                "text": "Fee",
+                                "text": "Item",
                                 "start_row_offset_idx": 0,
                                 "start_col_offset_idx": 0,
                             },
                             {
-                                "text": "Amount",
+                                "text": "Fall '25",
                                 "start_row_offset_idx": 0,
                                 "start_col_offset_idx": 1,
                             },
                             {
-                                "text": "Tuition",
+                                "text": "Winter '26",
+                                "start_row_offset_idx": 0,
+                                "start_col_offset_idx": 2,
+                            },
+                            {
+                                "text": "UNDERGRAD/GRAD GRADE CHANGE OPTION",
                                 "start_row_offset_idx": 1,
                                 "start_col_offset_idx": 0,
                             },
                             {
-                                "text": "$100",
+                                "text": "Nov 30 Sun",
                                 "start_row_offset_idx": 1,
                                 "start_col_offset_idx": 1,
+                            },
+                            {
+                                "text": "Mar 6 Fri",
+                                "start_row_offset_idx": 1,
+                                "start_col_offset_idx": 2,
                             },
                         ]
                     },
@@ -618,7 +1099,17 @@ def test_docling_parser_extracts_table_text_and_layout_metadata():
         "table",
         "figure",
     ]
-    assert "Fee | Amount" in blocks[1].text
-    assert "Tuition | $100" in blocks[1].text
+    assert "Item | Fall '25 | Winter '26" in blocks[1].text
+    assert (
+        "UNDERGRAD/GRAD GRADE CHANGE OPTION | Nov 30 Sun | Mar 6 Fri" in blocks[1].text
+    )
+    assert "Fall '25 = Nov 30 Sun" in blocks[1].text
+    table = blocks[1].metadata["table"]
+    assert table["columns"] == ["Item", "Fall '25", "Winter '26"]
+    assert table["header_rows"] == [0]
+    assert table["rows"][0]["label"] == "UNDERGRAD/GRAD GRADE CHANGE OPTION"
+    assert table["rows"][0]["values"]["Winter '26"] == "Mar 6 Fri"
+    assert table["rows"][0]["cells"][1]["col_index"] == 1
     assert blocks[0].bbox == [1.0, 2.0, 3.0, 4.0]
+    assert blocks[1].bbox == [10.0, 20.0, 30.0, 40.0]
     assert blocks[2].asset_ref == "#/pictures/0"

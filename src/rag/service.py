@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from src.memory import EmbeddingProvider, build_embedding_provider
 from src.rag.chunker import DocumentChunk, build_chunker
 from src.rag.parser import build_document_parser
+from src.rag.reranker import Reranker, build_reranker
 from src.rag.vector_store import RagSearchResult, build_vector_store
 from src.utils.schema import ResponseSource, ToolCall
 
@@ -163,6 +164,7 @@ class RagService:
         parser: Optional[Any] = None,
         vector_store: Optional[Any] = None,
         embedding_provider: Optional[EmbeddingProvider] = None,
+        reranker: Optional[Reranker] = None,
     ):
         self.config = dict(config or {})
         self.enabled = bool(self.config.get("enabled", False))
@@ -174,6 +176,7 @@ class RagService:
         self.chunking_config = dict(self.config.get("chunking", {}) or {})
         self.embedding_config = dict(self.config.get("embedding", {}) or {})
         self.retrieval_config = dict(self.config.get("retrieval", {}) or {})
+        self.rerank_config = dict(self.config.get("rerank", {}) or {})
         self.redis_config = dict(self.config.get("redis", {}) or {})
         self.intent_gate_config = dict(self.config.get("intent_gate", {}) or {})
         self.queue_config = dict(self.config.get("ingestion_queue", {}) or {})
@@ -215,6 +218,7 @@ class RagService:
         self.embedding_provider = embedding_provider or build_embedding_provider(
             self.embedding_config
         )
+        self.reranker = reranker or build_reranker(self.rerank_config)
         self.vector_store = vector_store or build_vector_store(self.config)
         self.jobs: Dict[str, IngestionJob] = {}
         self.batches: Dict[str, IngestionBatch] = {}
@@ -396,14 +400,23 @@ class RagService:
             return []
         embedding = await self._safe_embed(query)
         effective_kbs = self._effective_knowledge_base_ids(knowledge_base_ids)
-        return await self.vector_store.search(
+        top_k = int(max_results or self.retrieval_config.get("top_k", 5))
+        first_stage_candidate_count = int(
+            candidate_count or self.retrieval_config.get("candidate_count", 30)
+        )
+        rerank_top_n = int(self.rerank_config.get("top_n", top_k))
+        rerank_enabled = self._rerank_enabled()
+        first_stage_limit = (
+            max(top_k, first_stage_candidate_count, rerank_top_n)
+            if rerank_enabled
+            else top_k
+        )
+        results = await self.vector_store.search(
             query,
             embedding,
             knowledge_base_ids=effective_kbs,
-            limit=int(max_results or self.retrieval_config.get("top_k", 5)),
-            candidate_count=int(
-                candidate_count or self.retrieval_config.get("candidate_count", 30)
-            ),
+            limit=first_stage_limit,
+            candidate_count=max(first_stage_candidate_count, first_stage_limit),
             keyword_weight=float(self.retrieval_config.get("keyword_weight", 0.35)),
             vector_weight=float(self.retrieval_config.get("vector_weight", 0.6)),
             recency_weight=float(self.retrieval_config.get("recency_weight", 0.05)),
@@ -413,6 +426,9 @@ class RagService:
                 else self.retrieval_config.get("min_score", 0.0)
             ),
         )
+        if rerank_enabled:
+            results = await self._rerank_results(query, results, top_k, rerank_top_n)
+        return results[:top_k]
 
     def build_context(self, results: Sequence[RagSearchResult]) -> str:
         if not results:
@@ -437,7 +453,7 @@ class RagService:
                 if chunk.page_start == chunk.page_end
                 else f"pp. {chunk.page_start}-{chunk.page_end}"
             )
-            text = " ".join(chunk.text.split())
+            text = self._context_text_for_chunk(chunk)
             source_header = (
                 f"[S{index}] {title} ({page}, kb={result.knowledge_base_id})\n"
                 f"Chunk: {chunk.chunk_id}\n"
@@ -453,6 +469,34 @@ class RagService:
             lines.append(entry)
             remaining -= len(entry) + 2
         return "\n\n".join(lines)
+
+    def _context_text_for_chunk(self, chunk: DocumentChunk) -> str:
+        metadata = dict(chunk.metadata or {})
+        if metadata.get("is_table_row"):
+            values = dict(metadata.get("table_row_values") or {})
+            value_text = "; ".join(
+                f"{column} = {value}" for column, value in values.items()
+            )
+            columns = ", ".join(
+                str(value) for value in metadata.get("table_columns") or []
+            )
+            parts = []
+            if chunk.section_path:
+                parts.append(f"Section: {' > '.join(chunk.section_path)}")
+            if metadata.get("table_id"):
+                parts.append(f"Table: {metadata.get('table_id')}")
+            if columns:
+                parts.append(f"Columns: {columns}")
+            parts.append(
+                f"Table row: {metadata.get('table_row_label') or 'Untitled row'}"
+            )
+            if value_text:
+                parts.append(f"Values: {value_text}")
+            parts.append("Text: " + " ".join(chunk.text.split()))
+            return "\n".join(parts)
+        if metadata.get("is_table_summary"):
+            return "Table summary: " + " ".join(chunk.text.split())
+        return " ".join(chunk.text.split())
 
     def sources_from_results(
         self, results: Sequence[RagSearchResult]
@@ -872,6 +916,34 @@ class RagService:
         except Exception as exc:
             logger.info("RAG embedding unavailable; using keyword-only search: %s", exc)
             return None
+
+    def _rerank_enabled(self) -> bool:
+        return bool(self.rerank_config.get("enabled", False))
+
+    async def _rerank_results(
+        self,
+        query: str,
+        results: Sequence[RagSearchResult],
+        top_k: int,
+        rerank_top_n: int,
+    ) -> List[RagSearchResult]:
+        if len(results) <= 1:
+            return list(results)
+        head_count = max(top_k, min(len(results), rerank_top_n))
+        head = list(results[:head_count])
+        tail = list(results[head_count:])
+        try:
+            reranked = await asyncio.wait_for(
+                self.reranker.rerank(query, head),
+                timeout=float(self.rerank_config.get("timeout", 30)),
+            )
+        except Exception as exc:
+            logger.warning("RAG rerank failed; using first-stage order: %s", exc)
+            return list(results)
+        if len(reranked) != len(head):
+            logger.warning("RAG rerank returned an unexpected number of results")
+            return list(results)
+        return list(reranked) + tail
 
     def _effective_knowledge_base_ids(
         self, knowledge_base_ids: Optional[Sequence[str]]

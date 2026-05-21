@@ -171,13 +171,27 @@ class DoclingParser(DocumentParser):
 
         blocks = []
         for index, raw in enumerate(raw_blocks, start=1):
-            text = _extract_text(raw)
             block_type = _normalize_block_type(
                 raw.get("label") or raw.get("type") or raw.get("name")
             )
+            page, bbox = _extract_page_bbox(raw)
+            table_metadata = (
+                _extract_table_metadata(raw, page=page, bbox=bbox, fallback_index=index)
+                if block_type == "table"
+                else None
+            )
+            text = (
+                _table_text_from_metadata(table_metadata)
+                if table_metadata
+                else _extract_text(raw)
+            )
             if not text and block_type == "text":
                 continue
-            page, bbox = _extract_page_bbox(raw)
+            block_metadata = {
+                "raw_label": str(raw.get("label") or ""),
+            }
+            if table_metadata:
+                block_metadata["table"] = table_metadata
             blocks.append(
                 DocumentBlock(
                     doc_id=document_id,
@@ -188,9 +202,7 @@ class DoclingParser(DocumentParser):
                     reading_order=int(raw.get("reading_order") or index),
                     confidence=_safe_float(raw.get("confidence")),
                     asset_ref=str(raw.get("self_ref") or raw.get("id") or "") or None,
-                    metadata={
-                        "raw_label": str(raw.get("label") or ""),
-                    },
+                    metadata=block_metadata,
                 )
             )
         blocks.sort(key=lambda block: (block.page, block.reading_order))
@@ -283,10 +295,29 @@ def _extract_text(raw: Dict[str, Any]) -> str:
 
 
 def _extract_table_text(raw: Dict[str, Any]) -> str:
+    table = _extract_table_metadata(raw)
+    if table:
+        return _table_text_from_metadata(table)
+    return ""
+
+
+def _extract_table_metadata(
+    raw: Dict[str, Any],
+    *,
+    page: int = 1,
+    bbox: Optional[List[float]] = None,
+    fallback_index: int = 0,
+) -> Dict[str, Any]:
     data = raw.get("data") if isinstance(raw.get("data"), dict) else raw
     cells = data.get("table_cells") or data.get("cells")
+    table_id = str(
+        raw.get("self_ref") or raw.get("id") or data.get("self_ref") or ""
+    ).strip()
+    if not table_id:
+        table_id = f"table-{fallback_index or 1}"
     if isinstance(cells, list):
-        rows: Dict[int, Dict[int, str]] = {}
+        rows: Dict[int, Dict[int, Dict[str, Any]]] = {}
+        header_rows = set()
         for index, cell in enumerate(cells):
             cell_payload = _as_dict(cell)
             if not cell_payload:
@@ -313,36 +344,216 @@ def _extract_table_text(raw: Dict[str, Any]) -> str:
                 ),
                 0,
             )
-            rows.setdefault(row, {})[col] = text
+            cell_bbox = _normalize_bbox(
+                cell_payload.get("bbox") or cell_payload.get("box")
+            )
+            if bool(
+                _first_present(
+                    cell_payload,
+                    "column_header",
+                    "is_column_header",
+                    "is_header",
+                    "header",
+                )
+            ):
+                header_rows.add(row)
+            rows.setdefault(row, {})[col] = {
+                "row_index": row,
+                "col_index": col,
+                "text": text,
+                "bbox": cell_bbox,
+                "page": page,
+            }
         if rows:
-            rendered = []
-            for row_index in sorted(rows):
-                row = rows[row_index]
-                rendered.append(" | ".join(row[col] for col in sorted(row)))
-            return "\n".join(rendered)
+            if not header_rows:
+                header_rows.add(min(rows))
+            return _build_table_metadata(
+                table_id=table_id,
+                rows=rows,
+                header_rows=sorted(header_rows),
+                page=page,
+                bbox=bbox,
+            )
 
     rows_value = data.get("rows") or data.get("grid")
     if isinstance(rows_value, list):
-        rendered_rows = []
-        for row in rows_value:
+        rows: Dict[int, Dict[int, Dict[str, Any]]] = {}
+        for row_index, row in enumerate(rows_value):
             if isinstance(row, list):
-                values = [
-                    _first_text_value(_as_dict(cell))
-                    if not isinstance(cell, str)
-                    else cell
-                    for cell in row
-                ]
-                values = [value for value in values if value]
-                if values:
-                    rendered_rows.append(" | ".join(values))
+                for col_index, cell in enumerate(row):
+                    text = (
+                        cell
+                        if isinstance(cell, str)
+                        else _first_text_value(_as_dict(cell))
+                    )
+                    text = " ".join(str(text).split())
+                    if not text:
+                        continue
+                    rows.setdefault(row_index, {})[col_index] = {
+                        "row_index": row_index,
+                        "col_index": col_index,
+                        "text": text,
+                        "bbox": None,
+                        "page": page,
+                    }
             elif isinstance(row, dict):
-                values = _collect_text_values(row)
-                if values:
-                    rendered_rows.append(" | ".join(values))
-        if rendered_rows:
-            return "\n".join(rendered_rows)
+                for col_index, value in enumerate(_collect_text_values(row)):
+                    rows.setdefault(row_index, {})[col_index] = {
+                        "row_index": row_index,
+                        "col_index": col_index,
+                        "text": value,
+                        "bbox": None,
+                        "page": page,
+                    }
+        if rows:
+            return _build_table_metadata(
+                table_id=table_id,
+                rows=rows,
+                header_rows=[min(rows)],
+                page=page,
+                bbox=bbox,
+            )
 
-    return ""
+    return {}
+
+
+def _build_table_metadata(
+    *,
+    table_id: str,
+    rows: Dict[int, Dict[int, Dict[str, Any]]],
+    header_rows: List[int],
+    page: int,
+    bbox: Optional[List[float]],
+) -> Dict[str, Any]:
+    sorted_header_rows = sorted(set(header_rows))
+    header_map: Dict[int, str] = {}
+    for header_row in sorted_header_rows:
+        for col_index, cell in rows.get(header_row, {}).items():
+            text = str(cell.get("text") or "").strip()
+            if text:
+                header_map[col_index] = text
+    first_data_row = next(
+        (row for row in sorted(rows) if row not in sorted_header_rows),
+        None,
+    )
+    label_col = _infer_label_column(header_map, rows.get(first_data_row, {}))
+    data_columns = _infer_data_columns(
+        header_map, rows.get(first_data_row, {}), label_col
+    )
+
+    rendered_rows = []
+    structured_rows = []
+    for row_index in sorted(rows):
+        row_cells = rows[row_index]
+        rendered_rows.append(
+            " | ".join(
+                str(row_cells[col].get("text") or "").strip()
+                for col in sorted(row_cells)
+                if str(row_cells[col].get("text") or "").strip()
+            )
+        )
+        if row_index in sorted_header_rows:
+            continue
+        row_label = _row_label(row_cells, label_col)
+        values = {}
+        for col_index, column in data_columns:
+            text = str(row_cells.get(col_index, {}).get("text") or "").strip()
+            if text:
+                values[column] = text
+        semantic_text = _row_semantic_text(row_label, values)
+        structured_rows.append(
+            {
+                "row_id": f"r{len(structured_rows) + 1}",
+                "row_index": row_index,
+                "label": row_label,
+                "values": values,
+                "cells": [row_cells[col] for col in sorted(row_cells)],
+                "semantic_text": semantic_text,
+            }
+        )
+
+    columns = [column for _col, column in data_columns]
+    if label_col is not None:
+        label_name = header_map.get(label_col) or "Item"
+        columns = [label_name, *columns]
+    markdown = "\n".join(row for row in rendered_rows if row)
+    rowwise_text = "\n".join(
+        row["semantic_text"] for row in structured_rows if row.get("semantic_text")
+    )
+    return {
+        "table_id": table_id,
+        "page": page,
+        "bbox": bbox,
+        "columns": columns,
+        "header_rows": sorted_header_rows,
+        "rows": structured_rows,
+        "markdown": markdown,
+        "rowwise_text": rowwise_text,
+    }
+
+
+def _infer_label_column(
+    header_map: Dict[int, str], first_data_row: Dict[int, Dict[str, Any]]
+) -> Optional[int]:
+    if not first_data_row:
+        return None
+    data_cols = sorted(first_data_row)
+    if not data_cols:
+        return None
+    if data_cols[0] not in header_map:
+        return data_cols[0]
+    if len(header_map) == max(len(data_cols) - 1, 0):
+        return data_cols[0]
+    first_header = header_map.get(data_cols[0], "").strip().lower()
+    if first_header in {"", "item", "description", "deadline", "event"}:
+        return data_cols[0]
+    return None
+
+
+def _infer_data_columns(
+    header_map: Dict[int, str],
+    first_data_row: Dict[int, Dict[str, Any]],
+    label_col: Optional[int],
+) -> List[tuple[int, str]]:
+    data_cols = [col for col in sorted(first_data_row) if col != label_col]
+    header_items = [
+        (col, value) for col, value in sorted(header_map.items()) if col != label_col
+    ]
+    if len(header_items) == len(data_cols):
+        return [
+            (data_col, header_items[index][1])
+            for index, data_col in enumerate(data_cols)
+        ]
+    columns = []
+    for col in data_cols:
+        columns.append((col, header_map.get(col) or f"Column {col + 1}"))
+    return columns
+
+
+def _row_label(row_cells: Dict[int, Dict[str, Any]], label_col: Optional[int]) -> str:
+    if label_col is not None:
+        return str(row_cells.get(label_col, {}).get("text") or "").strip()
+    first_col = min(row_cells) if row_cells else None
+    if first_col is None:
+        return ""
+    return str(row_cells.get(first_col, {}).get("text") or "").strip()
+
+
+def _row_semantic_text(row_label: str, values: Dict[str, str]) -> str:
+    assignments = "; ".join(f"{column} = {value}" for column, value in values.items())
+    if row_label and assignments:
+        return f"{row_label}: {assignments}"
+    return assignments or row_label
+
+
+def _table_text_from_metadata(table: Optional[Dict[str, Any]]) -> str:
+    if not table:
+        return ""
+    parts = [
+        str(table.get("markdown") or "").strip(),
+        str(table.get("rowwise_text") or "").strip(),
+    ]
+    return "\n\n".join(part for part in parts if part)
 
 
 def _normalize_block_type(value: Any) -> str:

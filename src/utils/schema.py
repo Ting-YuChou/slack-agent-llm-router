@@ -802,6 +802,8 @@ class RagRetrievalConfig(ConfigModel):
     top_k: int = Field(5, ge=1, le=20)
     candidate_count: int = Field(30, ge=1, le=100)
     min_score: float = Field(0.0, ge=0.0, le=1.0)
+    keyword_scorer: str = "BM25STD"
+    keyword_score_normalization: str = "max"
     keyword_weight: float = Field(0.35, ge=0.0)
     vector_weight: float = Field(0.6, ge=0.0)
     recency_weight: float = Field(0.05, ge=0.0)
@@ -810,7 +812,7 @@ class RagRetrievalConfig(ConfigModel):
 
 class RagRerankConfig(ConfigModel):
     enabled: bool = False
-    provider: str = "none"
+    provider: str = "sentence_transformers"
     model: str = "BAAI/bge-reranker-v2-m3"
     top_n: int = Field(8, ge=1, le=50)
     timeout: int = Field(30, ge=1)

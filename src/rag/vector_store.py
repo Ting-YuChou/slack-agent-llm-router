@@ -16,6 +16,8 @@ from src.rag.chunker import DocumentChunk
 
 logger = logging.getLogger(__name__)
 
+TABLE_SIDECAR_METADATA_KEYS = {"table_sidecar", "table_row_sidecar"}
+
 
 @dataclass
 class StoredRagChunk:
@@ -46,6 +48,7 @@ class InMemoryRagVectorStore:
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = dict(config or {})
+        self.retrieval_config = dict(self.config.get("retrieval", {}) or {})
         self.items: Dict[str, StoredRagChunk] = {}
 
     async def initialize(self):
@@ -110,11 +113,18 @@ class InMemoryRagVectorStore:
     ) -> List[RagSearchResult]:
         tokens = tokenize(query)
         allowed_kbs = set(knowledge_base_ids or [])
+        searchable_items = [
+            (storage_id, item)
+            for storage_id, item in self.items.items()
+            if not allowed_kbs or item.knowledge_base_id in allowed_kbs
+        ]
+        keyword_scores = _bm25_scores(
+            tokens,
+            [(storage_id, item.chunk.text) for storage_id, item in searchable_items],
+        )
         results: Dict[str, Tuple[StoredRagChunk, float, str]] = {}
-        for storage_id, item in self.items.items():
-            if allowed_kbs and item.knowledge_base_id not in allowed_kbs:
-                continue
-            keyword_score = _keyword_score(tokens, item.chunk.text)
+        for storage_id, item in searchable_items:
+            keyword_score = keyword_scores.get(storage_id, 0.0)
             vector_score = (
                 _cosine_similarity(embedding, item.embedding)
                 if embedding and item.embedding
@@ -160,6 +170,7 @@ class RedisStackRagVectorStore:
         self.config = dict(config or {})
         self.redis_config = dict(self.config.get("redis", {}) or {})
         self.embedding_config = dict(self.config.get("embedding", {}) or {})
+        self.retrieval_config = dict(self.config.get("retrieval", {}) or {})
         self.key_prefix = self.redis_config.get("key_prefix", "rag")
         self.index_name = f"{self.key_prefix}:idx:chunks"
         self.dimensions = int(self.embedding_config.get("dimensions", 1024))
@@ -272,7 +283,9 @@ class RedisStackRagVectorStore:
                 "text": chunk.text,
                 "keywords": ",".join(tokenize(chunk.text)),
                 "block_types": ",".join(chunk.block_types),
-                "metadata": json.dumps(chunk.metadata, sort_keys=True),
+                "metadata": json.dumps(
+                    _metadata_for_chunk_storage(chunk.metadata), sort_keys=True
+                ),
                 "section_path": json.dumps(chunk.section_path),
                 "block_ids": json.dumps(chunk.block_ids),
                 "bboxes": json.dumps(chunk.bboxes),
@@ -293,6 +306,12 @@ class RedisStackRagVectorStore:
             )
             await self.client.sadd(
                 self._document_kbs_key(chunk.document_id), knowledge_base_id
+            )
+            await self._upsert_table_sidecars_from_chunk(
+                chunk,
+                knowledge_base_id=knowledge_base_id,
+                index_version=index_version,
+                updated_at=now_ts,
             )
             count += 1
         return count
@@ -328,6 +347,7 @@ class RedisStackRagVectorStore:
             )
             count += int(bool(deleted))
         await self.client.delete(self._document_key(document_id, knowledge_base_id))
+        await self._delete_table_sidecars(document_id, knowledge_base_id)
 
         remaining_kbs = await self.client.smembers(self._document_kbs_key(document_id))
         await self.client.srem(self._document_kbs_key(document_id), knowledge_base_id)
@@ -399,7 +419,7 @@ class RedisStackRagVectorStore:
             if filter_query != "*"
             else f"@text:({text_query})"
         )
-        results = await self._search(redis_query, limit, "keyword", tokens=tokens)
+        results = await self._keyword_text_search(redis_query, limit)
         if results:
             return results
 
@@ -410,6 +430,31 @@ class RedisStackRagVectorStore:
             else f"@keywords:{{{token_query}}}"
         )
         return await self._search(fallback_query, limit, "keyword", tokens=tokens)
+
+    async def _keyword_text_search(
+        self, query: str, limit: int
+    ) -> List[RagSearchResult]:
+        for scorer in self._keyword_scorer_candidates():
+            try:
+                return await self._search(
+                    query,
+                    limit,
+                    "keyword",
+                    with_scores=True,
+                    scorer=scorer,
+                    normalize_scores=self._keyword_normalization() == "max",
+                    raise_on_error=scorer is not None,
+                )
+            except Exception as exc:
+                logger.debug("Redis RAG keyword scorer %s failed: %s", scorer, exc)
+                continue
+        return await self._search(
+            query,
+            limit,
+            "keyword",
+            with_scores=True,
+            normalize_scores=self._keyword_normalization() == "max",
+        )
 
     async def _vector_search(
         self,
@@ -472,12 +517,18 @@ class RedisStackRagVectorStore:
         limit: int,
         source: str,
         tokens: Optional[Sequence[str]] = None,
+        with_scores: bool = False,
+        scorer: Optional[str] = None,
+        normalize_scores: bool = False,
+        raise_on_error: bool = False,
     ) -> List[RagSearchResult]:
-        try:
-            raw_results = await self.client.execute_command(
-                "FT.SEARCH",
-                self.index_name,
-                query,
+        command: List[Any] = ["FT.SEARCH", self.index_name, query]
+        if with_scores:
+            command.append("WITHSCORES")
+        if scorer:
+            command.extend(["SCORER", scorer])
+        command.extend(
+            [
                 "LIMIT",
                 "0",
                 str(limit),
@@ -498,24 +549,44 @@ class RedisStackRagVectorStore:
                 "created_at",
                 "updated_at",
                 "embedding",
-            )
+            ]
+        )
+        try:
+            raw_results = await self.client.execute_command(*command)
         except Exception as exc:
+            if raise_on_error:
+                raise
             logger.warning("Redis RAG keyword search failed: %s", exc)
             return []
-        return self._parse_results(raw_results, source, tokens=tokens)
+        return self._parse_results(
+            raw_results,
+            source,
+            tokens=tokens,
+            with_scores=with_scores,
+            normalize_scores=normalize_scores,
+        )
 
     def _parse_results(
         self,
         raw_results: Any,
         source: str,
         tokens: Optional[Sequence[str]] = None,
+        with_scores: bool = False,
+        normalize_scores: bool = False,
     ) -> List[RagSearchResult]:
         if not raw_results or len(raw_results) < 2:
             return []
         parsed = []
         entries = raw_results[1:]
-        for index in range(0, len(entries), 2):
-            fields = entries[index + 1]
+        index = 0
+        while index < len(entries):
+            index += 1
+            raw_score = None
+            if with_scores:
+                raw_score = entries[index]
+                index += 1
+            fields = entries[index]
+            index += 1
             payload = {}
             for field_index in range(0, len(fields), 2):
                 payload[_decode(fields[field_index])] = fields[field_index + 1]
@@ -527,8 +598,13 @@ class RedisStackRagVectorStore:
                     score = max(0.0, 1.0 - float(_decode(distance)))
                 except ValueError:
                     score = 0.0
+            elif raw_score is not None:
+                try:
+                    score = max(0.0, float(_decode(raw_score)))
+                except ValueError:
+                    score = 0.0
             elif tokens:
-                score = _keyword_score(tokens, item.chunk.text)
+                score = _keyword_overlap_score(tokens, item.chunk.text)
                 if score <= 0:
                     continue
             parsed.append(
@@ -541,6 +617,8 @@ class RedisStackRagVectorStore:
                     updated_at=item.updated_at,
                 )
             )
+        if normalize_scores:
+            parsed = _normalize_result_scores(parsed)
         return parsed
 
     def _deserialize(self, payload: Dict[Any, Any]) -> StoredRagChunk:
@@ -603,6 +681,142 @@ class RedisStackRagVectorStore:
     def _document_kbs_key(self, document_id: str) -> str:
         return f"{self.key_prefix}:document:{document_id}:knowledge_bases"
 
+    def _document_tables_key(self, document_id: str, knowledge_base_id: str) -> str:
+        return f"{self.key_prefix}:tables:{knowledge_base_id}:{document_id}"
+
+    def _table_key(
+        self, knowledge_base_id: str, document_id: str, table_id: str
+    ) -> str:
+        return f"{self.key_prefix}:table:{knowledge_base_id}:{document_id}:{table_id}"
+
+    def _table_rows_key(
+        self, knowledge_base_id: str, document_id: str, table_id: str
+    ) -> str:
+        return (
+            f"{self.key_prefix}:table_rows:{knowledge_base_id}:{document_id}:{table_id}"
+        )
+
+    def _table_row_key(
+        self,
+        knowledge_base_id: str,
+        document_id: str,
+        table_id: str,
+        row_id: str,
+    ) -> str:
+        return (
+            f"{self.key_prefix}:table_row:"
+            f"{knowledge_base_id}:{document_id}:{table_id}:{row_id}"
+        )
+
+    async def _upsert_table_sidecars_from_chunk(
+        self,
+        chunk: DocumentChunk,
+        *,
+        knowledge_base_id: str,
+        index_version: str,
+        updated_at: float,
+    ) -> None:
+        metadata = dict(chunk.metadata or {})
+        table_id = str(metadata.get("table_id") or "")
+        if not table_id:
+            return
+        table_sidecar = metadata.get("table_sidecar")
+        if isinstance(table_sidecar, dict):
+            await self.client.hset(
+                self._table_key(knowledge_base_id, chunk.document_id, table_id),
+                mapping={
+                    "knowledge_base_id": knowledge_base_id,
+                    "document_id": chunk.document_id,
+                    "table_id": table_id,
+                    "index_version": index_version,
+                    "updated_at": updated_at,
+                    "table_json": json.dumps(table_sidecar, sort_keys=True),
+                },
+            )
+            await self.client.sadd(
+                self._document_tables_key(chunk.document_id, knowledge_base_id),
+                table_id,
+            )
+
+        row_sidecar = metadata.get("table_row_sidecar")
+        row_id = str(metadata.get("table_row_id") or "")
+        if isinstance(row_sidecar, dict) and row_id:
+            await self.client.sadd(
+                self._document_tables_key(chunk.document_id, knowledge_base_id),
+                table_id,
+            )
+            await self.client.hset(
+                self._table_row_key(
+                    knowledge_base_id,
+                    chunk.document_id,
+                    table_id,
+                    row_id,
+                ),
+                mapping={
+                    "knowledge_base_id": knowledge_base_id,
+                    "document_id": chunk.document_id,
+                    "table_id": table_id,
+                    "row_id": row_id,
+                    "index_version": index_version,
+                    "updated_at": updated_at,
+                    "row_json": json.dumps(row_sidecar, sort_keys=True),
+                },
+            )
+            await self.client.sadd(
+                self._table_rows_key(knowledge_base_id, chunk.document_id, table_id),
+                row_id,
+            )
+
+    async def _delete_table_sidecars(
+        self, document_id: str, knowledge_base_id: str
+    ) -> None:
+        table_ids = await self.client.smembers(
+            self._document_tables_key(document_id, knowledge_base_id)
+        )
+        for raw_table_id in table_ids:
+            table_id = _decode(raw_table_id)
+            row_ids = await self.client.smembers(
+                self._table_rows_key(knowledge_base_id, document_id, table_id)
+            )
+            if row_ids:
+                await self.client.delete(
+                    *[
+                        self._table_row_key(
+                            knowledge_base_id,
+                            document_id,
+                            table_id,
+                            _decode(row_id),
+                        )
+                        for row_id in row_ids
+                    ]
+                )
+            await self.client.delete(
+                self._table_rows_key(knowledge_base_id, document_id, table_id),
+                self._table_key(knowledge_base_id, document_id, table_id),
+            )
+        await self.client.delete(
+            self._document_tables_key(document_id, knowledge_base_id)
+        )
+
+    def _keyword_scorer_candidates(self) -> List[Optional[str]]:
+        configured = str(
+            self.retrieval_config.get("keyword_scorer") or "BM25STD"
+        ).strip()
+        candidates: List[Optional[str]] = []
+        for scorer in [configured, "BM25", None]:
+            if scorer and scorer.upper() == "DEFAULT":
+                scorer = None
+            if scorer not in candidates:
+                candidates.append(scorer)
+        return candidates
+
+    def _keyword_normalization(self) -> str:
+        return (
+            str(self.retrieval_config.get("keyword_score_normalization") or "max")
+            .strip()
+            .lower()
+        )
+
 
 def build_vector_store(config: Dict[str, Any]):
     backend = str(config.get("backend", "redis_stack")).lower()
@@ -611,12 +825,93 @@ def build_vector_store(config: Dict[str, Any]):
     return RedisStackRagVectorStore(config)
 
 
-def _keyword_score(tokens: Sequence[str], text: str) -> float:
+def _keyword_overlap_score(tokens: Sequence[str], text: str) -> float:
     token_set = set(tokens)
     if not token_set:
         return 0.0
     text_tokens = set(tokenize(text))
     return len(token_set.intersection(text_tokens)) / len(token_set)
+
+
+def _metadata_for_chunk_storage(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in dict(metadata or {}).items()
+        if key not in TABLE_SIDECAR_METADATA_KEYS
+    }
+
+
+def _bm25_scores(
+    query_tokens: Sequence[str],
+    documents: Sequence[Tuple[str, str]],
+    *,
+    k1: float = 1.5,
+    b: float = 0.75,
+) -> Dict[str, float]:
+    if not query_tokens or not documents:
+        return {}
+    tokenized_documents = [(doc_id, tokenize(text)) for doc_id, text in documents]
+    document_count = len(tokenized_documents)
+    lengths = [len(tokens) for _doc_id, tokens in tokenized_documents]
+    avg_length = sum(lengths) / document_count if document_count else 0.0
+    if avg_length <= 0:
+        return {}
+
+    query_terms = list(dict.fromkeys(query_tokens))
+    document_frequency: Dict[str, int] = {term: 0 for term in query_terms}
+    for _doc_id, doc_tokens in tokenized_documents:
+        token_set = set(doc_tokens)
+        for term in query_terms:
+            if term in token_set:
+                document_frequency[term] += 1
+
+    scores: Dict[str, float] = {}
+    for doc_id, doc_tokens in tokenized_documents:
+        if not doc_tokens:
+            continue
+        term_counts: Dict[str, int] = {}
+        for token in doc_tokens:
+            if token in document_frequency:
+                term_counts[token] = term_counts.get(token, 0) + 1
+        score = 0.0
+        doc_length = len(doc_tokens)
+        for term in query_terms:
+            term_frequency = term_counts.get(term, 0)
+            if term_frequency <= 0:
+                continue
+            df = document_frequency.get(term, 0)
+            idf = math.log(1.0 + (document_count - df + 0.5) / (df + 0.5))
+            denominator = term_frequency + k1 * (1.0 - b + b * doc_length / avg_length)
+            score += idf * (term_frequency * (k1 + 1.0)) / denominator
+        if score > 0:
+            scores[doc_id] = score
+    return _normalize_scores(scores)
+
+
+def _normalize_scores(scores: Dict[str, float]) -> Dict[str, float]:
+    max_score = max(scores.values(), default=0.0)
+    if max_score <= 0:
+        return {key: 0.0 for key in scores}
+    return {key: max(0.0, value / max_score) for key, value in scores.items()}
+
+
+def _normalize_result_scores(
+    results: Sequence[RagSearchResult],
+) -> List[RagSearchResult]:
+    max_score = max((result.score for result in results), default=0.0)
+    if max_score <= 0:
+        return list(results)
+    return [
+        RagSearchResult(
+            chunk=result.chunk,
+            score=max(0.0, result.score / max_score),
+            match_source=result.match_source,
+            knowledge_base_id=result.knowledge_base_id,
+            index_version=result.index_version,
+            updated_at=result.updated_at,
+        )
+        for result in results
+    ]
 
 
 def _cosine_similarity(
