@@ -488,6 +488,15 @@ slack:
       enterprise:
         requests_per_hour: 2000
         burst_requests: 50
+  context:
+    enabled: true
+    strategy: thread_first
+    max_thread_messages: 20
+    max_channel_messages: 10
+    max_context_chars: 4000
+    include_bot_messages: false
+    timeout_seconds: 3
+    fail_open: true
   attachments:
     enabled: true
     max_files: 10

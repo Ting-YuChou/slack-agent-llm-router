@@ -557,6 +557,25 @@ class SlackRateLimitingConfig(ConfigModel):
     burst_requests: int = Field(5, ge=1)
 
 
+class SlackContextConfig(ConfigModel):
+    enabled: bool = True
+    strategy: str = "thread_first"
+    max_thread_messages: int = Field(20, ge=1)
+    max_channel_messages: int = Field(10, ge=1)
+    max_context_chars: int = Field(4000, ge=1)
+    include_bot_messages: bool = False
+    timeout_seconds: float = Field(3.0, gt=0)
+    fail_open: bool = True
+
+    @field_validator("strategy")
+    @classmethod
+    def validate_strategy(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"thread_first"}:
+            raise ValueError("strategy must be one of: thread_first")
+        return normalized
+
+
 class SlackMemorySearchConfig(ConfigModel):
     max_results: int = Field(5, ge=1)
     max_context_chars: int = Field(2000, ge=1)
@@ -625,6 +644,7 @@ class SlackConfig(ConfigModel):
     rate_limiting: SlackRateLimitingConfig = Field(
         default_factory=SlackRateLimitingConfig
     )
+    context: SlackContextConfig = Field(default_factory=SlackContextConfig)
     state_backend: str = "memory"
     state_file: str = "data/slack_state.json"
     state_key_prefix: str = "slack_state"

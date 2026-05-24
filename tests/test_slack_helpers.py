@@ -238,6 +238,152 @@ class TestSlackMessageHandler:
         assert request.conversation_id == "u1:c1:main"
 
     @pytest.mark.asyncio
+    async def test_handle_query_injects_thread_context_before_bot_history(
+        self, inference_response_factory
+    ):
+        inference_engine = SimpleNamespace(
+            process_query=AsyncMock(
+                return_value=inference_response_factory(response_text="thread answer")
+            )
+        )
+        bot = SlackBot(
+            {"channels": [], "context": {"enabled": True}},
+            inference_engine=inference_engine,
+        )
+        context = bot.conversation_manager.get_or_create_context("u1", "c1", "t1")
+        context.add_message("assistant", "previous bot answer")
+        client = SimpleNamespace(
+            conversations_replies=AsyncMock(
+                return_value={
+                    "ok": True,
+                    "messages": [
+                        {"ts": "1.0", "user": "u2", "text": "parent decision"},
+                        {"ts": "1.1", "user": "u3", "text": "prior reply"},
+                        {"ts": "1.15", "subtype": "channel_join", "text": "joined"},
+                        {
+                            "ts": "1.16",
+                            "user": "B1",
+                            "bot_id": "B1",
+                            "text": "bot noise",
+                        },
+                        {"ts": "1.2", "user": "u1", "text": "current question"},
+                    ],
+                }
+            )
+        )
+
+        response = await bot.message_handler._handle_query(
+            "what did we decide?",
+            "u1",
+            "c1",
+            "t1",
+            client=client,
+            message_ts="1.2",
+        )
+
+        request = inference_engine.process_query.await_args.args[0]
+        assert response == "thread answer"
+        assert request.context.index("Slack thread context:") < request.context.index(
+            "assistant: previous bot answer"
+        )
+        assert "<@u2>: parent decision" in request.context
+        assert "<@u3>: prior reply" in request.context
+        assert "current question" not in request.context
+        assert "bot noise" not in request.context
+        assert "joined" not in request.context
+        assert request.metadata["slack_context_source"] == "thread"
+        assert request.metadata["slack_context_message_count"] == 2
+        assert request.metadata["slack_context_truncated"] is False
+        client.conversations_replies.assert_awaited_once_with(
+            channel="c1", ts="t1", limit=20, latest="1.2", inclusive=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_handle_query_uses_channel_context_for_top_level_mentions(
+        self, inference_response_factory
+    ):
+        inference_engine = SimpleNamespace(
+            process_query=AsyncMock(
+                return_value=inference_response_factory(response_text="channel answer")
+            )
+        )
+        bot = SlackBot(
+            {
+                "channels": [],
+                "context": {"enabled": True, "max_channel_messages": 3},
+            },
+            inference_engine=inference_engine,
+        )
+        client = SimpleNamespace(
+            conversations_history=AsyncMock(
+                return_value={
+                    "ok": True,
+                    "messages": [
+                        {"ts": "2.2", "user": "u3", "text": "newer point"},
+                        {"ts": "2.1", "user": "u2", "text": "older point"},
+                        {"ts": "2.3", "user": "u1", "text": "current question"},
+                    ],
+                }
+            ),
+            conversations_replies=AsyncMock(),
+        )
+
+        await bot.message_handler._handle_query(
+            "summarize above",
+            "u1",
+            "c1",
+            "2.3",
+            client=client,
+            message_ts="2.3",
+        )
+
+        request = inference_engine.process_query.await_args.args[0]
+        assert "Recent channel context:" in request.context
+        assert request.context.index("older point") < request.context.index(
+            "newer point"
+        )
+        assert "current question" not in request.context
+        assert request.metadata["slack_context_source"] == "channel"
+        assert request.metadata["slack_context_message_count"] == 2
+        client.conversations_history.assert_awaited_once_with(
+            channel="c1", latest="2.3", inclusive=False, limit=3
+        )
+        client.conversations_replies.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_handle_query_fails_open_when_slack_context_fetch_fails(
+        self, inference_response_factory
+    ):
+        inference_engine = SimpleNamespace(
+            process_query=AsyncMock(
+                return_value=inference_response_factory(response_text="fallback answer")
+            )
+        )
+        bot = SlackBot(
+            {"channels": [], "context": {"enabled": True, "fail_open": True}},
+            inference_engine=inference_engine,
+        )
+        client = SimpleNamespace(
+            conversations_replies=AsyncMock(side_effect=RuntimeError("missing_scope"))
+        )
+
+        response = await bot.message_handler._handle_query(
+            "what happened?",
+            "u1",
+            "c1",
+            "t1",
+            client=client,
+            message_ts="1.2",
+        )
+
+        request = inference_engine.process_query.await_args.args[0]
+        assert response == "fallback answer"
+        assert "slack_context_error" in request.metadata
+        assert request.metadata["slack_context_error"] == "missing_scope"
+        assert request.metadata["slack_context_source"] == "none"
+        assert request.metadata["slack_context_message_count"] == 0
+
+    @pytest.mark.asyncio
     async def test_web_command_requires_web_search(self, inference_response_factory):
         inference_engine = SimpleNamespace(
             process_query=AsyncMock(

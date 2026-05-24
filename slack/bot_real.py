@@ -481,6 +481,17 @@ class ConversationContext:
         self.last_activity = datetime.now()
 
 
+@dataclass
+class SlackFetchedContext:
+    """Request-scoped Slack channel/thread context fetched from Slack history."""
+
+    context: str = ""
+    source: str = "none"
+    message_count: int = 0
+    truncated: bool = False
+    error: Optional[str] = None
+
+
 class UserManager:
     """Manages user data and preferences"""
 
@@ -743,6 +754,7 @@ class SlackMessageHandler:
         user_id = event.get("user")
         channel_id = event.get("channel")
         thread_ts = event.get("thread_ts") or event.get("ts")
+        message_ts = event.get("ts")
         team_id = self.bot._extract_team_id(event)
         attachments = list(event.get("_query_attachments", []) or [])
 
@@ -760,6 +772,7 @@ class SlackMessageHandler:
                 client,
                 attachments=attachments,
                 team_id=team_id,
+                message_ts=message_ts,
             )
 
         if not text and attachments:
@@ -774,6 +787,7 @@ class SlackMessageHandler:
             client,
             attachments=attachments,
             team_id=team_id,
+            message_ts=message_ts,
         )
 
     async def _handle_command_or_query(
@@ -786,6 +800,7 @@ class SlackMessageHandler:
         attachments: Optional[List[Attachment]] = None,
         team_id: Optional[str] = None,
         command_surface: str = "message",
+        message_ts: Optional[str] = None,
     ) -> str:
         """Handle inline `/llm` / `!llm` payloads as commands or free-form queries."""
         return await self._handle_command(
@@ -797,6 +812,7 @@ class SlackMessageHandler:
             attachments=attachments or [],
             team_id=team_id,
             command_surface=command_surface,
+            message_ts=message_ts,
         )
 
     async def _handle_command(
@@ -809,6 +825,7 @@ class SlackMessageHandler:
         attachments: Optional[List[Attachment]] = None,
         team_id: Optional[str] = None,
         command_surface: str = "message",
+        message_ts: Optional[str] = None,
     ) -> str:
         """Handle bot commands, falling back to a free-form query when appropriate."""
         parts = command_text.split()
@@ -828,6 +845,7 @@ class SlackMessageHandler:
                     thread_ts=thread_ts,
                     attachments=attachments,
                     team_id=team_id,
+                    message_ts=message_ts,
                 )
             if command == "fast":
                 return await self._handle_fast_command(
@@ -838,6 +856,7 @@ class SlackMessageHandler:
                     thread_ts=thread_ts,
                     attachments=attachments,
                     team_id=team_id,
+                    message_ts=message_ts,
                 )
             if command in {"remember", "memories", "forget"}:
                 return await self.commands[command](
@@ -858,6 +877,7 @@ class SlackMessageHandler:
             client,
             attachments=attachments,
             team_id=team_id,
+            message_ts=message_ts,
         )
 
     async def _handle_web_command(
@@ -869,6 +889,7 @@ class SlackMessageHandler:
         thread_ts: Optional[str] = None,
         attachments: Optional[List[Attachment]] = None,
         team_id: Optional[str] = None,
+        message_ts: Optional[str] = None,
     ) -> str:
         """Handle `/llm web <query>` by requiring the web_search tool."""
         query = " ".join(args).strip()
@@ -884,6 +905,7 @@ class SlackMessageHandler:
             team_id=team_id,
             tool_policy=ToolPolicy.REQUIRED,
             allowed_tools=["web_search"],
+            message_ts=message_ts,
         )
 
     async def _handle_fast_command(
@@ -895,6 +917,7 @@ class SlackMessageHandler:
         thread_ts: Optional[str] = None,
         attachments: Optional[List[Attachment]] = None,
         team_id: Optional[str] = None,
+        message_ts: Optional[str] = None,
     ) -> str:
         """Handle `/llm fast <query>` by marking this request low-latency."""
         query = " ".join(args).strip()
@@ -913,6 +936,7 @@ class SlackMessageHandler:
                 "latency_sla": "interactive",
                 "routing_intent_source": "slack_fast_command",
             },
+            message_ts=message_ts,
         )
 
     async def _handle_help_command(
@@ -1354,6 +1378,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         tool_policy: ToolPolicy = ToolPolicy.AUTO,
         allowed_tools: Optional[List[str]] = None,
         routing_metadata: Optional[Dict[str, Any]] = None,
+        message_ts: Optional[str] = None,
     ) -> str:
         """Handle regular query through inference engine"""
         try:
@@ -1368,13 +1393,25 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             context.user_tier = user_tier
             context.preferences = user_prefs
 
-            # Build conversation context
+            # Build request-scoped Slack and bot conversation context.
             conversation_context = (
                 self.bot.conversation_manager.get_conversation_summary(
                     user_id, channel_id, thread_ts
                 )
             )
-            request_context = conversation_context
+            slack_context = SlackFetchedContext()
+            slack_context_builder = getattr(self.bot, "_build_slack_context", None)
+            if callable(slack_context_builder):
+                slack_context = await slack_context_builder(
+                    client=client,
+                    channel_id=channel_id,
+                    thread_ts=thread_ts,
+                    message_ts=message_ts,
+                )
+
+            request_context = self._join_context_sections(
+                [slack_context.context, conversation_context]
+            )
             memory_manager = getattr(self.bot, "memory_manager", None)
             if memory_manager and getattr(memory_manager, "enabled", False):
                 scope = self.bot._memory_scope(team_id, user_id)
@@ -1390,11 +1427,13 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                     )
                     request_context = memory_manager.build_context(
                         memory_results,
-                        conversation_context,
+                        request_context,
                     )
                 except Exception:
                     logger.exception("Failed to search Slack memory")
-                    request_context = conversation_context
+                    request_context = self._join_context_sections(
+                        [slack_context.context, conversation_context]
+                    )
 
             # Create query request
             conversation_id_builder = getattr(
@@ -1421,6 +1460,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 else {}
             )
             query_metadata.update(dict(routing_metadata or {}))
+            self._add_slack_context_metadata(query_metadata, slack_context)
 
             query_request = QueryRequest(
                 query=text,
@@ -1473,6 +1513,21 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             if callable(error_builder):
                 return error_builder()
             return "❌ Sorry, I couldn't process that request right now. Please try again in a moment."
+
+    def _join_context_sections(self, sections: List[str]) -> str:
+        """Join non-empty context sections without adding persistence semantics."""
+        return "\n\n".join(section.strip() for section in sections if section.strip())
+
+    def _add_slack_context_metadata(
+        self, metadata: Dict[str, Any], slack_context: SlackFetchedContext
+    ) -> None:
+        """Attach Slack history fetch metadata only when a fetch happened or failed."""
+        if slack_context.source != "none" or slack_context.error:
+            metadata["slack_context_source"] = slack_context.source
+            metadata["slack_context_message_count"] = slack_context.message_count
+            metadata["slack_context_truncated"] = slack_context.truncated
+        if slack_context.error:
+            metadata["slack_context_error"] = slack_context.error
 
     def _format_response_with_sources(self, response: Any) -> str:
         """Append compact source links for web-search enriched answers."""
@@ -1568,6 +1623,9 @@ class SlackBot:
         self.allowed_channel_ids: Set[str] = set()
         self.allowed_channel_names: Set[str] = set()
         self.rate_limiting = config.get("rate_limiting", {})
+        self.context_settings = self._resolve_context_settings(
+            config.get("context", {})
+        )
         self.attachment_settings = {
             "enabled": True,
             "max_files": 10,
@@ -1931,6 +1989,218 @@ class SlackBot:
             append_chunk(current_part)
 
         return parts
+
+    def _resolve_context_settings(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Resolve Slack history context settings with backwards-compatible defaults."""
+        settings = {
+            "enabled": True,
+            "strategy": "thread_first",
+            "max_thread_messages": 20,
+            "max_channel_messages": 10,
+            "max_context_chars": 4000,
+            "include_bot_messages": False,
+            "timeout_seconds": 3.0,
+            "fail_open": True,
+        }
+        if isinstance(config, dict):
+            settings.update(config)
+
+        settings["strategy"] = str(settings.get("strategy") or "thread_first").lower()
+        settings["max_thread_messages"] = max(
+            1, int(settings.get("max_thread_messages") or 20)
+        )
+        settings["max_channel_messages"] = max(
+            1, int(settings.get("max_channel_messages") or 10)
+        )
+        settings["max_context_chars"] = max(
+            1, int(settings.get("max_context_chars") or 4000)
+        )
+        settings["timeout_seconds"] = max(
+            0.1, float(settings.get("timeout_seconds") or 3.0)
+        )
+        settings["enabled"] = bool(settings.get("enabled", True))
+        settings["include_bot_messages"] = bool(
+            settings.get("include_bot_messages", False)
+        )
+        settings["fail_open"] = bool(settings.get("fail_open", True))
+        return settings
+
+    async def _build_slack_context(
+        self,
+        client: AsyncWebClient,
+        channel_id: Optional[str],
+        thread_ts: Optional[str],
+        message_ts: Optional[str],
+    ) -> SlackFetchedContext:
+        """Fetch request-scoped Slack thread/channel context for the current query."""
+        if not self.context_settings.get("enabled", True):
+            return SlackFetchedContext()
+        if not client or not channel_id:
+            return SlackFetchedContext()
+
+        try:
+            return await asyncio.wait_for(
+                self._fetch_slack_context(client, channel_id, thread_ts, message_ts),
+                timeout=float(self.context_settings.get("timeout_seconds", 3.0)),
+            )
+        except Exception as exc:
+            if not self.context_settings.get("fail_open", True):
+                raise
+            error_name = self._slack_context_error_name(exc)
+            logger.warning("Slack context fetch failed: %s", error_name)
+            return SlackFetchedContext(error=error_name)
+
+    async def _fetch_slack_context(
+        self,
+        client: AsyncWebClient,
+        channel_id: str,
+        thread_ts: Optional[str],
+        message_ts: Optional[str],
+    ) -> SlackFetchedContext:
+        """Fetch Slack history using thread context first, then channel context."""
+        strategy = self.context_settings.get("strategy", "thread_first")
+        if strategy != "thread_first":
+            raise ValueError(f"Unsupported Slack context strategy: {strategy}")
+
+        use_thread = bool(thread_ts and (not message_ts or thread_ts != message_ts))
+        if use_thread:
+            method_name = "conversations_replies"
+            method = getattr(client, method_name, None)
+            if not callable(method):
+                raise RuntimeError(f"{method_name}_unavailable")
+
+            kwargs: Dict[str, Any] = {
+                "channel": channel_id,
+                "ts": thread_ts,
+                "limit": int(self.context_settings.get("max_thread_messages", 20)),
+            }
+            if message_ts:
+                kwargs["latest"] = message_ts
+                kwargs["inclusive"] = False
+            response = await method(**kwargs)
+            source = "thread"
+        else:
+            if not message_ts:
+                return SlackFetchedContext()
+            method_name = "conversations_history"
+            method = getattr(client, method_name, None)
+            if not callable(method):
+                raise RuntimeError(f"{method_name}_unavailable")
+
+            response = await method(
+                channel=channel_id,
+                latest=message_ts,
+                inclusive=False,
+                limit=int(self.context_settings.get("max_channel_messages", 10)),
+            )
+            source = "channel"
+
+        if isinstance(response, dict) and response.get("ok") is False:
+            raise RuntimeError(str(response.get("error") or "slack_api_error"))
+
+        messages = list((response or {}).get("messages", []) or [])
+        messages.sort(key=lambda message: self._slack_message_sort_key(message))
+        filtered_messages = [
+            message
+            for message in messages
+            if self._should_include_slack_context_message(message, message_ts)
+        ]
+        return self._format_slack_context(filtered_messages, source)
+
+    def _should_include_slack_context_message(
+        self, message: Dict[str, Any], current_ts: Optional[str]
+    ) -> bool:
+        """Filter Slack system/bot/current-query messages out of fetched context."""
+        if self._same_slack_timestamp(message.get("ts"), current_ts):
+            return False
+        if message.get("subtype"):
+            return False
+        if not self.context_settings.get("include_bot_messages", False):
+            if message.get("bot_id") or message.get("user") == self.bot_user_id:
+                return False
+        if not self._clean_slack_message_text(message.get("text", "")):
+            return False
+        return bool(self._slack_message_sender(message))
+
+    def _format_slack_context(
+        self, messages: List[Dict[str, Any]], source: str
+    ) -> SlackFetchedContext:
+        """Render Slack messages into a compact deterministic context block."""
+        if not messages:
+            return SlackFetchedContext(source=source)
+
+        header = (
+            "Slack thread context:" if source == "thread" else "Recent channel context:"
+        )
+        candidate_lines = [
+            f"{self._slack_message_sender(message)}: "
+            f"{self._clean_slack_message_text(message.get('text', ''))}"
+            for message in messages
+        ]
+
+        max_chars = int(self.context_settings.get("max_context_chars", 4000))
+        output_lines = [header]
+        included_count = 0
+        truncated = False
+
+        for line in candidate_lines:
+            current_text = "\n".join(output_lines)
+            separator_len = 1 if current_text else 0
+            remaining = max_chars - len(current_text) - separator_len
+            if remaining <= 0:
+                truncated = True
+                break
+            if len(line) <= remaining:
+                output_lines.append(line)
+                included_count += 1
+                continue
+            if remaining > 4:
+                output_lines.append(line[: remaining - 3].rstrip() + "...")
+                included_count += 1
+            truncated = True
+            break
+
+        if included_count < len(candidate_lines):
+            truncated = True
+        if included_count == 0:
+            return SlackFetchedContext(source=source, truncated=True)
+
+        return SlackFetchedContext(
+            context="\n".join(output_lines),
+            source=source,
+            message_count=included_count,
+            truncated=truncated,
+        )
+
+    def _clean_slack_message_text(self, text: Any) -> str:
+        """Normalize Slack text without resolving user IDs or making extra API calls."""
+        return " ".join(str(text or "").split())
+
+    def _slack_message_sender(self, message: Dict[str, Any]) -> str:
+        user_id = message.get("user")
+        if user_id:
+            return f"<@{user_id}>"
+        username = message.get("username")
+        if username:
+            return str(username)
+        return ""
+
+    def _same_slack_timestamp(self, left: Any, right: Any) -> bool:
+        if left is None or right is None:
+            return False
+        return str(left) == str(right)
+
+    def _slack_message_sort_key(self, message: Dict[str, Any]) -> float:
+        try:
+            return float(message.get("ts", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _slack_context_error_name(self, exc: Exception) -> str:
+        response = getattr(exc, "response", None)
+        if isinstance(response, dict) and response.get("error"):
+            return str(response["error"])
+        return str(exc) or type(exc).__name__
 
     async def _send_rate_limit_message(self, channel_id: str, user_id: str):
         """Send rate limit exceeded message"""

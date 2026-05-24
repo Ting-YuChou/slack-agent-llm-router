@@ -196,6 +196,35 @@ def test_platform_config_accepts_redis_slack_state_backend():
     assert config.slack.redis["db"] == 5
 
 
+def test_platform_config_accepts_slack_context_config():
+    config = PlatformConfig(
+        slack={
+            "context": {
+                "enabled": True,
+                "strategy": "thread_first",
+                "max_thread_messages": 25,
+                "max_channel_messages": 8,
+                "max_context_chars": 3000,
+                "include_bot_messages": False,
+                "timeout_seconds": 2.5,
+                "fail_open": True,
+            }
+        }
+    )
+
+    assert config.slack.context.enabled is True
+    assert config.slack.context.strategy == "thread_first"
+    assert config.slack.context.max_thread_messages == 25
+    assert config.slack.context.max_channel_messages == 8
+    assert config.slack.context.max_context_chars == 3000
+    assert config.slack.context.timeout_seconds == 2.5
+
+
+def test_platform_config_rejects_unknown_slack_context_strategy():
+    with pytest.raises(ValidationError):
+        PlatformConfig(slack={"context": {"strategy": "channel_first"}})
+
+
 def test_platform_config_accepts_slack_memory_config():
     config = PlatformConfig(
         slack={
