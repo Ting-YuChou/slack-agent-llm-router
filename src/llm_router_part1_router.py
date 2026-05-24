@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import tiktoken
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+from src.routing_features import build_routing_features
 from src.utils.metrics import ROUTER_METRICS
 from src.utils.schema import (
     ModelConfig,
@@ -387,6 +388,7 @@ class ModelRouter:
             "difficult_task_token_threshold": 50000,
             "local_simple_task_bonus": 12.0,
             "simple_task_token_threshold": 1200,
+            "low_latency_weight_bonus": 10.0,
             "local_simple_task_types": [
                 "general",
                 "summarization",
@@ -534,6 +536,13 @@ class ModelRouter:
         )
         if needs_web_search:
             query_type = QueryType.WEB_RESEARCH
+        routing_features = build_routing_features(
+            self._build_routing_feature_payload(
+                request=request,
+                query_type=query_type.value,
+                token_count=token_count,
+            )
+        )
 
         # Build context
         context = {
@@ -558,15 +567,82 @@ class ModelRouter:
             "web_search_blocked_reason": metadata.get("web_search_blocked_reason"),
             "timestamp": time.time(),
         }
+        context.update(routing_features)
 
         policy_context = await self._get_policy_context(request)
         context.update(policy_context)
-        if policy_context.get("policy_query_type"):
-            context["query_type"] = policy_context["policy_query_type"]
-        if policy_context.get("query_complexity"):
-            context["query_complexity"] = policy_context["query_complexity"]
+        self._restore_current_request_features(context, routing_features)
+        context["policy_source"] = self._combine_policy_sources(
+            policy_context.get("policy_source", "none"),
+            routing_features,
+        )
 
         return context
+
+    def _build_routing_feature_payload(
+        self, *, request: QueryRequest, query_type: str, token_count: int
+    ) -> Dict[str, Any]:
+        attachments = [
+            {
+                "id": getattr(attachment, "id", None),
+                "name": getattr(attachment, "name", None),
+                "type": getattr(getattr(attachment, "type", None), "value", None),
+                "size_bytes": getattr(attachment, "size_bytes", 0),
+                "mime_type": getattr(attachment, "mime_type", None),
+            }
+            for attachment in (request.attachments or [])
+        ]
+        return {
+            "query_text": request.query,
+            "query_type": query_type,
+            "query_token_estimate": token_count,
+            "user_id": request.user_id,
+            "user_tier": self._normalize_user_tier(request.user_tier),
+            "context": request.context or "",
+            "max_tokens": request.max_tokens,
+            "priority": request.priority,
+            "session_id": request.session_id,
+            "conversation_id": request.conversation_id,
+            "metadata": request.metadata or {},
+            "attachments": attachments,
+            "attachments_count": len(attachments),
+        }
+
+    def _restore_current_request_features(
+        self, context: Dict[str, Any], routing_features: Dict[str, Any]
+    ) -> None:
+        """Keep stale async policy state from overriding this request's shape."""
+        current_request_fields = (
+            "query_type",
+            "query_complexity",
+            "query_token_estimate",
+            "long_context",
+            "attachment_heavy",
+            "code_heavy",
+            "session_hotness",
+            "requires_low_latency",
+            "requires_high_reasoning",
+            "route_to_fast_lane",
+            "latency_sla",
+            "routing_intent_source",
+        )
+        for field in current_request_fields:
+            if field in routing_features:
+                context[field] = routing_features[field]
+
+    def _combine_policy_sources(
+        self, policy_source: str, routing_features: Dict[str, Any]
+    ) -> str:
+        sources = [
+            source
+            for source in str(policy_source or "none").split("+")
+            if source and source != "none"
+        ]
+        if routing_features.get("routing_intent_source"):
+            insert_at = 1 if sources and sources[0] == "request_metadata" else 0
+            if "request_features" not in sources:
+                sources.insert(insert_at, "request_features")
+        return "+".join(sources) if sources else "none"
 
     def _web_search_allowed(self, request: QueryRequest) -> bool:
         if request.tool_policy == ToolPolicy.DISABLED:
@@ -840,16 +916,16 @@ class ModelRouter:
     def _policy_based_routing(
         self, context: Dict[str, Any]
     ) -> Optional[ModelSelection]:
-        """Prefer low-latency local models when policy cache marks a request/user hot."""
-        preferred_models = self._derive_preferred_models_from_context(context)
+        """Handle explicit model pins and current-request fast-lane eligibility."""
         policy_source = context.get("policy_source", "none")
         route_to_fast_lane = bool(context.get("route_to_fast_lane", False))
+        explicitly_preferred_models = list(context.get("preferred_models", []) or [])
 
-        if not preferred_models and not route_to_fast_lane:
+        if not explicitly_preferred_models and not route_to_fast_lane:
             return None
 
+        preferred_models = self._derive_preferred_models_from_context(context)
         candidates = list(preferred_models)
-        explicitly_preferred_models = list(context.get("preferred_models", []) or [])
         preferred_candidates = self._filter_models_for_context(
             explicitly_preferred_models, context
         )
@@ -858,10 +934,11 @@ class ModelRouter:
             selected_model = self._select_best_model(preferred_candidates, context)
             hint_reason = context.get("hint_reason") or "preferred model pin"
             confidence = 0.98 if policy_source == "request" else 0.94
+            reason_prefix = self._selection_reason_prefix(policy_source)
             return ModelSelection(
                 model_name=selected_model,
                 confidence=confidence,
-                reason=f"Policy-cache selection ({policy_source}): {hint_reason}",
+                reason=f"{reason_prefix} ({policy_source}): {hint_reason}",
             )
 
         if route_to_fast_lane:
@@ -876,12 +953,18 @@ class ModelRouter:
         selected_model = self._select_best_model(suitable_models, context)
         hint_reason = context.get("hint_reason") or "fast-lane promotion"
         confidence = 0.97 if policy_source == "request" else 0.92
+        reason_prefix = self._selection_reason_prefix(policy_source)
 
         return ModelSelection(
             model_name=selected_model,
             confidence=confidence,
-            reason=(f"Policy-cache selection ({policy_source}): {hint_reason}"),
+            reason=(f"{reason_prefix} ({policy_source}): {hint_reason}"),
         )
+
+    def _selection_reason_prefix(self, policy_source: str) -> str:
+        if "request_features" in str(policy_source or ""):
+            return "Request-feature selection"
+        return "Policy-cache selection"
 
     def _derive_preferred_models_from_context(
         self, context: Dict[str, Any]
@@ -896,7 +979,7 @@ class ModelRouter:
 
         _append(list(context.get("preferred_models", []) or []))
 
-        if bool(context.get("requires_low_latency", False)):
+        if bool(context.get("route_to_fast_lane", False)):
             _append(self._get_fast_lane_candidates())
 
         if (
@@ -1122,8 +1205,11 @@ class ModelRouter:
             reliability_weight += 10.0
 
         score += success_rate * reliability_weight
+        latency_weight = float(self.scoring["latency_weight"])
+        if bool(context.get("requires_low_latency", False)):
+            latency_weight += float(self.scoring.get("low_latency_weight_bonus", 0.0))
         score += max(
-            0, float(self.scoring["latency_weight"]) - avg_latency / 100
+            0, latency_weight - avg_latency / 100
         )  # Speed weight (lower latency = higher score)
 
         # Cost efficiency (inverse relationship)

@@ -10,7 +10,7 @@ from flink.logic import (
 
 
 @pytest.mark.integration
-def test_flink_classifier_routes_enterprise_and_urgent_queries():
+def test_flink_classifier_uses_explicit_sla_for_fast_lane():
     timestamp = datetime(2026, 3, 13, 12, 0, 0)
 
     enterprise_event = classify_request_event(
@@ -22,12 +22,12 @@ def test_flink_classifier_routes_enterprise_and_urgent_queries():
         },
         timestamp=timestamp,
     )
-    assert enterprise_event["priority"] == "high"
-    assert enterprise_event["route_to_fast_lane"] is True
+    assert enterprise_event["priority"] == "low"
+    assert enterprise_event["route_to_fast_lane"] is False
     assert enterprise_event["query_type"] == "analysis"
     assert enterprise_event["requires_high_reasoning"] is True
 
-    urgent_enriched = build_request_enriched_event(
+    urgent_keyword_event = build_request_enriched_event(
         {
             "request_id": "integration-flink-urgent",
             "query_text": "Critical production outage, respond ASAP",
@@ -36,15 +36,29 @@ def test_flink_classifier_routes_enterprise_and_urgent_queries():
         },
         timestamp=timestamp,
     )
-    assert urgent_enriched["event_type"] == "requests.enriched"
-    assert urgent_enriched["priority"] == "critical"
-    assert urgent_enriched["route_to_fast_lane"] is True
-    assert urgent_enriched["requires_low_latency"] is True
+    assert urgent_keyword_event["event_type"] == "requests.enriched"
+    assert urgent_keyword_event["priority"] == "low"
+    assert urgent_keyword_event["route_to_fast_lane"] is False
+    assert urgent_keyword_event["requires_low_latency"] is False
 
-    urgent_hint = build_fast_lane_hint_event(urgent_enriched, timestamp=timestamp)
-    assert urgent_hint["event_type"] == "fast_lane_hints"
-    assert urgent_hint["route_to_fast_lane"] is True
-    assert urgent_hint["hint_type"] == "fast_lane_candidate"
+    priority_enriched = build_request_enriched_event(
+        {
+            "request_id": "integration-flink-priority",
+            "query_text": "Summarize this thread",
+            "user_tier": "free",
+            "user_id": "free-user",
+            "priority": 4,
+        },
+        timestamp=timestamp,
+    )
+    assert priority_enriched["priority"] == "high"
+    assert priority_enriched["route_to_fast_lane"] is True
+    assert priority_enriched["requires_low_latency"] is True
+
+    priority_hint = build_fast_lane_hint_event(priority_enriched, timestamp=timestamp)
+    assert priority_hint["event_type"] == "fast_lane_hints"
+    assert priority_hint["route_to_fast_lane"] is True
+    assert priority_hint["hint_type"] == "fast_lane_candidate"
 
 
 @pytest.mark.integration
@@ -57,7 +71,7 @@ def test_flink_classifier_keeps_standard_queries_off_fast_lane():
             "user_id": "premium-user",
         }
     )
-    assert event["priority"] == "medium"
+    assert event["priority"] == "low"
     assert event["route_to_fast_lane"] is False
 
 

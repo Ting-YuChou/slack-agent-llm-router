@@ -288,6 +288,49 @@ class TestSlackMessageHandler:
         assert "https://example.com/news" in response
 
     @pytest.mark.asyncio
+    async def test_fast_command_marks_one_request_low_latency(
+        self, inference_response_factory
+    ):
+        inference_engine = SimpleNamespace(
+            process_query=AsyncMock(
+                return_value=inference_response_factory(response_text="fast answer")
+            )
+        )
+        bot = SimpleNamespace(
+            user_manager=UserManager(),
+            conversation_manager=ConversationManager({}),
+            inference_engine=inference_engine,
+            _build_query_metadata=SlackBot._build_query_metadata,
+            _conversation_context_key=SlackBot._conversation_context_key,
+            _build_response_style_instructions=SlackBot._build_response_style_instructions,
+        )
+        bot._build_query_metadata = bot._build_query_metadata.__get__(
+            bot, SimpleNamespace
+        )
+        bot._conversation_context_key = bot._conversation_context_key.__get__(
+            bot, SimpleNamespace
+        )
+        bot._build_response_style_instructions = (
+            bot._build_response_style_instructions.__get__(bot, SimpleNamespace)
+        )
+        handler = SlackMessageHandler(bot)
+
+        response = await handler._handle_command_or_query(
+            "fast summarize this thread",
+            "u1",
+            "c1",
+            None,
+            client=None,
+        )
+
+        request = inference_engine.process_query.await_args.args[0]
+        assert response == "fast answer"
+        assert request.query == "summarize this thread"
+        assert request.metadata["requires_low_latency"] is True
+        assert request.metadata["latency_sla"] == "interactive"
+        assert request.metadata["routing_intent_source"] == "slack_fast_command"
+
+    @pytest.mark.asyncio
     async def test_handle_query_returns_safe_error_when_engine_returns_error_response(
         self, inference_response_factory
     ):
