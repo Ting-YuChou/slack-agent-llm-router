@@ -444,6 +444,15 @@ slack:
   rate_limiting:
     requests_per_hour: 100
     burst_requests: 5
+  context:
+    enabled: true
+    strategy: thread_first
+    max_thread_messages: 20
+    max_channel_messages: 10
+    max_context_chars: 4000
+    include_bot_messages: false
+    timeout_seconds: 3
+    fail_open: true
   state_backend: redis
   state_key_prefix: slack_state
   redis:
