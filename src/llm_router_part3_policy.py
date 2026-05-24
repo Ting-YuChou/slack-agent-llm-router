@@ -264,6 +264,8 @@ class RoutingPolicyCache:
             "session_hotness": event.get("session_hotness"),
             "cost_sensitivity": event.get("cost_sensitivity"),
             "error_sensitivity": event.get("error_sensitivity"),
+            "latency_sla": event.get("latency_sla"),
+            "routing_intent_source": event.get("routing_intent_source"),
             "preferred_models": list(event.get("preferred_models", []) or []),
             "avoid_models": list(event.get("avoid_models", []) or []),
             "avoid_providers": list(event.get("avoid_providers", []) or []),
@@ -279,42 +281,8 @@ class RoutingPolicyCache:
                 self.request_ttl_seconds,
             )
 
-        # User-level promotions should be short-lived and only written on fast-lane wins.
-        if route_to_fast_lane and user_id:
-            existing_user_policy = await self.get_user_hint_policy(user_id)
-            user_policy = {
-                "request_id": request_id,
-                "user_id": user_id,
-                "priority": priority,
-                "route_to_fast_lane": True,
-                "query_type": event.get("query_type"),
-                "query_complexity": event.get("query_complexity"),
-                "requires_low_latency": bool(event.get("requires_low_latency", False)),
-                "requires_high_reasoning": bool(
-                    event.get("requires_high_reasoning", False)
-                ),
-                "long_context": bool(event.get("long_context", False)),
-                "attachment_heavy": bool(event.get("attachment_heavy", False)),
-                "code_heavy": bool(event.get("code_heavy", False)),
-                "session_hotness": event.get("session_hotness"),
-                "cost_sensitivity": event.get("cost_sensitivity"),
-                "error_sensitivity": event.get("error_sensitivity"),
-                "preferred_models": list(event.get("preferred_models", []) or []),
-                "avoid_models": list(event.get("avoid_models", []) or []),
-                "avoid_providers": list(event.get("avoid_providers", []) or []),
-                "hint_reason": f"requests.enriched priority={priority}",
-                "source_event_type": event.get("event_type", "requests.enriched"),
-                "updated_at": updated_at,
-            }
-            if existing_user_policy:
-                user_policy = self._merge_policy_records(
-                    existing_user_policy, user_policy
-                )
-            await self._set_json(
-                self._user_hint_cache_key(user_id),
-                user_policy,
-                self.user_ttl_seconds,
-            )
+        # Request enrichment is late relative to the synchronous API path. Keep it
+        # request-scoped so a single task cannot promote future user fast-lane state.
 
     async def materialize_fast_lane_hint(self, event: Dict[str, Any]):
         """Materialize fast_lane_hints into request/user caches."""
@@ -324,7 +292,6 @@ class RoutingPolicyCache:
         request_id = str(event.get("request_id", "") or "")
         user_id = str(event.get("user_id", "") or "")
         existing_request_policy = await self.get_request_policy(request_id)
-        existing_user_policy = await self.get_user_hint_policy(user_id)
         selected_model = event.get("selected_model")
         preferred_models = [selected_model] if selected_model else []
         updated_at = event.get("emitted_at")
@@ -358,6 +325,8 @@ class RoutingPolicyCache:
             "session_hotness": event.get("session_hotness"),
             "cost_sensitivity": event.get("cost_sensitivity"),
             "error_sensitivity": event.get("error_sensitivity"),
+            "latency_sla": event.get("latency_sla"),
+            "routing_intent_source": event.get("routing_intent_source"),
             "preferred_models": preferred_models,
             "avoid_models": list(event.get("avoid_models", []) or []),
             "avoid_providers": list(event.get("avoid_providers", []) or []),
@@ -377,50 +346,8 @@ class RoutingPolicyCache:
                 self.request_ttl_seconds,
             )
 
-        if route_to_fast_lane and user_id:
-            user_policy = {
-                "request_id": request_id,
-                "user_id": user_id,
-                "priority": event.get("priority"),
-                "route_to_fast_lane": True,
-                "query_type": event.get("query_type"),
-                "query_complexity": event.get("query_complexity"),
-                "requires_low_latency": (
-                    bool(requires_low_latency)
-                    if requires_low_latency is not None
-                    else None
-                ),
-                "requires_high_reasoning": (
-                    bool(requires_high_reasoning)
-                    if requires_high_reasoning is not None
-                    else None
-                ),
-                "long_context": (
-                    bool(long_context) if long_context is not None else None
-                ),
-                "attachment_heavy": (
-                    bool(attachment_heavy) if attachment_heavy is not None else None
-                ),
-                "code_heavy": bool(code_heavy) if code_heavy is not None else None,
-                "session_hotness": event.get("session_hotness"),
-                "cost_sensitivity": event.get("cost_sensitivity"),
-                "error_sensitivity": event.get("error_sensitivity"),
-                "preferred_models": preferred_models,
-                "avoid_models": list(event.get("avoid_models", []) or []),
-                "avoid_providers": list(event.get("avoid_providers", []) or []),
-                "hint_reason": event.get("hint_reason", "fast_lane_candidate"),
-                "source_event_type": event.get("event_type", "fast_lane_hints"),
-                "updated_at": updated_at,
-            }
-            if existing_user_policy:
-                user_policy = self._merge_policy_records(
-                    existing_user_policy, user_policy
-                )
-            await self._set_json(
-                self._user_hint_cache_key(user_id),
-                user_policy,
-                self.user_ttl_seconds,
-            )
+        # Fast-lane hints are observability/request evidence. User or session
+        # policy must come from rolling routing.policy_state, not a single hint.
 
     async def materialize_routing_policy_state(self, event: Dict[str, Any]):
         """Materialize rolling user/session policy state emitted by Flink analytics."""

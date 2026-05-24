@@ -19,6 +19,8 @@ The default host-run config in [config/config.yaml](/Users/zhoutingyou/Desktop/S
 - `claude-sonnet-4-6` gets extra weight for `enterprise` users and difficult `analysis` / `reasoning` requests
 - simple general tasks can prefer local `vLLM` models such as `mistral-7b`
 - if a cloud model fails on the non-streaming API path, inference can fall back to a local model when one is configured
+- fast-lane routing is explicit-SLA only: set `metadata.requires_low_latency: true`, `metadata.latency_sla: "low"` or `"interactive"`, use API `priority >= 4`, or use Slack `/llm fast <query>`
+- fast-lane requests still need to be simple enough for the configured fast-lane model; complex reasoning, long-context, and attachment-heavy requests stay on the normal capability-aware path
 
 The compose runtime config in [config/config.compose.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.compose.yaml) is intentionally cloud-only:
 

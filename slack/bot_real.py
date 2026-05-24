@@ -711,6 +711,7 @@ class SlackMessageHandler:
             "analytics": self._handle_analytics_command,
             "clear": self._handle_clear_command,
             "web": self._handle_web_command,
+            "fast": self._handle_fast_command,
             "remember": self._handle_remember_command,
             "memories": self._handle_memories_command,
             "forget": self._handle_forget_command,
@@ -828,6 +829,16 @@ class SlackMessageHandler:
                     attachments=attachments,
                     team_id=team_id,
                 )
+            if command == "fast":
+                return await self._handle_fast_command(
+                    args,
+                    user_id,
+                    channel_id,
+                    client,
+                    thread_ts=thread_ts,
+                    attachments=attachments,
+                    team_id=team_id,
+                )
             if command in {"remember", "memories", "forget"}:
                 return await self.commands[command](
                     args,
@@ -875,6 +886,35 @@ class SlackMessageHandler:
             allowed_tools=["web_search"],
         )
 
+    async def _handle_fast_command(
+        self,
+        args: List[str],
+        user_id: str,
+        channel_id: str,
+        client: AsyncWebClient,
+        thread_ts: Optional[str] = None,
+        attachments: Optional[List[Attachment]] = None,
+        team_id: Optional[str] = None,
+    ) -> str:
+        """Handle `/llm fast <query>` by marking this request low-latency."""
+        query = " ".join(args).strip()
+        if not query:
+            return "Usage: `/llm fast <query>`"
+        return await self._handle_query(
+            query,
+            user_id,
+            channel_id,
+            thread_ts,
+            client,
+            attachments=attachments,
+            team_id=team_id,
+            routing_metadata={
+                "requires_low_latency": True,
+                "latency_sla": "interactive",
+                "routing_intent_source": "slack_fast_command",
+            },
+        )
+
     async def _handle_help_command(
         self, args: List[str], user_id: str, channel_id: str, client: AsyncWebClient
     ) -> str:
@@ -893,6 +933,7 @@ Mention me in a channel, use `/llm ...`, or reply inside an active bot thread.
 • `/llm analytics` - Show usage analytics (premium users)
 • `/llm clear` - Clear conversation history
 • `/llm web <query>` - Search the web before answering
+• `/llm fast <query>` - Prefer an explicit low-latency route for this query
 • `/llm remember <text>` - Save an explicit long-term memory
 • `/llm memories [query]` - List or search your memories
 • `/llm forget <memory_id|all>` - Delete saved memories
@@ -1312,6 +1353,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         team_id: Optional[str] = None,
         tool_policy: ToolPolicy = ToolPolicy.AUTO,
         allowed_tools: Optional[List[str]] = None,
+        routing_metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Handle regular query through inference engine"""
         try:
@@ -1367,6 +1409,19 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             else:
                 conversation_id = f"{user_id}:{channel_id}:{thread_ts or 'main'}"
 
+            query_metadata = (
+                self.bot._build_query_metadata(
+                    channel_id=channel_id,
+                    thread_ts=thread_ts,
+                    attachments=attachments or [],
+                    user_preferences=user_prefs,
+                    team_id=team_id,
+                )
+                if hasattr(self.bot, "_build_query_metadata")
+                else {}
+            )
+            query_metadata.update(dict(routing_metadata or {}))
+
             query_request = QueryRequest(
                 query=text,
                 user_id=user_id,
@@ -1380,17 +1435,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 allowed_tools=allowed_tools or [],
                 session_id=context.session_id,
                 conversation_id=conversation_id,
-                metadata=(
-                    self.bot._build_query_metadata(
-                        channel_id=channel_id,
-                        thread_ts=thread_ts,
-                        attachments=attachments or [],
-                        user_preferences=user_prefs,
-                        team_id=team_id,
-                    )
-                    if hasattr(self.bot, "_build_query_metadata")
-                    else {}
-                ),
+                metadata=query_metadata,
             )
 
             # Process through inference engine

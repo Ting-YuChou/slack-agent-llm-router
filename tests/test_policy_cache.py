@@ -5,7 +5,7 @@ import pytest
 
 
 @pytest.mark.asyncio
-async def test_policy_cache_materializes_request_and_user_fast_lane_hints():
+async def test_policy_cache_keeps_fast_lane_hints_request_scoped():
     cache = RoutingPolicyCache(
         {
             "enabled": False,
@@ -52,9 +52,8 @@ async def test_policy_cache_materializes_request_and_user_fast_lane_hints():
     assert request_policy["preferred_models"] == ["mistral-7b"]
     assert request_policy["query_type"] == "analysis"
     assert request_policy["requires_high_reasoning"] is True
-    assert user_policy["route_to_fast_lane"] is True
-    assert user_policy["preferred_models"] == ["mistral-7b"]
-    assert effective_policy["policy_source"] == "request+user"
+    assert user_policy is None
+    assert effective_policy["policy_source"] == "request"
 
 
 @pytest.mark.asyncio
@@ -203,7 +202,7 @@ async def test_policy_cache_merges_request_session_user_and_guardrails():
 
 
 @pytest.mark.asyncio
-async def test_policy_cache_keeps_user_hint_and_user_state_separate():
+async def test_policy_cache_uses_routing_policy_state_for_user_policy():
     cache = RoutingPolicyCache(
         {
             "enabled": False,
@@ -244,7 +243,7 @@ async def test_policy_cache_keeps_user_hint_and_user_state_separate():
     user_state_policy = await cache.get_user_state_policy("user-merged-1")
     user_policy = await cache.get_user_policy("user-merged-1")
 
-    assert user_hint_policy["preferred_models"] == ["mistral-7b"]
+    assert user_hint_policy is None
     assert user_state_policy["preferred_models"] == ["gpt-5"]
-    assert user_policy["preferred_models"] == ["mistral-7b", "gpt-5"]
-    assert user_policy["route_to_fast_lane"] is True
+    assert user_policy["preferred_models"] == ["gpt-5"]
+    assert user_policy["route_to_fast_lane"] is False

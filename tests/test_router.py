@@ -171,14 +171,16 @@ class TestModelRouter:
         assert "default" in selection.reason.lower()
 
     @pytest.mark.asyncio
-    async def test_route_query_uses_policy_cache_fast_lane_bias(self, router_config):
+    async def test_route_query_ignores_policy_fast_lane_without_explicit_sla(
+        self, router_config
+    ):
         class PolicyCacheStub:
             async def get_effective_policy(self, request_id, user_id):
                 return {
                     "policy_source": "user",
                     "route_to_fast_lane": True,
                     "preferred_models": [],
-                    "hint_reason": "priority=critical",
+                    "hint_reason": "stale_fast_lane_hint",
                 }
 
         router = ModelRouter(router_config, policy_cache=PolicyCacheStub())
@@ -198,66 +200,103 @@ class TestModelRouter:
 
         decision = await router.route_query(request)
 
-        assert decision.selected_model == "mistral-7b"
-        assert "Policy-cache selection" in decision.routing_reason
-        assert decision.actual_fast_lane_hit is True
+        assert decision.route_to_fast_lane is False
+        assert decision.actual_fast_lane_hit is False
+        assert decision.policy_source == "user"
 
     @pytest.mark.asyncio
-    async def test_route_query_prefers_explicit_fast_lane_model(self):
-        class PolicyCacheStub:
-            async def get_effective_policy(self, request_id, user_id):
-                return {
-                    "policy_source": "request",
-                    "route_to_fast_lane": True,
-                    "preferred_models": ["claude-3.5-sonnet"],
-                    "hint_reason": "priority=high",
-                }
-
-        router = ModelRouter(
-            {
-                "default_model": "mistral-7b",
-                "routing_strategy": "intelligent",
-                "fast_lane_models": ["claude-3.5-sonnet"],
-                "models": {
-                    "claude-3.5-sonnet": {
-                        "provider": "anthropic",
-                        "max_tokens": 200000,
-                        "cost_per_token": 0.000015,
-                        "priority": 2,
-                        "capabilities": ["reasoning", "writing", "analysis"],
-                        "api_key_env": "ANTHROPIC_API_KEY",
-                    },
-                    "mistral-7b": {
-                        "provider": "vllm",
-                        "model_path": "/models/mistral",
-                        "max_tokens": 4096,
-                        "cost_per_token": 0.0,
-                        "priority": 3,
-                        "capabilities": ["general", "coding"],
-                        "gpu_memory_gb": 16,
-                    },
-                },
-                "routing_rules": [],
-            },
-            policy_cache=PolicyCacheStub(),
+    async def test_route_query_uses_explicit_metadata_low_latency_fast_lane(
+        self, router_config
+    ):
+        router = ModelRouter(router_config)
+        router.classifier.classify_query = lambda _query: (
+            QueryType.SUMMARIZATION,
+            0.95,
         )
-        router.classifier.classify_query = lambda _query: (QueryType.ANALYSIS, 0.95)
-        router.token_counter.count_tokens = lambda _query, _model="default": 256
-        router.model_stats["claude-3.5-sonnet"] = {
-            "success_rate": 0.99,
-            "avg_latency": 700,
-        }
+        router.token_counter.count_tokens = lambda _query, _model="default": 128
+        router.model_stats["gpt-5"] = {"success_rate": 0.99, "avg_latency": 500}
+        router.model_stats["mistral-7b"] = {"success_rate": 0.92, "avg_latency": 100}
 
         request = QueryRequest(
-            query="Please analyze this customer escalation",
-            user_id="enterprise-user",
-            user_tier=UserTier.ENTERPRISE,
+            query="Summarize the latest thread",
+            user_id="u1",
+            user_tier=UserTier.PREMIUM,
+            metadata={"requires_low_latency": True},
         )
 
         decision = await router.route_query(request)
 
-        assert decision.selected_model == "claude-3.5-sonnet"
-        assert "Policy-cache selection" in decision.routing_reason
+        assert decision.selected_model == "mistral-7b"
+        assert decision.route_to_fast_lane is True
+        assert decision.actual_fast_lane_hit is True
+        assert decision.policy_source == "request_features"
+        assert "Request-feature selection" in decision.routing_reason
+
+    @pytest.mark.asyncio
+    async def test_route_query_uses_api_priority_for_fast_lane(self, router_config):
+        router = ModelRouter(router_config)
+        router.classifier.classify_query = lambda _query: (
+            QueryType.SUMMARIZATION,
+            0.95,
+        )
+        router.token_counter.count_tokens = lambda _query, _model="default": 128
+        router.model_stats["gpt-5"] = {"success_rate": 0.99, "avg_latency": 500}
+        router.model_stats["mistral-7b"] = {"success_rate": 0.92, "avg_latency": 100}
+
+        request = QueryRequest(
+            query="Summarize the latest thread",
+            user_id="u1",
+            user_tier=UserTier.PREMIUM,
+            priority=4,
+        )
+
+        decision = await router.route_query(request)
+
+        assert decision.selected_model == "mistral-7b"
+        assert decision.route_to_fast_lane is True
+        assert decision.actual_fast_lane_hit is True
+        assert decision.policy_source == "request_features"
+
+    @pytest.mark.asyncio
+    async def test_route_query_does_not_fast_lane_keyword_urgency(self, router_config):
+        router = ModelRouter(router_config)
+        router.classifier.classify_query = lambda _query: (
+            QueryType.SUMMARIZATION,
+            0.95,
+        )
+        router.token_counter.count_tokens = lambda _query, _model="default": 128
+
+        request = QueryRequest(
+            query="Urgent production outage: summarize the alerts",
+            user_id="u1",
+            user_tier=UserTier.PREMIUM,
+        )
+
+        decision = await router.route_query(request)
+
+        assert decision.route_to_fast_lane is False
+        assert decision.actual_fast_lane_hit is False
+
+    @pytest.mark.asyncio
+    async def test_route_query_does_not_fast_lane_complex_low_latency_request(
+        self, router_config
+    ):
+        router = ModelRouter(router_config)
+        router.classifier.classify_query = lambda _query: (QueryType.ANALYSIS, 0.95)
+        router.token_counter.count_tokens = lambda _query, _model="default": 4096
+
+        request = QueryRequest(
+            query="Analyze the root cause and tradeoffs for this incident",
+            user_id="u1",
+            user_tier=UserTier.ENTERPRISE,
+            metadata={"requires_low_latency": True},
+        )
+
+        decision = await router.route_query(request)
+
+        assert decision.route_to_fast_lane is False
+        assert decision.actual_fast_lane_hit is False
+        assert decision.policy_source == "request_features"
 
     @pytest.mark.asyncio
     async def test_route_query_uses_session_policy_model_pinning(self, router_config):
@@ -370,7 +409,7 @@ class TestModelRouter:
         assert "Policy-cache selection" in decision.routing_reason
 
     @pytest.mark.asyncio
-    async def test_route_query_respects_user_burst_protection_cost_bias(self):
+    async def test_route_query_policy_low_latency_does_not_create_fast_lane(self):
         class PolicyCacheStub:
             async def get_effective_policy(self, request_id, user_id):
                 return {
@@ -422,10 +461,11 @@ class TestModelRouter:
 
         assert decision.selected_model == "mistral-7b"
         assert decision.policy_source == "user"
-        assert "burst_protection" in decision.routing_reason
+        assert decision.route_to_fast_lane is False
+        assert decision.actual_fast_lane_hit is False
 
     @pytest.mark.asyncio
-    async def test_route_query_uses_policy_features_for_high_reasoning_selection(
+    async def test_route_query_policy_shape_does_not_override_current_request(
         self, router_config
     ):
         class PolicyCacheStub:
@@ -453,8 +493,8 @@ class TestModelRouter:
 
         decision = await router.route_query(request)
 
-        assert decision.selected_model == "gpt-5"
-        assert "Policy-cache selection" in decision.routing_reason
+        assert decision.selected_model in {"gpt-5", "mistral-7b"}
+        assert decision.query_type == QueryType.GENERAL
 
     @pytest.mark.asyncio
     async def test_route_query_filters_blocked_provider_guardrails(self, router_config):
