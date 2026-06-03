@@ -424,6 +424,7 @@ class ProviderEndpointConfig(ConfigModel):
     port: Optional[int] = Field(None, ge=1, le=65535)
     timeout: Optional[int] = Field(None, ge=1)
     max_retries: Optional[int] = Field(None, ge=0)
+    api_mode: Optional[str] = Field(None, pattern=r"^(completions|chat_completions)$")
 
 
 class CompressionConfig(ConfigModel):

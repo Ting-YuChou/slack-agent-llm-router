@@ -1069,6 +1069,7 @@ class vLLMProvider(BaseInferenceProvider):
             self.base_url = (
                 f"http://{config.get('host', 'localhost')}:{config.get('port', 8000)}"
             )
+        self.api_mode = str(config.get("api_mode", "completions")).lower()
         self.http_client = None
 
     async def initialize(self):
@@ -1102,21 +1103,32 @@ class vLLMProvider(BaseInferenceProvider):
         try:
             prompt = self._build_prompt(request)
 
-            payload = {
-                "model": model_name,
-                "prompt": prompt,
-                "max_tokens": request.max_tokens,
-                "temperature": request.temperature,
-                "stream": False,
-                "logprobs": None,
-            }
+            if self.api_mode == "chat_completions":
+                endpoint = "/v1/chat/completions"
+                payload = {
+                    "model": model_name,
+                    "messages": self._build_chat_messages(prompt),
+                    "max_tokens": request.max_tokens,
+                    "temperature": request.temperature,
+                    "stream": False,
+                }
+            else:
+                endpoint = "/v1/completions"
+                payload = {
+                    "model": model_name,
+                    "prompt": prompt,
+                    "max_tokens": request.max_tokens,
+                    "temperature": request.temperature,
+                    "stream": False,
+                    "logprobs": None,
+                }
 
             # Make request to vLLM server
-            response = await self.http_client.post("/v1/completions", json=payload)
+            response = await self.http_client.post(endpoint, json=payload)
             response.raise_for_status()
 
             data = response.json()
-            generated_text = data["choices"][0]["text"]
+            generated_text = self._extract_response_text(data)
             usage = data.get("usage", {})
 
             return InferenceResponse(
@@ -1147,28 +1159,79 @@ class vLLMProvider(BaseInferenceProvider):
         try:
             prompt = self._build_prompt(request)
 
-            payload = {
-                "model": model_name,
-                "prompt": prompt,
-                "max_tokens": request.max_tokens,
-                "temperature": request.temperature,
-                "stream": True,
-            }
+            if self.api_mode == "chat_completions":
+                endpoint = "/v1/chat/completions"
+                payload = {
+                    "model": model_name,
+                    "messages": self._build_chat_messages(prompt),
+                    "max_tokens": request.max_tokens,
+                    "temperature": request.temperature,
+                    "stream": True,
+                }
+            else:
+                endpoint = "/v1/completions"
+                payload = {
+                    "model": model_name,
+                    "prompt": prompt,
+                    "max_tokens": request.max_tokens,
+                    "temperature": request.temperature,
+                    "stream": True,
+                }
 
             async with self.http_client.stream(
-                "POST", "/v1/completions", json=payload
+                "POST", endpoint, json=payload
             ) as response:
                 async for line in response.aiter_lines():
-                    if line.startswith("data: "):
-                        data = json.loads(line[6:])
-                        if "choices" in data and data["choices"]:
-                            delta = data["choices"][0].get("text", "")
-                            if delta:
-                                yield delta
+                    if not line.startswith("data: "):
+                        continue
+                    raw_data = line[6:]
+                    if raw_data == "[DONE]":
+                        break
+                    data = json.loads(raw_data)
+                    delta = self._extract_stream_delta(data)
+                    if delta:
+                        yield delta
 
         except Exception as e:
             logger.error(f"vLLM streaming error: {e}")
             yield f"Error: {str(e)}"
+
+    def _build_chat_messages(self, prompt: str) -> List[Dict[str, str]]:
+        """Build OpenAI-compatible chat messages for vLLM chat templates."""
+        return [{"role": "user", "content": prompt}]
+
+    def _extract_response_text(self, data: Dict[str, Any]) -> str:
+        choice = data["choices"][0]
+        if self.api_mode == "chat_completions":
+            return self._coerce_chat_content(choice.get("message", {}))
+        return str(choice.get("text", ""))
+
+    def _extract_stream_delta(self, data: Dict[str, Any]) -> str:
+        choices = data.get("choices") or []
+        if not choices:
+            return ""
+        choice = choices[0]
+        if self.api_mode == "chat_completions":
+            return self._coerce_chat_content(choice.get("delta", {}))
+        return str(choice.get("text", ""))
+
+    def _coerce_chat_content(self, message: Any) -> str:
+        if not isinstance(message, dict):
+            return ""
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    parts.append(str(part.get("text") or part.get("content") or ""))
+                else:
+                    parts.append(str(part))
+            return "".join(parts)
+        if content is None:
+            return ""
+        return str(content)
 
     def get_health_status(self) -> Dict[str, Any]:
         """Get vLLM provider health status"""
@@ -1176,7 +1239,10 @@ class vLLMProvider(BaseInferenceProvider):
             "provider": "vllm",
             "status": "healthy" if self.http_client else "unhealthy",
             "base_url": self.base_url,
-            "models_available": ["mistral-7b", "llama-3.1-70b"],  # Example models
+            "api_mode": self.api_mode,
+            "models_available": self.config.get(
+                "models_available", ["qwen3.6-27b-fast"]
+            ),
         }
 
 

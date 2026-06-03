@@ -279,6 +279,117 @@ class TestVLLMProvider:
 
         assert provider.base_url == "http://vllm.internal:9000"
 
+    @pytest.mark.asyncio
+    async def test_generate_response_preserves_completions_mode(
+        self, sample_query_request
+    ):
+        provider = vLLMProvider({"base_url": "http://127.0.0.1:8001"})
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [{"text": "Use a helper."}],
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 4,
+                "total_tokens": 15,
+            },
+        }
+        provider.http_client = AsyncMock()
+        provider.http_client.post.return_value = mock_response
+
+        response = await provider.generate_response(sample_query_request, "mistral-7b")
+
+        endpoint, call_kwargs = provider.http_client.post.call_args.args[0], (
+            provider.http_client.post.call_args.kwargs
+        )
+        assert endpoint == "/v1/completions"
+        assert call_kwargs["json"]["model"] == "mistral-7b"
+        assert call_kwargs["json"]["prompt"]
+        assert response.response_text == "Use a helper."
+        assert response.total_tokens == 15
+
+    @pytest.mark.asyncio
+    async def test_generate_response_supports_chat_completions_mode(
+        self, sample_query_request
+    ):
+        provider = vLLMProvider(
+            {"base_url": "http://127.0.0.1:8001", "api_mode": "chat_completions"}
+        )
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": "Use a chat template."}}],
+            "usage": {
+                "prompt_tokens": 13,
+                "completion_tokens": 5,
+                "total_tokens": 18,
+            },
+        }
+        provider.http_client = AsyncMock()
+        provider.http_client.post.return_value = mock_response
+
+        response = await provider.generate_response(
+            sample_query_request, "qwen3.6-27b-fast"
+        )
+
+        endpoint, call_kwargs = provider.http_client.post.call_args.args[0], (
+            provider.http_client.post.call_args.kwargs
+        )
+        payload = call_kwargs["json"]
+        assert endpoint == "/v1/chat/completions"
+        assert payload["model"] == "qwen3.6-27b-fast"
+        assert payload["messages"][0]["role"] == "user"
+        assert (
+            "Context: Previous discussion context" in payload["messages"][0]["content"]
+        )
+        assert (
+            "Query: Write a Python function to add two numbers"
+            in payload["messages"][0]["content"]
+        )
+        assert payload["stream"] is False
+        assert response.response_text == "Use a chat template."
+        assert response.token_count_input == 13
+        assert response.token_count_output == 5
+        assert response.total_tokens == 18
+
+    @pytest.mark.asyncio
+    async def test_stream_response_supports_chat_completions_mode(
+        self, sample_query_request
+    ):
+        class StreamResponse:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+            async def aiter_lines(self):
+                lines = [
+                    'data: {"choices":[{"delta":{"content":"Use "}}]}',
+                    'data: {"choices":[{"delta":{"content":"streaming."}}]}',
+                    "data: [DONE]",
+                ]
+                for line in lines:
+                    yield line
+
+        provider = vLLMProvider(
+            {"base_url": "http://127.0.0.1:8001", "api_mode": "chat_completions"}
+        )
+        provider.http_client = MagicMock()
+        provider.http_client.stream.return_value = StreamResponse()
+
+        chunks = [
+            chunk
+            async for chunk in provider.stream_response(
+                sample_query_request, "qwen3.6-27b-fast"
+            )
+        ]
+
+        endpoint, call_kwargs = provider.http_client.stream.call_args.args[:2], (
+            provider.http_client.stream.call_args.kwargs
+        )
+        assert endpoint == ("POST", "/v1/chat/completions")
+        assert call_kwargs["json"]["stream"] is True
+        assert chunks == ["Use ", "streaming."]
+
 
 class TestResponseCache:
     def test_generate_cache_key_changes_with_request_parameters(self):

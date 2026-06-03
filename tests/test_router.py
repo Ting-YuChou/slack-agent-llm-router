@@ -8,7 +8,14 @@ from src.llm_router_part1_router import (
     RoutingRule,
     TokenCounter,
 )
-from src.utils.schema import QueryRequest, QueryType, ToolPolicy, UserTier
+from src.utils.schema import (
+    Attachment,
+    AttachmentType,
+    QueryRequest,
+    QueryType,
+    ToolPolicy,
+    UserTier,
+)
 
 
 class TestQueryClassifier:
@@ -215,6 +222,10 @@ class TestModelRouter:
         )
         router.token_counter.count_tokens = lambda _query, _model="default": 128
         router.model_stats["gpt-5"] = {"success_rate": 0.99, "avg_latency": 500}
+        router.model_stats["qwen3.6-27b-fast"] = {
+            "success_rate": 0.94,
+            "avg_latency": 90,
+        }
         router.model_stats["mistral-7b"] = {"success_rate": 0.92, "avg_latency": 100}
 
         request = QueryRequest(
@@ -226,7 +237,7 @@ class TestModelRouter:
 
         decision = await router.route_query(request)
 
-        assert decision.selected_model == "mistral-7b"
+        assert decision.selected_model == "qwen3.6-27b-fast"
         assert decision.route_to_fast_lane is True
         assert decision.actual_fast_lane_hit is True
         assert decision.policy_source == "request_features"
@@ -241,6 +252,10 @@ class TestModelRouter:
         )
         router.token_counter.count_tokens = lambda _query, _model="default": 128
         router.model_stats["gpt-5"] = {"success_rate": 0.99, "avg_latency": 500}
+        router.model_stats["qwen3.6-27b-fast"] = {
+            "success_rate": 0.94,
+            "avg_latency": 90,
+        }
         router.model_stats["mistral-7b"] = {"success_rate": 0.92, "avg_latency": 100}
 
         request = QueryRequest(
@@ -252,7 +267,7 @@ class TestModelRouter:
 
         decision = await router.route_query(request)
 
-        assert decision.selected_model == "mistral-7b"
+        assert decision.selected_model == "qwen3.6-27b-fast"
         assert decision.route_to_fast_lane is True
         assert decision.actual_fast_lane_hit is True
         assert decision.policy_source == "request_features"
@@ -297,6 +312,65 @@ class TestModelRouter:
         assert decision.route_to_fast_lane is False
         assert decision.actual_fast_lane_hit is False
         assert decision.policy_source == "request_features"
+
+    @pytest.mark.asyncio
+    async def test_route_query_does_not_fast_lane_long_context_request(
+        self, router_config
+    ):
+        router = ModelRouter(router_config)
+        router.classifier.classify_query = lambda _query: (
+            QueryType.SUMMARIZATION,
+            0.95,
+        )
+        router.token_counter.count_tokens = lambda _query, _model="default": 128
+
+        request = QueryRequest(
+            query="Summarize this context",
+            user_id="u1",
+            user_tier=UserTier.PREMIUM,
+            max_tokens=4096,
+            metadata={"requires_low_latency": True},
+        )
+
+        decision = await router.route_query(request)
+
+        assert decision.route_to_fast_lane is False
+        assert decision.actual_fast_lane_hit is False
+        assert decision.selected_model != "qwen3.6-27b-fast"
+
+    @pytest.mark.asyncio
+    async def test_route_query_does_not_fast_lane_attachment_heavy_request(
+        self, router_config
+    ):
+        router = ModelRouter(router_config)
+        router.classifier.classify_query = lambda _query: (
+            QueryType.SUMMARIZATION,
+            0.95,
+        )
+        router.token_counter.count_tokens = lambda _query, _model="default": 128
+
+        attachments = [
+            Attachment(
+                name=f"context-{index}.txt",
+                type=AttachmentType.FILE,
+                size_bytes=1024,
+                mime_type="text/plain",
+            )
+            for index in range(3)
+        ]
+        request = QueryRequest(
+            query="Summarize these files",
+            user_id="u1",
+            user_tier=UserTier.PREMIUM,
+            attachments=attachments,
+            metadata={"requires_low_latency": True},
+        )
+
+        decision = await router.route_query(request)
+
+        assert decision.route_to_fast_lane is False
+        assert decision.actual_fast_lane_hit is False
+        assert decision.selected_model != "qwen3.6-27b-fast"
 
     @pytest.mark.asyncio
     async def test_route_query_uses_session_policy_model_pinning(self, router_config):

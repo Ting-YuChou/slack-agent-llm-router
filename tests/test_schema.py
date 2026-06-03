@@ -10,6 +10,7 @@ from src.utils.schema import (
     InferenceResponse,
     ModelConfig,
     PlatformConfig,
+    ProviderEndpointConfig,
     QueryRequest,
     RagPolicy,
     ResponseSource,
@@ -166,6 +167,17 @@ def test_platform_config_rejects_invalid_api_port():
         PlatformConfig(api={"port": 70000})
 
 
+def test_provider_endpoint_config_accepts_chat_completions_api_mode():
+    config = ProviderEndpointConfig(api_mode="chat_completions")
+
+    assert config.api_mode == "chat_completions"
+
+
+def test_provider_endpoint_config_rejects_unknown_api_mode():
+    with pytest.raises(ValidationError):
+        ProviderEndpointConfig(api_mode="responses")
+
+
 def test_platform_config_rejects_unknown_slack_state_backend():
     with pytest.raises(ValidationError):
         PlatformConfig(slack={"state_backend": "sqlite"})
@@ -309,6 +321,17 @@ def test_checked_in_compose_config_validates():
     assert validated.pipeline.enabled is True
     assert validated.kafka.bootstrap_servers == ["kafka:29092"]
     assert validated.clickhouse.host == "clickhouse"
+
+
+def test_checked_in_default_config_uses_qwen_fast_lane():
+    config_path = Path(__file__).resolve().parents[1] / "config" / "config.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    validated = PlatformConfig.model_validate(config)
+
+    assert validated.router.fast_lane_models == ["qwen3.6-27b-fast"]
+    assert validated.router.models["qwen3.6-27b-fast"].provider == "vllm"
+    assert validated.router.models["qwen3.6-27b-fast"].max_tokens == 32768
+    assert validated.inference.vllm.api_mode == "chat_completions"
 
 
 def test_compose_and_default_config_keep_flink_topics_in_sync():

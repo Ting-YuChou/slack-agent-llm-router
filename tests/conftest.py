@@ -491,6 +491,7 @@ def router_config():
     return {
         "default_model": "gpt-5",
         "routing_strategy": "intelligent",
+        "fast_lane_models": ["qwen3.6-27b-fast"],
         "models": {
             "gpt-5": {
                 "provider": "openai",
@@ -499,6 +500,15 @@ def router_config():
                 "priority": 2,
                 "capabilities": ["general", "reasoning", "coding", "analysis"],
                 "api_key_env": "OPENAI_API_KEY",
+            },
+            "qwen3.6-27b-fast": {
+                "provider": "vllm",
+                "model_path": "Qwen/Qwen3.6-27B-FP8",
+                "max_tokens": 32768,
+                "cost_per_token": 0.0,
+                "priority": 3,
+                "capabilities": ["general", "coding"],
+                "gpu_memory_gb": 48,
             },
             "mistral-7b": {
                 "provider": "vllm",

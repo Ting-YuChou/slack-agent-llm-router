@@ -1070,6 +1070,9 @@ class ModelRouter:
         user_tier = context["user_tier"]
         avoid_models = set(context.get("avoid_models", []) or [])
         blocked_models = set(context.get("blocked_models", []) or [])
+        explicitly_preferred_models = set(context.get("preferred_models", []) or [])
+        dedicated_fast_lane_models = set(self.fast_lane_models)
+        route_to_fast_lane = bool(context.get("route_to_fast_lane", False))
         avoid_providers = {
             str(provider).lower()
             for provider in list(context.get("avoid_providers", []) or [])
@@ -1083,6 +1086,12 @@ class ModelRouter:
         for model_name in candidate_models:
             model_config = self.models.get(model_name)
             if not model_config:
+                continue
+            if (
+                model_name in dedicated_fast_lane_models
+                and not route_to_fast_lane
+                and model_name not in explicitly_preferred_models
+            ):
                 continue
             if model_name in avoid_models or model_name in blocked_models:
                 continue
