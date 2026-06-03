@@ -293,6 +293,34 @@ class TestModelRouter:
         assert decision.actual_fast_lane_hit is False
 
     @pytest.mark.asyncio
+    async def test_route_query_can_use_qwen_for_free_simple_request_without_fast_lane(
+        self, router_config
+    ):
+        router = ModelRouter(router_config)
+        router.classifier.classify_query = lambda _query: (
+            QueryType.SUMMARIZATION,
+            0.95,
+        )
+        router.token_counter.count_tokens = lambda _query, _model="default": 128
+        router.model_stats["qwen3.6-27b-fast"] = {
+            "success_rate": 0.94,
+            "avg_latency": 90,
+        }
+        router.model_stats["mistral-7b"] = {"success_rate": 0.92, "avg_latency": 140}
+
+        request = QueryRequest(
+            query="Summarize this short note",
+            user_id="free-user",
+            user_tier=UserTier.FREE,
+        )
+
+        decision = await router.route_query(request)
+
+        assert decision.selected_model == "qwen3.6-27b-fast"
+        assert decision.route_to_fast_lane is False
+        assert decision.actual_fast_lane_hit is False
+
+    @pytest.mark.asyncio
     async def test_route_query_does_not_fast_lane_complex_low_latency_request(
         self, router_config
     ):
@@ -336,7 +364,6 @@ class TestModelRouter:
 
         assert decision.route_to_fast_lane is False
         assert decision.actual_fast_lane_hit is False
-        assert decision.selected_model != "qwen3.6-27b-fast"
 
     @pytest.mark.asyncio
     async def test_route_query_does_not_fast_lane_attachment_heavy_request(
@@ -370,7 +397,6 @@ class TestModelRouter:
 
         assert decision.route_to_fast_lane is False
         assert decision.actual_fast_lane_hit is False
-        assert decision.selected_model != "qwen3.6-27b-fast"
 
     @pytest.mark.asyncio
     async def test_route_query_uses_session_policy_model_pinning(self, router_config):

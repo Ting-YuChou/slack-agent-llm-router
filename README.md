@@ -18,7 +18,7 @@ The default host-run config in [config/config.yaml](/Users/zhoutingyou/Desktop/S
 - `gpt-5` is the default model
 - `claude-sonnet-4-6` gets extra weight for `enterprise` users and difficult `analysis` / `reasoning` requests
 - host-run fast-lane traffic targets the external `vLLM` model `qwen3.6-27b-fast`
-- simple general tasks can still prefer local `vLLM` fallback models such as `mistral-7b`
+- simple general tasks, including free-tier traffic, can also select local `vLLM` models such as `qwen3.6-27b-fast` or `mistral-7b` through normal capability/scoring/rule routing
 - if a cloud model fails on the non-streaming API path, inference can fall back to a local model when one is configured
 - fast-lane routing is explicit-SLA only: set `metadata.requires_low_latency: true`, `metadata.latency_sla: "low"` or `"interactive"`, use API `priority >= 4`, or use Slack `/llm fast <query>`
 - fast-lane requests still need to be simple enough for the configured fast-lane model; complex reasoning, long-context, and attachment-heavy requests stay on the normal capability-aware path
