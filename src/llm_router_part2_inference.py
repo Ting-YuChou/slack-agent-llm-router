@@ -39,6 +39,16 @@ from src.tools import ToolRegistry, WebSearchTool, WebSearchResult
 
 logger = logging.getLogger(__name__)
 
+
+@dataclass
+class PromptSections:
+    """Provider prompt sections split by cache stability."""
+
+    static_cache_prefix: List[str]
+    dynamic_context: List[str]
+    query: str
+
+
 RAG_AUTO_STRONG_TERMS = {
     "academic calendar",
     "admissions",
@@ -598,34 +608,43 @@ class BaseInferenceProvider(ABC):
 
     def _build_prompt(self, request: QueryRequest) -> str:
         """Build a provider prompt that includes context plus extracted attachment content."""
-        cacheable_sections, query_section = self._build_prompt_sections(request)
-        prompt_sections = [*cacheable_sections, query_section]
+        sections = self._build_prompt_sections(request)
+        prompt_sections = [
+            *sections.static_cache_prefix,
+            *sections.dynamic_context,
+            sections.query,
+        ]
         return "\n\n".join(section for section in prompt_sections if section)
 
-    def _build_prompt_sections(self, request: QueryRequest) -> Tuple[List[str], str]:
-        """Split prompt into a stable prefix and a volatile user query section."""
-        prompt_sections = []
+    def _build_prompt_sections(self, request: QueryRequest) -> PromptSections:
+        """Split prompt into stable cache prefix, dynamic context, and user query."""
+        static_cache_prefix = []
+        dynamic_context = []
 
         response_style_instructions = (request.metadata or {}).get(
             "response_style_instructions"
         )
         if response_style_instructions:
-            prompt_sections.append(
+            static_cache_prefix.append(
                 f"Response style instructions:\n{response_style_instructions}"
             )
 
         attachment_prompt = self._build_attachment_prompt(request)
         if attachment_prompt:
-            prompt_sections.append(attachment_prompt)
+            dynamic_context.append(attachment_prompt)
         if request.context:
-            prompt_sections.append(f"Context: {request.context}")
+            dynamic_context.append(f"Context: {request.context}")
         rag_context = (request.metadata or {}).get("rag_context")
         if rag_context:
-            prompt_sections.append(str(rag_context))
+            dynamic_context.append(str(rag_context))
         web_search_context = (request.metadata or {}).get("web_search_context")
         if web_search_context:
-            prompt_sections.append(str(web_search_context))
-        return prompt_sections, f"Query: {request.query}"
+            dynamic_context.append(str(web_search_context))
+        return PromptSections(
+            static_cache_prefix=static_cache_prefix,
+            dynamic_context=dynamic_context,
+            query=f"Query: {request.query}",
+        )
 
     def _prompt_cache_config(self) -> Dict[str, Any]:
         """Return provider prompt-cache config without assuming it exists."""
@@ -819,6 +838,9 @@ class OpenAIProvider(BaseInferenceProvider):
         prompt_cache_key = self._build_prompt_cache_key(request)
         if prompt_cache_key:
             request_kwargs["prompt_cache_key"] = prompt_cache_key
+            prompt_cache_retention = self._prompt_cache_retention()
+            if prompt_cache_retention:
+                request_kwargs["prompt_cache_retention"] = prompt_cache_retention
         else:
             request_kwargs["user"] = request.user_id
 
@@ -865,6 +887,23 @@ class OpenAIProvider(BaseInferenceProvider):
 
         digest = hashlib.sha256(":".join(parts).encode("utf-8")).hexdigest()
         return f"{namespace}-{strategy}-{digest[:40]}"
+
+    def _prompt_cache_retention(self) -> Optional[str]:
+        """Return a valid OpenAI prompt cache retention hint, if configured."""
+        config = self._prompt_cache_config()
+        raw_retention = config.get("retention", "in_memory")
+        if raw_retention is None:
+            return None
+
+        retention = str(raw_retention).strip().lower().replace("-", "_")
+        if retention in {"in_memory", "24h"}:
+            return retention
+
+        logger.warning(
+            "Ignoring unsupported OpenAI prompt_cache.retention value: %s",
+            raw_retention,
+        )
+        return None
 
     def _calculate_cost(self, usage, model_name: str) -> float:
         """Calculate cost based on usage"""
@@ -995,25 +1034,52 @@ class AnthropicProvider(BaseInferenceProvider):
 
     def _build_messages(self, request: QueryRequest) -> List[Dict[str, Any]]:
         """Build Anthropic messages with an optional cache breakpoint."""
-        cacheable_sections, query_section = self._build_prompt_sections(request)
-        if not self._prompt_cache_enabled() or not cacheable_sections:
+        sections = self._build_prompt_sections(request)
+        if not self._prompt_cache_enabled() or not sections.static_cache_prefix:
             return [{"role": "user", "content": self._build_prompt(request)}]
 
-        cache_control = dict(
-            self._prompt_cache_config().get(
-                "cache_control",
-                {"type": "ephemeral"},
-            )
-        )
         content = [
             {
                 "type": "text",
-                "text": "\n\n".join(cacheable_sections),
-                "cache_control": cache_control,
-            },
-            {"type": "text", "text": query_section},
+                "text": "\n\n".join(sections.static_cache_prefix),
+                "cache_control": self._anthropic_cache_control(),
+            }
         ]
+        if sections.dynamic_context:
+            content.append(
+                {
+                    "type": "text",
+                    "text": "\n\n".join(sections.dynamic_context),
+                }
+            )
+        content.append({"type": "text", "text": sections.query})
         return [{"role": "user", "content": content}]
+
+    def _anthropic_cache_control(self) -> Dict[str, str]:
+        """Build Anthropic cache_control while only allowing supported TTLs."""
+        config = self._prompt_cache_config()
+        cache_control = dict(config.get("cache_control", {"type": "ephemeral"}) or {})
+        if not cache_control.get("type"):
+            cache_control["type"] = "ephemeral"
+
+        ttl = config.get("ttl", cache_control.get("ttl"))
+        if ttl is None:
+            return cache_control
+
+        normalized_ttl = str(ttl).strip().lower()
+        if normalized_ttl in {"5m", "1h"}:
+            if normalized_ttl == "1h":
+                cache_control["ttl"] = normalized_ttl
+            else:
+                cache_control.pop("ttl", None)
+            return cache_control
+
+        logger.warning(
+            "Ignoring unsupported Anthropic prompt_cache.ttl value: %s",
+            ttl,
+        )
+        cache_control.pop("ttl", None)
+        return cache_control
 
     def _calculate_cost(self, usage, model_name: str) -> float:
         """Calculate cost based on usage"""
@@ -1069,6 +1135,7 @@ class vLLMProvider(BaseInferenceProvider):
             self.base_url = (
                 f"http://{config.get('host', 'localhost')}:{config.get('port', 8000)}"
             )
+        self.api_mode = str(config.get("api_mode", "completions")).lower()
         self.http_client = None
 
     async def initialize(self):
@@ -1102,21 +1169,32 @@ class vLLMProvider(BaseInferenceProvider):
         try:
             prompt = self._build_prompt(request)
 
-            payload = {
-                "model": model_name,
-                "prompt": prompt,
-                "max_tokens": request.max_tokens,
-                "temperature": request.temperature,
-                "stream": False,
-                "logprobs": None,
-            }
+            if self.api_mode == "chat_completions":
+                endpoint = "/v1/chat/completions"
+                payload = {
+                    "model": model_name,
+                    "messages": self._build_chat_messages(prompt),
+                    "max_tokens": request.max_tokens,
+                    "temperature": request.temperature,
+                    "stream": False,
+                }
+            else:
+                endpoint = "/v1/completions"
+                payload = {
+                    "model": model_name,
+                    "prompt": prompt,
+                    "max_tokens": request.max_tokens,
+                    "temperature": request.temperature,
+                    "stream": False,
+                    "logprobs": None,
+                }
 
             # Make request to vLLM server
-            response = await self.http_client.post("/v1/completions", json=payload)
+            response = await self.http_client.post(endpoint, json=payload)
             response.raise_for_status()
 
             data = response.json()
-            generated_text = data["choices"][0]["text"]
+            generated_text = self._extract_response_text(data)
             usage = data.get("usage", {})
 
             return InferenceResponse(
@@ -1147,28 +1225,79 @@ class vLLMProvider(BaseInferenceProvider):
         try:
             prompt = self._build_prompt(request)
 
-            payload = {
-                "model": model_name,
-                "prompt": prompt,
-                "max_tokens": request.max_tokens,
-                "temperature": request.temperature,
-                "stream": True,
-            }
+            if self.api_mode == "chat_completions":
+                endpoint = "/v1/chat/completions"
+                payload = {
+                    "model": model_name,
+                    "messages": self._build_chat_messages(prompt),
+                    "max_tokens": request.max_tokens,
+                    "temperature": request.temperature,
+                    "stream": True,
+                }
+            else:
+                endpoint = "/v1/completions"
+                payload = {
+                    "model": model_name,
+                    "prompt": prompt,
+                    "max_tokens": request.max_tokens,
+                    "temperature": request.temperature,
+                    "stream": True,
+                }
 
             async with self.http_client.stream(
-                "POST", "/v1/completions", json=payload
+                "POST", endpoint, json=payload
             ) as response:
                 async for line in response.aiter_lines():
-                    if line.startswith("data: "):
-                        data = json.loads(line[6:])
-                        if "choices" in data and data["choices"]:
-                            delta = data["choices"][0].get("text", "")
-                            if delta:
-                                yield delta
+                    if not line.startswith("data: "):
+                        continue
+                    raw_data = line[6:]
+                    if raw_data == "[DONE]":
+                        break
+                    data = json.loads(raw_data)
+                    delta = self._extract_stream_delta(data)
+                    if delta:
+                        yield delta
 
         except Exception as e:
             logger.error(f"vLLM streaming error: {e}")
             yield f"Error: {str(e)}"
+
+    def _build_chat_messages(self, prompt: str) -> List[Dict[str, str]]:
+        """Build OpenAI-compatible chat messages for vLLM chat templates."""
+        return [{"role": "user", "content": prompt}]
+
+    def _extract_response_text(self, data: Dict[str, Any]) -> str:
+        choice = data["choices"][0]
+        if self.api_mode == "chat_completions":
+            return self._coerce_chat_content(choice.get("message", {}))
+        return str(choice.get("text", ""))
+
+    def _extract_stream_delta(self, data: Dict[str, Any]) -> str:
+        choices = data.get("choices") or []
+        if not choices:
+            return ""
+        choice = choices[0]
+        if self.api_mode == "chat_completions":
+            return self._coerce_chat_content(choice.get("delta", {}))
+        return str(choice.get("text", ""))
+
+    def _coerce_chat_content(self, message: Any) -> str:
+        if not isinstance(message, dict):
+            return ""
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    parts.append(str(part.get("text") or part.get("content") or ""))
+                else:
+                    parts.append(str(part))
+            return "".join(parts)
+        if content is None:
+            return ""
+        return str(content)
 
     def get_health_status(self) -> Dict[str, Any]:
         """Get vLLM provider health status"""
@@ -1176,7 +1305,10 @@ class vLLMProvider(BaseInferenceProvider):
             "provider": "vllm",
             "status": "healthy" if self.http_client else "unhealthy",
             "base_url": self.base_url,
-            "models_available": ["mistral-7b", "llama-3.1-70b"],  # Example models
+            "api_mode": self.api_mode,
+            "models_available": self.config.get(
+                "models_available", ["qwen3.6-27b-fast"]
+            ),
         }
 
 

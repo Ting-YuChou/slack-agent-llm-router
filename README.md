@@ -17,7 +17,8 @@ The default host-run config in [config/config.yaml](/Users/zhoutingyou/Desktop/S
 
 - `gpt-5` is the default model
 - `claude-sonnet-4-6` gets extra weight for `enterprise` users and difficult `analysis` / `reasoning` requests
-- simple general tasks can prefer local `vLLM` models such as `mistral-7b`
+- host-run fast-lane traffic targets the external `vLLM` model `qwen3.6-27b-fast`
+- simple general tasks, including free-tier traffic, can also select local `vLLM` models such as `qwen3.6-27b-fast` or `mistral-7b` through normal capability/scoring/rule routing
 - if a cloud model fails on the non-streaming API path, inference can fall back to a local model when one is configured
 - fast-lane routing is explicit-SLA only: set `metadata.requires_low_latency: true`, `metadata.latency_sla: "low"` or `"interactive"`, use API `priority >= 4`, or use Slack `/llm fast <query>`
 - fast-lane requests still need to be simple enough for the configured fast-lane model; complex reasoning, long-context, and attachment-heavy requests stay on the normal capability-aware path
@@ -26,6 +27,59 @@ The compose runtime config in [config/config.compose.yaml](/Users/zhoutingyou/De
 
 - it does not start a local `vLLM` server
 - it disables local-model scoring bias so the API does not route to a non-existent local model
+
+## Single-GPU vLLM Fast Lane
+
+The checked-in host config can route explicit low-latency text requests to
+`qwen3.6-27b-fast`, but this repository does not manage the GPU model server.
+Start vLLM separately before running the API:
+
+```bash
+vllm serve Qwen/Qwen3.6-27B-FP8 \
+  --served-model-name qwen3.6-27b-fast \
+  --host 0.0.0.0 \
+  --port 8001 \
+  --max-model-len 32768 \
+  --gpu-memory-utilization 0.90 \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 8192 \
+  --language-model-only \
+  --reasoning-parser qwen3 \
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --enable-prefix-caching \
+  --generation-config vllm \
+  --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}'
+```
+
+MTP speculative decoding is enabled by the vLLM `--speculative-config` flag.
+The router only sends OpenAI-compatible chat completion requests to the endpoint
+configured under `inference.vllm`.
+
+Recommended single-card target:
+
+- 40-48GB VRAM
+- text-only coding/chat requests
+- `16K-32K` context
+- low concurrency; if startup OOMs, lower `--max-num-seqs` to `2`, then lower `--max-model-len` to `16384`
+
+Smoke checklist:
+
+```bash
+curl http://127.0.0.1:8001/health
+curl http://127.0.0.1:8001/v1/models
+curl -X POST http://127.0.0.1:8001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.6-27b-fast","messages":[{"role":"user","content":"Write a tiny Python add function."}],"max_tokens":128,"temperature":0.3}'
+curl -X POST http://localhost:8080/route \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-api-key" \
+  -d '{"query":"Write a tiny Python add function.","user_id":"test-user","metadata":{"requires_low_latency":true}}'
+```
+
+For benchmarking, run the same vLLM server once with
+`--speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}'`
+and once without it, then compare vLLM serving latency plus `/route` end-to-end
+latency on the same prompt set.
 
 ## API Surface
 
