@@ -107,11 +107,76 @@ class TestOpenAIProvider:
 
             kwargs = mock_client.responses.create.await_args.kwargs
             assert "prompt_cache_key" in kwargs
-            assert "prompt_cache_retention" not in kwargs
+            assert kwargs["prompt_cache_retention"] == "24h"
             assert "temperature" not in kwargs
             assert kwargs["reasoning"] == {"effort": "minimal"}
             assert "user" not in kwargs
             assert response.provider_cached_input_tokens == 1024
+
+    def test_openai_prompt_cache_retention_normalizes_legacy_config(
+        self, sample_query_request
+    ):
+        provider = OpenAIProvider(
+            {
+                "api_key": "test-key",
+                "prompt_cache": {
+                    "enabled": True,
+                    "key_strategy": "conversation",
+                    "retention": "in-memory",
+                },
+            }
+        )
+
+        kwargs = provider._build_response_request_kwargs(
+            sample_query_request, "gpt-4.1", "Prompt"
+        )
+
+        assert kwargs["prompt_cache_retention"] == "in_memory"
+
+    def test_openai_prompt_cache_retention_ignores_invalid_config(
+        self, sample_query_request
+    ):
+        provider = OpenAIProvider(
+            {
+                "api_key": "test-key",
+                "prompt_cache": {
+                    "enabled": True,
+                    "key_strategy": "conversation",
+                    "retention": "forever",
+                },
+            }
+        )
+
+        kwargs = provider._build_response_request_kwargs(
+            sample_query_request, "gpt-4.1", "Prompt"
+        )
+
+        assert "prompt_cache_key" in kwargs
+        assert "prompt_cache_retention" not in kwargs
+
+    def test_prompt_sections_keep_dynamic_context_after_static_prefix(
+        self, sample_query_request
+    ):
+        provider = OpenAIProvider({"api_key": "test-key"})
+        metadata = {
+            "response_style_instructions": "Use precise technical terminology.",
+            "rag_context": "School document search results:\n- Stable policy",
+            "web_search_context": "Web search results:\n- Recent article",
+        }
+        request_a = sample_query_request.model_copy(
+            update={"context": "Slack thread context: A", "metadata": metadata}
+        )
+        request_b = sample_query_request.model_copy(
+            update={"context": "Slack thread context: B", "metadata": metadata}
+        )
+
+        sections_a = provider._build_prompt_sections(request_a)
+        sections_b = provider._build_prompt_sections(request_b)
+
+        assert sections_a.static_cache_prefix == sections_b.static_cache_prefix
+        assert sections_a.dynamic_context != sections_b.dynamic_context
+        assert "Slack thread context: A" in sections_a.dynamic_context[0]
+        assert "Slack thread context: A" not in sections_a.static_cache_prefix[0]
 
     def test_openai_request_kwargs_include_temperature_for_supported_models(
         self, sample_query_request
@@ -254,18 +319,95 @@ class TestAnthropicProvider:
             )
             await provider.initialize()
 
-            response = await provider.generate_response(
-                sample_query_request, "claude-sonnet-4-6"
+            request = sample_query_request.model_copy(
+                update={
+                    "metadata": {
+                        "response_style_instructions": "Use precise technical terminology.",
+                        "rag_context": "School document search results:\n- Admissions policy",
+                        "web_search_context": "Web search results:\n- Recent update",
+                    },
+                    "attachments": [
+                        Attachment(
+                            name="notes.txt",
+                            type=AttachmentType.DOCUMENT,
+                            size_bytes=11,
+                            mime_type="text/plain",
+                            content=b"file detail",
+                        )
+                    ],
+                }
             )
+
+            response = await provider.generate_response(request, "claude-sonnet-4-6")
 
             messages = mock_client.messages.create.await_args.kwargs["messages"]
             content = messages[0]["content"]
             assert content[0]["cache_control"] == {"type": "ephemeral"}
-            assert "Previous discussion context" in content[0]["text"]
-            assert content[1]["text"].startswith("Query:")
+            assert "Response style instructions" in content[0]["text"]
+            assert "Previous discussion context" not in content[0]["text"]
+            assert "School document search results" not in content[0]["text"]
+            assert "notes.txt" not in content[0]["text"]
+            assert "cache_control" not in content[1]
+            assert "Previous discussion context" in content[1]["text"]
+            assert "School document search results" in content[1]["text"]
+            assert "Web search results" in content[1]["text"]
+            assert "notes.txt" in content[1]["text"]
+            assert content[2]["text"].startswith("Query:")
             assert response.token_count_input == 21
             assert response.provider_cache_creation_input_tokens == 5
             assert response.provider_cache_read_input_tokens == 7
+
+    def test_anthropic_cache_control_includes_one_hour_ttl_when_configured(
+        self, sample_query_request
+    ):
+        provider = AnthropicProvider(
+            {
+                "api_key": "test-key",
+                "prompt_cache": {
+                    "enabled": True,
+                    "cache_control": {"type": "ephemeral"},
+                    "ttl": "1h",
+                },
+            }
+        )
+        request = sample_query_request.model_copy(
+            update={
+                "metadata": {
+                    "response_style_instructions": "Use precise technical terminology."
+                }
+            }
+        )
+
+        messages = provider._build_messages(request)
+        content = messages[0]["content"]
+
+        assert content[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+    def test_anthropic_cache_control_omits_default_five_minute_ttl(
+        self, sample_query_request
+    ):
+        provider = AnthropicProvider(
+            {
+                "api_key": "test-key",
+                "prompt_cache": {
+                    "enabled": True,
+                    "cache_control": {"type": "ephemeral"},
+                    "ttl": "5m",
+                },
+            }
+        )
+        request = sample_query_request.model_copy(
+            update={
+                "metadata": {
+                    "response_style_instructions": "Use precise technical terminology."
+                }
+            }
+        )
+
+        messages = provider._build_messages(request)
+        content = messages[0]["content"]
+
+        assert content[0]["cache_control"] == {"type": "ephemeral"}
 
 
 class TestVLLMProvider:

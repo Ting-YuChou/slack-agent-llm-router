@@ -39,6 +39,16 @@ from src.tools import ToolRegistry, WebSearchTool, WebSearchResult
 
 logger = logging.getLogger(__name__)
 
+
+@dataclass
+class PromptSections:
+    """Provider prompt sections split by cache stability."""
+
+    static_cache_prefix: List[str]
+    dynamic_context: List[str]
+    query: str
+
+
 RAG_AUTO_STRONG_TERMS = {
     "academic calendar",
     "admissions",
@@ -598,34 +608,43 @@ class BaseInferenceProvider(ABC):
 
     def _build_prompt(self, request: QueryRequest) -> str:
         """Build a provider prompt that includes context plus extracted attachment content."""
-        cacheable_sections, query_section = self._build_prompt_sections(request)
-        prompt_sections = [*cacheable_sections, query_section]
+        sections = self._build_prompt_sections(request)
+        prompt_sections = [
+            *sections.static_cache_prefix,
+            *sections.dynamic_context,
+            sections.query,
+        ]
         return "\n\n".join(section for section in prompt_sections if section)
 
-    def _build_prompt_sections(self, request: QueryRequest) -> Tuple[List[str], str]:
-        """Split prompt into a stable prefix and a volatile user query section."""
-        prompt_sections = []
+    def _build_prompt_sections(self, request: QueryRequest) -> PromptSections:
+        """Split prompt into stable cache prefix, dynamic context, and user query."""
+        static_cache_prefix = []
+        dynamic_context = []
 
         response_style_instructions = (request.metadata or {}).get(
             "response_style_instructions"
         )
         if response_style_instructions:
-            prompt_sections.append(
+            static_cache_prefix.append(
                 f"Response style instructions:\n{response_style_instructions}"
             )
 
         attachment_prompt = self._build_attachment_prompt(request)
         if attachment_prompt:
-            prompt_sections.append(attachment_prompt)
+            dynamic_context.append(attachment_prompt)
         if request.context:
-            prompt_sections.append(f"Context: {request.context}")
+            dynamic_context.append(f"Context: {request.context}")
         rag_context = (request.metadata or {}).get("rag_context")
         if rag_context:
-            prompt_sections.append(str(rag_context))
+            dynamic_context.append(str(rag_context))
         web_search_context = (request.metadata or {}).get("web_search_context")
         if web_search_context:
-            prompt_sections.append(str(web_search_context))
-        return prompt_sections, f"Query: {request.query}"
+            dynamic_context.append(str(web_search_context))
+        return PromptSections(
+            static_cache_prefix=static_cache_prefix,
+            dynamic_context=dynamic_context,
+            query=f"Query: {request.query}",
+        )
 
     def _prompt_cache_config(self) -> Dict[str, Any]:
         """Return provider prompt-cache config without assuming it exists."""
@@ -819,6 +838,9 @@ class OpenAIProvider(BaseInferenceProvider):
         prompt_cache_key = self._build_prompt_cache_key(request)
         if prompt_cache_key:
             request_kwargs["prompt_cache_key"] = prompt_cache_key
+            prompt_cache_retention = self._prompt_cache_retention()
+            if prompt_cache_retention:
+                request_kwargs["prompt_cache_retention"] = prompt_cache_retention
         else:
             request_kwargs["user"] = request.user_id
 
@@ -865,6 +887,23 @@ class OpenAIProvider(BaseInferenceProvider):
 
         digest = hashlib.sha256(":".join(parts).encode("utf-8")).hexdigest()
         return f"{namespace}-{strategy}-{digest[:40]}"
+
+    def _prompt_cache_retention(self) -> Optional[str]:
+        """Return a valid OpenAI prompt cache retention hint, if configured."""
+        config = self._prompt_cache_config()
+        raw_retention = config.get("retention", "in_memory")
+        if raw_retention is None:
+            return None
+
+        retention = str(raw_retention).strip().lower().replace("-", "_")
+        if retention in {"in_memory", "24h"}:
+            return retention
+
+        logger.warning(
+            "Ignoring unsupported OpenAI prompt_cache.retention value: %s",
+            raw_retention,
+        )
+        return None
 
     def _calculate_cost(self, usage, model_name: str) -> float:
         """Calculate cost based on usage"""
@@ -995,25 +1034,52 @@ class AnthropicProvider(BaseInferenceProvider):
 
     def _build_messages(self, request: QueryRequest) -> List[Dict[str, Any]]:
         """Build Anthropic messages with an optional cache breakpoint."""
-        cacheable_sections, query_section = self._build_prompt_sections(request)
-        if not self._prompt_cache_enabled() or not cacheable_sections:
+        sections = self._build_prompt_sections(request)
+        if not self._prompt_cache_enabled() or not sections.static_cache_prefix:
             return [{"role": "user", "content": self._build_prompt(request)}]
 
-        cache_control = dict(
-            self._prompt_cache_config().get(
-                "cache_control",
-                {"type": "ephemeral"},
-            )
-        )
         content = [
             {
                 "type": "text",
-                "text": "\n\n".join(cacheable_sections),
-                "cache_control": cache_control,
-            },
-            {"type": "text", "text": query_section},
+                "text": "\n\n".join(sections.static_cache_prefix),
+                "cache_control": self._anthropic_cache_control(),
+            }
         ]
+        if sections.dynamic_context:
+            content.append(
+                {
+                    "type": "text",
+                    "text": "\n\n".join(sections.dynamic_context),
+                }
+            )
+        content.append({"type": "text", "text": sections.query})
         return [{"role": "user", "content": content}]
+
+    def _anthropic_cache_control(self) -> Dict[str, str]:
+        """Build Anthropic cache_control while only allowing supported TTLs."""
+        config = self._prompt_cache_config()
+        cache_control = dict(config.get("cache_control", {"type": "ephemeral"}) or {})
+        if not cache_control.get("type"):
+            cache_control["type"] = "ephemeral"
+
+        ttl = config.get("ttl", cache_control.get("ttl"))
+        if ttl is None:
+            return cache_control
+
+        normalized_ttl = str(ttl).strip().lower()
+        if normalized_ttl in {"5m", "1h"}:
+            if normalized_ttl == "1h":
+                cache_control["ttl"] = normalized_ttl
+            else:
+                cache_control.pop("ttl", None)
+            return cache_control
+
+        logger.warning(
+            "Ignoring unsupported Anthropic prompt_cache.ttl value: %s",
+            ttl,
+        )
+        cache_control.pop("ttl", None)
+        return cache_control
 
     def _calculate_cost(self, usage, model_name: str) -> float:
         """Calculate cost based on usage"""
