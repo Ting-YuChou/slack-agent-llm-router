@@ -5,6 +5,7 @@ import yaml
 from pydantic import ValidationError
 
 from src.utils.schema import (
+    ApiRateLimitingConfig,
     Attachment,
     AttachmentType,
     InferenceResponse,
@@ -165,6 +166,51 @@ def test_system_metric_name_validation():
 def test_platform_config_rejects_invalid_api_port():
     with pytest.raises(ValidationError):
         PlatformConfig(api={"port": 70000})
+
+
+def test_api_rate_limiting_accepts_legacy_request_bucket_config():
+    config = ApiRateLimitingConfig(
+        enabled=True,
+        requests_per_minute=500,
+        burst_size=50,
+    )
+
+    assert config.enabled is True
+    assert config.requests_per_minute == 500
+    assert config.burst_size == 50
+    assert config.redis.db == 4
+    assert config.redis.key_prefix == "api_gateway"
+    assert config.failure_mode == "closed"
+
+
+def test_api_rate_limiting_accepts_nested_admission_config():
+    config = ApiRateLimitingConfig(
+        enabled=True,
+        failure_mode="open",
+        redis={"host": "redis", "db": 4, "key_prefix": "gateway"},
+        queue={"max_depth": 25, "timeout_ms": 50},
+        global_limits={"active_requests": 10, "tokens_per_minute": 1000},
+        per_user={"requests_per_minute": 5, "burst_size": 2},
+        by_tier={"premium": {"tokens_per_minute": 2000, "burst_tokens": 500}},
+        providers={"openai": {"active_requests": 3}},
+        models={"gpt-5": {"requests_per_minute": 10, "burst_size": 4}},
+        token_budget={"enabled": True, "tokens_per_minute": 5000, "burst_tokens": 500},
+    )
+
+    assert config.failure_mode == "open"
+    assert config.redis.host == "redis"
+    assert config.queue.max_depth == 25
+    assert config.global_limits.active_requests == 10
+    assert config.per_user.requests_per_minute == 5
+    assert config.by_tier["premium"].burst_tokens == 500
+    assert config.providers["openai"].active_requests == 3
+    assert config.models["gpt-5"].burst_size == 4
+    assert config.token_budget.enabled is True
+
+
+def test_api_rate_limiting_rejects_unknown_failure_mode():
+    with pytest.raises(ValidationError):
+        ApiRateLimitingConfig(failure_mode="maybe")
 
 
 def test_provider_endpoint_config_accepts_chat_completions_api_mode():

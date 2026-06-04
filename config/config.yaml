@@ -8,6 +8,73 @@ api:
     enabled: true
     requests_per_minute: 1000
     burst_size: 100
+    failure_mode: closed
+    redis:
+      host: localhost
+      port: 6379
+      db: 4
+      password_env: REDIS_PASSWORD
+      key_prefix: api_gateway
+    queue:
+      enabled: true
+      max_depth: 1000
+      timeout_ms: 250
+      poll_interval_ms: 25
+    global_limits:
+      active_requests: 100
+      tokens_per_minute: 500000
+      burst_tokens: 500000
+    per_user:
+      requests_per_minute: 60
+      burst_size: 10
+      tokens_per_minute: 80000
+      burst_tokens: 80000
+    by_tier:
+      free:
+        requests_per_minute: 30
+        burst_size: 5
+        tokens_per_minute: 30000
+        burst_tokens: 30000
+      premium:
+        requests_per_minute: 120
+        burst_size: 20
+        tokens_per_minute: 150000
+        burst_tokens: 150000
+      enterprise:
+        requests_per_minute: 300
+        burst_size: 60
+        tokens_per_minute: 400000
+        burst_tokens: 400000
+    providers:
+      openai:
+        active_requests: 40
+        requests_per_minute: 600
+        burst_size: 80
+        tokens_per_minute: 300000
+        burst_tokens: 300000
+      anthropic:
+        active_requests: 30
+        requests_per_minute: 400
+        burst_size: 60
+        tokens_per_minute: 250000
+        burst_tokens: 250000
+      vllm:
+        active_requests: 16
+        requests_per_minute: 240
+        burst_size: 40
+        tokens_per_minute: 150000
+        burst_tokens: 150000
+    models:
+      qwen3.6-27b-fast:
+        active_requests: 8
+        requests_per_minute: 120
+        burst_size: 20
+        tokens_per_minute: 80000
+        burst_tokens: 80000
+    token_budget:
+      enabled: true
+      tokens_per_minute: 500000
+      burst_tokens: 500000
 logging:
   level: INFO
   file: logs/llm_router.log
@@ -153,7 +220,7 @@ inference:
     prompt_cache:
       enabled: true
       key_strategy: conversation
-      retention: in-memory
+      retention: in_memory
       pricing:
         cached_input_multiplier: 0.5
   anthropic:

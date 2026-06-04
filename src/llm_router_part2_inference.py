@@ -22,6 +22,7 @@ import redis.asyncio as redis
 from tenacity import retry, stop_after_attempt, wait_exponential
 from transformers import AutoTokenizer
 
+from src.admission import AdmissionRejectedError
 from src.llm_router_part1_router import ModelRouter
 from src.utils.logger import setup_logging
 from src.utils.metrics import INFERENCE_METRICS
@@ -633,34 +634,43 @@ class BaseInferenceProvider(ABC):
 
     def _build_prompt(self, request: QueryRequest) -> str:
         """Build a provider prompt that includes context plus extracted attachment content."""
-        cacheable_sections, query_section = self._build_prompt_sections(request)
-        prompt_sections = [*cacheable_sections, query_section]
+        sections = self._build_prompt_sections(request)
+        prompt_sections = [
+            *sections.static_cache_prefix,
+            *sections.dynamic_context,
+            sections.query,
+        ]
         return "\n\n".join(section for section in prompt_sections if section)
 
-    def _build_prompt_sections(self, request: QueryRequest) -> Tuple[List[str], str]:
-        """Split prompt into a stable prefix and a volatile user query section."""
-        prompt_sections = []
+    def _build_prompt_sections(self, request: QueryRequest) -> PromptSections:
+        """Split prompt into stable cache prefix, dynamic context, and user query."""
+        static_cache_prefix = []
+        dynamic_context = []
 
         response_style_instructions = (request.metadata or {}).get(
             "response_style_instructions"
         )
         if response_style_instructions:
-            prompt_sections.append(
+            static_cache_prefix.append(
                 f"Response style instructions:\n{response_style_instructions}"
             )
 
         attachment_prompt = self._build_attachment_prompt(request)
         if attachment_prompt:
-            prompt_sections.append(attachment_prompt)
+            dynamic_context.append(attachment_prompt)
         if request.context:
-            prompt_sections.append(f"Context: {request.context}")
+            dynamic_context.append(f"Context: {request.context}")
         rag_context = (request.metadata or {}).get("rag_context")
         if rag_context:
-            prompt_sections.append(str(rag_context))
+            dynamic_context.append(str(rag_context))
         web_search_context = (request.metadata or {}).get("web_search_context")
         if web_search_context:
-            prompt_sections.append(str(web_search_context))
-        return prompt_sections, f"Query: {request.query}"
+            dynamic_context.append(str(web_search_context))
+        return PromptSections(
+            static_cache_prefix=static_cache_prefix,
+            dynamic_context=dynamic_context,
+            query=f"Query: {request.query}",
+        )
 
     def _prompt_cache_config(self) -> Dict[str, Any]:
         """Return provider prompt-cache config without assuming it exists."""
@@ -854,6 +864,9 @@ class OpenAIProvider(BaseInferenceProvider):
         prompt_cache_key = self._build_prompt_cache_key(request)
         if prompt_cache_key:
             request_kwargs["prompt_cache_key"] = prompt_cache_key
+            prompt_cache_retention = self._prompt_cache_retention()
+            if prompt_cache_retention:
+                request_kwargs["prompt_cache_retention"] = prompt_cache_retention
         else:
             request_kwargs["user"] = request.user_id
 
@@ -900,6 +913,23 @@ class OpenAIProvider(BaseInferenceProvider):
 
         digest = hashlib.sha256(":".join(parts).encode("utf-8")).hexdigest()
         return f"{namespace}-{strategy}-{digest[:40]}"
+
+    def _prompt_cache_retention(self) -> Optional[str]:
+        """Return a valid OpenAI prompt cache retention hint, if configured."""
+        config = self._prompt_cache_config()
+        raw_retention = config.get("retention", "in_memory")
+        if raw_retention is None:
+            return None
+
+        retention = str(raw_retention).strip().lower().replace("-", "_")
+        if retention in {"in_memory", "24h"}:
+            return retention
+
+        logger.warning(
+            "Ignoring unsupported OpenAI prompt_cache.retention value: %s",
+            raw_retention,
+        )
+        return None
 
     def _calculate_cost(self, usage, model_name: str) -> float:
         """Calculate cost based on usage"""
@@ -1030,25 +1060,52 @@ class AnthropicProvider(BaseInferenceProvider):
 
     def _build_messages(self, request: QueryRequest) -> List[Dict[str, Any]]:
         """Build Anthropic messages with an optional cache breakpoint."""
-        cacheable_sections, query_section = self._build_prompt_sections(request)
-        if not self._prompt_cache_enabled() or not cacheable_sections:
+        sections = self._build_prompt_sections(request)
+        if not self._prompt_cache_enabled() or not sections.static_cache_prefix:
             return [{"role": "user", "content": self._build_prompt(request)}]
 
-        cache_control = dict(
-            self._prompt_cache_config().get(
-                "cache_control",
-                {"type": "ephemeral"},
-            )
-        )
         content = [
             {
                 "type": "text",
-                "text": "\n\n".join(cacheable_sections),
-                "cache_control": cache_control,
-            },
-            {"type": "text", "text": query_section},
+                "text": "\n\n".join(sections.static_cache_prefix),
+                "cache_control": self._anthropic_cache_control(),
+            }
         ]
+        if sections.dynamic_context:
+            content.append(
+                {
+                    "type": "text",
+                    "text": "\n\n".join(sections.dynamic_context),
+                }
+            )
+        content.append({"type": "text", "text": sections.query})
         return [{"role": "user", "content": content}]
+
+    def _anthropic_cache_control(self) -> Dict[str, str]:
+        """Build Anthropic cache_control while only allowing supported TTLs."""
+        config = self._prompt_cache_config()
+        cache_control = dict(config.get("cache_control", {"type": "ephemeral"}) or {})
+        if not cache_control.get("type"):
+            cache_control["type"] = "ephemeral"
+
+        ttl = config.get("ttl", cache_control.get("ttl"))
+        if ttl is None:
+            return cache_control
+
+        normalized_ttl = str(ttl).strip().lower()
+        if normalized_ttl in {"5m", "1h"}:
+            if normalized_ttl == "1h":
+                cache_control["ttl"] = normalized_ttl
+            else:
+                cache_control.pop("ttl", None)
+            return cache_control
+
+        logger.warning(
+            "Ignoring unsupported Anthropic prompt_cache.ttl value: %s",
+            ttl,
+        )
+        cache_control.pop("ttl", None)
+        return cache_control
 
     def _calculate_cost(self, usage, model_name: str) -> float:
         """Calculate cost based on usage"""
@@ -1917,11 +1974,13 @@ class InferenceEngine:
         router: ModelRouter,
         event_producer: Optional[Any] = None,
         rag_service: Optional[Any] = None,
+        admission_controller: Optional[Any] = None,
     ):
         self.config = config
         self.router = router
         self.event_producer = event_producer
         self.rag_service = rag_service
+        self.admission_controller = admission_controller
         self.providers = {}
         self.context_compressor = ContextCompressor(config.get("compression", {}))
         self.cache = ResponseCache(config.get("cache", {}))
@@ -2505,6 +2564,8 @@ class InferenceEngine:
         try:
             response = await self._execute_model_request(request, primary_model)
             return response, primary_model, routing_decision
+        except AdmissionRejectedError:
+            raise
         except Exception as exc:
             self._record_failed_attempt(primary_model, exc, primary_started_at)
             fallback_models = self._get_local_fallback_models(
@@ -2554,6 +2615,8 @@ class InferenceEngine:
                             fallback_model=fallback_model,
                         ),
                     )
+                except AdmissionRejectedError:
+                    raise
                 except Exception as fallback_exc:
                     self._record_failed_attempt(
                         fallback_model,
@@ -2571,7 +2634,66 @@ class InferenceEngine:
         provider = self._get_provider_for_model(model_name)
         if not provider:
             raise ValueError(f"No provider available for model: {model_name}")
-        return await self.batch_processor.add_request(request, provider, model_name)
+
+        reservation = None
+        if self.admission_controller is not None:
+            model_info = self.router.get_model_info(model_name) or {}
+            provider_name = (
+                model_info.get("config", {}).get("provider")
+                or getattr(provider, "provider_name", None)
+                or "unknown"
+            )
+            decision = await self.admission_controller.acquire_provider(
+                request=request,
+                model_name=model_name,
+                provider=str(provider_name),
+                estimated_input_tokens=self._estimate_provider_admission_input_tokens(
+                    request
+                ),
+            )
+            if not decision.allowed:
+                raise AdmissionRejectedError(decision)
+            reservation = decision.reservation
+
+        response = None
+        try:
+            response = await self.batch_processor.add_request(
+                request, provider, model_name
+            )
+            return response
+        finally:
+            if reservation is not None:
+                await self.admission_controller.release(
+                    reservation,
+                    actual_tokens=response.total_tokens if response else None,
+                )
+
+    def _estimate_provider_admission_input_tokens(self, request: QueryRequest) -> int:
+        """Estimate provider input tokens for admission budget reservation."""
+        estimator = getattr(self.router, "_estimate_request_token_count", None)
+        if estimator is not None:
+            try:
+                return max(0, int(estimator(request)))
+            except Exception:
+                logger.debug("Provider admission token estimator failed", exc_info=True)
+
+        token_counter = getattr(self.router, "token_counter", None)
+        count_tokens = getattr(token_counter, "count_tokens", None)
+        if count_tokens is not None:
+            try:
+                prompt = "\n\n".join(
+                    part
+                    for part in [
+                        f"Context: {request.context}" if request.context else "",
+                        f"Query: {request.query}",
+                    ]
+                    if part
+                )
+                return max(0, int(count_tokens(prompt)))
+            except Exception:
+                logger.debug("Fallback provider token estimator failed", exc_info=True)
+
+        return max(1, len((request.query or "").split()))
 
     def _record_failed_attempt(
         self,

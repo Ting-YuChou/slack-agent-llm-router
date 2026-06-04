@@ -149,6 +149,48 @@ class SystemMetrics:
             ["database", "state"],
         )
 
+
+class AdmissionMetrics:
+    """API gateway admission-control metrics."""
+
+    def __init__(self):
+        self.decisions = Counter(
+            "llm_router_admission_decisions_total",
+            "Admission-control decisions",
+            ["stage", "outcome", "reason"],
+        )
+
+        self.queue_depth = Gauge(
+            "llm_router_admission_queue_depth",
+            "Current admission queue depth",
+            ["scope"],
+        )
+
+        self.queue_wait = Histogram(
+            "llm_router_admission_queue_wait_seconds",
+            "Admission queue wait time",
+            ["stage"],
+            buckets=[0.0, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
+        )
+
+        self.active_reservations = Gauge(
+            "llm_router_admission_active_reservations",
+            "Active admission reservations held by this process",
+            ["stage", "scope"],
+        )
+
+        self.tokens = Counter(
+            "llm_router_admission_tokens_total",
+            "Admission token budget reservations and reconciliation",
+            ["stage", "token_type"],
+        )
+
+        self.redis_errors = Counter(
+            "llm_router_admission_redis_errors_total",
+            "Redis errors in admission control",
+            ["operation"],
+        )
+
         self.http_connections = Gauge(
             "llm_router_http_connections",
             "Number of HTTP connections",
@@ -544,6 +586,7 @@ INFERENCE_METRICS = InferenceMetrics()
 PIPELINE_METRICS = PipelineMetrics()
 SLACK_METRICS = SlackMetrics()
 USER_METRICS = UserMetrics()
+ADMISSION_METRICS = AdmissionMetrics()
 
 
 class MetricsCollector:
@@ -888,6 +931,7 @@ def reset_metrics():
         PIPELINE_METRICS,
         SLACK_METRICS,
         USER_METRICS,
+        ADMISSION_METRICS,
     ]:
         for attr_name in dir(metric_class):
             attr = getattr(metric_class, attr_name)
@@ -973,6 +1017,7 @@ __all__ = [
     "PIPELINE_METRICS",
     "SLACK_METRICS",
     "USER_METRICS",
+    "ADMISSION_METRICS",
     "BUSINESS_METRICS",
     "METRICS_REPORTER",
     "MetricsCollector",

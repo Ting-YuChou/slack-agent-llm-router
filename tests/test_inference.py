@@ -5,6 +5,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
+from src.admission import AdmissionDecision, AdmissionReservation
 from src.llm_router_part2_inference import (
     AnthropicProvider,
     BatchProcessor,
@@ -26,6 +27,31 @@ from src.utils.schema import (
 )
 from src.rag.chunker import DocumentChunk
 from src.rag.vector_store import RagSearchResult
+
+
+class RecordingAdmissionController:
+    def __init__(self):
+        self.provider_calls = []
+        self.releases = []
+
+    async def acquire_provider(self, **kwargs):
+        self.provider_calls.append(kwargs)
+        return AdmissionDecision.allow(
+            AdmissionReservation(
+                reservation_id=f"r{len(self.provider_calls)}",
+                stage="provider",
+                reserved_tokens=kwargs["estimated_input_tokens"]
+                + kwargs["request"].max_tokens,
+                metadata={
+                    "model": kwargs["model_name"],
+                    "provider": kwargs["provider"],
+                },
+            )
+        )
+
+    async def release(self, reservation, *, actual_tokens=None):
+        self.releases.append((reservation, actual_tokens))
+        return True
 
 
 @pytest.fixture
@@ -108,11 +134,76 @@ class TestOpenAIProvider:
 
             kwargs = mock_client.responses.create.await_args.kwargs
             assert "prompt_cache_key" in kwargs
-            assert "prompt_cache_retention" not in kwargs
+            assert kwargs["prompt_cache_retention"] == "24h"
             assert "temperature" not in kwargs
             assert kwargs["reasoning"] == {"effort": "minimal"}
             assert "user" not in kwargs
             assert response.provider_cached_input_tokens == 1024
+
+    def test_openai_prompt_cache_retention_normalizes_legacy_config(
+        self, sample_query_request
+    ):
+        provider = OpenAIProvider(
+            {
+                "api_key": "test-key",
+                "prompt_cache": {
+                    "enabled": True,
+                    "key_strategy": "conversation",
+                    "retention": "in-memory",
+                },
+            }
+        )
+
+        kwargs = provider._build_response_request_kwargs(
+            sample_query_request, "gpt-4.1", "Prompt"
+        )
+
+        assert kwargs["prompt_cache_retention"] == "in_memory"
+
+    def test_openai_prompt_cache_retention_ignores_invalid_config(
+        self, sample_query_request
+    ):
+        provider = OpenAIProvider(
+            {
+                "api_key": "test-key",
+                "prompt_cache": {
+                    "enabled": True,
+                    "key_strategy": "conversation",
+                    "retention": "forever",
+                },
+            }
+        )
+
+        kwargs = provider._build_response_request_kwargs(
+            sample_query_request, "gpt-4.1", "Prompt"
+        )
+
+        assert "prompt_cache_key" in kwargs
+        assert "prompt_cache_retention" not in kwargs
+
+    def test_prompt_sections_keep_dynamic_context_after_static_prefix(
+        self, sample_query_request
+    ):
+        provider = OpenAIProvider({"api_key": "test-key"})
+        metadata = {
+            "response_style_instructions": "Use precise technical terminology.",
+            "rag_context": "School document search results:\n- Stable policy",
+            "web_search_context": "Web search results:\n- Recent article",
+        }
+        request_a = sample_query_request.model_copy(
+            update={"context": "Slack thread context: A", "metadata": metadata}
+        )
+        request_b = sample_query_request.model_copy(
+            update={"context": "Slack thread context: B", "metadata": metadata}
+        )
+
+        sections_a = provider._build_prompt_sections(request_a)
+        sections_b = provider._build_prompt_sections(request_b)
+
+        assert sections_a.static_cache_prefix == sections_b.static_cache_prefix
+        assert sections_a.dynamic_context != sections_b.dynamic_context
+        assert "Slack thread context: A" in sections_a.dynamic_context[0]
+        assert "Slack thread context: A" not in sections_a.static_cache_prefix[0]
 
     def test_openai_request_kwargs_include_temperature_for_supported_models(
         self, sample_query_request
@@ -255,18 +346,95 @@ class TestAnthropicProvider:
             )
             await provider.initialize()
 
-            response = await provider.generate_response(
-                sample_query_request, "claude-sonnet-4-6"
+            request = sample_query_request.model_copy(
+                update={
+                    "metadata": {
+                        "response_style_instructions": "Use precise technical terminology.",
+                        "rag_context": "School document search results:\n- Admissions policy",
+                        "web_search_context": "Web search results:\n- Recent update",
+                    },
+                    "attachments": [
+                        Attachment(
+                            name="notes.txt",
+                            type=AttachmentType.DOCUMENT,
+                            size_bytes=11,
+                            mime_type="text/plain",
+                            content=b"file detail",
+                        )
+                    ],
+                }
             )
+
+            response = await provider.generate_response(request, "claude-sonnet-4-6")
 
             messages = mock_client.messages.create.await_args.kwargs["messages"]
             content = messages[0]["content"]
             assert content[0]["cache_control"] == {"type": "ephemeral"}
-            assert "Previous discussion context" in content[0]["text"]
-            assert content[1]["text"].startswith("Query:")
+            assert "Response style instructions" in content[0]["text"]
+            assert "Previous discussion context" not in content[0]["text"]
+            assert "School document search results" not in content[0]["text"]
+            assert "notes.txt" not in content[0]["text"]
+            assert "cache_control" not in content[1]
+            assert "Previous discussion context" in content[1]["text"]
+            assert "School document search results" in content[1]["text"]
+            assert "Web search results" in content[1]["text"]
+            assert "notes.txt" in content[1]["text"]
+            assert content[2]["text"].startswith("Query:")
             assert response.token_count_input == 21
             assert response.provider_cache_creation_input_tokens == 5
             assert response.provider_cache_read_input_tokens == 7
+
+    def test_anthropic_cache_control_includes_one_hour_ttl_when_configured(
+        self, sample_query_request
+    ):
+        provider = AnthropicProvider(
+            {
+                "api_key": "test-key",
+                "prompt_cache": {
+                    "enabled": True,
+                    "cache_control": {"type": "ephemeral"},
+                    "ttl": "1h",
+                },
+            }
+        )
+        request = sample_query_request.model_copy(
+            update={
+                "metadata": {
+                    "response_style_instructions": "Use precise technical terminology."
+                }
+            }
+        )
+
+        messages = provider._build_messages(request)
+        content = messages[0]["content"]
+
+        assert content[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+    def test_anthropic_cache_control_omits_default_five_minute_ttl(
+        self, sample_query_request
+    ):
+        provider = AnthropicProvider(
+            {
+                "api_key": "test-key",
+                "prompt_cache": {
+                    "enabled": True,
+                    "cache_control": {"type": "ephemeral"},
+                    "ttl": "5m",
+                },
+            }
+        )
+        request = sample_query_request.model_copy(
+            update={
+                "metadata": {
+                    "response_style_instructions": "Use precise technical terminology."
+                }
+            }
+        )
+
+        messages = provider._build_messages(request)
+        content = messages[0]["content"]
+
+        assert content[0]["cache_control"] == {"type": "ephemeral"}
 
 
 class TestVLLMProvider:
@@ -848,6 +1016,39 @@ class TestInferenceEngine:
         assert isinstance(cached_payload["timestamp"], str)
 
     @pytest.mark.asyncio
+    async def test_process_query_releases_provider_admission_on_success(
+        self,
+        inference_config,
+        sample_query_request,
+        inference_response_factory,
+    ):
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="gpt-5")
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+        router.update_model_stats = MagicMock()
+        router._estimate_request_token_count.return_value = 123
+
+        admission = RecordingAdmissionController()
+        engine = InferenceEngine(
+            inference_config, router, admission_controller=admission
+        )
+        engine.providers = {"openai": AsyncMock()}
+        engine.providers["openai"].generate_response = AsyncMock(
+            return_value=inference_response_factory(total_tokens=42)
+        )
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+        engine.cache.cache_response = AsyncMock()
+
+        response = await engine.process_query(sample_query_request)
+
+        assert response.total_tokens == 42
+        assert admission.provider_calls[0]["model_name"] == "gpt-5"
+        assert admission.provider_calls[0]["estimated_input_tokens"] == 123
+        assert admission.releases[0][1] == 42
+
+    @pytest.mark.asyncio
     async def test_process_query_publishes_inference_completed_event(
         self,
         inference_config,
@@ -1233,6 +1434,44 @@ class TestInferenceEngine:
         engine.cache.cache_response.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_process_query_skips_provider_admission_on_cache_hit(
+        self,
+        inference_config,
+        sample_query_request,
+    ):
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="gpt-5")
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+        router.update_model_stats = MagicMock()
+
+        admission = RecordingAdmissionController()
+        engine = InferenceEngine(
+            inference_config, router, admission_controller=admission
+        )
+        engine.cache.get_cached_response = AsyncMock(
+            return_value={
+                "response_text": "from cache",
+                "model_name": "gpt-5",
+                "provider": "openai",
+                "token_count_input": 3,
+                "token_count_output": 7,
+                "total_tokens": 10,
+                "latency_ms": 5,
+                "tokens_per_second": 200.0,
+                "cost_usd": 0.0,
+                "cached": False,
+            }
+        )
+
+        response = await engine.process_query(sample_query_request)
+
+        assert response.cached is True
+        assert admission.provider_calls == []
+        assert admission.releases == []
+
+    @pytest.mark.asyncio
     async def test_process_query_checks_cache_after_context_compression(
         self,
         inference_config,
@@ -1366,6 +1605,39 @@ class TestInferenceEngine:
         assert response.error is not None
         assert response.total_tokens == 0
         assert response.tokens_per_second == 0.0
+
+    @pytest.mark.asyncio
+    async def test_process_query_releases_provider_admission_on_exception(
+        self,
+        inference_config,
+        sample_query_request,
+    ):
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(
+                selected_model="gpt-5",
+                token_count=32,
+                query_type=QueryType.GENERAL,
+            )
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+        router.update_model_stats = MagicMock()
+
+        admission = RecordingAdmissionController()
+        engine = InferenceEngine(
+            inference_config, router, admission_controller=admission
+        )
+        engine.providers = {"openai": AsyncMock()}
+        engine.providers["openai"].generate_response = AsyncMock(
+            side_effect=RuntimeError("upstream failed")
+        )
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+
+        response = await engine.process_query(sample_query_request)
+
+        assert response.provider == "error"
+        assert admission.provider_calls[0]["model_name"] == "gpt-5"
+        assert admission.releases[0][1] is None
 
     @pytest.mark.asyncio
     async def test_process_query_falls_back_to_local_model_when_cloud_provider_fails(
@@ -1607,3 +1879,77 @@ class TestInferenceEngine:
         assert response.provider == "error"
         assert response.error == "inference_failed"
         assert engine.providers["vllm"].generate_response.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_process_query_admits_and_releases_primary_and_fallback(
+        self,
+        inference_config,
+        sample_query_request,
+        inference_response_factory,
+    ):
+        from src.llm_router_part1_router import ModelRouter
+
+        router = ModelRouter(
+            {
+                "default_model": "gpt-5",
+                "routing_strategy": "intelligent",
+                "models": {
+                    "gpt-5": {
+                        "provider": "openai",
+                        "max_tokens": 128000,
+                        "cost_per_token": 0.00003,
+                        "priority": 2,
+                        "capabilities": ["general", "reasoning", "coding", "analysis"],
+                    },
+                    "mistral-7b": {
+                        "provider": "vllm",
+                        "model_path": "/models/mistral",
+                        "max_tokens": 4096,
+                        "cost_per_token": 0.0,
+                        "priority": 3,
+                        "capabilities": ["general", "coding"],
+                    },
+                },
+                "routing_rules": [],
+            }
+        )
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(
+                selected_model="gpt-5",
+                query_type=QueryType.GENERAL,
+                token_count=64,
+                routing_reason="Capability-based selection",
+            )
+        )
+        router.update_model_stats = MagicMock()
+
+        admission = RecordingAdmissionController()
+        engine = InferenceEngine(
+            inference_config,
+            router,
+            admission_controller=admission,
+        )
+        engine.providers = {"openai": AsyncMock(), "vllm": AsyncMock()}
+        engine.providers["openai"].generate_response = AsyncMock(
+            side_effect=RuntimeError("upstream overloaded")
+        )
+        engine.providers["vllm"].generate_response = AsyncMock(
+            return_value=inference_response_factory(
+                model_name="mistral-7b",
+                provider="vllm",
+                total_tokens=25,
+                cost_usd=0.0,
+            )
+        )
+        engine.cache.get_cached_response = AsyncMock(side_effect=[None, None])
+        engine.cache.cache_response = AsyncMock()
+
+        response = await engine.process_query(sample_query_request)
+
+        assert response.model_name == "mistral-7b"
+        assert [call["model_name"] for call in admission.provider_calls] == [
+            "gpt-5",
+            "mistral-7b",
+        ]
+        assert admission.releases[0][1] is None
+        assert admission.releases[1][1] == 25

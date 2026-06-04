@@ -374,10 +374,74 @@ class ConfigModel(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class ApiRateLimitRedisConfig(ConfigModel):
+    host: str = "localhost"
+    port: int = Field(6379, ge=1, le=65535)
+    db: int = Field(4, ge=0)
+    password_env: Optional[str] = "REDIS_PASSWORD"
+    url: Optional[str] = None
+    key_prefix: str = "api_gateway"
+
+
+class ApiRateLimitQueueConfig(ConfigModel):
+    enabled: bool = True
+    max_depth: int = Field(1000, ge=0)
+    timeout_ms: int = Field(250, ge=0)
+    poll_interval_ms: int = Field(25, ge=1)
+
+
+class ApiRateLimitBucketConfig(ConfigModel):
+    enabled: bool = True
+    requests_per_minute: int = Field(0, ge=0)
+    burst_size: int = Field(0, ge=0)
+
+
+class ApiRateLimitActiveConfig(ConfigModel):
+    enabled: bool = True
+    active_requests: int = Field(0, ge=0)
+
+
+class ApiTokenBudgetConfig(ConfigModel):
+    enabled: bool = False
+    tokens_per_minute: int = Field(0, ge=0)
+    burst_tokens: int = Field(0, ge=0)
+
+
+class ApiRateLimitScopeConfig(ConfigModel):
+    requests_per_minute: Optional[int] = Field(None, ge=0)
+    burst_size: Optional[int] = Field(None, ge=0)
+    active_requests: Optional[int] = Field(None, ge=0)
+    tokens_per_minute: Optional[int] = Field(None, ge=0)
+    burst_tokens: Optional[int] = Field(None, ge=0)
+
+
+class ApiRateLimitGlobalConfig(ApiRateLimitScopeConfig):
+    active_requests: Optional[int] = Field(100, ge=0)
+
+
 class ApiRateLimitingConfig(ConfigModel):
     enabled: bool = False
     requests_per_minute: int = Field(1000, ge=1)
     burst_size: int = Field(100, ge=1)
+    failure_mode: str = "closed"
+    redis: ApiRateLimitRedisConfig = Field(default_factory=ApiRateLimitRedisConfig)
+    queue: ApiRateLimitQueueConfig = Field(default_factory=ApiRateLimitQueueConfig)
+    per_user: ApiRateLimitScopeConfig = Field(default_factory=ApiRateLimitScopeConfig)
+    by_tier: Dict[str, ApiRateLimitScopeConfig] = Field(default_factory=dict)
+    global_limits: ApiRateLimitGlobalConfig = Field(
+        default_factory=ApiRateLimitGlobalConfig
+    )
+    providers: Dict[str, ApiRateLimitScopeConfig] = Field(default_factory=dict)
+    models: Dict[str, ApiRateLimitScopeConfig] = Field(default_factory=dict)
+    token_budget: ApiTokenBudgetConfig = Field(default_factory=ApiTokenBudgetConfig)
+
+    @field_validator("failure_mode")
+    @classmethod
+    def validate_failure_mode(cls, value: str) -> str:
+        normalized = value.lower()
+        if normalized not in {"open", "closed"}:
+            raise ValueError("failure_mode must be one of: open, closed")
+        return normalized
 
 
 class ApiConfig(ConfigModel):
