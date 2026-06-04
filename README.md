@@ -20,6 +20,7 @@ The default host-run config in [config/config.yaml](/Users/zhoutingyou/Desktop/S
 - host-run fast-lane traffic targets the external `vLLM` model `qwen3.6-27b-fast`
 - simple general tasks, including free-tier traffic, can also select local `vLLM` models such as `qwen3.6-27b-fast` or `mistral-7b` through normal capability/scoring/rule routing
 - if a cloud model fails on the non-streaming API path, inference can fall back to a local model when one is configured
+- if `qwen3.6-27b-fast` is temporarily unavailable, host-run config allows fallback to `mistral-7b` only for simple small text requests that are not attachment-heavy, tool/RAG-required, or complex reasoning
 - fast-lane routing is explicit-SLA only: set `metadata.requires_low_latency: true`, `metadata.latency_sla: "low"` or `"interactive"`, use API `priority >= 4`, or use Slack `/llm fast <query>`
 - fast-lane requests still need to be simple enough for the configured fast-lane model; complex reasoning, long-context, and attachment-heavy requests stay on the normal capability-aware path
 
@@ -80,6 +81,78 @@ For benchmarking, run the same vLLM server once with
 `--speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}'`
 and once without it, then compare vLLM serving latency plus `/route` end-to-end
 latency on the same prompt set.
+
+## vLLM Serving Pool
+
+The application can either point `inference.vllm.base_url` at an external
+[vLLM Production Stack](https://docs.vllm.ai/projects/production-stack/en/latest/)
+router, or use the repo-local provider pool by configuring multiple
+OpenAI-compatible vLLM endpoints. The old single `base_url` / `host` / `port`
+config remains valid and is normalized to one endpoint.
+
+The repo-local pool improves health/failover/observability with one endpoint.
+Tail-latency, queue spillover, prefix-cache locality, and model isolation only
+become meaningful when two or more serving endpoints are reachable.
+
+Example two-endpoint Qwen pool:
+
+```yaml
+inference:
+  vllm:
+    api_mode: chat_completions
+    routing_strategy: least_outstanding_prefix_aware
+    metrics_scrape_enabled: true
+    health_check_interval_seconds: 15
+    failure_cooldown_seconds: 30
+    metrics_refresh_seconds: 5
+    prefix_affinity_ttl_seconds: 300
+    endpoints:
+      - name: qwen-a
+        base_url: http://127.0.0.1:8001
+        models: [qwen3.6-27b-fast]
+        weight: 1.0
+        max_outstanding: 4
+        health_path: /health
+        metrics_path: /metrics
+        prefix_cache_enabled: true
+      - name: qwen-b
+        base_url: http://127.0.0.1:8002
+        models: [qwen3.6-27b-fast]
+        weight: 1.0
+        max_outstanding: 4
+        health_path: /health
+        metrics_path: /metrics
+        prefix_cache_enabled: true
+```
+
+Pool behavior:
+
+- endpoints with a non-empty `models` list only serve those model names
+- unhealthy endpoints are skipped until their cooldown expires
+- outstanding request count and optional vLLM `/metrics` signals influence endpoint choice
+- repeated prompt prefixes prefer the same healthy, non-saturated endpoint for best-effort prefix-cache locality
+- prefix-aware routing is process-local in this app; use an external vLLM Production Stack router if you need a dedicated serving gateway
+- endpoint pool failover keeps the same selected model; cross-model fallback such as `qwen3.6-27b-fast` to `mistral-7b` is controlled separately by `inference.vllm.model_fallback`
+
+Pool smoke checklist:
+
+```bash
+curl http://127.0.0.1:8001/health
+curl http://127.0.0.1:8002/health
+curl http://127.0.0.1:8001/v1/models
+curl http://127.0.0.1:8002/v1/models
+curl -X POST http://localhost:8080/route \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-api-key" \
+  -d '{"query":"Write a tiny Python add function.","user_id":"test-user","metadata":{"requires_low_latency":true}}'
+```
+
+To check queue failover, stop one vLLM endpoint and resend the same `/route`
+request. To check prefix affinity, send repeated requests with the same long
+stable prefix and inspect provider health output for endpoint outstanding counts
+and last errors. vLLM exports request and KV/cache metrics on `/metrics`; the
+pool reads `vllm:num_requests_running`, `vllm:num_requests_waiting`, and
+`vllm:gpu_cache_usage_perc` when `metrics_scrape_enabled` is true.
 
 ## API Surface
 

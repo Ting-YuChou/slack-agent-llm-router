@@ -1,4 +1,5 @@
 import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -269,6 +270,18 @@ class TestAnthropicProvider:
 
 
 class TestVLLMProvider:
+    def _mock_vllm_response(self, text="ok", prompt_tokens=3, completion_tokens=2):
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [{"text": text}],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+        }
+        return mock_response
+
     def test_uses_explicit_base_url_when_configured(self):
         provider = vLLMProvider({"base_url": "http://127.0.0.1:8001/"})
 
@@ -278,6 +291,14 @@ class TestVLLMProvider:
         provider = vLLMProvider({"host": "vllm.internal", "port": 9000})
 
         assert provider.base_url == "http://vllm.internal:9000"
+
+    def test_single_base_url_normalizes_to_default_endpoint(self):
+        provider = vLLMProvider({"base_url": "http://127.0.0.1:8001/"})
+
+        assert len(provider.endpoints) == 1
+        assert provider.endpoints[0].name == "default"
+        assert provider.endpoints[0].base_url == "http://127.0.0.1:8001"
+        assert provider.endpoints[0].models == []
 
     @pytest.mark.asyncio
     async def test_generate_response_preserves_completions_mode(
@@ -389,6 +410,203 @@ class TestVLLMProvider:
         assert endpoint == ("POST", "/v1/chat/completions")
         assert call_kwargs["json"]["stream"] is True
         assert chunks == ["Use ", "streaming."]
+
+    @pytest.mark.asyncio
+    async def test_pool_selects_least_outstanding_endpoint(self, sample_query_request):
+        provider = vLLMProvider(
+            {
+                "endpoints": [
+                    {"name": "qwen-a", "base_url": "http://127.0.0.1:8001"},
+                    {"name": "qwen-b", "base_url": "http://127.0.0.1:8002"},
+                ]
+            }
+        )
+        provider.endpoints[0].outstanding = 2
+        provider.endpoints[0].client = AsyncMock()
+        provider.endpoints[1].client = AsyncMock()
+        provider.endpoints[1].client.post.return_value = self._mock_vllm_response(
+            "endpoint b"
+        )
+
+        response = await provider.generate_response(sample_query_request, "mistral-7b")
+
+        assert response.response_text == "endpoint b"
+        provider.endpoints[0].client.post.assert_not_called()
+        provider.endpoints[1].client.post.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_pool_filters_endpoints_by_model(self, sample_query_request):
+        provider = vLLMProvider(
+            {
+                "endpoints": [
+                    {
+                        "name": "mistral",
+                        "base_url": "http://127.0.0.1:8001",
+                        "models": ["mistral-7b"],
+                    },
+                    {
+                        "name": "qwen",
+                        "base_url": "http://127.0.0.1:8002",
+                        "models": ["qwen3.6-27b-fast"],
+                    },
+                ]
+            }
+        )
+        provider.endpoints[0].client = AsyncMock()
+        provider.endpoints[1].client = AsyncMock()
+        provider.endpoints[1].client.post.return_value = self._mock_vllm_response(
+            "qwen endpoint"
+        )
+
+        response = await provider.generate_response(
+            sample_query_request, "qwen3.6-27b-fast"
+        )
+
+        assert response.response_text == "qwen endpoint"
+        provider.endpoints[0].client.post.assert_not_called()
+        provider.endpoints[1].client.post.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_pool_fails_over_from_unhealthy_endpoint(self, sample_query_request):
+        provider = vLLMProvider(
+            {
+                "failure_cooldown_seconds": 60,
+                "endpoints": [
+                    {"name": "qwen-a", "base_url": "http://127.0.0.1:8001"},
+                    {"name": "qwen-b", "base_url": "http://127.0.0.1:8002"},
+                ],
+            }
+        )
+        provider.endpoints[0].client = AsyncMock()
+        provider.endpoints[0].client.post.side_effect = RuntimeError("endpoint down")
+        provider.endpoints[1].client = AsyncMock()
+        provider.endpoints[1].client.post.return_value = self._mock_vllm_response(
+            "failover"
+        )
+
+        response = await provider.generate_response(sample_query_request, "mistral-7b")
+
+        assert response.response_text == "failover"
+        assert provider.endpoints[0].healthy is False
+        assert provider.endpoints[0].cooldown_until > time.time()
+        assert "endpoint down" in provider.endpoints[0].last_error
+        provider.endpoints[1].client.post.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_prefix_affinity_reuses_prior_endpoint(self, sample_query_request):
+        provider = vLLMProvider(
+            {
+                "endpoints": [
+                    {"name": "qwen-a", "base_url": "http://127.0.0.1:8001"},
+                    {"name": "qwen-b", "base_url": "http://127.0.0.1:8002"},
+                ]
+            }
+        )
+        provider.endpoints[0].outstanding = 1
+        provider.endpoints[0].client = AsyncMock()
+        provider.endpoints[0].client.post.return_value = self._mock_vllm_response(
+            "endpoint a"
+        )
+        provider.endpoints[1].client = AsyncMock()
+        provider.endpoints[1].client.post.return_value = self._mock_vllm_response(
+            "endpoint b"
+        )
+
+        first = await provider.generate_response(sample_query_request, "mistral-7b")
+        provider.endpoints[0].outstanding = 0
+        second = await provider.generate_response(sample_query_request, "mistral-7b")
+
+        assert first.response_text == "endpoint b"
+        assert second.response_text == "endpoint b"
+        provider.endpoints[0].client.post.assert_not_called()
+        assert provider.endpoints[1].client.post.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_prefix_affinity_falls_back_when_endpoint_saturated(
+        self, sample_query_request
+    ):
+        provider = vLLMProvider(
+            {
+                "endpoints": [
+                    {"name": "qwen-a", "base_url": "http://127.0.0.1:8001"},
+                    {
+                        "name": "qwen-b",
+                        "base_url": "http://127.0.0.1:8002",
+                        "max_outstanding": 1,
+                    },
+                ]
+            }
+        )
+        prompt = provider._build_prompt(sample_query_request)
+        prefix_key = provider._prompt_prefix_fingerprint("mistral-7b", prompt)
+        provider._prefix_affinity[prefix_key] = ("qwen-b", time.time() + 60)
+        provider.endpoints[0].client = AsyncMock()
+        provider.endpoints[0].client.post.return_value = self._mock_vllm_response(
+            "endpoint a"
+        )
+        provider.endpoints[1].outstanding = 1
+        provider.endpoints[1].client = AsyncMock()
+
+        response = await provider.generate_response(sample_query_request, "mistral-7b")
+
+        assert response.response_text == "endpoint a"
+        provider.endpoints[0].client.post.assert_called_once()
+        provider.endpoints[1].client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stream_response_tracks_outstanding_until_stream_finishes(
+        self, sample_query_request
+    ):
+        observed_outstanding = []
+
+        class StreamResponse:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+            async def aiter_lines(self):
+                observed_outstanding.append(provider.endpoints[0].outstanding)
+                lines = [
+                    'data: {"choices":[{"text":"first "}]}\n',
+                    'data: {"choices":[{"text":"chunk"}]}\n',
+                    "data: [DONE]",
+                ]
+                for line in lines:
+                    yield line
+
+        provider = vLLMProvider({"base_url": "http://127.0.0.1:8001"})
+        provider.http_client = MagicMock()
+        provider.http_client.stream.return_value = StreamResponse()
+
+        chunks = [
+            chunk
+            async for chunk in provider.stream_response(
+                sample_query_request, "mistral-7b"
+            )
+        ]
+
+        assert chunks == ["first ", "chunk"]
+        assert observed_outstanding == [1]
+        assert provider.endpoints[0].outstanding == 0
+
+    def test_parse_vllm_metrics_extracts_capacity_signals(self):
+        provider = vLLMProvider({"base_url": "http://127.0.0.1:8001"})
+        metrics = provider._parse_vllm_metrics(
+            """
+            # HELP vllm:num_requests_running Number of running requests.
+            vllm:num_requests_running{model_name="qwen"} 2
+            vllm:num_requests_waiting{model_name="qwen"} 3
+            vllm:gpu_cache_usage_perc{gpu="0"} 0.42
+            """
+        )
+
+        assert metrics == {
+            "running_requests": 2,
+            "queue_depth": 3,
+            "kv_cache_usage": 0.42,
+        }
 
 
 class TestResponseCache:
@@ -587,6 +805,14 @@ class TestInferenceEngine:
         await engine.initialize()
 
         assert "vllm" not in engine.providers
+
+    def test_vllm_pool_endpoints_count_as_configured(self):
+        router = MagicMock()
+        engine = InferenceEngine({}, router)
+
+        assert engine._vllm_configured(
+            {"endpoints": [{"base_url": "http://127.0.0.1:8001"}]}
+        )
 
     @pytest.mark.asyncio
     async def test_process_query_uses_provider_and_caches_result(
@@ -1219,3 +1445,165 @@ class TestInferenceEngine:
             success=True,
             latency_ms=response.latency_ms,
         )
+
+    @pytest.mark.asyncio
+    async def test_process_query_falls_back_between_configured_vllm_models(
+        self,
+        inference_config,
+        sample_query_request,
+        inference_response_factory,
+    ):
+        from src.llm_router_part1_router import ModelRouter
+
+        router = ModelRouter(
+            {
+                "default_model": "qwen3.6-27b-fast",
+                "routing_strategy": "intelligent",
+                "models": {
+                    "qwen3.6-27b-fast": {
+                        "provider": "vllm",
+                        "model_path": "Qwen/Qwen3.6-27B-FP8",
+                        "max_tokens": 32768,
+                        "cost_per_token": 0.0,
+                        "priority": 3,
+                        "capabilities": ["general", "coding"],
+                    },
+                    "mistral-7b": {
+                        "provider": "vllm",
+                        "model_path": "/models/mistral",
+                        "max_tokens": 8192,
+                        "cost_per_token": 0.0,
+                        "priority": 3,
+                        "capabilities": ["general", "coding"],
+                    },
+                },
+                "routing_rules": [],
+            }
+        )
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(
+                selected_model="qwen3.6-27b-fast",
+                query_type=QueryType.GENERAL,
+                token_count=64,
+                routing_reason="Fast local selection",
+            )
+        )
+        router.update_model_stats = MagicMock()
+        config = {
+            **inference_config,
+            "vllm": {
+                "model_fallback": {
+                    "enabled": True,
+                    "fallbacks": {"qwen3.6-27b-fast": ["mistral-7b"]},
+                    "allowed_query_types": ["general", "code_generation"],
+                    "max_input_tokens": 2048,
+                    "max_output_tokens": 1024,
+                    "disallow_attachments": True,
+                    "disallow_complex_reasoning": True,
+                }
+            },
+        }
+
+        engine = InferenceEngine(config, router)
+        engine.providers = {"vllm": AsyncMock()}
+        engine.providers["vllm"].generate_response = AsyncMock(
+            side_effect=[
+                RuntimeError("qwen temporarily unavailable"),
+                inference_response_factory(
+                    model_name="mistral-7b",
+                    provider="vllm",
+                    cost_usd=0.0,
+                ),
+            ]
+        )
+        engine.cache.get_cached_response = AsyncMock(side_effect=[None, None])
+        engine.cache.cache_response = AsyncMock()
+
+        response = await engine.process_query(sample_query_request)
+
+        assert response.model_name == "mistral-7b"
+        assert response.provider == "vllm"
+        assert [
+            call.args[1]
+            for call in engine.providers["vllm"].generate_response.await_args_list
+        ] == ["qwen3.6-27b-fast", "mistral-7b"]
+        router.update_model_stats.assert_any_call(
+            model_name="qwen3.6-27b-fast",
+            success=False,
+            latency_ms=ANY,
+        )
+        router.update_model_stats.assert_any_call(
+            model_name="mistral-7b",
+            success=True,
+            latency_ms=response.latency_ms,
+        )
+
+    @pytest.mark.asyncio
+    async def test_vllm_model_fallback_rejects_complex_reasoning(
+        self,
+        inference_config,
+        sample_query_request,
+    ):
+        from src.llm_router_part1_router import ModelRouter
+
+        router = ModelRouter(
+            {
+                "default_model": "qwen3.6-27b-fast",
+                "routing_strategy": "intelligent",
+                "models": {
+                    "qwen3.6-27b-fast": {
+                        "provider": "vllm",
+                        "model_path": "Qwen/Qwen3.6-27B-FP8",
+                        "max_tokens": 32768,
+                        "cost_per_token": 0.0,
+                        "priority": 3,
+                        "capabilities": ["general", "coding", "reasoning"],
+                    },
+                    "mistral-7b": {
+                        "provider": "vllm",
+                        "model_path": "/models/mistral",
+                        "max_tokens": 8192,
+                        "cost_per_token": 0.0,
+                        "priority": 3,
+                        "capabilities": ["general", "coding"],
+                    },
+                },
+                "routing_rules": [],
+            }
+        )
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(
+                selected_model="qwen3.6-27b-fast",
+                query_type=QueryType.REASONING,
+                query_complexity="complex",
+                token_count=512,
+                routing_reason="Fast local selection",
+            )
+        )
+        router.update_model_stats = MagicMock()
+        config = {
+            **inference_config,
+            "vllm": {
+                "model_fallback": {
+                    "enabled": True,
+                    "fallbacks": {"qwen3.6-27b-fast": ["mistral-7b"]},
+                    "allowed_query_types": ["general", "code_generation"],
+                    "max_input_tokens": 2048,
+                    "max_output_tokens": 1024,
+                    "disallow_complex_reasoning": True,
+                }
+            },
+        }
+
+        engine = InferenceEngine(config, router)
+        engine.providers = {"vllm": AsyncMock()}
+        engine.providers["vllm"].generate_response = AsyncMock(
+            side_effect=RuntimeError("qwen temporarily unavailable")
+        )
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+
+        response = await engine.process_query(sample_query_request)
+
+        assert response.provider == "error"
+        assert response.error == "inference_failed"
+        assert engine.providers["vllm"].generate_response.await_count == 1
