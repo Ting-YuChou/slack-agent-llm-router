@@ -12,6 +12,7 @@ from src.utils.schema import (
     ModelConfig,
     PlatformConfig,
     ProviderEndpointConfig,
+    ProviderSchedulerConfig,
     QueryRequest,
     RagPolicy,
     ResponseSource,
@@ -217,6 +218,39 @@ def test_provider_endpoint_config_accepts_chat_completions_api_mode():
     config = ProviderEndpointConfig(api_mode="chat_completions")
 
     assert config.api_mode == "chat_completions"
+
+
+def test_provider_scheduler_config_accepts_nested_policy():
+    config = ProviderSchedulerConfig(
+        enabled=True,
+        queue_enabled=True,
+        wait_timeout_ms=100,
+        poll_interval_ms=10,
+        failure_mode="open",
+        retry={
+            "max_attempts_per_request": 3,
+            "budget_enabled": True,
+            "budget_tokens": 50,
+        },
+        circuit_breaker={
+            "enabled": True,
+            "failure_threshold": 2,
+            "recovery_timeout_ms": 500,
+            "half_open_max_requests": 2,
+        },
+    )
+
+    assert config.queue_enabled is True
+    assert config.failure_mode == "open"
+    assert config.retry.max_attempts_per_request == 3
+    assert config.retry.budget_tokens == 50
+    assert config.circuit_breaker.failure_threshold == 2
+    assert config.circuit_breaker.half_open_max_requests == 2
+
+
+def test_provider_scheduler_config_rejects_unknown_failure_mode():
+    with pytest.raises(ValidationError):
+        ProviderSchedulerConfig(failure_mode="maybe")
 
 
 def test_provider_endpoint_config_accepts_vllm_pool_endpoints():

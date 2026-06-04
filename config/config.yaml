@@ -253,6 +253,27 @@ inference:
     enabled: true
     max_batch_size: 32
     max_wait_time_ms: 50
+  scheduler:
+    enabled: true
+    queue_enabled: true
+    wait_timeout_ms: 250
+    poll_interval_ms: 25
+    failure_mode: closed
+    allow_fallback_on_provider_rejection: true
+    key_prefix: provider_scheduler
+    retry:
+      max_attempts_per_request: 3
+      initial_backoff_ms: 100
+      max_backoff_ms: 1000
+      budget_enabled: true
+      budget_tokens: 200
+      budget_window_seconds: 60
+    circuit_breaker:
+      enabled: true
+      failure_threshold: 5
+      recovery_timeout_ms: 30000
+      half_open_max_requests: 1
+      state_ttl_seconds: 3600
 tools:
   web_search:
     enabled: false

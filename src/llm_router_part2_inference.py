@@ -9,28 +9,26 @@ import logging
 import os
 import time
 from abc import ABC, abstractmethod
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Any, AsyncIterator, Union, Tuple, Sequence
+from typing import Dict, List, Optional, Any, AsyncIterator, Tuple, Sequence
 import hashlib
 
 import httpx
 import openai
 import anthropic
 import redis.asyncio as redis
-from tenacity import retry, stop_after_attempt, wait_exponential
 from transformers import AutoTokenizer
 
 from src.admission import AdmissionRejectedError
 from src.llm_router_part1_router import ModelRouter
+from src.provider_scheduler import ProviderCapacityScheduler
 from src.utils.logger import setup_logging
 from src.utils.metrics import INFERENCE_METRICS
 from src.utils.schema import (
     AttachmentType,
     QueryRequest,
     InferenceResponse,
-    ModelConfig,
     QueryType,
     RagPolicy,
     ToolCall,
@@ -772,16 +770,17 @@ class OpenAIProvider(BaseInferenceProvider):
 
     async def initialize(self):
         """Initialize OpenAI client"""
+        api_key = self.config.get("api_key")
+        api_key_env = self.config.get("api_key_env", "OPENAI_API_KEY")
+        if not api_key and api_key_env:
+            api_key = os.getenv(str(api_key_env))
         self.client = openai.AsyncOpenAI(
-            api_key=self.config.get("api_key"),
+            api_key=api_key,
             base_url=self.config.get("base_url", "https://api.openai.com/v1"),
             timeout=self.config.get("timeout", 60),
         )
         logger.info("OpenAI provider initialized")
 
-    @retry(
-        stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10)
-    )
     async def generate_response(
         self, request: QueryRequest, model_name: str
     ) -> InferenceResponse:
@@ -976,16 +975,17 @@ class AnthropicProvider(BaseInferenceProvider):
 
     async def initialize(self):
         """Initialize Anthropic client"""
+        api_key = self.config.get("api_key")
+        api_key_env = self.config.get("api_key_env", "ANTHROPIC_API_KEY")
+        if not api_key and api_key_env:
+            api_key = os.getenv(str(api_key_env))
         self.client = anthropic.AsyncAnthropic(
-            api_key=self.config.get("api_key"),
+            api_key=api_key,
             base_url=self.config.get("base_url", "https://api.anthropic.com"),
             timeout=self.config.get("timeout", 60),
         )
         logger.info("Anthropic provider initialized")
 
-    @retry(
-        stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10)
-    )
     async def generate_response(
         self, request: QueryRequest, model_name: str
     ) -> InferenceResponse:
@@ -1985,6 +1985,10 @@ class InferenceEngine:
         self.context_compressor = ContextCompressor(config.get("compression", {}))
         self.cache = ResponseCache(config.get("cache", {}))
         self.batch_processor = BatchProcessor(config.get("batching", {}))
+        self.scheduler = ProviderCapacityScheduler(
+            config.get("scheduler", {}),
+            admission_controller=admission_controller,
+        )
         self.tool_registry = ToolRegistry()
         self.web_search_tool: Optional[WebSearchTool] = None
 
@@ -2166,6 +2170,8 @@ class InferenceEngine:
             )
             return response
 
+        except AdmissionRejectedError:
+            raise
         except Exception as exc:
             # Update error metrics
             if not getattr(exc, "_attempt_recorded", False):
@@ -2523,10 +2529,32 @@ class InferenceEngine:
                 yield f"Error: No provider available for model: {model_name}"
                 return
 
-            # Stream response
-            async for chunk in provider.stream_response(request, model_name):
-                yield chunk
+            model_info = self.router.get_model_info(model_name) or {}
+            provider_name = (
+                model_info.get("config", {}).get("provider")
+                or getattr(provider, "provider_name", None)
+                or "unknown"
+            )
+            lease = await self.scheduler.acquire(
+                request=request,
+                model_name=model_name,
+                provider=str(provider_name),
+                estimated_input_tokens=self._estimate_provider_admission_input_tokens(
+                    request
+                ),
+            )
+            try:
+                async for chunk in provider.stream_response(request, model_name):
+                    yield chunk
+                await self.scheduler.record_success(
+                    provider=str(provider_name),
+                    model_name=model_name,
+                )
+            finally:
+                await self.scheduler.release(lease, actual_tokens=None)
 
+        except AdmissionRejectedError as exc:
+            yield f"Error: {exc.decision.reason}"
         except Exception:
             logger.exception("Streaming failed")
             yield "Error: Request processing failed"
@@ -2564,8 +2592,68 @@ class InferenceEngine:
         try:
             response = await self._execute_model_request(request, primary_model)
             return response, primary_model, routing_decision
-        except AdmissionRejectedError:
-            raise
+        except AdmissionRejectedError as exc:
+            if not self.scheduler.allow_fallback_for_rejection(exc.decision):
+                raise
+            fallback_models = self._get_local_fallback_models(
+                request,
+                routing_decision,
+                exclude_models=[primary_model],
+            )
+            if not fallback_models:
+                raise
+            logger.warning(
+                "Primary model %s was rejected by provider scheduler (%s); "
+                "attempting local fallback candidates %s",
+                primary_model,
+                exc.decision.reason,
+                fallback_models,
+            )
+            last_exception: Exception = exc
+            for fallback_model in fallback_models:
+                fallback_started_at = time.time()
+                response = await self._get_cached_inference_response(
+                    request,
+                    fallback_model,
+                )
+                if response:
+                    return (
+                        response,
+                        fallback_model,
+                        self._build_fallback_routing_decision(
+                            routing_decision,
+                            original_model=primary_model,
+                            fallback_model=fallback_model,
+                            from_cache=True,
+                        ),
+                    )
+                try:
+                    response = await self._execute_model_request(
+                        request, fallback_model
+                    )
+                    return (
+                        response,
+                        fallback_model,
+                        self._build_fallback_routing_decision(
+                            routing_decision,
+                            original_model=primary_model,
+                            fallback_model=fallback_model,
+                        ),
+                    )
+                except AdmissionRejectedError as fallback_rejection:
+                    if not self.scheduler.allow_fallback_for_rejection(
+                        fallback_rejection.decision
+                    ):
+                        raise
+                    last_exception = fallback_rejection
+                except Exception as fallback_exc:
+                    self._record_failed_attempt(
+                        fallback_model,
+                        fallback_exc,
+                        fallback_started_at,
+                    )
+                    last_exception = fallback_exc
+            raise last_exception
         except Exception as exc:
             self._record_failed_attempt(primary_model, exc, primary_started_at)
             fallback_models = self._get_local_fallback_models(
@@ -2615,8 +2703,12 @@ class InferenceEngine:
                             fallback_model=fallback_model,
                         ),
                     )
-                except AdmissionRejectedError:
-                    raise
+                except AdmissionRejectedError as fallback_rejection:
+                    if not self.scheduler.allow_fallback_for_rejection(
+                        fallback_rejection.decision
+                    ):
+                        raise
+                    last_exception = fallback_rejection
                 except Exception as fallback_exc:
                     self._record_failed_attempt(
                         fallback_model,
@@ -2635,38 +2727,25 @@ class InferenceEngine:
         if not provider:
             raise ValueError(f"No provider available for model: {model_name}")
 
-        reservation = None
-        if self.admission_controller is not None:
-            model_info = self.router.get_model_info(model_name) or {}
-            provider_name = (
-                model_info.get("config", {}).get("provider")
-                or getattr(provider, "provider_name", None)
-                or "unknown"
-            )
-            decision = await self.admission_controller.acquire_provider(
-                request=request,
-                model_name=model_name,
-                provider=str(provider_name),
-                estimated_input_tokens=self._estimate_provider_admission_input_tokens(
-                    request
-                ),
-            )
-            if not decision.allowed:
-                raise AdmissionRejectedError(decision)
-            reservation = decision.reservation
-
-        response = None
-        try:
-            response = await self.batch_processor.add_request(
-                request, provider, model_name
-            )
-            return response
-        finally:
-            if reservation is not None:
-                await self.admission_controller.release(
-                    reservation,
-                    actual_tokens=response.total_tokens if response else None,
-                )
+        model_info = self.router.get_model_info(model_name) or {}
+        provider_name = (
+            model_info.get("config", {}).get("provider")
+            or getattr(provider, "provider_name", None)
+            or "unknown"
+        )
+        return await self.scheduler.run_provider_call(
+            request=request,
+            model_name=model_name,
+            provider=str(provider_name),
+            estimated_input_tokens=self._estimate_provider_admission_input_tokens(
+                request
+            ),
+            operation=lambda: self.batch_processor.add_request(
+                request,
+                provider,
+                model_name,
+            ),
+        )
 
     def _estimate_provider_admission_input_tokens(self, request: QueryRequest) -> int:
         """Estimate provider input tokens for admission budget reservation."""
@@ -3103,6 +3182,7 @@ class InferenceEngine:
                 self.web_search_tool and self.web_search_tool.enabled
             ),
             "rag_enabled": bool(self.rag_service and self.rag_service.enabled),
+            "scheduler": self.scheduler.get_health_status(),
             "stats": self.inference_stats,
         }
 

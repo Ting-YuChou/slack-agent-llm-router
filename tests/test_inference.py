@@ -5,7 +5,11 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.admission import AdmissionDecision, AdmissionReservation
+from src.admission import (
+    AdmissionDecision,
+    AdmissionRejectedError,
+    AdmissionReservation,
+)
 from src.llm_router_part2_inference import (
     AnthropicProvider,
     BatchProcessor,
@@ -54,6 +58,37 @@ class RecordingAdmissionController:
         return True
 
 
+class RejectingAdmissionController(RecordingAdmissionController):
+    def __init__(self, reasons):
+        super().__init__()
+        self.reasons = list(reasons)
+
+    async def acquire_provider(self, **kwargs):
+        self.provider_calls.append(kwargs)
+        if self.reasons:
+            reason = self.reasons.pop(0)
+            if reason:
+                return AdmissionDecision.reject(
+                    status_code=429,
+                    error="rate_limited",
+                    reason=reason,
+                    message="denied",
+                    retry_after_seconds=1,
+                )
+        return AdmissionDecision.allow(
+            AdmissionReservation(
+                reservation_id=f"r{len(self.provider_calls)}",
+                stage="provider",
+                reserved_tokens=kwargs["estimated_input_tokens"]
+                + kwargs["request"].max_tokens,
+                metadata={
+                    "model": kwargs["model_name"],
+                    "provider": kwargs["provider"],
+                },
+            )
+        )
+
+
 @pytest.fixture
 def inference_config():
     return {
@@ -74,6 +109,15 @@ def inference_config():
 
 
 class TestOpenAIProvider:
+    @pytest.mark.asyncio
+    async def test_initialize_reads_api_key_from_configured_env(self, monkeypatch):
+        monkeypatch.setenv("TEST_OPENAI_KEY", "env-openai-key")
+        with patch("src.llm_router_part2_inference.openai.AsyncOpenAI") as mock_openai:
+            provider = OpenAIProvider({"api_key_env": "TEST_OPENAI_KEY"})
+            await provider.initialize()
+
+        assert mock_openai.call_args.kwargs["api_key"] == "env-openai-key"
+
     @pytest.mark.asyncio
     async def test_generate_response_returns_complete_inference_response(
         self, sample_query_request
@@ -289,6 +333,17 @@ class TestOpenAIProvider:
 
 
 class TestAnthropicProvider:
+    @pytest.mark.asyncio
+    async def test_initialize_reads_api_key_from_configured_env(self, monkeypatch):
+        monkeypatch.setenv("TEST_ANTHROPIC_KEY", "env-anthropic-key")
+        with patch(
+            "src.llm_router_part2_inference.anthropic.AsyncAnthropic"
+        ) as mock_anthropic:
+            provider = AnthropicProvider({"api_key_env": "TEST_ANTHROPIC_KEY"})
+            await provider.initialize()
+
+        assert mock_anthropic.call_args.kwargs["api_key"] == "env-anthropic-key"
+
     @pytest.mark.asyncio
     async def test_generate_response_returns_complete_inference_response(
         self, sample_query_request
@@ -1550,6 +1605,67 @@ class TestInferenceEngine:
         provider.stream_response.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_stream_query_acquires_and_releases_scheduler_capacity(
+        self,
+        inference_config,
+        sample_query_request,
+    ):
+        class StreamingProvider:
+            provider_name = "openai"
+
+            async def stream_response(self, _request, _model_name):
+                yield "he"
+                yield "llo"
+
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="gpt-5")
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+        admission = RecordingAdmissionController()
+        engine = InferenceEngine(
+            inference_config,
+            router,
+            admission_controller=admission,
+        )
+        engine.providers = {"openai": StreamingProvider()}
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+
+        chunks = [chunk async for chunk in engine.stream_query(sample_query_request)]
+
+        assert "".join(chunks) == "hello"
+        assert [call["model_name"] for call in admission.provider_calls] == ["gpt-5"]
+        assert len(admission.releases) == 1
+        assert admission.releases[0][1] is None
+
+    @pytest.mark.asyncio
+    async def test_stream_query_scheduler_rejection_skips_provider_stream(
+        self,
+        inference_config,
+        sample_query_request,
+    ):
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="gpt-5")
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+        admission = RejectingAdmissionController(["provider_active_requests_exceeded"])
+        engine = InferenceEngine(
+            inference_config,
+            router,
+            admission_controller=admission,
+        )
+        provider = AsyncMock()
+        engine.providers = {"openai": provider}
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+
+        chunks = [chunk async for chunk in engine.stream_query(sample_query_request)]
+
+        assert chunks == ["Error: provider_active_requests_exceeded"]
+        provider.stream_response.assert_not_called()
+        assert admission.releases == []
+
+    @pytest.mark.asyncio
     async def test_process_query_publishes_error_completion_event_when_provider_missing(
         self,
         inference_config,
@@ -1953,3 +2069,134 @@ class TestInferenceEngine:
         ]
         assert admission.releases[0][1] is None
         assert admission.releases[1][1] == 25
+
+    @pytest.mark.asyncio
+    async def test_process_query_falls_back_on_provider_scheduler_rejection(
+        self,
+        inference_config,
+        sample_query_request,
+        inference_response_factory,
+    ):
+        from src.llm_router_part1_router import ModelRouter
+
+        router = ModelRouter(
+            {
+                "default_model": "gpt-5",
+                "routing_strategy": "intelligent",
+                "models": {
+                    "gpt-5": {
+                        "provider": "openai",
+                        "max_tokens": 128000,
+                        "cost_per_token": 0.00003,
+                        "priority": 2,
+                        "capabilities": ["general", "reasoning", "coding", "analysis"],
+                    },
+                    "mistral-7b": {
+                        "provider": "vllm",
+                        "model_path": "/models/mistral",
+                        "max_tokens": 4096,
+                        "cost_per_token": 0.0,
+                        "priority": 3,
+                        "capabilities": ["general", "coding"],
+                    },
+                },
+                "routing_rules": [],
+            }
+        )
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(
+                selected_model="gpt-5",
+                query_type=QueryType.GENERAL,
+                token_count=64,
+                routing_reason="Capability-based selection",
+            )
+        )
+        router.update_model_stats = MagicMock()
+
+        admission = RejectingAdmissionController(
+            ["provider_active_requests_exceeded", None]
+        )
+        engine = InferenceEngine(
+            inference_config,
+            router,
+            admission_controller=admission,
+        )
+        engine.providers = {"openai": AsyncMock(), "vllm": AsyncMock()}
+        engine.providers["openai"].generate_response = AsyncMock()
+        engine.providers["vllm"].generate_response = AsyncMock(
+            return_value=inference_response_factory(
+                model_name="mistral-7b",
+                provider="vllm",
+                total_tokens=25,
+                cost_usd=0.0,
+            )
+        )
+        engine.cache.get_cached_response = AsyncMock(side_effect=[None, None])
+        engine.cache.cache_response = AsyncMock()
+
+        response = await engine.process_query(sample_query_request)
+
+        assert response.model_name == "mistral-7b"
+        assert [call["model_name"] for call in admission.provider_calls] == [
+            "gpt-5",
+            "mistral-7b",
+        ]
+        engine.providers["openai"].generate_response.assert_not_called()
+        assert admission.releases[0][1] == 25
+
+    @pytest.mark.asyncio
+    async def test_process_query_does_not_fallback_on_global_scheduler_rejection(
+        self,
+        inference_config,
+        sample_query_request,
+    ):
+        from src.llm_router_part1_router import ModelRouter
+
+        router = ModelRouter(
+            {
+                "default_model": "gpt-5",
+                "routing_strategy": "intelligent",
+                "models": {
+                    "gpt-5": {
+                        "provider": "openai",
+                        "max_tokens": 128000,
+                        "cost_per_token": 0.00003,
+                        "priority": 2,
+                        "capabilities": ["general", "reasoning", "coding", "analysis"],
+                    },
+                    "mistral-7b": {
+                        "provider": "vllm",
+                        "model_path": "/models/mistral",
+                        "max_tokens": 4096,
+                        "cost_per_token": 0.0,
+                        "priority": 3,
+                        "capabilities": ["general", "coding"],
+                    },
+                },
+                "routing_rules": [],
+            }
+        )
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(
+                selected_model="gpt-5",
+                query_type=QueryType.GENERAL,
+                token_count=64,
+                routing_reason="Capability-based selection",
+            )
+        )
+        router.update_model_stats = MagicMock()
+
+        admission = RejectingAdmissionController(["global_token_budget_exceeded"])
+        engine = InferenceEngine(
+            inference_config,
+            router,
+            admission_controller=admission,
+        )
+        engine.providers = {"openai": AsyncMock(), "vllm": AsyncMock()}
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+
+        with pytest.raises(AdmissionRejectedError) as exc:
+            await engine.process_query(sample_query_request)
+
+        assert exc.value.decision.reason == "global_token_budget_exceeded"
+        assert [call["model_name"] for call in admission.provider_calls] == ["gpt-5"]

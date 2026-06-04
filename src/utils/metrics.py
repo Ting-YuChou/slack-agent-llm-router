@@ -344,6 +344,38 @@ class InferenceMetrics:
             ["model", "provider", "outcome"],  # hit, write, miss
         )
 
+        # Provider capacity scheduler metrics
+        self.scheduler_decisions = Counter(
+            "llm_router_provider_scheduler_decisions_total",
+            "Provider scheduler decisions",
+            ["provider", "model", "outcome", "reason"],
+        )
+
+        self.scheduler_queue_depth = Gauge(
+            "llm_router_provider_scheduler_queue_depth",
+            "Provider scheduler queue depth",
+            ["provider", "model"],
+        )
+
+        self.scheduler_queue_wait = Histogram(
+            "llm_router_provider_scheduler_queue_wait_seconds",
+            "Provider scheduler queue wait time",
+            ["provider", "model"],
+            buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
+        )
+
+        self.scheduler_circuit_state = Gauge(
+            "llm_router_provider_scheduler_circuit_state",
+            "Provider scheduler circuit breaker state",
+            ["provider", "model", "state"],
+        )
+
+        self.scheduler_retries = Counter(
+            "llm_router_provider_scheduler_retries_total",
+            "Provider scheduler retry attempts and outcomes",
+            ["provider", "model", "outcome"],
+        )
+
         # Context compression metrics
         self.context_compressions = Counter(
             "llm_router_context_compressions_total",
