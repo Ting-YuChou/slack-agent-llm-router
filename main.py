@@ -12,6 +12,7 @@ This is the unified entry point that orchestrates all system components:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import multiprocessing as mp
@@ -36,6 +37,12 @@ from pydantic import ValidationError
 from prometheus_client import start_http_server
 
 # Import all our components
+from src.admission import (
+    AdmissionDecision,
+    AdmissionRejectedError,
+    AdmissionReservation,
+    RedisAdmissionController,
+)
 from src.llm_router_part1_router import ModelRouter
 from src.llm_router_part2_inference import InferenceEngine
 from src.llm_router_part3_policy import PolicyMaterializer, RoutingPolicyCache
@@ -52,7 +59,12 @@ from src.utils.metrics import (
     sum_metric_by_label,
     sum_metric_values,
 )
-from src.utils.schema import PlatformConfig, QueryRequest, RagBatchRequest, RagQueryRequest
+from src.utils.schema import (
+    PlatformConfig,
+    QueryRequest,
+    RagBatchRequest,
+    RagQueryRequest,
+)
 from slack.bot import SlackBot
 
 
@@ -207,6 +219,18 @@ class LLMRouterPlatform:
         """Return whether Flink routing hints should be materialized into shared cache."""
         return bool(self.config.get("policy_cache", {}).get("enabled", False))
 
+    def _api_rate_limiting_config(self) -> Dict[str, Any]:
+        """Return API gateway admission/rate-limit config."""
+        return dict(self.config.get("api", {}).get("rate_limiting", {}) or {})
+
+    def _admission_enabled(self) -> bool:
+        """Return whether API admission control is enabled."""
+        return bool(self._api_rate_limiting_config().get("enabled", False))
+
+    def _get_admission_controller(self) -> Optional[Any]:
+        """Return the configured admission controller, if any."""
+        return self.services.get("admission")
+
     def _rag_enabled(self) -> bool:
         """Return whether school-document RAG is enabled."""
         return bool(self.config.get("rag", {}).get("enabled", False))
@@ -222,6 +246,12 @@ class LLMRouterPlatform:
                 config=self._build_event_producer_config()
             )
             await self.services["event_producer"].initialize()
+
+        if self._admission_enabled():
+            self.services["admission"] = RedisAdmissionController(
+                config=self._api_rate_limiting_config()
+            )
+            await self.services["admission"].initialize()
 
         if self._policy_cache_enabled():
             self.services["policy_cache"] = RoutingPolicyCache(
@@ -247,6 +277,7 @@ class LLMRouterPlatform:
             router=self.services["router"],
             event_producer=self.services.get("event_producer"),
             rag_service=self.services.get("rag"),
+            admission_controller=self.services.get("admission"),
         )
         await self.services["inference"].initialize()
 
@@ -544,6 +575,88 @@ class LLMRouterPlatform:
                 return True
         return False
 
+    def _admission_identifier(self, request: Request) -> Optional[str]:
+        """Build a stable non-secret identity for protected non-route admission."""
+        api_key = self._extract_api_key(request)
+        if api_key:
+            return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+        if request.client and request.client.host:
+            return f"ip:{request.client.host}"
+        return None
+
+    async def _admit_http_request(
+        self, request: Request
+    ) -> tuple[Optional[JSONResponse], Optional[AdmissionReservation]]:
+        """Apply lightweight admission to protected non-route API requests."""
+        admission = self._get_admission_controller()
+        if admission is None:
+            return self._missing_admission_response("http"), None
+
+        decision = await admission.acquire_http(
+            endpoint=request.url.path,
+            method=request.method,
+            identifier=self._admission_identifier(request),
+        )
+        if decision.allowed:
+            return None, decision.reservation
+        return self._build_admission_response(decision), None
+
+    async def _admit_route_request(
+        self, query_data: QueryRequest
+    ) -> tuple[Optional[JSONResponse], Optional[AdmissionReservation]]:
+        """Apply full route-level admission after QueryRequest validation."""
+        admission = self._get_admission_controller()
+        if admission is None:
+            return self._missing_admission_response("route"), None
+
+        decision = await admission.acquire_route(query_data)
+        if decision.allowed:
+            return None, decision.reservation
+        return self._build_admission_response(decision), None
+
+    async def _release_admission_reservation(
+        self,
+        reservation: Optional[AdmissionReservation],
+        *,
+        actual_tokens: Optional[int] = None,
+    ):
+        admission = self._get_admission_controller()
+        if admission is None or reservation is None:
+            return
+        await admission.release(reservation, actual_tokens=actual_tokens)
+
+    def _missing_admission_response(self, stage: str) -> Optional[JSONResponse]:
+        if not self._admission_enabled():
+            return None
+        config = self._api_rate_limiting_config()
+        if str(config.get("failure_mode", "closed")).lower() == "open":
+            return None
+        decision = AdmissionDecision.reject(
+            status_code=503,
+            error="admission_unavailable",
+            reason="admission_service_missing",
+            message="API admission control is enabled but not initialized",
+            retry_after_seconds=1,
+            metadata={"stage": stage},
+        )
+        return self._build_admission_response(decision)
+
+    def _build_admission_response(self, decision: AdmissionDecision) -> JSONResponse:
+        headers = {}
+        if decision.retry_after_seconds is not None:
+            headers["Retry-After"] = str(decision.retry_after_seconds)
+        return JSONResponse(
+            status_code=decision.status_code,
+            headers=headers,
+            content={
+                "error": decision.error,
+                "message": decision.message,
+                "reason": decision.reason,
+                "retry_after_seconds": decision.retry_after_seconds,
+                "details": decision.metadata,
+            },
+        )
+
     def _build_liveness_payload(self) -> Dict[str, Any]:
         """Build process liveness payload."""
         return {
@@ -563,6 +676,7 @@ class LLMRouterPlatform:
         service_status = self._get_service_status()
         required_services = ["router", "inference"]
         for optional_required in (
+            "admission",
             "event_producer",
             "pipeline",
             "policy_materializer",
@@ -1262,6 +1376,20 @@ class LLMRouterPlatform:
 
         return filtered_logs
 
+    async def _call_with_http_admission(self, request: Request, call_next):
+        """Run protected non-route requests through lightweight admission."""
+        if request.url.path == "/route" or not self._admission_enabled():
+            return await call_next(request)
+
+        response, reservation = await self._admit_http_request(request)
+        if response is not None:
+            return response
+
+        try:
+            return await call_next(request)
+        finally:
+            await self._release_admission_reservation(reservation)
+
     def _create_fastapi_app(self, lifespan=None) -> FastAPI:
         """Create FastAPI application with all endpoints"""
         app = FastAPI(
@@ -1289,7 +1417,7 @@ class LLMRouterPlatform:
                 return await call_next(request)
 
             if not self._api_key_auth_enabled():
-                return await call_next(request)
+                return await self._call_with_http_admission(request, call_next)
 
             source_ip = request.client.host if request.client else None
             if not self._api_key_auth_configured():
@@ -1310,7 +1438,7 @@ class LLMRouterPlatform:
                 )
 
             if self._is_valid_api_key(self._extract_api_key(request)):
-                return await call_next(request)
+                return await self._call_with_http_admission(request, call_next)
 
             security_logger.log_authentication_attempt(
                 user_id="anonymous",
@@ -1351,11 +1479,22 @@ class LLMRouterPlatform:
             method = "POST"
             start_time = time.perf_counter()
             status_code = 500
+            route_reservation: Optional[AdmissionReservation] = None
+            active_request_recorded = False
             active_requests = getattr(SYSTEM_METRICS, "active_requests", None)
-            if active_requests is not None:
-                active_requests.labels(endpoint=endpoint).inc()
 
             try:
+                admission_response, route_reservation = await self._admit_route_request(
+                    query_data
+                )
+                if admission_response is not None:
+                    status_code = admission_response.status_code
+                    return admission_response
+
+                if active_requests is not None:
+                    active_requests.labels(endpoint=endpoint).inc()
+                    active_request_recorded = True
+
                 await self._publish_request_raw_event(query_data)
                 result = await self.services["inference"].process_query(query_data)
                 status_code = 502 if result.error else 200
@@ -1363,6 +1502,9 @@ class LLMRouterPlatform:
                     status_code=status_code,
                     content=jsonable_encoder(result),
                 )
+            except AdmissionRejectedError as exc:
+                status_code = exc.decision.status_code
+                return self._build_admission_response(exc.decision)
             except Exception:
                 status_code = 500
                 self.logger.exception("Query processing error")
@@ -1381,8 +1523,9 @@ class LLMRouterPlatform:
                     duration_seconds=time.perf_counter() - start_time,
                     error_type="RouteError" if status_code >= 500 else None,
                 )
-                if active_requests is not None:
+                if active_requests is not None and active_request_recorded:
                     active_requests.labels(endpoint=endpoint).dec()
+                await self._release_admission_reservation(route_reservation)
 
         @app.post("/rag/documents")
         async def ingest_rag_document(
