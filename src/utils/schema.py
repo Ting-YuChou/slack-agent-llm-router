@@ -482,6 +482,39 @@ class RouterConfig(ConfigModel):
         return normalized
 
 
+class ProviderPoolEndpointConfig(ConfigModel):
+    name: Optional[str] = None
+    base_url: Optional[str] = None
+    host: Optional[str] = None
+    port: Optional[int] = Field(None, ge=1, le=65535)
+    models: List[str] = Field(default_factory=list)
+    weight: float = Field(1.0, gt=0)
+    max_outstanding: int = Field(0, ge=0)
+    health_path: str = "/health"
+    metrics_path: str = "/metrics"
+    prefix_cache_enabled: bool = True
+    enabled: bool = True
+
+
+class ProviderModelFallbackConfig(ConfigModel):
+    enabled: bool = False
+    fallbacks: Dict[str, List[str]] = Field(default_factory=dict)
+    allowed_query_types: List[str] = Field(
+        default_factory=lambda: [
+            QueryType.GENERAL.value,
+            QueryType.CODE_GENERATION.value,
+            QueryType.CODE_ANALYSIS.value,
+            QueryType.QUESTION_ANSWERING.value,
+        ]
+    )
+    max_input_tokens: int = Field(2048, ge=1)
+    max_output_tokens: int = Field(1024, ge=1)
+    disallow_attachments: bool = True
+    disallow_complex_reasoning: bool = True
+    disallow_required_tools: bool = True
+    disallow_required_rag: bool = True
+
+
 class ProviderEndpointConfig(ConfigModel):
     base_url: Optional[str] = None
     host: Optional[str] = None
@@ -489,6 +522,19 @@ class ProviderEndpointConfig(ConfigModel):
     timeout: Optional[int] = Field(None, ge=1)
     max_retries: Optional[int] = Field(None, ge=0)
     api_mode: Optional[str] = Field(None, pattern=r"^(completions|chat_completions)$")
+    endpoints: List[ProviderPoolEndpointConfig] = Field(default_factory=list)
+    routing_strategy: Optional[str] = Field(
+        None, pattern=r"^(least_outstanding|least_outstanding_prefix_aware)$"
+    )
+    health_check_interval_seconds: Optional[float] = Field(None, gt=0)
+    failure_cooldown_seconds: Optional[float] = Field(None, ge=0)
+    metrics_refresh_seconds: Optional[float] = Field(None, gt=0)
+    prefix_affinity_ttl_seconds: Optional[float] = Field(None, ge=0)
+    metrics_scrape_enabled: bool = False
+    validate_models_on_health: bool = False
+    model_fallback: ProviderModelFallbackConfig = Field(
+        default_factory=ProviderModelFallbackConfig
+    )
 
 
 class CompressionConfig(ConfigModel):

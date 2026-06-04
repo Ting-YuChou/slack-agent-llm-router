@@ -219,9 +219,64 @@ def test_provider_endpoint_config_accepts_chat_completions_api_mode():
     assert config.api_mode == "chat_completions"
 
 
+def test_provider_endpoint_config_accepts_vllm_pool_endpoints():
+    config = ProviderEndpointConfig(
+        api_mode="chat_completions",
+        routing_strategy="least_outstanding_prefix_aware",
+        health_check_interval_seconds=10,
+        failure_cooldown_seconds=30,
+        metrics_refresh_seconds=5,
+        prefix_affinity_ttl_seconds=120,
+        metrics_scrape_enabled=True,
+        endpoints=[
+            {
+                "name": "qwen-a",
+                "base_url": "http://127.0.0.1:8001",
+                "models": ["qwen3.6-27b-fast"],
+                "weight": 2.0,
+                "max_outstanding": 4,
+                "health_path": "/health",
+                "metrics_path": "/metrics",
+                "prefix_cache_enabled": True,
+                "enabled": True,
+            }
+        ],
+    )
+
+    assert config.endpoints[0].name == "qwen-a"
+    assert config.endpoints[0].models == ["qwen3.6-27b-fast"]
+    assert config.endpoints[0].max_outstanding == 4
+    assert config.metrics_scrape_enabled is True
+
+
+def test_provider_endpoint_config_accepts_vllm_model_fallback_policy():
+    config = ProviderEndpointConfig(
+        model_fallback={
+            "enabled": True,
+            "fallbacks": {"qwen3.6-27b-fast": ["mistral-7b"]},
+            "allowed_query_types": ["general", "code_generation"],
+            "max_input_tokens": 2048,
+            "max_output_tokens": 1024,
+            "disallow_attachments": True,
+            "disallow_complex_reasoning": True,
+            "disallow_required_tools": True,
+            "disallow_required_rag": True,
+        }
+    )
+
+    assert config.model_fallback.enabled is True
+    assert config.model_fallback.fallbacks == {"qwen3.6-27b-fast": ["mistral-7b"]}
+    assert config.model_fallback.max_input_tokens == 2048
+
+
 def test_provider_endpoint_config_rejects_unknown_api_mode():
     with pytest.raises(ValidationError):
         ProviderEndpointConfig(api_mode="responses")
+
+
+def test_provider_endpoint_config_rejects_unknown_routing_strategy():
+    with pytest.raises(ValidationError):
+        ProviderEndpointConfig(routing_strategy="random")
 
 
 def test_platform_config_rejects_unknown_slack_state_backend():
@@ -378,6 +433,10 @@ def test_checked_in_default_config_uses_qwen_fast_lane():
     assert validated.router.models["qwen3.6-27b-fast"].provider == "vllm"
     assert validated.router.models["qwen3.6-27b-fast"].max_tokens == 32768
     assert validated.inference.vllm.api_mode == "chat_completions"
+    assert validated.inference.vllm.model_fallback.enabled is True
+    assert validated.inference.vllm.model_fallback.fallbacks == {
+        "qwen3.6-27b-fast": ["mistral-7b"]
+    }
 
 
 def test_compose_and_default_config_keep_flink_topics_in_sync():

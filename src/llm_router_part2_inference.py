@@ -50,6 +50,31 @@ class PromptSections:
     query: str
 
 
+@dataclass
+class VLLMEndpointState:
+    """Runtime state for one vLLM serving endpoint."""
+
+    name: str
+    base_url: str
+    models: List[str] = field(default_factory=list)
+    weight: float = 1.0
+    max_outstanding: int = 0
+    health_path: str = "/health"
+    metrics_path: str = "/metrics"
+    prefix_cache_enabled: bool = True
+    enabled: bool = True
+    client: Optional[httpx.AsyncClient] = None
+    healthy: bool = True
+    outstanding: int = 0
+    queue_depth: int = 0
+    running_requests: int = 0
+    kv_cache_usage: Optional[float] = None
+    last_health_check: float = 0.0
+    last_metrics_refresh: float = 0.0
+    cooldown_until: float = 0.0
+    last_error: Optional[str] = None
+
+
 RAG_AUTO_STRONG_TERMS = {
     "academic calendar",
     "admissions",
@@ -1129,125 +1154,145 @@ class vLLMProvider(BaseInferenceProvider):
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        configured_base_url = config.get("base_url")
-        if configured_base_url:
-            self.base_url = str(configured_base_url).rstrip("/")
-        else:
-            self.base_url = (
-                f"http://{config.get('host', 'localhost')}:{config.get('port', 8000)}"
-            )
+        self.endpoints = self._build_endpoint_states(config)
+        self.base_url = self.endpoints[0].base_url
         self.api_mode = str(config.get("api_mode", "completions")).lower()
+        self.routing_strategy = str(
+            config.get("routing_strategy", "least_outstanding_prefix_aware")
+        ).lower()
+        self.health_check_interval_seconds = float(
+            config.get("health_check_interval_seconds", 15)
+        )
+        self.failure_cooldown_seconds = float(
+            config.get("failure_cooldown_seconds", 30)
+        )
+        self.metrics_refresh_seconds = float(config.get("metrics_refresh_seconds", 5))
+        self.prefix_affinity_ttl_seconds = float(
+            config.get("prefix_affinity_ttl_seconds", 300)
+        )
+        self.metrics_scrape_enabled = bool(config.get("metrics_scrape_enabled", False))
+        self.validate_models_on_health = bool(
+            config.get("validate_models_on_health", False)
+        )
         self.http_client = None
+        self._pool_lock = asyncio.Lock()
+        self._prefix_affinity: Dict[str, Tuple[str, float]] = {}
 
     async def initialize(self):
-        """Initialize vLLM client"""
-        self.http_client = httpx.AsyncClient(
-            base_url=self.base_url,
-            timeout=self.config.get(
-                "timeout", 300
-            ),  # Longer timeout for local inference
+        """Initialize vLLM clients and run endpoint health checks."""
+        for endpoint in self.endpoints:
+            if not endpoint.enabled:
+                endpoint.healthy = False
+                endpoint.last_error = "Endpoint disabled"
+                continue
+
+            endpoint.client = httpx.AsyncClient(
+                base_url=endpoint.base_url,
+                timeout=self.config.get(
+                    "timeout", 300
+                ),  # Longer timeout for local inference
+            )
+            if self.http_client is None:
+                self.http_client = endpoint.client
+
+            await self._refresh_endpoint_health(endpoint, force=True)
+            await self._refresh_endpoint_metrics(endpoint, force=True)
+
+        healthy_count = sum(
+            1 for endpoint in self.endpoints if endpoint.enabled and endpoint.healthy
         )
+        if healthy_count:
+            logger.info(
+                "vLLM provider initialized with %s healthy endpoint(s)",
+                healthy_count,
+            )
+        else:
+            logger.warning("vLLM provider initialized with no healthy endpoints")
 
-        # Test connection
-        try:
-            response = await self.http_client.get("/health")
-            if response.status_code == 200:
-                logger.info("vLLM provider initialized successfully")
-            else:
-                logger.warning(f"vLLM health check failed: {response.status_code}")
-        except Exception as e:
-            logger.error(f"vLLM initialization error: {e}")
-
-    @retry(
-        stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=2, max=8)
-    )
     async def generate_response(
         self, request: QueryRequest, model_name: str
     ) -> InferenceResponse:
         """Generate response using vLLM"""
         start_time = time.time()
+        prompt = self._build_prompt(request)
+        endpoint_path, payload = self._build_request_payload(
+            prompt, model_name, request, stream=False
+        )
+        prefix_key = self._prompt_prefix_fingerprint(model_name, prompt)
+        excluded_endpoints: set[str] = set()
+        last_error: Optional[Exception] = None
+        attempts = max(1, self._candidate_endpoint_count(model_name))
 
-        try:
-            prompt = self._build_prompt(request)
-
-            if self.api_mode == "chat_completions":
-                endpoint = "/v1/chat/completions"
-                payload = {
-                    "model": model_name,
-                    "messages": self._build_chat_messages(prompt),
-                    "max_tokens": request.max_tokens,
-                    "temperature": request.temperature,
-                    "stream": False,
-                }
-            else:
-                endpoint = "/v1/completions"
-                payload = {
-                    "model": model_name,
-                    "prompt": prompt,
-                    "max_tokens": request.max_tokens,
-                    "temperature": request.temperature,
-                    "stream": False,
-                    "logprobs": None,
-                }
-
-            # Make request to vLLM server
-            response = await self.http_client.post(endpoint, json=payload)
-            response.raise_for_status()
-
-            data = response.json()
-            generated_text = self._extract_response_text(data)
-            usage = data.get("usage", {})
-
-            return InferenceResponse(
-                response_text=generated_text,
-                model_name=model_name,
-                token_count_input=usage.get("prompt_tokens", 0),
-                token_count_output=usage.get("completion_tokens", 0),
-                total_tokens=usage.get("total_tokens", 0)
-                or (usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)),
-                latency_ms=int((time.time() - start_time) * 1000),
-                tokens_per_second=(
-                    usage.get("completion_tokens", 0)
-                    / max(time.time() - start_time, 1e-6)
-                ),
-                cost_usd=0.0,  # Self-hosted models have no API cost
-                provider="vllm",
-                cached=False,
+        for _ in range(attempts):
+            endpoint = await self._reserve_endpoint(
+                model_name, prefix_key, excluded_endpoints
             )
 
-        except Exception as e:
-            logger.error(f"vLLM inference error: {e}")
-            raise
+            try:
+                client = self._endpoint_client(endpoint)
+                if client is None:
+                    raise RuntimeError(f"vLLM endpoint {endpoint.name} has no client")
+
+                response = await client.post(endpoint_path, json=payload)
+                response.raise_for_status()
+
+                data = response.json()
+                generated_text = self._extract_response_text(data)
+                usage = data.get("usage", {})
+                await self._mark_endpoint_success(endpoint, prefix_key)
+
+                return InferenceResponse(
+                    response_text=generated_text,
+                    model_name=model_name,
+                    token_count_input=usage.get("prompt_tokens", 0),
+                    token_count_output=usage.get("completion_tokens", 0),
+                    total_tokens=usage.get("total_tokens", 0)
+                    or (
+                        usage.get("prompt_tokens", 0)
+                        + usage.get("completion_tokens", 0)
+                    ),
+                    latency_ms=int((time.time() - start_time) * 1000),
+                    tokens_per_second=(
+                        usage.get("completion_tokens", 0)
+                        / max(time.time() - start_time, 1e-6)
+                    ),
+                    cost_usd=0.0,  # Self-hosted models have no API cost
+                    provider="vllm",
+                    cached=False,
+                )
+
+            except Exception as e:
+                last_error = e
+                excluded_endpoints.add(endpoint.name)
+                await self._mark_endpoint_failure(endpoint, e)
+                logger.error(
+                    "vLLM inference error on endpoint %s: %s", endpoint.name, e
+                )
+
+            finally:
+                await self._release_endpoint(endpoint)
+
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"No healthy vLLM endpoint can serve model {model_name}")
 
     async def stream_response(
         self, request: QueryRequest, model_name: str
     ) -> AsyncIterator[str]:
         """Stream response using vLLM"""
+        endpoint: Optional[VLLMEndpointState] = None
         try:
             prompt = self._build_prompt(request)
+            endpoint_path, payload = self._build_request_payload(
+                prompt, model_name, request, stream=True
+            )
+            prefix_key = self._prompt_prefix_fingerprint(model_name, prompt)
+            endpoint = await self._reserve_endpoint(model_name, prefix_key, set())
+            client = self._endpoint_client(endpoint)
+            if client is None:
+                raise RuntimeError(f"vLLM endpoint {endpoint.name} has no client")
 
-            if self.api_mode == "chat_completions":
-                endpoint = "/v1/chat/completions"
-                payload = {
-                    "model": model_name,
-                    "messages": self._build_chat_messages(prompt),
-                    "max_tokens": request.max_tokens,
-                    "temperature": request.temperature,
-                    "stream": True,
-                }
-            else:
-                endpoint = "/v1/completions"
-                payload = {
-                    "model": model_name,
-                    "prompt": prompt,
-                    "max_tokens": request.max_tokens,
-                    "temperature": request.temperature,
-                    "stream": True,
-                }
-
-            async with self.http_client.stream(
-                "POST", endpoint, json=payload
-            ) as response:
+            async with client.stream("POST", endpoint_path, json=payload) as response:
                 async for line in response.aiter_lines():
                     if not line.startswith("data: "):
                         continue
@@ -1258,14 +1303,389 @@ class vLLMProvider(BaseInferenceProvider):
                     delta = self._extract_stream_delta(data)
                     if delta:
                         yield delta
+            await self._mark_endpoint_success(endpoint, prefix_key)
 
         except Exception as e:
+            if endpoint is not None:
+                await self._mark_endpoint_failure(endpoint, e)
             logger.error(f"vLLM streaming error: {e}")
             yield f"Error: {str(e)}"
+
+        finally:
+            if endpoint is not None:
+                await self._release_endpoint(endpoint)
+
+    def _build_endpoint_states(self, config: Dict[str, Any]) -> List[VLLMEndpointState]:
+        endpoint_configs = config.get("endpoints") or []
+        if not endpoint_configs:
+            endpoint_configs = [
+                {
+                    "name": "default",
+                    "base_url": self._configured_base_url(config),
+                    "models": config.get("models_available") or [],
+                    "weight": config.get("weight", 1.0),
+                    "max_outstanding": config.get("max_outstanding", 0),
+                    "health_path": config.get("health_path", "/health"),
+                    "metrics_path": config.get("metrics_path", "/metrics"),
+                    "prefix_cache_enabled": config.get("prefix_cache_enabled", True),
+                    "enabled": True,
+                }
+            ]
+
+        endpoints: List[VLLMEndpointState] = []
+        used_names: set[str] = set()
+        for index, endpoint_config in enumerate(endpoint_configs):
+            endpoint_dict = dict(endpoint_config or {})
+            name = str(endpoint_dict.get("name") or f"endpoint-{index + 1}")
+            if name in used_names:
+                name = f"{name}-{index + 1}"
+            used_names.add(name)
+            endpoints.append(
+                VLLMEndpointState(
+                    name=name,
+                    base_url=self._configured_base_url(endpoint_dict).rstrip("/"),
+                    models=self._normalize_model_list(endpoint_dict.get("models", [])),
+                    weight=max(float(endpoint_dict.get("weight", 1.0)), 0.001),
+                    max_outstanding=max(
+                        int(endpoint_dict.get("max_outstanding", 0)), 0
+                    ),
+                    health_path=self._normalize_path(
+                        endpoint_dict.get("health_path", "/health")
+                    ),
+                    metrics_path=self._normalize_path(
+                        endpoint_dict.get("metrics_path", "/metrics")
+                    ),
+                    prefix_cache_enabled=bool(
+                        endpoint_dict.get("prefix_cache_enabled", True)
+                    ),
+                    enabled=bool(endpoint_dict.get("enabled", True)),
+                )
+            )
+
+        return endpoints or [
+            VLLMEndpointState(
+                name="default", base_url=self._configured_base_url(config)
+            )
+        ]
+
+    def _configured_base_url(self, config: Dict[str, Any]) -> str:
+        configured_base_url = config.get("base_url")
+        if configured_base_url:
+            return str(configured_base_url).rstrip("/")
+        return f"http://{config.get('host', 'localhost')}:{config.get('port', 8000)}"
+
+    def _normalize_model_list(self, models: Any) -> List[str]:
+        if models is None:
+            return []
+        if isinstance(models, str):
+            return [models]
+        if isinstance(models, Sequence):
+            return [str(model) for model in models]
+        return []
+
+    def _normalize_path(self, path: Any) -> str:
+        path_value = str(path or "/")
+        return path_value if path_value.startswith("/") else f"/{path_value}"
+
+    def _build_request_payload(
+        self,
+        prompt: str,
+        model_name: str,
+        request: QueryRequest,
+        *,
+        stream: bool,
+    ) -> Tuple[str, Dict[str, Any]]:
+        if self.api_mode == "chat_completions":
+            return (
+                "/v1/chat/completions",
+                {
+                    "model": model_name,
+                    "messages": self._build_chat_messages(prompt),
+                    "max_tokens": request.max_tokens,
+                    "temperature": request.temperature,
+                    "stream": stream,
+                },
+            )
+
+        return (
+            "/v1/completions",
+            {
+                "model": model_name,
+                "prompt": prompt,
+                "max_tokens": request.max_tokens,
+                "temperature": request.temperature,
+                "stream": stream,
+                "logprobs": None,
+            },
+        )
 
     def _build_chat_messages(self, prompt: str) -> List[Dict[str, str]]:
         """Build OpenAI-compatible chat messages for vLLM chat templates."""
         return [{"role": "user", "content": prompt}]
+
+    def _prompt_prefix_fingerprint(self, model_name: str, prompt: str) -> str:
+        prefix = prompt[:4096]
+        payload = f"{model_name}\n{prefix}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    async def _reserve_endpoint(
+        self,
+        model_name: str,
+        prefix_key: str,
+        excluded_names: set[str],
+    ) -> VLLMEndpointState:
+        await self._refresh_pool_state()
+        async with self._pool_lock:
+            endpoint = self._select_endpoint_locked(
+                model_name, prefix_key, excluded_names
+            )
+            endpoint.outstanding += 1
+            return endpoint
+
+    async def _release_endpoint(self, endpoint: VLLMEndpointState):
+        async with self._pool_lock:
+            endpoint.outstanding = max(endpoint.outstanding - 1, 0)
+
+    async def _mark_endpoint_success(
+        self, endpoint: VLLMEndpointState, prefix_key: str
+    ):
+        async with self._pool_lock:
+            endpoint.healthy = True
+            endpoint.last_error = None
+            endpoint.cooldown_until = 0.0
+            if endpoint.prefix_cache_enabled and self._prefix_affinity_enabled():
+                self._prefix_affinity[prefix_key] = (
+                    endpoint.name,
+                    time.time() + self.prefix_affinity_ttl_seconds,
+                )
+
+    async def _mark_endpoint_failure(
+        self, endpoint: VLLMEndpointState, error: Exception
+    ):
+        async with self._pool_lock:
+            endpoint.healthy = False
+            endpoint.last_error = str(error)
+            endpoint.cooldown_until = time.time() + self.failure_cooldown_seconds
+
+    def _select_endpoint_locked(
+        self,
+        model_name: str,
+        prefix_key: str,
+        excluded_names: set[str],
+    ) -> VLLMEndpointState:
+        now = time.time()
+        self._prune_prefix_affinity(now)
+
+        if self._prefix_affinity_enabled():
+            affinity = self._prefix_affinity.get(prefix_key)
+            if affinity:
+                endpoint_name, _ = affinity
+                endpoint = self._endpoint_by_name(endpoint_name)
+                if (
+                    endpoint
+                    and endpoint.name not in excluded_names
+                    and endpoint.prefix_cache_enabled
+                    and self._endpoint_available(endpoint, model_name, now)
+                    and not self._endpoint_saturated(endpoint)
+                ):
+                    return endpoint
+
+        candidates = [
+            endpoint
+            for endpoint in self.endpoints
+            if endpoint.name not in excluded_names
+            and self._endpoint_available(endpoint, model_name, now)
+        ]
+        unsaturated = [
+            endpoint
+            for endpoint in candidates
+            if not self._endpoint_saturated(endpoint)
+        ]
+        if unsaturated:
+            return min(unsaturated, key=self._endpoint_score)
+        if candidates:
+            return min(candidates, key=self._endpoint_score)
+        raise RuntimeError(f"No healthy vLLM endpoint can serve model {model_name}")
+
+    def _endpoint_available(
+        self, endpoint: VLLMEndpointState, model_name: str, now: float
+    ) -> bool:
+        if not endpoint.enabled:
+            return False
+        if not self._endpoint_accepts_model(endpoint, model_name):
+            return False
+        if endpoint.healthy:
+            return True
+        return endpoint.cooldown_until <= now
+
+    def _endpoint_accepts_model(
+        self, endpoint: VLLMEndpointState, model_name: str
+    ) -> bool:
+        return not endpoint.models or model_name in endpoint.models
+
+    def _endpoint_saturated(self, endpoint: VLLMEndpointState) -> bool:
+        return bool(
+            endpoint.max_outstanding
+            and endpoint.outstanding >= endpoint.max_outstanding
+        )
+
+    def _endpoint_score(self, endpoint: VLLMEndpointState) -> float:
+        load = endpoint.outstanding + endpoint.queue_depth + endpoint.running_requests
+        return load / max(endpoint.weight, 0.001)
+
+    def _endpoint_by_name(self, name: str) -> Optional[VLLMEndpointState]:
+        for endpoint in self.endpoints:
+            if endpoint.name == name:
+                return endpoint
+        return None
+
+    def _endpoint_client(self, endpoint: VLLMEndpointState) -> Optional[Any]:
+        return endpoint.client or self.http_client
+
+    def _candidate_endpoint_count(self, model_name: str) -> int:
+        count = sum(
+            1
+            for endpoint in self.endpoints
+            if endpoint.enabled and self._endpoint_accepts_model(endpoint, model_name)
+        )
+        return count or 1
+
+    def _prefix_affinity_enabled(self) -> bool:
+        return (
+            "prefix" in self.routing_strategy and self.prefix_affinity_ttl_seconds > 0
+        )
+
+    def _prune_prefix_affinity(self, now: float):
+        expired_keys = [
+            prefix_key
+            for prefix_key, (_, expires_at) in self._prefix_affinity.items()
+            if expires_at <= now
+        ]
+        for prefix_key in expired_keys:
+            self._prefix_affinity.pop(prefix_key, None)
+
+    async def _refresh_pool_state(self):
+        for endpoint in self.endpoints:
+            await self._refresh_endpoint_health(endpoint)
+            await self._refresh_endpoint_metrics(endpoint)
+
+    async def _refresh_endpoint_health(
+        self, endpoint: VLLMEndpointState, *, force: bool = False
+    ):
+        if not endpoint.enabled:
+            return
+        if endpoint.client is None:
+            return
+
+        now = time.time()
+        if (
+            not force
+            and endpoint.last_health_check > 0
+            and now - endpoint.last_health_check < self.health_check_interval_seconds
+        ):
+            return
+        if not force and endpoint.last_health_check <= 0:
+            return
+
+        endpoint.last_health_check = now
+        try:
+            response = await endpoint.client.get(endpoint.health_path)
+            if response.status_code != 200:
+                raise RuntimeError(f"health check returned {response.status_code}")
+
+            if self.validate_models_on_health:
+                await self._validate_endpoint_models(endpoint)
+
+            endpoint.healthy = True
+            endpoint.last_error = None
+            endpoint.cooldown_until = 0.0
+        except Exception as e:
+            endpoint.healthy = False
+            endpoint.last_error = str(e)
+            endpoint.cooldown_until = time.time() + self.failure_cooldown_seconds
+            logger.warning("vLLM endpoint %s health check failed: %s", endpoint.name, e)
+
+    async def _validate_endpoint_models(self, endpoint: VLLMEndpointState):
+        if not endpoint.models:
+            return
+        response = await endpoint.client.get("/v1/models")
+        if response.status_code != 200:
+            raise RuntimeError(f"model list returned {response.status_code}")
+        data = response.json()
+        model_ids = {
+            str(item.get("id"))
+            for item in data.get("data", [])
+            if isinstance(item, dict) and item.get("id")
+        }
+        missing = [model for model in endpoint.models if model not in model_ids]
+        if missing:
+            raise RuntimeError(
+                f"endpoint missing configured model(s): {', '.join(missing)}"
+            )
+
+    async def _refresh_endpoint_metrics(
+        self, endpoint: VLLMEndpointState, *, force: bool = False
+    ):
+        if not self.metrics_scrape_enabled or not endpoint.enabled:
+            return
+        if endpoint.client is None:
+            return
+
+        now = time.time()
+        if (
+            not force
+            and endpoint.last_metrics_refresh > 0
+            and now - endpoint.last_metrics_refresh < self.metrics_refresh_seconds
+        ):
+            return
+        if not force and endpoint.last_metrics_refresh <= 0:
+            return
+
+        endpoint.last_metrics_refresh = now
+        try:
+            response = await endpoint.client.get(endpoint.metrics_path)
+            if response.status_code != 200:
+                raise RuntimeError(f"metrics returned {response.status_code}")
+            metrics = self._parse_vllm_metrics(response.text)
+            endpoint.running_requests = metrics["running_requests"]
+            endpoint.queue_depth = metrics["queue_depth"]
+            endpoint.kv_cache_usage = metrics["kv_cache_usage"]
+        except Exception as e:
+            endpoint.last_error = str(e)
+            logger.warning(
+                "vLLM endpoint %s metrics scrape failed: %s", endpoint.name, e
+            )
+
+    def _parse_vllm_metrics(self, metrics_text: str) -> Dict[str, Any]:
+        running_requests = 0
+        queue_depth = 0
+        kv_cache_usage: Optional[float] = None
+
+        for raw_line in metrics_text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            metric_name = parts[0].split("{", 1)[0]
+            try:
+                value = float(parts[-1])
+            except ValueError:
+                continue
+
+            if metric_name == "vllm:num_requests_running":
+                running_requests += int(value)
+            elif metric_name == "vllm:num_requests_waiting":
+                queue_depth += int(value)
+            elif metric_name == "vllm:gpu_cache_usage_perc":
+                kv_cache_usage = max(kv_cache_usage or 0.0, value)
+
+        return {
+            "running_requests": running_requests,
+            "queue_depth": queue_depth,
+            "kv_cache_usage": kv_cache_usage,
+        }
 
     def _extract_response_text(self, data: Dict[str, Any]) -> str:
         choice = data["choices"][0]
@@ -1302,15 +1722,50 @@ class vLLMProvider(BaseInferenceProvider):
 
     def get_health_status(self) -> Dict[str, Any]:
         """Get vLLM provider health status"""
+        endpoint_statuses = [
+            {
+                "name": endpoint.name,
+                "base_url": endpoint.base_url,
+                "enabled": endpoint.enabled,
+                "healthy": endpoint.healthy,
+                "outstanding": endpoint.outstanding,
+                "queue_depth": endpoint.queue_depth,
+                "running_requests": endpoint.running_requests,
+                "kv_cache_usage": endpoint.kv_cache_usage,
+                "models": endpoint.models,
+                "last_error": endpoint.last_error,
+                "cooldown_until": endpoint.cooldown_until,
+            }
+            for endpoint in self.endpoints
+        ]
+        pool_has_client = bool(self.http_client) or any(
+            endpoint.client for endpoint in self.endpoints
+        )
+        pool_healthy = any(
+            endpoint.enabled and endpoint.healthy for endpoint in self.endpoints
+        )
         return {
             "provider": "vllm",
-            "status": "healthy" if self.http_client else "unhealthy",
+            "status": "healthy" if pool_has_client and pool_healthy else "unhealthy",
             "base_url": self.base_url,
             "api_mode": self.api_mode,
             "models_available": self.config.get(
                 "models_available", ["qwen3.6-27b-fast"]
             ),
+            "routing_strategy": self.routing_strategy,
+            "endpoints": endpoint_statuses,
         }
+
+    async def aclose(self):
+        """Close all endpoint HTTP clients."""
+        closed_clients = set()
+        for endpoint in self.endpoints:
+            client = endpoint.client
+            if client and id(client) not in closed_clients:
+                await client.aclose()
+                closed_clients.add(id(client))
+        if self.http_client and id(self.http_client) not in closed_clients:
+            await self.http_client.aclose()
 
 
 class BatchProcessor:
@@ -1578,6 +2033,9 @@ class InferenceEngine:
             return False
 
         if config.get("base_url"):
+            return True
+
+        if config.get("endpoints"):
             return True
 
         return bool(config.get("host")) and bool(config.get("port"))
@@ -2275,57 +2733,174 @@ class InferenceEngine:
         routing_decision: Any,
         exclude_models: Optional[List[str]] = None,
     ) -> List[str]:
-        """Rank local vLLM candidates that can safely replace a failed cloud model."""
+        """Return local vLLM candidates that can safely replace a failed model."""
         selected_model = routing_decision.selected_model
         selected_model_info = self.router.get_model_info(selected_model)
         if not selected_model_info:
             return []
 
         selected_provider = selected_model_info["config"]["provider"].lower()
-        if selected_provider == "vllm":
-            return []
-
         exclude = set(exclude_models or [])
-        context = {
-            "query_type": (
-                routing_decision.query_type.value
-                if hasattr(routing_decision, "query_type")
-                and hasattr(routing_decision.query_type, "value")
-                else str(getattr(routing_decision, "query_type", "general"))
-            ),
-            "token_count": getattr(
+        context = self._build_local_fallback_context(request, routing_decision)
+
+        if selected_provider == "vllm":
+            return self._get_configured_vllm_model_fallbacks(
+                selected_model,
+                request,
                 routing_decision,
-                "token_count",
-                self.router.token_counter.count_tokens(request.query),
-            ),
+                context,
+                exclude,
+            )
+
+        return self._rank_local_vllm_fallback_candidates(context, exclude)
+
+    def _build_local_fallback_context(
+        self, request: QueryRequest, routing_decision: Any
+    ) -> Dict[str, Any]:
+        query_type = getattr(routing_decision, "query_type", QueryType.GENERAL.value)
+        if hasattr(query_type, "value"):
+            query_type = query_type.value
+        else:
+            query_type = str(query_type)
+
+        token_count = getattr(routing_decision, "token_count", None)
+        if token_count is None:
+            token_count = self._estimate_provider_admission_input_tokens(request)
+
+        context = {
+            "query_type": query_type,
+            "token_count": int(token_count),
             "user_tier": request.user_tier,
             "priority": request.priority,
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
             "has_attachments": bool(request.attachments),
         }
+        return context
+
+    def _get_configured_vllm_model_fallbacks(
+        self,
+        selected_model: str,
+        request: QueryRequest,
+        routing_decision: Any,
+        context: Dict[str, Any],
+        exclude: set[str],
+    ) -> List[str]:
+        policy = self._vllm_model_fallback_config()
+        if not self._vllm_model_fallback_allowed(
+            policy, request, routing_decision, context
+        ):
+            return []
+
+        fallback_map = policy.get("fallbacks") or {}
+        configured_models = self._normalize_fallback_model_list(
+            fallback_map.get(selected_model, [])
+        )
+
+        fallback_models = []
+        for fallback_model in configured_models:
+            if fallback_model in exclude:
+                continue
+            if self._local_vllm_fallback_model_eligible(fallback_model, context):
+                fallback_models.append(fallback_model)
+        return fallback_models
+
+    def _vllm_model_fallback_config(self) -> Dict[str, Any]:
+        vllm_config = dict(self.config.get("vllm", {}) or {})
+        return dict(vllm_config.get("model_fallback", {}) or {})
+
+    def _normalize_fallback_model_list(self, models: Any) -> List[str]:
+        if models is None:
+            return []
+        if isinstance(models, str):
+            return [models]
+        if isinstance(models, Sequence):
+            return [str(model) for model in models]
+        return []
+
+    def _vllm_model_fallback_allowed(
+        self,
+        policy: Dict[str, Any],
+        request: QueryRequest,
+        routing_decision: Any,
+        context: Dict[str, Any],
+    ) -> bool:
+        if not bool(policy.get("enabled", False)):
+            return False
+
+        allowed_query_types = set(
+            self._normalize_fallback_model_list(
+                policy.get(
+                    "allowed_query_types",
+                    [
+                        QueryType.GENERAL.value,
+                        QueryType.CODE_GENERATION.value,
+                        QueryType.CODE_ANALYSIS.value,
+                        QueryType.QUESTION_ANSWERING.value,
+                    ],
+                )
+            )
+        )
+        if context["query_type"] not in allowed_query_types:
+            return False
+
+        max_input_tokens = int(policy.get("max_input_tokens", 2048) or 2048)
+        if int(context["token_count"]) > max_input_tokens:
+            return False
+
+        max_output_tokens = int(policy.get("max_output_tokens", 1024) or 1024)
+        if int(request.max_tokens) > max_output_tokens:
+            return False
+
+        if bool(policy.get("disallow_attachments", True)) and request.attachments:
+            return False
+
+        if bool(policy.get("disallow_required_tools", True)):
+            tool_policy = getattr(
+                request.tool_policy, "value", str(request.tool_policy)
+            )
+            if tool_policy == ToolPolicy.REQUIRED.value:
+                return False
+
+        if bool(policy.get("disallow_required_rag", True)):
+            rag_policy = getattr(request.rag_policy, "value", str(request.rag_policy))
+            if rag_policy == RagPolicy.REQUIRED.value:
+                return False
+
+        if bool(policy.get("disallow_complex_reasoning", True)):
+            metadata = request.metadata or {}
+            query_complexity = (
+                getattr(routing_decision, "query_complexity", None)
+                or metadata.get("query_complexity")
+                or ""
+            )
+            requires_high_reasoning = bool(
+                getattr(routing_decision, "requires_high_reasoning", False)
+                or metadata.get("requires_high_reasoning", False)
+            )
+            if str(query_complexity).lower() == "complex":
+                return False
+            if requires_high_reasoning:
+                return False
+            if context["query_type"] in {
+                QueryType.REASONING.value,
+                QueryType.MATH.value,
+                QueryType.ANALYSIS.value,
+            }:
+                return False
+
+        return True
+
+    def _rank_local_vllm_fallback_candidates(
+        self, context: Dict[str, Any], exclude: set[str]
+    ) -> List[str]:
+        """Rank local vLLM candidates that can safely replace a failed cloud model."""
 
         ranked_candidates = []
         for model_name, model_config in getattr(self.router, "models", {}).items():
             if model_name in exclude:
                 continue
-            if getattr(model_config, "provider", "").lower() != "vllm":
-                continue
-            if context["token_count"] > model_config.max_tokens:
-                continue
-            if hasattr(
-                self.router, "_has_capability"
-            ) and not self.router._has_capability(
-                model_config,
-                context["query_type"],
-            ):
-                continue
-            if hasattr(
-                self.router, "_check_user_access"
-            ) and not self.router._check_user_access(
-                model_config,
-                context["user_tier"],
-            ):
+            if not self._local_vllm_fallback_model_eligible(model_name, context):
                 continue
             score = (
                 self.router._score_model(model_name, context)
@@ -2336,6 +2911,30 @@ class InferenceEngine:
 
         ranked_candidates.sort(reverse=True)
         return [model_name for _score, model_name in ranked_candidates]
+
+    def _local_vllm_fallback_model_eligible(
+        self, model_name: str, context: Dict[str, Any]
+    ) -> bool:
+        model_config = getattr(self.router, "models", {}).get(model_name)
+        if not model_config:
+            return False
+        if getattr(model_config, "provider", "").lower() != "vllm":
+            return False
+        if context["token_count"] > model_config.max_tokens:
+            return False
+        if hasattr(self.router, "_has_capability") and not self.router._has_capability(
+            model_config,
+            context["query_type"],
+        ):
+            return False
+        if hasattr(
+            self.router, "_check_user_access"
+        ) and not self.router._check_user_access(
+            model_config,
+            context["user_tier"],
+        ):
+            return False
+        return True
 
     def _build_fallback_routing_decision(
         self,
@@ -2516,7 +3115,9 @@ class InferenceEngine:
 
         # Close HTTP clients
         for provider in self.providers.values():
-            if hasattr(provider, "http_client") and provider.http_client:
+            if hasattr(provider, "aclose"):
+                await provider.aclose()
+            elif hasattr(provider, "http_client") and provider.http_client:
                 await provider.http_client.aclose()
 
         # Close Redis connection

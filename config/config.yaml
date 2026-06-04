@@ -197,6 +197,22 @@ inference:
     gpu_memory_utilization: 0.9
     tensor_parallel_size: 1
     trust_remote_code: true
+    model_fallback:
+      enabled: true
+      fallbacks:
+        qwen3.6-27b-fast:
+        - mistral-7b
+      allowed_query_types:
+      - general
+      - code_generation
+      - code_analysis
+      - question_answering
+      max_input_tokens: 2048
+      max_output_tokens: 1024
+      disallow_attachments: true
+      disallow_complex_reasoning: true
+      disallow_required_tools: true
+      disallow_required_rag: true
   openai:
     base_url: https://api.openai.com/v1
     timeout: 60
