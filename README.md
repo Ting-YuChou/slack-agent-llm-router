@@ -154,6 +154,20 @@ and last errors. vLLM exports request and KV/cache metrics on `/metrics`; the
 pool reads `vllm:num_requests_running`, `vllm:num_requests_waiting`, and
 `vllm:gpu_cache_usage_perc` when `metrics_scrape_enabled` is true.
 
+## Provider Capacity Scheduler
+
+Provider guardrails and the provider scheduler handle different layers:
+
+- routing guardrails influence which model/provider the router selects
+- `inference.scheduler` controls whether a selected provider/model may be called now
+- provider/model active request limits, request rate, and token budgets still come from `api.rate_limiting`
+- scheduler queues are per provider/model and ordered by explicit low-latency intent, request priority, user tier, then age
+- scheduler-managed retry and circuit-breaker state protect providers from retry storms and repeated unhealthy calls
+
+The `/route` API remains synchronous. If provider capacity is unavailable and no
+safe local fallback applies, scheduler rejection bubbles through the existing
+admission response path, including `Retry-After` when present.
+
 ## API Surface
 
 Public health endpoints:

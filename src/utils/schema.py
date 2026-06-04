@@ -558,6 +558,45 @@ class BatchingConfig(ConfigModel):
     max_wait_time_ms: int = Field(50, ge=1)
 
 
+class SchedulerRetryConfig(ConfigModel):
+    max_attempts_per_request: int = Field(1, ge=1)
+    initial_backoff_ms: int = Field(100, ge=0)
+    max_backoff_ms: int = Field(1000, ge=0)
+    budget_enabled: bool = False
+    budget_tokens: int = Field(0, ge=0)
+    budget_window_seconds: int = Field(60, ge=1)
+
+
+class SchedulerCircuitBreakerConfig(ConfigModel):
+    enabled: bool = False
+    failure_threshold: int = Field(5, ge=1)
+    recovery_timeout_ms: int = Field(30000, ge=0)
+    half_open_max_requests: int = Field(1, ge=1)
+    state_ttl_seconds: int = Field(3600, ge=1)
+
+
+class ProviderSchedulerConfig(ConfigModel):
+    enabled: bool = True
+    queue_enabled: bool = False
+    wait_timeout_ms: int = Field(250, ge=0)
+    poll_interval_ms: int = Field(25, ge=1)
+    failure_mode: str = "closed"
+    allow_fallback_on_provider_rejection: bool = True
+    key_prefix: str = "provider_scheduler"
+    retry: SchedulerRetryConfig = Field(default_factory=SchedulerRetryConfig)
+    circuit_breaker: SchedulerCircuitBreakerConfig = Field(
+        default_factory=SchedulerCircuitBreakerConfig
+    )
+
+    @field_validator("failure_mode")
+    @classmethod
+    def validate_failure_mode(cls, value: str) -> str:
+        normalized = value.lower()
+        if normalized not in {"open", "closed"}:
+            raise ValueError("failure_mode must be one of: open, closed")
+        return normalized
+
+
 class InferenceConfig(ConfigModel):
     vllm: ProviderEndpointConfig = Field(default_factory=ProviderEndpointConfig)
     openai: ProviderEndpointConfig = Field(default_factory=ProviderEndpointConfig)
@@ -565,6 +604,7 @@ class InferenceConfig(ConfigModel):
     compression: CompressionConfig = Field(default_factory=CompressionConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
     batching: BatchingConfig = Field(default_factory=BatchingConfig)
+    scheduler: ProviderSchedulerConfig = Field(default_factory=ProviderSchedulerConfig)
 
 
 class WebSearchToolConfig(ConfigModel):

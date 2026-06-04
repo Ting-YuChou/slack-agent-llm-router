@@ -913,6 +913,48 @@ class TestApiApp:
         assert response.json()["reason"] == "user_request_rate_exceeded"
         assert inference.processed_requests == []
 
+    def test_route_scheduler_rejection_returns_429_with_retry_after(
+        self, tmp_path, patched_platform_deps
+    ):
+        class RejectingInferenceEngine(DummyInferenceEngine):
+            async def process_query(self, request):
+                self.processed_requests.append(request)
+                decision = main.AdmissionDecision.reject(
+                    status_code=429,
+                    error="rate_limited",
+                    reason="provider_active_requests_exceeded",
+                    message="Request rejected by provider capacity scheduler",
+                    retry_after_seconds=2,
+                    metadata={"provider": "openai", "model": "gpt-5"},
+                )
+                raise main.AdmissionRejectedError(decision)
+
+        config_path = _write_config(
+            tmp_path,
+            overrides={
+                "api": {"rate_limiting": {"enabled": True, "failure_mode": "closed"}}
+            },
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        inference = RejectingInferenceEngine({}, DummyRouter({}))
+        platform.services["inference"] = inference
+        platform.services["admission"] = DummyAdmissionController()
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post("/route", json={"query": "hello", "user_id": "u1"})
+
+        assert response.status_code == 429
+        assert response.headers["retry-after"] == "2"
+        assert response.json() == {
+            "error": "rate_limited",
+            "message": "Request rejected by provider capacity scheduler",
+            "reason": "provider_active_requests_exceeded",
+            "retry_after_seconds": 2,
+            "details": {"provider": "openai", "model": "gpt-5"},
+        }
+        assert len(inference.processed_requests) == 1
+
     def test_missing_admission_service_returns_503_when_fail_closed(
         self, tmp_path, patched_platform_deps
     ):
