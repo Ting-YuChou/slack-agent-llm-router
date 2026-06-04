@@ -67,11 +67,20 @@ class DummyRouter:
 
 
 class DummyInferenceEngine:
-    def __init__(self, config, router, event_producer=None, rag_service=None):
+    def __init__(
+        self,
+        config,
+        router,
+        event_producer=None,
+        rag_service=None,
+        admission_controller=None,
+    ):
         self.config = config
         self.router = router
         self.event_producer = event_producer
         self.rag_service = rag_service
+        self.admission_controller = admission_controller
+        self.processed_requests = []
         self.response = InferenceResponse(
             response_text="ok",
             model_name="gpt-5",
@@ -88,10 +97,38 @@ class DummyInferenceEngine:
         return None
 
     async def process_query(self, request):
+        self.processed_requests.append(request)
         return self.response
 
     async def shutdown(self):
         return None
+
+    def is_healthy(self):
+        return True
+
+
+class DummyAdmissionController:
+    def __init__(self, *, http_decision=None, route_decision=None):
+        self.http_decision = http_decision or main.AdmissionDecision.allow(None)
+        self.route_decision = route_decision or main.AdmissionDecision.allow(None)
+        self.http_calls = []
+        self.route_calls = []
+        self.released = []
+
+    async def initialize(self):
+        return None
+
+    async def acquire_http(self, **kwargs):
+        self.http_calls.append(kwargs)
+        return self.http_decision
+
+    async def acquire_route(self, request):
+        self.route_calls.append(request)
+        return self.route_decision
+
+    async def release(self, reservation, *, actual_tokens=None):
+        self.released.append((reservation, actual_tokens))
+        return True
 
     def is_healthy(self):
         return True
@@ -442,6 +479,11 @@ def patched_platform_deps(monkeypatch):
     monkeypatch.setattr(main, "MonitoringService", DummyMonitoring)
     monkeypatch.setattr(main, "SlackBot", DummySlackBot)
     monkeypatch.setattr(main, "RagService", DummyRagService)
+    monkeypatch.setattr(
+        main,
+        "RedisAdmissionController",
+        lambda config: DummyAdmissionController(),
+    )
 
 
 class TestPlatformInitialization:
@@ -768,6 +810,156 @@ class TestApiApp:
 
         assert response.status_code == 200
         assert response.json()["response_text"] == "ok"
+
+    def test_public_endpoints_bypass_api_admission(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(
+            tmp_path,
+            overrides={
+                "api": {"rate_limiting": {"enabled": True, "failure_mode": "closed"}}
+            },
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        admission = DummyAdmissionController(
+            http_decision=main.AdmissionDecision.reject(
+                status_code=429,
+                error="rate_limited",
+                reason="global_request_rate_exceeded",
+                message="denied",
+                retry_after_seconds=1,
+            )
+        )
+        platform.services["admission"] = admission
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.get("/live")
+
+        assert response.status_code == 200
+        assert admission.http_calls == []
+
+    def test_auth_runs_before_api_admission(
+        self, tmp_path, monkeypatch, patched_platform_deps
+    ):
+        monkeypatch.setenv("LLM_ROUTER_API_KEYS", "test-key")
+        config_path = _write_config(
+            tmp_path,
+            overrides={
+                "api": {"rate_limiting": {"enabled": True, "failure_mode": "closed"}},
+                "security": {
+                    "api_keys": {
+                        "enabled": True,
+                        "header_name": "X-API-Key",
+                        "env_var": "LLM_ROUTER_API_KEYS",
+                    },
+                    "cors": {"enabled": False},
+                },
+            },
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        admission = DummyAdmissionController(
+            route_decision=main.AdmissionDecision.reject(
+                status_code=429,
+                error="rate_limited",
+                reason="global_request_rate_exceeded",
+                message="denied",
+                retry_after_seconds=1,
+            )
+        )
+        platform.services["admission"] = admission
+        platform.services["inference"] = DummyInferenceEngine({}, DummyRouter({}))
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/route",
+                json={"query": "hello", "user_id": "u1"},
+                headers={"X-API-Key": "wrong-key"},
+            )
+
+        assert response.status_code == 401
+        assert response.json()["error"] == "unauthorized"
+        assert admission.route_calls == []
+
+    def test_route_admission_denial_returns_429_without_inference(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(
+            tmp_path,
+            overrides={
+                "api": {"rate_limiting": {"enabled": True, "failure_mode": "closed"}}
+            },
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        inference = DummyInferenceEngine({}, DummyRouter({}))
+        platform.services["inference"] = inference
+        platform.services["admission"] = DummyAdmissionController(
+            route_decision=main.AdmissionDecision.reject(
+                status_code=429,
+                error="rate_limited",
+                reason="user_request_rate_exceeded",
+                message="Request rejected by API admission control",
+                retry_after_seconds=3,
+            )
+        )
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post("/route", json={"query": "hello", "user_id": "u1"})
+
+        assert response.status_code == 429
+        assert response.headers["retry-after"] == "3"
+        assert response.json()["reason"] == "user_request_rate_exceeded"
+        assert inference.processed_requests == []
+
+    def test_missing_admission_service_returns_503_when_fail_closed(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(
+            tmp_path,
+            overrides={
+                "api": {"rate_limiting": {"enabled": True, "failure_mode": "closed"}}
+            },
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        platform.services["inference"] = DummyInferenceEngine({}, DummyRouter({}))
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post("/route", json={"query": "hello", "user_id": "u1"})
+
+        assert response.status_code == 503
+        assert response.json()["error"] == "admission_unavailable"
+
+    def test_protected_non_route_endpoint_uses_http_admission(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(
+            tmp_path,
+            overrides={
+                "api": {"rate_limiting": {"enabled": True, "failure_mode": "closed"}}
+            },
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        admission = DummyAdmissionController(
+            http_decision=main.AdmissionDecision.reject(
+                status_code=429,
+                error="rate_limited",
+                reason="global_request_rate_exceeded",
+                message="Request rejected by API admission control",
+                retry_after_seconds=2,
+            )
+        )
+        platform.services["admission"] = admission
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.get("/dashboard")
+
+        assert response.status_code == 429
+        assert response.json()["reason"] == "global_request_rate_exceeded"
+        assert admission.http_calls[0]["endpoint"] == "/dashboard"
 
     @pytest.mark.parametrize("path", ["/dashboard", "/dashboard/logs", "/metrics"])
     def test_management_endpoints_require_api_key_when_enabled(

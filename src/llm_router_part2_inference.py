@@ -22,6 +22,7 @@ import redis.asyncio as redis
 from tenacity import retry, stop_after_attempt, wait_exponential
 from transformers import AutoTokenizer
 
+from src.admission import AdmissionRejectedError
 from src.llm_router_part1_router import ModelRouter
 from src.utils.logger import setup_logging
 from src.utils.metrics import INFERENCE_METRICS
@@ -1518,11 +1519,13 @@ class InferenceEngine:
         router: ModelRouter,
         event_producer: Optional[Any] = None,
         rag_service: Optional[Any] = None,
+        admission_controller: Optional[Any] = None,
     ):
         self.config = config
         self.router = router
         self.event_producer = event_producer
         self.rag_service = rag_service
+        self.admission_controller = admission_controller
         self.providers = {}
         self.context_compressor = ContextCompressor(config.get("compression", {}))
         self.cache = ResponseCache(config.get("cache", {}))
@@ -2103,6 +2106,8 @@ class InferenceEngine:
         try:
             response = await self._execute_model_request(request, primary_model)
             return response, primary_model, routing_decision
+        except AdmissionRejectedError:
+            raise
         except Exception as exc:
             self._record_failed_attempt(primary_model, exc, primary_started_at)
             fallback_models = self._get_local_fallback_models(
@@ -2152,6 +2157,8 @@ class InferenceEngine:
                             fallback_model=fallback_model,
                         ),
                     )
+                except AdmissionRejectedError:
+                    raise
                 except Exception as fallback_exc:
                     self._record_failed_attempt(
                         fallback_model,
@@ -2169,7 +2176,66 @@ class InferenceEngine:
         provider = self._get_provider_for_model(model_name)
         if not provider:
             raise ValueError(f"No provider available for model: {model_name}")
-        return await self.batch_processor.add_request(request, provider, model_name)
+
+        reservation = None
+        if self.admission_controller is not None:
+            model_info = self.router.get_model_info(model_name) or {}
+            provider_name = (
+                model_info.get("config", {}).get("provider")
+                or getattr(provider, "provider_name", None)
+                or "unknown"
+            )
+            decision = await self.admission_controller.acquire_provider(
+                request=request,
+                model_name=model_name,
+                provider=str(provider_name),
+                estimated_input_tokens=self._estimate_provider_admission_input_tokens(
+                    request
+                ),
+            )
+            if not decision.allowed:
+                raise AdmissionRejectedError(decision)
+            reservation = decision.reservation
+
+        response = None
+        try:
+            response = await self.batch_processor.add_request(
+                request, provider, model_name
+            )
+            return response
+        finally:
+            if reservation is not None:
+                await self.admission_controller.release(
+                    reservation,
+                    actual_tokens=response.total_tokens if response else None,
+                )
+
+    def _estimate_provider_admission_input_tokens(self, request: QueryRequest) -> int:
+        """Estimate provider input tokens for admission budget reservation."""
+        estimator = getattr(self.router, "_estimate_request_token_count", None)
+        if estimator is not None:
+            try:
+                return max(0, int(estimator(request)))
+            except Exception:
+                logger.debug("Provider admission token estimator failed", exc_info=True)
+
+        token_counter = getattr(self.router, "token_counter", None)
+        count_tokens = getattr(token_counter, "count_tokens", None)
+        if count_tokens is not None:
+            try:
+                prompt = "\n\n".join(
+                    part
+                    for part in [
+                        f"Context: {request.context}" if request.context else "",
+                        f"Query: {request.query}",
+                    ]
+                    if part
+                )
+                return max(0, int(count_tokens(prompt)))
+            except Exception:
+                logger.debug("Fallback provider token estimator failed", exc_info=True)
+
+        return max(1, len((request.query or "").split()))
 
     def _record_failed_attempt(
         self,
