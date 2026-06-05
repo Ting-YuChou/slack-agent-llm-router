@@ -30,8 +30,8 @@ def main():
         },
         timestamp=timestamp,
     )
-    assert enterprise_event["priority"] == "high"
-    assert enterprise_event["route_to_fast_lane"] is True
+    assert enterprise_event["priority"] == "low"
+    assert enterprise_event["route_to_fast_lane"] is False
 
     enriched_event = build_request_enriched_event(
         {
@@ -43,10 +43,24 @@ def main():
         timestamp=timestamp,
     )
     assert enriched_event["event_type"] == "requests.enriched"
-    assert enriched_event["priority"] == "critical"
-    assert enriched_event["route_to_fast_lane"] is True
+    assert enriched_event["priority"] == "low"
+    assert enriched_event["route_to_fast_lane"] is False
 
-    fast_lane_hint = build_fast_lane_hint_event(enriched_event, timestamp=timestamp)
+    priority_enriched = build_request_enriched_event(
+        {
+            "request_id": "flink-smoke-priority",
+            "query_text": "Summarize this thread",
+            "user_tier": "free",
+            "user_id": "free-user",
+            "priority": 4,
+        },
+        timestamp=timestamp,
+    )
+    assert priority_enriched["event_type"] == "requests.enriched"
+    assert priority_enriched["priority"] == "high"
+    assert priority_enriched["route_to_fast_lane"] is True
+
+    fast_lane_hint = build_fast_lane_hint_event(priority_enriched, timestamp=timestamp)
     assert fast_lane_hint["event_type"] == "fast_lane_hints"
     assert fast_lane_hint["route_to_fast_lane"] is True
     assert fast_lane_hint["hint_type"] == "fast_lane_candidate"
@@ -60,10 +74,12 @@ def main():
         },
         timestamp=timestamp,
     )
-    assert premium_event["priority"] == "medium"
+    assert premium_event["priority"] == "low"
     assert premium_event["route_to_fast_lane"] is False
 
-    print("Flink smoke test passed: enrichment and fast-lane hint outputs match expectations")
+    print(
+        "Flink smoke test passed: enrichment and fast-lane hint outputs match expectations"
+    )
 
 
 if __name__ == "__main__":

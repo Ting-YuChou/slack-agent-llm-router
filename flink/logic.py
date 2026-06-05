@@ -1109,10 +1109,3 @@ def classify_request_event(
 ) -> Dict[str, Any]:
     """Alias for the enrichment classifier used by the Flink request path."""
     return classify_query_event(data, timestamp=timestamp)
-
-
-def build_fast_lane_event(
-    data: Dict[str, Any], timestamp: datetime | None = None
-) -> Dict[str, Any]:
-    """Backward-compatible alias for legacy smoke tests."""
-    return build_fast_lane_hint_event(data, timestamp=timestamp)
