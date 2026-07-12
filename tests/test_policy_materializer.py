@@ -197,7 +197,9 @@ async def test_policy_materializer_stops_partition_after_materialization_failure
         materialize_routing_guardrail=AsyncMock(),
         materialize_routing_policy_state=AsyncMock(),
     )
-    setattr(policy_cache, cache_method, AsyncMock(side_effect=fail_first_materialization))
+    setattr(
+        policy_cache, cache_method, AsyncMock(side_effect=fail_first_materialization)
+    )
     materializer = PolicyMaterializer(
         {
             "bootstrap_servers": ["localhost:9092"],
