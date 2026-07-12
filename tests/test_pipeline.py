@@ -1,4 +1,5 @@
 import json
+import asyncio
 import uuid
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -811,6 +812,103 @@ class TestKafkaConsumerManager:
 
         assert consumer.clickhouse.batch_insert_query_logs.await_count == 1
         assert consumer.awaiting_commit_offsets["queries"] == {}
+
+    @pytest.mark.asyncio
+    async def test_flush_detaches_batch_before_await_and_preserves_new_arrivals(
+        self, pipeline_config, sample_query_log
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        insert_started = asyncio.Event()
+        release_insert = asyncio.Event()
+
+        async def blocked_insert(batch):
+            assert batch == [sample_query_log]
+            insert_started.set()
+            await release_insert.wait()
+
+        consumer.clickhouse.batch_insert_query_logs = blocked_insert
+        consumer.consumers["queries"] = AsyncMock()
+        first_tp = TopicPartition("test-queries", 0)
+        second_tp = TopicPartition("test-queries", 1)
+        consumer.batch_processors["queries"].append(sample_query_log)
+        consumer.pending_commit_offsets["queries"][first_tp] = 8
+
+        flush_task = asyncio.create_task(consumer.flush_pending_batches())
+        await insert_started.wait()
+
+        new_entry = MagicMock(name="new_entry")
+        consumer.batch_processors["queries"].append(new_entry)
+        consumer.pending_commit_offsets["queries"][second_tp] = 12
+        release_insert.set()
+        await flush_task
+
+        assert consumer.batch_processors["queries"] == [new_entry]
+        assert consumer.pending_commit_offsets["queries"] == {second_tp: 12}
+        consumer.consumers["queries"].commit.assert_awaited_once_with({first_tp: 8})
+
+    @pytest.mark.asyncio
+    async def test_flush_insert_failure_restores_detached_batch_before_new_arrivals(
+        self, pipeline_config, sample_query_log
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        insert_started = asyncio.Event()
+        release_insert = asyncio.Event()
+
+        async def failed_insert(batch):
+            insert_started.set()
+            await release_insert.wait()
+            raise RuntimeError("insert failed")
+
+        consumer.clickhouse.batch_insert_query_logs = failed_insert
+        old_tp = TopicPartition("test-queries", 0)
+        new_tp = TopicPartition("test-queries", 1)
+        consumer.batch_processors["queries"].append(sample_query_log)
+        consumer.pending_commit_offsets["queries"][old_tp] = 8
+
+        flush_task = asyncio.create_task(consumer.flush_pending_batches())
+        await insert_started.wait()
+        new_entry = MagicMock(name="new_entry")
+        consumer.batch_processors["queries"].append(new_entry)
+        consumer.pending_commit_offsets["queries"][old_tp] = 10
+        consumer.pending_commit_offsets["queries"][new_tp] = 4
+        release_insert.set()
+
+        with pytest.raises(RuntimeError, match="insert failed"):
+            await flush_task
+
+        assert consumer.batch_processors["queries"] == [sample_query_log, new_entry]
+        assert consumer.pending_commit_offsets["queries"] == {old_tp: 10, new_tp: 4}
+
+    @pytest.mark.asyncio
+    async def test_concurrent_flushes_for_same_topic_do_not_overlap(
+        self, pipeline_config, sample_query_log
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        active = 0
+        peak_active = 0
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def tracked_insert(batch):
+            nonlocal active, peak_active
+            active += 1
+            peak_active = max(peak_active, active)
+            if not first_started.is_set():
+                first_started.set()
+                await release_first.wait()
+            active -= 1
+
+        consumer.clickhouse.batch_insert_query_logs = tracked_insert
+        consumer.batch_processors["queries"].append(sample_query_log)
+        first_flush = asyncio.create_task(consumer.flush_pending_batches())
+        await first_started.wait()
+        consumer.batch_processors["queries"].append(MagicMock(name="second_entry"))
+        second_flush = asyncio.create_task(consumer.flush_pending_batches())
+        await asyncio.sleep(0)
+        release_first.set()
+        await asyncio.gather(first_flush, second_flush)
+
+        assert peak_active == 1
 
     @pytest.mark.asyncio
     async def test_flush_pending_batches_commits_routing_guardrail_offsets(

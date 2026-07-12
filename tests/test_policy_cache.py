@@ -2,6 +2,7 @@ from src.llm_router_part3_policy import RoutingPolicyCache
 
 
 import pytest
+from unittest.mock import AsyncMock, MagicMock
 
 
 @pytest.mark.asyncio
@@ -247,3 +248,43 @@ async def test_policy_cache_uses_routing_policy_state_for_user_policy():
     assert user_state_policy["preferred_models"] == ["gpt-5"]
     assert user_policy["preferred_models"] == ["gpt-5"]
     assert user_policy["route_to_fast_lane"] is False
+
+
+@pytest.mark.asyncio
+async def test_enabled_policy_cache_does_not_update_l1_when_redis_write_fails():
+    cache = RoutingPolicyCache({"enabled": True})
+    cache.redis_client = MagicMock()
+    cache.redis_client.setex = AsyncMock(side_effect=RuntimeError("redis down"))
+    cache_key = cache._cache_key("request", "req-failed")
+
+    with pytest.raises(RuntimeError, match="redis down"):
+        await cache._set_json(cache_key, {"request_id": "req-failed"}, 30)
+
+    assert cache._local_get(cache_key) is None
+
+
+@pytest.mark.asyncio
+async def test_guardrail_payload_and_index_are_transactional_before_l1_update():
+    cache = RoutingPolicyCache({"enabled": True, "guardrail_ttl_seconds": 180})
+    pipeline = MagicMock()
+    pipeline.setex = MagicMock(return_value=pipeline)
+    pipeline.sadd = MagicMock(return_value=pipeline)
+    pipeline.execute = AsyncMock(side_effect=RuntimeError("transaction failed"))
+    cache.redis_client = MagicMock()
+    cache.redis_client.pipeline.return_value = pipeline
+
+    with pytest.raises(RuntimeError, match="transaction failed"):
+        await cache.materialize_routing_guardrail(
+            {
+                "event_type": "routing.guardrails",
+                "scope_type": "model",
+                "scope_key": "gpt-5",
+                "guardrail_action": "avoid",
+            }
+        )
+
+    cache.redis_client.pipeline.assert_called_once_with(transaction=True)
+    pipeline.setex.assert_called_once()
+    pipeline.sadd.assert_called_once()
+    assert cache._local_get(cache._guardrail_cache_key("model", "gpt-5")) is None
+    assert "gpt-5" not in cache._local_guardrail_index["model"]

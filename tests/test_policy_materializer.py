@@ -115,3 +115,120 @@ async def test_policy_materializer_skips_invalid_json_with_manual_commit():
     consumer.commit.assert_awaited_once_with(
         {TopicPartition("requests.enriched", 0): 4}
     )
+
+
+@pytest.mark.asyncio
+async def test_policy_materializer_does_not_commit_when_redis_materialization_fails():
+    policy_cache = SimpleNamespace(
+        config={"consumer": {"enable_auto_commit": False}},
+        enabled=True,
+        materialize_request_enriched=AsyncMock(side_effect=RuntimeError("redis down")),
+        materialize_fast_lane_hint=AsyncMock(),
+        materialize_routing_guardrail=AsyncMock(),
+        materialize_routing_policy_state=AsyncMock(),
+    )
+    materializer = PolicyMaterializer(
+        {
+            "bootstrap_servers": ["localhost:9092"],
+            "consumer": {"enable_auto_commit": False},
+        },
+        policy_cache,
+    )
+    materializer.running = True
+    consumer = AsyncMessageConsumer(
+        [
+            SimpleNamespace(
+                value={"event_type": "requests.enriched", "request_id": "req-1"},
+                topic="requests.enriched",
+                partition=0,
+                offset=9,
+            )
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="redis down"):
+        await materializer._consume_requests_enriched(consumer)
+
+    consumer.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("consume_method", "cache_method", "topic_name"),
+    [
+        (
+            "_consume_requests_enriched",
+            "materialize_request_enriched",
+            "requests.enriched",
+        ),
+        (
+            "_consume_fast_lane_hints",
+            "materialize_fast_lane_hint",
+            "fast_lane_hints",
+        ),
+        (
+            "_consume_routing_guardrails",
+            "materialize_routing_guardrail",
+            "routing.guardrails",
+        ),
+        (
+            "_consume_routing_policy_state",
+            "materialize_routing_policy_state",
+            "routing.policy_state",
+        ),
+    ],
+)
+async def test_policy_materializer_stops_partition_after_materialization_failure(
+    consume_method, cache_method, topic_name
+):
+    cache_calls = 0
+
+    async def fail_first_materialization(payload):
+        nonlocal cache_calls
+        cache_calls += 1
+        if cache_calls == 1:
+            raise RuntimeError("redis down")
+
+    policy_cache = SimpleNamespace(
+        config={"consumer": {"enable_auto_commit": False}},
+        enabled=True,
+        materialize_request_enriched=AsyncMock(),
+        materialize_fast_lane_hint=AsyncMock(),
+        materialize_routing_guardrail=AsyncMock(),
+        materialize_routing_policy_state=AsyncMock(),
+    )
+    setattr(policy_cache, cache_method, AsyncMock(side_effect=fail_first_materialization))
+    materializer = PolicyMaterializer(
+        {
+            "bootstrap_servers": ["localhost:9092"],
+            "consumer": {"enable_auto_commit": False},
+        },
+        policy_cache,
+    )
+    materializer.running = True
+    consumer = AsyncMessageConsumer(
+        [
+            SimpleNamespace(
+                value={"event_type": topic_name, "request_id": "req-1"},
+                topic=topic_name,
+                partition=0,
+                offset=9,
+            ),
+            SimpleNamespace(
+                value={"event_type": topic_name, "request_id": "req-2"},
+                topic=topic_name,
+                partition=0,
+                offset=10,
+            ),
+        ]
+    )
+
+    materialization_error = None
+    try:
+        await getattr(materializer, consume_method)(consumer)
+    except RuntimeError as error:
+        materialization_error = error
+
+    getattr(policy_cache, cache_method).assert_awaited_once()
+    consumer.commit.assert_not_awaited()
+    assert str(materialization_error) == "redis down"

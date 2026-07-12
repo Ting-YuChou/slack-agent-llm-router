@@ -1532,6 +1532,9 @@ class KafkaConsumerManager:
         self.awaiting_commit_offsets: Dict[str, Dict[TopicPartition, int]] = {
             topic_key: {} for topic_key in self.batch_processors
         }
+        self.batch_flush_locks: Dict[str, asyncio.Lock] = {
+            topic_key: asyncio.Lock() for topic_key in self.batch_processors
+        }
 
     async def initialize(self):
         """Initialize Kafka consumers"""
@@ -2294,28 +2297,42 @@ class KafkaConsumerManager:
         insert_method: Callable[[List[Any]], Any],
     ):
         """Flush one batched topic and commit offsets after durable persistence."""
-        if self.awaiting_commit_offsets.get(topic_key):
-            await self._commit_offsets(
-                topic_key, self.awaiting_commit_offsets[topic_key]
-            )
-            self.awaiting_commit_offsets[topic_key].clear()
+        async with self.batch_flush_locks[topic_key]:
+            if self.awaiting_commit_offsets.get(topic_key):
+                await self._commit_offsets(
+                    topic_key, self.awaiting_commit_offsets[topic_key]
+                )
+                self.awaiting_commit_offsets[topic_key].clear()
 
-        batch = list(self.batch_processors.get(topic_key, []))
-        if not batch:
-            return
+            batch = self.batch_processors.get(topic_key, [])
+            offsets = self.pending_commit_offsets.get(topic_key, {})
+            if not batch:
+                return
 
-        await insert_method(batch)
-        self.batch_processors[topic_key].clear()
-        self.awaiting_commit_offsets[topic_key] = dict(
-            self.pending_commit_offsets.get(topic_key, {})
-        )
-        self.pending_commit_offsets[topic_key].clear()
+            # Swap both buffers before the first I/O await. Consumers can continue
+            # appending to the new buffers while this detached batch is persisted.
+            self.batch_processors[topic_key] = []
+            self.pending_commit_offsets[topic_key] = {}
 
-        if self.awaiting_commit_offsets[topic_key]:
-            await self._commit_offsets(
-                topic_key, self.awaiting_commit_offsets[topic_key]
-            )
-            self.awaiting_commit_offsets[topic_key].clear()
+            try:
+                await insert_method(batch)
+            except Exception:
+                self.batch_processors[topic_key] = (
+                    batch + self.batch_processors[topic_key]
+                )
+                current_offsets = self.pending_commit_offsets[topic_key]
+                for partition, offset in offsets.items():
+                    current_offsets[partition] = max(
+                        offset, current_offsets.get(partition, offset)
+                    )
+                raise
+
+            self.awaiting_commit_offsets[topic_key] = offsets
+            if self.awaiting_commit_offsets[topic_key]:
+                await self._commit_offsets(
+                    topic_key, self.awaiting_commit_offsets[topic_key]
+                )
+                self.awaiting_commit_offsets[topic_key].clear()
 
     async def flush_pending_batches(self):
         """Flush any pending Kafka batches to ClickHouse immediately"""

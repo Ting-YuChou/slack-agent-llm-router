@@ -132,14 +132,16 @@ class RoutingPolicyCache:
             return None
 
     async def _set_json(self, cache_key: str, value: Dict[str, Any], ttl_seconds: int):
-        self._local_set(cache_key, value, ttl_seconds)
         if not self.enabled or not self.redis_client:
+            self._local_set(cache_key, value, ttl_seconds)
             return
 
         try:
             await self.redis_client.setex(cache_key, ttl_seconds, json.dumps(value))
         except Exception as e:
             logger.warning(f"Failed to write routing policy cache key {cache_key}: {e}")
+            raise
+        self._local_set(cache_key, value, ttl_seconds)
 
     async def get_request_policy(self, request_id: str) -> Optional[Dict[str, Any]]:
         """Get request-scoped policy hints if present."""
@@ -441,13 +443,21 @@ class RoutingPolicyCache:
 
         cache_key = self._guardrail_cache_key(scope_type, scope_key)
         index_key = self._guardrail_index_key(scope_type)
-        await self._set_json(cache_key, payload, self.guardrail_ttl_seconds)
         try:
-            await self.redis_client.sadd(index_key, scope_key)
+            transaction = self.redis_client.pipeline(transaction=True)
+            transaction.setex(
+                cache_key, self.guardrail_ttl_seconds, json.dumps(payload)
+            )
+            transaction.sadd(index_key, scope_key)
+            await transaction.execute()
         except Exception as e:
             logger.warning(
                 f"Failed to update routing guardrail index {scope_type}:{scope_key}: {e}"
             )
+            raise
+
+        self._local_guardrail_index.setdefault(scope_type, set()).add(scope_key)
+        self._local_set(cache_key, payload, self.guardrail_ttl_seconds)
 
     async def get_active_guardrails(self) -> Dict[str, Any]:
         """Return active model/provider guardrails for router candidate filtering."""
@@ -747,6 +757,7 @@ class PolicyMaterializer:
                     logger.warning(
                         f"Failed to materialize requests.enriched message: {e}"
                     )
+                    raise
         except Exception as e:
             logger.error(f"requests.enriched consumer error: {e}")
             raise
@@ -767,6 +778,7 @@ class PolicyMaterializer:
                     logger.warning(
                         f"Failed to materialize fast_lane_hints message: {e}"
                     )
+                    raise
         except Exception as e:
             logger.error(f"fast_lane_hints consumer error: {e}")
             raise
@@ -787,6 +799,7 @@ class PolicyMaterializer:
                     logger.warning(
                         f"Failed to materialize routing_guardrails message: {e}"
                     )
+                    raise
         except Exception as e:
             logger.error(f"routing_guardrails consumer error: {e}")
             raise
@@ -809,6 +822,7 @@ class PolicyMaterializer:
                     logger.warning(
                         f"Failed to materialize routing_policy_state message: {e}"
                     )
+                    raise
         except Exception as e:
             logger.error(f"routing_policy_state consumer error: {e}")
             raise
