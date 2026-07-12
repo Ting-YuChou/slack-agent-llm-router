@@ -28,6 +28,14 @@ logger = logging.getLogger(__name__)
 EVENT_SCHEMA_VERSION = "1.0"
 
 
+@dataclass(frozen=True)
+class _DeliveryEnvelope:
+    topic_key: str
+    default_topic: str
+    key: Optional[str]
+    value: Dict[str, Any]
+
+
 def _isoformat_utc(timestamp: Optional[datetime] = None) -> str:
     """Serialize a timestamp using an explicit UTC ISO-8601 string."""
     timestamp = timestamp or datetime.now(timezone.utc)
@@ -495,6 +503,19 @@ class KafkaProducerManager:
             )
         )
         self.raise_on_failure = bool(producer_config.get("raise_on_failure", False))
+        self.queue_capacity = int(producer_config.get("queue_capacity", 10000) or 10000)
+        self.dispatcher_batch_size = int(
+            producer_config.get("dispatcher_batch_size", 256) or 256
+        )
+        self.shutdown_drain_timeout_seconds = float(
+            producer_config.get("shutdown_drain_timeout_seconds", 10) or 10
+        )
+        self.shutdown_cancel_timeout_seconds = float(
+            producer_config.get("shutdown_cancel_timeout_seconds", 1) or 1
+        )
+        self._delivery_queue: asyncio.Queue = asyncio.Queue(maxsize=self.queue_capacity)
+        self._dispatcher_task: Optional[asyncio.Task] = None
+        self._accepting = False
         self.consecutive_failures = 0
         self.last_error: Optional[str] = None
 
@@ -525,6 +546,10 @@ class KafkaProducerManager:
         try:
             self.producer = AIOKafkaProducer(**self.producer_config)
             await self.producer.start()
+            self._accepting = True
+            self._dispatcher_task = asyncio.create_task(
+                self._dispatch_loop(), name="kafka_producer_dispatcher"
+            )
             logger.info("Kafka producer initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize Kafka producer: {e}")
@@ -582,6 +607,111 @@ class KafkaProducerManager:
             raise last_error
         return False
 
+    def _enqueue_message(
+        self,
+        topic_key: str,
+        default_topic: str,
+        *,
+        key: Optional[str],
+        value: Dict[str, Any],
+    ) -> bool:
+        """Accept a message for background delivery without yielding control."""
+        if not self._accepting:
+            PIPELINE_METRICS.producer_queue_dropped.labels(
+                topic=topic_key, reason="not_accepting"
+            ).inc()
+            return False
+        envelope = _DeliveryEnvelope(topic_key, default_topic, key, value)
+        try:
+            self._delivery_queue.put_nowait(envelope)
+        except asyncio.QueueFull:
+            PIPELINE_METRICS.producer_queue_dropped.labels(
+                topic=topic_key, reason="queue_full"
+            ).inc()
+            return False
+        PIPELINE_METRICS.producer_queue_accepted.labels(topic=topic_key).inc()
+        PIPELINE_METRICS.producer_queue_depth.set(self._delivery_queue.qsize())
+        return True
+
+    async def _send_envelope(self, envelope) -> bool:
+        topic_key = envelope.topic_key
+        try:
+            return await self._send_message(
+                topic_key,
+                envelope.default_topic,
+                key=envelope.key,
+                value=envelope.value,
+            )
+        except Exception:
+            return False
+
+    def _record_delivery(self, envelope, delivered: bool) -> None:
+        topic_key = envelope.topic_key
+        if delivered:
+            PIPELINE_METRICS.producer_queue_delivered.labels(topic=topic_key).inc()
+        else:
+            PIPELINE_METRICS.producer_delivery_failed.labels(topic=topic_key).inc()
+
+    async def _deliver_envelope(self, envelope) -> None:
+        self._record_delivery(envelope, await self._send_envelope(envelope))
+
+    @staticmethod
+    def _consume_task_result(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+
+    async def _dispatch_loop(self) -> None:
+        """Drain accepted messages in FIFO batches and deliver them concurrently."""
+        while self._accepting or not self._delivery_queue.empty():
+            envelope = await self._delivery_queue.get()
+            batch = [envelope]
+            while len(batch) < self.dispatcher_batch_size:
+                try:
+                    batch.append(self._delivery_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            PIPELINE_METRICS.producer_queue_depth.set(self._delivery_queue.qsize())
+            deliveries = [
+                asyncio.create_task(self._send_envelope(item)) for item in batch
+            ]
+            try:
+                done, _ = await asyncio.wait(
+                    deliveries, return_when=asyncio.ALL_COMPLETED
+                )
+                for item, task in zip(batch, deliveries):
+                    if task in done:
+                        self._record_delivery(item, task.result())
+            except asyncio.CancelledError:
+                for item, task in zip(batch, deliveries):
+                    if task.done():
+                        self._record_delivery(item, task.result())
+                        continue
+                    PIPELINE_METRICS.producer_queue_dropped.labels(
+                        topic=item.topic_key, reason="shutdown_timeout"
+                    ).inc()
+                    task.cancel()
+                    task.add_done_callback(self._consume_task_result)
+                raise
+            finally:
+                for _ in batch:
+                    self._delivery_queue.task_done()
+
+    def _drop_queued_messages(self, reason: str) -> None:
+        while True:
+            try:
+                envelope = self._delivery_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            PIPELINE_METRICS.producer_queue_dropped.labels(
+                topic=envelope.topic_key, reason=reason
+            ).inc()
+            self._delivery_queue.task_done()
+        PIPELINE_METRICS.producer_queue_depth.set(0)
+
     async def _send_once(
         self,
         topic: str,
@@ -611,7 +741,7 @@ class KafkaProducerManager:
 
     async def produce_request_raw(self, query_request: QueryRequest):
         """Produce a pre-inference API request event."""
-        await self._send_message(
+        return self._enqueue_message(
             "requests_raw",
             "requests.raw",
             key=query_request.user_id,
@@ -625,7 +755,7 @@ class KafkaProducerManager:
         routing_decision: Optional[Any] = None,
     ):
         """Produce a post-inference completion event."""
-        await self._send_message(
+        return self._enqueue_message(
             "inference_completed",
             "inference.completed",
             key=query_request.request_id,
@@ -667,7 +797,7 @@ class KafkaProducerManager:
             cached_response=inference_response.cached,
         )
 
-        await self._send_message(
+        return self._enqueue_message(
             "queries",
             "llm-queries",
             key=query_log.user_id,
@@ -676,7 +806,7 @@ class KafkaProducerManager:
 
     async def produce_response_log(self, response_data: Dict[str, Any]):
         """Produce response log message"""
-        await self._send_message(
+        return self._enqueue_message(
             "responses",
             "llm-responses",
             key=response_data.get("query_id"),
@@ -699,7 +829,7 @@ class KafkaProducerManager:
             labels=labels or {},
         )
 
-        await self._send_message(
+        return self._enqueue_message(
             "metrics",
             "llm-metrics",
             key=f"{service}:{metric_name}",
@@ -710,7 +840,7 @@ class KafkaProducerManager:
         """Produce error message"""
         error_data["timestamp"] = datetime.now(timezone.utc)
 
-        await self._send_message(
+        return self._enqueue_message(
             "errors",
             "llm-errors",
             key=error_data.get("error_id", str(uuid.uuid4())),
@@ -732,9 +862,37 @@ class KafkaProducerManager:
 
     async def shutdown(self):
         """Shutdown producer"""
-        if self.producer:
-            await self.producer.stop()
-            logger.info("Kafka producer shutdown complete")
+        self._accepting = False
+        try:
+            if self._dispatcher_task:
+                dispatcher = self._dispatcher_task
+                try:
+                    await asyncio.wait_for(
+                        self._delivery_queue.join(),
+                        timeout=self.shutdown_drain_timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    dispatcher.cancel()
+                    done, _ = await asyncio.wait(
+                        {dispatcher}, timeout=self.shutdown_cancel_timeout_seconds
+                    )
+                    if dispatcher not in done:
+                        dispatcher.add_done_callback(self._consume_task_result)
+                    self._drop_queued_messages("shutdown_timeout")
+                else:
+                    if not dispatcher.done():
+                        dispatcher.cancel()
+                    done, _ = await asyncio.wait(
+                        {dispatcher}, timeout=self.shutdown_cancel_timeout_seconds
+                    )
+                    if dispatcher not in done:
+                        dispatcher.add_done_callback(self._consume_task_result)
+                finally:
+                    self._dispatcher_task = None
+        finally:
+            if self.producer:
+                await self.producer.stop()
+                logger.info("Kafka producer shutdown complete")
 
 
 class ClickHouseManager:
