@@ -532,6 +532,7 @@ kafka:
     dispatcher_batch_size: 256
     shutdown_drain_timeout_seconds: 10
     shutdown_cancel_timeout_seconds: 1
+    shutdown_producer_timeout_seconds: 1
   consumer:
     group_id: llm-router-consumer
     auto_offset_reset: latest

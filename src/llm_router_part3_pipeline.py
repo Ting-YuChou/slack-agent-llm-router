@@ -513,6 +513,9 @@ class KafkaProducerManager:
         self.shutdown_cancel_timeout_seconds = float(
             producer_config.get("shutdown_cancel_timeout_seconds", 1) or 1
         )
+        self.shutdown_producer_timeout_seconds = float(
+            producer_config.get("shutdown_producer_timeout_seconds", 1) or 1
+        )
         self._delivery_queue: asyncio.Queue = asyncio.Queue(maxsize=self.queue_capacity)
         self._dispatcher_task: Optional[asyncio.Task] = None
         self._accepting = False
@@ -686,15 +689,25 @@ class KafkaProducerManager:
                     if task in done:
                         self._record_delivery(item, task.result())
             except asyncio.CancelledError:
-                for item, task in zip(batch, deliveries):
-                    if task.done():
-                        self._record_delivery(item, task.result())
-                        continue
-                    PIPELINE_METRICS.producer_queue_dropped.labels(
-                        topic=item.topic_key, reason="shutdown_timeout"
-                    ).inc()
+                unfinished = [task for task in deliveries if not task.done()]
+                for task in unfinished:
                     task.cancel()
-                    task.add_done_callback(self._consume_task_result)
+                if unfinished:
+                    await asyncio.wait(
+                        unfinished, timeout=self.shutdown_cancel_timeout_seconds
+                    )
+                for item, task in zip(batch, deliveries):
+                    if task.done() and not task.cancelled():
+                        self._record_delivery(item, task.result())
+                    elif task.done():
+                        PIPELINE_METRICS.producer_queue_dropped.labels(
+                            topic=item.topic_key, reason="shutdown_timeout"
+                        ).inc()
+                    else:
+                        PIPELINE_METRICS.producer_queue_dropped.labels(
+                            topic=item.topic_key, reason="shutdown_abandoned"
+                        ).inc()
+                        task.add_done_callback(self._consume_task_result)
                 raise
             finally:
                 for _ in batch:
@@ -891,8 +904,20 @@ class KafkaProducerManager:
                     self._dispatcher_task = None
         finally:
             if self.producer:
-                await self.producer.stop()
-                logger.info("Kafka producer shutdown complete")
+                stop_task = asyncio.create_task(self.producer.stop())
+                done, _ = await asyncio.wait(
+                    {stop_task}, timeout=self.shutdown_producer_timeout_seconds
+                )
+                if stop_task in done:
+                    await stop_task
+                    logger.info("Kafka producer shutdown complete")
+                else:
+                    stop_task.cancel()
+                    stop_task.add_done_callback(self._consume_task_result)
+                    self.consecutive_failures += 1
+                    self.last_error = "Kafka producer stop timed out"
+                    PIPELINE_METRICS.producer_errors.inc()
+                    logger.error(self.last_error)
 
 
 class ClickHouseManager:

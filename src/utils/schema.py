@@ -671,6 +671,7 @@ class KafkaProducerConfig(ConfigModel):
     dispatcher_batch_size: int = Field(256, ge=1)
     shutdown_drain_timeout_seconds: float = Field(10.0, gt=0)
     shutdown_cancel_timeout_seconds: float = Field(1.0, gt=0)
+    shutdown_producer_timeout_seconds: float = Field(1.0, gt=0)
 
 
 class KafkaConsumerConfig(ConfigModel):

@@ -273,16 +273,19 @@ def test_kafka_producer_config_accepts_background_dispatcher_limits():
         dispatcher_batch_size=512,
         shutdown_drain_timeout_seconds=15,
         shutdown_cancel_timeout_seconds=2,
+        shutdown_producer_timeout_seconds=3,
     )
 
     assert defaults.queue_capacity == 10_000
     assert defaults.dispatcher_batch_size == 256
     assert defaults.shutdown_drain_timeout_seconds == 10
     assert defaults.shutdown_cancel_timeout_seconds == 1
+    assert defaults.shutdown_producer_timeout_seconds == 1
     assert config.queue_capacity == 20_000
     assert config.dispatcher_batch_size == 512
     assert config.shutdown_drain_timeout_seconds == 15
     assert config.shutdown_cancel_timeout_seconds == 2
+    assert config.shutdown_producer_timeout_seconds == 3
 
 
 def test_provider_scheduler_config_rejects_unknown_failure_mode():

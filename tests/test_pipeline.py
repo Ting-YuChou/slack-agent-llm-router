@@ -1,6 +1,7 @@
 import json
 import asyncio
 import uuid
+from contextlib import suppress
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -371,15 +372,67 @@ class TestKafkaProducerManager:
         )
         manager._accepting = True
         manager._dispatcher_task = asyncio.create_task(manager._dispatch_loop())
+        delivered = PIPELINE_METRICS.producer_queue_delivered.labels(
+            topic="requests_raw"
+        )
+        abandoned = PIPELINE_METRICS.producer_queue_dropped.labels(
+            topic="requests_raw", reason="shutdown_abandoned"
+        )
+        shutdown_timeout = PIPELINE_METRICS.producer_queue_dropped.labels(
+            topic="requests_raw", reason="shutdown_timeout"
+        )
+        delivered_before = delivered._value.get()
+        abandoned_before = abandoned._value.get()
+        shutdown_timeout_before = shutdown_timeout._value.get()
         request = QueryRequest(query="hung", user_id="u1", user_tier=UserTier.FREE)
         assert await manager.produce_request_raw(request) is True
         await asyncio.wait_for(delivery_started.wait(), 0.05)
 
         await asyncio.wait_for(manager.shutdown(), 0.1)
 
-        manager.producer.stop.assert_awaited_once()
-        release_delivery.set()
-        await asyncio.sleep(0)
+        try:
+            manager.producer.stop.assert_awaited_once()
+            assert delivered._value.get() == delivered_before
+            assert abandoned._value.get() == abandoned_before + 1
+            assert shutdown_timeout._value.get() == shutdown_timeout_before
+        finally:
+            release_delivery.set()
+            await asyncio.sleep(0)
+        assert delivered._value.get() == delivered_before
+
+    @pytest.mark.asyncio
+    async def test_shutdown_bounds_producer_stop_that_suppresses_cancellation(
+        self, pipeline_config
+    ):
+        config = {
+            **pipeline_config,
+            "producer": {"shutdown_producer_timeout_seconds": 0.01},
+        }
+        manager = KafkaProducerManager(config)
+        manager.producer = AsyncMock()
+        release_stop = asyncio.Event()
+
+        async def cancellation_resistant_stop():
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await release_stop.wait()
+
+        manager.producer.stop = AsyncMock(side_effect=cancellation_resistant_stop)
+
+        shutdown_task = asyncio.create_task(manager.shutdown())
+        done, _ = await asyncio.wait({shutdown_task}, timeout=0.1)
+        try:
+            assert shutdown_task in done
+            manager.producer.stop.assert_awaited_once()
+            assert manager.consecutive_failures == 1
+            assert manager.last_error == "Kafka producer stop timed out"
+        finally:
+            if not shutdown_task.done():
+                shutdown_task.cancel()
+            release_stop.set()
+            with suppress(asyncio.CancelledError):
+                await shutdown_task
 
     def test_serialize_message_handles_datetime(self, pipeline_config):
         manager = KafkaProducerManager(pipeline_config)
