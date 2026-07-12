@@ -9,6 +9,8 @@ from src.utils.schema import (
     Attachment,
     AttachmentType,
     InferenceResponse,
+    InferenceConfig,
+    KafkaProducerConfig,
     ModelConfig,
     PlatformConfig,
     ProviderEndpointConfig,
@@ -246,6 +248,41 @@ def test_provider_scheduler_config_accepts_nested_policy():
     assert config.retry.budget_tokens == 50
     assert config.circuit_breaker.failure_threshold == 2
     assert config.circuit_breaker.half_open_max_requests == 2
+
+
+def test_inference_config_accepts_single_flight_and_request_deadline():
+    config = InferenceConfig(
+        single_flight={"enabled": True},
+        scheduler={"request_deadline_seconds": 60},
+    )
+
+    assert config.single_flight.enabled is True
+    assert config.scheduler.request_deadline_seconds == 60
+
+
+def test_inference_config_maps_legacy_batching_enabled_to_single_flight():
+    config = InferenceConfig(batching={"enabled": True})
+
+    assert config.single_flight.enabled is True
+
+
+def test_kafka_producer_config_accepts_background_dispatcher_limits():
+    defaults = KafkaProducerConfig()
+    config = KafkaProducerConfig(
+        queue_capacity=20_000,
+        dispatcher_batch_size=512,
+        shutdown_drain_timeout_seconds=15,
+        shutdown_cancel_timeout_seconds=2,
+    )
+
+    assert defaults.queue_capacity == 10_000
+    assert defaults.dispatcher_batch_size == 256
+    assert defaults.shutdown_drain_timeout_seconds == 10
+    assert defaults.shutdown_cancel_timeout_seconds == 1
+    assert config.queue_capacity == 20_000
+    assert config.dispatcher_batch_size == 512
+    assert config.shutdown_drain_timeout_seconds == 15
+    assert config.shutdown_cancel_timeout_seconds == 2
 
 
 def test_provider_scheduler_config_rejects_unknown_failure_mode():
