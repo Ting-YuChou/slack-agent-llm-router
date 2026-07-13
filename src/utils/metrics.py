@@ -191,6 +191,24 @@ class AdmissionMetrics:
             ["operation"],
         )
 
+        self.redis_recovery = Counter(
+            "llm_router_admission_redis_recovery_total",
+            "Redis admission recovery attempts and outcomes",
+            ["outcome"],
+        )
+
+        self.redis_state = Gauge(
+            "llm_router_admission_redis_state",
+            "Redis admission connection state (1 for the current state)",
+            ["state"],
+        )
+
+        self.redis_pool_exhaustion = Counter(
+            "llm_router_admission_redis_pool_exhaustion_total",
+            "Redis admission connection-pool exhaustion events",
+            ["operation", "failure_mode"],
+        )
+
         self.http_connections = Gauge(
             "llm_router_http_connections",
             "Number of HTTP connections",

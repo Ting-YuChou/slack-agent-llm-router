@@ -18,6 +18,10 @@ api:
       db: 4
       password_env: REDIS_PASSWORD
       key_prefix: api_gateway
+      connect_timeout_ms: 100
+      socket_timeout_ms: 100
+      max_connections: 100
+      recovery_cooldown_ms: 1000
     queue:
       enabled: true
       max_depth: 1000

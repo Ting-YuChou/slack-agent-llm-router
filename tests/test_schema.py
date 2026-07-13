@@ -183,7 +183,25 @@ def test_api_rate_limiting_accepts_legacy_request_bucket_config():
     assert config.burst_size == 50
     assert config.redis.db == 4
     assert config.redis.key_prefix == "api_gateway"
+    assert config.redis.connect_timeout_ms == 100
+    assert config.redis.socket_timeout_ms == 100
+    assert config.redis.max_connections == 100
+    assert config.redis.recovery_cooldown_ms == 1000
     assert config.failure_mode == "closed"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("connect_timeout_ms", 0),
+        ("socket_timeout_ms", 0),
+        ("max_connections", 0),
+        ("recovery_cooldown_ms", -1),
+    ],
+)
+def test_api_rate_limiting_rejects_invalid_redis_resilience_config(field, value):
+    with pytest.raises(ValidationError):
+        ApiRateLimitingConfig(redis={field: value})
 
 
 def test_api_rate_limiting_accepts_nested_admission_config():

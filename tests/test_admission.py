@@ -1,6 +1,11 @@
+import asyncio
+import time
+
 import pytest
+from redis.exceptions import MaxConnectionsError
 
 from src.admission import RedisAdmissionController
+from src.utils.metrics import ADMISSION_METRICS, metric_value_for_labels
 from src.utils.schema import QueryRequest, UserTier
 
 
@@ -134,6 +139,56 @@ class Clock:
 
     async def sleep(self, seconds):
         self.now += seconds
+
+
+class RecoveringRedis(FakeRedis):
+    def __init__(self):
+        super().__init__()
+        self.available = False
+        self.ping_calls = 0
+
+    async def ping(self):
+        self.ping_calls += 1
+        if not self.available:
+            raise ConnectionError("redis unavailable")
+        return True
+
+    async def eval(self, script, numkeys, *keys_and_args):
+        if not self.available:
+            raise ConnectionError("redis unavailable")
+        return await super().eval(script, numkeys, *keys_and_args)
+
+
+class PoolExhaustedRedis(FakeRedis):
+    async def eval(self, script, numkeys, *keys_and_args):
+        raise MaxConnectionsError("pool exhausted")
+
+
+class RecoveringPingRedis(FakeRedis):
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+        self.ping_calls = 0
+
+    async def ping(self):
+        self.ping_calls += 1
+        if self.error is not None:
+            raise self.error
+        return True
+
+
+class BlockingRedis(FakeRedis):
+    def __init__(self, delay_seconds=1.0):
+        super().__init__()
+        self.delay_seconds = delay_seconds
+
+    async def ping(self):
+        await asyncio.sleep(self.delay_seconds)
+        return True
+
+    async def eval(self, script, numkeys, *keys_and_args):
+        await asyncio.sleep(self.delay_seconds)
+        return await super().eval(script, numkeys, *keys_and_args)
 
 
 def _controller(config, *, clock=None, redis_client=None):
@@ -343,3 +398,169 @@ async def test_redis_failure_mode_closed_and_open():
     assert closed_decision.status_code == 503
     assert closed_decision.error == "admission_unavailable"
     assert open_decision.allowed is True
+
+
+@pytest.mark.asyncio
+async def test_transient_redis_failure_recovers_after_cooldown_without_restart():
+    clock = Clock()
+    client = RecoveringRedis()
+    controller = _controller(
+        {"redis": {"recovery_cooldown_ms": 1000}},
+        clock=clock,
+        redis_client=client,
+    )
+    request = QueryRequest(query="hello", user_id="u1")
+
+    failed = await controller.acquire_route(request)
+    assert failed.status_code == 503
+    assert controller.redis_client is client
+
+    client.available = True
+    clock.now += 1.1
+    recovered = await controller.acquire_route(request)
+
+    assert recovered.allowed is True
+    assert client.ping_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_recovery_uses_a_single_half_open_ping():
+    clock = Clock()
+    client = RecoveringRedis()
+    controller = _controller(
+        {"redis": {"recovery_cooldown_ms": 1000}},
+        clock=clock,
+        redis_client=client,
+    )
+    request = QueryRequest(query="hello", user_id="u1")
+    await controller.acquire_route(request)
+    client.available = True
+    clock.now += 1.1
+
+    decisions = await asyncio.gather(
+        *(controller.acquire_route(request) for _ in range(100))
+    )
+
+    assert all(decision.allowed for decision in decisions)
+    assert client.ping_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_mode", "allowed"), [("closed", False), ("open", True)]
+)
+async def test_pool_exhaustion_obeys_failure_mode(failure_mode, allowed):
+    controller = _controller(
+        {"failure_mode": failure_mode}, redis_client=PoolExhaustedRedis()
+    )
+
+    decision = await controller.acquire_route(QueryRequest(query="hello", user_id="u1"))
+
+    assert decision.allowed is allowed
+    if not allowed:
+        assert decision.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_owned_redis_client_uses_bounded_timeouts_and_health_checks(monkeypatch):
+    captured = {}
+
+    def build_client(**kwargs):
+        captured.update(kwargs)
+        return FakeRedis()
+
+    monkeypatch.setattr("src.admission.redis.Redis", build_client)
+    controller = RedisAdmissionController({"enabled": True})
+
+    await controller.initialize()
+
+    assert captured["socket_connect_timeout"] == 0.1
+    assert captured["socket_timeout"] == 0.1
+    assert captured["max_connections"] == 100
+    assert captured["health_check_interval"] > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "initial_error",
+    [ConnectionError("redis unavailable"), MaxConnectionsError("pool exhausted")],
+)
+async def test_injected_client_initialize_failure_recovers_after_cooldown(
+    initial_error,
+):
+    clock = Clock()
+    client = RecoveringPingRedis(initial_error)
+    controller = _controller(
+        {"redis": {"recovery_cooldown_ms": 1000}},
+        clock=clock,
+        redis_client=client,
+    )
+    initialize_errors_before = metric_value_for_labels(
+        ADMISSION_METRICS.redis_errors, {"operation": "initialize"}
+    )
+    pool_errors_before = metric_value_for_labels(
+        ADMISSION_METRICS.redis_pool_exhaustion,
+        {"operation": "initialize", "failure_mode": "closed"},
+    )
+
+    await controller.initialize()
+
+    assert controller._redis_available is False
+    assert controller._redis_failure_at == clock.now
+    assert metric_value_for_labels(
+        ADMISSION_METRICS.redis_errors, {"operation": "initialize"}
+    ) == (initialize_errors_before + 1)
+    expected_pool_increment = 1 if isinstance(initial_error, MaxConnectionsError) else 0
+    assert metric_value_for_labels(
+        ADMISSION_METRICS.redis_pool_exhaustion,
+        {"operation": "initialize", "failure_mode": "closed"},
+    ) == (pool_errors_before + expected_pool_increment)
+
+    client.error = None
+    clock.now += 1.1
+    recovered = await controller.acquire_route(
+        QueryRequest(query="hello", user_id="u1")
+    )
+
+    assert recovered.allowed is True
+    assert controller._redis_available is True
+    assert client.ping_calls == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["ping", "eval"])
+async def test_controller_bounds_blocking_redis_operations(operation):
+    client = BlockingRedis()
+    controller = _controller({"redis": {"socket_timeout_ms": 100}}, redis_client=client)
+    started = time.monotonic()
+
+    if operation == "ping":
+        await controller.initialize()
+        assert controller._redis_available is False
+    else:
+        decision = await controller.acquire_route(
+            QueryRequest(query="hello", user_id="u1")
+        )
+        assert decision.allowed is False
+        assert decision.status_code == 503
+
+    elapsed = time.monotonic() - started
+    assert 0.08 <= elapsed < 0.25
+
+
+@pytest.mark.asyncio
+async def test_blocking_redis_eval_times_out_and_fails_open_when_configured():
+    controller = _controller(
+        {
+            "failure_mode": "open",
+            "redis": {"socket_timeout_ms": 100},
+        },
+        redis_client=BlockingRedis(),
+    )
+    started = time.monotonic()
+
+    decision = await controller.acquire_route(QueryRequest(query="hello", user_id="u1"))
+
+    assert decision.allowed is True
+    assert decision.reason == "fail_open"
+    assert time.monotonic() - started < 0.25

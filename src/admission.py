@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 import redis.asyncio as redis
+from redis.exceptions import MaxConnectionsError
 
 from src.utils.metrics import ADMISSION_METRICS
 
@@ -304,15 +305,23 @@ class RedisAdmissionController:
         self.redis_client = redis_client
         self._owns_redis_client = redis_client is None
         self._redis_available = redis_client is not None
+        self._redis_failure_at: Optional[float] = None
+        self._recovery_lock = asyncio.Lock()
         self._time_func = time_func or time.time
         self._sleep_func = sleep_func or asyncio.sleep
+        self._set_redis_state("available" if self._redis_available else "unavailable")
 
     async def initialize(self):
         """Initialize the Redis connection used for atomic admission decisions."""
         if not self.enabled:
             return
         if self.redis_client is not None:
-            await self._ping()
+            try:
+                await self._ping()
+            except Exception as exc:
+                ADMISSION_METRICS.redis_errors.labels(operation="initialize").inc()
+                self._mark_redis_failure("initialize", exc)
+                logger.warning("Failed to initialize API admission controller: %s", exc)
             return
 
         try:
@@ -322,11 +331,22 @@ class RedisAdmissionController:
                 password = os.getenv(str(password_env))
 
             redis_url = self.redis_config.get("url")
+            client_options = {
+                "socket_connect_timeout": int(
+                    self.redis_config.get("connect_timeout_ms", 100)
+                )
+                / 1000.0,
+                "socket_timeout": int(self.redis_config.get("socket_timeout_ms", 100))
+                / 1000.0,
+                "max_connections": int(self.redis_config.get("max_connections", 100)),
+                "health_check_interval": 30,
+            }
             if redis_url and hasattr(redis.Redis, "from_url"):
                 self.redis_client = redis.Redis.from_url(
                     redis_url,
                     password=password,
                     decode_responses=True,
+                    **client_options,
                 )
             else:
                 self.redis_client = redis.Redis(
@@ -335,21 +355,22 @@ class RedisAdmissionController:
                     db=int(self.redis_config.get("db", 4)),
                     password=password,
                     decode_responses=True,
+                    **client_options,
                 )
             await self._ping()
             logger.info("API admission controller initialized")
         except Exception as exc:
-            self.redis_client = None
-            self._redis_available = False
             ADMISSION_METRICS.redis_errors.labels(operation="initialize").inc()
+            self._mark_redis_failure("initialize", exc)
             logger.warning("Failed to initialize API admission controller: %s", exc)
 
     async def _ping(self):
         if self.redis_client is None:
             self._redis_available = False
+            self._set_redis_state("unavailable")
             return
-        await self.redis_client.ping()
-        self._redis_available = True
+        await self._run_redis_operation(self.redis_client.ping())
+        self._mark_redis_available()
 
     def is_healthy(self) -> bool:
         if not self.enabled:
@@ -365,6 +386,8 @@ class RedisAdmissionController:
                     await result
         self.redis_client = None
         self._redis_available = False
+        self._redis_failure_at = None
+        self._set_redis_state("unavailable")
 
     async def acquire_http(
         self,
@@ -488,10 +511,10 @@ class RedisAdmissionController:
             result = await self._eval(RELEASE_SCRIPT, keys, args)
             released = bool(int(self._result_value(result, 0, 0)))
             if released:
-                for spec in reservation.active_specs:
+                for active_spec in reservation.active_specs:
                     ADMISSION_METRICS.active_reservations.labels(
                         stage=reservation.stage,
-                        scope=spec.scope,
+                        scope=active_spec.scope,
                     ).dec()
                 if reservation.reserved_tokens > 0:
                     ADMISSION_METRICS.tokens.labels(
@@ -511,6 +534,7 @@ class RedisAdmissionController:
             return released
         except Exception as exc:
             ADMISSION_METRICS.redis_errors.labels(operation="release").inc()
+            self._mark_redis_failure("release", exc)
             logger.warning("Admission release failed: %s", exc)
             return False
 
@@ -528,9 +552,15 @@ class RedisAdmissionController:
             self._record_decision(stage, "allowed", "disabled")
             return AdmissionDecision.allow(None, reason="disabled", metadata=metadata)
 
-        unavailable = self._unavailable_decision(stage)
-        if unavailable:
-            return unavailable
+        if not self._redis_available:
+            await self._recover_if_due()
+            if not self._redis_available:
+                unavailable = self._unavailable_decision(stage)
+                if unavailable:
+                    return unavailable
+                return AdmissionDecision.allow(
+                    None, reason="fail_open", metadata=metadata
+                )
 
         queued = False
         queue_started = self._time_func()
@@ -617,7 +647,7 @@ class RedisAdmissionController:
         except Exception as exc:
             ADMISSION_METRICS.redis_errors.labels(operation="admit").inc()
             logger.warning("Admission admit failed: %s", exc)
-            self._redis_available = False
+            self._mark_redis_failure("admit", exc)
             unavailable = self._unavailable_decision(stage)
             if unavailable:
                 return unavailable
@@ -648,10 +678,10 @@ class RedisAdmissionController:
             metadata=metadata,
         )
         self._record_decision(stage, "allowed", "allowed")
-        for spec in active_specs:
+        for active_spec in active_specs:
             ADMISSION_METRICS.active_reservations.labels(
                 stage=stage,
-                scope=spec.scope,
+                scope=active_spec.scope,
             ).inc()
         if reserved_tokens > 0:
             ADMISSION_METRICS.tokens.labels(
@@ -696,7 +726,7 @@ class RedisAdmissionController:
         except Exception as exc:
             ADMISSION_METRICS.redis_errors.labels(operation="queue_enter").inc()
             logger.warning("Admission queue enter failed: %s", exc)
-            self._redis_available = False
+            self._mark_redis_failure("queue_enter", exc)
             unavailable = self._unavailable_decision(stage)
             return unavailable or AdmissionDecision.allow(None, reason="fail_open")
 
@@ -713,7 +743,62 @@ class RedisAdmissionController:
             ADMISSION_METRICS.queue_depth.labels(scope="global").set(depth)
         except Exception as exc:
             ADMISSION_METRICS.redis_errors.labels(operation="queue_leave").inc()
+            self._mark_redis_failure("queue_leave", exc)
             logger.warning("Admission queue leave failed for %s: %s", stage, exc)
+
+    async def _recover_if_due(self) -> bool:
+        if self.redis_client is None or self._redis_available:
+            return self._redis_available
+        cooldown_seconds = (
+            max(0, int(self.redis_config.get("recovery_cooldown_ms", 1000))) / 1000.0
+        )
+        if (
+            self._redis_failure_at is not None
+            and self._time_func() - self._redis_failure_at < cooldown_seconds
+        ):
+            return False
+
+        async with self._recovery_lock:
+            if self._redis_available:
+                return True
+            if (
+                self._redis_failure_at is not None
+                and self._time_func() - self._redis_failure_at < cooldown_seconds
+            ):
+                return False
+            ADMISSION_METRICS.redis_recovery.labels(outcome="attempt").inc()
+            self._set_redis_state("recovering")
+            try:
+                await self._run_redis_operation(self.redis_client.ping())
+            except Exception as exc:
+                ADMISSION_METRICS.redis_recovery.labels(outcome="failure").inc()
+                self._mark_redis_failure("recovery_ping", exc)
+                return False
+            ADMISSION_METRICS.redis_recovery.labels(outcome="success").inc()
+            self._mark_redis_available()
+            return True
+
+    def _mark_redis_available(self):
+        self._redis_available = True
+        self._redis_failure_at = None
+        self._set_redis_state("available")
+
+    def _mark_redis_failure(self, operation: str, exc: Exception):
+        self._redis_available = False
+        self._redis_failure_at = self._time_func()
+        self._set_redis_state("unavailable")
+        if isinstance(exc, MaxConnectionsError):
+            ADMISSION_METRICS.redis_pool_exhaustion.labels(
+                operation=operation,
+                failure_mode=self.failure_mode,
+            ).inc()
+
+    @staticmethod
+    def _set_redis_state(state: str):
+        for candidate in ("available", "unavailable", "recovering"):
+            ADMISSION_METRICS.redis_state.labels(state=candidate).set(
+                1 if candidate == state else 0
+            )
 
     def _unavailable_decision(self, stage: str) -> Optional[AdmissionDecision]:
         if self.redis_client is not None and self._redis_available:
@@ -760,7 +845,19 @@ class RedisAdmissionController:
     ) -> Sequence[Any]:
         if self.redis_client is None:
             raise RuntimeError("Redis client is not initialized")
-        return await self.redis_client.eval(script, len(keys), *keys, *args)
+        result = await self._run_redis_operation(
+            self.redis_client.eval(script, len(keys), *keys, *args)
+        )
+        self._mark_redis_available()
+        return result
+
+    async def _run_redis_operation(self, awaitable: Any) -> Any:
+        timeout_seconds = max(
+            0.001,
+            int(self.redis_config.get("socket_timeout_ms", 100)) / 1000.0,
+        )
+        async with asyncio.timeout(timeout_seconds):
+            return await awaitable
 
     def _global_active_specs(self) -> List[ActiveSpec]:
         global_limits = dict(self.config.get("global_limits", {}) or {})

@@ -381,6 +381,10 @@ class ApiRateLimitRedisConfig(ConfigModel):
     password_env: Optional[str] = "REDIS_PASSWORD"
     url: Optional[str] = None
     key_prefix: str = "api_gateway"
+    connect_timeout_ms: int = Field(100, ge=1)
+    socket_timeout_ms: int = Field(100, ge=1)
+    max_connections: int = Field(100, ge=1)
+    recovery_cooldown_ms: int = Field(1000, ge=0)
 
 
 class ApiRateLimitQueueConfig(ConfigModel):
