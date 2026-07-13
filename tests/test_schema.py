@@ -261,6 +261,10 @@ def test_provider_scheduler_config_accepts_nested_policy():
     )
 
     assert config.queue_enabled is True
+    assert config.max_poll_interval_ms == 250
+    assert config.poll_jitter_ratio == 0.2
+    assert config.queue_lease_grace_ms == 1000
+    assert config.control_plane_version == "v2"
     assert config.failure_mode == "open"
     assert config.retry.max_attempts_per_request == 3
     assert config.retry.budget_tokens == 50

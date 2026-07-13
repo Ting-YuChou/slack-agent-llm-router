@@ -86,10 +86,23 @@ class RecordingAdmission:
 
     async def acquire_provider(self, **kwargs):
         self.calls.append(kwargs)
+        queue_request = kwargs.get("queue_request")
+        if queue_request is not None and queue_request.enqueue:
+            self.redis_client.zsets.setdefault(queue_request.order_key, {})[
+                queue_request.member_id
+            ] = queue_request.priority_score
+            self.redis_client.zsets.setdefault(queue_request.expiry_key, {})[
+                queue_request.member_id
+            ] = queue_request.expiry_timestamp_ms
+            self.redis_client.values[queue_request.depth_key] = len(
+                self.redis_client.zsets[queue_request.order_key]
+            )
         if self.decisions:
             decision = self.decisions.pop(0)
             if decision is not None:
                 return decision
+        if queue_request is not None and queue_request.enqueue:
+            await self._cleanup_queue(queue_request)
         return AdmissionDecision.allow(
             SimpleNamespace(reservation_id=f"r{len(self.calls)}", stage="provider")
         )
@@ -97,6 +110,37 @@ class RecordingAdmission:
     async def release(self, reservation, *, actual_tokens=None):
         self.releases.append((reservation, actual_tokens))
         return True
+
+    async def _cleanup_queue(self, queue_request):
+        self.redis_client.zsets.setdefault(queue_request.order_key, {}).pop(
+            queue_request.member_id, None
+        )
+        self.redis_client.zsets.setdefault(queue_request.expiry_key, {}).pop(
+            queue_request.member_id, None
+        )
+        depth = len(self.redis_client.zsets[queue_request.order_key])
+        self.redis_client.values[queue_request.depth_key] = depth
+        return depth
+
+
+@pytest.mark.asyncio
+async def test_scheduler_fast_path_passes_try_only_provider_queue_request():
+    admission = RecordingAdmission()
+    scheduler = ProviderCapacityScheduler({"queue_enabled": True}, admission)
+
+    await scheduler.acquire(
+        request=QueryRequest(query="hello", user_id="u1"),
+        model_name="gpt-5",
+        provider="openai",
+        estimated_input_tokens=1,
+    )
+
+    queue_request = admission.calls[0]["queue_request"]
+    assert queue_request.enqueue is False
+    assert queue_request.scope == "provider:openai:gpt-5"
+    assert ":v2:queue:" in queue_request.order_key
+    assert queue_request.depth_key.endswith(":depth")
+    assert queue_request.sequence_key.endswith(":sequence")
 
 
 def _deny(reason, status_code=429):
@@ -183,6 +227,7 @@ async def test_scheduler_queue_timeout_cleans_up_wait_record():
         decisions=[
             _deny("provider_active_requests_exceeded"),
             _deny("provider_active_requests_exceeded"),
+            _deny("provider_active_requests_exceeded"),
         ]
     )
     scheduler = ProviderCapacityScheduler(
@@ -207,6 +252,126 @@ async def test_scheduler_queue_timeout_cleans_up_wait_record():
     assert scheduler.get_health_status()["queue_depths"] == [
         {"provider": "openai", "model": "gpt-5", "depth": 0}
     ]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_cleanup_preserves_other_member_depth():
+    clock = Clock()
+    admission = RecordingAdmission(
+        decisions=[
+            _deny("provider_active_requests_exceeded"),
+            _deny("provider_active_requests_exceeded"),
+        ]
+    )
+    scheduler = ProviderCapacityScheduler(
+        {
+            "queue_enabled": True,
+            "wait_timeout_ms": 1,
+            "poll_interval_ms": 1,
+            "poll_jitter_ratio": 0,
+        },
+        admission,
+        time_func=clock,
+        sleep_func=clock.sleep,
+    )
+    queue_key = scheduler._queue_key("openai", "gpt-5")
+    expiry_key = scheduler._queue_expiry_key("openai", "gpt-5")
+    depth_key = scheduler._queue_depth_key("openai", "gpt-5")
+    admission.redis_client.zsets[queue_key] = {"other": 1}
+    admission.redis_client.zsets[expiry_key] = {"other": 9999999}
+    admission.redis_client.values[depth_key] = 1
+
+    with pytest.raises(AdmissionRejectedError):
+        await scheduler.acquire(
+            request=QueryRequest(query="hello", user_id="u1"),
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+        )
+
+    assert scheduler.get_health_status()["queue_depths"] == [
+        {"provider": "openai", "model": "gpt-5", "depth": 1}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_adaptive_poll_sequence_caps_and_respects_deadline():
+    sleeps = []
+    now = 1000.0
+
+    def time_func():
+        return now
+
+    async def sleep_func(seconds):
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    admission = RecordingAdmission(
+        decisions=[_deny("provider_active_requests_exceeded")] * 20
+    )
+    scheduler = ProviderCapacityScheduler(
+        {
+            "queue_enabled": True,
+            "wait_timeout_ms": 700,
+            "poll_interval_ms": 25,
+            "max_poll_interval_ms": 250,
+            "poll_jitter_ratio": 0,
+        },
+        admission,
+        time_func=time_func,
+        sleep_func=sleep_func,
+    )
+
+    with pytest.raises(AdmissionRejectedError):
+        await scheduler.acquire(
+            request=QueryRequest(query="hello", user_id="u1"),
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+        )
+
+    assert sleeps == pytest.approx([0.025, 0.05, 0.1, 0.2, 0.25, 0.075])
+
+
+@pytest.mark.asyncio
+async def test_scheduler_adaptive_poll_jitter_stays_bounded_by_deadline():
+    sleeps = []
+    now = 1000.0
+
+    def time_func():
+        return now
+
+    async def sleep_func(seconds):
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    scheduler = ProviderCapacityScheduler(
+        {
+            "queue_enabled": True,
+            "wait_timeout_ms": 400,
+            "poll_interval_ms": 25,
+            "max_poll_interval_ms": 250,
+            "poll_jitter_ratio": 0.2,
+        },
+        RecordingAdmission(decisions=[_deny("provider_active_requests_exceeded")] * 20),
+        time_func=time_func,
+        sleep_func=sleep_func,
+    )
+
+    with pytest.raises(AdmissionRejectedError):
+        await scheduler.acquire(
+            request=QueryRequest(query="hello", user_id="u1"),
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+        )
+
+    nominal = [0.025, 0.05, 0.1, 0.2]
+    for actual, expected in zip(sleeps, nominal):
+        assert expected * 0.8 <= actual <= expected * 1.2
+    assert sum(sleeps) == pytest.approx(0.4)
 
 
 def test_scheduler_allows_fallback_for_queue_timeout_with_provider_last_reason():

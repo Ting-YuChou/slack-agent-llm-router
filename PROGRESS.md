@@ -7,6 +7,13 @@
 - Verification: `python -m pytest tests/test_admission.py tests/test_schema.py -q` (`57 passed`); Black, Flake8, mypy, and `git diff --check` passed; independent task review approved.
 - Follow-up: atomic fast admission, v2 queue leases, and circuit transitions remain in the next tasks.
 
+## 2026-07-12 — Atomic admission before queueing
+
+- Changed: unified API/provider fast admission and queued admission in one Lua primitive; added v2 order/expiry/depth/sequence state, stale lease pruning, deterministic FIFO/priority ordering, adaptive jittered polling, and atomic terminal cleanup. Provider scheduling now bypasses the admission global queue.
+- Key files: `src/admission.py`, `src/provider_scheduler.py`, scheduler/admission schema and metrics, scoped tests, and `tests/test_admission_redis_integration.py`.
+- Verification: scoped suite (`81 passed`) and real Redis integration (`13 passed`); Black, Flake8, mypy, compileall, and `git diff --check` passed; independent review approved after two fix/re-review rounds.
+- Follow-up: atomic circuit transitions, v1 key cleanup tooling, and performance gates remain.
+
 ## 2026-07-12 — Kafka and provider hot-path hardening
 
 - Changed: made Kafka consumer batch persistence race-safe; made Redis policy materialization fail before offset commit; moved Kafka delivery/ack/retry into a bounded background dispatcher with explicit drain, abandonment, and producer-close deadlines; replaced pseudo batching with zero-wait single-flight ahead of provider scheduling; centralized retries under a shared 60-second deadline and transport-attempt budget.

@@ -24,6 +24,10 @@ api:
       max_depth: 1000
       timeout_ms: 250
       poll_interval_ms: 25
+      max_poll_interval_ms: 250
+      poll_jitter_ratio: 0.2
+      queue_lease_grace_ms: 1000
+      control_plane_version: v2
     global_limits:
       active_requests: 100
       tokens_per_minute: 500000
@@ -260,6 +264,10 @@ inference:
     queue_enabled: true
     wait_timeout_ms: 250
     poll_interval_ms: 25
+    max_poll_interval_ms: 250
+    poll_jitter_ratio: 0.2
+    queue_lease_grace_ms: 1000
+    control_plane_version: v2
     failure_mode: closed
     allow_fallback_on_provider_rejection: true
     key_prefix: provider_scheduler

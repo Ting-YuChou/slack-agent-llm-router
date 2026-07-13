@@ -392,6 +392,10 @@ class ApiRateLimitQueueConfig(ConfigModel):
     max_depth: int = Field(1000, ge=0)
     timeout_ms: int = Field(250, ge=0)
     poll_interval_ms: int = Field(25, ge=1)
+    max_poll_interval_ms: int = Field(250, ge=1)
+    poll_jitter_ratio: float = Field(0.2, ge=0.0, le=1.0)
+    queue_lease_grace_ms: int = Field(1000, ge=0)
+    control_plane_version: str = "v2"
 
 
 class ApiRateLimitBucketConfig(ConfigModel):
@@ -588,6 +592,10 @@ class ProviderSchedulerConfig(ConfigModel):
     queue_enabled: bool = False
     wait_timeout_ms: int = Field(250, ge=0)
     poll_interval_ms: int = Field(25, ge=1)
+    max_poll_interval_ms: int = Field(250, ge=1)
+    poll_jitter_ratio: float = Field(0.2, ge=0.0, le=1.0)
+    queue_lease_grace_ms: int = Field(1000, ge=0)
+    control_plane_version: str = "v2"
     failure_mode: str = "closed"
     allow_fallback_on_provider_rejection: bool = True
     key_prefix: str = "provider_scheduler"

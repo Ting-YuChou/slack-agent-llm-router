@@ -13,7 +13,11 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 import httpx
 
-from src.admission import AdmissionDecision, AdmissionRejectedError
+from src.admission import (
+    AdmissionDecision,
+    AdmissionRejectedError,
+    QueueAdmissionRequest,
+)
 from src.utils.metrics import INFERENCE_METRICS
 
 logger = logging.getLogger(__name__)
@@ -101,6 +105,19 @@ class ProviderCapacityScheduler:
         self.wait_timeout_ms = int(self.config.get("wait_timeout_ms", 250) or 0)
         self.poll_interval_ms = max(
             1, int(self.config.get("poll_interval_ms", 25) or 25)
+        )
+        self.max_poll_interval_ms = max(
+            self.poll_interval_ms,
+            int(self.config.get("max_poll_interval_ms", 250) or 250),
+        )
+        self.poll_jitter_ratio = max(
+            0.0, min(1.0, float(self.config.get("poll_jitter_ratio", 0.2) or 0.0))
+        )
+        self.queue_lease_grace_ms = max(
+            0, int(self.config.get("queue_lease_grace_ms", 1000) or 0)
+        )
+        self.control_plane_version = str(
+            self.config.get("control_plane_version", "v2") or "v2"
         )
         self.failure_mode = str(self.config.get("failure_mode", "closed")).lower()
         if self.failure_mode not in {"open", "closed"}:
@@ -254,6 +271,7 @@ class ProviderCapacityScheduler:
                     queue_key=None,
                     queue_member=None,
                     wait_seconds=0.0,
+                    queue_request=None,
                 )
         except Exception:
             await self._release_circuit_probe(circuit_probe_key)
@@ -417,6 +435,7 @@ class ProviderCapacityScheduler:
                     queue_key=None,
                     queue_member=None,
                     wait_seconds=0.0,
+                    queue_request=None,
                 )
             decision = self._reject(
                 provider=provider,
@@ -428,16 +447,31 @@ class ProviderCapacityScheduler:
             raise AdmissionRejectedError(decision)
 
         queue_key = self._queue_key(provider, model_name)
+        expiry_key = self._queue_expiry_key(provider, model_name)
+        depth_key = self._queue_depth_key(provider, model_name)
+        sequence_key = self._queue_sequence_key(provider, model_name)
         queue_member = self._queue_member(request)
         started_at = self._time_func()
-        await self._queue_add(
-            client, queue_key, queue_member, self._queue_score(request)
+        expiry_ms = int(
+            (started_at * 1000) + self.wait_timeout_ms + self.queue_lease_grace_ms
         )
-        await self._set_queue_depth(provider, model_name, queue_key)
+        queue_request = QueueAdmissionRequest(
+            scope=f"provider:{provider}:{model_name}",
+            member_id=queue_member,
+            priority_score=0,
+            priority_band=self._queue_priority_band(request),
+            expiry_timestamp_ms=expiry_ms,
+            enqueue=False,
+            order_key=queue_key,
+            expiry_key=expiry_key,
+            depth_key=depth_key,
+            sequence_key=sequence_key,
+        )
 
         last_decision: Optional[AdmissionDecision] = None
         try:
             deadline = started_at + (max(0, self.wait_timeout_ms) / 1000.0)
+            poll_interval_ms = self.poll_interval_ms
             while True:
                 now = self._time_func()
                 if last_decision is not None and (
@@ -450,22 +484,32 @@ class ProviderCapacityScheduler:
                     )
                     self._record_rejection(provider, model_name, decision)
                     raise AdmissionRejectedError(decision)
-                if await self._queue_is_head(client, queue_key, queue_member):
-                    try:
-                        return await self._try_acquire(
-                            request=request,
-                            model_name=model_name,
-                            provider=provider,
-                            estimated_input_tokens=estimated_input_tokens,
-                            queued=True,
-                            queue_key=queue_key,
-                            queue_member=queue_member,
-                            wait_seconds=max(0.0, self._time_func() - started_at),
+                try:
+                    return await self._try_acquire(
+                        request=request,
+                        model_name=model_name,
+                        provider=provider,
+                        estimated_input_tokens=estimated_input_tokens,
+                        queued=queue_request.enqueue,
+                        queue_key=queue_key,
+                        queue_member=queue_member,
+                        wait_seconds=max(0.0, self._time_func() - started_at),
+                        queue_request=queue_request,
+                    )
+                except AdmissionRejectedError as exc:
+                    last_decision = exc.decision
+                    if not self._is_waitable_reason(
+                        exc.decision.reason
+                    ) and exc.decision.reason not in {
+                        "queue_required",
+                        "queue_wait",
+                    }:
+                        raise
+                    if not queue_request.enqueue:
+                        queue_request = QueueAdmissionRequest(
+                            **{**queue_request.__dict__, "enqueue": True}
                         )
-                    except AdmissionRejectedError as exc:
-                        last_decision = exc.decision
-                        if not self._is_waitable_reason(exc.decision.reason):
-                            raise
+                        continue
 
                 now = self._time_func()
                 if self.wait_timeout_ms <= 0 or now >= deadline:
@@ -476,13 +520,31 @@ class ProviderCapacityScheduler:
                     )
                     self._record_rejection(provider, model_name, decision)
                     raise AdmissionRejectedError(decision)
+                jitter = 1.0
+                if self.poll_jitter_ratio:
+                    digest = int(hashlib.sha256(str(now).encode()).hexdigest()[:8], 16)
+                    jitter += (
+                        ((digest / 0xFFFFFFFF) * 2.0) - 1.0
+                    ) * self.poll_jitter_ratio
                 sleep_for = min(
-                    self.poll_interval_ms / 1000.0, max(deadline - now, 0.0)
+                    max(0.001, (poll_interval_ms * jitter) / 1000.0),
+                    max(deadline - now, 0.0),
                 )
+                INFERENCE_METRICS.scheduler_queue_polls.labels(
+                    provider=provider, model=model_name
+                ).inc()
                 await self._sleep_func(sleep_for)
+                poll_interval_ms = min(self.max_poll_interval_ms, poll_interval_ms * 2)
         finally:
-            await self._queue_remove(client, queue_key, queue_member)
-            await self._set_queue_depth(provider, model_name, queue_key)
+            cleanup = getattr(self.admission_controller, "_cleanup_queue", None)
+            if cleanup is not None and queue_request.enqueue:
+                depth = int(await cleanup(queue_request))
+            else:
+                depth = self._last_queue_depths.get((provider, model_name), 0)
+            self._last_queue_depths[(provider, model_name)] = depth
+            INFERENCE_METRICS.scheduler_queue_depth.labels(
+                provider=provider, model=model_name
+            ).set(depth)
 
     async def _try_acquire(
         self,
@@ -495,6 +557,7 @@ class ProviderCapacityScheduler:
         queue_key: Optional[str],
         queue_member: Optional[str],
         wait_seconds: float,
+        queue_request: Optional[QueueAdmissionRequest],
     ) -> SchedulerLease:
         acquire_provider = getattr(self.admission_controller, "acquire_provider", None)
         if acquire_provider is None:
@@ -512,7 +575,19 @@ class ProviderCapacityScheduler:
             model_name=model_name,
             provider=provider,
             estimated_input_tokens=estimated_input_tokens,
+            queue_request=queue_request,
         )
+        if queue_request is not None:
+            depth = int(decision.metadata.get("queue_depth", 0) or 0)
+            pruned = int(decision.metadata.get("queue_pruned", 0) or 0)
+            self._last_queue_depths[(provider, model_name)] = depth
+            INFERENCE_METRICS.scheduler_queue_depth.labels(
+                provider=provider, model=model_name
+            ).set(depth)
+            if pruned:
+                INFERENCE_METRICS.scheduler_queue_pruned.labels(
+                    provider=provider, model=model_name
+                ).inc(pruned)
         if not decision.allowed:
             self._record_rejection(provider, model_name, decision)
             raise AdmissionRejectedError(decision)
@@ -534,6 +609,9 @@ class ProviderCapacityScheduler:
         )
 
     def _queue_score(self, request: Any) -> float:
+        return float(self._queue_priority_band(request))
+
+    def _queue_priority_band(self, request: Any) -> int:
         metadata = getattr(request, "metadata", None) or {}
         latency_sla = str(metadata.get("latency_sla", "") or "").lower()
         explicit_fast = bool(
@@ -547,63 +625,29 @@ class ProviderCapacityScheduler:
         tier_value = getattr(getattr(request, "user_tier", "free"), "value", None)
         tier = str(tier_value or getattr(request, "user_tier", "free")).lower()
         tier_rank = {"enterprise": 0, "premium": 1, "free": 2}.get(tier, 2)
-        now_ms = int(self._time_func() * 1000)
-        return (
-            latency_rank * 1_000_000_000_000
-            + priority_rank * 10_000_000_000
-            + tier_rank * 100_000_000
-            + now_ms
-        )
+        return latency_rank * 100 + priority_rank * 10 + tier_rank
 
     def _queue_key(self, provider: str, model_name: str) -> str:
         return (
-            f"{self.key_prefix}:queue:{self._scope(provider)}:{self._scope(model_name)}"
+            f"{self.key_prefix}:{self.control_plane_version}:queue:"
+            f"{self._scope(provider)}:{self._scope(model_name)}:order"
+        )
+
+    def _queue_expiry_key(self, provider: str, model_name: str) -> str:
+        return self._queue_key(provider, model_name).removesuffix(":order") + ":expiry"
+
+    def _queue_depth_key(self, provider: str, model_name: str) -> str:
+        return self._queue_key(provider, model_name).removesuffix(":order") + ":depth"
+
+    def _queue_sequence_key(self, provider: str, model_name: str) -> str:
+        return (
+            self._queue_key(provider, model_name).removesuffix(":order") + ":sequence"
         )
 
     def _queue_member(self, request: Any) -> str:
         request_id = str(getattr(request, "request_id", "") or uuid.uuid4().hex)
         digest = hashlib.sha256(uuid.uuid4().hex.encode("utf-8")).hexdigest()[:12]
         return f"{request_id}:{digest}"
-
-    async def _queue_add(
-        self, client: Any, queue_key: str, queue_member: str, score: float
-    ) -> None:
-        await client.zadd(queue_key, {queue_member: score})
-
-    async def _queue_remove(
-        self, client: Any, queue_key: str, queue_member: str
-    ) -> None:
-        try:
-            await client.zrem(queue_key, queue_member)
-        except Exception as exc:
-            logger.warning("Failed to remove provider scheduler queue member: %s", exc)
-
-    async def _queue_is_head(
-        self, client: Any, queue_key: str, queue_member: str
-    ) -> bool:
-        raw = await client.zrange(queue_key, 0, 0)
-        if not raw:
-            return False
-        head = raw[0]
-        if isinstance(head, bytes):
-            head = head.decode("utf-8")
-        return str(head) == queue_member
-
-    async def _set_queue_depth(
-        self, provider: str, model_name: str, queue_key: str
-    ) -> None:
-        client = self._redis_client()
-        if client is None:
-            return
-        try:
-            depth = int(await client.zcard(queue_key))
-        except Exception:
-            return
-        self._last_queue_depths[(provider, model_name)] = depth
-        INFERENCE_METRICS.scheduler_queue_depth.labels(
-            provider=provider,
-            model=model_name,
-        ).set(depth)
 
     def _timeout_decision(
         self,
