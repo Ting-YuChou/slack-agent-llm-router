@@ -53,6 +53,34 @@ class SchedulerLease:
     queue_member: Optional[str] = None
     acquired_at: float = field(default_factory=time.time)
     wait_seconds: float = 0.0
+    released: bool = False
+    release_task: Optional[asyncio.Task] = None
+
+
+@dataclass
+class RequestExecutionBudget:
+    """One monotonic deadline and transport-attempt budget for a request."""
+
+    max_attempts: int
+    deadline_seconds: float = 60.0
+    started_at: float = field(default_factory=time.monotonic)
+    attempts_used: int = 0
+
+    @property
+    def remaining_seconds(self) -> float:
+        return max(0.0, self.deadline_seconds - (time.monotonic() - self.started_at))
+
+    def consume_attempt(self) -> bool:
+        if self.remaining_seconds <= 0 or self.attempts_used >= self.max_attempts:
+            return False
+        self.attempts_used += 1
+        return True
+
+    def ensure_available(self) -> None:
+        if self.remaining_seconds <= 0:
+            raise asyncio.TimeoutError("request execution deadline exceeded")
+        if self.attempts_used >= self.max_attempts:
+            raise RuntimeError("request transport attempt budget exhausted")
 
 
 class ProviderCapacityScheduler:
@@ -94,6 +122,16 @@ class ProviderCapacityScheduler:
         self._last_circuit_states: Dict[tuple[str, str], str] = {}
         self._last_rejection: Optional[Dict[str, Any]] = None
 
+    def create_execution_budget(self) -> RequestExecutionBudget:
+        return RequestExecutionBudget(
+            max_attempts=max(
+                1, int(self.retry_config.get("max_attempts_per_request", 1) or 1)
+            ),
+            deadline_seconds=float(
+                self.config.get("request_deadline_seconds", 60) or 60
+            ),
+        )
+
     async def run_provider_call(
         self,
         *,
@@ -102,49 +140,78 @@ class ProviderCapacityScheduler:
         provider: str,
         estimated_input_tokens: int,
         operation: Callable[[], Awaitable[Any]],
+        execution_budget: Optional[RequestExecutionBudget] = None,
     ) -> Any:
         """Run a non-streaming provider call under scheduler control."""
         if not self.enabled:
             self._record_decision(provider, model_name, "allowed", "disabled")
-            return await operation()
+            if execution_budget is None:
+                return await operation()
+            execution_budget.ensure_available()
+            if not execution_budget.consume_attempt():
+                execution_budget.ensure_available()
+            async with asyncio.timeout(execution_budget.remaining_seconds):
+                return await operation()
 
         attempts = max(
             1, int(self.retry_config.get("max_attempts_per_request", 1) or 1)
         )
-        attempt = 0
+        budget = execution_budget or RequestExecutionBudget(
+            max_attempts=attempts,
+            deadline_seconds=float(
+                self.config.get("request_deadline_seconds", 60) or 60
+            ),
+        )
         last_exc: Optional[Exception] = None
-        while attempt < attempts:
-            attempt += 1
-            lease = await self.acquire(
-                request=request,
-                model_name=model_name,
-                provider=provider,
-                estimated_input_tokens=estimated_input_tokens,
-            )
+        local_attempt = 0
+        while local_attempt < attempts:
+            budget.ensure_available()
+            lease: Optional[SchedulerLease] = None
             response = None
             try:
-                response = await operation()
-                await self.release(
-                    lease,
-                    actual_tokens=getattr(response, "total_tokens", None),
-                )
+                async with asyncio.timeout(budget.remaining_seconds):
+                    lease = await self.acquire(
+                        request=request,
+                        model_name=model_name,
+                        provider=provider,
+                        estimated_input_tokens=estimated_input_tokens,
+                    )
+                    if not budget.consume_attempt():
+                        budget.ensure_available()
+                    local_attempt += 1
+                    response = await operation()
                 await self.record_success(provider=provider, model_name=model_name)
-                if attempt > 1:
+                if local_attempt > 1:
                     self._record_retry_metric(provider, model_name, "success")
                 return response
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 last_exc = exc
-                await self.release(lease, actual_tokens=None)
-                await self.record_failure(
-                    provider=provider, model_name=model_name, error=exc
-                )
-                if attempt >= attempts or not self._is_retryable_exception(exc):
+                if local_attempt > 0:
+                    await self.record_failure(
+                        provider=provider, model_name=model_name, error=exc
+                    )
+                if (
+                    local_attempt >= attempts
+                    or budget.attempts_used >= budget.max_attempts
+                    or budget.remaining_seconds <= 0
+                    or not self._is_retryable_exception(exc)
+                ):
                     raise
                 if not await self._consume_retry_budget(provider, model_name):
                     self._record_retry_metric(provider, model_name, "budget_exhausted")
                     raise
                 self._record_retry_metric(provider, model_name, "retry")
-                await self._sleep_func(self._retry_backoff_seconds(attempt))
+                backoff = self._retry_backoff_seconds(local_attempt)
+                if backoff >= budget.remaining_seconds:
+                    raise asyncio.TimeoutError("request execution deadline exceeded")
+                await self._sleep_func(backoff)
+            finally:
+                await self.release(
+                    lease,
+                    actual_tokens=getattr(response, "total_tokens", None),
+                )
 
         if last_exc:
             raise last_exc
@@ -200,24 +267,44 @@ class ProviderCapacityScheduler:
     ) -> bool:
         if not lease:
             return False
+        if lease.released:
+            return False
+
+        if lease.release_task is None:
+            lease.release_task = asyncio.create_task(
+                self._release_once(lease, actual_tokens=actual_tokens)
+            )
+        try:
+            return bool(await asyncio.shield(lease.release_task))
+        except asyncio.CancelledError:
+            await lease.release_task
+            raise
+
+    async def _release_once(
+        self, lease: SchedulerLease, *, actual_tokens: Optional[int]
+    ) -> bool:
+        """Release reservation and probe once, even if the caller is cancelled."""
 
         released = False
-        if lease.reservation and self.admission_controller is not None:
-            release_method = getattr(self.admission_controller, "release", None)
-            if release_method:
-                try:
+        try:
+            if lease.reservation and self.admission_controller is not None:
+                release_method = getattr(self.admission_controller, "release", None)
+                if release_method:
                     released = bool(
                         await release_method(
                             lease.reservation, actual_tokens=actual_tokens
                         )
                     )
-                except Exception:
-                    logger.warning(
-                        "Provider scheduler failed to release admission reservation",
-                        exc_info=True,
-                    )
-
-        await self._release_circuit_probe(lease.circuit_probe_key)
+        except Exception:
+            logger.warning(
+                "Provider scheduler failed to release admission reservation",
+                exc_info=True,
+            )
+        finally:
+            try:
+                await self._release_circuit_probe(lease.circuit_probe_key)
+            finally:
+                lease.released = True
         return released
 
     def allow_fallback_for_rejection(

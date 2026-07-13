@@ -457,6 +457,35 @@ class PipelineMetrics:
             ],
         )
 
+        self.producer_queue_depth = Gauge(
+            "llm_router_kafka_producer_queue_depth",
+            "Kafka producer delivery queue depth",
+        )
+
+        self.producer_queue_accepted = Counter(
+            "llm_router_kafka_producer_queue_accepted_total",
+            "Kafka messages accepted by the delivery queue",
+            ["topic"],
+        )
+
+        self.producer_queue_delivered = Counter(
+            "llm_router_kafka_producer_queue_delivered_total",
+            "Kafka messages delivered by the background dispatcher",
+            ["topic"],
+        )
+
+        self.producer_queue_dropped = Counter(
+            "llm_router_kafka_producer_queue_dropped_total",
+            "Kafka messages dropped by the delivery queue",
+            ["topic", "reason"],
+        )
+
+        self.producer_delivery_failed = Counter(
+            "llm_router_kafka_producer_delivery_failed_total",
+            "Kafka messages whose background delivery exhausted retries",
+            ["topic"],
+        )
+
         self.consumer_errors = Counter(
             "llm_router_kafka_consumer_errors_total", "Kafka consumer errors"
         )

@@ -5,7 +5,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from src.admission import AdmissionDecision, AdmissionRejectedError
-from src.provider_scheduler import ProviderCapacityScheduler
+from src.provider_scheduler import (
+    ProviderCapacityScheduler,
+    RequestExecutionBudget,
+    SchedulerLease,
+)
 from src.utils.schema import QueryRequest, UserTier
 
 
@@ -441,3 +445,104 @@ async def test_scheduler_retry_budget_exhaustion_stops_retry():
         )
 
     assert operation.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_request_execution_budget_is_shared_across_provider_calls():
+    scheduler = ProviderCapacityScheduler(
+        {"retry": {"max_attempts_per_request": 3, "initial_backoff_ms": 0}},
+        RecordingAdmission(),
+    )
+    budget = RequestExecutionBudget(max_attempts=3, deadline_seconds=60)
+    request = QueryRequest(query="hello", user_id="u1")
+    first = AsyncMock(side_effect=RuntimeError("503 temporarily overloaded"))
+    second = AsyncMock(side_effect=RuntimeError("503 temporarily overloaded"))
+
+    with pytest.raises(RuntimeError):
+        await scheduler.run_provider_call(
+            request=request,
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+            operation=first,
+            execution_budget=budget,
+        )
+    with pytest.raises(RuntimeError):
+        await scheduler.run_provider_call(
+            request=request,
+            model_name="local",
+            provider="vllm",
+            estimated_input_tokens=1,
+            operation=second,
+            execution_budget=budget,
+        )
+
+    assert first.await_count == 3
+    assert second.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_request_execution_deadline_stops_provider_call_and_releases_lease():
+    admission = RecordingAdmission()
+    scheduler = ProviderCapacityScheduler(
+        {"request_deadline_seconds": 0.01, "retry": {"max_attempts_per_request": 3}},
+        admission,
+    )
+    budget = RequestExecutionBudget(max_attempts=3, deadline_seconds=0.01)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await scheduler.run_provider_call(
+            request=QueryRequest(query="hello", user_id="u1"),
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+            operation=lambda: asyncio.sleep(1),
+            execution_budget=budget,
+        )
+
+    assert len(admission.releases) == 1
+
+
+@pytest.mark.asyncio
+async def test_acquire_timeout_does_not_record_provider_transport_failure():
+    scheduler = ProviderCapacityScheduler({"request_deadline_seconds": 0.01})
+    scheduler.acquire = AsyncMock(side_effect=asyncio.TimeoutError())
+    scheduler.record_failure = AsyncMock()
+
+    with pytest.raises(asyncio.TimeoutError):
+        await scheduler.run_provider_call(
+            request=QueryRequest(query="hello", user_id="u1"),
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+            operation=AsyncMock(),
+        )
+
+    scheduler.record_failure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_release_cleanup_completes_when_caller_is_cancelled():
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    completed = asyncio.Event()
+    admission = RecordingAdmission()
+
+    async def release(_reservation, *, actual_tokens=None):
+        started.set()
+        await finish.wait()
+        completed.set()
+        return True
+
+    admission.release = release
+    scheduler = ProviderCapacityScheduler({}, admission)
+    lease = SchedulerLease(provider="openai", model_name="gpt-5", reservation=object())
+    task = asyncio.create_task(scheduler.release(lease))
+    await started.wait()
+    task.cancel()
+    finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert completed.is_set()
+    assert lease.released is True

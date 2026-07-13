@@ -183,10 +183,8 @@ inference:
       port: 6379
       db: 0
       password_env: REDIS_PASSWORD
-  batching:
+  single_flight:
     enabled: true
-    max_batch_size: 32
-    max_wait_time_ms: 50
   scheduler:
     enabled: true
     queue_enabled: true
@@ -195,6 +193,7 @@ inference:
     failure_mode: closed
     allow_fallback_on_provider_rejection: true
     key_prefix: provider_scheduler
+    request_deadline_seconds: 60
     retry:
       max_attempts_per_request: 3
       initial_backoff_ms: 100
@@ -466,6 +465,11 @@ kafka:
     wait_for_ack: true
     raise_on_failure: false
     health_failure_threshold: 5
+    queue_capacity: 10000
+    dispatcher_batch_size: 256
+    shutdown_drain_timeout_seconds: 10
+    shutdown_cancel_timeout_seconds: 1
+    shutdown_producer_timeout_seconds: 1
   consumer:
     group_id: llm-router-consumer
     auto_offset_reset: latest

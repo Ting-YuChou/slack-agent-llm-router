@@ -558,6 +558,10 @@ class BatchingConfig(ConfigModel):
     max_wait_time_ms: int = Field(50, ge=1)
 
 
+class SingleFlightConfig(ConfigModel):
+    enabled: bool = False
+
+
 class SchedulerRetryConfig(ConfigModel):
     max_attempts_per_request: int = Field(1, ge=1)
     initial_backoff_ms: int = Field(100, ge=0)
@@ -583,6 +587,7 @@ class ProviderSchedulerConfig(ConfigModel):
     failure_mode: str = "closed"
     allow_fallback_on_provider_rejection: bool = True
     key_prefix: str = "provider_scheduler"
+    request_deadline_seconds: float = Field(60.0, gt=0)
     retry: SchedulerRetryConfig = Field(default_factory=SchedulerRetryConfig)
     circuit_breaker: SchedulerCircuitBreakerConfig = Field(
         default_factory=SchedulerCircuitBreakerConfig
@@ -604,7 +609,20 @@ class InferenceConfig(ConfigModel):
     compression: CompressionConfig = Field(default_factory=CompressionConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
     batching: BatchingConfig = Field(default_factory=BatchingConfig)
+    single_flight: SingleFlightConfig = Field(default_factory=SingleFlightConfig)
     scheduler: ProviderSchedulerConfig = Field(default_factory=ProviderSchedulerConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def map_legacy_batching_to_single_flight(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "single_flight" in value:
+            return value
+        batching = value.get("batching")
+        if isinstance(batching, dict) and "enabled" in batching:
+            mapped = dict(value)
+            mapped["single_flight"] = {"enabled": bool(batching["enabled"])}
+            return mapped
+        return value
 
 
 class WebSearchToolConfig(ConfigModel):
@@ -649,6 +667,11 @@ class KafkaProducerConfig(ConfigModel):
     wait_for_ack: bool = True
     raise_on_failure: bool = False
     health_failure_threshold: int = Field(5, ge=1)
+    queue_capacity: int = Field(10_000, ge=1)
+    dispatcher_batch_size: int = Field(256, ge=1)
+    shutdown_drain_timeout_seconds: float = Field(10.0, gt=0)
+    shutdown_cancel_timeout_seconds: float = Field(1.0, gt=0)
+    shutdown_producer_timeout_seconds: float = Field(1.0, gt=0)
 
 
 class KafkaConsumerConfig(ConfigModel):

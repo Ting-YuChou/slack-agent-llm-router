@@ -1,5 +1,7 @@
 import json
+import asyncio
 import uuid
+from contextlib import suppress
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,6 +26,7 @@ from src.utils.schema import (
     ToolCall,
     UserTier,
 )
+from src.utils.metrics import PIPELINE_METRICS
 
 
 @pytest.fixture
@@ -170,6 +173,267 @@ class TestKafkaProducerManager:
         assert manager.producer.send_and_wait.await_count == 2
         assert manager.consecutive_failures == 0
 
+    @pytest.mark.asyncio
+    async def test_produce_does_not_wait_for_broker_ack(self, pipeline_config):
+        config = {**pipeline_config, "producer": {"dispatcher_batch_size": 1}}
+        manager = KafkaProducerManager(config)
+        manager.producer = AsyncMock()
+        ack_gate = asyncio.Event()
+        send_started = asyncio.Event()
+
+        async def delayed_ack(**kwargs):
+            send_started.set()
+            await ack_gate.wait()
+
+        manager.producer.send_and_wait = AsyncMock(side_effect=delayed_ack)
+        manager._accepting = True
+        manager._dispatcher_task = asyncio.create_task(manager._dispatch_loop())
+
+        request = QueryRequest(query="hello", user_id="u1", user_tier=UserTier.FREE)
+        assert (
+            await asyncio.wait_for(manager.produce_request_raw(request), 0.05) is True
+        )
+        await asyncio.wait_for(send_started.wait(), 0.05)
+
+        ack_gate.set()
+        await manager.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_queue_is_fifo_and_drops_newest_when_full(self, pipeline_config):
+        config = {**pipeline_config, "producer": {"queue_capacity": 2}}
+        manager = KafkaProducerManager(config)
+        manager._accepting = True
+
+        first = QueryRequest(query="first", user_id="u1", user_tier=UserTier.FREE)
+        second = QueryRequest(query="second", user_id="u2", user_tier=UserTier.FREE)
+        third = QueryRequest(query="third", user_id="u3", user_tier=UserTier.FREE)
+
+        assert await manager.produce_request_raw(first) is True
+        assert await manager.produce_request_raw(second) is True
+        assert await manager.produce_request_raw(third) is False
+        queued = list(manager._delivery_queue._queue)
+        assert [item.value["query_text"] for item in queued] == ["first", "second"]
+
+    @pytest.mark.asyncio
+    async def test_delivery_failure_is_not_requeued(self, pipeline_config):
+        config = {
+            **pipeline_config,
+            "producer": {"retries": 1, "retry_backoff_ms": 0},
+        }
+        manager = KafkaProducerManager(config)
+        manager.producer = AsyncMock()
+        manager.producer.send_and_wait = AsyncMock(side_effect=RuntimeError("down"))
+        manager._accepting = True
+        manager._dispatcher_task = asyncio.create_task(manager._dispatch_loop())
+
+        request = QueryRequest(query="hello", user_id="u1", user_tier=UserTier.FREE)
+        assert await manager.produce_request_raw(request) is True
+        await asyncio.wait_for(manager._delivery_queue.join(), 0.2)
+
+        assert manager.producer.send_and_wait.await_count == 2
+        assert manager._delivery_queue.empty()
+        await manager.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_drains_queue_before_stopping_producer(
+        self, pipeline_config
+    ):
+        manager = KafkaProducerManager(pipeline_config)
+        manager.producer = AsyncMock()
+        manager._accepting = True
+        manager._dispatcher_task = asyncio.create_task(manager._dispatch_loop())
+        request = QueryRequest(query="hello", user_id="u1", user_tier=UserTier.FREE)
+        assert await manager.produce_request_raw(request) is True
+
+        await manager.shutdown()
+
+        manager.producer.send_and_wait.assert_awaited_once()
+        manager.producer.stop.assert_awaited_once()
+        assert manager._delivery_queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_successful_background_delivery_increments_delivered_metric(
+        self, pipeline_config
+    ):
+        manager = KafkaProducerManager(pipeline_config)
+        manager.producer = AsyncMock()
+        manager._accepting = True
+        before = manager._delivery_queue.qsize()
+        delivered_before = PIPELINE_METRICS.producer_queue_delivered.labels(
+            topic="requests_raw"
+        )._value.get()
+        request = QueryRequest(query="hello", user_id="u1", user_tier=UserTier.FREE)
+
+        assert await manager.produce_request_raw(request) is True
+        envelope = manager._delivery_queue.get_nowait()
+        await manager._deliver_envelope(envelope)
+
+        assert before == 0
+        assert (
+            PIPELINE_METRICS.producer_queue_delivered.labels(
+                topic="requests_raw"
+            )._value.get()
+            == delivered_before + 1
+        )
+
+    @pytest.mark.asyncio
+    async def test_shutdown_timeout_drops_remaining_queue(self, pipeline_config):
+        config = {
+            **pipeline_config,
+            "producer": {"shutdown_drain_timeout_seconds": 0.01},
+        }
+        manager = KafkaProducerManager(config)
+        manager.producer = AsyncMock()
+        never_ack = asyncio.Event()
+
+        async def delayed_ack(**kwargs):
+            await never_ack.wait()
+
+        manager.producer.send_and_wait = AsyncMock(side_effect=delayed_ack)
+        manager._accepting = True
+        manager._dispatcher_task = asyncio.create_task(manager._dispatch_loop())
+        request = QueryRequest(query="hello", user_id="u1", user_tier=UserTier.FREE)
+        assert await manager.produce_request_raw(request) is True
+
+        await asyncio.wait_for(manager.shutdown(), 0.2)
+
+        assert manager._delivery_queue.empty()
+        manager.producer.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_timeout_counts_only_unfinished_batch_deliveries(
+        self, pipeline_config
+    ):
+        config = {
+            **pipeline_config,
+            "producer": {
+                "dispatcher_batch_size": 2,
+                "shutdown_drain_timeout_seconds": 0.01,
+            },
+        }
+        manager = KafkaProducerManager(config)
+        manager.producer = AsyncMock()
+        hung_started = asyncio.Event()
+        never_ack = asyncio.Event()
+
+        async def selective_ack(*, value, **kwargs):
+            if value["query_text"] == "hung":
+                hung_started.set()
+                await never_ack.wait()
+
+        manager.producer.send_and_wait = AsyncMock(side_effect=selective_ack)
+        manager._accepting = True
+        delivered = PIPELINE_METRICS.producer_queue_delivered.labels(
+            topic="requests_raw"
+        )
+        dropped = PIPELINE_METRICS.producer_queue_dropped.labels(
+            topic="requests_raw", reason="shutdown_timeout"
+        )
+        delivered_before = delivered._value.get()
+        dropped_before = dropped._value.get()
+
+        for query in ("fast", "hung"):
+            request = QueryRequest(query=query, user_id="u1", user_tier=UserTier.FREE)
+            assert await manager.produce_request_raw(request) is True
+        manager._dispatcher_task = asyncio.create_task(manager._dispatch_loop())
+        await asyncio.wait_for(hung_started.wait(), 0.05)
+
+        await asyncio.wait_for(manager.shutdown(), 0.2)
+
+        assert delivered._value.get() == delivered_before + 1
+        assert dropped._value.get() == dropped_before + 1
+        manager.producer.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_bounds_delivery_that_suppresses_cancellation(
+        self, pipeline_config
+    ):
+        config = {
+            **pipeline_config,
+            "producer": {
+                "shutdown_drain_timeout_seconds": 0.01,
+                "shutdown_cancel_timeout_seconds": 0.01,
+            },
+        }
+        manager = KafkaProducerManager(config)
+        manager.producer = AsyncMock()
+        delivery_started = asyncio.Event()
+        release_delivery = asyncio.Event()
+
+        async def cancellation_resistant_ack(**kwargs):
+            delivery_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await release_delivery.wait()
+
+        manager.producer.send_and_wait = AsyncMock(
+            side_effect=cancellation_resistant_ack
+        )
+        manager._accepting = True
+        manager._dispatcher_task = asyncio.create_task(manager._dispatch_loop())
+        delivered = PIPELINE_METRICS.producer_queue_delivered.labels(
+            topic="requests_raw"
+        )
+        abandoned = PIPELINE_METRICS.producer_queue_dropped.labels(
+            topic="requests_raw", reason="shutdown_abandoned"
+        )
+        shutdown_timeout = PIPELINE_METRICS.producer_queue_dropped.labels(
+            topic="requests_raw", reason="shutdown_timeout"
+        )
+        delivered_before = delivered._value.get()
+        abandoned_before = abandoned._value.get()
+        shutdown_timeout_before = shutdown_timeout._value.get()
+        request = QueryRequest(query="hung", user_id="u1", user_tier=UserTier.FREE)
+        assert await manager.produce_request_raw(request) is True
+        await asyncio.wait_for(delivery_started.wait(), 0.05)
+
+        await asyncio.wait_for(manager.shutdown(), 0.1)
+
+        try:
+            manager.producer.stop.assert_awaited_once()
+            assert delivered._value.get() == delivered_before
+            assert abandoned._value.get() == abandoned_before + 1
+            assert shutdown_timeout._value.get() == shutdown_timeout_before
+        finally:
+            release_delivery.set()
+            await asyncio.sleep(0)
+        assert delivered._value.get() == delivered_before
+
+    @pytest.mark.asyncio
+    async def test_shutdown_bounds_producer_stop_that_suppresses_cancellation(
+        self, pipeline_config
+    ):
+        config = {
+            **pipeline_config,
+            "producer": {"shutdown_producer_timeout_seconds": 0.01},
+        }
+        manager = KafkaProducerManager(config)
+        manager.producer = AsyncMock()
+        release_stop = asyncio.Event()
+
+        async def cancellation_resistant_stop():
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await release_stop.wait()
+
+        manager.producer.stop = AsyncMock(side_effect=cancellation_resistant_stop)
+
+        shutdown_task = asyncio.create_task(manager.shutdown())
+        done, _ = await asyncio.wait({shutdown_task}, timeout=0.1)
+        try:
+            assert shutdown_task in done
+            manager.producer.stop.assert_awaited_once()
+            assert manager.consecutive_failures == 1
+            assert manager.last_error == "Kafka producer stop timed out"
+        finally:
+            if not shutdown_task.done():
+                shutdown_task.cancel()
+            release_stop.set()
+            with suppress(asyncio.CancelledError):
+                await shutdown_task
+
     def test_serialize_message_handles_datetime(self, pipeline_config):
         manager = KafkaProducerManager(pipeline_config)
         payload = {
@@ -186,24 +450,24 @@ class TestKafkaProducerManager:
     @pytest.mark.asyncio
     async def test_produce_request_raw_emits_requests_raw_event(self, pipeline_config):
         manager = KafkaProducerManager(pipeline_config)
-        manager.producer = AsyncMock()
+        manager._accepting = True
         request = QueryRequest(query="hello", user_id="u1", user_tier=UserTier.FREE)
 
         await manager.produce_request_raw(request)
 
-        send_kwargs = manager.producer.send_and_wait.await_args.kwargs
-        assert send_kwargs["topic"] == "requests.raw"
-        assert send_kwargs["key"] == "u1"
-        assert send_kwargs["value"]["event_type"] == "requests.raw"
-        assert send_kwargs["value"]["request_id"] == request.request_id
-        assert send_kwargs["value"]["query_text"] == "hello"
+        envelope = manager._delivery_queue.get_nowait()
+        assert envelope.default_topic == "requests.raw"
+        assert envelope.key == "u1"
+        assert envelope.value["event_type"] == "requests.raw"
+        assert envelope.value["request_id"] == request.request_id
+        assert envelope.value["query_text"] == "hello"
 
     @pytest.mark.asyncio
     async def test_produce_inference_completed_emits_completion_event(
         self, pipeline_config
     ):
         manager = KafkaProducerManager(pipeline_config)
-        manager.producer = AsyncMock()
+        manager._accepting = True
         request = QueryRequest(
             query="hello",
             user_id="u1",
@@ -252,30 +516,30 @@ class TestKafkaProducerManager:
 
         await manager.produce_inference_completed(request, response, routing_decision)
 
-        send_kwargs = manager.producer.send_and_wait.await_args.kwargs
-        assert send_kwargs["topic"] == "inference.completed"
-        assert send_kwargs["key"] == request.request_id
-        assert send_kwargs["value"]["event_type"] == "inference.completed"
-        assert send_kwargs["value"]["selected_model"] == "gpt-5"
-        assert send_kwargs["value"]["query_type"] == "analysis"
-        assert send_kwargs["value"]["fallback_models"] == ["mistral-7b"]
-        assert send_kwargs["value"]["session_id"] == "session-1"
-        assert send_kwargs["value"]["conversation_id"] == "u1:c1:main"
-        assert send_kwargs["value"]["route_to_fast_lane"] is True
-        assert send_kwargs["value"]["actual_fast_lane_hit"] is True
-        assert send_kwargs["value"]["policy_source"] == "session+user"
-        assert send_kwargs["value"]["tools_used"] == ["web_search"]
-        assert send_kwargs["value"]["web_search_result_count"] == 1
-        assert send_kwargs["value"]["web_search_latency_ms"] == 9
-        assert send_kwargs["value"]["web_search_provider"] == "tavily"
-        assert send_kwargs["value"]["source_domains"] == ["example.com"]
+        envelope = manager._delivery_queue.get_nowait()
+        assert envelope.default_topic == "inference.completed"
+        assert envelope.key == request.request_id
+        assert envelope.value["event_type"] == "inference.completed"
+        assert envelope.value["selected_model"] == "gpt-5"
+        assert envelope.value["query_type"] == "analysis"
+        assert envelope.value["fallback_models"] == ["mistral-7b"]
+        assert envelope.value["session_id"] == "session-1"
+        assert envelope.value["conversation_id"] == "u1:c1:main"
+        assert envelope.value["route_to_fast_lane"] is True
+        assert envelope.value["actual_fast_lane_hit"] is True
+        assert envelope.value["policy_source"] == "session+user"
+        assert envelope.value["tools_used"] == ["web_search"]
+        assert envelope.value["web_search_result_count"] == 1
+        assert envelope.value["web_search_latency_ms"] == 9
+        assert envelope.value["web_search_provider"] == "tavily"
+        assert envelope.value["source_domains"] == ["example.com"]
 
     @pytest.mark.asyncio
     async def test_produce_query_log_uses_request_id_and_fallback_query_type(
         self, pipeline_config
     ):
         manager = KafkaProducerManager(pipeline_config)
-        manager.producer = AsyncMock()
+        manager._accepting = True
         request = QueryRequest(query="hello", user_id="u1", user_tier=UserTier.FREE)
         response = InferenceResponse(
             response_text="world",
@@ -291,10 +555,13 @@ class TestKafkaProducerManager:
 
         await manager.produce_query_log(request, response, SimpleNamespace())
 
-        send_kwargs = manager.producer.send_and_wait.await_args.kwargs
-        assert send_kwargs["topic"] == "test-queries"
-        assert send_kwargs["value"]["query_id"] == request.request_id
-        assert send_kwargs["value"]["query_type"] == "general"
+        envelope = manager._delivery_queue.get_nowait()
+        assert (
+            manager._topic_name(envelope.topic_key, envelope.default_topic)
+            == "test-queries"
+        )
+        assert envelope.value["query_id"] == request.request_id
+        assert envelope.value["query_type"] == "general"
 
 
 class TestClickHouseManager:
@@ -811,6 +1078,103 @@ class TestKafkaConsumerManager:
 
         assert consumer.clickhouse.batch_insert_query_logs.await_count == 1
         assert consumer.awaiting_commit_offsets["queries"] == {}
+
+    @pytest.mark.asyncio
+    async def test_flush_detaches_batch_before_await_and_preserves_new_arrivals(
+        self, pipeline_config, sample_query_log
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        insert_started = asyncio.Event()
+        release_insert = asyncio.Event()
+
+        async def blocked_insert(batch):
+            assert batch == [sample_query_log]
+            insert_started.set()
+            await release_insert.wait()
+
+        consumer.clickhouse.batch_insert_query_logs = blocked_insert
+        consumer.consumers["queries"] = AsyncMock()
+        first_tp = TopicPartition("test-queries", 0)
+        second_tp = TopicPartition("test-queries", 1)
+        consumer.batch_processors["queries"].append(sample_query_log)
+        consumer.pending_commit_offsets["queries"][first_tp] = 8
+
+        flush_task = asyncio.create_task(consumer.flush_pending_batches())
+        await insert_started.wait()
+
+        new_entry = MagicMock(name="new_entry")
+        consumer.batch_processors["queries"].append(new_entry)
+        consumer.pending_commit_offsets["queries"][second_tp] = 12
+        release_insert.set()
+        await flush_task
+
+        assert consumer.batch_processors["queries"] == [new_entry]
+        assert consumer.pending_commit_offsets["queries"] == {second_tp: 12}
+        consumer.consumers["queries"].commit.assert_awaited_once_with({first_tp: 8})
+
+    @pytest.mark.asyncio
+    async def test_flush_insert_failure_restores_detached_batch_before_new_arrivals(
+        self, pipeline_config, sample_query_log
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        insert_started = asyncio.Event()
+        release_insert = asyncio.Event()
+
+        async def failed_insert(batch):
+            insert_started.set()
+            await release_insert.wait()
+            raise RuntimeError("insert failed")
+
+        consumer.clickhouse.batch_insert_query_logs = failed_insert
+        old_tp = TopicPartition("test-queries", 0)
+        new_tp = TopicPartition("test-queries", 1)
+        consumer.batch_processors["queries"].append(sample_query_log)
+        consumer.pending_commit_offsets["queries"][old_tp] = 8
+
+        flush_task = asyncio.create_task(consumer.flush_pending_batches())
+        await insert_started.wait()
+        new_entry = MagicMock(name="new_entry")
+        consumer.batch_processors["queries"].append(new_entry)
+        consumer.pending_commit_offsets["queries"][old_tp] = 10
+        consumer.pending_commit_offsets["queries"][new_tp] = 4
+        release_insert.set()
+
+        with pytest.raises(RuntimeError, match="insert failed"):
+            await flush_task
+
+        assert consumer.batch_processors["queries"] == [sample_query_log, new_entry]
+        assert consumer.pending_commit_offsets["queries"] == {old_tp: 10, new_tp: 4}
+
+    @pytest.mark.asyncio
+    async def test_concurrent_flushes_for_same_topic_do_not_overlap(
+        self, pipeline_config, sample_query_log
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        active = 0
+        peak_active = 0
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def tracked_insert(batch):
+            nonlocal active, peak_active
+            active += 1
+            peak_active = max(peak_active, active)
+            if not first_started.is_set():
+                first_started.set()
+                await release_first.wait()
+            active -= 1
+
+        consumer.clickhouse.batch_insert_query_logs = tracked_insert
+        consumer.batch_processors["queries"].append(sample_query_log)
+        first_flush = asyncio.create_task(consumer.flush_pending_batches())
+        await first_started.wait()
+        consumer.batch_processors["queries"].append(MagicMock(name="second_entry"))
+        second_flush = asyncio.create_task(consumer.flush_pending_batches())
+        await asyncio.sleep(0)
+        release_first.set()
+        await asyncio.gather(first_flush, second_flush)
+
+        assert peak_active == 1
 
     @pytest.mark.asyncio
     async def test_flush_pending_batches_commits_routing_guardrail_offsets(

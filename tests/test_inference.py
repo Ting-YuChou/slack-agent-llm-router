@@ -16,6 +16,7 @@ from src.llm_router_part2_inference import (
     InferenceEngine,
     OpenAIProvider,
     ResponseCache,
+    SingleFlightCoordinator,
     vLLMProvider,
 )
 from src.utils.schema import (
@@ -31,6 +32,7 @@ from src.utils.schema import (
 )
 from src.rag.chunker import DocumentChunk
 from src.rag.vector_store import RagSearchResult
+from src.provider_scheduler import RequestExecutionBudget
 
 
 class RecordingAdmissionController:
@@ -117,6 +119,7 @@ class TestOpenAIProvider:
             await provider.initialize()
 
         assert mock_openai.call_args.kwargs["api_key"] == "env-openai-key"
+        assert mock_openai.call_args.kwargs["max_retries"] == 0
 
     @pytest.mark.asyncio
     async def test_generate_response_returns_complete_inference_response(
@@ -343,6 +346,7 @@ class TestAnthropicProvider:
             await provider.initialize()
 
         assert mock_anthropic.call_args.kwargs["api_key"] == "env-anthropic-key"
+        assert mock_anthropic.call_args.kwargs["max_retries"] == 0
 
     @pytest.mark.asyncio
     async def test_generate_response_returns_complete_inference_response(
@@ -950,16 +954,22 @@ class TestBatchProcessor:
         assert response_a is not response_b
 
     @pytest.mark.asyncio
-    async def test_enabled_batching_dispatches_distinct_requests_as_batch(
+    async def test_enabled_single_flight_dispatches_distinct_requests_immediately(
         self, sample_query_request, inference_response_factory
     ):
         provider = AsyncMock()
-        provider.generate_batch_responses = AsyncMock(
-            return_value=[
-                inference_response_factory(response_text="first"),
-                inference_response_factory(response_text="second"),
-            ]
-        )
+        both_started = asyncio.Event()
+        calls = 0
+
+        async def generate_response(request, _model_name):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                both_started.set()
+            await both_started.wait()
+            return inference_response_factory(response_text=request.query)
+
+        provider.generate_response.side_effect = generate_response
 
         processor = BatchProcessor(
             {"enabled": True, "max_batch_size": 2, "max_wait_time_ms": 50}
@@ -973,10 +983,96 @@ class TestBatchProcessor:
             processor.add_request(request_b, provider, "gpt-5"),
         )
 
-        provider.generate_batch_responses.assert_awaited_once()
-        provider.generate_response.assert_not_called()
-        assert response_a.response_text == "first"
-        assert response_b.response_text == "second"
+        assert provider.generate_response.await_count == 2
+        assert response_a.response_text == sample_query_request.query
+        assert response_b.response_text == request_b.query
+
+    @pytest.mark.asyncio
+    async def test_single_flight_follower_cancellation_does_not_cancel_leader(
+        self, sample_query_request, inference_response_factory
+    ):
+        release = asyncio.Event()
+        started = asyncio.Event()
+        provider = object()
+
+        async def operation():
+            started.set()
+            await release.wait()
+            return inference_response_factory(response_text="leader-result")
+
+        coordinator = SingleFlightCoordinator({"enabled": True})
+        leader = asyncio.create_task(
+            coordinator.run(sample_query_request, provider, "gpt-5", operation)
+        )
+        await started.wait()
+        follower = asyncio.create_task(
+            coordinator.run(
+                sample_query_request.model_copy(), provider, "gpt-5", operation
+            )
+        )
+        await asyncio.sleep(0)
+        follower.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await follower
+
+        release.set()
+        response = await leader
+        assert response.response_text == "leader-result"
+
+    @pytest.mark.asyncio
+    async def test_single_flight_consumes_unobserved_leader_exception(
+        self, sample_query_request
+    ):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def operation():
+            started.set()
+            await release.wait()
+            raise RuntimeError("leader failed")
+
+        coordinator = SingleFlightCoordinator({"enabled": True})
+        waiter = asyncio.create_task(
+            coordinator.run(sample_query_request, object(), "gpt-5", operation)
+        )
+        await started.wait()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert coordinator.inflight_requests == {}
+
+    @pytest.mark.asyncio
+    async def test_engine_single_flight_acquires_one_provider_lease(
+        self, sample_query_request, inference_response_factory
+    ):
+        router = MagicMock()
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+        router._estimate_request_token_count.return_value = 3
+        admission = RecordingAdmissionController()
+        engine = InferenceEngine(
+            {"single_flight": {"enabled": True}, "scheduler": {"enabled": True}},
+            router,
+            admission_controller=admission,
+        )
+        provider = AsyncMock()
+        provider.generate_response.return_value = inference_response_factory()
+        engine.providers["openai"] = provider
+
+        await asyncio.gather(
+            *(
+                engine._execute_model_request(
+                    sample_query_request.model_copy(), "gpt-5"
+                )
+                for _ in range(20)
+            )
+        )
+
+        assert provider.generate_response.await_count == 1
+        assert len(admission.provider_calls) == 1
+        assert len(admission.releases) == 1
 
 
 class TestResponseCache:
@@ -1018,6 +1114,33 @@ class TestResponseCache:
 
 
 class TestInferenceEngine:
+    @pytest.mark.asyncio
+    async def test_fallback_cache_lookup_cannot_outlive_request_deadline(
+        self, sample_query_request, inference_response_factory
+    ):
+        engine = InferenceEngine({}, MagicMock())
+        engine._execute_model_request = AsyncMock(
+            side_effect=[
+                ValueError("primary invalid"),
+                inference_response_factory(model_name="fallback"),
+            ]
+        )
+        engine._get_local_fallback_models = MagicMock(return_value=["fallback"])
+
+        async def slow_cache(*_args):
+            await asyncio.sleep(0.05)
+            return None
+
+        engine._get_cached_inference_response = slow_cache
+        budget = RequestExecutionBudget(max_attempts=2, deadline_seconds=0.01)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await engine._generate_response_with_fallback(
+                sample_query_request,
+                SimpleNamespace(selected_model="primary"),
+                execution_budget=budget,
+            )
+
     @pytest.mark.asyncio
     async def test_initialize_skips_vllm_when_endpoint_not_configured(self):
         router = MagicMock()
