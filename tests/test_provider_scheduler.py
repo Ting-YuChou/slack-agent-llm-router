@@ -6,6 +6,7 @@ import pytest
 
 from src.admission import AdmissionDecision, AdmissionRejectedError
 from src.provider_scheduler import (
+    CircuitPermit,
     ProviderCapacityScheduler,
     RequestExecutionBudget,
     SchedulerLease,
@@ -64,6 +65,14 @@ class FakeSchedulerRedis:
 
     async def expire(self, _key, _seconds):
         return True
+
+
+class BrokenCircuitRedis:
+    async def eval(self, *_args):
+        raise ConnectionError("redis unavailable")
+
+    async def hgetall(self, *_args):
+        raise ConnectionError("redis unavailable")
 
 
 class Clock:
@@ -440,11 +449,12 @@ async def test_scheduler_circuit_opens_and_half_open_probe_closes():
     clock = Clock()
     scheduler = ProviderCapacityScheduler(
         {
+            "failure_mode": "open",
             "circuit_breaker": {
                 "enabled": True,
                 "failure_threshold": 1,
                 "recovery_timeout_ms": 1000,
-            }
+            },
         },
         RecordingAdmission(),
         time_func=clock,
@@ -493,12 +503,13 @@ async def test_scheduler_half_open_allows_only_limited_probe_traffic():
     admission = RecordingAdmission()
     scheduler = ProviderCapacityScheduler(
         {
+            "failure_mode": "open",
             "circuit_breaker": {
                 "enabled": True,
                 "failure_threshold": 1,
                 "recovery_timeout_ms": 1000,
                 "half_open_max_requests": 1,
-            }
+            },
         },
         admission,
         time_func=clock,
@@ -549,11 +560,12 @@ async def test_scheduler_half_open_failure_reopens_circuit():
     clock = Clock()
     scheduler = ProviderCapacityScheduler(
         {
+            "failure_mode": "open",
             "circuit_breaker": {
                 "enabled": True,
                 "failure_threshold": 5,
                 "recovery_timeout_ms": 1000,
-            }
+            },
         },
         RecordingAdmission(),
         time_func=clock,
@@ -583,6 +595,167 @@ async def test_scheduler_half_open_failure_reopens_circuit():
     state = await scheduler._read_circuit_state("openai", "gpt-5")
     assert state["state"] == "open"
     assert state["opened_until"] > clock.now
+
+
+@pytest.mark.asyncio
+async def test_late_success_does_not_clear_newer_failure_count():
+    clock = Clock()
+    scheduler = ProviderCapacityScheduler(
+        {
+            "failure_mode": "open",
+            "circuit_breaker": {"enabled": True, "failure_threshold": 5},
+        },
+        RecordingAdmission(),
+        time_func=clock,
+    )
+    await scheduler.record_failure(
+        provider="openai",
+        model_name="gpt-5",
+        error=RuntimeError("503 temporarily overloaded"),
+        request_started_at_ms=999_000,
+    )
+    await scheduler.record_success(
+        provider="openai", model_name="gpt-5", request_started_at_ms=999_000
+    )
+
+    state = await scheduler._read_circuit_state("openai", "gpt-5")
+    assert state["failure_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_probe_epoch_cannot_close_circuit():
+    clock = Clock()
+    scheduler = ProviderCapacityScheduler(
+        {
+            "failure_mode": "open",
+            "circuit_breaker": {"enabled": True, "failure_threshold": 1},
+        },
+        RecordingAdmission(),
+        time_func=clock,
+    )
+    await scheduler._write_circuit_state(
+        "openai",
+        "gpt-5",
+        {"state": "half_open", "failure_count": 1, "epoch": 3, "probe_count": 1},
+    )
+    await scheduler.record_success(
+        provider="openai",
+        model_name="gpt-5",
+        request_started_at_ms=1_000_000,
+        circuit_permit=CircuitPermit(epoch=2, probe=True),
+    )
+
+    state = await scheduler._read_circuit_state("openai", "gpt-5")
+    assert state["state"] == "half_open"
+
+
+@pytest.mark.asyncio
+async def test_open_state_late_failure_does_not_extend_recovery_window():
+    clock = Clock()
+    scheduler = ProviderCapacityScheduler(
+        {
+            "failure_mode": "open",
+            "circuit_breaker": {
+                "enabled": True,
+                "failure_threshold": 1,
+                "recovery_timeout_ms": 1000,
+            },
+        },
+        RecordingAdmission(),
+        time_func=clock,
+    )
+    await scheduler.record_failure(
+        provider="openai",
+        model_name="gpt-5",
+        error=RuntimeError("503 temporarily overloaded"),
+        request_started_at_ms=1_000_000,
+    )
+    opened = (await scheduler._read_circuit_state("openai", "gpt-5"))["opened_until_ms"]
+    clock.now += 0.5
+    await scheduler.record_failure(
+        provider="openai",
+        model_name="gpt-5",
+        error=RuntimeError("503 temporarily overloaded"),
+        request_started_at_ms=1_000_100,
+    )
+    assert (await scheduler._read_circuit_state("openai", "gpt-5"))[
+        "opened_until_ms"
+    ] == opened
+
+
+@pytest.mark.asyncio
+async def test_circuit_redis_error_obeys_failure_mode_on_acquire():
+    request = QueryRequest(query="hello", user_id="u1")
+    closed = ProviderCapacityScheduler(
+        {"failure_mode": "closed", "circuit_breaker": {"enabled": True}},
+        RecordingAdmission(),
+        redis_client=BrokenCircuitRedis(),
+    )
+    with pytest.raises(AdmissionRejectedError) as exc:
+        await closed.acquire(
+            request=request,
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+        )
+    assert exc.value.decision.reason == "circuit_unavailable"
+
+    opened = ProviderCapacityScheduler(
+        {"failure_mode": "open", "circuit_breaker": {"enabled": True}},
+        RecordingAdmission(),
+        redis_client=BrokenCircuitRedis(),
+    )
+    lease = await opened.acquire(
+        request=request,
+        model_name="gpt-5",
+        provider="openai",
+        estimated_input_tokens=1,
+    )
+    assert lease is not None
+
+
+@pytest.mark.asyncio
+async def test_circuit_missing_redis_client_rejects_when_failure_mode_closed():
+    admission = RecordingAdmission()
+    admission.redis_client = None
+    scheduler = ProviderCapacityScheduler(
+        {"failure_mode": "closed", "circuit_breaker": {"enabled": True}},
+        admission,
+    )
+
+    with pytest.raises(AdmissionRejectedError) as exc:
+        await scheduler.acquire(
+            request=QueryRequest(query="hello", user_id="u1"),
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+        )
+
+    assert exc.value.decision.reason == "circuit_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_probe_release_falls_back_to_epoch_checked_local_state_when_open():
+    scheduler = ProviderCapacityScheduler(
+        {"failure_mode": "open", "circuit_breaker": {"enabled": True}},
+        RecordingAdmission(),
+        redis_client=BrokenCircuitRedis(),
+    )
+    key = scheduler._circuit_key("openai", "gpt-5")
+    scheduler._local_circuit_state[key] = scheduler._normalize_circuit_state(
+        {"state": "half_open", "epoch": 4, "probe_count": 1}
+    )
+
+    await scheduler._release_circuit_probe(
+        CircuitPermit(
+            epoch=4,
+            probe=True,
+            provider="openai",
+            model_name="gpt-5",
+        )
+    )
+
+    assert scheduler._local_circuit_state[key]["probe_count"] == 0
 
 
 @pytest.mark.asyncio

@@ -583,7 +583,7 @@ class SchedulerCircuitBreakerConfig(ConfigModel):
     enabled: bool = False
     failure_threshold: int = Field(5, ge=1)
     recovery_timeout_ms: int = Field(30000, ge=0)
-    half_open_max_requests: int = Field(1, ge=1)
+    half_open_max_requests: int = Field(1, ge=1, le=1)
     state_ttl_seconds: int = Field(3600, ge=1)
 
 

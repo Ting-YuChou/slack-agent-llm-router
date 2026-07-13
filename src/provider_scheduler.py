@@ -23,6 +23,80 @@ from src.utils.metrics import INFERENCE_METRICS
 logger = logging.getLogger(__name__)
 
 
+_CIRCUIT_LUA = r"""
+local key = KEYS[1]
+local action = ARGV[1]
+local now = tonumber(ARGV[2])
+local threshold = tonumber(ARGV[3])
+local recovery = tonumber(ARGV[4])
+local max_probes = tonumber(ARGV[5])
+local request_started = tonumber(ARGV[6])
+local permit_epoch = tonumber(ARGV[7])
+local permit_probe = tonumber(ARGV[8])
+local ttl = tonumber(ARGV[9])
+
+local state = redis.call('HGET', key, 'state') or 'closed'
+local failures = tonumber(redis.call('HGET', key, 'failure_count') or '0')
+local opened_until = tonumber(redis.call('HGET', key, 'opened_until_ms') or '0')
+local epoch = tonumber(redis.call('HGET', key, 'epoch') or '0')
+local probes = tonumber(redis.call('HGET', key, 'probe_count') or '0')
+local last_failure = tonumber(redis.call('HGET', key, 'last_failure_at_ms') or '0')
+
+if action == 'acquire' then
+  if state == 'open' and opened_until <= now then
+    state = 'half_open'
+    probes = 0
+  end
+  if state == 'open' then
+    return {0, epoch, 0, state, opened_until, failures, probes, last_failure}
+  end
+  if state == 'half_open' then
+    if probes >= max_probes then
+      return {0, epoch, 0, state, opened_until, failures, probes, last_failure}
+    end
+    probes = probes + 1
+    redis.call('HSET', key, 'state', state, 'failure_count', failures,
+      'opened_until_ms', opened_until, 'epoch', epoch, 'probe_count', probes,
+      'last_failure_at_ms', last_failure, 'updated_at_ms', now)
+    redis.call('EXPIRE', key, ttl)
+    return {1, epoch, 1, state, opened_until, failures, probes, last_failure}
+  end
+  return {1, epoch, 0, state, opened_until, failures, probes, last_failure}
+end
+
+if action == 'success' then
+  if permit_probe == 1 then
+    if state == 'half_open' and permit_epoch == epoch then
+      state = 'closed'; failures = 0; opened_until = 0; probes = 0
+    end
+  elseif state == 'closed' and request_started >= last_failure then
+    failures = 0
+  end
+elseif action == 'failure' then
+  if permit_probe == 1 and permit_epoch ~= epoch then
+    return {1, epoch, permit_probe, state, opened_until, failures, probes, last_failure}
+  end
+  if state ~= 'open' then
+    failures = failures + 1
+    last_failure = now
+    if state == 'half_open' or failures >= threshold then
+      state = 'open'; opened_until = now + recovery; probes = 0; epoch = epoch + 1
+    end
+  end
+elseif action == 'release' then
+  if permit_probe == 1 and state == 'half_open' and permit_epoch == epoch and probes > 0 then
+    probes = probes - 1
+  end
+end
+
+redis.call('HSET', key, 'state', state, 'failure_count', failures,
+  'opened_until_ms', opened_until, 'epoch', epoch, 'probe_count', probes,
+  'last_failure_at_ms', last_failure, 'updated_at_ms', now)
+redis.call('EXPIRE', key, ttl)
+return {1, epoch, permit_probe, state, opened_until, failures, probes, last_failure}
+"""
+
+
 SCHEDULER_FALLBACK_REASONS = {
     "provider_active_requests_exceeded",
     "model_active_requests_exceeded",
@@ -45,13 +119,23 @@ SCHEDULER_WAITABLE_REASONS = {
 
 
 @dataclass
+class CircuitPermit:
+    """Epoch-bound permission for a circuit-protected provider attempt."""
+
+    epoch: int = 0
+    probe: bool = False
+    provider: str = ""
+    model_name: str = ""
+
+
+@dataclass
 class SchedulerLease:
     """Capacity lease held while one provider call is in flight."""
 
     provider: str
     model_name: str
     reservation: Optional[Any] = None
-    circuit_probe_key: Optional[str] = None
+    circuit_permit: Optional[CircuitPermit] = None
     queued: bool = False
     queue_key: Optional[str] = None
     queue_member: Optional[str] = None
@@ -133,7 +217,7 @@ class ProviderCapacityScheduler:
         self.retry_config = dict(self.config.get("retry", {}) or {})
         self.circuit_config = dict(self.config.get("circuit_breaker", {}) or {})
         self._local_circuit_state: Dict[str, Dict[str, Any]] = {}
-        self._local_circuit_probes: Dict[str, tuple[int, float]] = {}
+        self._circuit_lock = asyncio.Lock()
         self._local_retry_budget: Dict[str, tuple[int, float]] = {}
         self._last_queue_depths: Dict[tuple[str, str], int] = {}
         self._last_circuit_states: Dict[tuple[str, str], str] = {}
@@ -186,6 +270,7 @@ class ProviderCapacityScheduler:
             lease: Optional[SchedulerLease] = None
             response = None
             try:
+                request_started_at_ms = int(self._time_func() * 1000)
                 async with asyncio.timeout(budget.remaining_seconds):
                     lease = await self.acquire(
                         request=request,
@@ -197,7 +282,12 @@ class ProviderCapacityScheduler:
                         budget.ensure_available()
                     local_attempt += 1
                     response = await operation()
-                await self.record_success(provider=provider, model_name=model_name)
+                await self.record_success(
+                    provider=provider,
+                    model_name=model_name,
+                    request_started_at_ms=request_started_at_ms,
+                    circuit_permit=lease.circuit_permit if lease else None,
+                )
                 if local_attempt > 1:
                     self._record_retry_metric(provider, model_name, "success")
                 return response
@@ -207,7 +297,11 @@ class ProviderCapacityScheduler:
                 last_exc = exc
                 if local_attempt > 0:
                     await self.record_failure(
-                        provider=provider, model_name=model_name, error=exc
+                        provider=provider,
+                        model_name=model_name,
+                        error=exc,
+                        request_started_at_ms=request_started_at_ms,
+                        circuit_permit=lease.circuit_permit if lease else None,
                     )
                 if (
                     local_attempt >= attempts
@@ -249,7 +343,7 @@ class ProviderCapacityScheduler:
             self._record_decision(provider, model_name, "allowed", "disabled")
             return SchedulerLease(provider=provider, model_name=model_name)
 
-        circuit_probe_key = await self._acquire_circuit_probe_or_reject(
+        circuit_permit = await self._acquire_circuit_probe_or_reject(
             provider, model_name
         )
 
@@ -274,10 +368,10 @@ class ProviderCapacityScheduler:
                     queue_request=None,
                 )
         except Exception:
-            await self._release_circuit_probe(circuit_probe_key)
+            await self._release_circuit_probe(circuit_permit)
             raise
 
-        lease.circuit_probe_key = circuit_probe_key
+        lease.circuit_permit = circuit_permit
         return lease
 
     async def release(
@@ -320,7 +414,7 @@ class ProviderCapacityScheduler:
             )
         finally:
             try:
-                await self._release_circuit_probe(lease.circuit_probe_key)
+                await self._release_circuit_probe(lease.circuit_permit)
             finally:
                 lease.released = True
         return released
@@ -337,52 +431,47 @@ class ProviderCapacityScheduler:
             )
         return str(decision.reason) in SCHEDULER_FALLBACK_REASONS
 
-    async def record_success(self, *, provider: str, model_name: str) -> None:
+    async def record_success(
+        self,
+        *,
+        provider: str,
+        model_name: str,
+        request_started_at_ms: Optional[int] = None,
+        circuit_permit: Optional[CircuitPermit] = None,
+    ) -> None:
         if not bool(self.circuit_config.get("enabled", False)):
             return
-        await self._write_circuit_state(
+        result = await self._circuit_transition_with_fallback(
             provider,
             model_name,
-            {
-                "state": "closed",
-                "failure_count": 0,
-                "opened_until": 0.0,
-                "updated_at": self._time_func(),
-            },
+            "success",
+            request_started_at_ms=request_started_at_ms,
+            permit=circuit_permit,
         )
-        self._set_circuit_metric(provider, model_name, "closed")
+        self._set_circuit_metric(provider, model_name, str(result["state"]))
 
     async def record_failure(
-        self, *, provider: str, model_name: str, error: Exception
+        self,
+        *,
+        provider: str,
+        model_name: str,
+        error: Exception,
+        request_started_at_ms: Optional[int] = None,
+        circuit_permit: Optional[CircuitPermit] = None,
     ) -> None:
         if not bool(self.circuit_config.get("enabled", False)):
             return
         if not self._is_retryable_exception(error):
             return
 
-        state = await self._read_circuit_state(provider, model_name)
-        failure_count = int(state.get("failure_count", 0) or 0) + 1
-        threshold = max(1, int(self.circuit_config.get("failure_threshold", 5) or 5))
-        next_state = "closed"
-        opened_until = 0.0
-        if state.get("state") == "half_open" or failure_count >= threshold:
-            next_state = "open"
-            opened_until = self._time_func() + (
-                max(0, int(self.circuit_config.get("recovery_timeout_ms", 30_000) or 0))
-                / 1000.0
-            )
-        await self._write_circuit_state(
+        result = await self._circuit_transition_with_fallback(
             provider,
             model_name,
-            {
-                "state": next_state,
-                "failure_count": failure_count,
-                "opened_until": opened_until,
-                "last_error": str(error),
-                "updated_at": self._time_func(),
-            },
+            "failure",
+            request_started_at_ms=request_started_at_ms,
+            permit=circuit_permit,
         )
-        self._set_circuit_metric(provider, model_name, next_state)
+        self._set_circuit_metric(provider, model_name, str(result["state"]))
 
     def get_health_status(self) -> Dict[str, Any]:
         return {
@@ -691,163 +780,119 @@ class ProviderCapacityScheduler:
 
     async def _acquire_circuit_probe_or_reject(
         self, provider: str, model_name: str
-    ) -> Optional[str]:
+    ) -> Optional[CircuitPermit]:
         if not bool(self.circuit_config.get("enabled", False)):
             return None
-        state = await self._read_circuit_state(provider, model_name)
-        circuit_state = state.get("state")
-        if circuit_state not in {"open", "half_open"}:
-            return None
-        opened_until = float(state.get("opened_until", 0.0) or 0.0)
-        if circuit_state == "open" and opened_until <= self._time_func():
-            await self._write_circuit_state(
-                provider,
-                model_name,
-                {
-                    **state,
-                    "state": "half_open",
-                    "updated_at": self._time_func(),
-                },
+        try:
+            state = await self._circuit_transition(provider, model_name, "acquire")
+        except Exception:
+            logger.warning("Circuit control plane unavailable", exc_info=True)
+            if self.failure_mode == "open":
+                state = await self._local_circuit_transition(
+                    provider, model_name, "acquire"
+                )
+            else:
+                decision = self._reject(
+                    provider=provider,
+                    model_name=model_name,
+                    reason="circuit_unavailable",
+                    status_code=503,
+                    retry_after_seconds=1,
+                )
+                self._record_rejection(provider, model_name, decision)
+                raise AdmissionRejectedError(decision)
+        self._set_circuit_metric(provider, model_name, str(state["state"]))
+        if state["allowed"]:
+            return CircuitPermit(
+                epoch=int(state["epoch"]),
+                probe=bool(state["probe"]),
+                provider=provider,
+                model_name=model_name,
             )
-            self._set_circuit_metric(provider, model_name, "half_open")
-            return await self._acquire_half_open_probe(provider, model_name)
-        if circuit_state == "half_open":
-            return await self._acquire_half_open_probe(provider, model_name)
-        retry_after = max(1, math.ceil(opened_until - self._time_func()))
+        retry_after = max(
+            1,
+            math.ceil(
+                (int(state["opened_until_ms"]) - int(self._time_func() * 1000)) / 1000.0
+            ),
+        )
         decision = self._reject(
             provider=provider,
             model_name=model_name,
             reason="circuit_open",
             status_code=429,
             retry_after_seconds=retry_after,
-            metadata={"opened_until": opened_until},
+            metadata={
+                "state": state["state"],
+                "opened_until_ms": state["opened_until_ms"],
+                "max_probe_requests": self._max_circuit_probes(),
+            },
         )
         self._record_rejection(provider, model_name, decision)
         raise AdmissionRejectedError(decision)
 
-    async def _acquire_half_open_probe(self, provider: str, model_name: str) -> str:
-        max_probes = max(
-            1, int(self.circuit_config.get("half_open_max_requests", 1) or 1)
-        )
-        key = self._circuit_probe_key(provider, model_name)
-        ttl_seconds = max(
-            1,
-            math.ceil(
-                max(1, int(self.circuit_config.get("recovery_timeout_ms", 30_000) or 1))
-                / 1000.0
-            ),
-        )
-        client = self._redis_client()
-        if client is not None:
-            try:
-                current = int(await client.incr(key))
-                if current == 1:
-                    expire = getattr(client, "expire", None)
-                    if expire:
-                        result = expire(key, ttl_seconds)
-                        if hasattr(result, "__await__"):
-                            await result
-                if current <= max_probes:
-                    return key
-                decr = getattr(client, "decr", None)
-                if decr:
-                    result = decr(key)
-                    if hasattr(result, "__await__"):
-                        await result
-                decision = self._reject(
-                    provider=provider,
-                    model_name=model_name,
-                    reason="circuit_open",
-                    status_code=429,
-                    retry_after_seconds=ttl_seconds,
-                    metadata={"state": "half_open", "max_probe_requests": max_probes},
-                )
-                self._record_rejection(provider, model_name, decision)
-                raise AdmissionRejectedError(decision)
-            except AdmissionRejectedError:
-                raise
-            except Exception:
-                logger.debug("Falling back to local circuit probes", exc_info=True)
-
-        now = self._time_func()
-        current, expires_at = self._local_circuit_probes.get(
-            key, (0, now + ttl_seconds)
-        )
-        if expires_at <= now:
-            current = 0
-            expires_at = now + ttl_seconds
-        if current >= max_probes:
-            decision = self._reject(
-                provider=provider,
-                model_name=model_name,
-                reason="circuit_open",
-                status_code=429,
-                retry_after_seconds=ttl_seconds,
-                metadata={"state": "half_open", "max_probe_requests": max_probes},
-            )
-            self._record_rejection(provider, model_name, decision)
-            raise AdmissionRejectedError(decision)
-        self._local_circuit_probes[key] = (current + 1, expires_at)
-        return key
-
-    async def _release_circuit_probe(self, probe_key: Optional[str]) -> None:
-        if not probe_key:
+    async def _release_circuit_probe(self, permit: Optional[CircuitPermit]) -> None:
+        if not permit or not permit.probe:
             return
-        client = self._redis_client()
-        if client is not None:
-            try:
-                decr = getattr(client, "decr", None)
-                if decr:
-                    result = decr(probe_key)
-                    if hasattr(result, "__await__"):
-                        current = await result
-                    else:
-                        current = result
-                    if int(current or 0) <= 0:
-                        delete = getattr(client, "delete", None)
-                        if delete:
-                            result = delete(probe_key)
-                            if hasattr(result, "__await__"):
-                                await result
-                    return
-            except Exception:
-                logger.debug(
-                    "Falling back to local circuit probe release", exc_info=True
+        # Release is best-effort and epoch-checked. Success/failure may already have
+        # consumed the probe by changing state, making this an intentional no-op.
+        try:
+            await self._circuit_transition(
+                permit.provider, permit.model_name, "release", permit=permit
+            )
+        except Exception:
+            if self.failure_mode == "open":
+                logger.warning(
+                    "Using process-local circuit probe release after Redis failure",
+                    exc_info=True,
                 )
-
-        current, expires_at = self._local_circuit_probes.get(probe_key, (0, 0.0))
-        if current <= 1:
-            self._local_circuit_probes.pop(probe_key, None)
-        else:
-            self._local_circuit_probes[probe_key] = (current - 1, expires_at)
+                await self._local_circuit_transition(
+                    permit.provider,
+                    permit.model_name,
+                    "release",
+                    permit=permit,
+                )
+            else:
+                logger.error(
+                    "Circuit probe release failed closed; future acquires remain "
+                    "dependent on the Redis control plane",
+                    exc_info=True,
+                )
 
     async def _read_circuit_state(
         self, provider: str, model_name: str
     ) -> Dict[str, Any]:
         key = self._circuit_key(provider, model_name)
         client = self._redis_client()
-        if client is not None:
+        if client is not None and hasattr(client, "eval"):
             try:
                 raw = await client.hgetall(key)
                 if raw:
-                    return {
+                    state = {
                         self._decode(k): self._coerce_state_value(v)
                         for k, v in raw.items()
                     }
+                    state["opened_until"] = (
+                        int(state.get("opened_until_ms", 0) or 0) / 1000.0
+                    )
+                    return state
             except Exception:
                 logger.debug("Falling back to local circuit state", exc_info=True)
-        return dict(self._local_circuit_state.get(key, {}))
+        state = dict(self._local_circuit_state.get(key, {}))
+        if state:
+            state["opened_until"] = int(state.get("opened_until_ms", 0) or 0) / 1000.0
+        return state
 
     async def _write_circuit_state(
         self, provider: str, model_name: str, state: Dict[str, Any]
     ) -> None:
         key = self._circuit_key(provider, model_name)
-        self._local_circuit_state[key] = dict(state)
+        normalized = self._normalize_circuit_state(state)
+        self._local_circuit_state[key] = dict(normalized)
         client = self._redis_client()
         if client is None:
             return
         try:
-            await client.hset(key, mapping={k: str(v) for k, v in state.items()})
+            await client.hset(key, mapping={k: str(v) for k, v in normalized.items()})
             ttl = int(self.circuit_config.get("state_ttl_seconds", 3600) or 3600)
             expire = getattr(client, "expire", None)
             if expire:
@@ -856,6 +901,203 @@ class ProviderCapacityScheduler:
                     await result
         except Exception:
             logger.debug("Failed to persist scheduler circuit state", exc_info=True)
+
+    async def _circuit_transition(
+        self,
+        provider: str,
+        model_name: str,
+        action: str,
+        *,
+        request_started_at_ms: Optional[int] = None,
+        permit: Optional[CircuitPermit] = None,
+    ) -> Dict[str, Any]:
+        client = self._redis_client()
+        if client is None or not hasattr(client, "eval"):
+            raise ConnectionError(
+                "Redis circuit control plane is not configured or does not support eval"
+            )
+        now_ms = int(self._time_func() * 1000)
+        result = await client.eval(
+            _CIRCUIT_LUA,
+            1,
+            self._circuit_key(provider, model_name),
+            action,
+            now_ms,
+            self._circuit_threshold(),
+            self._circuit_recovery_ms(),
+            self._max_circuit_probes(),
+            request_started_at_ms if request_started_at_ms is not None else now_ms,
+            permit.epoch if permit else -1,
+            1 if permit and permit.probe else 0,
+            int(self.circuit_config.get("state_ttl_seconds", 3600) or 3600),
+        )
+        parsed = self._parse_circuit_result(result)
+        self._local_circuit_state[self._circuit_key(provider, model_name)] = {
+            key: parsed[key]
+            for key in (
+                "state",
+                "failure_count",
+                "opened_until_ms",
+                "epoch",
+                "probe_count",
+                "last_failure_at_ms",
+                "updated_at_ms",
+            )
+        }
+        return parsed
+
+    async def _circuit_transition_with_fallback(
+        self,
+        provider: str,
+        model_name: str,
+        action: str,
+        *,
+        request_started_at_ms: Optional[int] = None,
+        permit: Optional[CircuitPermit] = None,
+    ) -> Dict[str, Any]:
+        try:
+            return await self._circuit_transition(
+                provider,
+                model_name,
+                action,
+                request_started_at_ms=request_started_at_ms,
+                permit=permit,
+            )
+        except Exception:
+            if self.failure_mode != "open":
+                raise
+            logger.warning(
+                "Using process-local circuit after Redis transition failure",
+                exc_info=True,
+            )
+            return await self._local_circuit_transition(
+                provider,
+                model_name,
+                action,
+                request_started_at_ms=request_started_at_ms,
+                permit=permit,
+            )
+
+    async def _local_circuit_transition(
+        self,
+        provider: str,
+        model_name: str,
+        action: str,
+        *,
+        request_started_at_ms: Optional[int] = None,
+        permit: Optional[CircuitPermit] = None,
+    ) -> Dict[str, Any]:
+        async with self._circuit_lock:
+            key = self._circuit_key(provider, model_name)
+            now_ms = int(self._time_func() * 1000)
+            state = self._normalize_circuit_state(
+                self._local_circuit_state.get(key, {})
+            )
+            current = str(state["state"])
+            if action == "acquire":
+                if current == "open" and int(state["opened_until_ms"]) <= now_ms:
+                    current = "half_open"
+                    state["state"] = current
+                    state["probe_count"] = 0
+                if current == "open":
+                    return self._local_result(state, allowed=False, probe=False)
+                if current == "half_open":
+                    if int(state["probe_count"]) >= self._max_circuit_probes():
+                        return self._local_result(state, allowed=False, probe=False)
+                    state["probe_count"] = int(state["probe_count"]) + 1
+                    state["updated_at_ms"] = now_ms
+                    self._local_circuit_state[key] = state
+                    return self._local_result(state, allowed=True, probe=True)
+                return self._local_result(state, allowed=True, probe=False)
+
+            permit_matches = bool(
+                permit and permit.probe and permit.epoch == int(state["epoch"])
+            )
+            if action == "success":
+                if permit_matches and current == "half_open":
+                    state.update(
+                        state="closed",
+                        failure_count=0,
+                        opened_until_ms=0,
+                        probe_count=0,
+                    )
+                elif not (permit and permit.probe) and current == "closed":
+                    started = request_started_at_ms or now_ms
+                    if started >= int(state["last_failure_at_ms"]):
+                        state["failure_count"] = 0
+            elif action == "failure":
+                if permit and permit.probe and not permit_matches:
+                    return self._local_result(state, allowed=True, probe=True)
+                if current != "open":
+                    state["failure_count"] = int(state["failure_count"]) + 1
+                    state["last_failure_at_ms"] = now_ms
+                    if (
+                        current == "half_open"
+                        or int(state["failure_count"]) >= self._circuit_threshold()
+                    ):
+                        state["state"] = "open"
+                        state["opened_until_ms"] = now_ms + self._circuit_recovery_ms()
+                        state["probe_count"] = 0
+                        state["epoch"] = int(state["epoch"]) + 1
+            elif action == "release":
+                if (
+                    permit_matches
+                    and current == "half_open"
+                    and int(state["probe_count"]) > 0
+                ):
+                    state["probe_count"] = int(state["probe_count"]) - 1
+            state["updated_at_ms"] = now_ms
+            self._local_circuit_state[key] = state
+            return self._local_result(
+                state, allowed=True, probe=bool(permit and permit.probe)
+            )
+
+    def _normalize_circuit_state(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        opened_ms = state.get("opened_until_ms")
+        if opened_ms is None:
+            opened_ms = int(float(state.get("opened_until", 0) or 0) * 1000)
+        updated_ms = state.get("updated_at_ms")
+        if updated_ms is None:
+            updated_ms = int(float(state.get("updated_at", self._time_func())) * 1000)
+        return {
+            "state": str(state.get("state", "closed") or "closed"),
+            "failure_count": int(state.get("failure_count", 0) or 0),
+            "opened_until_ms": int(opened_ms or 0),
+            "epoch": int(state.get("epoch", 0) or 0),
+            "probe_count": int(state.get("probe_count", 0) or 0),
+            "last_failure_at_ms": int(state.get("last_failure_at_ms", 0) or 0),
+            "updated_at_ms": int(updated_ms or 0),
+        }
+
+    def _parse_circuit_result(self, result: Any) -> Dict[str, Any]:
+        values = list(result)
+        return {
+            "allowed": bool(int(values[0])),
+            "epoch": int(values[1]),
+            "probe": bool(int(values[2])),
+            "state": self._decode(values[3]),
+            "opened_until_ms": int(values[4]),
+            "failure_count": int(values[5]),
+            "probe_count": int(values[6]),
+            "last_failure_at_ms": int(values[7]),
+            "updated_at_ms": int(self._time_func() * 1000),
+        }
+
+    def _local_result(
+        self, state: Dict[str, Any], *, allowed: bool, probe: bool
+    ) -> Dict[str, Any]:
+        return {**state, "allowed": allowed, "probe": probe}
+
+    def _circuit_threshold(self) -> int:
+        return max(1, int(self.circuit_config.get("failure_threshold", 5) or 5))
+
+    def _circuit_recovery_ms(self) -> int:
+        return max(0, int(self.circuit_config.get("recovery_timeout_ms", 30_000) or 0))
+
+    def _max_circuit_probes(self) -> int:
+        # A single probe is part of the v2 circuit contract. Keep raw-dict callers
+        # safe even when they bypass schema validation.
+        return 1
 
     async def _consume_retry_budget(self, provider: str, model_name: str) -> bool:
         if not bool(self.retry_config.get("budget_enabled", False)):
@@ -902,11 +1144,8 @@ class ProviderCapacityScheduler:
         )
 
     def _circuit_key(self, provider: str, model_name: str) -> str:
-        return f"{self.key_prefix}:circuit:{self._scope(provider)}:{self._scope(model_name)}"
-
-    def _circuit_probe_key(self, provider: str, model_name: str) -> str:
         return (
-            f"{self.key_prefix}:circuit_probe:"
+            f"{self.key_prefix}:{self.control_plane_version}:circuit:"
             f"{self._scope(provider)}:{self._scope(model_name)}"
         )
 

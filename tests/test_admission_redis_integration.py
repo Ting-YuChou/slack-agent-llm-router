@@ -10,7 +10,7 @@ import pytest_asyncio
 import redis.asyncio as redis
 
 from src.admission import QueueAdmissionRequest, RedisAdmissionController
-from src.provider_scheduler import ProviderCapacityScheduler
+from src.provider_scheduler import CircuitPermit, ProviderCapacityScheduler
 from src.utils.schema import QueryRequest
 
 
@@ -80,6 +80,87 @@ async def _saturate(controller):
 
 def _command_count(info, command):
     return int(info.get(f"cmdstat_{command}", {}).get("calls", 0))
+
+
+def _circuit_scheduler(redis_client, *, threshold=5, recovery_ms=1000):
+    return ProviderCapacityScheduler(
+        {
+            "key_prefix": f"test:scheduler:{uuid.uuid4().hex}",
+            "control_plane_version": "v2",
+            "circuit_breaker": {
+                "enabled": True,
+                "failure_threshold": threshold,
+                "recovery_timeout_ms": recovery_ms,
+                "half_open_max_requests": 1,
+            },
+        },
+        redis_client=redis_client,
+    )
+
+
+@pytest.mark.asyncio
+async def test_circuit_concurrent_failures_open_atomically(redis_client):
+    scheduler = _circuit_scheduler(redis_client, threshold=5)
+
+    await asyncio.gather(
+        *(
+            scheduler.record_failure(
+                provider="openai",
+                model_name="gpt-5",
+                error=RuntimeError("503 temporarily overloaded"),
+                request_started_at_ms=int(time.time() * 1000),
+            )
+            for _ in range(10)
+        )
+    )
+
+    state = await scheduler._read_circuit_state("openai", "gpt-5")
+    assert state["state"] == "open"
+    assert state["failure_count"] == 5
+    assert ":v2:circuit:" in scheduler._circuit_key("openai", "gpt-5")
+
+
+@pytest.mark.asyncio
+async def test_circuit_probe_epoch_and_cap_are_atomic(redis_client):
+    scheduler = _circuit_scheduler(redis_client, threshold=1, recovery_ms=0)
+    await scheduler.record_failure(
+        provider="openai",
+        model_name="gpt-5",
+        error=RuntimeError("503 temporarily overloaded"),
+        request_started_at_ms=int(time.time() * 1000),
+    )
+
+    results = await asyncio.gather(
+        *(
+            scheduler._circuit_transition("openai", "gpt-5", "acquire")
+            for _ in range(10)
+        )
+    )
+    admitted = [result for result in results if result["allowed"]]
+    assert len(admitted) == 1
+    permit = CircuitPermit(
+        epoch=admitted[0]["epoch"],
+        probe=True,
+        provider="openai",
+        model_name="gpt-5",
+    )
+
+    await scheduler.record_success(
+        provider="openai",
+        model_name="gpt-5",
+        request_started_at_ms=int(time.time() * 1000),
+        circuit_permit=CircuitPermit(epoch=permit.epoch - 1, probe=True),
+    )
+    assert (await scheduler._read_circuit_state("openai", "gpt-5"))[
+        "state"
+    ] == "half_open"
+    await scheduler.record_success(
+        provider="openai",
+        model_name="gpt-5",
+        request_started_at_ms=int(time.time() * 1000),
+        circuit_permit=permit,
+    )
+    assert (await scheduler._read_circuit_state("openai", "gpt-5"))["state"] == "closed"
 
 
 @pytest.mark.asyncio

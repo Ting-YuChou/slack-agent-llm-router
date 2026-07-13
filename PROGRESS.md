@@ -14,6 +14,13 @@
 - Verification: scoped suite (`81 passed`) and real Redis integration (`13 passed`); Black, Flake8, mypy, compileall, and `git diff --check` passed; independent review approved after two fix/re-review rounds.
 - Follow-up: atomic circuit transitions, v1 key cleanup tooling, and performance gates remain.
 
+## 2026-07-12 — Atomic provider circuit transitions
+
+- Changed: replaced circuit read/modify/write operations with an epoch-aware Redis Lua state machine for acquire, success, failure, and probe release; streaming and non-streaming paths now propagate attempt timestamps and permits consistently.
+- Key files: `src/provider_scheduler.py`, `src/llm_router_part2_inference.py`, scheduler schema, and scheduler/inference/real-Redis tests.
+- Verification: scoped suite (`133 passed`) and real Redis integration (`15 passed`); Black, Flake8, mypy, compileall, and `git diff --check` passed; independent review approved after streaming, fallback-release, closed-mode, and probe-cap fixes.
+- Follow-up: v1 cleanup tooling and Redis control-plane performance gates remain.
+
 ## 2026-07-12 — Kafka and provider hot-path hardening
 
 - Changed: made Kafka consumer batch persistence race-safe; made Redis policy materialization fail before offset commit; moved Kafka delivery/ack/retry into a bounded background dispatcher with explicit drain, abandonment, and producer-close deadlines; replaced pseudo batching with zero-wait single-flight ahead of provider scheduling; centralized retries under a shared 60-second deadline and transport-attempt budget.

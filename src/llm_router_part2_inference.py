@@ -2483,23 +2483,41 @@ class InferenceEngine:
                 or getattr(provider, "provider_name", None)
                 or "unknown"
             )
-            lease = await self.scheduler.acquire(
-                request=request,
-                model_name=model_name,
-                provider=str(provider_name),
-                estimated_input_tokens=self._estimate_provider_admission_input_tokens(
-                    request
-                ),
-            )
+            request_started_at_ms = int(time.time() * 1000)
+            lease = None
             try:
-                async for chunk in provider.stream_response(request, model_name):
-                    yield chunk
-                await self.scheduler.record_success(
-                    provider=str(provider_name),
+                lease = await self.scheduler.acquire(
+                    request=request,
                     model_name=model_name,
+                    provider=str(provider_name),
+                    estimated_input_tokens=self._estimate_provider_admission_input_tokens(
+                        request
+                    ),
                 )
+                try:
+                    async for chunk in provider.stream_response(request, model_name):
+                        yield chunk
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    await self.scheduler.record_failure(
+                        provider=str(provider_name),
+                        model_name=model_name,
+                        error=exc,
+                        request_started_at_ms=request_started_at_ms,
+                        circuit_permit=lease.circuit_permit,
+                    )
+                    raise
+                else:
+                    await self.scheduler.record_success(
+                        provider=str(provider_name),
+                        model_name=model_name,
+                        request_started_at_ms=request_started_at_ms,
+                        circuit_permit=lease.circuit_permit,
+                    )
             finally:
-                await self.scheduler.release(lease, actual_tokens=None)
+                if lease is not None:
+                    await self.scheduler.release(lease, actual_tokens=None)
 
         except AdmissionRejectedError as exc:
             yield f"Error: {exc.decision.reason}"

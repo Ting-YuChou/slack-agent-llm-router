@@ -256,7 +256,7 @@ def test_provider_scheduler_config_accepts_nested_policy():
             "enabled": True,
             "failure_threshold": 2,
             "recovery_timeout_ms": 500,
-            "half_open_max_requests": 2,
+            "half_open_max_requests": 1,
         },
     )
 
@@ -269,7 +269,14 @@ def test_provider_scheduler_config_accepts_nested_policy():
     assert config.retry.max_attempts_per_request == 3
     assert config.retry.budget_tokens == 50
     assert config.circuit_breaker.failure_threshold == 2
-    assert config.circuit_breaker.half_open_max_requests == 2
+    assert config.circuit_breaker.half_open_max_requests == 1
+
+
+def test_provider_scheduler_config_rejects_multiple_half_open_probes():
+    with pytest.raises(ValidationError):
+        ProviderSchedulerConfig(
+            circuit_breaker={"half_open_max_requests": 2},
+        )
 
 
 def test_inference_config_accepts_single_flight_and_request_deadline():
