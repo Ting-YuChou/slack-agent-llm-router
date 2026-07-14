@@ -59,27 +59,29 @@ if queue_enabled == 1 then
         end
     end
     if queue_enqueue == 0 and queue_depth > 0 then
-        return {0, "queue_required", 0, queue_order_key, queue_depth, pruned_count}
+        return {0, "queue_required", 0, queue_order_key, queue_depth, pruned_count, queue_score}
     end
     if queue_enqueue == 1 then
         local existing = redis.call("ZSCORE", queue_order_key, queue_member)
         if queue_max_depth and queue_max_depth > 0 and existing == false and queue_depth >= queue_max_depth then
-            return {0, "queue_depth_exceeded", 1000, queue_order_key, queue_depth, pruned_count}
+            return {0, "queue_depth_exceeded", 1000, queue_order_key, queue_depth, pruned_count, queue_score}
         end
         if existing == false then
             local sequence = redis.call("INCR", queue_sequence_key)
             if queue_depth > 0 and sequence >= 1000000000000 then
-                return {0, "queue_sequence_exhausted", 0, queue_order_key, queue_depth, pruned_count}
+                return {0, "queue_sequence_exhausted", 0, queue_order_key, queue_depth, pruned_count, queue_score}
             end
             queue_score = queue_score * 1000000000000 + sequence
             redis.call("ZADD", queue_order_key, queue_score, queue_member)
             queue_depth = queue_depth + 1
             redis.call("SET", queue_depth_key, queue_depth)
+        else
+            queue_score = tonumber(existing)
         end
         redis.call("ZADD", queue_expiry_key, queue_expiry_ms, queue_member)
         local head = redis.call("ZRANGE", queue_order_key, 0, 0)[1]
         if head ~= queue_member then
-            return {0, "queue_wait", 0, queue_order_key, queue_depth, pruned_count}
+            return {0, "queue_wait", 0, queue_order_key, queue_depth, pruned_count, queue_score}
         end
     end
 end
@@ -97,7 +99,7 @@ for index = 1, active_count do
     if limit and limit > 0 then
         local current = tonumber(redis.call("GET", KEYS[1 + index]) or "0")
         if current >= limit then
-            return {0, "active_limit", 100, KEYS[1 + index], queue_depth, pruned_count}
+            return {0, "active_limit", 100, KEYS[1 + index], queue_depth, pruned_count, queue_score}
         end
     end
 end
@@ -133,7 +135,7 @@ for index = 1, bucket_count do
         if refill_per_ms and refill_per_ms > 0 then
             retry_ms = math.ceil((cost - tokens) / refill_per_ms)
         end
-        return {0, reason, retry_ms, bucket_key, queue_depth, pruned_count}
+        return {0, reason, retry_ms, bucket_key, queue_depth, pruned_count, queue_score}
     end
     next_tokens[index] = tokens - cost
     bucket_capacities[index] = capacity
@@ -148,7 +150,7 @@ local reservation_created = redis.call(
     "NX"
 )
 if not reservation_created then
-    return {0, "reservation_conflict", 1000, reservation_key, queue_depth, pruned_count}
+    return {0, "reservation_conflict", 1000, reservation_key, queue_depth, pruned_count, queue_score}
 end
 
 for index = 1, active_count do
@@ -183,7 +185,7 @@ if queue_enabled == 1 and queue_enqueue == 1 then
         end
     end
 end
-return {1, "allowed", 0, "", queue_depth, pruned_count}
+return {1, "allowed", 0, "", queue_depth, pruned_count, queue_score}
 """
 
 QUEUE_CLEANUP_SCRIPT = """
@@ -810,6 +812,7 @@ class RedisAdmissionController:
         denied_key = str(self._decode(self._result_value(result, 3, "")))
         queue_depth = int(float(self._result_value(result, 4, 0) or 0))
         pruned_count = int(float(self._result_value(result, 5, 0) or 0))
+        queue_score = float(self._result_value(result, 6, 0) or 0)
         if queue_request is not None:
             ADMISSION_METRICS.queue_depth.labels(scope=queue_request.scope).set(
                 queue_depth
@@ -831,6 +834,7 @@ class RedisAdmissionController:
                         **metadata,
                         "queue_depth": queue_depth,
                         "queue_pruned": pruned_count,
+                        "queue_score": queue_score,
                     },
                 )
             denial_reason = self._normalize_denial_reason(reason, denied_key)
@@ -843,6 +847,7 @@ class RedisAdmissionController:
                     "redis_key": denied_key,
                     "queue_depth": queue_depth,
                     "queue_pruned": pruned_count,
+                    "queue_score": queue_score,
                 },
             )
             return decision
@@ -872,6 +877,7 @@ class RedisAdmissionController:
                 **metadata,
                 "queue_depth": queue_depth,
                 "queue_pruned": pruned_count,
+                "queue_score": queue_score,
             },
         )
 
@@ -1015,6 +1021,13 @@ class RedisAdmissionController:
         return result
 
     async def _run_redis_operation(self, awaitable: Any) -> Any:
+        # redis-py applies socket_connect_timeout and socket_timeout at the
+        # transport boundary. A second timeout around the high-level command
+        # would also count connection-pool/client/server scheduling time and
+        # falsely fail healthy Redis under high concurrency. Keep the wrapper
+        # only for injected clients that do not expose a configured pool.
+        if getattr(self.redis_client, "connection_pool", None) is not None:
+            return await awaitable
         timeout_seconds = max(
             0.001,
             int(self.redis_config.get("socket_timeout_ms", 100)) / 1000.0,

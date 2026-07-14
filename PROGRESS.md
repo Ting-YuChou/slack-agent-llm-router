@@ -1,5 +1,12 @@
 # Project Progress
 
+## 2026-07-14 — Redis control-plane performance gates and v1 cleanup
+
+- Changed: added a real-Redis control-plane benchmark, dry-run-first v1 provider queue cleanup, and a per-process/provider polling coordinator that uses Redis-assigned queue scores while waking only the next local waiter. Redis transport timeouts no longer count healthy client/server queue delay as a socket blackhole.
+- Key files: `src/admission.py`, `src/provider_scheduler.py`, `scripts/loadtest_redis_control_plane.py`, `scripts/cleanup_v1_provider_scheduler_keys.py`, `Makefile`, and matching tests.
+- Verification: paired 1,000-waiter Redis benchmark passed with 1,000/1,000 successful requests and zero stale entries; commands/request fell from 494.63 to 49.23 (90.05%), commands/sec from 16,361.62 to 1,575.06 (90.37%), and slot-release p95 from 62.021 ms to 34.934 ms. Full suite passed with real Redis (`420 passed, 7 skipped` before final review fixes); Black, Flake8, mypy, compileall, and `git diff --check` passed. Independent task and whole-branch reviews approved after fixing cleanup races, explicit commands/sec gating, post-response circuit persistence semantics, and stale probe epoch handling.
+- Follow-up: publish the reviewed branch when ready.
+
 ## 2026-07-12 — Resilient Redis admission connections
 
 - Changed: added bounded Redis connect/read timeouts, a bounded connection pool, controller-level operation deadlines, and cooldown-gated single-flight recovery so transient failures recover without restarting workers.

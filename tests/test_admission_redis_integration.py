@@ -164,6 +164,39 @@ async def test_circuit_probe_epoch_and_cap_are_atomic(redis_client):
 
 
 @pytest.mark.asyncio
+async def test_stale_probe_success_does_not_mutate_hash_or_refresh_ttl(redis_client):
+    scheduler = _circuit_scheduler(redis_client, threshold=1, recovery_ms=0)
+    await scheduler.record_failure(
+        provider="openai",
+        model_name="gpt-5",
+        error=RuntimeError("503 temporarily overloaded"),
+        request_started_at_ms=int(time.time() * 1000),
+    )
+    acquired = await scheduler._circuit_transition("openai", "gpt-5", "acquire")
+    key = scheduler._circuit_key("openai", "gpt-5")
+    await redis_client.pexpire(key, 5000)
+    before_updated_at = await redis_client.hget(key, "updated_at_ms")
+    before_ttl = await redis_client.pttl(key)
+
+    await scheduler.record_success(
+        provider="openai",
+        model_name="gpt-5",
+        request_started_at_ms=int(time.time() * 1000),
+        circuit_permit=CircuitPermit(
+            epoch=int(acquired["epoch"]) - 1,
+            probe=True,
+            provider="openai",
+            model_name="gpt-5",
+        ),
+    )
+
+    after_updated_at = await redis_client.hget(key, "updated_at_ms")
+    after_ttl = await redis_client.pttl(key)
+    assert after_updated_at == before_updated_at
+    assert 0 < after_ttl <= before_ttl <= 5000
+
+
+@pytest.mark.asyncio
 async def test_uncontended_fast_path_executes_no_sorted_set_commands(redis_client):
     controller = _controller(redis_client)
     before = await redis_client.info("commandstats")

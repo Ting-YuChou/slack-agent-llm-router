@@ -10,6 +10,8 @@ from src.provider_scheduler import (
     ProviderCapacityScheduler,
     RequestExecutionBudget,
     SchedulerLease,
+    _QueuePollCoordinator,
+    _QueuePollScope,
 )
 from src.utils.schema import QueryRequest, UserTier
 
@@ -132,6 +134,29 @@ class RecordingAdmission:
         return depth
 
 
+class ConcurrentDenyAdmission(RecordingAdmission):
+    def __init__(self):
+        super().__init__()
+        self.poll_started = asyncio.Event()
+
+    async def acquire_provider(self, **kwargs):
+        self.calls.append(kwargs)
+        queue_request = kwargs.get("queue_request")
+        if queue_request is not None and queue_request.enqueue:
+            self.redis_client.zsets.setdefault(queue_request.order_key, {})[
+                queue_request.member_id
+            ] = queue_request.priority_band
+            self.redis_client.zsets.setdefault(queue_request.expiry_key, {})[
+                queue_request.member_id
+            ] = queue_request.expiry_timestamp_ms
+            self.redis_client.values[queue_request.depth_key] = len(
+                self.redis_client.zsets[queue_request.order_key]
+            )
+            if sum(bool(call["queue_request"].enqueue) for call in self.calls) > 20:
+                self.poll_started.set()
+        return _deny("provider_active_requests_exceeded")
+
+
 @pytest.mark.asyncio
 async def test_scheduler_fast_path_passes_try_only_provider_queue_request():
     admission = RecordingAdmission()
@@ -180,6 +205,46 @@ async def test_scheduler_acquires_and_releases_provider_capacity():
     assert result is response
     assert admission.calls[0]["model_name"] == "gpt-5"
     assert admission.releases[0][1] == 7
+
+
+@pytest.mark.asyncio
+async def test_successful_provider_response_survives_circuit_success_write_failure():
+    admission = RecordingAdmission()
+    scheduler = ProviderCapacityScheduler(
+        {
+            "failure_mode": "closed",
+            "circuit_breaker": {"enabled": True},
+        },
+        admission,
+    )
+    scheduler._circuit_transition = AsyncMock(
+        side_effect=[
+            {
+                "allowed": True,
+                "epoch": 0,
+                "probe": False,
+                "state": "closed",
+                "opened_until_ms": 0,
+            },
+            ConnectionError("redis failed after provider response"),
+        ]
+    )
+    scheduler.record_failure = AsyncMock(wraps=scheduler.record_failure)
+    response = SimpleNamespace(total_tokens=7)
+    operation = AsyncMock(return_value=response)
+
+    result = await scheduler.run_provider_call(
+        request=QueryRequest(query="hello", user_id="u1"),
+        model_name="gpt-5",
+        provider="openai",
+        estimated_input_tokens=1,
+        operation=operation,
+    )
+
+    assert result is response
+    operation.assert_awaited_once()
+    scheduler.record_failure.assert_not_awaited()
+    assert len(admission.releases) == 1
 
 
 @pytest.mark.asyncio
@@ -381,6 +446,78 @@ async def test_scheduler_adaptive_poll_jitter_stays_bounded_by_deadline():
     for actual, expected in zip(sleeps, nominal):
         assert expected * 0.8 <= actual <= expected * 1.2
     assert sum(sleeps) == pytest.approx(0.4)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_coalesces_concurrent_queue_polling_per_provider_scope():
+    admission = ConcurrentDenyAdmission()
+    scheduler = ProviderCapacityScheduler(
+        {
+            "queue_enabled": True,
+            "wait_timeout_ms": 10_000,
+            "poll_interval_ms": 25,
+            "max_poll_interval_ms": 250,
+            "poll_jitter_ratio": 0,
+        },
+        admission,
+    )
+    tasks = [
+        asyncio.create_task(
+            scheduler.acquire(
+                request=QueryRequest(query=f"hello {index}", user_id=f"u{index}"),
+                model_name="gpt-5",
+                provider="openai",
+                estimated_input_tokens=1,
+            )
+        )
+        for index in range(20)
+    ]
+
+    await asyncio.wait_for(admission.poll_started.wait(), timeout=1)
+    await asyncio.sleep(0.12)
+    enqueue_calls = sum(bool(call["queue_request"].enqueue) for call in admission.calls)
+
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    # One enqueue per waiter plus polling proportional to the single scope,
+    # rather than each waiter independently polling Redis every interval.
+    assert enqueue_calls <= 26
+
+
+@pytest.mark.asyncio
+async def test_queue_poll_coordinator_rotates_a_local_candidate_that_is_not_redis_head():
+    coordinator = _QueuePollCoordinator(
+        base_interval_ms=25,
+        max_interval_ms=250,
+        jitter_ratio=0,
+        time_func=lambda: 1000.0,
+        sleep_func=asyncio.sleep,
+    )
+    state = _QueuePollScope(
+        candidates={"wrong-local-head": (0, 1), "redis-head": (0, 2)},
+        events={
+            "wrong-local-head": asyncio.Event(),
+            "redis-head": asyncio.Event(),
+        },
+        sequence=2,
+        active_member="wrong-local-head",
+        interval_ms=50,
+    )
+    coordinator._scopes["provider:openai:gpt-5"] = state
+
+    await coordinator.poll_denied(
+        "provider:openai:gpt-5",
+        "wrong-local-head",
+        blocked_by_queue_head=True,
+    )
+    await coordinator.wait_turn(
+        "provider:openai:gpt-5", "redis-head", 0, deadline=1001.0
+    )
+
+    assert state.active_member == "redis-head"
+    assert state.candidates["wrong-local-head"][1] > state.candidates["redis-head"][1]
 
 
 def test_scheduler_allows_fallback_for_queue_timeout_with_provider_last_reason():

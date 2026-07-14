@@ -1800,6 +1800,52 @@ class TestInferenceEngine:
         engine.scheduler.release.assert_awaited_once_with(lease, actual_tokens=None)
 
     @pytest.mark.asyncio
+    async def test_completed_stream_survives_circuit_success_write_failure(
+        self, inference_config, sample_query_request
+    ):
+        class StreamingProvider:
+            provider_name = "openai"
+
+            async def stream_response(self, _request, _model_name):
+                yield "complete"
+
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="gpt-5")
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+        config = {
+            **inference_config,
+            "scheduler": {
+                "failure_mode": "closed",
+                "circuit_breaker": {"enabled": True},
+            },
+        }
+        engine = InferenceEngine(config, router)
+        engine.providers = {"openai": StreamingProvider()}
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+        permit = CircuitPermit(
+            epoch=4, probe=False, provider="openai", model_name="gpt-5"
+        )
+        lease = SchedulerLease(
+            provider="openai", model_name="gpt-5", circuit_permit=permit
+        )
+        engine.scheduler.acquire = AsyncMock(return_value=lease)
+        engine.scheduler._circuit_transition = AsyncMock(
+            side_effect=ConnectionError("redis failed after completed stream")
+        )
+        engine.scheduler.record_failure = AsyncMock(
+            wraps=engine.scheduler.record_failure
+        )
+        engine.scheduler.release = AsyncMock(return_value=True)
+
+        chunks = [chunk async for chunk in engine.stream_query(sample_query_request)]
+
+        assert chunks == ["complete"]
+        engine.scheduler.record_failure.assert_not_awaited()
+        engine.scheduler.release.assert_awaited_once_with(lease, actual_tokens=None)
+
+    @pytest.mark.asyncio
     async def test_stream_query_half_open_probe_success_closes_circuit(
         self, inference_config, sample_query_request
     ):

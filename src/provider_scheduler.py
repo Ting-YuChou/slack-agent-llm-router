@@ -65,6 +65,9 @@ if action == 'acquire' then
 end
 
 if action == 'success' then
+  if permit_probe == 1 and permit_epoch ~= epoch then
+    return {1, epoch, permit_probe, state, opened_until, failures, probes, last_failure}
+  end
   if permit_probe == 1 then
     if state == 'half_open' and permit_epoch == epoch then
       state = 'closed'; failures = 0; opened_until = 0; probes = 0
@@ -146,6 +149,170 @@ class SchedulerLease:
 
 
 @dataclass
+class _QueuePollScope:
+    condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    candidates: Dict[str, tuple[float, int]] = field(default_factory=dict)
+    events: Dict[str, asyncio.Event] = field(default_factory=dict)
+    authoritative_members: set[str] = field(default_factory=set)
+    sequence: int = 0
+    active_member: Optional[str] = None
+    next_poll_at: float = 0.0
+    interval_ms: int = 0
+
+
+class _QueuePollCoordinator:
+    """Allow one Redis queue poll at a time for each local provider scope."""
+
+    def __init__(
+        self,
+        *,
+        base_interval_ms: int,
+        max_interval_ms: int,
+        jitter_ratio: float,
+        time_func: Callable[[], float],
+        sleep_func: Callable[[float], Awaitable[Any]],
+    ):
+        self._base_interval_ms = base_interval_ms
+        self._max_interval_ms = max_interval_ms
+        self._jitter_ratio = jitter_ratio
+        self._time_func = time_func
+        self._sleep_func = sleep_func
+        self._scopes: Dict[str, _QueuePollScope] = {}
+
+    @staticmethod
+    def _wake_best(state: _QueuePollScope) -> None:
+        if state.active_member is not None or not state.candidates:
+            return
+        best = min(state.candidates, key=lambda item: state.candidates[item])
+        state.events[best].set()
+
+    async def wait_turn(
+        self,
+        scope: str,
+        member: str,
+        priority: int,
+        *,
+        deadline: float,
+        order_score: Optional[float] = None,
+    ) -> None:
+        state = self._scopes.setdefault(
+            scope,
+            _QueuePollScope(
+                interval_ms=min(self._max_interval_ms, self._base_interval_ms * 2)
+            ),
+        )
+        async with state.condition:
+            if member not in state.candidates:
+                state.sequence += 1
+                score = (
+                    float(order_score)
+                    if order_score is not None
+                    else float(priority * 1_000_000_000_000 + state.sequence)
+                )
+                state.candidates[member] = (score, state.sequence)
+                state.events[member] = asyncio.Event()
+                if order_score is not None:
+                    state.authoritative_members.add(member)
+                if len(state.candidates) == 1:
+                    state.next_poll_at = self._time_func() + (
+                        self._base_interval_ms / 1000.0
+                    )
+            event = state.events[member]
+            self._wake_best(state)
+
+        while True:
+            await event.wait()
+            event.clear()
+            async with state.condition:
+                if member not in state.candidates:
+                    raise asyncio.CancelledError
+                best = min(state.candidates, key=lambda item: state.candidates[item])
+                if state.active_member is None and best == member:
+                    state.active_member = member
+                    delay = min(
+                        max(0.0, state.next_poll_at - self._time_func()),
+                        max(0.0, deadline - self._time_func()),
+                    )
+                else:
+                    self._wake_best(state)
+                    continue
+
+            if delay:
+                await self._sleep_func(delay)
+
+            async with state.condition:
+                best = min(state.candidates, key=lambda item: state.candidates[item])
+                if state.active_member == member and best == member:
+                    return
+                if state.active_member == member:
+                    state.active_member = None
+                    self._wake_best(state)
+
+    async def poll_denied(
+        self, scope: str, member: str, *, blocked_by_queue_head: bool
+    ) -> None:
+        state = self._scopes[scope]
+        async with state.condition:
+            if state.active_member == member:
+                state.active_member = None
+            if (
+                blocked_by_queue_head
+                and member in state.candidates
+                and member not in state.authoritative_members
+            ):
+                score, _ = state.candidates[member]
+                state.sequence += 1
+                priority_base = (int(score) // 1_000_000_000_000) * 1_000_000_000_000
+                state.candidates[member] = (
+                    float(priority_base + state.sequence),
+                    state.sequence,
+                )
+                state.next_poll_at = self._time_func()
+                state.interval_ms = self._base_interval_ms
+                self._wake_best(state)
+                return
+            interval_ms = state.interval_ms
+            jitter = 1.0
+            if self._jitter_ratio:
+                digest = int(
+                    hashlib.sha256(str(self._time_func()).encode()).hexdigest()[:8],
+                    16,
+                )
+                jitter += (((digest / 0xFFFFFFFF) * 2.0) - 1.0) * self._jitter_ratio
+            state.next_poll_at = self._time_func() + (
+                (max(1.0, interval_ms * jitter) / 1000.0) + 1e-12
+            )
+            state.interval_ms = min(self._max_interval_ms, interval_ms * 2)
+            self._wake_best(state)
+
+    async def remove(self, scope: str, member: str, *, wake: bool) -> None:
+        state = self._scopes.get(scope)
+        if state is None:
+            return
+        async with state.condition:
+            state.candidates.pop(member, None)
+            state.events.pop(member, None)
+            state.authoritative_members.discard(member)
+            if state.active_member == member:
+                state.active_member = None
+            if wake:
+                state.next_poll_at = self._time_func()
+                state.interval_ms = self._base_interval_ms
+            self._wake_best(state)
+            if not state.candidates and state.active_member is None:
+                self._scopes.pop(scope, None)
+
+    async def wake(self, scope: str) -> None:
+        state = self._scopes.get(scope)
+        if state is None:
+            return
+        async with state.condition:
+            state.next_poll_at = self._time_func()
+            state.interval_ms = self._base_interval_ms
+            self._wake_best(state)
+
+
+@dataclass
 class RequestExecutionBudget:
     """One monotonic deadline and transport-attempt budget for a request."""
 
@@ -222,6 +389,13 @@ class ProviderCapacityScheduler:
         self._last_queue_depths: Dict[tuple[str, str], int] = {}
         self._last_circuit_states: Dict[tuple[str, str], str] = {}
         self._last_rejection: Optional[Dict[str, Any]] = None
+        self._queue_poll_coordinator = _QueuePollCoordinator(
+            base_interval_ms=self.poll_interval_ms,
+            max_interval_ms=self.max_poll_interval_ms,
+            jitter_ratio=self.poll_jitter_ratio,
+            time_func=self._time_func,
+            sleep_func=self._sleep_func,
+        )
 
     def create_execution_budget(self) -> RequestExecutionBudget:
         return RequestExecutionBudget(
@@ -417,6 +591,9 @@ class ProviderCapacityScheduler:
                 await self._release_circuit_probe(lease.circuit_permit)
             finally:
                 lease.released = True
+                await self._queue_poll_coordinator.wake(
+                    f"provider:{lease.provider}:{lease.model_name}"
+                )
         return released
 
     def allow_fallback_for_rejection(
@@ -441,13 +618,20 @@ class ProviderCapacityScheduler:
     ) -> None:
         if not bool(self.circuit_config.get("enabled", False)):
             return
-        result = await self._circuit_transition_with_fallback(
-            provider,
-            model_name,
-            "success",
-            request_started_at_ms=request_started_at_ms,
-            permit=circuit_permit,
-        )
+        try:
+            result = await self._circuit_transition_with_fallback(
+                provider,
+                model_name,
+                "success",
+                request_started_at_ms=request_started_at_ms,
+                permit=circuit_permit,
+            )
+        except Exception:
+            logger.error(
+                "Circuit success transition failed after provider response",
+                exc_info=True,
+            )
+            return
         self._set_circuit_metric(provider, model_name, str(result["state"]))
 
     async def record_failure(
@@ -557,14 +741,16 @@ class ProviderCapacityScheduler:
             sequence_key=sequence_key,
         )
 
+        queue_scope = queue_request.scope
         last_decision: Optional[AdmissionDecision] = None
+        coordinator_active = False
+        acquired = False
         try:
             deadline = started_at + (max(0, self.wait_timeout_ms) / 1000.0)
-            poll_interval_ms = self.poll_interval_ms
             while True:
                 now = self._time_func()
                 if last_decision is not None and (
-                    self.wait_timeout_ms <= 0 or now >= deadline
+                    self.wait_timeout_ms <= 0 or now >= deadline - 1e-9
                 ):
                     decision = self._timeout_decision(
                         provider=provider,
@@ -574,7 +760,7 @@ class ProviderCapacityScheduler:
                     self._record_rejection(provider, model_name, decision)
                     raise AdmissionRejectedError(decision)
                 try:
-                    return await self._try_acquire(
+                    lease = await self._try_acquire(
                         request=request,
                         model_name=model_name,
                         provider=provider,
@@ -585,6 +771,8 @@ class ProviderCapacityScheduler:
                         wait_seconds=max(0.0, self._time_func() - started_at),
                         queue_request=queue_request,
                     )
+                    acquired = True
+                    return lease
                 except AdmissionRejectedError as exc:
                     last_decision = exc.decision
                     if not self._is_waitable_reason(
@@ -600,31 +788,32 @@ class ProviderCapacityScheduler:
                         )
                         continue
 
-                now = self._time_func()
-                if self.wait_timeout_ms <= 0 or now >= deadline:
-                    decision = self._timeout_decision(
-                        provider=provider,
-                        model_name=model_name,
-                        last_decision=last_decision,
+                    if coordinator_active:
+                        await self._queue_poll_coordinator.poll_denied(
+                            queue_scope,
+                            queue_member,
+                            blocked_by_queue_head=exc.decision.reason
+                            in {"queue_required", "queue_wait"},
+                        )
+                        coordinator_active = False
+
+                    await self._queue_poll_coordinator.wait_turn(
+                        queue_scope,
+                        queue_member,
+                        queue_request.priority_band,
+                        deadline=deadline,
+                        order_score=(exc.decision.metadata or {}).get("queue_score"),
                     )
-                    self._record_rejection(provider, model_name, decision)
-                    raise AdmissionRejectedError(decision)
-                jitter = 1.0
-                if self.poll_jitter_ratio:
-                    digest = int(hashlib.sha256(str(now).encode()).hexdigest()[:8], 16)
-                    jitter += (
-                        ((digest / 0xFFFFFFFF) * 2.0) - 1.0
-                    ) * self.poll_jitter_ratio
-                sleep_for = min(
-                    max(0.001, (poll_interval_ms * jitter) / 1000.0),
-                    max(deadline - now, 0.0),
-                )
-                INFERENCE_METRICS.scheduler_queue_polls.labels(
-                    provider=provider, model=model_name
-                ).inc()
-                await self._sleep_func(sleep_for)
-                poll_interval_ms = min(self.max_poll_interval_ms, poll_interval_ms * 2)
+                    coordinator_active = True
+                    INFERENCE_METRICS.scheduler_queue_polls.labels(
+                        provider=provider, model=model_name
+                    ).inc()
         finally:
+            await self._queue_poll_coordinator.remove(
+                queue_scope,
+                queue_member,
+                wake=not acquired,
+            )
             cleanup = getattr(self.admission_controller, "_cleanup_queue", None)
             if cleanup is not None and queue_request.enqueue:
                 depth = int(await cleanup(queue_request))

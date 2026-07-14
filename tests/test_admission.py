@@ -755,3 +755,22 @@ async def test_blocking_redis_eval_times_out_and_fails_open_when_configured():
     assert decision.allowed is True
     assert decision.reason == "fail_open"
     assert time.monotonic() - started < 0.25
+
+
+@pytest.mark.asyncio
+async def test_real_redis_operation_timeout_does_not_include_client_queue_delay():
+    class ConnectionBackedRedis:
+        connection_pool = object()
+
+    controller = _controller(
+        {"redis": {"socket_timeout_ms": 100}},
+        redis_client=ConnectionBackedRedis(),
+    )
+    started = time.monotonic()
+
+    result = await controller._run_redis_operation(
+        asyncio.sleep(0.15, result="healthy redis response")
+    )
+
+    assert result == "healthy redis response"
+    assert time.monotonic() - started >= 0.14
