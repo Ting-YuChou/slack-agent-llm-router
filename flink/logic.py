@@ -854,6 +854,125 @@ def _dominant_key(
     return key
 
 
+def _empty_routing_policy_aggregate() -> Dict[str, Any]:
+    return {
+        "request_count": 0,
+        "success_count": 0,
+        "latency_sum_ms": 0.0,
+        "total_tokens_sum": 0,
+        "cost_sum_usd": 0.0,
+        "fast_lane_hits": 0,
+        "query_type_counts": {},
+        "model_success_counts": {},
+        "model_all_counts": {},
+        "failed_model_counts": {},
+        "failed_provider_counts": {},
+        "latest_event": {},
+        "latest_event_timestamp_ms": -1,
+    }
+
+
+def _increment_count(counts: Dict[str, int], key: str, amount: int = 1) -> None:
+    if not key:
+        return
+    updated = int(counts.get(key, 0)) + amount
+    if updated > 0:
+        counts[key] = updated
+    else:
+        counts.pop(key, None)
+
+
+def add_routing_policy_event(
+    aggregate: Dict[str, Any],
+    event: Dict[str, Any],
+    *,
+    event_timestamp_ms: int = 0,
+) -> Dict[str, Any]:
+    """Increment a routing-policy aggregate with one completion event."""
+    aggregate["request_count"] = int(aggregate.get("request_count", 0)) + 1
+    succeeded = event.get("status") == "success"
+    if succeeded:
+        aggregate["success_count"] = int(aggregate.get("success_count", 0)) + 1
+    aggregate["latency_sum_ms"] = _safe_float(
+        aggregate.get("latency_sum_ms")
+    ) + _safe_float(event.get("latency_ms"))
+    aggregate["total_tokens_sum"] = _safe_int(
+        aggregate.get("total_tokens_sum")
+    ) + _safe_int(event.get("total_tokens"))
+    aggregate["cost_sum_usd"] = _safe_float(
+        aggregate.get("cost_sum_usd")
+    ) + _safe_float(event.get("cost_usd"))
+    if bool(event.get("actual_fast_lane_hit", False)):
+        aggregate["fast_lane_hits"] = int(aggregate.get("fast_lane_hits", 0)) + 1
+
+    query_type = str(event.get("query_type", "general") or "general").lower()
+    _increment_count(aggregate.setdefault("query_type_counts", {}), query_type)
+    selected_model = str(event.get("selected_model", "") or "")
+    if selected_model:
+        _increment_count(aggregate.setdefault("model_all_counts", {}), selected_model)
+        target = "model_success_counts" if succeeded else "failed_model_counts"
+        _increment_count(aggregate.setdefault(target, {}), selected_model)
+    provider = str(event.get("provider", "") or "").lower()
+    if provider and not succeeded:
+        _increment_count(aggregate.setdefault("failed_provider_counts", {}), provider)
+
+    if event_timestamp_ms >= int(aggregate.get("latest_event_timestamp_ms", -1)):
+        aggregate["latest_event_timestamp_ms"] = event_timestamp_ms
+        aggregate["latest_event"] = {
+            key: event.get(key) for key in ("user_id", "session_id", "user_tier")
+        }
+    return aggregate
+
+
+def aggregate_routing_policy_events(
+    events: list[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Compatibility adapter from the historic event list to an aggregate."""
+    aggregate = _empty_routing_policy_aggregate()
+    for sequence, event in enumerate(events):
+        explicit_timestamp = event.get("event_timestamp_ms")
+        timestamp_ms = (
+            _safe_int(explicit_timestamp)
+            if explicit_timestamp is not None
+            else sequence
+        )
+        add_routing_policy_event(aggregate, event, event_timestamp_ms=timestamp_ms)
+    return aggregate
+
+
+def merge_routing_policy_aggregate(
+    target: Dict[str, Any], source: Dict[str, Any], *, sign: int = 1
+) -> Dict[str, Any]:
+    """Add or subtract a bucket aggregate from a rolling aggregate."""
+    for key in (
+        "request_count",
+        "success_count",
+        "total_tokens_sum",
+        "fast_lane_hits",
+    ):
+        target[key] = int(target.get(key, 0)) + sign * int(source.get(key, 0))
+    for key in ("latency_sum_ms", "cost_sum_usd"):
+        target[key] = _safe_float(target.get(key)) + sign * _safe_float(source.get(key))
+    for key in (
+        "query_type_counts",
+        "model_success_counts",
+        "model_all_counts",
+        "failed_model_counts",
+        "failed_provider_counts",
+    ):
+        target_counts = target.setdefault(key, {})
+        for item, count in source.get(key, {}).items():
+            _increment_count(target_counts, item, sign * int(count))
+    if sign > 0 and int(source.get("latest_event_timestamp_ms", -1)) >= int(
+        target.get("latest_event_timestamp_ms", -1)
+    ):
+        target["latest_event_timestamp_ms"] = int(
+            source.get("latest_event_timestamp_ms", -1)
+        )
+        target["latest_event"] = dict(source.get("latest_event", {}))
+    return target
+
+
 def build_routing_policy_state_event(
     *,
     scope_type: str,
@@ -863,67 +982,56 @@ def build_routing_policy_state_event(
     policy_config: Dict[str, Any] | None = None,
     timestamp: datetime | None = None,
 ) -> Dict[str, Any]:
-    """Derive rolling user/session routing policy state from recent completions."""
+    """Derive policy state through the event-list compatibility adapter."""
+    if not events:
+        raise ValueError("events is required to build routing policy state")
+    return build_routing_policy_state_event_from_aggregate(
+        scope_type=scope_type,
+        scope_key=scope_key,
+        aggregate=aggregate_routing_policy_events(events),
+        window_size_seconds=window_size_seconds,
+        policy_config=policy_config,
+        timestamp=timestamp,
+    )
+
+
+def build_routing_policy_state_event_from_aggregate(
+    *,
+    scope_type: str,
+    scope_key: str,
+    aggregate: Dict[str, Any],
+    window_size_seconds: int = 300,
+    policy_config: Dict[str, Any] | None = None,
+    timestamp: datetime | None = None,
+) -> Dict[str, Any]:
+    """Derive rolling user/session routing policy state from counters and sums."""
     if scope_type not in {"user", "session"}:
         raise ValueError(f"Unsupported routing policy scope_type: {scope_type}")
     if not scope_key:
         raise ValueError("scope_key is required for routing policy state")
-    if not events:
-        raise ValueError("events is required to build routing policy state")
-
-    request_count = len(events)
-    success_count = sum(1 for event in events if event.get("status") == "success")
+    request_count = int(aggregate.get("request_count", 0))
+    if request_count <= 0:
+        raise ValueError("aggregate is required to build routing policy state")
+    success_count = int(aggregate.get("success_count", 0))
     error_count = request_count - success_count
     recent_error_rate = error_count / request_count if request_count > 0 else 0.0
-    avg_total_tokens = (
-        sum(_safe_int(event.get("total_tokens")) for event in events) / request_count
-    )
-    avg_cost_usd = (
-        sum(_safe_float(event.get("cost_usd")) for event in events) / request_count
-    )
-    avg_latency_ms = (
-        sum(_safe_float(event.get("latency_ms")) for event in events) / request_count
-    )
-    fast_lane_hits = sum(
-        1 for event in events if bool(event.get("actual_fast_lane_hit", False))
-    )
+    avg_total_tokens = _safe_int(aggregate.get("total_tokens_sum")) / request_count
+    avg_cost_usd = _safe_float(aggregate.get("cost_sum_usd")) / request_count
+    avg_latency_ms = _safe_float(aggregate.get("latency_sum_ms")) / request_count
+    fast_lane_hits = int(aggregate.get("fast_lane_hits", 0))
     fast_lane_hit_rate = fast_lane_hits / request_count if request_count > 0 else 0.0
 
-    query_type_counts: Dict[str, int] = {}
-    model_success_counts: Dict[str, int] = {}
-    model_all_counts: Dict[str, int] = {}
-    failed_model_counts: Dict[str, int] = {}
-    failed_provider_counts: Dict[str, int] = {}
+    query_type_counts = dict(aggregate.get("query_type_counts", {}))
+    model_success_counts = dict(aggregate.get("model_success_counts", {}))
+    model_all_counts = dict(aggregate.get("model_all_counts", {}))
+    failed_model_counts = dict(aggregate.get("failed_model_counts", {}))
+    failed_provider_counts = dict(aggregate.get("failed_provider_counts", {}))
 
-    latest_event = events[-1]
+    latest_event = dict(aggregate.get("latest_event", {}))
     user_tier = str(latest_event.get("user_tier", "free") or "free").lower()
     user_id = latest_event.get("user_id")
     session_id = latest_event.get("session_id")
     config = _merged_config(DEFAULT_ROLLING_POLICY_CONFIG, policy_config)
-
-    for event in events:
-        query_type = str(event.get("query_type", "general") or "general").lower()
-        query_type_counts[query_type] = query_type_counts.get(query_type, 0) + 1
-
-        selected_model = str(event.get("selected_model", "") or "")
-        if selected_model:
-            model_all_counts[selected_model] = (
-                model_all_counts.get(selected_model, 0) + 1
-            )
-            if event.get("status") == "success":
-                model_success_counts[selected_model] = (
-                    model_success_counts.get(selected_model, 0) + 1
-                )
-            else:
-                failed_model_counts[selected_model] = (
-                    failed_model_counts.get(selected_model, 0) + 1
-                )
-
-        provider = str(event.get("provider", "") or "").lower()
-        if provider and event.get("status") != "success":
-            failed_provider_counts[provider] = (
-                failed_provider_counts.get(provider, 0) + 1
-            )
 
     dominant_query_type = _dominant_key(query_type_counts) or "general"
     session_hotness = _derive_hotness_from_request_count(

@@ -1,5 +1,12 @@
 # Project Progress
 
+## 2026-07-15 — Incremental Flink rolling-policy state
+
+- Changed: replaced per-event five-minute `ListState` rewrites with five-second event-time `MapState` buckets plus an incremental rolling aggregate; split event-list compatibility from aggregate policy construction; limited dirty hot-key emission to one update per five seconds after the initial emission; added 60-second watermark idleness.
+- Migration: preserved the original ListState descriptor for savepoint restoration and lazily migrates only in-window events; legacy state is cleared only after v2 state is fully written, and partial writes are safely overwritten on retry.
+- Verification: focused Flink, schema, late-event, cleanup, emit-cadence, and migration tests passed (`56 passed`); touched-file Black and Flake8 checks, compileall, and `git diff --check` passed.
+- Follow-up: the real PyFlink savepoint restore and Kafka/Flink runtime smoke remain for the performance-contract phase because the local runtime was not running.
+
 ## 2026-07-15 — ClickHouse analytics read-path hardening
 
 - Changed: moved analytics tables to time-first `ReplacingMergeTree` sorting; made dashboard reads replay-safe with `FINAL`; combined query analytics with `GROUPING SETS`; added a four-query concurrent dashboard bundle and a bounded five-second single-flight cache; fetched pipeline and monitoring bundles concurrently.

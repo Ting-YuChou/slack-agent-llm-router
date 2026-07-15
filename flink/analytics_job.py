@@ -29,7 +29,11 @@ try:  # pragma: no cover - optional in unit-test environments
         KeyedProcessFunction,
         MapFunction,
     )
-    from pyflink.datastream.state import ListStateDescriptor, ValueStateDescriptor
+    from pyflink.datastream.state import (
+        ListStateDescriptor,
+        MapStateDescriptor,
+        ValueStateDescriptor,
+    )
 except Exception:  # pragma: no cover - used only when PyFlink is unavailable
     SimpleStringSchema = None
 
@@ -78,9 +82,14 @@ except Exception:  # pragma: no cover - used only when PyFlink is unavailable
         def __init__(self, *args, **kwargs):
             pass
 
+    class MapStateDescriptor:  # pragma: no cover - placeholder descriptor
+        def __init__(self, *args, **kwargs):
+            pass
+
     class ValueStateDescriptor:  # pragma: no cover - placeholder descriptor
         def __init__(self, *args, **kwargs):
             pass
+
 
 try:
     from pyflink.common.watermark_strategy import TimestampAssigner, WatermarkStrategy
@@ -101,13 +110,16 @@ from flink.logic import (
     INFERENCE_COMPLETED_EVENT,
     MODEL_METRICS_1M_EVENT,
     ROUTING_GUARDRAIL_EVENT,
+    _empty_routing_policy_aggregate,
+    add_routing_policy_event,
     build_alert_event,
     build_model_metrics_window_event,
-    build_routing_policy_state_event,
+    build_routing_policy_state_event_from_aggregate,
     completion_event_timestamp_ms,
     detect_metric_anomalies,
     detect_model_routing_guardrails,
     detect_provider_routing_guardrails,
+    merge_routing_policy_aggregate,
     validate_inference_completed_event,
 )
 
@@ -568,24 +580,42 @@ class ProviderRoutingGuardrailDetector(KeyedProcessFunction):
 
 
 class RollingScopePolicyEmitter(KeyedProcessFunction):
-    """Emit rolling routing policy state for a user or session scope."""
+    """Incrementally emit rolling routing policy state for one keyed scope."""
 
     def __init__(
         self,
         scope_type: str,
         window_size_seconds: int = 300,
+        bucket_size_seconds: int = 5,
+        emit_interval_seconds: int = 5,
         policy_config: Dict[str, Any] | None = None,
     ):
         self.scope_type = scope_type
         self.window_size_seconds = window_size_seconds
         self.window_size_ms = window_size_seconds * 1000
+        self.bucket_size_ms = max(1, bucket_size_seconds) * 1000
+        self.emit_interval_ms = max(1, emit_interval_seconds) * 1000
         self.policy_config = dict(policy_config or {})
 
     def open(self, runtime_context):
+        # This descriptor name and type are intentionally unchanged so v1
+        # savepoints can restore before lazy migration into bucket_state.
         self.recent_events_state = runtime_context.get_list_state(
             ListStateDescriptor(
                 f"{self.scope_type}_recent_completion_events",
                 Types.STRING(),
+            )
+        )
+        self.bucket_state = runtime_context.get_map_state(
+            MapStateDescriptor(
+                f"{self.scope_type}_rolling_policy_buckets_v2",
+                Types.LONG(),
+                Types.STRING(),
+            )
+        )
+        self.aggregate_state = runtime_context.get_state(
+            ValueStateDescriptor(
+                f"{self.scope_type}_rolling_policy_aggregate_v2", Types.STRING()
             )
         )
         self.cleanup_timer_state = runtime_context.get_state(
@@ -594,6 +624,22 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
         self.cleanup_timer_kind_state = runtime_context.get_state(
             ValueStateDescriptor(
                 f"{self.scope_type}_cleanup_timer_kind", Types.STRING()
+            )
+        )
+        self.last_emit_state = runtime_context.get_state(
+            ValueStateDescriptor(
+                f"{self.scope_type}_rolling_policy_last_emit_ms_v2", Types.LONG()
+            )
+        )
+        self.dirty_state = runtime_context.get_state(
+            ValueStateDescriptor(
+                f"{self.scope_type}_rolling_policy_dirty_v2", Types.LONG()
+            )
+        )
+        self.migration_complete_state = runtime_context.get_state(
+            ValueStateDescriptor(
+                f"{self.scope_type}_rolling_policy_migration_complete_v2",
+                Types.LONG(),
             )
         )
 
@@ -605,6 +651,7 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
             ctx.timer_service(), current_processing_time
         )
         cutoff_ms = current_time_progress - self.window_size_ms
+        self._migrate_legacy_state_if_needed(cutoff_ms=cutoff_ms)
         event_timestamp_ms = completion_event_timestamp_ms(
             value,
             default_ms=current_processing_time,
@@ -617,57 +664,67 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
             )
             return
 
-        recent_events = self._prune_recent_events(
-            [json.loads(item) for item in self.recent_events_state.get()],
-            cutoff_ms,
+        normalized_event = self._policy_event(value, event_timestamp_ms)
+        bucket_start_ms = self._bucket_start(event_timestamp_ms)
+        bucket = self._load_bucket(bucket_start_ms)
+        add_routing_policy_event(
+            bucket,
+            normalized_event,
+            event_timestamp_ms=event_timestamp_ms,
         )
-        recent_events.append(
-            {
-                "event_timestamp_ms": event_timestamp_ms,
-                "user_id": value.get("user_id"),
-                "session_id": value.get("session_id"),
-                "user_tier": value.get("user_tier"),
-                "query_type": value.get("query_type"),
-                "selected_model": value.get("selected_model"),
-                "provider": value.get("provider"),
-                "status": value.get("status"),
-                "latency_ms": value.get("latency_ms"),
-                "total_tokens": value.get("total_tokens"),
-                "cost_usd": value.get("cost_usd"),
-                "actual_fast_lane_hit": bool(value.get("actual_fast_lane_hit", False)),
-                "route_to_fast_lane": bool(value.get("route_to_fast_lane", False)),
-            }
-        )
-        self.recent_events_state.update([json.dumps(event) for event in recent_events])
-        self._schedule_next_cleanup(ctx, recent_events)
+        self.bucket_state.put(bucket_start_ms, json.dumps(bucket))
 
-        yield build_routing_policy_state_event(
-            scope_type=self.scope_type,
-            scope_key=str(ctx.get_current_key()),
-            events=recent_events,
-            window_size_seconds=self.window_size_seconds,
-            policy_config=self.policy_config,
+        aggregate = self._load_aggregate()
+        was_empty = int(aggregate.get("request_count", 0)) == 0
+        add_routing_policy_event(
+            aggregate,
+            normalized_event,
+            event_timestamp_ms=event_timestamp_ms,
         )
+        self._save_aggregate(aggregate)
+
+        if was_empty:
+            self.last_emit_state.update(current_time_progress)
+            self.dirty_state.clear()
+            yield self._build_policy(ctx, aggregate)
+        else:
+            self.dirty_state.update(1)
+        self._schedule_next_timer(ctx)
 
     def on_timer(self, timestamp: int, ctx: "KeyedProcessFunction.OnTimerContext"):
-        cutoff_ms = timestamp - self.window_size_ms
-        recent_events = self._prune_recent_events(
-            [json.loads(item) for item in self.recent_events_state.get()],
-            cutoff_ms,
-        )
+        self._migrate_legacy_state_if_needed(cutoff_ms=timestamp - self.window_size_ms)
         self.cleanup_timer_state.clear()
         self.cleanup_timer_kind_state.clear()
-        if recent_events:
-            self.recent_events_state.update(
-                [json.dumps(event) for event in recent_events]
-            )
-            self._schedule_next_cleanup(ctx, recent_events)
-            return
-        self.recent_events_state.clear()
 
-    def _schedule_next_cleanup(
-        self, ctx: "KeyedProcessFunction.Context", recent_events: list[Dict[str, Any]]
-    ):
+        aggregate = self._load_aggregate()
+        expired = []
+        for bucket_start_ms in list(self.bucket_state.keys()):
+            if self._bucket_expiry(int(bucket_start_ms)) <= timestamp:
+                bucket = self._load_bucket(int(bucket_start_ms))
+                merge_routing_policy_aggregate(aggregate, bucket, sign=-1)
+                self.bucket_state.remove(bucket_start_ms)
+                expired.append(bucket_start_ms)
+
+        if expired:
+            self.dirty_state.update(1)
+            self._refresh_latest_event(aggregate)
+
+        if int(aggregate.get("request_count", 0)) <= 0:
+            self._clear_v2_state()
+            return
+
+        self._save_aggregate(aggregate)
+        last_emit_ms = int(self.last_emit_state.value() or 0)
+        if (
+            self.dirty_state.value()
+            and timestamp >= last_emit_ms + self.emit_interval_ms
+        ):
+            self.last_emit_state.update(timestamp)
+            self.dirty_state.clear()
+            yield self._build_policy(ctx, aggregate)
+        self._schedule_next_timer(ctx)
+
+    def _schedule_next_timer(self, ctx: "KeyedProcessFunction.Context"):
         existing_timer = self.cleanup_timer_state.value()
         if existing_timer:
             _delete_timer(
@@ -678,13 +735,16 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
             self.cleanup_timer_state.clear()
             self.cleanup_timer_kind_state.clear()
 
-        if not recent_events:
+        bucket_starts = [int(key) for key in self.bucket_state.keys()]
+        if not bucket_starts:
             return
 
-        oldest_event_ms = min(
-            int(event.get("event_timestamp_ms", 0) or 0) for event in recent_events
-        )
-        next_cleanup_ms = oldest_event_ms + self.window_size_ms + 1000
+        candidates = [self._bucket_expiry(start) for start in bucket_starts]
+        if self.dirty_state.value():
+            candidates.append(
+                int(self.last_emit_state.value() or 0) + self.emit_interval_ms
+            )
+        next_cleanup_ms = min(candidates)
         timer_service = ctx.timer_service()
         register_event_time = getattr(timer_service, "register_event_time_timer", None)
         if not callable(register_event_time):
@@ -695,15 +755,136 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
         if timer_kind:
             self.cleanup_timer_kind_state.update(timer_kind)
 
+    def _migrate_legacy_state_if_needed(self, *, cutoff_ms: int):
+        if self.migration_complete_state.value():
+            return
+        raw_events = list(self.recent_events_state.get())
+        if not raw_events:
+            self.migration_complete_state.update(1)
+            return
+        events = [json.loads(item) for item in raw_events]
+        buckets: Dict[int, Dict[str, Any]] = {}
+        for sequence, event in enumerate(events):
+            event_timestamp_ms = int(event.get("event_timestamp_ms", sequence) or 0)
+            if event_timestamp_ms < cutoff_ms:
+                continue
+            bucket_start_ms = self._bucket_start(event_timestamp_ms)
+            bucket = buckets.setdefault(
+                bucket_start_ms, _empty_routing_policy_aggregate()
+            )
+            add_routing_policy_event(
+                bucket, event, event_timestamp_ms=event_timestamp_ms
+            )
+        self._write_migrated_state(buckets)
+        self.recent_events_state.clear()
+        self.migration_complete_state.update(1)
+
+    def _write_migrated_state(self, buckets: Dict[int, Dict[str, Any]]):
+        aggregate = _empty_routing_policy_aggregate()
+        self.bucket_state.clear()
+        for bucket_start_ms, bucket in buckets.items():
+            self.bucket_state.put(bucket_start_ms, json.dumps(bucket))
+            merge_routing_policy_aggregate(aggregate, bucket)
+        self._save_aggregate(aggregate)
+        self.dirty_state.update(1)
+
+    def _refresh_latest_event(self, aggregate: Dict[str, Any]):
+        aggregate["latest_event"] = {}
+        aggregate["latest_event_timestamp_ms"] = -1
+        for _, raw_bucket in self.bucket_state.items():
+            bucket = json.loads(raw_bucket)
+            if int(bucket.get("latest_event_timestamp_ms", -1)) >= int(
+                aggregate.get("latest_event_timestamp_ms", -1)
+            ):
+                aggregate["latest_event_timestamp_ms"] = int(
+                    bucket.get("latest_event_timestamp_ms", -1)
+                )
+                aggregate["latest_event"] = dict(bucket.get("latest_event", {}))
+
+    def _build_policy(self, ctx, aggregate: Dict[str, Any]) -> Dict[str, Any]:
+        return build_routing_policy_state_event_from_aggregate(
+            scope_type=self.scope_type,
+            scope_key=str(ctx.get_current_key()),
+            aggregate=aggregate,
+            window_size_seconds=self.window_size_seconds,
+            policy_config=self.policy_config,
+        )
+
+    def _load_bucket(self, bucket_start_ms: int) -> Dict[str, Any]:
+        raw_bucket = self.bucket_state.get(bucket_start_ms)
+        return (
+            json.loads(raw_bucket) if raw_bucket else _empty_routing_policy_aggregate()
+        )
+
+    def _load_aggregate(self) -> Dict[str, Any]:
+        raw_aggregate = self.aggregate_state.value()
+        return (
+            json.loads(raw_aggregate)
+            if raw_aggregate
+            else _empty_routing_policy_aggregate()
+        )
+
+    def _save_aggregate(self, aggregate: Dict[str, Any]):
+        self.aggregate_state.update(json.dumps(aggregate))
+
+    def _clear_v2_state(self):
+        self.bucket_state.clear()
+        self.aggregate_state.clear()
+        self.last_emit_state.clear()
+        self.dirty_state.clear()
+
+    def _bucket_start(self, event_timestamp_ms: int) -> int:
+        return (event_timestamp_ms // self.bucket_size_ms) * self.bucket_size_ms
+
+    def _bucket_expiry(self, bucket_start_ms: int) -> int:
+        return bucket_start_ms + self.bucket_size_ms + self.window_size_ms
+
     @staticmethod
-    def _prune_recent_events(
-        recent_events: list[Dict[str, Any]], cutoff_ms: int
-    ) -> list[Dict[str, Any]]:
-        return [
-            event
-            for event in recent_events
-            if int(event.get("event_timestamp_ms", 0) or 0) >= cutoff_ms
-        ]
+    def _policy_event(value: Dict[str, Any], event_timestamp_ms: int) -> Dict[str, Any]:
+        return {
+            "event_timestamp_ms": event_timestamp_ms,
+            "user_id": value.get("user_id"),
+            "session_id": value.get("session_id"),
+            "user_tier": value.get("user_tier"),
+            "query_type": value.get("query_type"),
+            "selected_model": value.get("selected_model"),
+            "provider": value.get("provider"),
+            "status": value.get("status"),
+            "latency_ms": value.get("latency_ms"),
+            "total_tokens": value.get("total_tokens"),
+            "cost_usd": value.get("cost_usd"),
+            "actual_fast_lane_hit": bool(value.get("actual_fast_lane_hit", False)),
+            "route_to_fast_lane": bool(value.get("route_to_fast_lane", False)),
+        }
+
+
+def _rolling_policy_operator_config(
+    rolling_policy_config: Dict[str, Any],
+) -> Dict[str, int]:
+    return {
+        "bucket_size_seconds": int(rolling_policy_config.get("bucket_size_seconds", 5)),
+        "emit_interval_seconds": int(
+            rolling_policy_config.get("emit_interval_seconds", 5)
+        ),
+    }
+
+
+def _completion_watermark_strategy(
+    out_of_orderness_seconds: int, idleness_seconds: int
+):
+    if (
+        WatermarkStrategy is None
+        or Duration is None
+        or CompletionTimestampAssigner is None
+    ):
+        return None
+    return (
+        WatermarkStrategy.for_bounded_out_of_orderness(
+            Duration.of_seconds(out_of_orderness_seconds)
+        )
+        .with_timestamp_assigner(CompletionTimestampAssigner())
+        .with_idleness(Duration.of_seconds(idleness_seconds))
+    )
 
 
 def _analytics_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -813,16 +994,16 @@ def create_flink_job(config: Dict[str, Any]):
             "watermark_out_of_orderness_seconds", allowed_lateness_seconds
         )
     )
-    if (
-        WatermarkStrategy is not None
-        and Duration is not None
-        and CompletionTimestampAssigner is not None
-    ):
+    watermark_idleness_seconds = int(
+        analytics_config.get("watermark_idleness_seconds", 60)
+    )
+    watermark_strategy = _completion_watermark_strategy(
+        watermark_out_of_orderness_seconds, watermark_idleness_seconds
+    )
+    if watermark_strategy is not None:
         valid_completions_stream = (
             valid_completions_stream.assign_timestamps_and_watermarks(
-                WatermarkStrategy.for_bounded_out_of_orderness(
-                    Duration.of_seconds(watermark_out_of_orderness_seconds)
-                ).with_timestamp_assigner(CompletionTimestampAssigner())
+                watermark_strategy
             )
         )
 
@@ -892,6 +1073,9 @@ def create_flink_job(config: Dict[str, Any]):
         )
     )
     rolling_policy_config = dict(analytics_config.get("rolling_policy", {}) or {})
+    rolling_policy_operator_config = _rolling_policy_operator_config(
+        rolling_policy_config
+    )
     user_policy_state_stream = (
         valid_completions_stream.filter(NonEmptyFieldFilter("user_id"))
         .key_by(lambda event: event.get("user_id", "unknown"))
@@ -899,6 +1083,7 @@ def create_flink_job(config: Dict[str, Any]):
             RollingScopePolicyEmitter(
                 scope_type="user",
                 window_size_seconds=rolling_policy_window_seconds,
+                **rolling_policy_operator_config,
                 policy_config=rolling_policy_config,
             ),
             output_type=Types.PICKLED_BYTE_ARRAY(),
@@ -911,6 +1096,7 @@ def create_flink_job(config: Dict[str, Any]):
             RollingScopePolicyEmitter(
                 scope_type="session",
                 window_size_seconds=rolling_policy_window_seconds,
+                **rolling_policy_operator_config,
                 policy_config=rolling_policy_config,
             ),
             output_type=Types.PICKLED_BYTE_ARRAY(),
@@ -962,6 +1148,11 @@ def main():
             "anomaly_threshold_multiplier": 2.0,
             "guardrail_threshold_multiplier": 2.0,
             "watermark_out_of_orderness_seconds": 15,
+            "watermark_idleness_seconds": 60,
+            "rolling_policy": {
+                "bucket_size_seconds": 5,
+                "emit_interval_seconds": 5,
+            },
         },
         "kafka": {
             "bootstrap_servers": ["localhost:9092"],
