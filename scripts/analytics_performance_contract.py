@@ -30,13 +30,14 @@ if str(ROOT) not in sys.path:
 DEFAULT_THRESHOLDS = {
     "clickhouse_rows": 1_000_000,
     "read_rows_reduction_ratio": 0.70,
-    "cold_p95_improvement_ratio": 0.40,
+    "dashboard_cold_p95_improvement_ratio": 0.40,
     "dashboard_query_count": 4,
     "flink_events": 10_000,
     "state_bytes_reduction_ratio": 0.80,
     "throughput_improvement_ratio": 5.0,
     "emits_per_scope": 2,
 }
+MIN_DASHBOARD_LATENCY_SAMPLES = 20
 
 
 def _finite_number(value: Any) -> bool:
@@ -91,16 +92,22 @@ def evaluate_contracts(
                     limits["read_rows_reduction_ratio"],
                 ),
                 _gate(
-                    "clickhouse.cold_p95_improvement",
-                    values.get("cold_p95_improvement_ratio"),
+                    "clickhouse.dashboard_cold_p95_improvement",
+                    values.get("dashboard_cold_p95_improvement_ratio"),
                     ">=",
-                    limits["cold_p95_improvement_ratio"],
+                    limits["dashboard_cold_p95_improvement_ratio"],
                 ),
                 _gate(
                     "clickhouse.dashboard_query_count",
                     values.get("dashboard_query_count"),
                     "<=",
                     limits["dashboard_query_count"],
+                ),
+                _gate(
+                    "clickhouse.model_performance_seed_rows",
+                    values.get("model_performance_seed_rows"),
+                    "==",
+                    1,
                 ),
                 _gate(
                     "clickhouse.replay_final_count",
@@ -151,23 +158,61 @@ def evaluate_contracts(
     return all(gate["passed"] for gate in gates), gates
 
 
+def _legacy_event(sequence: int) -> Dict[str, Any]:
+    return {
+        "event_timestamp_ms": min(sequence, 4_999),
+        "user_id": "benchmark-user",
+        "session_id": "benchmark-session",
+        "user_tier": "premium",
+        "query_type": "analysis",
+        "selected_model": "gpt-5",
+        "provider": "openai",
+        "status": "success",
+        "latency_ms": 100,
+        "total_tokens": 200,
+        "cost_usd": 0.01,
+        "actual_fast_lane_hit": True,
+        "route_to_fast_lane": False,
+    }
+
+
 def _legacy_hot_key(events: int) -> Tuple[int, int]:
-    state: List[Tuple[int, int, str]] = []
+    from flink.logic import build_routing_policy_state_event
+
+    serialized_state: List[str] = []
     checksum = 0
     for sequence in range(events):
-        state.append((sequence, 200, "gpt-5"))
-        # This models the legacy ListState read/prune/rewrite scan per completion.
-        checksum = sum(item[1] for item in state)
-    state_bytes = len(
-        json.dumps(
-            [
-                {"timestamp_ms": item[0], "total_tokens": item[1], "model": item[2]}
-                for item in state
-            ],
-            separators=(",", ":"),
-        ).encode("utf-8")
-    )
+        event = _legacy_event(sequence)
+        cutoff_ms = int(event["event_timestamp_ms"]) - 300_000
+        # Match the old ListState hot path: deserialize every retained event,
+        # prune the rolling window, append, then rewrite the complete state.
+        state = [
+            retained
+            for retained in (json.loads(item) for item in serialized_state)
+            if int(retained.get("event_timestamp_ms", 0) or 0) >= cutoff_ms
+        ]
+        state.append(event)
+        serialized_state = [json.dumps(event) for event in state]
+        build_routing_policy_state_event(
+            scope_type="user",
+            scope_key="benchmark-user",
+            events=state,
+            window_size_seconds=300,
+        )
+        checksum = sum(int(item.get("total_tokens", 0) or 0) for item in state)
+    state_bytes = sum(len(item.encode("utf-8")) for item in serialized_state)
     return checksum, state_bytes
+
+
+def _legacy_final_state(events: int) -> Tuple[int, int]:
+    serialized_state = [
+        json.dumps(_legacy_event(sequence)) for sequence in range(events)
+    ]
+    return events * 200, sum(len(item.encode("utf-8")) for item in serialized_state)
+
+
+def _cumulative_list_state_work(events: int) -> int:
+    return events * (events + 1) // 2
 
 
 def _incremental_hot_key(events: int) -> Tuple[int, int, int]:
@@ -332,10 +377,18 @@ def benchmark_flink_hot_key(events: int = 10_000, repeats: int = 3) -> Dict[str,
     incremental_times: List[float] = []
     legacy_bytes = incremental_bytes = emits = 0
     legacy_checksum = incremental_checksum = 0
+    legacy_measured_events = min(events, 1_000)
+    measured_work = _cumulative_list_state_work(legacy_measured_events)
+    requested_work = _cumulative_list_state_work(events)
+    legacy_extrapolation_factor = (
+        requested_work / measured_work if measured_work else 1.0
+    )
     for _ in range(max(1, repeats)):
         started = time.perf_counter()
-        legacy_checksum, legacy_bytes = _legacy_hot_key(events)
-        legacy_times.append(time.perf_counter() - started)
+        _legacy_hot_key(legacy_measured_events)
+        legacy_times.append(
+            (time.perf_counter() - started) * legacy_extrapolation_factor
+        )
 
         started = time.perf_counter()
         (
@@ -344,6 +397,8 @@ def benchmark_flink_hot_key(events: int = 10_000, repeats: int = 3) -> Dict[str,
             emits,
         ) = _run_actual_rolling_scope_emitter(events)
         incremental_times.append(time.perf_counter() - started)
+
+    legacy_checksum, legacy_bytes = _legacy_final_state(events)
 
     if legacy_checksum != incremental_checksum:
         errors.append(
@@ -363,6 +418,8 @@ def benchmark_flink_hot_key(events: int = 10_000, repeats: int = 3) -> Dict[str,
         "events": events,
         "repeats": max(1, repeats),
         "legacy_seconds_median": legacy_seconds,
+        "legacy_measured_events": legacy_measured_events,
+        "legacy_extrapolation_factor": legacy_extrapolation_factor,
         "incremental_seconds_median": incremental_seconds,
         "legacy_events_per_second": events / legacy_seconds if legacy_seconds else 0,
         "incremental_events_per_second": (
@@ -375,8 +432,10 @@ def benchmark_flink_hot_key(events: int = 10_000, repeats: int = 3) -> Dict[str,
         "emits_per_scope": emits,
         "measurement_mode": "rolling_scope_policy_emitter_harness",
         "measurement_limitations": (
-            "Executes production process_element/on_timer and serialized state, "
-            "but does not measure a RocksDB backend or checkpoint bytes."
+            "Executes production process_element/on_timer for every requested event. "
+            "The legacy JSON ListState and policy path is measured for at most 1,000 "
+            "events and extrapolated by cumulative retained-entry work; neither path "
+            "measures a RocksDB backend or checkpoint bytes."
         ),
         "actual_operator_events": events,
         "errors": errors,
@@ -421,6 +480,153 @@ def _run_production_dashboard_bundle(
     return measured.count, bundle
 
 
+def legacy_dashboard_queries(database: str, *, hours: int = 1) -> Dict[str, str]:
+    """Return the six queries issued by the pre-bundle sequential dashboard flow."""
+    window = f"timestamp >= now() - INTERVAL {max(int(hours), 0)} HOUR"
+    return {
+        "analytics_overall": f"""
+            SELECT count(), sum(token_count_input + token_count_output),
+                   sum(cost_usd), avg(latency_ms),
+                   countIf(status = 'success') * 100.0 / count()
+            FROM {database}.query_logs_legacy WHERE {window}
+        """,
+        "analytics_model_breakdown": f"""
+            SELECT selected_model, count(), sum(cost_usd)
+            FROM {database}.query_logs_legacy WHERE {window}
+            GROUP BY selected_model
+        """,
+        "analytics_query_type_breakdown": f"""
+            SELECT query_type, count()
+            FROM {database}.query_logs_legacy WHERE {window}
+            GROUP BY query_type
+        """,
+        "model_performance": f"""
+            SELECT model_name, provider, sum(requests_count),
+                   sum(success_count) * 100.0 / nullIf(sum(requests_count), 0),
+                   sum(avg_latency_ms * requests_count) /
+                       nullIf(sum(requests_count), 0),
+                   sum(avg_tokens_per_second * requests_count) /
+                       nullIf(sum(requests_count), 0),
+                   sum(error_count), sum(total_cost_usd)
+            FROM {database}.model_performance WHERE {window}
+            GROUP BY model_name, provider
+        """,
+        "routing_guardrails": f"""
+            SELECT timestamp, alert_type, severity, description, model_name,
+                   provider, payload_json
+            FROM {database}.alert_events WHERE {window}
+              AND source_event_type = 'routing.guardrails'
+            ORDER BY timestamp DESC LIMIT 50
+        """,
+        "routing_policy_state": f"""
+            SELECT timestamp, scope_type, scope_key, user_id, session_id,
+                   user_tier, hint_reason, recent_request_count,
+                   recent_error_rate, avg_latency_ms, fast_lane_hit_rate,
+                   dominant_query_type, query_complexity, requires_low_latency,
+                   requires_high_reasoning, route_to_fast_lane,
+                   burst_protection_active, enterprise_priority_active,
+                   preferred_models, avoid_models, avoid_providers, payload_json
+            FROM {database}.routing_policy_state_events WHERE {window}
+            ORDER BY timestamp DESC LIMIT 50
+        """,
+    }
+
+
+def _drop_dashboard_caches(client) -> None:
+    """Apply the same ClickHouse cold-cache treatment before every sample."""
+    client.command("SYSTEM DROP MARK CACHE")
+    client.command("SYSTEM DROP UNCOMPRESSED CACHE")
+
+
+def _time_legacy_dashboard_bundle(client, database: str) -> Tuple[int, float]:
+    """Time the complete six-query legacy dashboard path sequentially."""
+    _drop_dashboard_caches(client)
+    queries = legacy_dashboard_queries(database)
+    started = time.perf_counter()
+    for sql in queries.values():
+        client.query(sql)
+    return len(queries), time.perf_counter() - started
+
+
+def _time_production_dashboard_bundle(
+    client, database: str
+) -> Tuple[int, Dict[str, Any], float]:
+    """Time the cache-disabled production bundle, including thread coordination."""
+    _drop_dashboard_caches(client)
+    started = time.perf_counter()
+    count, bundle = _run_production_dashboard_bundle(client, database)
+    return count, bundle, time.perf_counter() - started
+
+
+def benchmark_dashboard_bundle_latency(
+    client, database: str, *, repeats: int
+) -> Dict[str, Any]:
+    """Compare full legacy and production dashboard bundles with cold caches."""
+    sample_count = max(MIN_DASHBOARD_LATENCY_SAMPLES, int(repeats))
+    legacy_durations: List[float] = []
+    production_durations: List[float] = []
+    production_query_count = 0
+
+    for sample_index in range(sample_count):
+        if sample_index % 2 == 0:
+            legacy_query_count, legacy_duration = _time_legacy_dashboard_bundle(
+                client, database
+            )
+            (
+                production_query_count,
+                bundle,
+                production_duration,
+            ) = _time_production_dashboard_bundle(client, database)
+        else:
+            (
+                production_query_count,
+                bundle,
+                production_duration,
+            ) = _time_production_dashboard_bundle(client, database)
+            legacy_query_count, legacy_duration = _time_legacy_dashboard_bundle(
+                client, database
+            )
+        if legacy_query_count != 6:
+            raise RuntimeError(
+                f"legacy dashboard issued {legacy_query_count} queries instead of 6"
+            )
+        if production_query_count != 4:
+            raise RuntimeError(
+                "production dashboard must issue all four independent sections; "
+                f"observed {production_query_count} queries"
+            )
+        if bundle.get("errors"):
+            raise RuntimeError(
+                f"production dashboard bundle errors: {bundle['errors']}"
+            )
+        legacy_durations.append(legacy_duration)
+        production_durations.append(production_duration)
+
+    if (
+        len(legacy_durations) != sample_count
+        or len(production_durations) != sample_count
+        or not all(
+            _finite_number(value) and value > 0
+            for value in legacy_durations + production_durations
+        )
+    ):
+        raise RuntimeError("dashboard bundle timing samples are missing or invalid")
+
+    legacy_p95 = _p95(legacy_durations)
+    production_p95 = _p95(production_durations)
+    return {
+        "dashboard_latency_samples": sample_count,
+        "legacy_dashboard_query_count": 6,
+        "dashboard_query_count": production_query_count,
+        "legacy_dashboard_cold_p95_seconds": legacy_p95,
+        "v2_dashboard_cold_p95_seconds": production_p95,
+        "dashboard_cold_p95_improvement_ratio": 1.0 - production_p95 / legacy_p95,
+        "dashboard_latency_measurement_mode": (
+            "legacy_sequential_vs_production_get_dashboard_bundle_real_clickhouse"
+        ),
+    }
+
+
 def _create_production_dashboard_tables(client, database: str) -> None:
     """Create the exact table schemas used by production dashboard methods."""
     from src.llm_router_part3_pipeline import ClickHouseManager
@@ -428,6 +634,36 @@ def _create_production_dashboard_tables(client, database: str) -> None:
     manager = ClickHouseManager({"database": database})
     manager.client = client
     asyncio.run(manager._create_tables())
+
+
+def seed_model_performance(client, database: str) -> int:
+    """Seed and verify the non-empty section assumed by the six-query baseline."""
+    event_id = "analytics-contract:model-performance"
+    client.command(
+        f"""
+        INSERT INTO {database}.model_performance
+            (event_id, timestamp, model_name, provider, requests_count,
+             success_count, success_rate, avg_latency_ms,
+             avg_tokens_per_second, error_count, total_cost_usd,
+             gpu_utilization, memory_usage_gb)
+        SELECT '{event_id}', now64(3), 'gpt-5', 'openai', 100,
+               99, 99.0, 125.0, 40.0, 1, 0.25, 0.0, 0.0
+        """
+    )
+    count = int(
+        clickhouse_scalar(
+            client.query(
+                f"SELECT count() FROM {database}.model_performance FINAL "
+                f"WHERE event_id = '{event_id}'"
+            )
+        )
+    )
+    if count != 1:
+        raise RuntimeError(
+            "model_performance seed must produce exactly one visible row; "
+            f"observed {count}"
+        )
+    return count
 
 
 def _p95(values: List[float]) -> float:
@@ -516,6 +752,14 @@ def _create_migration_sources(client, database: str) -> None:
         )
 
 
+def legacy_query_logs_ddl(database: str, columns: str) -> str:
+    return (
+        f"CREATE TABLE {database}.query_logs_legacy ({columns}) "
+        "ENGINE=ReplacingMergeTree PARTITION BY toYYYYMM(timestamp) "
+        "ORDER BY event_id"
+    )
+
+
 def _exercise_migration(client, database: str) -> Tuple[bool, int]:
     from scripts.migrate_clickhouse_analytics_v2 import migration_plan
 
@@ -582,14 +826,16 @@ def benchmark_clickhouse(
         client.command(f"CREATE DATABASE {database} ENGINE=Atomic")
         client.command(f"CREATE DATABASE {migration_database} ENGINE=Atomic")
         _create_production_dashboard_tables(client, database)
+        metrics["model_performance_seed_rows"] = seed_model_performance(
+            client, database
+        )
         common_columns = (
-            "event_id String, timestamp DateTime64(3), selected_model LowCardinality(String), "
-            "query_type LowCardinality(String), latency_ms UInt32, total_tokens UInt32"
+            "event_id String, timestamp DateTime64(3), user_id String, "
+            "selected_model LowCardinality(String), query_type LowCardinality(String), "
+            "token_count_input UInt32, token_count_output UInt32, latency_ms UInt32, "
+            "cost_usd Float64, status LowCardinality(String), total_tokens UInt32"
         )
-        client.command(
-            f"CREATE TABLE {database}.query_logs_legacy ({common_columns}) "
-            "ENGINE=ReplacingMergeTree ORDER BY event_id"
-        )
+        client.command(legacy_query_logs_ddl(database, common_columns))
         client.command(
             f"CREATE TABLE {database}.query_logs_v2 ({common_columns}) "
             "ENGINE=ReplacingMergeTree PARTITION BY toYYYYMM(timestamp) "
@@ -597,11 +843,14 @@ def benchmark_clickhouse(
         )
         generator = (
             f"SELECT {clickhouse_event_id_expression('number')}, "
-            "toDateTime64('2026-06-01 00:00:00', 3) + "
+            "now64(3) - INTERVAL 30 DAY + "
             f"toIntervalMillisecond(intDiv(number * 2592000000, {rows})), "
+            "'benchmark-user', "
             "if(number % 2 = 0, 'gpt-5', 'claude-sonnet'), "
             "if(number % 3 = 0, 'analysis', 'chat'), "
-            "toUInt32(50 + number % 500), toUInt32(100 + number % 2000) "
+            "toUInt32(25 + number % 250), toUInt32(75 + number % 1750), "
+            "toUInt32(50 + number % 500), toFloat64(number % 1000) / 100000.0, "
+            "'success', toUInt32(100 + number % 2000) "
             f"FROM numbers({rows})"
         )
         client.command(f"INSERT INTO {database}.query_logs_legacy {generator}")
@@ -614,8 +863,8 @@ def benchmark_clickhouse(
             "query_type, selected_model, token_count_input, token_count_output, "
             "latency_ms, cost_usd, status, error_message, context_compressed, "
             "compression_ratio, cached_response) "
-            f"SELECT event_id, event_id, timestamp, 'benchmark-user', 'premium', '', "
-            "query_type, selected_model, 0, total_tokens, latency_ms, 0.0, "
+            f"SELECT event_id, event_id, timestamp, user_id, 'premium', '', "
+            "query_type, selected_model, token_count_input, token_count_output, latency_ms, cost_usd, "
             f"'success', '', false, 1.0, false FROM {database}.query_logs_v2"
         )
 
@@ -635,10 +884,7 @@ def benchmark_clickhouse(
             )
         )
 
-        window = (
-            "timestamp >= toDateTime64('2026-06-29 23:00:00', 3) AND "
-            "timestamp < toDateTime64('2026-06-30 00:00:00', 3)"
-        )
+        window = "timestamp >= now64(3) - INTERVAL 1 HOUR AND timestamp < now64(3)"
         legacy_queries = [
             f"SELECT count(), avg(latency_ms), sum(total_tokens) FROM {database}.query_logs_legacy FINAL WHERE {window}",
             f"SELECT selected_model, count() FROM {database}.query_logs_legacy FINAL WHERE {window} GROUP BY selected_model",
@@ -654,20 +900,15 @@ def benchmark_clickhouse(
         )
         legacy_bundle_read_rows = 0
         legacy_same_query_read_rows = 0
-        legacy_durations: List[float] = []
         grouped_read_rows = 0
-        grouped_durations: List[float] = []
         for repeat in range(max(1, repeats)):
-            duration = 0.0
             current_rows = 0
             for index, sql in enumerate(legacy_queries):
                 read_rows, elapsed = _query_read_rows(
                     client, sql, f"legacy-{repeat}-{index}"
                 )
                 current_rows += read_rows
-                duration += elapsed
             legacy_bundle_read_rows = max(legacy_bundle_read_rows, current_rows)
-            legacy_durations.append(duration)
             read_rows, _ = _query_read_rows(
                 client, legacy_grouped_query, f"legacy-grouped-{repeat}"
             )
@@ -676,10 +917,6 @@ def benchmark_clickhouse(
                 client, v2_grouped_query, f"grouped-{repeat}"
             )
             grouped_read_rows = max(grouped_read_rows, read_rows)
-            grouped_durations.append(elapsed)
-
-        legacy_p95 = _p95(legacy_durations)
-        grouped_p95 = _p95(grouped_durations)
         metrics.update(
             clickhouse_read_rows_metrics(
                 legacy_same_query_rows=legacy_same_query_read_rows,
@@ -688,26 +925,8 @@ def benchmark_clickhouse(
             )
         )
         metrics.update(
-            {
-                "legacy_cold_p95_seconds": legacy_p95,
-                "v2_cold_p95_seconds": grouped_p95,
-                "cold_p95_improvement_ratio": (
-                    1.0 - grouped_p95 / legacy_p95 if legacy_p95 else float("nan")
-                ),
-            }
+            benchmark_dashboard_bundle_latency(client, database, repeats=repeats)
         )
-
-        dashboard_query_count, dashboard_bundle = _run_production_dashboard_bundle(
-            client, database
-        )
-        if dashboard_bundle.get("errors"):
-            raise RuntimeError(
-                f"production dashboard bundle errors: {dashboard_bundle['errors']}"
-            )
-        metrics["dashboard_query_count"] = dashboard_query_count
-        metrics[
-            "dashboard_query_measurement_mode"
-        ] = "production_kafka_ingestion_pipeline_real_clickhouse_queries"
 
         _create_migration_sources(client, migration_database)
         migration_verified, statement_count = _exercise_migration(
