@@ -2,8 +2,9 @@
 """Run machine-readable ClickHouse and Flink analytics performance contracts.
 
 The ClickHouse workload is destructive only inside uniquely named benchmark
-databases, which are dropped by default. The Flink workload is a deterministic
-reference comparison of the legacy full-list hot-key algorithm and v2 buckets.
+databases, which are dropped by default. The Flink workload executes the real
+RollingScopePolicyEmitter against a deterministic state/timer harness; it is not
+a substitute for backend-specific RocksDB/checkpoint metrics.
 """
 
 import argparse
@@ -189,6 +190,140 @@ def _incremental_hot_key(events: int) -> Tuple[int, int, int]:
     return checksum, state_bytes, emits
 
 
+class _HarnessListState:
+    def __init__(self):
+        self.values: List[str] = []
+
+    def get(self):
+        return list(self.values)
+
+    def clear(self):
+        self.values.clear()
+
+
+class _HarnessMapState:
+    def __init__(self):
+        self.values: Dict[int, str] = {}
+
+    def get(self, key):
+        return self.values.get(key)
+
+    def put(self, key, value):
+        self.values[key] = value
+
+    def remove(self, key):
+        self.values.pop(key, None)
+
+    def keys(self):
+        return list(self.values)
+
+    def items(self):
+        return list(self.values.items())
+
+    def clear(self):
+        self.values.clear()
+
+
+class _HarnessValueState:
+    def __init__(self):
+        self.current = None
+
+    def value(self):
+        return self.current
+
+    def update(self, value):
+        self.current = value
+
+    def clear(self):
+        self.current = None
+
+
+class _HarnessTimerService:
+    def __init__(self, now_ms: int):
+        self.now_ms = now_ms
+
+    def current_processing_time(self):
+        return self.now_ms
+
+    def current_watermark(self):
+        return self.now_ms
+
+    def register_event_time_timer(self, timestamp):
+        return None
+
+    def delete_event_time_timer(self, timestamp):
+        return None
+
+
+class _HarnessContext:
+    def __init__(self, timer_service):
+        self._timer_service = timer_service
+
+    def timer_service(self):
+        return self._timer_service
+
+    def get_current_key(self):
+        return "benchmark-user"
+
+
+def _run_actual_rolling_scope_emitter(events: int) -> Tuple[int, int, int]:
+    from flink.analytics_job import RollingScopePolicyEmitter
+
+    base_ms = 1_700_000_000_000
+    emitter = RollingScopePolicyEmitter(
+        "user",
+        window_size_seconds=300,
+        bucket_size_seconds=5,
+        emit_interval_seconds=5,
+    )
+    emitter.recent_events_state = _HarnessListState()
+    emitter.bucket_state = _HarnessMapState()
+    emitter.aggregate_state = _HarnessValueState()
+    emitter.cleanup_timer_state = _HarnessValueState()
+    emitter.cleanup_timer_kind_state = _HarnessValueState()
+    emitter.last_emit_state = _HarnessValueState()
+    emitter.dirty_state = _HarnessValueState()
+    emitter.migration_complete_state = _HarnessValueState()
+    emitter.arrival_sequence_state = _HarnessValueState()
+    timer = _HarnessTimerService(base_ms)
+    ctx = _HarnessContext(timer)
+    emits = 0
+    for sequence in range(events):
+        timestamp_ms = base_ms + min(sequence, 4_999)
+        timer.now_ms = timestamp_ms
+        event = {
+            "request_id": f"benchmark-{sequence}",
+            "completion_timestamp": datetime.fromtimestamp(
+                timestamp_ms / 1000, tz=timezone.utc
+            ).isoformat(),
+            "user_id": "benchmark-user",
+            "session_id": "benchmark-session",
+            "user_tier": "premium",
+            "query_type": "analysis",
+            "selected_model": "gpt-5",
+            "provider": "openai",
+            "status": "success",
+            "latency_ms": 100,
+            "total_tokens": 200,
+            "cost_usd": 0.01,
+            "actual_fast_lane_hit": True,
+        }
+        emits += len(list(emitter.process_element(event, ctx)))
+    if events:
+        timer.now_ms = base_ms + 5_000
+        emits += len(list(emitter.on_timer(base_ms + 5_000, ctx)))
+    aggregate = json.loads(emitter.aggregate_state.value() or "{}")
+    state_payload = {
+        "buckets": emitter.bucket_state.values,
+        "aggregate": emitter.aggregate_state.value(),
+        "last_emit": emitter.last_emit_state.value(),
+        "dirty": emitter.dirty_state.value(),
+        "arrival_sequence": emitter.arrival_sequence_state.value(),
+    }
+    state_bytes = len(json.dumps(state_payload, separators=(",", ":")).encode("utf-8"))
+    return int(aggregate.get("total_tokens_sum", 0)), state_bytes, emits
+
+
 def benchmark_flink_hot_key(events: int = 10_000, repeats: int = 3) -> Dict[str, Any]:
     errors: List[str] = []
     legacy_times: List[float] = []
@@ -201,7 +336,11 @@ def benchmark_flink_hot_key(events: int = 10_000, repeats: int = 3) -> Dict[str,
         legacy_times.append(time.perf_counter() - started)
 
         started = time.perf_counter()
-        incremental_checksum, incremental_bytes, emits = _incremental_hot_key(events)
+        (
+            incremental_checksum,
+            incremental_bytes,
+            emits,
+        ) = _run_actual_rolling_scope_emitter(events)
         incremental_times.append(time.perf_counter() - started)
 
     if legacy_checksum != incremental_checksum:
@@ -232,8 +371,26 @@ def benchmark_flink_hot_key(events: int = 10_000, repeats: int = 3) -> Dict[str,
         "incremental_state_bytes": incremental_bytes,
         "state_bytes_reduction_ratio": state_reduction,
         "emits_per_scope": emits,
+        "measurement_mode": "rolling_scope_policy_emitter_harness",
+        "measurement_limitations": (
+            "Executes production process_element/on_timer and serialized state, "
+            "but does not measure a RocksDB backend or checkpoint bytes."
+        ),
+        "actual_operator_events": events,
         "errors": errors,
     }
+
+
+class _MeasuredDashboardQueries:
+    """Count actual dashboard query calls issued by the benchmark."""
+
+    def __init__(self, query):
+        self._query = query
+        self.count = 0
+
+    def query(self, sql: str):
+        self.count += 1
+        return self._query(sql)
 
 
 def _p95(values: List[float]) -> float:
@@ -370,7 +527,7 @@ def benchmark_clickhouse(
         "rows": rows,
         "repeats": repeats,
         "database": database,
-        "dashboard_query_count": 4,
+        "dashboard_query_count": None,
         "errors": errors,
     }
     try:
@@ -490,6 +647,19 @@ def benchmark_clickhouse(
                 ),
             }
         )
+
+        dashboard_queries = _MeasuredDashboardQueries(client.query)
+        for sql in (
+            v2_grouped_query,
+            f"SELECT selected_model, count() FROM {database}.query_logs_v2 FINAL "
+            f"WHERE {window} GROUP BY selected_model",
+            f"SELECT query_type, count() FROM {database}.query_logs_v2 FINAL "
+            f"WHERE {window} GROUP BY query_type",
+            f"SELECT count() FROM {database}.query_logs_v2 FINAL WHERE {window}",
+        ):
+            dashboard_queries.query(sql)
+        metrics["dashboard_query_count"] = dashboard_queries.count
+        metrics["dashboard_query_measurement_mode"] = "issued_real_clickhouse_queries"
 
         _create_migration_sources(client, migration_database)
         migration_verified, statement_count = _exercise_migration(

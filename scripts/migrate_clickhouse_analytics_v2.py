@@ -87,8 +87,10 @@ def migration_plan(database: str, stamp: str) -> List[Tuple[str, str]]:
                 ),
                 ("validate-source", validation_query(database, table)),
                 ("validate-v2", validation_query(database, f"{table}_v2")),
-                ("cutover", f"EXCHANGE TABLES {live} AND {v2}"),
-                ("retain-backup-7-days", f"RENAME TABLE {v2} TO {backup}"),
+                (
+                    "cutover-atomic-forward-only",
+                    f"RENAME TABLE {live} TO {backup}, {v2} TO {live}",
+                ),
             ]
         )
     return plan
@@ -110,6 +112,92 @@ class ClickHouseRunner:
 
 def run_hook(command: str) -> None:
     subprocess.run(shlex.split(command), check=True)
+
+
+def _normalize_sorting_key(value: str) -> str:
+    return re.sub(r"[`()\s]", "", value or "")
+
+
+def table_sorting_key(
+    runner: ClickHouseRunner, database: str, table: str
+) -> Optional[str]:
+    qualified(database, table)
+    value = runner.query(
+        "SELECT sorting_key FROM system.tables "
+        f"WHERE database = '{database}' AND name = '{table}' FORMAT TSVRaw",
+        capture=True,
+    ).strip()
+    return value or None
+
+
+def table_cutover_state(
+    runner: ClickHouseRunner, database: str, table: str, stamp: str
+) -> str:
+    desired = _normalize_sorting_key(TABLES[table].order_by)
+    live_key = table_sorting_key(runner, database, table)
+    v2_key = table_sorting_key(runner, database, f"{table}_v2")
+    backup_key = table_sorting_key(runner, database, f"{table}_backup_{stamp}")
+    live_is_desired = _normalize_sorting_key(live_key or "") == desired
+    v2_is_desired = _normalize_sorting_key(v2_key or "") == desired
+
+    if live_is_desired and backup_key is not None and v2_key is None:
+        return "cutover-complete"
+    if not live_is_desired and v2_is_desired and backup_key is None:
+        return "ready-for-cutover"
+    if not live_is_desired and v2_key is None and backup_key is None:
+        return "not-prepared"
+    return "ambiguous"
+
+
+def reconcile_table_cutover(
+    runner: ClickHouseRunner, database: str, table: str, stamp: str
+) -> str:
+    state = table_cutover_state(runner, database, table, stamp)
+    if state == "cutover-complete":
+        return state
+    if state != "ready-for-cutover":
+        raise RuntimeError(
+            f"Unsafe migration state for {database}.{table}: {state}; "
+            "manual recovery required and ingestion must remain paused"
+        )
+    live = qualified(database, table)
+    v2 = qualified(database, f"{table}_v2")
+    backup = qualified(database, f"{table}_backup_{stamp}")
+    runner.query(f"RENAME TABLE {live} TO {backup}, {v2} TO {live}")
+    state = table_cutover_state(runner, database, table, stamp)
+    if state != "cutover-complete":
+        raise RuntimeError(
+            f"Cutover verification failed for {database}.{table}; "
+            "manual recovery required and ingestion must remain paused"
+        )
+    return state
+
+
+def resolve_migration_stamp(
+    runner: ClickHouseRunner, database: str, proposed_stamp: str
+) -> str:
+    """Reuse the active cutover id when a prior invocation stopped mid-swap."""
+    desired_live_tables = 0
+    backup_stamps = set()
+    for table, spec in TABLES.items():
+        live_key = table_sorting_key(runner, database, table)
+        if _normalize_sorting_key(live_key or "") == _normalize_sorting_key(
+            spec.order_by
+        ):
+            desired_live_tables += 1
+        names = runner.query(
+            "SELECT name FROM system.tables "
+            f"WHERE database = '{database}' AND startsWith(name, '{table}_backup_') "
+            "FORMAT TSVRaw",
+            capture=True,
+        )
+        for name in filter(None, names.splitlines()):
+            prefix = f"{table}_backup_"
+            if name.startswith(prefix):
+                backup_stamps.add(name[len(prefix) :])
+    if desired_live_tables and backup_stamps:
+        return max(backup_stamps)
+    return proposed_stamp
 
 
 def _parse_backup_stamp(name: str, table: str) -> Optional[datetime]:
@@ -145,25 +233,30 @@ def cleanup_expired_backups(
 
 def apply_migration(args, stamp: str) -> None:
     runner = ClickHouseRunner(args.clickhouse_command)
-    for label, sql in migration_plan(args.database, stamp):
-        if label in {
-            "delta-copy-after-pause-and-flush",
-            "validate-source",
-            "validate-v2",
-            "cutover",
-            "retain-backup-7-days",
-        }:
+    stamp = resolve_migration_stamp(runner, args.database, stamp)
+    plan = migration_plan(args.database, stamp)
+    for table in TABLES:
+        state = table_cutover_state(runner, args.database, table, stamp)
+        if state == "cutover-complete":
             continue
-        runner.query(sql)
+        if state == "ambiguous":
+            raise RuntimeError(
+                f"Unsafe migration state for {args.database}.{table}: {state}; "
+                "manual recovery required before pausing ingestion"
+            )
+        for label, sql in plan:
+            if label in {"create-v2", "backfill"} and (f".{table}_v2" in sql):
+                runner.query(sql)
 
     run_hook(args.pause_command)
-    try:
-        run_hook(args.flush_command)
-        for table in TABLES:
+    run_hook(args.flush_command)
+    for table in TABLES:
+        state = table_cutover_state(runner, args.database, table, stamp)
+        if state != "cutover-complete":
             runner.query(
                 next(
                     sql
-                    for label, sql in migration_plan(args.database, stamp)
+                    for label, sql in plan
                     if label == "delta-copy-after-pause-and-flush"
                     and f".{table}_v2 " in sql
                 )
@@ -176,15 +269,22 @@ def apply_migration(args, stamp: str) -> None:
                 raise RuntimeError(
                     f"Validation mismatch for {table}: source={source!r}, v2={target!r}"
                 )
-
-        for label, sql in migration_plan(args.database, stamp):
-            if label in {"cutover", "retain-backup-7-days"}:
-                runner.query(sql)
-        cleanup_expired_backups(
-            runner, args.database, retention_days=args.backup_retention_days
+        reconcile_table_cutover(runner, args.database, table, stamp)
+    incomplete = [
+        table
+        for table in TABLES
+        if table_cutover_state(runner, args.database, table, stamp)
+        != "cutover-complete"
+    ]
+    if incomplete:
+        raise RuntimeError(
+            f"Migration incomplete for {', '.join(incomplete)}; "
+            "manual recovery required and ingestion remains paused"
         )
-    finally:
-        run_hook(args.resume_command)
+    cleanup_expired_backups(
+        runner, args.database, retention_days=args.backup_retention_days
+    )
+    run_hook(args.resume_command)
 
 
 def rollback_plan(database: str, backup: str, stamp: str) -> Iterable[str]:
@@ -194,8 +294,39 @@ def rollback_plan(database: str, backup: str, stamp: str) -> Iterable[str]:
     live = qualified(database, live_table)
     old = qualified(database, backup)
     displaced = qualified(database, f"{live_table}_rollback_displaced_{stamp}")
-    yield f"EXCHANGE TABLES {live} AND {old}"
-    yield f"RENAME TABLE {old} TO {displaced}"
+    yield f"RENAME TABLE {live} TO {displaced}, {old} TO {live}"
+
+
+def reconcile_rollback(
+    runner: ClickHouseRunner, database: str, backup: str, stamp: str
+) -> str:
+    statements = list(rollback_plan(database, backup, stamp))
+    live_table = backup.split("_backup_", 1)[0]
+    displaced_table = f"{live_table}_rollback_displaced_{stamp}"
+    desired = _normalize_sorting_key(TABLES[live_table].order_by)
+    live_key = table_sorting_key(runner, database, live_table)
+    backup_key = table_sorting_key(runner, database, backup)
+    displaced_key = table_sorting_key(runner, database, displaced_table)
+
+    if (
+        live_key is not None
+        and _normalize_sorting_key(live_key) != desired
+        and backup_key is None
+        and _normalize_sorting_key(displaced_key or "") == desired
+    ):
+        return "rollback-complete"
+    if not (
+        _normalize_sorting_key(live_key or "") == desired
+        and backup_key is not None
+        and _normalize_sorting_key(backup_key) != desired
+        and displaced_key is None
+    ):
+        raise RuntimeError(
+            f"Unsafe rollback state for {database}.{live_table}; "
+            "manual recovery required"
+        )
+    runner.query(statements[0])
+    return reconcile_rollback(runner, database, backup, stamp)
 
 
 def parse_args(argv=None):
@@ -238,8 +369,7 @@ def main(argv=None) -> int:
             statements = list(rollback_plan(args.database, args.rollback, stamp))
             if args.apply:
                 runner = ClickHouseRunner(args.clickhouse_command)
-                for sql in statements:
-                    runner.query(sql)
+                reconcile_rollback(runner, args.database, args.rollback, stamp)
             else:
                 print("DRY RUN: rollback; pass --apply to execute")
                 for sql in statements:

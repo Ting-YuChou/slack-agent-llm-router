@@ -869,6 +869,7 @@ def _empty_routing_policy_aggregate() -> Dict[str, Any]:
         "failed_provider_counts": {},
         "latest_event": {},
         "latest_event_timestamp_ms": -1,
+        "latest_arrival_sequence": -1,
     }
 
 
@@ -887,6 +888,7 @@ def add_routing_policy_event(
     event: Dict[str, Any],
     *,
     event_timestamp_ms: int = 0,
+    arrival_sequence: int = 0,
 ) -> Dict[str, Any]:
     """Increment a routing-policy aggregate with one completion event."""
     aggregate["request_count"] = int(aggregate.get("request_count", 0)) + 1
@@ -916,7 +918,8 @@ def add_routing_policy_event(
     if provider and not succeeded:
         _increment_count(aggregate.setdefault("failed_provider_counts", {}), provider)
 
-    if event_timestamp_ms >= int(aggregate.get("latest_event_timestamp_ms", -1)):
+    if arrival_sequence >= int(aggregate.get("latest_arrival_sequence", -1)):
+        aggregate["latest_arrival_sequence"] = arrival_sequence
         aggregate["latest_event_timestamp_ms"] = event_timestamp_ms
         aggregate["latest_event"] = {
             key: event.get(key) for key in ("user_id", "session_id", "user_tier")
@@ -936,7 +939,12 @@ def aggregate_routing_policy_events(
             if explicit_timestamp is not None
             else sequence
         )
-        add_routing_policy_event(aggregate, event, event_timestamp_ms=timestamp_ms)
+        add_routing_policy_event(
+            aggregate,
+            event,
+            event_timestamp_ms=timestamp_ms,
+            arrival_sequence=sequence,
+        )
     return aggregate
 
 
@@ -963,9 +971,12 @@ def merge_routing_policy_aggregate(
         target_counts = target.setdefault(key, {})
         for item, count in source.get(key, {}).items():
             _increment_count(target_counts, item, sign * int(count))
-    if sign > 0 and int(source.get("latest_event_timestamp_ms", -1)) >= int(
-        target.get("latest_event_timestamp_ms", -1)
+    if sign > 0 and int(source.get("latest_arrival_sequence", -1)) >= int(
+        target.get("latest_arrival_sequence", -1)
     ):
+        target["latest_arrival_sequence"] = int(
+            source.get("latest_arrival_sequence", -1)
+        )
         target["latest_event_timestamp_ms"] = int(
             source.get("latest_event_timestamp_ms", -1)
         )

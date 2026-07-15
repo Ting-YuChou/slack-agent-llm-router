@@ -4,8 +4,9 @@
 
 - Added: a machine-readable ClickHouse/Flink performance-contract runner with hard success/error gates, isolated benchmark databases, replay-before-merge verification, migration checksum execution, and deterministic hot-key state/throughput comparison.
 - Runtime: made `/workspace` importable in both Flink containers and corrected uninitialized event-time watermark handling so buffered startup events are not misclassified as late.
-- Measured: on a real 1M-row ClickHouse 24.8 workload, the same one-hour `GROUPING SETS` query reduced `read_rows` from 1,081,920 to 24,576 (97.73%); cold bundle p95 improved 87.56%; replay `FINAL` count was exactly one; all 35 migration statements/checks passed. The 10k Flink reference workload reduced serialized state by 99.986%, improved throughput by 475x, and emitted twice.
-- Verification: focused analytics tests passed (`71 passed`); the real Flink analytics runtime smoke passed twice consecutively with model metrics, model/provider guardrails, and user/session policy outputs; touched-file Black and Flake8 checks and `git diff --check` passed.
+- Measured: on a real 1M-row ClickHouse 24.8 workload, the same one-hour `GROUPING SETS` query reduced `read_rows` from 1,081,920 to 24,576 (97.73%); cold bundle p95 improved 88.02%; replay `FINAL` count was exactly one; all migration checks passed; the benchmark measured four issued queries instead of assuming the count. The 10k production `RollingScopePolicyEmitter` harness reduced serialized state by 99.78%, improved throughput by 5.24x, and emitted twice; this harness does not claim RocksDB/checkpoint-byte coverage.
+- Review fixes: disabled generated ClickHouse sessions for safe concurrent dashboard reads; made migration cutover forward-only and restart-aware with atomic multi-rename and fail-closed ambiguity handling; preserved legacy arrival-order identity semantics for out-of-order Flink events.
+- Verification: focused analytics tests passed (`88 passed`) plus a real concurrent ClickHouse bundle test; the real Flink analytics runtime smoke passed after the review fixes with model metrics, model/provider guardrails, and user/session policy outputs; touched-file Black and Flake8 checks and `git diff --check` passed.
 
 ## 2026-07-15 — Incremental Flink rolling-policy state
 

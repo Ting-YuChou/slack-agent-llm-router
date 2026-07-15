@@ -566,6 +566,26 @@ class TestKafkaProducerManager:
 
 class TestClickHouseManager:
     @pytest.mark.asyncio
+    async def test_initialize_disables_shared_clickhouse_sessions_for_concurrent_queries(
+        self, pipeline_config
+    ):
+        with patch(
+            "src.llm_router_part3_pipeline.clickhouse_connect.get_client"
+        ) as mock_get_client:
+            client = MagicMock()
+            client.query.return_value.result_rows = [[1]]
+            mock_get_client.return_value = client
+
+            manager = ClickHouseManager(pipeline_config["clickhouse"])
+            await manager.initialize()
+
+        assert len(mock_get_client.call_args_list) == 2
+        assert all(
+            call.kwargs["autogenerate_session_id"] is False
+            for call in mock_get_client.call_args_list
+        )
+
+    @pytest.mark.asyncio
     async def test_runtime_tables_use_time_first_replay_safe_sort_keys(
         self, pipeline_config
     ):

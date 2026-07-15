@@ -66,7 +66,21 @@ def test_flink_benchmark_is_deterministic_in_shape_and_meets_hot_key_contract():
     assert metrics["state_bytes_reduction_ratio"] >= 0.80
     assert metrics["throughput_improvement_ratio"] >= 5.0
     assert metrics["emits_per_scope"] <= 2
+    assert metrics["measurement_mode"] == "rolling_scope_policy_emitter_harness"
+    assert metrics["actual_operator_events"] == 10_000
     assert metrics["errors"] == []
+
+
+def test_clickhouse_dashboard_count_is_derived_from_issued_queries():
+    from scripts.analytics_performance_contract import _MeasuredDashboardQueries
+
+    issued = []
+    measurement = _MeasuredDashboardQueries(lambda sql: issued.append(sql))
+    measurement.query("SELECT 1")
+    measurement.query("SELECT 2")
+
+    assert measurement.count == 2
+    assert issued == ["SELECT 1", "SELECT 2"]
 
 
 def test_clickhouse_event_id_expression_uses_a_24_8_supported_hash():

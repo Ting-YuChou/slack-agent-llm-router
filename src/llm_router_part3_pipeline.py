@@ -937,6 +937,9 @@ class ClickHouseManager:
             "port": config.get("port", 8123),
             "username": config.get("username", "default"),
             "password": config.get("password", ""),
+            # Dashboard queries run concurrently in worker threads. ClickHouse
+            # rejects overlapping queries that reuse one generated session id.
+            "autogenerate_session_id": False,
         }
 
         # Batch insertion settings

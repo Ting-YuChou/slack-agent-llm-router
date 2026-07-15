@@ -167,7 +167,52 @@ def _emitter(*, legacy=(), window_seconds=10, bucket_seconds=5, emit_seconds=5):
     emitter.last_emit_state = _ValueState()
     emitter.dirty_state = _ValueState()
     emitter.migration_complete_state = _ValueState()
+    emitter.arrival_sequence_state = _ValueState()
     return emitter
+
+
+def test_out_of_order_event_identity_uses_arrival_order_then_restores_remaining_bucket():
+    timer = _TimerService(now_ms=20_000, watermark_ms=20_000)
+    ctx = _Context(timer)
+    emitter = _emitter(window_seconds=10)
+
+    first = list(emitter.process_element(_event(20_000, user_tier="premium"), ctx))
+    list(emitter.process_element(_event(12_000, user_tier="enterprise"), ctx))
+    aggregate = json.loads(emitter.aggregate_state.value())
+
+    assert first[0]["user_tier"] == "premium"
+    assert aggregate["latest_event"]["user_tier"] == "enterprise"
+
+    list(emitter.on_timer(27_000, ctx))
+    aggregate = json.loads(emitter.aggregate_state.value())
+    assert aggregate["latest_event"]["user_tier"] == "premium"
+
+
+def test_preserved_legacy_out_of_order_fixture_migrates_with_last_arrival_identity():
+    legacy = [
+        json.dumps(
+            dict(_event(20_000, user_tier="premium"), event_timestamp_ms=20_000)
+        ),
+        json.dumps(
+            dict(_event(12_000, user_tier="enterprise"), event_timestamp_ms=12_000)
+        ),
+    ]
+    emitter = _emitter(legacy=legacy, window_seconds=20)
+    timer = _TimerService(now_ms=21_000, watermark_ms=21_000)
+    ctx = _Context(timer)
+
+    list(emitter.process_element(_event(21_000, user_tier="free"), ctx))
+    aggregate = json.loads(emitter.aggregate_state.value())
+
+    assert aggregate["latest_event"]["user_tier"] == "free"
+    assert aggregate["latest_arrival_sequence"] == 2
+    migrated = [json.loads(value) for value in emitter.bucket_state.values.values()]
+    enterprise_bucket = next(
+        bucket
+        for bucket in migrated
+        if bucket.get("latest_event", {}).get("user_tier") == "enterprise"
+    )
+    assert enterprise_bucket["latest_arrival_sequence"] == 1
 
 
 def test_first_event_emits_immediately_then_hot_key_waits_for_cadence_timer():

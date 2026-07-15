@@ -646,6 +646,12 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
                 Types.LONG(),
             )
         )
+        self.arrival_sequence_state = runtime_context.get_state(
+            ValueStateDescriptor(
+                f"{self.scope_type}_rolling_policy_arrival_sequence_v2",
+                Types.LONG(),
+            )
+        )
 
     def process_element(
         self, value: Dict[str, Any], ctx: "KeyedProcessFunction.Context"
@@ -669,12 +675,15 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
             return
 
         normalized_event = self._policy_event(value, event_timestamp_ms)
+        arrival_sequence = int(self.arrival_sequence_state.value() or 0)
+        self.arrival_sequence_state.update(arrival_sequence + 1)
         bucket_start_ms = self._bucket_start(event_timestamp_ms)
         bucket = self._load_bucket(bucket_start_ms)
         add_routing_policy_event(
             bucket,
             normalized_event,
             event_timestamp_ms=event_timestamp_ms,
+            arrival_sequence=arrival_sequence,
         )
         self.bucket_state.put(bucket_start_ms, json.dumps(bucket))
 
@@ -684,6 +693,7 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
             aggregate,
             normalized_event,
             event_timestamp_ms=event_timestamp_ms,
+            arrival_sequence=arrival_sequence,
         )
         self._save_aggregate(aggregate)
 
@@ -777,9 +787,13 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
                 bucket_start_ms, _empty_routing_policy_aggregate()
             )
             add_routing_policy_event(
-                bucket, event, event_timestamp_ms=event_timestamp_ms
+                bucket,
+                event,
+                event_timestamp_ms=event_timestamp_ms,
+                arrival_sequence=sequence,
             )
         self._write_migrated_state(buckets)
+        self.arrival_sequence_state.update(len(events))
         self.recent_events_state.clear()
         self.migration_complete_state.update(1)
 
@@ -795,11 +809,15 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
     def _refresh_latest_event(self, aggregate: Dict[str, Any]):
         aggregate["latest_event"] = {}
         aggregate["latest_event_timestamp_ms"] = -1
+        aggregate["latest_arrival_sequence"] = -1
         for _, raw_bucket in self.bucket_state.items():
             bucket = json.loads(raw_bucket)
-            if int(bucket.get("latest_event_timestamp_ms", -1)) >= int(
-                aggregate.get("latest_event_timestamp_ms", -1)
+            if int(bucket.get("latest_arrival_sequence", -1)) >= int(
+                aggregate.get("latest_arrival_sequence", -1)
             ):
+                aggregate["latest_arrival_sequence"] = int(
+                    bucket.get("latest_arrival_sequence", -1)
+                )
                 aggregate["latest_event_timestamp_ms"] = int(
                     bucket.get("latest_event_timestamp_ms", -1)
                 )
@@ -836,6 +854,7 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
         self.aggregate_state.clear()
         self.last_emit_state.clear()
         self.dirty_state.clear()
+        self.arrival_sequence_state.clear()
 
     def _bucket_start(self, event_timestamp_ms: int) -> int:
         return (event_timestamp_ms // self.bucket_size_ms) * self.bucket_size_ms
