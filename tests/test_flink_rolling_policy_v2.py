@@ -339,3 +339,42 @@ def test_watermark_strategy_applies_sixty_second_idleness(monkeypatch):
         ("assigner", "CompletionTimestampAssigner"),
         ("idle", 60),
     ]
+
+
+def test_negative_uninitialized_watermark_does_not_drop_first_metrics_event():
+    timer = _TimerService(now_ms=1_000_000_000, watermark_ms=-1)
+    ctx = _Context(timer, key="gpt-5\0openai")
+    aggregator = analytics_job.ModelMetricsWindowAggregator(
+        window_size_seconds=60, allowed_lateness_seconds=15
+    )
+    aggregator.window_buckets_state = _ListState()
+    aggregator.flush_timer_state = _ValueState()
+    aggregator.flush_timer_kind_state = _ValueState()
+
+    outputs = list(aggregator.process_element(_event(10_000), ctx))
+
+    assert outputs == []
+    buckets = [json.loads(item) for item in aggregator.window_buckets_state.values]
+    assert buckets[0]["request_count"] == 1
+
+
+def test_negative_uninitialized_watermark_does_not_drop_first_policy_event():
+    timer = _TimerService(now_ms=1_000_000_000, watermark_ms=-1)
+    ctx = _Context(timer)
+    emitter = _emitter(window_seconds=10)
+
+    outputs = list(emitter.process_element(_event(10_000), ctx))
+
+    assert outputs[0]["recent_request_count"] == 1
+
+
+def test_processing_time_fallback_remains_when_watermark_api_is_absent():
+    class _ProcessingOnlyTimer:
+        pass
+
+    assert (
+        analytics_job._current_time_progress_ms(
+            _ProcessingOnlyTimer(), processing_time_ms=123_456
+        )
+        == 123_456
+    )

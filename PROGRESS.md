@@ -1,5 +1,12 @@
 # Project Progress
 
+## 2026-07-15 — Analytics performance contracts and runtime verification
+
+- Added: a machine-readable ClickHouse/Flink performance-contract runner with hard success/error gates, isolated benchmark databases, replay-before-merge verification, migration checksum execution, and deterministic hot-key state/throughput comparison.
+- Runtime: made `/workspace` importable in both Flink containers and corrected uninitialized event-time watermark handling so buffered startup events are not misclassified as late.
+- Measured: on a real 1M-row ClickHouse 24.8 workload, the same one-hour `GROUPING SETS` query reduced `read_rows` from 1,081,920 to 24,576 (97.73%); cold bundle p95 improved 87.56%; replay `FINAL` count was exactly one; all 35 migration statements/checks passed. The 10k Flink reference workload reduced serialized state by 99.986%, improved throughput by 475x, and emitted twice.
+- Verification: focused analytics tests passed (`71 passed`); the real Flink analytics runtime smoke passed twice consecutively with model metrics, model/provider guardrails, and user/session policy outputs; touched-file Black and Flake8 checks and `git diff --check` passed.
+
 ## 2026-07-15 — Incremental Flink rolling-policy state
 
 - Changed: replaced per-event five-minute `ListState` rewrites with five-second event-time `MapState` buckets plus an incremental rolling aggregate; split event-list compatibility from aggregate policy construction; limited dirty hot-key emission to one update per five seconds after the initial emission; added 60-second watermark idleness.

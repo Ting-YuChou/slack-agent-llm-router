@@ -134,7 +134,11 @@ def _current_time_progress_ms(timer_service: Any, processing_time_ms: int) -> in
             if watermark_ms >= 0:
                 return watermark_ms
         except Exception:
-            pass
+            return 0
+        # A negative watermark is Flink's startup sentinel. Falling back to
+        # wall-clock time here would classify buffered event-time records as
+        # late before the first watermark has been observed.
+        return 0
     return processing_time_ms
 
 
