@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -1284,6 +1285,49 @@ class TestApiApp:
         assert (
             body["sources"]["routing_policy_state"] == "monitoring_service+clickhouse"
         )
+
+    @pytest.mark.asyncio
+    async def test_dashboard_fetches_monitoring_and_pipeline_bundle_concurrently(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(tmp_path)
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        both_started = asyncio.Event()
+        release = asyncio.Event()
+        started = set()
+
+        async def rendezvous(name):
+            started.add(name)
+            if len(started) == 2:
+                both_started.set()
+            await release.wait()
+
+        class ConcurrentPipeline(DummyPipeline):
+            async def get_dashboard_bundle(self, user_id=None, hours=24):
+                await rendezvous("pipeline")
+                return {
+                    "analytics": {},
+                    "model_performance": [],
+                    "routing_guardrails": [],
+                    "routing_policy_state": [],
+                    "errors": {},
+                }
+
+        class ConcurrentMonitoring(DummyMonitoring):
+            async def get_dashboard_data(self):
+                await rendezvous("monitoring")
+                return {}
+
+        platform.services["pipeline"] = ConcurrentPipeline({})
+        platform.services["monitoring"] = ConcurrentMonitoring({})
+
+        dashboard_task = asyncio.create_task(platform._build_dashboard_payload(6))
+        await asyncio.wait_for(both_started.wait(), timeout=0.5)
+        release.set()
+        payload = await dashboard_task
+
+        assert started == {"pipeline", "monitoring"}
+        assert payload["time_window_hours"] == 6
 
     def test_dashboard_endpoint_supports_pipeline_get_analytics_fallback(
         self, tmp_path, patched_platform_deps

@@ -490,6 +490,10 @@ clickhouse:
   database: default
   username: llm_router
   password: llm_router_pass
+  dashboard:
+    cache_ttl_seconds: 5
+    cache_max_entries: 32
+    max_concurrent_queries: 4
   enabled: true
 
 monitoring:

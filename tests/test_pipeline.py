@@ -566,6 +566,25 @@ class TestKafkaProducerManager:
 
 class TestClickHouseManager:
     @pytest.mark.asyncio
+    async def test_runtime_tables_use_time_first_replay_safe_sort_keys(
+        self, pipeline_config
+    ):
+        manager = ClickHouseManager(pipeline_config["clickhouse"])
+        manager.client = MagicMock()
+        manager._run_blocking = AsyncMock(return_value=None)
+
+        await manager._create_tables()
+
+        ddl = "\n".join(
+            call.args[1] for call in manager._run_blocking.await_args_list[:6]
+        )
+        assert "ORDER BY (timestamp, event_id)" in ddl
+        assert "ORDER BY (timestamp, service, metric_name, event_id)" in ddl
+        assert "ORDER BY (timestamp, model_name, provider, event_id)" in ddl
+        assert "ORDER BY (source_event_type, timestamp, event_id)" in ddl
+        assert "ORDER BY (timestamp, scope_type, scope_key, event_id)" in ddl
+
+    @pytest.mark.asyncio
     async def test_insert_query_log_calls_insert(
         self, pipeline_config, sample_query_log
     ):
@@ -717,28 +736,23 @@ class TestClickHouseManager:
             manager = ClickHouseManager(pipeline_config["clickhouse"])
             await manager.initialize()
             manager._run_blocking = AsyncMock(
-                side_effect=[
-                    SimpleNamespace(result_rows=[[10, 200, 3.5, 140.0, 80.0]]),
-                    SimpleNamespace(
-                        result_rows=[
-                            ["gpt-5", 8, 2.5],
-                            ["mistral-7b", 2, 1.0],
-                        ]
-                    ),
-                    SimpleNamespace(
-                        result_rows=[
-                            ["analysis", 6],
-                            ["general", 4],
-                        ]
-                    ),
-                ]
+                return_value=SimpleNamespace(
+                    result_rows=[
+                        [1, 1, "", "", 10, 200, 3.5, 140.0, 80.0],
+                        [0, 1, "gpt-5", "", 8, 160, 2.5, 130.0, 87.5],
+                        [0, 1, "mistral-7b", "", 2, 40, 1.0, 180.0, 50.0],
+                        [1, 0, "", "analysis", 6, 120, 2.0, 150.0, 80.0],
+                        [1, 0, "", "general", 4, 80, 1.5, 125.0, 80.0],
+                    ]
+                )
             )
 
             analytics = await manager.get_query_analytics(hours=6)
 
-            assert manager._run_blocking.await_count == 3
+            assert manager._run_blocking.await_count == 1
             overall_query = manager._run_blocking.await_args_list[0].args[1]
-            assert "GROUP BY selected_model, query_type" not in overall_query
+            assert "FROM test_db.query_logs FINAL" in overall_query
+            assert "GROUPING SETS" in overall_query
             assert analytics == {
                 "total_queries": 10,
                 "total_tokens": 200,
@@ -751,6 +765,19 @@ class TestClickHouseManager:
                 },
                 "query_type_breakdown": {"analysis": 6, "general": 4},
             }
+
+    @pytest.mark.asyncio
+    async def test_all_dashboard_reads_use_final(self, pipeline_config):
+        manager = ClickHouseManager(pipeline_config["clickhouse"])
+        manager.client = MagicMock()
+        manager._run_blocking = AsyncMock(return_value=SimpleNamespace(result_rows=[]))
+
+        await manager.get_model_performance(hours=1)
+        await manager.get_routing_guardrails(hours=1)
+        await manager.get_routing_policy_state_events(hours=1)
+
+        queries = [call.args[1] for call in manager._run_blocking.await_args_list]
+        assert all(" FINAL" in query for query in queries)
 
     @pytest.mark.asyncio
     async def test_get_model_performance_groups_by_provider(self, pipeline_config):
@@ -798,6 +825,19 @@ class TestClickHouseManager:
                     "total_cost": 0.55,
                 },
             ]
+
+    @pytest.mark.asyncio
+    async def test_empty_model_performance_does_not_add_a_fifth_dashboard_query(
+        self, pipeline_config
+    ):
+        manager = ClickHouseManager(pipeline_config["clickhouse"])
+        manager.client = MagicMock()
+        manager._run_blocking = AsyncMock(return_value=SimpleNamespace(result_rows=[]))
+
+        performance = await manager.get_model_performance(hours=6)
+
+        assert performance == []
+        manager._run_blocking.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_initialize_raises_when_required_table_creation_fails(
@@ -1207,6 +1247,110 @@ class TestKafkaConsumerManager:
 
 
 class TestKafkaIngestionPipeline:
+    @pytest.mark.asyncio
+    async def test_dashboard_bundle_coalesces_identical_callers_and_copies_results(
+        self, pipeline_config
+    ):
+        pipeline_config["clickhouse"]["dashboard"] = {
+            "cache_ttl_seconds": 5,
+            "cache_max_entries": 32,
+            "max_concurrent_queries": 4,
+        }
+        pipeline = KafkaIngestionPipeline(pipeline_config)
+        gate = asyncio.Event()
+
+        async def analytics(user_id=None, hours=24, *, raise_errors=False):
+            await gate.wait()
+            return {"total_queries": 1, "model_breakdown": {}}
+
+        pipeline.get_query_analytics = AsyncMock(side_effect=analytics)
+        pipeline.get_model_performance = AsyncMock(return_value=[])
+        pipeline.get_routing_guardrails = AsyncMock(return_value=[])
+        pipeline.get_routing_policy_state_events = AsyncMock(return_value=[])
+
+        callers = [
+            asyncio.create_task(
+                pipeline.get_dashboard_bundle(user_id="user-1", hours=6)
+            )
+            for _ in range(100)
+        ]
+        await asyncio.sleep(0)
+        gate.set()
+        results = await asyncio.gather(*callers)
+
+        assert pipeline.get_query_analytics.await_count == 1
+        assert pipeline.get_model_performance.await_count == 1
+        assert pipeline.get_routing_guardrails.await_count == 1
+        assert pipeline.get_routing_policy_state_events.await_count == 1
+        results[0]["analytics"]["total_queries"] = 99
+        assert results[1]["analytics"]["total_queries"] == 1
+
+    @pytest.mark.asyncio
+    async def test_dashboard_bundle_degrades_only_failed_section_without_caching(
+        self, pipeline_config
+    ):
+        pipeline = KafkaIngestionPipeline(pipeline_config)
+        pipeline.get_query_analytics = AsyncMock(return_value={"total_queries": 2})
+        pipeline.get_model_performance = AsyncMock(side_effect=RuntimeError("down"))
+        pipeline.get_routing_guardrails = AsyncMock(return_value=[{"id": 1}])
+        pipeline.get_routing_policy_state_events = AsyncMock(return_value=[])
+
+        first = await pipeline.get_dashboard_bundle(hours=3)
+        second = await pipeline.get_dashboard_bundle(hours=3)
+
+        assert first["analytics"] == {"total_queries": 2}
+        assert first["model_performance"] == []
+        assert first["routing_guardrails"] == [{"id": 1}]
+        assert first["errors"] == {"model_performance": "down"}
+        assert second == first
+        assert pipeline.get_query_analytics.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_dashboard_bundle_does_not_cache_clickhouse_transport_failure(
+        self, pipeline_config
+    ):
+        pipeline = KafkaIngestionPipeline(pipeline_config)
+        pipeline.clickhouse_manager.client = MagicMock()
+        pipeline.clickhouse_manager._run_blocking = AsyncMock(
+            side_effect=RuntimeError("clickhouse unavailable")
+        )
+
+        first = await pipeline.get_dashboard_bundle(hours=2)
+        second = await pipeline.get_dashboard_bundle(hours=2)
+
+        assert set(first["errors"]) == {
+            "analytics",
+            "model_performance",
+            "routing_guardrails",
+            "routing_policy_state",
+        }
+        assert second == first
+        assert pipeline.clickhouse_manager._run_blocking.await_count == 8
+
+    @pytest.mark.asyncio
+    async def test_dashboard_bundle_limits_independent_queries(self, pipeline_config):
+        pipeline_config["clickhouse"]["dashboard"] = {"max_concurrent_queries": 2}
+        pipeline = KafkaIngestionPipeline(pipeline_config)
+        active = 0
+        peak = 0
+
+        async def tracked(*args, **kwargs):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return []
+
+        pipeline.get_query_analytics = tracked
+        pipeline.get_model_performance = tracked
+        pipeline.get_routing_guardrails = tracked
+        pipeline.get_routing_policy_state_events = tracked
+
+        await pipeline.get_dashboard_bundle(hours=1)
+
+        assert peak == 2
+
     @pytest.mark.asyncio
     async def test_health_status_reflects_component_state(self, pipeline_config):
         pipeline = KafkaIngestionPipeline(pipeline_config)
