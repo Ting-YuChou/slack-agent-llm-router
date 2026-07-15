@@ -8,11 +8,13 @@ a substitute for backend-specific RocksDB/checkpoint metrics.
 """
 
 import argparse
+import asyncio
 import json
 import math
 import os
 import statistics
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -387,10 +389,45 @@ class _MeasuredDashboardQueries:
     def __init__(self, query):
         self._query = query
         self.count = 0
+        self._lock = threading.Lock()
 
-    def query(self, sql: str):
-        self.count += 1
-        return self._query(sql)
+    def query(self, sql: str, *args, **kwargs):
+        with self._lock:
+            self.count += 1
+        return self._query(sql, *args, **kwargs)
+
+
+def _run_production_dashboard_bundle(
+    client, database: str
+) -> Tuple[int, Dict[str, Any]]:
+    """Count queries issued by the production dashboard implementation."""
+    from src.llm_router_part3_pipeline import KafkaIngestionPipeline
+
+    pipeline = KafkaIngestionPipeline(
+        {
+            "clickhouse": {
+                "database": database,
+                "dashboard": {
+                    "cache_ttl_seconds": 0,
+                    "cache_max_entries": 1,
+                    "max_concurrent_queries": 4,
+                },
+            }
+        }
+    )
+    measured = _MeasuredDashboardQueries(client.query)
+    pipeline.clickhouse_manager.client = measured
+    bundle = asyncio.run(pipeline.get_dashboard_bundle(hours=1))
+    return measured.count, bundle
+
+
+def _create_production_dashboard_tables(client, database: str) -> None:
+    """Create the exact table schemas used by production dashboard methods."""
+    from src.llm_router_part3_pipeline import ClickHouseManager
+
+    manager = ClickHouseManager({"database": database})
+    manager.client = client
+    asyncio.run(manager._create_tables())
 
 
 def _p95(values: List[float]) -> float:
@@ -540,9 +577,11 @@ def benchmark_clickhouse(
             password=password,
             connect_timeout=5,
             send_receive_timeout=120,
+            autogenerate_session_id=False,
         )
         client.command(f"CREATE DATABASE {database} ENGINE=Atomic")
         client.command(f"CREATE DATABASE {migration_database} ENGINE=Atomic")
+        _create_production_dashboard_tables(client, database)
         common_columns = (
             "event_id String, timestamp DateTime64(3), selected_model LowCardinality(String), "
             "query_type LowCardinality(String), latency_ms UInt32, total_tokens UInt32"
@@ -568,6 +607,16 @@ def benchmark_clickhouse(
         client.command(f"INSERT INTO {database}.query_logs_legacy {generator}")
         client.command(
             f"INSERT INTO {database}.query_logs_v2 SELECT * FROM {database}.query_logs_legacy"
+        )
+        client.command(
+            f"INSERT INTO {database}.query_logs "
+            "(event_id, query_id, timestamp, user_id, user_tier, query_text, "
+            "query_type, selected_model, token_count_input, token_count_output, "
+            "latency_ms, cost_usd, status, error_message, context_compressed, "
+            "compression_ratio, cached_response) "
+            f"SELECT event_id, event_id, timestamp, 'benchmark-user', 'premium', '', "
+            "query_type, selected_model, 0, total_tokens, latency_ms, 0.0, "
+            f"'success', '', false, 1.0, false FROM {database}.query_logs_v2"
         )
 
         client.command(
@@ -648,18 +697,17 @@ def benchmark_clickhouse(
             }
         )
 
-        dashboard_queries = _MeasuredDashboardQueries(client.query)
-        for sql in (
-            v2_grouped_query,
-            f"SELECT selected_model, count() FROM {database}.query_logs_v2 FINAL "
-            f"WHERE {window} GROUP BY selected_model",
-            f"SELECT query_type, count() FROM {database}.query_logs_v2 FINAL "
-            f"WHERE {window} GROUP BY query_type",
-            f"SELECT count() FROM {database}.query_logs_v2 FINAL WHERE {window}",
-        ):
-            dashboard_queries.query(sql)
-        metrics["dashboard_query_count"] = dashboard_queries.count
-        metrics["dashboard_query_measurement_mode"] = "issued_real_clickhouse_queries"
+        dashboard_query_count, dashboard_bundle = _run_production_dashboard_bundle(
+            client, database
+        )
+        if dashboard_bundle.get("errors"):
+            raise RuntimeError(
+                f"production dashboard bundle errors: {dashboard_bundle['errors']}"
+            )
+        metrics["dashboard_query_count"] = dashboard_query_count
+        metrics[
+            "dashboard_query_measurement_mode"
+        ] = "production_kafka_ingestion_pipeline_real_clickhouse_queries"
 
         _create_migration_sources(client, migration_database)
         migration_verified, statement_count = _exercise_migration(

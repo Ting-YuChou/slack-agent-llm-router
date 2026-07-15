@@ -88,9 +88,10 @@ def migration_plan(database: str, stamp: str) -> List[Tuple[str, str]]:
                 ("validate-source", validation_query(database, table)),
                 ("validate-v2", validation_query(database, f"{table}_v2")),
                 (
-                    "cutover-atomic-forward-only",
-                    f"RENAME TABLE {live} TO {backup}, {v2} TO {live}",
+                    "cutover-atomic-exchange",
+                    f"EXCHANGE TABLES {live} AND {v2}",
                 ),
+                ("rename-old-to-backup", f"RENAME TABLE {v2} TO {backup}"),
             ]
         )
     return plan
@@ -140,11 +141,28 @@ def table_cutover_state(
     live_is_desired = _normalize_sorting_key(live_key or "") == desired
     v2_is_desired = _normalize_sorting_key(v2_key or "") == desired
 
-    if live_is_desired and backup_key is not None and v2_key is None:
+    backup_is_old = backup_key is not None and not (
+        _normalize_sorting_key(backup_key) == desired
+    )
+    v2_is_old = v2_key is not None and not v2_is_desired
+
+    if live_is_desired and backup_is_old and v2_key is None:
         return "cutover-complete"
-    if not live_is_desired and v2_is_desired and backup_key is None:
+    if (
+        live_key is not None
+        and not live_is_desired
+        and v2_is_desired
+        and backup_key is None
+    ):
         return "ready-for-cutover"
-    if not live_is_desired and v2_key is None and backup_key is None:
+    if live_is_desired and v2_is_old and backup_key is None:
+        return "exchanged-awaiting-backup"
+    if (
+        live_key is not None
+        and not live_is_desired
+        and v2_key is None
+        and backup_key is None
+    ):
         return "not-prepared"
     return "ambiguous"
 
@@ -155,7 +173,7 @@ def reconcile_table_cutover(
     state = table_cutover_state(runner, database, table, stamp)
     if state == "cutover-complete":
         return state
-    if state != "ready-for-cutover":
+    if state not in {"ready-for-cutover", "exchanged-awaiting-backup"}:
         raise RuntimeError(
             f"Unsafe migration state for {database}.{table}: {state}; "
             "manual recovery required and ingestion must remain paused"
@@ -163,7 +181,15 @@ def reconcile_table_cutover(
     live = qualified(database, table)
     v2 = qualified(database, f"{table}_v2")
     backup = qualified(database, f"{table}_backup_{stamp}")
-    runner.query(f"RENAME TABLE {live} TO {backup}, {v2} TO {live}")
+    if state == "ready-for-cutover":
+        runner.query(f"EXCHANGE TABLES {live} AND {v2}")
+        state = table_cutover_state(runner, database, table, stamp)
+        if state != "exchanged-awaiting-backup":
+            raise RuntimeError(
+                f"Cutover exchange verification failed for {database}.{table}; "
+                "manual recovery required and ingestion must remain paused"
+            )
+    runner.query(f"RENAME TABLE {v2} TO {backup}")
     state = table_cutover_state(runner, database, table, stamp)
     if state != "cutover-complete":
         raise RuntimeError(
@@ -244,15 +270,16 @@ def apply_migration(args, stamp: str) -> None:
                 f"Unsafe migration state for {args.database}.{table}: {state}; "
                 "manual recovery required before pausing ingestion"
             )
-        for label, sql in plan:
-            if label in {"create-v2", "backfill"} and (f".{table}_v2" in sql):
-                runner.query(sql)
+        if state == "not-prepared":
+            for label, sql in plan:
+                if label in {"create-v2", "backfill"} and (f".{table}_v2" in sql):
+                    runner.query(sql)
 
     run_hook(args.pause_command)
     run_hook(args.flush_command)
     for table in TABLES:
         state = table_cutover_state(runner, args.database, table, stamp)
-        if state != "cutover-complete":
+        if state == "ready-for-cutover":
             runner.query(
                 next(
                     sql
@@ -293,8 +320,10 @@ def rollback_plan(database: str, backup: str, stamp: str) -> Iterable[str]:
     live_table = backup.split("_backup_", 1)[0]
     live = qualified(database, live_table)
     old = qualified(database, backup)
-    displaced = qualified(database, f"{live_table}_rollback_displaced_{stamp}")
-    yield f"RENAME TABLE {live} TO {displaced}, {old} TO {live}"
+    backup_stamp = backup.split("_backup_", 1)[1]
+    displaced = qualified(database, f"{live_table}_rollback_displaced_{backup_stamp}")
+    yield f"EXCHANGE TABLES {live} AND {old}"
+    yield f"RENAME TABLE {old} TO {displaced}"
 
 
 def reconcile_rollback(
@@ -302,31 +331,84 @@ def reconcile_rollback(
 ) -> str:
     statements = list(rollback_plan(database, backup, stamp))
     live_table = backup.split("_backup_", 1)[0]
-    displaced_table = f"{live_table}_rollback_displaced_{stamp}"
+    backup_stamp = backup.split("_backup_", 1)[1]
+    displaced_table = f"{live_table}_rollback_displaced_{backup_stamp}"
     desired = _normalize_sorting_key(TABLES[live_table].order_by)
     live_key = table_sorting_key(runner, database, live_table)
     backup_key = table_sorting_key(runner, database, backup)
     displaced_key = table_sorting_key(runner, database, displaced_table)
 
+    live_is_desired = _normalize_sorting_key(live_key or "") == desired
+    backup_is_desired = _normalize_sorting_key(backup_key or "") == desired
+    displaced_is_desired = _normalize_sorting_key(displaced_key or "") == desired
     if (
         live_key is not None
-        and _normalize_sorting_key(live_key) != desired
+        and not live_is_desired
         and backup_key is None
-        and _normalize_sorting_key(displaced_key or "") == desired
+        and displaced_is_desired
     ):
         return "rollback-complete"
-    if not (
-        _normalize_sorting_key(live_key or "") == desired
+    ready = (
+        live_is_desired
         and backup_key is not None
-        and _normalize_sorting_key(backup_key) != desired
+        and not backup_is_desired
         and displaced_key is None
-    ):
+    )
+    exchanged = (
+        live_key is not None
+        and not live_is_desired
+        and backup_is_desired
+        and displaced_key is None
+    )
+    if not (ready or exchanged):
         raise RuntimeError(
             f"Unsafe rollback state for {database}.{live_table}; "
             "manual recovery required"
         )
-    runner.query(statements[0])
+    if ready:
+        runner.query(statements[0])
+        return reconcile_rollback(runner, database, backup, stamp)
+    runner.query(statements[1])
     return reconcile_rollback(runner, database, backup, stamp)
+
+
+def apply_rollback(args, backup: str, stamp: str) -> None:
+    """Rollback without losing writes accepted after the original cutover."""
+    if not any(backup.startswith(f"{table}_backup_") for table in TABLES):
+        raise ValueError("Rollback backup must be a versioned analytics backup table")
+    live_table = backup.split("_backup_", 1)[0]
+    runner = ClickHouseRunner(args.clickhouse_command)
+    run_hook(args.pause_command)
+    run_hook(args.flush_command)
+
+    desired = _normalize_sorting_key(TABLES[live_table].order_by)
+    live_key = table_sorting_key(runner, args.database, live_table)
+    backup_key = table_sorting_key(runner, args.database, backup)
+    if (
+        _normalize_sorting_key(live_key or "") == desired
+        and backup_key is not None
+        and _normalize_sorting_key(backup_key) != desired
+    ):
+        live = qualified(args.database, live_table)
+        old = qualified(args.database, backup)
+        runner.query(
+            f"INSERT INTO {old} SELECT * FROM {live} "
+            f"WHERE event_id NOT IN (SELECT event_id FROM {old})"
+        )
+        source = runner.query(validation_query(args.database, live_table), capture=True)
+        target = runner.query(validation_query(args.database, backup), capture=True)
+        if source != target:
+            raise RuntimeError(
+                f"Rollback validation mismatch for {live_table}: "
+                f"live={source!r}, backup={target!r}"
+            )
+
+    if reconcile_rollback(runner, args.database, backup, stamp) != "rollback-complete":
+        raise RuntimeError(
+            f"Rollback incomplete for {args.database}.{live_table}; "
+            "manual recovery required and ingestion remains paused"
+        )
+    run_hook(args.resume_command)
 
 
 def parse_args(argv=None):
@@ -346,7 +428,7 @@ def parse_args(argv=None):
         ),
     )
     args = parser.parse_args(argv)
-    if args.apply and not args.rollback:
+    if args.apply:
         missing = [
             flag
             for flag, value in (
@@ -368,8 +450,7 @@ def main(argv=None) -> int:
         if args.rollback:
             statements = list(rollback_plan(args.database, args.rollback, stamp))
             if args.apply:
-                runner = ClickHouseRunner(args.clickhouse_command)
-                reconcile_rollback(runner, args.database, args.rollback, stamp)
+                apply_rollback(args, args.rollback, stamp)
             else:
                 print("DRY RUN: rollback; pass --apply to execute")
                 for sql in statements:

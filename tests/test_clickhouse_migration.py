@@ -31,6 +31,7 @@ def test_migration_defaults_to_dry_run_with_safe_side_by_side_plan():
     assert "count()" in result.stdout and "FINAL" in result.stdout
     assert "groupBitXor(cityHash64(event_id))" in result.stdout
     assert "groupBitXor(cityHash64(toJSONString(tuple(*))))" in result.stdout
+    assert "EXCHANGE TABLES" in result.stdout
     assert "RENAME TABLE" in result.stdout
     assert "backup" in result.stdout
 
@@ -43,6 +44,19 @@ def test_migration_apply_requires_pause_and_flush_hooks():
     assert "--flush-command" in result.stderr
 
 
+def test_rollback_apply_requires_pause_flush_and_resume_hooks():
+    result = _run(
+        "--apply",
+        "--rollback",
+        "query_logs_backup_20260715T120000Z",
+    )
+
+    assert result.returncode != 0
+    assert "--pause-command" in result.stderr
+    assert "--flush-command" in result.stderr
+    assert "--resume-command" in result.stderr
+
+
 def test_rollback_plan_is_explicit_and_dry_run_by_default():
     result = _run(
         "--rollback",
@@ -53,28 +67,35 @@ def test_rollback_plan_is_explicit_and_dry_run_by_default():
 
     assert result.returncode == 0, result.stderr
     assert "DRY RUN" in result.stdout
-    assert "RENAME TABLE analytics_test.query_logs" in result.stdout
+    assert "EXCHANGE TABLES analytics_test.query_logs AND" in result.stdout
     assert "analytics_test.query_logs_backup_20260715T120000Z" in result.stdout
 
 
 class _Runner:
-    def __init__(self, sorting_keys):
+    def __init__(self, sorting_keys, fail_after=None):
         self.sorting_keys = dict(sorting_keys)
         self.commands = []
+        self.fail_after = fail_after
 
     def query(self, sql, *, capture=False):
         self.commands.append(sql)
         if "FROM system.tables" in sql and "sorting_key" in sql:
             table = sql.split("name = '", 1)[1].split("'", 1)[0]
             return self.sorting_keys.get(table, "")
-        if sql.startswith("RENAME TABLE"):
-            first, second = sql.removeprefix("RENAME TABLE ").split(", ")
-            old_live, backup = first.split(" TO ")
-            v2, live = second.split(" TO ")
-            old_key = self.sorting_keys.pop(old_live.split(".")[-1])
-            new_key = self.sorting_keys.pop(v2.split(".")[-1])
-            self.sorting_keys[backup.split(".")[-1]] = old_key
-            self.sorting_keys[live.split(".")[-1]] = new_key
+        if sql.startswith("EXCHANGE TABLES"):
+            first, second = sql.removeprefix("EXCHANGE TABLES ").split(" AND ")
+            first, second = first.split(".")[-1], second.split(".")[-1]
+            self.sorting_keys[first], self.sorting_keys[second] = (
+                self.sorting_keys[second],
+                self.sorting_keys[first],
+            )
+        elif sql.startswith("RENAME TABLE"):
+            source, target = sql.removeprefix("RENAME TABLE ").split(" TO ")
+            self.sorting_keys[target.split(".")[-1]] = self.sorting_keys.pop(
+                source.split(".")[-1]
+            )
+        if self.fail_after == sql:
+            raise RuntimeError("injected crash")
         return ""
 
 
@@ -95,7 +116,7 @@ def test_cutover_resumes_after_crash_without_swapping_completed_table_back():
     assert not any(command.startswith("RENAME TABLE") for command in runner.commands)
 
 
-def test_cutover_atomically_renames_old_live_and_v2_and_is_restart_safe():
+def test_cutover_exchanges_then_renames_old_table_to_backup():
     desired = migration.TABLES["query_logs"].order_by
     runner = _Runner({"query_logs": "event_id", "query_logs_v2": desired})
 
@@ -105,13 +126,15 @@ def test_cutover_atomically_renames_old_live_and_v2_and_is_restart_safe():
         )
         == "cutover-complete"
     )
-    rename_commands = [
-        command for command in runner.commands if command.startswith("RENAME TABLE")
+    mutation_commands = [
+        command
+        for command in runner.commands
+        if command.startswith(("EXCHANGE TABLES", "RENAME TABLE"))
     ]
-    assert rename_commands == [
-        "RENAME TABLE analytics_test.query_logs TO "
-        "analytics_test.query_logs_backup_stamp, "
-        "analytics_test.query_logs_v2 TO analytics_test.query_logs"
+    assert mutation_commands == [
+        "EXCHANGE TABLES analytics_test.query_logs AND analytics_test.query_logs_v2",
+        "RENAME TABLE analytics_test.query_logs_v2 TO "
+        "analytics_test.query_logs_backup_stamp",
     ]
 
     runner.commands.clear()
@@ -121,7 +144,65 @@ def test_cutover_atomically_renames_old_live_and_v2_and_is_restart_safe():
         )
         == "cutover-complete"
     )
-    assert not any(command.startswith("RENAME TABLE") for command in runner.commands)
+    assert not any(
+        command.startswith(("EXCHANGE TABLES", "RENAME TABLE"))
+        for command in runner.commands
+    )
+
+
+def test_cutover_resumes_after_crash_between_exchange_and_backup_rename():
+    desired = migration.TABLES["query_logs"].order_by
+    exchange = (
+        "EXCHANGE TABLES analytics_test.query_logs AND " "analytics_test.query_logs_v2"
+    )
+    runner = _Runner(
+        {"query_logs": "event_id", "query_logs_v2": desired},
+        fail_after=exchange,
+    )
+
+    with pytest.raises(RuntimeError, match="injected crash"):
+        migration.reconcile_table_cutover(
+            runner, "analytics_test", "query_logs", "stamp"
+        )
+
+    assert runner.sorting_keys == {"query_logs": desired, "query_logs_v2": "event_id"}
+    runner.fail_after = None
+    runner.commands.clear()
+    assert (
+        migration.reconcile_table_cutover(
+            runner, "analytics_test", "query_logs", "stamp"
+        )
+        == "cutover-complete"
+    )
+    assert not any(command.startswith("EXCHANGE TABLES") for command in runner.commands)
+    assert any(command.startswith("RENAME TABLE") for command in runner.commands)
+
+
+def test_cutover_rerun_after_backup_rename_never_exchanges_back():
+    desired = migration.TABLES["query_logs"].order_by
+    rename = (
+        "RENAME TABLE analytics_test.query_logs_v2 TO "
+        "analytics_test.query_logs_backup_stamp"
+    )
+    runner = _Runner(
+        {"query_logs": "event_id", "query_logs_v2": desired},
+        fail_after=rename,
+    )
+
+    with pytest.raises(RuntimeError, match="injected crash"):
+        migration.reconcile_table_cutover(
+            runner, "analytics_test", "query_logs", "stamp"
+        )
+
+    runner.fail_after = None
+    runner.commands.clear()
+    assert (
+        migration.reconcile_table_cutover(
+            runner, "analytics_test", "query_logs", "stamp"
+        )
+        == "cutover-complete"
+    )
+    assert not any(command.startswith("EXCHANGE TABLES") for command in runner.commands)
 
 
 def test_cutover_fails_closed_on_ambiguous_sorting_state():
@@ -140,6 +221,9 @@ def test_apply_failure_keeps_ingestion_paused(monkeypatch):
     class _ApplyRunner:
         def query(self, sql, *, capture=False):
             if "sorting_key" in sql:
+                table = sql.split("name = '", 1)[1].split("'", 1)[0]
+                if table in migration.TABLES:
+                    return "event_id"
                 return ""
             if sql.startswith("SELECT uniqExact"):
                 return "same"
@@ -222,7 +306,146 @@ def test_rollback_is_forward_only_and_restart_safe():
         )
         == "rollback-complete"
     )
-    assert not any(command.startswith("RENAME TABLE") for command in runner.commands)
+    assert not any(
+        command.startswith(("EXCHANGE TABLES", "RENAME TABLE"))
+        for command in runner.commands
+    )
+
+
+def test_rollback_resumes_after_crash_between_exchange_and_displaced_rename():
+    desired = migration.TABLES["query_logs"].order_by
+    backup = "query_logs_backup_20260715T120000Z"
+    exchange = f"EXCHANGE TABLES analytics_test.query_logs AND analytics_test.{backup}"
+    runner = _Runner({"query_logs": desired, backup: "event_id"}, fail_after=exchange)
+
+    with pytest.raises(RuntimeError, match="injected crash"):
+        migration.reconcile_rollback(runner, "analytics_test", backup, "rollbackstamp")
+
+    runner.fail_after = None
+    runner.commands.clear()
+    assert (
+        migration.reconcile_rollback(runner, "analytics_test", backup, "rollbackstamp")
+        == "rollback-complete"
+    )
+    assert not any(command.startswith("EXCHANGE TABLES") for command in runner.commands)
+
+
+def test_rollback_rerun_after_displaced_rename_never_exchanges_back():
+    desired = migration.TABLES["query_logs"].order_by
+    backup = "query_logs_backup_20260715T120000Z"
+    rename = (
+        f"RENAME TABLE analytics_test.{backup} TO "
+        "analytics_test.query_logs_rollback_displaced_20260715T120000Z"
+    )
+    runner = _Runner({"query_logs": desired, backup: "event_id"}, fail_after=rename)
+
+    with pytest.raises(RuntimeError, match="injected crash"):
+        migration.reconcile_rollback(runner, "analytics_test", backup, "rollbackstamp")
+
+    runner.fail_after = None
+    runner.commands.clear()
+    assert (
+        migration.reconcile_rollback(runner, "analytics_test", backup, "rollbackstamp")
+        == "rollback-complete"
+    )
+    assert not any(command.startswith("EXCHANGE TABLES") for command in runner.commands)
+
+
+def test_rollback_restart_with_new_invocation_stamp_recognizes_complete():
+    desired = migration.TABLES["query_logs"].order_by
+    backup = "query_logs_backup_20260715T120000Z"
+    runner = _Runner({"query_logs": desired, backup: "event_id"})
+
+    assert (
+        migration.reconcile_rollback(runner, "analytics_test", backup, "firststamp")
+        == "rollback-complete"
+    )
+    runner.commands.clear()
+    assert (
+        migration.reconcile_rollback(runner, "analytics_test", backup, "secondstamp")
+        == "rollback-complete"
+    )
+    assert not any(
+        command.startswith(("EXCHANGE TABLES", "RENAME TABLE"))
+        for command in runner.commands
+    )
+
+
+def test_apply_rollback_pauses_flushes_copies_delta_and_resumes_only_when_verified(
+    monkeypatch,
+):
+    hooks = []
+    desired = migration.TABLES["query_logs"].order_by
+    backup = "query_logs_backup_20260715T120000Z"
+    runner = _Runner({"query_logs": desired, backup: "event_id"})
+    monkeypatch.setattr(migration, "run_hook", hooks.append)
+    monkeypatch.setattr(migration, "ClickHouseRunner", lambda command: runner)
+    monkeypatch.setattr(migration, "validation_query", lambda *args: "SELECT verify")
+    original_query = runner.query
+
+    def query(sql, *, capture=False):
+        if sql == "SELECT verify":
+            return "same"
+        return original_query(sql, capture=capture)
+
+    runner.query = query
+    args = type(
+        "Args",
+        (),
+        {
+            "clickhouse_command": "ignored",
+            "database": "analytics_test",
+            "pause_command": "pause",
+            "flush_command": "flush",
+            "resume_command": "resume",
+        },
+    )()
+
+    migration.apply_rollback(args, backup, "rollbackstamp")
+
+    assert hooks == ["pause", "flush", "resume"]
+    assert any(
+        command.startswith(f"INSERT INTO analytics_test.{backup} SELECT *")
+        for command in runner.commands
+    )
+
+
+def test_apply_rollback_failure_keeps_ingestion_paused(monkeypatch):
+    hooks = []
+    backup = "query_logs_backup_20260715T120000Z"
+    desired = migration.TABLES["query_logs"].order_by
+    runner = _Runner({"query_logs": desired, backup: "event_id"})
+    monkeypatch.setattr(migration, "run_hook", hooks.append)
+    monkeypatch.setattr(migration, "ClickHouseRunner", lambda command: runner)
+    monkeypatch.setattr(
+        migration,
+        "validation_query",
+        lambda database, table: f"SELECT verify {table}",
+    )
+    original_query = runner.query
+
+    def query(sql, *, capture=False):
+        if sql.startswith("SELECT verify"):
+            return "live" if sql.endswith("query_logs") else "backup-mismatch"
+        return original_query(sql, capture=capture)
+
+    runner.query = query
+    args = type(
+        "Args",
+        (),
+        {
+            "clickhouse_command": "ignored",
+            "database": "analytics_test",
+            "pause_command": "pause",
+            "flush_command": "flush",
+            "resume_command": "resume",
+        },
+    )()
+
+    with pytest.raises(RuntimeError, match="Rollback validation mismatch"):
+        migration.apply_rollback(args, backup, "rollbackstamp")
+
+    assert hooks == ["pause", "flush"]
 
 
 def test_rollback_rejects_backup_with_desired_sorting_key():

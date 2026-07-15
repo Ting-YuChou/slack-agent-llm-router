@@ -2,6 +2,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -81,6 +82,55 @@ def test_clickhouse_dashboard_count_is_derived_from_issued_queries():
 
     assert measurement.count == 2
     assert issued == ["SELECT 1", "SELECT 2"]
+
+
+def test_dashboard_query_gate_executes_the_production_pipeline_bundle():
+    from scripts.analytics_performance_contract import (
+        _run_production_dashboard_bundle,
+    )
+
+    issued = []
+
+    class _Result:
+        result_rows = []
+
+    class _Client:
+        def query(self, sql, **kwargs):
+            issued.append(sql)
+            return _Result()
+
+    count, bundle = _run_production_dashboard_bundle(
+        _Client(), "analytics_contract_test"
+    )
+
+    assert count == 4
+    assert bundle["errors"] == {}
+    assert any("query_logs FINAL" in sql for sql in issued)
+    assert any("model_performance FINAL" in sql for sql in issued)
+    assert any("alert_events FINAL" in sql for sql in issued)
+    assert any("routing_policy_state_events FINAL" in sql for sql in issued)
+
+
+def test_clickhouse_benchmark_disables_generated_sessions_for_concurrent_bundle(
+    monkeypatch,
+):
+    from scripts.analytics_performance_contract import benchmark_clickhouse
+
+    captured = {}
+
+    def get_client(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop after client construction")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "clickhouse_connect",
+        SimpleNamespace(get_client=get_client),
+    )
+
+    benchmark_clickhouse(rows=1, repeats=1)
+
+    assert captured["autogenerate_session_id"] is False
 
 
 def test_clickhouse_event_id_expression_uses_a_24_8_supported_hash():
