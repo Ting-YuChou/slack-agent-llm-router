@@ -72,6 +72,8 @@ DEFAULT_CONFIG_PATH = "config/config.yaml"
 CONFIG_ENV_VAR = "LLM_ROUTER_CONFIG"
 DEFAULT_API_KEY_ENV_VAR = "LLM_ROUTER_API_KEYS"
 WEB_SEARCH_ENABLED_ENV_VAR = "LLM_ROUTER_WEB_SEARCH_ENABLED"
+RAG_ENABLED_ENV_VAR = "LLM_ROUTER_RAG_ENABLED"
+RAG_QUEUE_ENABLED_ENV_VAR = "LLM_ROUTER_RAG_QUEUE_ENABLED"
 PUBLIC_ENDPOINTS = {"/live", "/ready", "/health"}
 
 
@@ -151,6 +153,16 @@ class LLMRouterPlatform:
             tools_config = raw_config.setdefault("tools", {})
             web_search_config = tools_config.setdefault("web_search", {})
             web_search_config["enabled"] = web_search_enabled
+
+        rag_enabled = _env_flag_enabled(os.getenv(RAG_ENABLED_ENV_VAR))
+        rag_queue_enabled = _env_flag_enabled(os.getenv(RAG_QUEUE_ENABLED_ENV_VAR))
+        if rag_enabled is not None or rag_queue_enabled is not None:
+            rag_config = raw_config.setdefault("rag", {})
+            if rag_enabled is not None:
+                rag_config["enabled"] = rag_enabled
+            if rag_queue_enabled is not None:
+                queue_config = rag_config.setdefault("ingestion_queue", {})
+                queue_config["enabled"] = rag_queue_enabled
 
     def _log_configuration_warnings(self):
         """Log high-risk runtime configuration warnings."""

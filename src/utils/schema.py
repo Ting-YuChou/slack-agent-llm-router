@@ -1054,6 +1054,8 @@ class RagIngestionQueueConfig(ConfigModel):
     max_attempts: int = Field(3, ge=1)
     retry_backoff_seconds: float = Field(30.0, ge=0.0)
     stream_maxlen: int = Field(10000, ge=0)
+    heartbeat_interval_seconds: float = Field(5.0, gt=0.0)
+    heartbeat_ttl_seconds: int = Field(15, ge=1)
 
 
 class RagStorageConfig(ConfigModel):

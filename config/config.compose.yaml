@@ -282,6 +282,8 @@ rag:
     max_attempts: 3
     retry_backoff_seconds: 30
     stream_maxlen: 10000
+    heartbeat_interval_seconds: 5
+    heartbeat_ttl_seconds: 15
   storage:
     staging_dir: /app/data/rag/uploads
     cleanup_completed_files: false

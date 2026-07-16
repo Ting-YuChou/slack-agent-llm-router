@@ -216,6 +216,12 @@ class RagService:
             0.0, float(self.queue_config.get("retry_backoff_seconds", 30))
         )
         self.stream_maxlen = int(self.queue_config.get("stream_maxlen", 10000))
+        self.heartbeat_interval_seconds = float(
+            self.queue_config.get("heartbeat_interval_seconds", 5)
+        )
+        self.heartbeat_ttl_seconds = int(
+            self.queue_config.get("heartbeat_ttl_seconds", 15)
+        )
         self.staging_dir = Path(
             self.storage_config.get("staging_dir") or "data/rag/uploads"
         )
@@ -758,11 +764,30 @@ class RagService:
             )
             for index in range(self.worker_count)
         ]
+        worker_id = f"{socket.gethostname()}-{os.getpid()}"
+        heartbeat = asyncio.create_task(
+            self._worker_heartbeat_loop(worker_id),
+            name="rag_ingestion_worker_heartbeat",
+        )
         try:
             await asyncio.gather(*workers)
         finally:
+            heartbeat.cancel()
             for worker in workers:
                 worker.cancel()
+
+    async def _worker_heartbeat_loop(self, worker_id: str) -> None:
+        client = self._job_client()
+        if not client:
+            raise RuntimeError("Redis client is required for RAG worker heartbeat")
+        key = self._prefixed_key(f"worker:heartbeat:{worker_id}")
+        while True:
+            await client.set(
+                key,
+                datetime.now().isoformat(),
+                ex=self.heartbeat_ttl_seconds,
+            )
+            await asyncio.sleep(self.heartbeat_interval_seconds)
 
     async def _worker_loop(self, consumer_name: str):
         semaphore = asyncio.Semaphore(self.worker_concurrency)

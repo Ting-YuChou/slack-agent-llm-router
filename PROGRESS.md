@@ -1,5 +1,11 @@
 # Project Progress
 
+## 2026-07-16 — Operational RAG worker profile
+
+- Changed: added explicit Docker environment overrides for RAG and its ingestion queue, a Compose overlay that enables both API and worker against Redis Stack, and a TTL-backed worker heartbeat used by the container healthcheck.
+- Verification: new RED/GREEN tests cover environment wiring, overlay dependencies, and repeated heartbeat refresh; RAG/API/schema regression passed (`86 passed`), along with touched-file Black and `git diff --check`.
+- Follow-up: embedding batching, atomic generation indexing, parallel retrieval, and streaming uploads remain in the next phases.
+
 ## 2026-07-14 — Redis control-plane performance gates and v1 cleanup
 
 - Changed: added a real-Redis control-plane benchmark, dry-run-first v1 provider queue cleanup, and a per-process/provider polling coordinator that uses Redis-assigned queue scores while waking only the next local waiter. Redis transport timeouts no longer count healthy client/server queue delay as a socket blackhole.

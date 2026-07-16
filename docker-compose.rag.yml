@@ -1,0 +1,22 @@
+services:
+  api:
+    environment:
+      LLM_ROUTER_RAG_ENABLED: "true"
+      LLM_ROUTER_RAG_QUEUE_ENABLED: "true"
+    depends_on:
+      redis-stack:
+        condition: service_healthy
+
+  rag-workers:
+    environment:
+      LLM_ROUTER_RAG_ENABLED: "true"
+      LLM_ROUTER_RAG_QUEUE_ENABLED: "true"
+    depends_on:
+      redis-stack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "scripts/rag_worker_health.py", "--config", "config/config.compose.yaml"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
