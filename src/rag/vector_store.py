@@ -1,6 +1,7 @@
 """Vector stores for school-document RAG chunks."""
 
 import array
+import asyncio
 import hashlib
 import json
 import logging
@@ -629,17 +630,64 @@ class RedisStackRagVectorStore:
         visual_min_score: float = 0.0,
         visual_candidate_count: Optional[int] = None,
     ) -> List[RagSearchResult]:
-        keyword_results = await self._keyword_search(
-            query, knowledge_base_ids, candidate_count
+        semaphore = asyncio.Semaphore(
+            max(1, int(self.retrieval_config.get("max_concurrent_branches", 3)))
         )
-        vector_results = await self._vector_search(
-            embedding, knowledge_base_ids, candidate_count
+
+        async def run_branch(name: str, factory: Any) -> List[RagSearchResult]:
+            async with semaphore:
+                try:
+                    return await factory()
+                except Exception as exc:
+                    logger.warning("Redis RAG %s retrieval failed: %s", name, exc)
+                    return []
+
+        tasks = [
+            asyncio.create_task(
+                run_branch(
+                    "keyword",
+                    lambda: self._keyword_search(
+                        query, knowledge_base_ids, candidate_count
+                    ),
+                )
+            ),
+            asyncio.create_task(
+                run_branch(
+                    "vector",
+                    lambda: self._vector_search(
+                        embedding, knowledge_base_ids, candidate_count
+                    ),
+                )
+            ),
+            asyncio.create_task(
+                run_branch(
+                    "visual",
+                    lambda: self._visual_search(
+                        visual_embedding,
+                        knowledge_base_ids,
+                        int(visual_candidate_count or candidate_count),
+                    ),
+                )
+            ),
+        ]
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=float(self.retrieval_config.get("deadline_seconds", 30)),
         )
-        visual_results = await self._visual_search(
-            visual_embedding,
-            knowledge_base_ids,
-            int(visual_candidate_count or candidate_count),
-        )
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+            logger.warning(
+                "Redis RAG retrieval deadline expired for %s branches", len(pending)
+            )
+        branch_results: List[List[RagSearchResult]] = []
+        for task in tasks:
+            if task in done and not task.cancelled():
+                branch_results.append(task.result())
+            else:
+                branch_results.append([])
+        keyword_results, vector_results, visual_results = branch_results
         merged = _merge_results(
             keyword_results,
             vector_results,
@@ -733,7 +781,7 @@ class RedisStackRagVectorStore:
                 "0",
                 str(limit),
                 "RETURN",
-                "16",
+                "15",
                 "knowledge_base_id",
                 "document_id",
                 "chunk_id",
@@ -747,7 +795,6 @@ class RedisStackRagVectorStore:
                 "page_end",
                 "created_at",
                 "updated_at",
-                "embedding",
                 "index_version",
                 "distance",
                 "DIALECT",
@@ -788,7 +835,7 @@ class RedisStackRagVectorStore:
                 "0",
                 str(limit),
                 "RETURN",
-                "15",
+                "14",
                 "knowledge_base_id",
                 "document_id",
                 "chunk_id",
@@ -849,7 +896,6 @@ class RedisStackRagVectorStore:
                 "page_end",
                 "created_at",
                 "updated_at",
-                "embedding",
             ]
         )
         try:

@@ -1032,6 +1032,8 @@ class RagRetrievalConfig(ConfigModel):
     vector_weight: float = Field(0.6, ge=0.0)
     recency_weight: float = Field(0.05, ge=0.0)
     max_context_chars: int = Field(6000, ge=500)
+    max_concurrent_branches: int = Field(3, ge=1, le=3)
+    deadline_seconds: float = Field(30.0, gt=0.0, le=300.0)
 
 
 class RagRerankConfig(ConfigModel):

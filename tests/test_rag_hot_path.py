@@ -341,3 +341,114 @@ def test_rag_batch_and_indexing_config_survive_validation():
     assert config.rag.redis.pipeline_batch_size == 64
     assert config.rag.indexing.control_plane_version == "v2"
     assert config.rag.indexing.atomic_commit_max_chunks == 2000
+
+
+@pytest.mark.asyncio
+async def test_query_text_and_visual_embeddings_start_concurrently():
+    both_started = asyncio.Event()
+    started = set()
+
+    async def mark_started(name, value):
+        started.add(name)
+        if len(started) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=0.1)
+        return value
+
+    class TextProvider:
+        async def embed(self, _text):
+            return await mark_started("text", [1.0])
+
+    class VisualProvider:
+        async def embed_query(self, _text):
+            return await mark_started("visual", [1.0])
+
+    class Store:
+        def __init__(self):
+            self.embedding = None
+            self.visual_embedding = None
+
+        async def search(self, _query, embedding, **kwargs):
+            self.embedding = embedding
+            self.visual_embedding = kwargs["visual_embedding"]
+            return []
+
+    store = Store()
+    service = RagService(
+        {
+            "enabled": True,
+            "backend": "memory",
+            "visual": {"enabled": True, "embedding": {"enabled": True}},
+        },
+        embedding_provider=TextProvider(),
+        visual_processor=VisualProvider(),
+        vector_store=store,
+    )
+
+    assert await service.retrieve("tuition") == []
+    assert started == {"text", "visual"}
+    assert store.embedding == [1.0]
+    assert store.visual_embedding == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_redis_retrieval_branches_run_concurrently_and_degrade_independently():
+    store = RedisStackRagVectorStore(
+        {
+            "retrieval": {"max_concurrent_branches": 3, "deadline_seconds": 1},
+            "embedding": {"dimensions": 1},
+        }
+    )
+    store.client = object()
+    all_started = asyncio.Event()
+    started = set()
+
+    async def branch(name, *, fail=False):
+        started.add(name)
+        if len(started) == 3:
+            all_started.set()
+        await asyncio.wait_for(all_started.wait(), timeout=0.1)
+        if fail:
+            raise RuntimeError("branch failed")
+        return []
+
+    store._keyword_search = lambda *_args: branch("keyword")
+    store._vector_search = lambda *_args: branch("vector", fail=True)
+    store._visual_search = lambda *_args: branch("visual")
+
+    results = await store.search(
+        "tuition",
+        [1.0],
+        knowledge_base_ids=[],
+        limit=5,
+        candidate_count=30,
+        keyword_weight=0.35,
+        vector_weight=0.6,
+        recency_weight=0.05,
+        min_score=0.0,
+        visual_embedding=[1.0],
+        visual_weight=0.4,
+    )
+
+    assert results == []
+    assert started == {"keyword", "vector", "visual"}
+
+
+@pytest.mark.asyncio
+async def test_redis_search_commands_do_not_return_embedding_payloads():
+    class SearchRedis:
+        def __init__(self):
+            self.commands = []
+
+        async def execute_command(self, *command):
+            self.commands.append(command)
+            return [0]
+
+    store = RedisStackRagVectorStore({"embedding": {"dimensions": 1}})
+    store.client = SearchRedis()
+
+    await store._search("*", 30, "keyword")
+    await store._vector_search([1.0], [], 30)
+
+    assert len(store.client.commands) == 2
+    assert all("embedding" not in command for command in store.client.commands)

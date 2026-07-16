@@ -433,8 +433,10 @@ class RagService:
     ) -> List[RagSearchResult]:
         if not self.enabled:
             return []
-        embedding = await self._safe_embed(query)
-        visual_embedding = await self._safe_visual_query_embed(query)
+        embedding, visual_embedding = await asyncio.gather(
+            self._safe_embed(query),
+            self._safe_visual_query_embed(query),
+        )
         effective_kbs = self._effective_knowledge_base_ids(knowledge_base_ids)
         top_k = int(max_results or self.retrieval_config.get("top_k", 5))
         first_stage_candidate_count = int(

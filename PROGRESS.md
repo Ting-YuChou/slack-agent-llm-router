@@ -1,5 +1,12 @@
 # Project Progress
 
+## 2026-07-16 — Parallel RAG retrieval and bounded result payloads
+
+- Changed: text and visual query embeddings now start together; Redis keyword, vector, and visual branches run with a three-branch bound and one shared 30-second deadline. Branch failures degrade only that source and merge order remains keyword/vector/visual deterministic.
+- Payload: keyword and vector `FT.SEARCH` projections no longer return or deserialize the unused embedding vector, removing 1024-float payloads from the default 30-candidate read path.
+- Verification: RED/GREEN concurrency tests require both embedding paths and all three retrieval branches to be in flight together, cover isolated branch failure, and inspect production Redis commands for omitted embedding fields. Scoped RAG regression passed (`39 passed`).
+- Follow-up: streaming upload staging and end-to-end performance contracts remain.
+
 ## 2026-07-16 — Batched RAG embedding and atomic generation indexing
 
 - Changed: added ordered multi-input embedding calls for OpenAI and local HTTP providers, bounded 32-item/2-concurrent batching with scalar-provider compatibility, and a reusable local HTTP client. Redis ingestion now stages chunks in 64-item pipelines and performs one verified Lua cutover without deleting the prior document first; generation keys expire after 24 hours and documents above the 2,000-chunk atomic bound fail before writes.

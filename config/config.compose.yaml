@@ -305,6 +305,8 @@ rag:
     vector_weight: 0.6
     recency_weight: 0.05
     max_context_chars: 6000
+    max_concurrent_branches: 3
+    deadline_seconds: 30
   rerank:
     enabled: false
     provider: sentence_transformers
