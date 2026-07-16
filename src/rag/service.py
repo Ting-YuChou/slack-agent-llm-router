@@ -258,6 +258,9 @@ class RagService:
         if not self.enabled:
             return
         await self.vector_store.shutdown()
+        close_embedding_provider = getattr(self.embedding_provider, "close", None)
+        if callable(close_embedding_provider):
+            await close_embedding_provider()
         self._initialized = False
 
     def is_healthy(self) -> bool:
@@ -986,16 +989,51 @@ class RagService:
     async def _embed_chunks(
         self, chunks: Sequence[DocumentChunk]
     ) -> tuple[List[Optional[List[float]]], List[str]]:
-        embeddings = []
-        failures = 0
-        for chunk in chunks:
-            if chunk.metadata.get("is_figure") and not chunk.text.strip():
-                embeddings.append(None)
-                continue
-            embedding = await self._safe_embed(chunk.text)
-            if embedding is None:
-                failures += 1
-            embeddings.append(embedding)
+        embeddings: List[Optional[List[float]]] = [None] * len(chunks)
+        eligible = [
+            (index, chunk.text)
+            for index, chunk in enumerate(chunks)
+            if not (chunk.metadata.get("is_figure") and not chunk.text.strip())
+        ]
+        embed_many = getattr(self.embedding_provider, "embed_many", None)
+        batch_size = max(1, int(self.embedding_config.get("batch_size", 32)))
+        max_concurrency = max(
+            1, int(self.embedding_config.get("max_concurrent_batches", 2))
+        )
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        async def embed_batch(
+            batch: Sequence[tuple[int, str]],
+        ) -> tuple[Sequence[tuple[int, str]], List[Optional[List[float]]]]:
+            async with semaphore:
+                if callable(embed_many):
+                    try:
+                        values = await asyncio.wait_for(
+                            embed_many([text for _, text in batch]),
+                            timeout=float(self.embedding_config.get("timeout", 30)),
+                        )
+                        if len(values) != len(batch):
+                            raise ValueError("embedding batch response length mismatch")
+                        return batch, [list(value) for value in values]
+                    except Exception as exc:
+                        logger.info("RAG embedding batch unavailable: %s", exc)
+                        return batch, [None] * len(batch)
+                values = []
+                for _, text in batch:
+                    values.append(await self._safe_embed(text))
+                return batch, values
+
+        batches = [
+            eligible[index : index + batch_size]
+            for index in range(0, len(eligible), batch_size)
+        ]
+        for batch, values in await asyncio.gather(
+            *(embed_batch(batch) for batch in batches)
+        ):
+            for (chunk_index, _), value in zip(batch, values):
+                embeddings[chunk_index] = value
+
+        failures = sum(1 for index, _ in eligible if embeddings[index] is None)
         warnings = []
         if failures:
             warnings.append(

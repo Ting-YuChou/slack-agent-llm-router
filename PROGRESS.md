@@ -1,5 +1,12 @@
 # Project Progress
 
+## 2026-07-16 — Batched RAG embedding and atomic generation indexing
+
+- Changed: added ordered multi-input embedding calls for OpenAI and local HTTP providers, bounded 32-item/2-concurrent batching with scalar-provider compatibility, and a reusable local HTTP client. Redis ingestion now stages chunks in 64-item pipelines and performs one verified Lua cutover without deleting the prior document first; generation keys expire after 24 hours and documents above the 2,000-chunk atomic bound fail before writes.
+- Rollout: RediSearch index names are versioned under `v2`; the dry-run-first migration command creates and validates the new index while retaining the legacy index and existing chunk hashes.
+- Verification: RED/GREEN tests cover 1,000-chunk batching/order, isolated batch failure, provider wire format/client reuse, pipeline count, staging-only writes, single atomic cutover, atomic size limit, and validated config. RAG/schema scoped regression passed (`77 passed`).
+- Follow-up: retrieval parallelism, upload streaming, real Redis fault injection, and performance contracts remain.
+
 ## 2026-07-16 — Operational RAG worker profile
 
 - Changed: added explicit Docker environment overrides for RAG and its ingestion queue, a Compose overlay that enables both API and worker against Redis Stack, and a TTL-backed worker heartbeat used by the container healthcheck.

@@ -23,6 +23,58 @@ SIDECAR_METADATA_KEYS = {
     "visual_embedding",
 }
 
+ATOMIC_GENERATION_COMMIT_LUA = """
+local staging_set = KEYS[1]
+local document_set = KEYS[2]
+local document_kbs = KEYS[3]
+local active_generation = KEYS[4]
+local expected = tonumber(ARGV[1])
+local knowledge_base_id = ARGV[2]
+local generation = ARGV[3]
+local chunk_prefix = ARGV[4]
+
+if redis.call('SCARD', staging_set) ~= expected then
+    return redis.error_reply('incomplete RAG staging generation')
+end
+
+for index = 1, expected do
+    local offset = 5 + ((index - 1) * 3)
+    if redis.call('EXISTS', ARGV[offset]) ~= 1 then
+        return redis.error_reply('missing RAG staging chunk')
+    end
+end
+
+local active = redis.call('GET', active_generation)
+if active and active > generation then
+    for index = 1, expected do
+        local offset = 5 + ((index - 1) * 3)
+        redis.call('DEL', ARGV[offset])
+    end
+    redis.call('DEL', staging_set)
+    return expected
+end
+
+local previous = redis.call('SMEMBERS', document_set)
+for _, chunk_id in ipairs(previous) do
+    redis.call('DEL', chunk_prefix .. chunk_id)
+end
+redis.call('DEL', document_set)
+
+for index = 1, expected do
+    local offset = 5 + ((index - 1) * 3)
+    local staging_key = ARGV[offset]
+    local live_key = ARGV[offset + 1]
+    local chunk_id = ARGV[offset + 2]
+    redis.call('RENAME', staging_key, live_key)
+    redis.call('PERSIST', live_key)
+    redis.call('SADD', document_set, chunk_id)
+end
+redis.call('SADD', document_kbs, knowledge_base_id)
+redis.call('SET', active_generation, generation)
+redis.call('DEL', staging_set)
+return expected
+"""
+
 
 @dataclass
 class StoredRagChunk:
@@ -202,6 +254,7 @@ class RedisStackRagVectorStore:
     def __init__(self, config: Dict[str, Any]):
         self.config = dict(config or {})
         self.redis_config = dict(self.config.get("redis", {}) or {})
+        self.indexing_config = dict(self.config.get("indexing", {}) or {})
         self.embedding_config = dict(self.config.get("embedding", {}) or {})
         self.retrieval_config = dict(self.config.get("retrieval", {}) or {})
         self.visual_config = dict(self.config.get("visual", {}) or {})
@@ -209,13 +262,28 @@ class RedisStackRagVectorStore:
             self.visual_config.get("embedding", {}) or {}
         )
         self.key_prefix = self.redis_config.get("key_prefix", "rag")
-        self.index_name = f"{self.key_prefix}:idx:chunks"
-        self.visual_index_name = f"{self.key_prefix}:idx:visual_chunks"
+        self.control_plane_version = str(
+            self.indexing_config.get("control_plane_version", "v2")
+        )
+        index_suffix = (
+            f"{self.control_plane_version}:" if self.control_plane_version else ""
+        )
+        self.index_name = f"{self.key_prefix}:idx:{index_suffix}chunks"
+        self.visual_index_name = f"{self.key_prefix}:idx:{index_suffix}visual_chunks"
         self.dimensions = int(self.embedding_config.get("dimensions", 1024))
         self.visual_dimensions = int(
             self.visual_embedding_config.get("dimensions", 1024)
         )
         self.client = None
+        self.pipeline_batch_size = max(
+            1, int(self.redis_config.get("pipeline_batch_size", 64))
+        )
+        self.atomic_commit_max_chunks = max(
+            1, int(self.indexing_config.get("atomic_commit_max_chunks", 2000))
+        )
+        self.staging_ttl_seconds = max(
+            1, int(self.indexing_config.get("staging_ttl_seconds", 86400))
+        )
 
     async def initialize(self):
         import redis.asyncio as redis_asyncio
@@ -366,47 +434,47 @@ class RedisStackRagVectorStore:
     ) -> int:
         if not self.client or not chunks:
             return 0
+        if len(chunks) > self.atomic_commit_max_chunks:
+            raise ValueError(
+                "Document exceeds the configured RAG atomic commit limit "
+                f"({self.atomic_commit_max_chunks} chunks)"
+            )
         now_ts = time.time()
         document_id = chunks[0].document_id
-        await self.delete_document(document_id, knowledge_base_id)
         index_version = _new_index_version()
-        count = 0
         visual_embeddings = visual_embeddings or [None] * len(chunks)
-        for chunk, embedding, visual_embedding in zip(
-            chunks, embeddings, visual_embeddings
-        ):
-            mapping: Dict[str, Any] = {
-                "knowledge_base_id": knowledge_base_id,
-                "document_id": chunk.document_id,
-                "chunk_id": chunk.chunk_id,
-                "index_version": index_version,
-                "text": chunk.text,
-                "keywords": ",".join(tokenize(chunk.text)),
-                "block_types": ",".join(chunk.block_types),
-                "metadata": json.dumps(
-                    _metadata_for_chunk_storage(chunk.metadata), sort_keys=True
-                ),
-                "section_path": json.dumps(chunk.section_path),
-                "block_ids": json.dumps(chunk.block_ids),
-                "bboxes": json.dumps(chunk.bboxes),
-                "page_start": int(chunk.page_start),
-                "page_end": int(chunk.page_end),
-                "created_at": now_ts,
-                "updated_at": now_ts,
-            }
-            if embedding:
-                if len(embedding) != self.dimensions:
-                    raise ValueError("Embedding dimensions do not match RAG index")
-                mapping["embedding"] = _vector_to_bytes(embedding)
-            await self.client.hset(
-                self._chunk_key(chunk.chunk_id, knowledge_base_id), mapping=mapping
-            )
-            await self.client.sadd(
-                self._document_key(chunk.document_id, knowledge_base_id), chunk.chunk_id
-            )
-            await self.client.sadd(
-                self._document_kbs_key(chunk.document_id), knowledge_base_id
-            )
+        staging_set = self._staging_generation_key(
+            document_id, knowledge_base_id, index_version
+        )
+        staged_keys: List[Tuple[str, str, str]] = []
+        for batch_start in range(0, len(chunks), self.pipeline_batch_size):
+            pipeline = self.client.pipeline(transaction=False)
+            batch_end = batch_start + self.pipeline_batch_size
+            for chunk, embedding in zip(
+                chunks[batch_start:batch_end], embeddings[batch_start:batch_end]
+            ):
+                mapping = self._chunk_mapping(
+                    chunk,
+                    embedding,
+                    knowledge_base_id=knowledge_base_id,
+                    index_version=index_version,
+                    updated_at=now_ts,
+                )
+                staging_key = self._staging_chunk_key(
+                    chunk.chunk_id,
+                    knowledge_base_id,
+                    document_id,
+                    index_version,
+                )
+                live_key = self._chunk_key(chunk.chunk_id, knowledge_base_id)
+                pipeline.hset(staging_key, mapping=mapping)
+                pipeline.expire(staging_key, self.staging_ttl_seconds)
+                pipeline.sadd(staging_set, chunk.chunk_id)
+                pipeline.expire(staging_set, self.staging_ttl_seconds)
+                staged_keys.append((staging_key, live_key, chunk.chunk_id))
+            await pipeline.execute()
+
+        for chunk, visual_embedding in zip(chunks, visual_embeddings):
             await self._upsert_table_sidecars_from_chunk(
                 chunk,
                 knowledge_base_id=knowledge_base_id,
@@ -426,8 +494,60 @@ class RedisStackRagVectorStore:
                 index_version=index_version,
                 updated_at=now_ts,
             )
-            count += 1
-        return count
+        arguments: List[Any] = [
+            len(chunks),
+            knowledge_base_id,
+            index_version,
+            f"{self._chunk_prefix()}{knowledge_base_id}:",
+        ]
+        for staging_key, live_key, chunk_id in staged_keys:
+            arguments.extend([staging_key, live_key, chunk_id])
+        committed = await self.client.eval(
+            ATOMIC_GENERATION_COMMIT_LUA,
+            4,
+            staging_set,
+            self._document_key(document_id, knowledge_base_id),
+            self._document_kbs_key(document_id),
+            self._active_generation_key(document_id, knowledge_base_id),
+            *arguments,
+        )
+        if int(committed) != len(chunks):
+            raise RuntimeError("RAG generation cutover returned an unexpected count")
+        return len(chunks)
+
+    def _chunk_mapping(
+        self,
+        chunk: DocumentChunk,
+        embedding: Optional[Sequence[float]],
+        *,
+        knowledge_base_id: str,
+        index_version: str,
+        updated_at: float,
+    ) -> Dict[str, Any]:
+        mapping: Dict[str, Any] = {
+            "knowledge_base_id": knowledge_base_id,
+            "document_id": chunk.document_id,
+            "chunk_id": chunk.chunk_id,
+            "index_version": index_version,
+            "text": chunk.text,
+            "keywords": ",".join(tokenize(chunk.text)),
+            "block_types": ",".join(chunk.block_types),
+            "metadata": json.dumps(
+                _metadata_for_chunk_storage(chunk.metadata), sort_keys=True
+            ),
+            "section_path": json.dumps(chunk.section_path),
+            "block_ids": json.dumps(chunk.block_ids),
+            "bboxes": json.dumps(chunk.bboxes),
+            "page_start": int(chunk.page_start),
+            "page_end": int(chunk.page_end),
+            "created_at": updated_at,
+            "updated_at": updated_at,
+        }
+        if embedding:
+            if len(embedding) != self.dimensions:
+                raise ValueError("Embedding dimensions do not match RAG index")
+            mapping["embedding"] = _vector_to_bytes(embedding)
+        return mapping
 
     async def delete_document(
         self, document_id: str, knowledge_base_id: Optional[str] = None
@@ -849,6 +969,29 @@ class RedisStackRagVectorStore:
 
     def _chunk_key(self, chunk_id: str, knowledge_base_id: str) -> str:
         return f"{self._chunk_prefix()}{knowledge_base_id}:{chunk_id}"
+
+    def _generation_tag(self, document_id: str, knowledge_base_id: str) -> str:
+        return f"{{{knowledge_base_id}:{document_id}}}"
+
+    def _staging_generation_key(
+        self, document_id: str, knowledge_base_id: str, generation: str
+    ) -> str:
+        tag = self._generation_tag(document_id, knowledge_base_id)
+        return f"{self.key_prefix}:v2:{tag}:staging:{generation}:chunks"
+
+    def _staging_chunk_key(
+        self,
+        chunk_id: str,
+        knowledge_base_id: str,
+        document_id: str,
+        generation: str,
+    ) -> str:
+        tag = self._generation_tag(document_id, knowledge_base_id)
+        return f"{self.key_prefix}:v2:{tag}:staging:{generation}:chunk:{chunk_id}"
+
+    def _active_generation_key(self, document_id: str, knowledge_base_id: str) -> str:
+        tag = self._generation_tag(document_id, knowledge_base_id)
+        return f"{self.key_prefix}:v2:{tag}:active_generation"
 
     def _visual_chunk_prefix(self) -> str:
         return f"{self.key_prefix}:visual_chunk:"
@@ -1328,8 +1471,7 @@ def _escape_text_token(value: Any) -> str:
 
 
 def _new_index_version() -> str:
-    payload = f"{time.time_ns()}:{os.getpid()}".encode("utf-8")
-    return hashlib.sha1(payload).hexdigest()[:16]
+    return f"{time.time_ns():020d}-{os.getpid():08d}"
 
 
 def _vector_to_bytes(values: Sequence[float]) -> bytes:

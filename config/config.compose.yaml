@@ -263,12 +263,19 @@ rag:
     timeout: 30
     url: http://host.docker.internal:8002/v1
     api_key_env: OPENAI_API_KEY
+    batch_size: 32
+    max_concurrent_batches: 2
   redis:
     host: redis-stack
     port: 6379
     db: 0
     key_prefix: rag
     password_env: REDIS_PASSWORD
+    pipeline_batch_size: 64
+  indexing:
+    control_plane_version: v2
+    atomic_commit_max_chunks: 2000
+    staging_ttl_seconds: 86400
   ingestion_queue:
     enabled: false
     stream_key: rag:ingestion:stream

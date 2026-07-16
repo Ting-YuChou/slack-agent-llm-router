@@ -87,11 +87,17 @@ class EmbeddingProvider(Protocol):
     async def embed(self, text: str) -> List[float]:
         """Return an embedding for the supplied text."""
 
+    async def embed_many(self, texts: Sequence[str]) -> List[List[float]]:
+        """Return ordered embeddings for a bounded batch of text."""
+
 
 class NoOpEmbeddingProvider:
     """Embedding provider used when vector search is disabled or unavailable."""
 
     async def embed(self, text: str) -> List[float]:
+        raise RuntimeError("Embedding provider is disabled")
+
+    async def embed_many(self, texts: Sequence[str]) -> List[List[float]]:
         raise RuntimeError("Embedding provider is disabled")
 
 
@@ -112,6 +118,9 @@ class HashEmbeddingProvider:
             return vector
         return [value / norm for value in vector]
 
+    async def embed_many(self, texts: Sequence[str]) -> List[List[float]]:
+        return [await self.embed(text) for text in texts]
+
 
 class OpenAIEmbeddingProvider:
     """OpenAI embeddings provider with a narrow dependency surface."""
@@ -128,6 +137,9 @@ class OpenAIEmbeddingProvider:
         self.client = None
 
     async def embed(self, text: str) -> List[float]:
+        return (await self.embed_many([text]))[0]
+
+    async def embed_many(self, texts: Sequence[str]) -> List[List[float]]:
         if not self.api_key:
             raise RuntimeError("OpenAI embedding API key is not configured")
         if self.client is None:
@@ -140,9 +152,13 @@ class OpenAIEmbeddingProvider:
 
         response = await self.client.embeddings.create(
             model=self.model,
-            input=text,
+            input=list(texts),
         )
-        return list(response.data[0].embedding)
+        ordered = sorted(
+            enumerate(response.data),
+            key=lambda value: int(getattr(value[1], "index", value[0])),
+        )
+        return [list(item.embedding) for _, item in ordered]
 
 
 class LocalHttpEmbeddingProvider:
@@ -153,22 +169,36 @@ class LocalHttpEmbeddingProvider:
         self.url = config.get("url") or config.get("base_url")
         self.model = config.get("model")
         self.timeout = float(config.get("timeout", 10))
+        self.client = None
 
     async def embed(self, text: str) -> List[float]:
+        return (await self.embed_many([text]))[0]
+
+    async def embed_many(self, texts: Sequence[str]) -> List[List[float]]:
         if not self.url:
             raise RuntimeError("Local embedding URL is not configured")
         import httpx
 
-        payload = {"input": text}
+        payload = {"input": list(texts)}
         if self.model:
             payload["model"] = self.model
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.post(
-                str(self.url).rstrip("/") + "/embeddings", json=payload
-            )
-            response.raise_for_status()
-            data = response.json()
-        return list(data["data"][0]["embedding"])
+        if self.client is None:
+            self.client = httpx.AsyncClient(timeout=self.timeout)
+        response = await self.client.post(
+            str(self.url).rstrip("/") + "/embeddings", json=payload
+        )
+        response.raise_for_status()
+        data = response.json()
+        ordered = sorted(
+            enumerate(data["data"]),
+            key=lambda value: int(value[1].get("index", value[0])),
+        )
+        return [list(item["embedding"]) for _, item in ordered]
+
+    async def close(self) -> None:
+        if self.client is not None and hasattr(self.client, "aclose"):
+            await self.client.aclose()
+        self.client = None
 
 
 class MemoryStore(Protocol):

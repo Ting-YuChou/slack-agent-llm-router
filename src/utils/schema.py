@@ -1002,6 +1002,8 @@ class RagEmbeddingConfig(ConfigModel):
     api_key_env: Optional[str] = "OPENAI_API_KEY"
     base_url: Optional[str] = None
     url: Optional[str] = "http://127.0.0.1:8002/v1"
+    batch_size: int = Field(32, ge=1, le=2048)
+    max_concurrent_batches: int = Field(2, ge=1, le=32)
 
 
 class RagRedisConfig(ConfigModel):
@@ -1011,6 +1013,13 @@ class RagRedisConfig(ConfigModel):
     url: Optional[str] = None
     password_env: Optional[str] = None
     key_prefix: str = "rag"
+    pipeline_batch_size: int = Field(64, ge=1, le=1000)
+
+
+class RagIndexingConfig(ConfigModel):
+    control_plane_version: str = "v2"
+    atomic_commit_max_chunks: int = Field(2000, ge=1, le=10000)
+    staging_ttl_seconds: int = Field(86400, ge=60)
 
 
 class RagRetrievalConfig(ConfigModel):
@@ -1124,6 +1133,7 @@ class RagConfig(ConfigModel):
     chunking: RagChunkingConfig = Field(default_factory=RagChunkingConfig)
     embedding: RagEmbeddingConfig = Field(default_factory=RagEmbeddingConfig)
     redis: RagRedisConfig = Field(default_factory=RagRedisConfig)
+    indexing: RagIndexingConfig = Field(default_factory=RagIndexingConfig)
     retrieval: RagRetrievalConfig = Field(default_factory=RagRetrievalConfig)
     rerank: RagRerankConfig = Field(default_factory=RagRerankConfig)
     visual: RagVisualConfig = Field(default_factory=RagVisualConfig)
