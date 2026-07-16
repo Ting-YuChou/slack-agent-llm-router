@@ -45,6 +45,10 @@ JOB_STATUSES = {
 }
 
 
+class RagPayloadTooLarge(ValueError):
+    """Raised before an oversized RAG upload can enter parsing or indexing."""
+
+
 @dataclass
 class IngestionJob:
     """Ingestion job record surfaced by the API."""
@@ -190,6 +194,7 @@ class RagService:
         self.intent_gate_config = dict(self.config.get("intent_gate", {}) or {})
         self.queue_config = dict(self.config.get("ingestion_queue", {}) or {})
         self.storage_config = dict(self.config.get("storage", {}) or {})
+        self.upload_config = dict(self.config.get("upload", {}) or {})
         self.job_ttl_seconds = int(self.config.get("job_ttl_seconds", 86400))
         self.queue_enabled = bool(self.queue_config.get("enabled", False))
         self.stream_key = str(
@@ -216,6 +221,12 @@ class RagService:
             0.0, float(self.queue_config.get("retry_backoff_seconds", 30))
         )
         self.stream_maxlen = int(self.queue_config.get("stream_maxlen", 10000))
+        self.heartbeat_interval_seconds = float(
+            self.queue_config.get("heartbeat_interval_seconds", 5)
+        )
+        self.heartbeat_ttl_seconds = int(
+            self.queue_config.get("heartbeat_ttl_seconds", 15)
+        )
         self.staging_dir = Path(
             self.storage_config.get("staging_dir") or "data/rag/uploads"
         )
@@ -252,6 +263,9 @@ class RagService:
         if not self.enabled:
             return
         await self.vector_store.shutdown()
+        close_embedding_provider = getattr(self.embedding_provider, "close", None)
+        if callable(close_embedding_provider):
+            await close_embedding_provider()
         self._initialized = False
 
     def is_healthy(self) -> bool:
@@ -333,7 +347,7 @@ class RagService:
         self,
         job_id: str,
         *,
-        content: bytes,
+        content: Optional[bytes],
         filename: str,
         knowledge_base_id: str,
         metadata: Optional[Dict[str, Any]] = None,
@@ -424,8 +438,38 @@ class RagService:
     ) -> List[RagSearchResult]:
         if not self.enabled:
             return []
-        embedding = await self._safe_embed(query)
-        visual_embedding = await self._safe_visual_query_embed(query)
+        deadline_seconds = max(
+            0.001, float(self.retrieval_config.get("deadline_seconds", 30))
+        )
+        try:
+            async with asyncio.timeout(deadline_seconds):
+                return await self._retrieve_within_deadline(
+                    query,
+                    knowledge_base_ids=knowledge_base_ids,
+                    max_results=max_results,
+                    candidate_count=candidate_count,
+                    min_score=min_score,
+                )
+        except TimeoutError:
+            logger.warning(
+                "RAG retrieval exceeded its %.3fs shared deadline",
+                deadline_seconds,
+            )
+            return []
+
+    async def _retrieve_within_deadline(
+        self,
+        query: str,
+        *,
+        knowledge_base_ids: Optional[Sequence[str]] = None,
+        max_results: Optional[int] = None,
+        candidate_count: Optional[int] = None,
+        min_score: Optional[float] = None,
+    ) -> List[RagSearchResult]:
+        embedding, visual_embedding = await asyncio.gather(
+            self._safe_embed(query),
+            self._safe_visual_query_embed(query),
+        )
         effective_kbs = self._effective_knowledge_base_ids(knowledge_base_ids)
         top_k = int(max_results or self.retrieval_config.get("top_k", 5))
         first_stage_candidate_count = int(
@@ -645,6 +689,17 @@ class RagService:
         if not documents:
             raise ValueError("batch documents must not be empty")
 
+        decoded_limit = int(
+            self.upload_config.get("json_max_decoded_bytes", 10_000_000)
+        )
+        # Validate every inline document before creating the manifest or enqueueing
+        # any jobs. This prevents an oversized later item from leaving a partial
+        # batch behind.
+        for item in documents:
+            encoded = item.get("content_base64")
+            if encoded:
+                decode_base64_document(str(encoded), max_decoded_bytes=decoded_limit)
+
         batch_id = str(uuid.uuid4())
         resolved_kb_id = knowledge_base_id or self._default_write_kb()
         batch = IngestionBatch(
@@ -666,7 +721,10 @@ class RagService:
             }
             content = item.get("content")
             if content is None and item.get("content_base64"):
-                content = decode_base64_document(str(item["content_base64"]))
+                content = decode_base64_document(
+                    str(item["content_base64"]),
+                    max_decoded_bytes=decoded_limit,
+                )
             job = await self.queue_document_ingestion(
                 content=content,
                 storage_ref=item.get("storage_ref"),
@@ -758,11 +816,52 @@ class RagService:
             )
             for index in range(self.worker_count)
         ]
+        worker_id = f"{socket.gethostname()}-{os.getpid()}"
+        heartbeat = asyncio.create_task(
+            self._worker_heartbeat_loop(worker_id),
+            name="rag_ingestion_worker_heartbeat",
+        )
+        tasks = [*workers, heartbeat]
         try:
-            await asyncio.gather(*workers)
+            await asyncio.gather(*tasks)
         finally:
-            for worker in workers:
-                worker.cancel()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _worker_heartbeat_loop(self, worker_id: str) -> None:
+        client = self._job_client()
+        if not client:
+            raise RuntimeError("Redis client is required for RAG worker heartbeat")
+        key = self._prefixed_key(f"worker:heartbeat:{worker_id}")
+        consecutive_failures = 0
+        failure_limit = max(
+            2,
+            int(self.heartbeat_ttl_seconds / self.heartbeat_interval_seconds),
+        )
+        while True:
+            try:
+                await client.set(
+                    key,
+                    datetime.now().isoformat(),
+                    ex=self.heartbeat_ttl_seconds,
+                )
+                consecutive_failures = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                consecutive_failures += 1
+                logger.warning(
+                    "RAG worker heartbeat failed (%d/%d)",
+                    consecutive_failures,
+                    failure_limit,
+                    exc_info=True,
+                )
+                if consecutive_failures >= failure_limit:
+                    raise RuntimeError(
+                        "RAG worker heartbeat exceeded its Redis failure limit"
+                    )
+            await asyncio.sleep(self.heartbeat_interval_seconds)
 
     async def _worker_loop(self, consumer_name: str):
         semaphore = asyncio.Semaphore(self.worker_concurrency)
@@ -961,16 +1060,72 @@ class RagService:
     async def _embed_chunks(
         self, chunks: Sequence[DocumentChunk]
     ) -> tuple[List[Optional[List[float]]], List[str]]:
-        embeddings = []
-        failures = 0
-        for chunk in chunks:
-            if chunk.metadata.get("is_figure") and not chunk.text.strip():
-                embeddings.append(None)
-                continue
-            embedding = await self._safe_embed(chunk.text)
-            if embedding is None:
-                failures += 1
-            embeddings.append(embedding)
+        embeddings: List[Optional[List[float]]] = [None] * len(chunks)
+        eligible = [
+            (index, chunk.text)
+            for index, chunk in enumerate(chunks)
+            if not (chunk.metadata.get("is_figure") and not chunk.text.strip())
+        ]
+        embed_many = getattr(self.embedding_provider, "embed_many", None)
+        batch_size = max(1, int(self.embedding_config.get("batch_size", 32)))
+        max_concurrency = max(
+            1, int(self.embedding_config.get("max_concurrent_batches", 2))
+        )
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        async def embed_batch(
+            batch: Sequence[tuple[int, str]],
+        ) -> tuple[Sequence[tuple[int, str]], List[Optional[List[float]]]]:
+            async with semaphore:
+                if callable(embed_many):
+                    try:
+                        values = await asyncio.wait_for(
+                            embed_many([text for _, text in batch]),
+                            timeout=float(self.embedding_config.get("timeout", 30)),
+                        )
+                        if len(values) != len(batch):
+                            raise ValueError("embedding batch response length mismatch")
+                        return batch, [list(value) for value in values]
+                    except Exception as exc:
+                        logger.info(
+                            "RAG embedding batch unavailable; retrying scalar: %s",
+                            exc,
+                        )
+                        scalar_values: List[Optional[List[float]]] = []
+                        for _, text in batch:
+                            try:
+                                value = await asyncio.wait_for(
+                                    self.embedding_provider.embed(text),
+                                    timeout=float(
+                                        self.embedding_config.get("timeout", 30)
+                                    ),
+                                )
+                            except Exception as scalar_exc:
+                                raise RuntimeError(
+                                    "scalar embedding fallback failed after batch error"
+                                ) from scalar_exc
+                            if value is None:
+                                raise RuntimeError(
+                                    "scalar embedding fallback failed after batch error"
+                                )
+                            scalar_values.append(list(value))
+                        return batch, scalar_values
+                values = []
+                for _, text in batch:
+                    values.append(await self._safe_embed(text))
+                return batch, values
+
+        batches = [
+            eligible[index : index + batch_size]
+            for index in range(0, len(eligible), batch_size)
+        ]
+        for batch, values in await asyncio.gather(
+            *(embed_batch(batch) for batch in batches)
+        ):
+            for (chunk_index, _), value in zip(batch, values):
+                embeddings[chunk_index] = value
+
+        failures = sum(1 for index, _ in eligible if embeddings[index] is None)
         warnings = []
         if failures:
             warnings.append(
@@ -1192,6 +1347,70 @@ class RagService:
         target.write_bytes(content)
         return str(target)
 
+    async def stage_uploaded_file(
+        self,
+        upload: Any,
+        *,
+        filename: str,
+        knowledge_base_id: str,
+        document_id: str,
+    ) -> str:
+        """Stream an upload to disk and publish it with an atomic rename."""
+        safe_filename = _safe_path_component(filename or "document.pdf")
+        safe_kb = _safe_path_component(knowledge_base_id)
+        safe_document = _safe_path_component(document_id)
+        target_dir = self.staging_dir / safe_kb / safe_document
+        target_dir.mkdir(parents=True, exist_ok=True)
+        temporary = target_dir / f".{uuid.uuid4().hex}-{safe_filename}.part"
+        max_bytes = int(self.upload_config.get("multipart_max_bytes", 100_000_000))
+        chunk_bytes = max(
+            1, int(self.upload_config.get("stream_chunk_bytes", 1_048_576))
+        )
+        digest = hashlib.sha256()
+        size = 0
+        published = False
+        target: Optional[Path] = None
+        target_existed = False
+        try:
+            with temporary.open("xb") as staged_file:
+                while True:
+                    chunk = await upload.read(chunk_bytes)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise RagPayloadTooLarge(
+                            "Multipart document exceeds the configured RAG upload limit"
+                        )
+                    digest.update(chunk)
+                    await asyncio.to_thread(staged_file.write, chunk)
+                await asyncio.to_thread(staged_file.flush)
+                await asyncio.to_thread(os.fsync, staged_file.fileno())
+            target = target_dir / f"{digest.hexdigest()}-{safe_filename}"
+            target_existed = target.exists()
+            if target_existed:
+                temporary.unlink(missing_ok=True)
+                published = True
+                return str(target)
+            publish_task = asyncio.create_task(
+                asyncio.to_thread(os.replace, temporary, target)
+            )
+            try:
+                await asyncio.shield(publish_task)
+            except asyncio.CancelledError:
+                # The thread cannot be cancelled once os.replace has started. Wait
+                # for its deterministic outcome, then remove an otherwise
+                # unreferenced target before propagating cancellation.
+                await publish_task
+                if not target_existed:
+                    target.unlink(missing_ok=True)
+                raise
+            published = True
+            return str(target)
+        finally:
+            if not published:
+                temporary.unlink(missing_ok=True)
+
     def load_staged_content(self, storage_ref: Optional[str]) -> bytes:
         if not storage_ref:
             raise ValueError("storage_ref is required for queued ingestion")
@@ -1305,11 +1524,25 @@ class RagService:
         return self._prefixed_key(f"batch:{batch_id}:jobs")
 
 
-def decode_base64_document(payload: str) -> bytes:
+def decode_base64_document(
+    payload: str, *, max_decoded_bytes: Optional[int] = None
+) -> bytes:
+    if max_decoded_bytes is not None:
+        padding = len(payload) - len(payload.rstrip("="))
+        estimated_size = (len(payload) * 3) // 4 - padding
+        if estimated_size > max_decoded_bytes:
+            raise RagPayloadTooLarge(
+                "JSON document exceeds the configured decoded RAG upload limit"
+            )
     try:
-        return base64.b64decode(payload.encode("utf-8"), validate=True)
+        decoded = base64.b64decode(payload.encode("utf-8"), validate=True)
     except (binascii.Error, ValueError) as exc:
         raise ValueError("content_base64 must be valid base64") from exc
+    if max_decoded_bytes is not None and len(decoded) > max_decoded_bytes:
+        raise RagPayloadTooLarge(
+            "JSON document exceeds the configured decoded RAG upload limit"
+        )
+    return decoded
 
 
 def _decode(value: Any) -> str:

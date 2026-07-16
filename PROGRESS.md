@@ -1,5 +1,48 @@
 # Project Progress
 
+## 2026-07-16 — RAG hot-path review hardening
+
+- Correctness: embedding batch failures now retry through the scalar provider and fail ingestion before cutover if any required vector remains unavailable. Redis stages chunks plus table, row, figure, and visual resources under one document hash tag, validates every staging key, and switches them in one Lua execution; stale generations return a distinct result and cannot mutate the active document.
+- Resilience: one monotonic retrieval deadline now covers query embeddings, Redis branches, and reranking, with unconditional branch-task cleanup. JSON batches enforce the decoded 10 MB limit before creating any job and return HTTP 413. Multipart publication is cancellation-safe, and worker heartbeat failures are retried then propagated to the Compose restart supervisor.
+- Rollout: `docker compose --profile rag up` now auto-loads the RAG API/worker wiring and healthcheck. V1 and v2 RediSearch hashes use disjoint roots so rolling deployment cannot double-index a chunk. The v2 key migration is dry-run by default and uses persisted copy, validation, pause, delta-copy, switch, resume, and rollback phases; rollback reverse-copies and validates post-cutover v2 writes into v1 while paused before switching. Apply requires explicit idempotent operator hooks and failed rollback remains paused.
+- Measured production paths: for 1,000 chunks, embedding requests fell from 1,000 to 32 (96.8%), observed Redis waits from 1,006 to 22 (97.81%), and complete `RagService.ingest_document` time from 1.586 s to 0.141 s (11.25x throughput). Production `RagService.retrieve` p95 fell from 34.86 ms to 22.25 ms (36.18%) under a disclosed fixed 10 ms Redis RTT, preserving result order. A real uvicorn `/rag/documents` request streamed by curl increased sampled server RSS by 4.73 MB for a 100 MB upload. All gates completed with zero errors.
+- Verification: deterministic stale-writer and sidecar-fault tests, real Redis generation/migration tests, migration dry-run, and the performance contract passed. The complete suite passed with local Redis services (`534 passed, 4 skipped`); touched-file Black and Flake8, configured mypy, compileall, Compose config, and `git diff --check` passed. The production worker image built successfully, remained healthy under the exact RAG profile, completed a real text/hash ingestion job, promoted one forced failure through retry, and wrote exactly one dead-letter event after attempt two.
+
+## 2026-07-16 — RAG hot-path performance contracts
+
+- Added: a fail-closed 1,000-chunk benchmark that directly exercises production embedding batching, Redis generation indexing, retrieval branch orchestration, and 100 MB streaming staging. Contract tests reject regressions below the agreed request/wait/throughput/p95/RSS thresholds.
+- Measured: embedding calls fell from 1,000 to 32 (96.8%); Redis network waits fell from 3,000 to 17 (99.43%); combined ingestion throughput improved 15.06x; retrieval p95 fell from 36.51 ms to 12.54 ms (65.65%); the 100 MB streaming upload increased peak RSS by 10.13 MB. The workload completed with zero errors.
+- Real Redis: all four Redis Stack integration scenarios passed after correcting exact `RETURN` projections and stale table/figure/visual sidecar cleanup (`21 passed` with the hot-path suite).
+- Runtime note: the production RAG worker image build was started but intentionally stopped while its first-time Docling/Torch dependency layer was downloading a 427 MB Torch wheel plus accelerator packages; Compose runtime health and live job retry/dead-letter still require that heavyweight build to finish.
+- Verification: full test suite passed with local Redis services (`514 passed, 4 skipped`); full Black and Flake8 checks, configured mypy, compileall, migration dry-run, and `git diff --check` passed.
+
+## 2026-07-16 — Streaming RAG upload staging
+
+- Changed: multipart files are read in 1 MiB chunks into a same-directory `.part` file, with incremental SHA-256/size accounting, fsync, and atomic rename. Cancellation, read/write failure, and the 100 MB limit remove the partial file. JSON base64 is capped at 10 MB decoded before decode/allocation proceeds.
+- API: oversized uploads return HTTP 413 with `rag_payload_too_large`; both queued and queue-disabled background ingestion receive a durable `storage_ref` instead of retaining a multipart body in request memory.
+- Verification: RED/GREEN tests cover fixed-size reads, byte fidelity, atomic publication, overflow cleanup, decoded base64 boundaries, schema preservation, API 413 behavior, and queue-disabled storage-ref handoff. RAG/API/schema scoped regression passed (`126 passed`).
+- Follow-up: real 100 MB RSS measurement, real Redis fault injection, compose worker smoke, and full-suite verification remain.
+
+## 2026-07-16 — Parallel RAG retrieval and bounded result payloads
+
+- Changed: text and visual query embeddings now start together; Redis keyword, vector, and visual branches run with a three-branch bound and one shared 30-second deadline. Branch failures degrade only that source and merge order remains keyword/vector/visual deterministic.
+- Payload: keyword and vector `FT.SEARCH` projections no longer return or deserialize the unused embedding vector, removing 1024-float payloads from the default 30-candidate read path.
+- Verification: RED/GREEN concurrency tests require both embedding paths and all three retrieval branches to be in flight together, cover isolated branch failure, and inspect production Redis commands for omitted embedding fields. Scoped RAG regression passed (`39 passed`).
+- Follow-up: streaming upload staging and end-to-end performance contracts remain.
+
+## 2026-07-16 — Batched RAG embedding and atomic generation indexing
+
+- Changed: added ordered multi-input embedding calls for OpenAI and local HTTP providers, bounded 32-item/2-concurrent batching with scalar-provider compatibility, and a reusable local HTTP client. Redis ingestion now stages chunks in 64-item pipelines and performs one verified Lua cutover without deleting the prior document first; generation keys expire after 24 hours and documents above the 2,000-chunk atomic bound fail before writes.
+- Rollout: RediSearch index names are versioned under `v2`; the dry-run-first migration command creates and validates the new index while retaining the legacy index and existing chunk hashes.
+- Verification: RED/GREEN tests cover 1,000-chunk batching/order, isolated batch failure, provider wire format/client reuse, pipeline count, staging-only writes, single atomic cutover, atomic size limit, and validated config. RAG/schema scoped regression passed (`77 passed`).
+- Follow-up: retrieval parallelism, upload streaming, real Redis fault injection, and performance contracts remain.
+
+## 2026-07-16 — Operational RAG worker profile
+
+- Changed: added explicit Docker environment overrides for RAG and its ingestion queue, a Compose overlay that enables both API and worker against Redis Stack, and a TTL-backed worker heartbeat used by the container healthcheck.
+- Verification: new RED/GREEN tests cover environment wiring, overlay dependencies, and repeated heartbeat refresh; RAG/API/schema regression passed (`86 passed`), along with touched-file Black and `git diff --check`.
+- Follow-up: embedding batching, atomic generation indexing, parallel retrieval, and streaming uploads remain in the next phases.
+
 ## 2026-07-14 — Redis control-plane performance gates and v1 cleanup
 
 - Changed: added a real-Redis control-plane benchmark, dry-run-first v1 provider queue cleanup, and a per-process/provider polling coordinator that uses Redis-assigned queue scores while waking only the next local waiter. Redis transport timeouts no longer count healthy client/server queue delay as a socket blackhole.

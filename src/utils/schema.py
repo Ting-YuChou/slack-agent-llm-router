@@ -1002,6 +1002,8 @@ class RagEmbeddingConfig(ConfigModel):
     api_key_env: Optional[str] = "OPENAI_API_KEY"
     base_url: Optional[str] = None
     url: Optional[str] = "http://127.0.0.1:8002/v1"
+    batch_size: int = Field(32, ge=1, le=2048)
+    max_concurrent_batches: int = Field(2, ge=1, le=32)
 
 
 class RagRedisConfig(ConfigModel):
@@ -1011,6 +1013,13 @@ class RagRedisConfig(ConfigModel):
     url: Optional[str] = None
     password_env: Optional[str] = None
     key_prefix: str = "rag"
+    pipeline_batch_size: int = Field(64, ge=1, le=1000)
+
+
+class RagIndexingConfig(ConfigModel):
+    control_plane_version: str = "v2"
+    atomic_commit_max_chunks: int = Field(2000, ge=1, le=10000)
+    staging_ttl_seconds: int = Field(86400, ge=60)
 
 
 class RagRetrievalConfig(ConfigModel):
@@ -1023,6 +1032,8 @@ class RagRetrievalConfig(ConfigModel):
     vector_weight: float = Field(0.6, ge=0.0)
     recency_weight: float = Field(0.05, ge=0.0)
     max_context_chars: int = Field(6000, ge=500)
+    max_concurrent_branches: int = Field(3, ge=1, le=3)
+    deadline_seconds: float = Field(30.0, gt=0.0, le=300.0)
 
 
 class RagRerankConfig(ConfigModel):
@@ -1054,12 +1065,20 @@ class RagIngestionQueueConfig(ConfigModel):
     max_attempts: int = Field(3, ge=1)
     retry_backoff_seconds: float = Field(30.0, ge=0.0)
     stream_maxlen: int = Field(10000, ge=0)
+    heartbeat_interval_seconds: float = Field(5.0, gt=0.0)
+    heartbeat_ttl_seconds: int = Field(15, ge=1)
 
 
 class RagStorageConfig(ConfigModel):
     staging_dir: str = "data/rag/uploads"
     cleanup_completed_files: bool = False
     completed_file_ttl_seconds: int = Field(86400, ge=0)
+
+
+class RagUploadConfig(ConfigModel):
+    json_max_decoded_bytes: int = Field(10_000_000, ge=1)
+    multipart_max_bytes: int = Field(100_000_000, ge=1)
+    stream_chunk_bytes: int = Field(1_048_576, ge=1024, le=16_777_216)
 
 
 class RagVisualProviderConfig(ConfigModel):
@@ -1122,6 +1141,7 @@ class RagConfig(ConfigModel):
     chunking: RagChunkingConfig = Field(default_factory=RagChunkingConfig)
     embedding: RagEmbeddingConfig = Field(default_factory=RagEmbeddingConfig)
     redis: RagRedisConfig = Field(default_factory=RagRedisConfig)
+    indexing: RagIndexingConfig = Field(default_factory=RagIndexingConfig)
     retrieval: RagRetrievalConfig = Field(default_factory=RagRetrievalConfig)
     rerank: RagRerankConfig = Field(default_factory=RagRerankConfig)
     visual: RagVisualConfig = Field(default_factory=RagVisualConfig)
@@ -1130,6 +1150,7 @@ class RagConfig(ConfigModel):
         default_factory=RagIngestionQueueConfig
     )
     storage: RagStorageConfig = Field(default_factory=RagStorageConfig)
+    upload: RagUploadConfig = Field(default_factory=RagUploadConfig)
 
     @field_validator("backend")
     @classmethod
