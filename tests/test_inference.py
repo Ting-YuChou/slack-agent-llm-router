@@ -32,7 +32,7 @@ from src.utils.schema import (
 )
 from src.rag.chunker import DocumentChunk
 from src.rag.vector_store import RagSearchResult
-from src.provider_scheduler import RequestExecutionBudget
+from src.provider_scheduler import CircuitPermit, RequestExecutionBudget, SchedulerLease
 
 
 class RecordingAdmissionController:
@@ -1760,6 +1760,260 @@ class TestInferenceEngine:
         assert [call["model_name"] for call in admission.provider_calls] == ["gpt-5"]
         assert len(admission.releases) == 1
         assert admission.releases[0][1] is None
+
+    @pytest.mark.asyncio
+    async def test_stream_query_records_success_with_acquired_circuit_permit(
+        self, inference_config, sample_query_request
+    ):
+        class StreamingProvider:
+            provider_name = "openai"
+
+            async def stream_response(self, _request, _model_name):
+                yield "ok"
+
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="gpt-5")
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+        engine = InferenceEngine(inference_config, router)
+        engine.providers = {"openai": StreamingProvider()}
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+        permit = CircuitPermit(
+            epoch=7, probe=True, provider="openai", model_name="gpt-5"
+        )
+        lease = SchedulerLease(
+            provider="openai", model_name="gpt-5", circuit_permit=permit
+        )
+        engine.scheduler.acquire = AsyncMock(return_value=lease)
+        engine.scheduler.record_success = AsyncMock()
+        engine.scheduler.record_failure = AsyncMock()
+        engine.scheduler.release = AsyncMock(return_value=True)
+
+        chunks = [chunk async for chunk in engine.stream_query(sample_query_request)]
+
+        assert chunks == ["ok"]
+        success = engine.scheduler.record_success.await_args.kwargs
+        assert success["circuit_permit"] is permit
+        assert isinstance(success["request_started_at_ms"], int)
+        engine.scheduler.record_failure.assert_not_awaited()
+        engine.scheduler.release.assert_awaited_once_with(lease, actual_tokens=None)
+
+    @pytest.mark.asyncio
+    async def test_completed_stream_survives_circuit_success_write_failure(
+        self, inference_config, sample_query_request
+    ):
+        class StreamingProvider:
+            provider_name = "openai"
+
+            async def stream_response(self, _request, _model_name):
+                yield "complete"
+
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="gpt-5")
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+        config = {
+            **inference_config,
+            "scheduler": {
+                "failure_mode": "closed",
+                "circuit_breaker": {"enabled": True},
+            },
+        }
+        engine = InferenceEngine(config, router)
+        engine.providers = {"openai": StreamingProvider()}
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+        permit = CircuitPermit(
+            epoch=4, probe=False, provider="openai", model_name="gpt-5"
+        )
+        lease = SchedulerLease(
+            provider="openai", model_name="gpt-5", circuit_permit=permit
+        )
+        engine.scheduler.acquire = AsyncMock(return_value=lease)
+        engine.scheduler._circuit_transition = AsyncMock(
+            side_effect=ConnectionError("redis failed after completed stream")
+        )
+        engine.scheduler.record_failure = AsyncMock(
+            wraps=engine.scheduler.record_failure
+        )
+        engine.scheduler.release = AsyncMock(return_value=True)
+
+        chunks = [chunk async for chunk in engine.stream_query(sample_query_request)]
+
+        assert chunks == ["complete"]
+        engine.scheduler.record_failure.assert_not_awaited()
+        engine.scheduler.release.assert_awaited_once_with(lease, actual_tokens=None)
+
+    @pytest.mark.asyncio
+    async def test_stream_query_half_open_probe_success_closes_circuit(
+        self, inference_config, sample_query_request
+    ):
+        class StreamingProvider:
+            provider_name = "openai"
+
+            async def stream_response(self, _request, _model_name):
+                yield "ok"
+
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="gpt-5")
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+        config = {
+            **inference_config,
+            "scheduler": {
+                "failure_mode": "open",
+                "circuit_breaker": {"enabled": True, "failure_threshold": 1},
+            },
+        }
+        engine = InferenceEngine(
+            config, router, admission_controller=RecordingAdmissionController()
+        )
+        engine.providers = {"openai": StreamingProvider()}
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+        await engine.scheduler._write_circuit_state(
+            "openai",
+            "gpt-5",
+            {"state": "half_open", "epoch": 3, "failure_count": 1},
+        )
+
+        chunks = [chunk async for chunk in engine.stream_query(sample_query_request)]
+
+        assert chunks == ["ok"]
+        state = await engine.scheduler._read_circuit_state("openai", "gpt-5")
+        assert state["state"] == "closed"
+        assert state["failure_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_stream_query_records_retryable_provider_failure_with_permit(
+        self, inference_config, sample_query_request
+    ):
+        class FailingProvider:
+            provider_name = "openai"
+
+            async def stream_response(self, _request, _model_name):
+                raise RuntimeError("503 temporarily overloaded")
+                yield  # pragma: no cover
+
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="gpt-5")
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+        engine = InferenceEngine(inference_config, router)
+        engine.providers = {"openai": FailingProvider()}
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+        permit = CircuitPermit(
+            epoch=8, probe=True, provider="openai", model_name="gpt-5"
+        )
+        lease = SchedulerLease(
+            provider="openai", model_name="gpt-5", circuit_permit=permit
+        )
+        engine.scheduler.acquire = AsyncMock(return_value=lease)
+        engine.scheduler.record_success = AsyncMock()
+        engine.scheduler.record_failure = AsyncMock()
+        engine.scheduler.release = AsyncMock(return_value=True)
+
+        chunks = [chunk async for chunk in engine.stream_query(sample_query_request)]
+
+        assert chunks == ["Error: Request processing failed"]
+        failure = engine.scheduler.record_failure.await_args.kwargs
+        assert isinstance(failure["error"], RuntimeError)
+        assert failure["circuit_permit"] is permit
+        assert isinstance(failure["request_started_at_ms"], int)
+        engine.scheduler.record_success.assert_not_awaited()
+        engine.scheduler.release.assert_awaited_once_with(lease, actual_tokens=None)
+
+    @pytest.mark.asyncio
+    async def test_stream_query_half_open_retryable_failure_reopens_circuit(
+        self, inference_config, sample_query_request
+    ):
+        class FailingProvider:
+            provider_name = "openai"
+
+            async def stream_response(self, _request, _model_name):
+                raise RuntimeError("503 temporarily overloaded")
+                yield  # pragma: no cover
+
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="gpt-5")
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+        config = {
+            **inference_config,
+            "scheduler": {
+                "failure_mode": "open",
+                "circuit_breaker": {
+                    "enabled": True,
+                    "failure_threshold": 5,
+                    "recovery_timeout_ms": 1000,
+                },
+            },
+        }
+        engine = InferenceEngine(
+            config, router, admission_controller=RecordingAdmissionController()
+        )
+        engine.providers = {"openai": FailingProvider()}
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+        await engine.scheduler._write_circuit_state(
+            "openai",
+            "gpt-5",
+            {
+                "state": "half_open",
+                "epoch": 3,
+                "failure_count": 1,
+                "probe_count": 0,
+            },
+        )
+
+        chunks = [chunk async for chunk in engine.stream_query(sample_query_request)]
+
+        assert chunks == ["Error: Request processing failed"]
+        state = await engine.scheduler._read_circuit_state("openai", "gpt-5")
+        assert state["state"] == "open"
+        assert state["failure_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_stream_query_cancellation_releases_without_recording_failure(
+        self, inference_config, sample_query_request
+    ):
+        started = asyncio.Event()
+
+        class BlockingProvider:
+            provider_name = "openai"
+
+            async def stream_response(self, _request, _model_name):
+                started.set()
+                await asyncio.Event().wait()
+                yield  # pragma: no cover
+
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="gpt-5")
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+        engine = InferenceEngine(inference_config, router)
+        engine.providers = {"openai": BlockingProvider()}
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+        lease = SchedulerLease(provider="openai", model_name="gpt-5")
+        engine.scheduler.acquire = AsyncMock(return_value=lease)
+        engine.scheduler.record_success = AsyncMock()
+        engine.scheduler.record_failure = AsyncMock()
+        engine.scheduler.release = AsyncMock(return_value=True)
+
+        async def consume():
+            return [chunk async for chunk in engine.stream_query(sample_query_request)]
+
+        task = asyncio.create_task(consume())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        engine.scheduler.record_failure.assert_not_awaited()
+        engine.scheduler.release.assert_awaited_once_with(lease, actual_tokens=None)
 
     @pytest.mark.asyncio
     async def test_stream_query_scheduler_rejection_skips_provider_stream(

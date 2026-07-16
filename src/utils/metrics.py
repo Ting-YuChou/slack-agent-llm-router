@@ -173,6 +173,22 @@ class AdmissionMetrics:
             buckets=[0.0, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
         )
 
+        self.fast_path = Counter(
+            "llm_router_admission_fast_path_total",
+            "Admission fast-path outcomes",
+            ["stage", "outcome"],
+        )
+        self.queue_polls = Counter(
+            "llm_router_admission_queue_polls_total",
+            "Admission queue polling attempts",
+            ["stage"],
+        )
+        self.queue_pruned = Counter(
+            "llm_router_admission_queue_pruned_total",
+            "Expired admission queue members pruned",
+            ["scope"],
+        )
+
         self.active_reservations = Gauge(
             "llm_router_admission_active_reservations",
             "Active admission reservations held by this process",
@@ -189,6 +205,24 @@ class AdmissionMetrics:
             "llm_router_admission_redis_errors_total",
             "Redis errors in admission control",
             ["operation"],
+        )
+
+        self.redis_recovery = Counter(
+            "llm_router_admission_redis_recovery_total",
+            "Redis admission recovery attempts and outcomes",
+            ["outcome"],
+        )
+
+        self.redis_state = Gauge(
+            "llm_router_admission_redis_state",
+            "Redis admission connection state (1 for the current state)",
+            ["state"],
+        )
+
+        self.redis_pool_exhaustion = Counter(
+            "llm_router_admission_redis_pool_exhaustion_total",
+            "Redis admission connection-pool exhaustion events",
+            ["operation", "failure_mode"],
         )
 
         self.http_connections = Gauge(
@@ -362,6 +396,17 @@ class InferenceMetrics:
             "Provider scheduler queue wait time",
             ["provider", "model"],
             buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
+        )
+
+        self.scheduler_queue_polls = Counter(
+            "llm_router_provider_scheduler_queue_polls_total",
+            "Provider scheduler queue polling attempts",
+            ["provider", "model"],
+        )
+        self.scheduler_queue_pruned = Counter(
+            "llm_router_provider_scheduler_queue_pruned_total",
+            "Expired provider scheduler queue members pruned",
+            ["provider", "model"],
         )
 
         self.scheduler_circuit_state = Gauge(
@@ -1017,7 +1062,7 @@ class SlidingWindowCounter:
 
     def __init__(self, window_size: int = 3600):  # 1 hour default
         self.window_size = window_size
-        self.values = []
+        self.values: List[tuple[float, float]] = []
         self._lock = threading.Lock()
 
     def inc(self, amount: float = 1.0):

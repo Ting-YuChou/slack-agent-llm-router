@@ -18,3 +18,4 @@ prometheus-client==0.21.0
 python-json-logger==2.0.7
 structlog==24.4.0
 psutil==6.0.0
+redis==5.0.8

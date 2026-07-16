@@ -14,21 +14,84 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 import redis.asyncio as redis
+from redis.exceptions import MaxConnectionsError
 
 from src.utils.metrics import ADMISSION_METRICS
 
 
 logger = logging.getLogger(__name__)
 
+QUEUE_PRIORITY_STRIDE = 1_000_000_000_000
+
 
 ADMIT_SCRIPT = """
--- admission:admit
+-- admission:atomic_admit
+local queue_enabled = tonumber(ARGV[1])
+local queue_member = ARGV[2]
+local queue_score = tonumber(ARGV[3])
+local queue_expiry_ms = tonumber(ARGV[4])
+local queue_enqueue = tonumber(ARGV[5])
+local queue_max_depth = tonumber(ARGV[6])
+local queue_depth = 0
+local pruned_count = 0
+
+if queue_enabled == 1 then
+    local queue_order_key = KEYS[#KEYS - 3]
+    local queue_expiry_key = KEYS[#KEYS - 2]
+    local queue_depth_key = KEYS[#KEYS - 1]
+    local queue_sequence_key = KEYS[#KEYS]
+    queue_depth = tonumber(redis.call("GET", queue_depth_key) or "0")
+    if queue_depth > 0 then
+        local expired = redis.call("ZRANGEBYSCORE", queue_expiry_key, "-inf", tonumber(ARGV[9]))
+        for _, member in ipairs(expired) do
+            local removed = redis.call("ZREM", queue_order_key, member)
+            redis.call("ZREM", queue_expiry_key, member)
+            if removed == 1 then
+                queue_depth = math.max(0, queue_depth - 1)
+                pruned_count = pruned_count + 1
+            end
+        end
+        if queue_depth == 0 then
+            redis.call("DEL", queue_depth_key)
+            redis.call("DEL", queue_sequence_key)
+        else
+            redis.call("SET", queue_depth_key, queue_depth)
+        end
+    end
+    if queue_enqueue == 0 and queue_depth > 0 then
+        return {0, "queue_required", 0, queue_order_key, queue_depth, pruned_count, queue_score}
+    end
+    if queue_enqueue == 1 then
+        local existing = redis.call("ZSCORE", queue_order_key, queue_member)
+        if queue_max_depth and queue_max_depth > 0 and existing == false and queue_depth >= queue_max_depth then
+            return {0, "queue_depth_exceeded", 1000, queue_order_key, queue_depth, pruned_count, queue_score}
+        end
+        if existing == false then
+            local sequence = redis.call("INCR", queue_sequence_key)
+            if queue_depth > 0 and sequence >= 1000000000000 then
+                return {0, "queue_sequence_exhausted", 0, queue_order_key, queue_depth, pruned_count, queue_score}
+            end
+            queue_score = queue_score * 1000000000000 + sequence
+            redis.call("ZADD", queue_order_key, queue_score, queue_member)
+            queue_depth = queue_depth + 1
+            redis.call("SET", queue_depth_key, queue_depth)
+        else
+            queue_score = tonumber(existing)
+        end
+        redis.call("ZADD", queue_expiry_key, queue_expiry_ms, queue_member)
+        local head = redis.call("ZRANGE", queue_order_key, 0, 0)[1]
+        if head ~= queue_member then
+            return {0, "queue_wait", 0, queue_order_key, queue_depth, pruned_count, queue_score}
+        end
+    end
+end
+
 local reservation_key = KEYS[1]
-local reservation_ttl_ms = tonumber(ARGV[1])
-local bucket_ttl_ms = tonumber(ARGV[2])
-local now_ms = tonumber(ARGV[3])
-local active_count = tonumber(ARGV[4])
-local arg_index = 5
+local reservation_ttl_ms = tonumber(ARGV[7])
+local bucket_ttl_ms = tonumber(ARGV[8])
+local now_ms = tonumber(ARGV[9])
+local active_count = tonumber(ARGV[10])
+local arg_index = 11
 
 for index = 1, active_count do
     local limit = tonumber(ARGV[arg_index])
@@ -36,7 +99,7 @@ for index = 1, active_count do
     if limit and limit > 0 then
         local current = tonumber(redis.call("GET", KEYS[1 + index]) or "0")
         if current >= limit then
-            return {0, "active_limit", 100, KEYS[1 + index]}
+            return {0, "active_limit", 100, KEYS[1 + index], queue_depth, pruned_count, queue_score}
         end
     end
 end
@@ -72,7 +135,7 @@ for index = 1, bucket_count do
         if refill_per_ms and refill_per_ms > 0 then
             retry_ms = math.ceil((cost - tokens) / refill_per_ms)
         end
-        return {0, reason, retry_ms, bucket_key}
+        return {0, reason, retry_ms, bucket_key, queue_depth, pruned_count, queue_score}
     end
     next_tokens[index] = tokens - cost
     bucket_capacities[index] = capacity
@@ -87,7 +150,7 @@ local reservation_created = redis.call(
     "NX"
 )
 if not reservation_created then
-    return {0, "reservation_conflict", 1000, reservation_key}
+    return {0, "reservation_conflict", 1000, reservation_key, queue_depth, pruned_count, queue_score}
 end
 
 for index = 1, active_count do
@@ -109,35 +172,37 @@ for index = 1, bucket_count do
     redis.call("PEXPIRE", bucket_key, bucket_ttl_ms)
 end
 
-return {1, "allowed", 0, ""}
+if queue_enabled == 1 and queue_enqueue == 1 then
+    local removed = redis.call("ZREM", KEYS[#KEYS - 3], queue_member)
+    redis.call("ZREM", KEYS[#KEYS - 2], queue_member)
+    if removed == 1 then
+        queue_depth = math.max(0, queue_depth - 1)
+        if queue_depth == 0 then
+            redis.call("DEL", KEYS[#KEYS - 1])
+            redis.call("DEL", KEYS[#KEYS])
+        else
+            redis.call("SET", KEYS[#KEYS - 1], queue_depth)
+        end
+    end
+end
+return {1, "allowed", 0, "", queue_depth, pruned_count, queue_score}
 """
 
-
-QUEUE_ENTER_SCRIPT = """
--- admission:queue_enter
-local max_depth = tonumber(ARGV[1])
-local ttl_ms = tonumber(ARGV[2])
-local current = tonumber(redis.call("GET", KEYS[1]) or "0")
-if max_depth and max_depth > 0 and current >= max_depth then
-    return {0, current}
+QUEUE_CLEANUP_SCRIPT = """
+-- admission:queue_cleanup
+local removed = redis.call("ZREM", KEYS[1], ARGV[1])
+redis.call("ZREM", KEYS[2], ARGV[1])
+local depth = tonumber(redis.call("GET", KEYS[3]) or "0")
+if removed == 1 then
+    depth = math.max(0, depth - 1)
 end
-current = redis.call("INCR", KEYS[1])
-if ttl_ms and ttl_ms > 0 then
-    redis.call("PEXPIRE", KEYS[1], ttl_ms)
+if depth == 0 then
+    redis.call("DEL", KEYS[3])
+    redis.call("DEL", KEYS[4])
+else
+    redis.call("SET", KEYS[3], depth)
 end
-return {1, current}
-"""
-
-
-QUEUE_LEAVE_SCRIPT = """
--- admission:queue_leave
-local current = tonumber(redis.call("GET", KEYS[1]) or "0")
-if current <= 1 then
-    redis.call("DEL", KEYS[1])
-    return {1, 0}
-end
-current = redis.call("DECR", KEYS[1])
-return {1, current}
+return {1, depth}
 """
 
 
@@ -210,6 +275,21 @@ class ActiveSpec:
     limit: int
     reason: str
     scope: str
+
+
+@dataclass(frozen=True)
+class QueueAdmissionRequest:
+    scope: str
+    member_id: str
+    priority_score: float
+    expiry_timestamp_ms: int
+    enqueue: bool
+    order_key: str = ""
+    expiry_key: str = ""
+    depth_key: str = ""
+    sequence_key: str = ""
+    max_depth: int = 0
+    priority_band: int = 0
 
 
 @dataclass
@@ -304,15 +384,23 @@ class RedisAdmissionController:
         self.redis_client = redis_client
         self._owns_redis_client = redis_client is None
         self._redis_available = redis_client is not None
+        self._redis_failure_at: Optional[float] = None
+        self._recovery_lock = asyncio.Lock()
         self._time_func = time_func or time.time
         self._sleep_func = sleep_func or asyncio.sleep
+        self._set_redis_state("available" if self._redis_available else "unavailable")
 
     async def initialize(self):
         """Initialize the Redis connection used for atomic admission decisions."""
         if not self.enabled:
             return
         if self.redis_client is not None:
-            await self._ping()
+            try:
+                await self._ping()
+            except Exception as exc:
+                ADMISSION_METRICS.redis_errors.labels(operation="initialize").inc()
+                self._mark_redis_failure("initialize", exc)
+                logger.warning("Failed to initialize API admission controller: %s", exc)
             return
 
         try:
@@ -322,11 +410,22 @@ class RedisAdmissionController:
                 password = os.getenv(str(password_env))
 
             redis_url = self.redis_config.get("url")
+            client_options = {
+                "socket_connect_timeout": int(
+                    self.redis_config.get("connect_timeout_ms", 100)
+                )
+                / 1000.0,
+                "socket_timeout": int(self.redis_config.get("socket_timeout_ms", 100))
+                / 1000.0,
+                "max_connections": int(self.redis_config.get("max_connections", 100)),
+                "health_check_interval": 30,
+            }
             if redis_url and hasattr(redis.Redis, "from_url"):
                 self.redis_client = redis.Redis.from_url(
                     redis_url,
                     password=password,
                     decode_responses=True,
+                    **client_options,
                 )
             else:
                 self.redis_client = redis.Redis(
@@ -335,21 +434,22 @@ class RedisAdmissionController:
                     db=int(self.redis_config.get("db", 4)),
                     password=password,
                     decode_responses=True,
+                    **client_options,
                 )
             await self._ping()
             logger.info("API admission controller initialized")
         except Exception as exc:
-            self.redis_client = None
-            self._redis_available = False
             ADMISSION_METRICS.redis_errors.labels(operation="initialize").inc()
+            self._mark_redis_failure("initialize", exc)
             logger.warning("Failed to initialize API admission controller: %s", exc)
 
     async def _ping(self):
         if self.redis_client is None:
             self._redis_available = False
+            self._set_redis_state("unavailable")
             return
-        await self.redis_client.ping()
-        self._redis_available = True
+        await self._run_redis_operation(self.redis_client.ping())
+        self._mark_redis_available()
 
     def is_healthy(self) -> bool:
         if not self.enabled:
@@ -365,6 +465,8 @@ class RedisAdmissionController:
                     await result
         self.redis_client = None
         self._redis_available = False
+        self._redis_failure_at = None
+        self._set_redis_state("unavailable")
 
     async def acquire_http(
         self,
@@ -417,6 +519,7 @@ class RedisAdmissionController:
         model_name: str,
         provider: str,
         estimated_input_tokens: int,
+        queue_request: Optional[QueueAdmissionRequest] = None,
     ) -> AdmissionDecision:
         """Acquire model/provider capacity and token budget before provider IO."""
         provider_name = provider.lower()
@@ -449,6 +552,7 @@ class RedisAdmissionController:
                 "provider": provider_name,
                 "user_tier": self._tier_value(request.user_tier),
             },
+            queue_request=queue_request,
         )
 
     async def release(
@@ -488,10 +592,10 @@ class RedisAdmissionController:
             result = await self._eval(RELEASE_SCRIPT, keys, args)
             released = bool(int(self._result_value(result, 0, 0)))
             if released:
-                for spec in reservation.active_specs:
+                for active_spec in reservation.active_specs:
                     ADMISSION_METRICS.active_reservations.labels(
                         stage=reservation.stage,
-                        scope=spec.scope,
+                        scope=active_spec.scope,
                     ).dec()
                 if reservation.reserved_tokens > 0:
                     ADMISSION_METRICS.tokens.labels(
@@ -511,6 +615,7 @@ class RedisAdmissionController:
             return released
         except Exception as exc:
             ADMISSION_METRICS.redis_errors.labels(operation="release").inc()
+            self._mark_redis_failure("release", exc)
             logger.warning("Admission release failed: %s", exc)
             return False
 
@@ -523,26 +628,56 @@ class RedisAdmissionController:
         token_specs: List[BucketSpec],
         reserved_tokens: int,
         metadata: Dict[str, Any],
+        queue_request: Optional[QueueAdmissionRequest] = None,
     ) -> AdmissionDecision:
         if not self.enabled:
             self._record_decision(stage, "allowed", "disabled")
             return AdmissionDecision.allow(None, reason="disabled", metadata=metadata)
 
-        unavailable = self._unavailable_decision(stage)
-        if unavailable:
-            return unavailable
+        if not self._redis_available:
+            await self._recover_if_due()
+            if not self._redis_available:
+                unavailable = self._unavailable_decision(stage)
+                if unavailable:
+                    return unavailable
+                return AdmissionDecision.allow(
+                    None, reason="fail_open", metadata=metadata
+                )
+
+        external_queue = queue_request is not None
+        queue_enabled = bool(self.queue_config.get("enabled", True))
+        if queue_request is None and queue_enabled:
+            member_id = uuid.uuid4().hex
+            version = str(self.queue_config.get("control_plane_version", "v2"))
+            prefix = self._key(version, "queue", "global")
+            queue_request = QueueAdmissionRequest(
+                scope="global",
+                member_id=member_id,
+                priority_score=0,
+                priority_band=0,
+                expiry_timestamp_ms=self._queue_expiry_timestamp_ms(self._now_ms()),
+                enqueue=False,
+                order_key=f"{prefix}:order",
+                expiry_key=f"{prefix}:expiry",
+                depth_key=f"{prefix}:depth",
+                sequence_key=f"{prefix}:sequence",
+                max_depth=int(self.queue_config.get("max_depth", 0) or 0),
+            )
 
         queued = False
         queue_started = self._time_func()
+        first_attempt = True
         try:
-            queue_decision = await self._enter_queue(stage)
-            if not queue_decision.allowed:
-                return queue_decision
-            queued = bool(queue_decision.metadata.get("queued", False))
-
             timeout_ms = int(self.queue_config.get("timeout_ms", 0) or 0)
             poll_interval_ms = max(
                 1, int(self.queue_config.get("poll_interval_ms", 25) or 25)
+            )
+            max_poll_interval_ms = max(
+                poll_interval_ms,
+                int(self.queue_config.get("max_poll_interval_ms", 250) or 250),
+            )
+            jitter_ratio = max(
+                0.0, float(self.queue_config.get("poll_jitter_ratio", 0.2) or 0.0)
             )
             deadline = self._now_ms() + timeout_ms
             last_denial: Optional[AdmissionDecision] = None
@@ -555,7 +690,14 @@ class RedisAdmissionController:
                     token_specs=token_specs,
                     reserved_tokens=reserved_tokens,
                     metadata=metadata,
+                    queue_request=queue_request,
                 )
+                if first_attempt:
+                    ADMISSION_METRICS.fast_path.labels(
+                        stage=stage,
+                        outcome="allowed" if decision.allowed else decision.reason,
+                    ).inc()
+                    first_attempt = False
                 if decision.allowed:
                     wait_seconds = max(0.0, self._time_func() - queue_started)
                     ADMISSION_METRICS.queue_wait.labels(stage=stage).observe(
@@ -564,20 +706,44 @@ class RedisAdmissionController:
                     return decision
 
                 last_denial = decision
-                now_ms = self._now_ms()
-                retry_ms = max(1, int((decision.retry_after_seconds or 1) * 1000))
-                if (
-                    timeout_ms <= 0
-                    or now_ms + min(retry_ms, poll_interval_ms) > deadline
-                ):
+                if external_queue:
                     return decision
-
-                await self._sleep_func(min(retry_ms, poll_interval_ms) / 1000.0)
+                if decision.reason == "queue_required" or (
+                    not queued and self._is_waitable_denial(decision.reason)
+                ):
+                    if queue_request is None or timeout_ms <= 0:
+                        return decision
+                    queued = True
+                    queue_request = QueueAdmissionRequest(
+                        **{
+                            **queue_request.__dict__,
+                            "enqueue": True,
+                        }
+                    )
+                    continue
+                if decision.reason == "queue_wait":
+                    queued = True
+                elif not self._is_waitable_denial(decision.reason):
+                    return decision
+                now_ms = self._now_ms()
+                if timeout_ms <= 0 or now_ms >= deadline:
+                    return decision
+                remaining_ms = max(0, deadline - now_ms)
+                jitter = 1.0
+                if jitter_ratio:
+                    digest = int(
+                        hashlib.sha256(str(now_ms).encode()).hexdigest()[:8], 16
+                    )
+                    jitter += (((digest / 0xFFFFFFFF) * 2.0) - 1.0) * jitter_ratio
+                sleep_ms = min(remaining_ms, max(1, int(poll_interval_ms * jitter)))
+                ADMISSION_METRICS.queue_polls.labels(stage=stage).inc()
+                await self._sleep_func(sleep_ms / 1000.0)
+                poll_interval_ms = min(max_poll_interval_ms, poll_interval_ms * 2)
 
             return last_denial or self._deny_rate_limited(stage, "admission_rejected")
         finally:
-            if queued:
-                await self._leave_queue(stage)
+            if queued and queue_request is not None:
+                await self._cleanup_queue(queue_request)
 
     async def _try_admit(
         self,
@@ -588,13 +754,30 @@ class RedisAdmissionController:
         token_specs: List[BucketSpec],
         reserved_tokens: int,
         metadata: Dict[str, Any],
+        queue_request: Optional[QueueAdmissionRequest] = None,
     ) -> AdmissionDecision:
         reservation_id = uuid.uuid4().hex
         keys = [self._reservation_key(reservation_id)]
         keys.extend(spec.key for spec in active_specs)
         keys.extend(spec.key for spec in bucket_specs)
 
+        if queue_request is not None:
+            keys.extend(
+                [
+                    queue_request.order_key,
+                    queue_request.expiry_key,
+                    queue_request.depth_key,
+                    queue_request.sequence_key,
+                ]
+            )
+
         args: List[str] = [
+            "1" if queue_request is not None else "0",
+            queue_request.member_id if queue_request else "",
+            str(queue_request.priority_band if queue_request else 0),
+            str(queue_request.expiry_timestamp_ms if queue_request else 0),
+            "1" if queue_request and queue_request.enqueue else "0",
+            str(queue_request.max_depth if queue_request else 0),
             str(self.reservation_ttl_ms),
             str(self.bucket_ttl_ms),
             str(self._now_ms()),
@@ -617,7 +800,7 @@ class RedisAdmissionController:
         except Exception as exc:
             ADMISSION_METRICS.redis_errors.labels(operation="admit").inc()
             logger.warning("Admission admit failed: %s", exc)
-            self._redis_available = False
+            self._mark_redis_failure("admit", exc)
             unavailable = self._unavailable_decision(stage)
             if unavailable:
                 return unavailable
@@ -627,15 +810,45 @@ class RedisAdmissionController:
         reason = str(self._decode(self._result_value(result, 1, "unknown")))
         retry_ms = int(float(self._result_value(result, 2, 0) or 0))
         denied_key = str(self._decode(self._result_value(result, 3, "")))
+        queue_depth = int(float(self._result_value(result, 4, 0) or 0))
+        pruned_count = int(float(self._result_value(result, 5, 0) or 0))
+        queue_score = float(self._result_value(result, 6, 0) or 0)
+        if queue_request is not None:
+            ADMISSION_METRICS.queue_depth.labels(scope=queue_request.scope).set(
+                queue_depth
+            )
+            ADMISSION_METRICS.queue_pruned.labels(scope=queue_request.scope).inc(
+                pruned_count
+            )
 
         if not allowed:
             retry_after_seconds = max(1, math.ceil(retry_ms / 1000.0))
+            if reason in {"queue_required", "queue_wait"}:
+                return AdmissionDecision.reject(
+                    status_code=429,
+                    error="rate_limited",
+                    reason=reason,
+                    message="Admission queue wait required",
+                    retry_after_seconds=retry_after_seconds,
+                    metadata={
+                        **metadata,
+                        "queue_depth": queue_depth,
+                        "queue_pruned": pruned_count,
+                        "queue_score": queue_score,
+                    },
+                )
             denial_reason = self._normalize_denial_reason(reason, denied_key)
             decision = self._deny_rate_limited(
                 stage,
                 denial_reason,
                 retry_after_seconds=retry_after_seconds,
-                metadata={**metadata, "redis_key": denied_key},
+                metadata={
+                    **metadata,
+                    "redis_key": denied_key,
+                    "queue_depth": queue_depth,
+                    "queue_pruned": pruned_count,
+                    "queue_score": queue_score,
+                },
             )
             return decision
 
@@ -648,72 +861,113 @@ class RedisAdmissionController:
             metadata=metadata,
         )
         self._record_decision(stage, "allowed", "allowed")
-        for spec in active_specs:
+        for active_spec in active_specs:
             ADMISSION_METRICS.active_reservations.labels(
                 stage=stage,
-                scope=spec.scope,
+                scope=active_spec.scope,
             ).inc()
         if reserved_tokens > 0:
             ADMISSION_METRICS.tokens.labels(
                 stage=stage,
                 token_type="reserved",
             ).inc(reserved_tokens)
-        return AdmissionDecision.allow(reservation, metadata=metadata)
-
-    async def _enter_queue(self, stage: str) -> AdmissionDecision:
-        if not bool(self.queue_config.get("enabled", True)):
-            return AdmissionDecision.allow(None, metadata={"queued": False})
-        if self.redis_client is None:
-            unavailable = self._unavailable_decision(stage)
-            return unavailable or AdmissionDecision.allow(None, reason="fail_open")
-
-        queue_key = self._key("queue", "global")
-        max_depth = int(self.queue_config.get("max_depth", 0) or 0)
-        ttl_ms = max(
-            int(self.queue_config.get("timeout_ms", 0) or 0) + 1000,
-            1000,
+        return AdmissionDecision.allow(
+            reservation,
+            metadata={
+                **metadata,
+                "queue_depth": queue_depth,
+                "queue_pruned": pruned_count,
+                "queue_score": queue_score,
+            },
         )
-        try:
-            result = await self._eval(
-                QUEUE_ENTER_SCRIPT,
-                [queue_key],
-                [str(max_depth), str(ttl_ms)],
-            )
-            allowed = bool(int(self._result_value(result, 0, 0)))
-            depth = int(float(self._result_value(result, 1, 0) or 0))
-            ADMISSION_METRICS.queue_depth.labels(scope="global").set(depth)
-            if not allowed:
-                return self._deny_rate_limited(
-                    stage,
-                    "queue_depth_exceeded",
-                    retry_after_seconds=1,
-                    metadata={"queue_depth": depth},
-                )
-            return AdmissionDecision.allow(
-                None,
-                metadata={"queued": True, "queue_depth": depth},
-            )
-        except Exception as exc:
-            ADMISSION_METRICS.redis_errors.labels(operation="queue_enter").inc()
-            logger.warning("Admission queue enter failed: %s", exc)
-            self._redis_available = False
-            unavailable = self._unavailable_decision(stage)
-            return unavailable or AdmissionDecision.allow(None, reason="fail_open")
 
-    async def _leave_queue(self, stage: str):
-        if self.redis_client is None:
-            return
+    async def _cleanup_queue(self, request: QueueAdmissionRequest) -> int:
         try:
             result = await self._eval(
-                QUEUE_LEAVE_SCRIPT,
-                [self._key("queue", "global")],
-                [],
+                QUEUE_CLEANUP_SCRIPT,
+                [
+                    request.order_key,
+                    request.expiry_key,
+                    request.depth_key,
+                    request.sequence_key,
+                ],
+                [request.member_id],
             )
             depth = int(float(self._result_value(result, 1, 0) or 0))
-            ADMISSION_METRICS.queue_depth.labels(scope="global").set(depth)
+            ADMISSION_METRICS.queue_depth.labels(scope=request.scope).set(depth)
+            return depth
         except Exception as exc:
-            ADMISSION_METRICS.redis_errors.labels(operation="queue_leave").inc()
-            logger.warning("Admission queue leave failed for %s: %s", stage, exc)
+            ADMISSION_METRICS.redis_errors.labels(operation="queue_cleanup").inc()
+            self._mark_redis_failure("queue_cleanup", exc)
+            return int(0)
+
+    def _queue_expiry_timestamp_ms(self, started_ms: int) -> int:
+        timeout_ms = int(self.queue_config.get("timeout_ms", 0) or 0)
+        grace_value = self.queue_config.get("queue_lease_grace_ms", 1000)
+        grace_ms = max(0, int(1000 if grace_value is None else grace_value))
+        return started_ms + timeout_ms + grace_ms
+
+    @staticmethod
+    def _is_waitable_denial(reason: str) -> bool:
+        return reason.endswith("_active_requests_exceeded") or reason in {
+            "active_limit",
+            "queue_wait",
+            "queue_required",
+        }
+
+    async def _recover_if_due(self) -> bool:
+        if self.redis_client is None or self._redis_available:
+            return self._redis_available
+        cooldown_seconds = (
+            max(0, int(self.redis_config.get("recovery_cooldown_ms", 1000))) / 1000.0
+        )
+        if (
+            self._redis_failure_at is not None
+            and self._time_func() - self._redis_failure_at < cooldown_seconds
+        ):
+            return False
+
+        async with self._recovery_lock:
+            if self._redis_available:
+                return True
+            if (
+                self._redis_failure_at is not None
+                and self._time_func() - self._redis_failure_at < cooldown_seconds
+            ):
+                return False
+            ADMISSION_METRICS.redis_recovery.labels(outcome="attempt").inc()
+            self._set_redis_state("recovering")
+            try:
+                await self._run_redis_operation(self.redis_client.ping())
+            except Exception as exc:
+                ADMISSION_METRICS.redis_recovery.labels(outcome="failure").inc()
+                self._mark_redis_failure("recovery_ping", exc)
+                return False
+            ADMISSION_METRICS.redis_recovery.labels(outcome="success").inc()
+            self._mark_redis_available()
+            return True
+
+    def _mark_redis_available(self):
+        self._redis_available = True
+        self._redis_failure_at = None
+        self._set_redis_state("available")
+
+    def _mark_redis_failure(self, operation: str, exc: Exception):
+        self._redis_available = False
+        self._redis_failure_at = self._time_func()
+        self._set_redis_state("unavailable")
+        if isinstance(exc, MaxConnectionsError):
+            ADMISSION_METRICS.redis_pool_exhaustion.labels(
+                operation=operation,
+                failure_mode=self.failure_mode,
+            ).inc()
+
+    @staticmethod
+    def _set_redis_state(state: str):
+        for candidate in ("available", "unavailable", "recovering"):
+            ADMISSION_METRICS.redis_state.labels(state=candidate).set(
+                1 if candidate == state else 0
+            )
 
     def _unavailable_decision(self, stage: str) -> Optional[AdmissionDecision]:
         if self.redis_client is not None and self._redis_available:
@@ -760,7 +1014,26 @@ class RedisAdmissionController:
     ) -> Sequence[Any]:
         if self.redis_client is None:
             raise RuntimeError("Redis client is not initialized")
-        return await self.redis_client.eval(script, len(keys), *keys, *args)
+        result = await self._run_redis_operation(
+            self.redis_client.eval(script, len(keys), *keys, *args)
+        )
+        self._mark_redis_available()
+        return result
+
+    async def _run_redis_operation(self, awaitable: Any) -> Any:
+        # redis-py applies socket_connect_timeout and socket_timeout at the
+        # transport boundary. A second timeout around the high-level command
+        # would also count connection-pool/client/server scheduling time and
+        # falsely fail healthy Redis under high concurrency. Keep the wrapper
+        # only for injected clients that do not expose a configured pool.
+        if getattr(self.redis_client, "connection_pool", None) is not None:
+            return await awaitable
+        timeout_seconds = max(
+            0.001,
+            int(self.redis_config.get("socket_timeout_ms", 100)) / 1000.0,
+        )
+        async with asyncio.timeout(timeout_seconds):
+            return await awaitable
 
     def _global_active_specs(self) -> List[ActiveSpec]:
         global_limits = dict(self.config.get("global_limits", {}) or {})

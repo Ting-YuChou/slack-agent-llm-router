@@ -183,7 +183,25 @@ def test_api_rate_limiting_accepts_legacy_request_bucket_config():
     assert config.burst_size == 50
     assert config.redis.db == 4
     assert config.redis.key_prefix == "api_gateway"
+    assert config.redis.connect_timeout_ms == 100
+    assert config.redis.socket_timeout_ms == 100
+    assert config.redis.max_connections == 100
+    assert config.redis.recovery_cooldown_ms == 1000
     assert config.failure_mode == "closed"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("connect_timeout_ms", 0),
+        ("socket_timeout_ms", 0),
+        ("max_connections", 0),
+        ("recovery_cooldown_ms", -1),
+    ],
+)
+def test_api_rate_limiting_rejects_invalid_redis_resilience_config(field, value):
+    with pytest.raises(ValidationError):
+        ApiRateLimitingConfig(redis={field: value})
 
 
 def test_api_rate_limiting_accepts_nested_admission_config():
@@ -238,16 +256,27 @@ def test_provider_scheduler_config_accepts_nested_policy():
             "enabled": True,
             "failure_threshold": 2,
             "recovery_timeout_ms": 500,
-            "half_open_max_requests": 2,
+            "half_open_max_requests": 1,
         },
     )
 
     assert config.queue_enabled is True
+    assert config.max_poll_interval_ms == 250
+    assert config.poll_jitter_ratio == 0.2
+    assert config.queue_lease_grace_ms == 1000
+    assert config.control_plane_version == "v2"
     assert config.failure_mode == "open"
     assert config.retry.max_attempts_per_request == 3
     assert config.retry.budget_tokens == 50
     assert config.circuit_breaker.failure_threshold == 2
-    assert config.circuit_breaker.half_open_max_requests == 2
+    assert config.circuit_breaker.half_open_max_requests == 1
+
+
+def test_provider_scheduler_config_rejects_multiple_half_open_probes():
+    with pytest.raises(ValidationError):
+        ProviderSchedulerConfig(
+            circuit_breaker={"half_open_max_requests": 2},
+        )
 
 
 def test_inference_config_accepts_single_flight_and_request_deadline():

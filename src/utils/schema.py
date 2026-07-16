@@ -381,6 +381,10 @@ class ApiRateLimitRedisConfig(ConfigModel):
     password_env: Optional[str] = "REDIS_PASSWORD"
     url: Optional[str] = None
     key_prefix: str = "api_gateway"
+    connect_timeout_ms: int = Field(100, ge=1)
+    socket_timeout_ms: int = Field(100, ge=1)
+    max_connections: int = Field(100, ge=1)
+    recovery_cooldown_ms: int = Field(1000, ge=0)
 
 
 class ApiRateLimitQueueConfig(ConfigModel):
@@ -388,6 +392,10 @@ class ApiRateLimitQueueConfig(ConfigModel):
     max_depth: int = Field(1000, ge=0)
     timeout_ms: int = Field(250, ge=0)
     poll_interval_ms: int = Field(25, ge=1)
+    max_poll_interval_ms: int = Field(250, ge=1)
+    poll_jitter_ratio: float = Field(0.2, ge=0.0, le=1.0)
+    queue_lease_grace_ms: int = Field(1000, ge=0)
+    control_plane_version: str = "v2"
 
 
 class ApiRateLimitBucketConfig(ConfigModel):
@@ -575,7 +583,7 @@ class SchedulerCircuitBreakerConfig(ConfigModel):
     enabled: bool = False
     failure_threshold: int = Field(5, ge=1)
     recovery_timeout_ms: int = Field(30000, ge=0)
-    half_open_max_requests: int = Field(1, ge=1)
+    half_open_max_requests: int = Field(1, ge=1, le=1)
     state_ttl_seconds: int = Field(3600, ge=1)
 
 
@@ -584,6 +592,10 @@ class ProviderSchedulerConfig(ConfigModel):
     queue_enabled: bool = False
     wait_timeout_ms: int = Field(250, ge=0)
     poll_interval_ms: int = Field(25, ge=1)
+    max_poll_interval_ms: int = Field(250, ge=1)
+    poll_jitter_ratio: float = Field(0.2, ge=0.0, le=1.0)
+    queue_lease_grace_ms: int = Field(1000, ge=0)
+    control_plane_version: str = "v2"
     failure_mode: str = "closed"
     allow_fallback_on_provider_rejection: bool = True
     key_prefix: str = "provider_scheduler"

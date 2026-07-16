@@ -1,7 +1,7 @@
 PYTHON ?= python
 DOCKER_COMPOSE ?= docker compose
 
-.PHONY: up down api api-dev workers loadtest-api smoke smoke-kafka smoke-web-search smoke-redis-stack-memory smoke-flink smoke-flink-runtime smoke-flink-analytics smoke-flink-analytics-runtime integration integration-kafka integration-flink integration-flink-runtime integration-flink-analytics integration-flink-analytics-runtime
+.PHONY: up down api api-dev workers loadtest-api loadtest-redis-control-plane cleanup-v1-provider-scheduler-keys smoke smoke-kafka smoke-web-search smoke-redis-stack-memory smoke-flink smoke-flink-runtime smoke-flink-analytics smoke-flink-analytics-runtime integration integration-kafka integration-flink integration-flink-runtime integration-flink-analytics integration-flink-analytics-runtime
 
 up:
 	$(DOCKER_COMPOSE) up -d --build redis-stack kafka clickhouse flink-jobmanager flink-taskmanager
@@ -20,6 +20,12 @@ workers:
 
 loadtest-api:
 	$(PYTHON) scripts/loadtest_api_baseline.py
+
+loadtest-redis-control-plane:
+	$(PYTHON) scripts/loadtest_redis_control_plane.py
+
+cleanup-v1-provider-scheduler-keys:
+	$(PYTHON) scripts/cleanup_v1_provider_scheduler_keys.py
 
 smoke: up smoke-kafka smoke-flink smoke-flink-runtime smoke-flink-analytics smoke-flink-analytics-runtime
 
