@@ -490,6 +490,10 @@ clickhouse:
   database: default
   username: llm_router
   password: llm_router_pass
+  dashboard:
+    cache_ttl_seconds: 5
+    cache_max_entries: 32
+    max_concurrent_queries: 4
   enabled: true
 
 monitoring:
@@ -590,6 +594,7 @@ flink:
     anomaly_threshold_multiplier: 2.0
     guardrail_threshold_multiplier: 2.0
     watermark_out_of_orderness_seconds: 15
+    watermark_idleness_seconds: 60
     model_guardrails:
       high_error_rate: 0.3
       high_latency_ms: 5000
@@ -608,6 +613,8 @@ flink:
       regression_error_rate_floor: 0.1
       regression_latency_floor_ms: 4500
     rolling_policy:
+      bucket_size_seconds: 5
+      emit_interval_seconds: 5
       hot_request_count: 10
       warm_request_count: 4
       complex_total_tokens: 2400

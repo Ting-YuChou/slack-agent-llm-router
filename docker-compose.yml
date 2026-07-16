@@ -138,6 +138,7 @@ services:
       - "8081:8081"
     environment:
       JOB_MANAGER_RPC_ADDRESS: flink-jobmanager
+      PYTHONPATH: /workspace
     volumes:
       - ./:/workspace
     depends_on:
@@ -152,6 +153,7 @@ services:
     command: taskmanager
     environment:
       JOB_MANAGER_RPC_ADDRESS: flink-jobmanager
+      PYTHONPATH: /workspace
     volumes:
       - ./:/workspace
     depends_on:

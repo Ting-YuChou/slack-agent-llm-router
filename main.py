@@ -1005,6 +1005,51 @@ class LLMRouterPlatform:
 
         raise ValueError("Use application/json or multipart/form-data")
 
+    async def _fetch_pipeline_dashboard_bundle(
+        self, pipeline: Any, *, hours: int
+    ) -> Dict[str, Any]:
+        """Use the pipeline bundle API, with a compatibility fallback."""
+        get_bundle = getattr(pipeline, "get_dashboard_bundle", None)
+        if callable(get_bundle):
+            return await get_bundle(user_id=None, hours=hours)
+
+        get_analytics = getattr(pipeline, "get_query_analytics", None)
+        if not callable(get_analytics):
+            get_analytics = getattr(pipeline, "get_analytics", None)
+        calls: Dict[str, Any] = {
+            "analytics": (
+                get_analytics(hours=hours) if callable(get_analytics) else None
+            ),
+            "model_performance": pipeline.get_model_performance(hours=hours),
+            "routing_guardrails": (
+                pipeline.get_routing_guardrails(hours=hours)
+                if callable(getattr(pipeline, "get_routing_guardrails", None))
+                else None
+            ),
+            "routing_policy_state": (
+                pipeline.get_routing_policy_state_events(hours=hours)
+                if callable(getattr(pipeline, "get_routing_policy_state_events", None))
+                else None
+            ),
+        }
+        names = [name for name, call in calls.items() if call is not None]
+        results = await asyncio.gather(
+            *(calls[name] for name in names), return_exceptions=True
+        )
+        bundle: Dict[str, Any] = {
+            "analytics": {},
+            "model_performance": [],
+            "routing_guardrails": [],
+            "routing_policy_state": [],
+            "errors": {},
+        }
+        for name, result in zip(names, results):
+            if isinstance(result, BaseException):
+                bundle["errors"][name] = str(result)
+            else:
+                bundle[name] = result
+        return bundle
+
     async def _build_dashboard_payload(self, hours: int = 24) -> Dict[str, Any]:
         """Build a dashboard-friendly live snapshot."""
         business_metrics = self._build_business_metrics()
@@ -1018,7 +1063,7 @@ class LLMRouterPlatform:
         }
         hours = max(1, min(int(hours), 24 * 7))
 
-        overview = {
+        overview: Dict[str, Any] = {
             "total_requests": int(business_metrics.get("total_requests_24h", 0) or 0),
             "avg_latency_ms": (
                 float(business_metrics.get("average_response_time", 0.0) or 0.0) * 1000
@@ -1032,7 +1077,7 @@ class LLMRouterPlatform:
             "error_rate": float(business_metrics.get("error_rate", 0.0) or 0.0),
         }
 
-        analytics = {
+        analytics: Dict[str, Any] = {
             "total_queries": overview["total_requests"],
             "total_cost": overview["total_cost"],
             "avg_latency_ms": overview["avg_latency_ms"],
@@ -1102,11 +1147,44 @@ class LLMRouterPlatform:
             analytics["model_request_distribution"][model_name] = model["requests"]
             analytics["model_cost_breakdown"][model_name] = model["total_cost"]
 
-        monitoring_dashboard = None
+        monitoring_task = None
+        pipeline_task = None
         if "monitoring" in self.services:
-            monitoring_dashboard = await self.services[
-                "monitoring"
-            ].get_dashboard_data()
+            monitoring_task = asyncio.create_task(
+                self.services["monitoring"].get_dashboard_data()
+            )
+        if "pipeline" in self.services:
+            pipeline_task = asyncio.create_task(
+                self._fetch_pipeline_dashboard_bundle(
+                    self.services["pipeline"], hours=hours
+                )
+            )
+
+        pending = [
+            task for task in (monitoring_task, pipeline_task) if task is not None
+        ]
+        fetched = (
+            await asyncio.gather(*pending, return_exceptions=True) if pending else []
+        )
+        fetched_by_task = dict(zip(pending, fetched))
+        monitoring_dashboard = (
+            fetched_by_task.get(monitoring_task)
+            if monitoring_task is not None
+            else None
+        )
+        pipeline_bundle = (
+            fetched_by_task.get(pipeline_task) if pipeline_task is not None else None
+        )
+        if isinstance(monitoring_dashboard, BaseException):
+            self.logger.error(
+                "Monitoring dashboard query failed: %s", monitoring_dashboard
+            )
+            monitoring_dashboard = None
+        if isinstance(pipeline_bundle, BaseException):
+            self.logger.error("Pipeline dashboard bundle failed: %s", pipeline_bundle)
+            pipeline_bundle = None
+
+        if monitoring_dashboard is not None:
             recent_alerts = monitoring_dashboard.get("alert_status", {}).get(
                 "recent_alerts", []
             )
@@ -1126,38 +1204,11 @@ class LLMRouterPlatform:
             )
             sources["routing_policy_state"] = "monitoring_service"
 
-        if "pipeline" in self.services:
-            get_pipeline_analytics = getattr(
-                self.services["pipeline"], "get_query_analytics", None
-            )
-            if not callable(get_pipeline_analytics):
-                get_pipeline_analytics = getattr(
-                    self.services["pipeline"], "get_analytics", None
-                )
-            pipeline_analytics = (
-                await get_pipeline_analytics(hours=hours)
-                if callable(get_pipeline_analytics)
-                else {}
-            )
-            pipeline_models = await self.services["pipeline"].get_model_performance(
-                hours=hours
-            )
-            get_routing_guardrails = getattr(
-                self.services["pipeline"], "get_routing_guardrails", None
-            )
-            pipeline_guardrails = (
-                await get_routing_guardrails(hours=hours)
-                if callable(get_routing_guardrails)
-                else []
-            )
-            get_routing_policy_state_events = getattr(
-                self.services["pipeline"], "get_routing_policy_state_events", None
-            )
-            pipeline_policy_states = (
-                await get_routing_policy_state_events(hours=hours)
-                if callable(get_routing_policy_state_events)
-                else []
-            )
+        if pipeline_bundle is not None:
+            pipeline_analytics = pipeline_bundle.get("analytics", {})
+            pipeline_models = pipeline_bundle.get("model_performance", [])
+            pipeline_guardrails = pipeline_bundle.get("routing_guardrails", [])
+            pipeline_policy_states = pipeline_bundle.get("routing_policy_state", [])
 
             if pipeline_analytics:
                 overview.update(
