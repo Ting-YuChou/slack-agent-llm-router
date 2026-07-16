@@ -312,7 +312,9 @@ class RedisStackRagVectorStore:
             await self._ensure_visual_index()
 
     async def shutdown(self):
-        if self.client and hasattr(self.client, "close"):
+        if self.client and hasattr(self.client, "aclose"):
+            await self.client.aclose()
+        elif self.client and hasattr(self.client, "close"):
             await self.client.close()
 
     async def _ensure_index(self):
@@ -475,6 +477,28 @@ class RedisStackRagVectorStore:
                 staged_keys.append((staging_key, live_key, chunk.chunk_id))
             await pipeline.execute()
 
+        arguments: List[Any] = [
+            len(chunks),
+            knowledge_base_id,
+            index_version,
+            f"{self._chunk_prefix()}{knowledge_base_id}:",
+        ]
+        for staging_key, live_key, chunk_id in staged_keys:
+            arguments.extend([staging_key, live_key, chunk_id])
+        committed = await self.client.eval(
+            ATOMIC_GENERATION_COMMIT_LUA,
+            4,
+            staging_set,
+            self._document_key(document_id, knowledge_base_id),
+            self._document_kbs_key(document_id),
+            self._active_generation_key(document_id, knowledge_base_id),
+            *arguments,
+        )
+        if int(committed) != len(chunks):
+            raise RuntimeError("RAG generation cutover returned an unexpected count")
+        await self._delete_table_sidecars(document_id, knowledge_base_id)
+        await self._delete_figure_sidecars(document_id, knowledge_base_id)
+        await self._delete_visual_chunks(document_id, knowledge_base_id)
         for chunk, visual_embedding in zip(chunks, visual_embeddings):
             await self._upsert_table_sidecars_from_chunk(
                 chunk,
@@ -495,25 +519,6 @@ class RedisStackRagVectorStore:
                 index_version=index_version,
                 updated_at=now_ts,
             )
-        arguments: List[Any] = [
-            len(chunks),
-            knowledge_base_id,
-            index_version,
-            f"{self._chunk_prefix()}{knowledge_base_id}:",
-        ]
-        for staging_key, live_key, chunk_id in staged_keys:
-            arguments.extend([staging_key, live_key, chunk_id])
-        committed = await self.client.eval(
-            ATOMIC_GENERATION_COMMIT_LUA,
-            4,
-            staging_set,
-            self._document_key(document_id, knowledge_base_id),
-            self._document_kbs_key(document_id),
-            self._active_generation_key(document_id, knowledge_base_id),
-            *arguments,
-        )
-        if int(committed) != len(chunks):
-            raise RuntimeError("RAG generation cutover returned an unexpected count")
         return len(chunks)
 
     def _chunk_mapping(
@@ -835,7 +840,7 @@ class RedisStackRagVectorStore:
                 "0",
                 str(limit),
                 "RETURN",
-                "14",
+                "15",
                 "knowledge_base_id",
                 "document_id",
                 "chunk_id",
@@ -881,7 +886,7 @@ class RedisStackRagVectorStore:
                 "0",
                 str(limit),
                 "RETURN",
-                "15",
+                "14",
                 "knowledge_base_id",
                 "document_id",
                 "chunk_id",

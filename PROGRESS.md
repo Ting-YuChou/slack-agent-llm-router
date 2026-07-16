@@ -1,5 +1,13 @@
 # Project Progress
 
+## 2026-07-16 — RAG hot-path performance contracts
+
+- Added: a fail-closed 1,000-chunk benchmark that directly exercises production embedding batching, Redis generation indexing, retrieval branch orchestration, and 100 MB streaming staging. Contract tests reject regressions below the agreed request/wait/throughput/p95/RSS thresholds.
+- Measured: embedding calls fell from 1,000 to 32 (96.8%); Redis network waits fell from 3,000 to 17 (99.43%); combined ingestion throughput improved 15.06x; retrieval p95 fell from 36.51 ms to 12.54 ms (65.65%); the 100 MB streaming upload increased peak RSS by 10.13 MB. The workload completed with zero errors.
+- Real Redis: all four Redis Stack integration scenarios passed after correcting exact `RETURN` projections and stale table/figure/visual sidecar cleanup (`21 passed` with the hot-path suite).
+- Runtime note: the production RAG worker image build was started but intentionally stopped while its first-time Docling/Torch dependency layer was downloading a 427 MB Torch wheel plus accelerator packages; Compose runtime health and live job retry/dead-letter still require that heavyweight build to finish.
+- Verification: full test suite passed with local Redis services (`514 passed, 4 skipped`); full Black and Flake8 checks, configured mypy, compileall, migration dry-run, and `git diff --check` passed.
+
 ## 2026-07-16 — Streaming RAG upload staging
 
 - Changed: multipart files are read in 1 MiB chunks into a same-directory `.part` file, with incremental SHA-256/size accounting, fsync, and atomic rename. Cancellation, read/write failure, and the 100 MB limit remove the partial file. JSON base64 is capped at 10 MB decoded before decode/allocation proceeds.

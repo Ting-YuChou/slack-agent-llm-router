@@ -262,8 +262,11 @@ class _AtomicRedis:
         return int(args[numkeys])
 
     async def delete(self, *keys):
-        self.direct_deletes.extend(keys)
+        self.direct_deletes.append((bool(self.eval_calls), keys))
         return len(keys)
+
+    async def smembers(self, _key):
+        return set()
 
 
 @pytest.mark.asyncio
@@ -291,7 +294,7 @@ async def test_redis_generation_stages_in_bounded_pipelines_before_atomic_cutove
     assert count == 1000
     assert len(redis.pipeline_executes) == 16
     assert len(redis.eval_calls) == 1
-    assert redis.direct_deletes == []
+    assert all(after_cutover for after_cutover, _keys in redis.direct_deletes)
     staged_hsets = [
         command
         for batch in redis.pipeline_executes
