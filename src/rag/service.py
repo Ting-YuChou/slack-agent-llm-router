@@ -438,6 +438,34 @@ class RagService:
     ) -> List[RagSearchResult]:
         if not self.enabled:
             return []
+        deadline_seconds = max(
+            0.001, float(self.retrieval_config.get("deadline_seconds", 30))
+        )
+        try:
+            async with asyncio.timeout(deadline_seconds):
+                return await self._retrieve_within_deadline(
+                    query,
+                    knowledge_base_ids=knowledge_base_ids,
+                    max_results=max_results,
+                    candidate_count=candidate_count,
+                    min_score=min_score,
+                )
+        except TimeoutError:
+            logger.warning(
+                "RAG retrieval exceeded its %.3fs shared deadline",
+                deadline_seconds,
+            )
+            return []
+
+    async def _retrieve_within_deadline(
+        self,
+        query: str,
+        *,
+        knowledge_base_ids: Optional[Sequence[str]] = None,
+        max_results: Optional[int] = None,
+        candidate_count: Optional[int] = None,
+        min_score: Optional[float] = None,
+    ) -> List[RagSearchResult]:
         embedding, visual_embedding = await asyncio.gather(
             self._safe_embed(query),
             self._safe_visual_query_embed(query),
@@ -661,6 +689,17 @@ class RagService:
         if not documents:
             raise ValueError("batch documents must not be empty")
 
+        decoded_limit = int(
+            self.upload_config.get("json_max_decoded_bytes", 10_000_000)
+        )
+        # Validate every inline document before creating the manifest or enqueueing
+        # any jobs. This prevents an oversized later item from leaving a partial
+        # batch behind.
+        for item in documents:
+            encoded = item.get("content_base64")
+            if encoded:
+                decode_base64_document(str(encoded), max_decoded_bytes=decoded_limit)
+
         batch_id = str(uuid.uuid4())
         resolved_kb_id = knowledge_base_id or self._default_write_kb()
         batch = IngestionBatch(
@@ -682,7 +721,10 @@ class RagService:
             }
             content = item.get("content")
             if content is None and item.get("content_base64"):
-                content = decode_base64_document(str(item["content_base64"]))
+                content = decode_base64_document(
+                    str(item["content_base64"]),
+                    max_decoded_bytes=decoded_limit,
+                )
             job = await self.queue_document_ingestion(
                 content=content,
                 storage_ref=item.get("storage_ref"),
@@ -779,24 +821,46 @@ class RagService:
             self._worker_heartbeat_loop(worker_id),
             name="rag_ingestion_worker_heartbeat",
         )
+        tasks = [*workers, heartbeat]
         try:
-            await asyncio.gather(*workers)
+            await asyncio.gather(*tasks)
         finally:
-            heartbeat.cancel()
-            for worker in workers:
-                worker.cancel()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _worker_heartbeat_loop(self, worker_id: str) -> None:
         client = self._job_client()
         if not client:
             raise RuntimeError("Redis client is required for RAG worker heartbeat")
         key = self._prefixed_key(f"worker:heartbeat:{worker_id}")
+        consecutive_failures = 0
+        failure_limit = max(
+            2,
+            int(self.heartbeat_ttl_seconds / self.heartbeat_interval_seconds),
+        )
         while True:
-            await client.set(
-                key,
-                datetime.now().isoformat(),
-                ex=self.heartbeat_ttl_seconds,
-            )
+            try:
+                await client.set(
+                    key,
+                    datetime.now().isoformat(),
+                    ex=self.heartbeat_ttl_seconds,
+                )
+                consecutive_failures = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                consecutive_failures += 1
+                logger.warning(
+                    "RAG worker heartbeat failed (%d/%d)",
+                    consecutive_failures,
+                    failure_limit,
+                    exc_info=True,
+                )
+                if consecutive_failures >= failure_limit:
+                    raise RuntimeError(
+                        "RAG worker heartbeat exceeded its Redis failure limit"
+                    )
             await asyncio.sleep(self.heartbeat_interval_seconds)
 
     async def _worker_loop(self, consumer_name: str):
@@ -1023,8 +1087,29 @@ class RagService:
                             raise ValueError("embedding batch response length mismatch")
                         return batch, [list(value) for value in values]
                     except Exception as exc:
-                        logger.info("RAG embedding batch unavailable: %s", exc)
-                        return batch, [None] * len(batch)
+                        logger.info(
+                            "RAG embedding batch unavailable; retrying scalar: %s",
+                            exc,
+                        )
+                        scalar_values: List[Optional[List[float]]] = []
+                        for _, text in batch:
+                            try:
+                                value = await asyncio.wait_for(
+                                    self.embedding_provider.embed(text),
+                                    timeout=float(
+                                        self.embedding_config.get("timeout", 30)
+                                    ),
+                                )
+                            except Exception as scalar_exc:
+                                raise RuntimeError(
+                                    "scalar embedding fallback failed after batch error"
+                                ) from scalar_exc
+                            if value is None:
+                                raise RuntimeError(
+                                    "scalar embedding fallback failed after batch error"
+                                )
+                            scalar_values.append(list(value))
+                        return batch, scalar_values
                 values = []
                 for _, text in batch:
                     values.append(await self._safe_embed(text))
@@ -1284,6 +1369,8 @@ class RagService:
         digest = hashlib.sha256()
         size = 0
         published = False
+        target: Optional[Path] = None
+        target_existed = False
         try:
             with temporary.open("xb") as staged_file:
                 while True:
@@ -1300,7 +1387,24 @@ class RagService:
                 await asyncio.to_thread(staged_file.flush)
                 await asyncio.to_thread(os.fsync, staged_file.fileno())
             target = target_dir / f"{digest.hexdigest()}-{safe_filename}"
-            await asyncio.to_thread(os.replace, temporary, target)
+            target_existed = target.exists()
+            if target_existed:
+                temporary.unlink(missing_ok=True)
+                published = True
+                return str(target)
+            publish_task = asyncio.create_task(
+                asyncio.to_thread(os.replace, temporary, target)
+            )
+            try:
+                await asyncio.shield(publish_task)
+            except asyncio.CancelledError:
+                # The thread cannot be cancelled once os.replace has started. Wait
+                # for its deterministic outcome, then remove an otherwise
+                # unreferenced target before propagating cancellation.
+                await publish_task
+                if not target_existed:
+                    target.unlink(missing_ok=True)
+                raise
             published = True
             return str(target)
         finally:

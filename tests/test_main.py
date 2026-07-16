@@ -1255,6 +1255,35 @@ class TestApiApp:
         assert get_response.status_code == 200
         assert get_response.json()["status_counts"]["queued"] == 1
 
+    def test_rag_batch_endpoint_maps_decoded_size_error_to_413(
+        self, tmp_path, patched_platform_deps
+    ):
+        class OversizedBatchRagService(DummyRagService):
+            async def create_batch(self, **_kwargs):
+                raise main.RagPayloadTooLarge("batch document is too large")
+
+        config_path = _write_config(
+            tmp_path,
+            overrides={"rag": {"enabled": True, "backend": "memory"}},
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        platform.services["rag"] = OversizedBatchRagService({"enabled": True})
+        app = platform._create_fastapi_app()
+        payload = {
+            "documents": [
+                {
+                    "filename": "large.pdf",
+                    "content_base64": base64.b64encode(b"12345").decode("ascii"),
+                }
+            ]
+        }
+
+        with TestClient(app) as client:
+            response = client.post("/rag/batches", json=payload)
+
+        assert response.status_code == 413
+        assert response.json()["error"] == "rag_payload_too_large"
+
     def test_rag_query_and_delete_endpoints_require_rag_service(
         self, tmp_path, patched_platform_deps
     ):

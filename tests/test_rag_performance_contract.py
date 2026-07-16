@@ -1,4 +1,9 @@
-from scripts.rag_performance_contract import evaluate_contract
+import pytest
+
+from scripts.rag_performance_contract import (
+    RedisOperationCounter,
+    evaluate_contract,
+)
 
 
 def test_rag_performance_contract_rejects_each_regression():
@@ -27,3 +32,32 @@ def test_rag_performance_contract_accepts_thresholds():
     }
 
     assert evaluate_contract(result) == []
+
+
+class _Pipeline:
+    async def execute(self):
+        return [1]
+
+
+class _Redis:
+    def pipeline(self, **_kwargs):
+        return _Pipeline()
+
+    async def eval(self, *_args):
+        return 1
+
+    async def hset(self, *_args, **_kwargs):
+        return 1
+
+
+@pytest.mark.asyncio
+async def test_redis_operation_counter_measures_actual_await_boundaries():
+    counter = RedisOperationCounter(_Redis())
+
+    pipeline = counter.pipeline(transaction=False)
+    await pipeline.execute()
+    await counter.eval("return 1", 0)
+    await counter.hset("key", mapping={"field": "value"})
+
+    assert counter.network_waits == 3
+    assert counter.operations == {"pipeline.execute": 1, "eval": 1, "hset": 1}

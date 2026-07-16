@@ -27,32 +27,53 @@ SIDECAR_METADATA_KEYS = {
 ATOMIC_GENERATION_COMMIT_LUA = """
 local staging_set = KEYS[1]
 local document_set = KEYS[2]
-local document_kbs = KEYS[3]
-local active_generation = KEYS[4]
+local active_generation = KEYS[3]
+local document_tables = KEYS[4]
+local document_figures = KEYS[5]
+local document_visuals = KEYS[6]
 local expected = tonumber(ARGV[1])
 local knowledge_base_id = ARGV[2]
 local generation = ARGV[3]
 local chunk_prefix = ARGV[4]
+local resource_count = tonumber(ARGV[5])
+local table_prefix = ARGV[6]
+local table_rows_prefix = ARGV[7]
+local table_row_prefix = ARGV[8]
+local figure_prefix = ARGV[9]
+local visual_prefix = ARGV[10]
+local chunk_args_start = 11
+local chunk_keys_start = 7
+local resource_keys_start = chunk_keys_start + (expected * 2)
 
 if redis.call('SCARD', staging_set) ~= expected then
     return redis.error_reply('incomplete RAG staging generation')
 end
 
 for index = 1, expected do
-    local offset = 5 + ((index - 1) * 3)
-    if redis.call('EXISTS', ARGV[offset]) ~= 1 then
+    local key_offset = chunk_keys_start + ((index - 1) * 2)
+    if redis.call('EXISTS', KEYS[key_offset]) ~= 1 then
         return redis.error_reply('missing RAG staging chunk')
+    end
+end
+for index = 1, resource_count do
+    local key_offset = resource_keys_start + ((index - 1) * 2)
+    if redis.call('EXISTS', KEYS[key_offset]) ~= 1 then
+        return redis.error_reply('missing RAG staging sidecar')
     end
 end
 
 local active = redis.call('GET', active_generation)
 if active and active > generation then
     for index = 1, expected do
-        local offset = 5 + ((index - 1) * 3)
-        redis.call('DEL', ARGV[offset])
+        local key_offset = chunk_keys_start + ((index - 1) * 2)
+        redis.call('DEL', KEYS[key_offset])
+    end
+    for index = 1, resource_count do
+        local key_offset = resource_keys_start + ((index - 1) * 2)
+        redis.call('DEL', KEYS[key_offset])
     end
     redis.call('DEL', staging_set)
-    return expected
+    return -expected
 end
 
 local previous = redis.call('SMEMBERS', document_set)
@@ -62,15 +83,40 @@ end
 redis.call('DEL', document_set)
 
 for index = 1, expected do
-    local offset = 5 + ((index - 1) * 3)
-    local staging_key = ARGV[offset]
-    local live_key = ARGV[offset + 1]
-    local chunk_id = ARGV[offset + 2]
+    local key_offset = chunk_keys_start + ((index - 1) * 2)
+    local staging_key = KEYS[key_offset]
+    local live_key = KEYS[key_offset + 1]
+    local chunk_id = ARGV[chunk_args_start + index - 1]
     redis.call('RENAME', staging_key, live_key)
     redis.call('PERSIST', live_key)
     redis.call('SADD', document_set, chunk_id)
 end
-redis.call('SADD', document_kbs, knowledge_base_id)
+
+local previous_tables = redis.call('SMEMBERS', document_tables)
+for _, table_id in ipairs(previous_tables) do
+    local rows_key = table_rows_prefix .. table_id
+    local previous_rows = redis.call('SMEMBERS', rows_key)
+    for _, row_id in ipairs(previous_rows) do
+        redis.call('DEL', table_row_prefix .. table_id .. ':' .. row_id)
+    end
+    redis.call('DEL', rows_key)
+    redis.call('DEL', table_prefix .. table_id)
+end
+local previous_figures = redis.call('SMEMBERS', document_figures)
+for _, figure_id in ipairs(previous_figures) do
+    redis.call('DEL', figure_prefix .. figure_id)
+end
+local previous_visuals = redis.call('SMEMBERS', document_visuals)
+for _, chunk_id in ipairs(previous_visuals) do
+    redis.call('DEL', visual_prefix .. chunk_id)
+end
+redis.call('DEL', document_tables, document_figures, document_visuals)
+
+for index = 1, resource_count do
+    local key_offset = resource_keys_start + ((index - 1) * 2)
+    redis.call('RENAME', KEYS[key_offset], KEYS[key_offset + 1])
+    redis.call('PERSIST', KEYS[key_offset + 1])
+end
 redis.call('SET', active_generation, generation)
 redis.call('DEL', staging_set)
 return expected
@@ -469,57 +515,214 @@ class RedisStackRagVectorStore:
                     document_id,
                     index_version,
                 )
-                live_key = self._chunk_key(chunk.chunk_id, knowledge_base_id)
+                live_key = self._chunk_key(
+                    chunk.chunk_id,
+                    knowledge_base_id,
+                    document_id=document_id,
+                )
                 pipeline.hset(staging_key, mapping=mapping)
                 pipeline.expire(staging_key, self.staging_ttl_seconds)
                 pipeline.sadd(staging_set, chunk.chunk_id)
                 pipeline.expire(staging_set, self.staging_ttl_seconds)
                 staged_keys.append((staging_key, live_key, chunk.chunk_id))
+            if batch_start == 0:
+                pipeline.sadd(self._document_kbs_key(document_id), knowledge_base_id)
+            await pipeline.execute()
+
+        sidecar_resources = self._generation_sidecar_resources(
+            chunks,
+            visual_embeddings,
+            knowledge_base_id=knowledge_base_id,
+            index_version=index_version,
+            updated_at=now_ts,
+        )
+        staged_resources: List[Tuple[str, str]] = []
+        resource_items = list(sidecar_resources.items())
+        for batch_start in range(0, len(resource_items), self.pipeline_batch_size):
+            pipeline = self.client.pipeline(transaction=False)
+            batch_end = batch_start + self.pipeline_batch_size
+            for live_key, (resource_type, value) in resource_items[
+                batch_start:batch_end
+            ]:
+                staging_key = self._staging_resource_key(
+                    document_id,
+                    knowledge_base_id,
+                    index_version,
+                    live_key,
+                )
+                if resource_type == "hash":
+                    pipeline.hset(staging_key, mapping=value)
+                else:
+                    pipeline.sadd(staging_key, *sorted(value))
+                pipeline.expire(staging_key, self.staging_ttl_seconds)
+                staged_resources.append((staging_key, live_key))
             await pipeline.execute()
 
         arguments: List[Any] = [
             len(chunks),
             knowledge_base_id,
             index_version,
-            f"{self._chunk_prefix()}{knowledge_base_id}:",
+            self._document_chunk_prefix(document_id, knowledge_base_id),
+            len(staged_resources),
+            self._table_prefix(document_id, knowledge_base_id),
+            self._table_rows_prefix(document_id, knowledge_base_id),
+            self._table_row_prefix(document_id, knowledge_base_id),
+            self._figure_prefix(document_id, knowledge_base_id),
+            self._visual_chunk_document_prefix(document_id, knowledge_base_id),
         ]
-        for staging_key, live_key, chunk_id in staged_keys:
-            arguments.extend([staging_key, live_key, chunk_id])
-        committed = await self.client.eval(
-            ATOMIC_GENERATION_COMMIT_LUA,
-            4,
+        arguments.extend(chunk_id for _, _, chunk_id in staged_keys)
+        keys: List[str] = [
             staging_set,
             self._document_key(document_id, knowledge_base_id),
-            self._document_kbs_key(document_id),
             self._active_generation_key(document_id, knowledge_base_id),
+            self._document_tables_key(document_id, knowledge_base_id),
+            self._document_figures_key(document_id, knowledge_base_id),
+            self._document_visual_key(document_id, knowledge_base_id),
+        ]
+        for staging_key, live_key, _ in staged_keys:
+            keys.extend([staging_key, live_key])
+        for staging_key, live_key in staged_resources:
+            keys.extend([staging_key, live_key])
+        committed = await self.client.eval(
+            ATOMIC_GENERATION_COMMIT_LUA,
+            len(keys),
+            *keys,
             *arguments,
         )
+        if int(committed) == -len(chunks):
+            return len(chunks)
         if int(committed) != len(chunks):
             raise RuntimeError("RAG generation cutover returned an unexpected count")
-        await self._delete_table_sidecars(document_id, knowledge_base_id)
-        await self._delete_figure_sidecars(document_id, knowledge_base_id)
-        await self._delete_visual_chunks(document_id, knowledge_base_id)
-        for chunk, visual_embedding in zip(chunks, visual_embeddings):
-            await self._upsert_table_sidecars_from_chunk(
-                chunk,
-                knowledge_base_id=knowledge_base_id,
-                index_version=index_version,
-                updated_at=now_ts,
-            )
-            await self._upsert_figure_sidecars_from_chunk(
-                chunk,
-                knowledge_base_id=knowledge_base_id,
-                index_version=index_version,
-                updated_at=now_ts,
-            )
-            await self._upsert_visual_chunk(
-                chunk,
-                visual_embedding,
-                knowledge_base_id=knowledge_base_id,
-                index_version=index_version,
-                updated_at=now_ts,
-            )
         return len(chunks)
+
+    def _generation_sidecar_resources(
+        self,
+        chunks: Sequence[DocumentChunk],
+        visual_embeddings: Sequence[Optional[Sequence[float]]],
+        *,
+        knowledge_base_id: str,
+        index_version: str,
+        updated_at: float,
+    ) -> Dict[str, Tuple[str, Any]]:
+        resources: Dict[str, Tuple[str, Any]] = {}
+
+        def add_set(key: str, member: str) -> None:
+            resource = resources.setdefault(key, ("set", set()))
+            resource[1].add(member)
+
+        for chunk, visual_embedding in zip(chunks, visual_embeddings):
+            metadata = dict(chunk.metadata or {})
+            table_id = str(metadata.get("table_id") or "")
+            table_sidecar = metadata.get("table_sidecar")
+            row_sidecar = metadata.get("table_row_sidecar")
+            row_id = str(metadata.get("table_row_id") or "")
+            if table_id and isinstance(table_sidecar, dict):
+                resources[
+                    self._table_key(knowledge_base_id, chunk.document_id, table_id)
+                ] = (
+                    "hash",
+                    {
+                        "knowledge_base_id": knowledge_base_id,
+                        "document_id": chunk.document_id,
+                        "table_id": table_id,
+                        "index_version": index_version,
+                        "updated_at": updated_at,
+                        "table_json": json.dumps(table_sidecar, sort_keys=True),
+                    },
+                )
+                add_set(
+                    self._document_tables_key(chunk.document_id, knowledge_base_id),
+                    table_id,
+                )
+            if table_id and row_id and isinstance(row_sidecar, dict):
+                add_set(
+                    self._document_tables_key(chunk.document_id, knowledge_base_id),
+                    table_id,
+                )
+                resources[
+                    self._table_row_key(
+                        knowledge_base_id, chunk.document_id, table_id, row_id
+                    )
+                ] = (
+                    "hash",
+                    {
+                        "knowledge_base_id": knowledge_base_id,
+                        "document_id": chunk.document_id,
+                        "table_id": table_id,
+                        "row_id": row_id,
+                        "index_version": index_version,
+                        "updated_at": updated_at,
+                        "row_json": json.dumps(row_sidecar, sort_keys=True),
+                    },
+                )
+                add_set(
+                    self._table_rows_key(
+                        knowledge_base_id, chunk.document_id, table_id
+                    ),
+                    row_id,
+                )
+
+            figure_id = str(metadata.get("figure_id") or "")
+            figure_sidecar = metadata.get("figure_sidecar")
+            if figure_id and isinstance(figure_sidecar, dict):
+                resources[
+                    self._figure_key(knowledge_base_id, chunk.document_id, figure_id)
+                ] = (
+                    "hash",
+                    {
+                        "knowledge_base_id": knowledge_base_id,
+                        "document_id": chunk.document_id,
+                        "figure_id": figure_id,
+                        "index_version": index_version,
+                        "updated_at": updated_at,
+                        "figure_json": json.dumps(
+                            _figure_sidecar_for_storage(figure_sidecar), sort_keys=True
+                        ),
+                    },
+                )
+                add_set(
+                    self._document_figures_key(chunk.document_id, knowledge_base_id),
+                    figure_id,
+                )
+
+            if visual_embedding and self._visual_enabled():
+                if len(visual_embedding) != self.visual_dimensions:
+                    raise ValueError(
+                        "Visual embedding dimensions do not match RAG visual index"
+                    )
+                resources[
+                    self._visual_chunk_key(
+                        chunk.chunk_id,
+                        knowledge_base_id,
+                        document_id=chunk.document_id,
+                    )
+                ] = (
+                    "hash",
+                    {
+                        "knowledge_base_id": knowledge_base_id,
+                        "document_id": chunk.document_id,
+                        "chunk_id": chunk.chunk_id,
+                        "index_version": index_version,
+                        "text": chunk.text,
+                        "block_types": ",".join(chunk.block_types),
+                        "metadata": json.dumps(
+                            _metadata_for_chunk_storage(chunk.metadata), sort_keys=True
+                        ),
+                        "section_path": json.dumps(chunk.section_path),
+                        "block_ids": json.dumps(chunk.block_ids),
+                        "bboxes": json.dumps(chunk.bboxes),
+                        "page_start": int(chunk.page_start),
+                        "page_end": int(chunk.page_end),
+                        "created_at": updated_at,
+                        "updated_at": updated_at,
+                        "visual_embedding": _vector_to_bytes(visual_embedding),
+                    },
+                )
+                add_set(
+                    self._document_visual_key(chunk.document_id, knowledge_base_id),
+                    chunk.chunk_id,
+                )
+        return resources
 
     def _chunk_mapping(
         self,
@@ -582,7 +785,7 @@ class RedisStackRagVectorStore:
         for raw_chunk_id in chunk_ids:
             chunk_id = _decode(raw_chunk_id)
             deleted = await self.client.delete(
-                self._chunk_key(chunk_id, knowledge_base_id)
+                self._chunk_key(chunk_id, knowledge_base_id, document_id=document_id)
             )
             count += int(bool(deleted))
         await self.client.delete(self._document_key(document_id, knowledge_base_id))
@@ -675,14 +878,20 @@ class RedisStackRagVectorStore:
                 )
             ),
         ]
-        done, pending = await asyncio.wait(
-            tasks,
-            timeout=float(self.retrieval_config.get("deadline_seconds", 30)),
-        )
-        for task in pending:
-            task.cancel()
+        done: set[asyncio.Task] = set()
+        pending: set[asyncio.Task] = set(tasks)
+        try:
+            done, pending = await asyncio.wait(
+                tasks,
+                timeout=float(self.retrieval_config.get("deadline_seconds", 30)),
+            )
+        finally:
+            unfinished = [task for task in tasks if not task.done()]
+            for task in unfinished:
+                task.cancel()
+            if unfinished:
+                await asyncio.gather(*unfinished, return_exceptions=True)
         if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
             logger.warning(
                 "Redis RAG retrieval deadline expired for %s branches", len(pending)
             )
@@ -1016,9 +1225,27 @@ class RedisStackRagVectorStore:
         return f"@knowledge_base_id:{{{values}}}"
 
     def _chunk_prefix(self) -> str:
+        return f"{self.key_prefix}:v2:chunk:"
+
+    def _legacy_chunk_prefix(self) -> str:
         return f"{self.key_prefix}:chunk:"
 
-    def _chunk_key(self, chunk_id: str, knowledge_base_id: str) -> str:
+    def _document_prefix(self, document_id: str, knowledge_base_id: str) -> str:
+        return f"{self.key_prefix}:v2:{self._generation_tag(document_id, knowledge_base_id)}"
+
+    def _document_chunk_prefix(self, document_id: str, knowledge_base_id: str) -> str:
+        tag = self._generation_tag(document_id, knowledge_base_id)
+        return f"{self._chunk_prefix()}{tag}:"
+
+    def _chunk_key(
+        self,
+        chunk_id: str,
+        knowledge_base_id: str,
+        *,
+        document_id: Optional[str] = None,
+    ) -> str:
+        if document_id:
+            return f"{self._document_chunk_prefix(document_id, knowledge_base_id)}{chunk_id}"
         return f"{self._chunk_prefix()}{knowledge_base_id}:{chunk_id}"
 
     def _generation_tag(self, document_id: str, knowledge_base_id: str) -> str:
@@ -1040,21 +1267,53 @@ class RedisStackRagVectorStore:
         tag = self._generation_tag(document_id, knowledge_base_id)
         return f"{self.key_prefix}:v2:{tag}:staging:{generation}:chunk:{chunk_id}"
 
+    def _staging_resource_key(
+        self,
+        document_id: str,
+        knowledge_base_id: str,
+        generation: str,
+        live_key: str,
+    ) -> str:
+        tag = self._generation_tag(document_id, knowledge_base_id)
+        digest = hashlib.sha1(live_key.encode("utf-8")).hexdigest()
+        return f"{self.key_prefix}:v2:{tag}:staging:{generation}:resource:{digest}"
+
     def _active_generation_key(self, document_id: str, knowledge_base_id: str) -> str:
         tag = self._generation_tag(document_id, knowledge_base_id)
         return f"{self.key_prefix}:v2:{tag}:active_generation"
 
     def _visual_chunk_prefix(self) -> str:
+        return f"{self.key_prefix}:v2:visual_chunk:"
+
+    def _legacy_visual_chunk_prefix(self) -> str:
         return f"{self.key_prefix}:visual_chunk:"
 
-    def _visual_chunk_key(self, chunk_id: str, knowledge_base_id: str) -> str:
+    def _visual_chunk_document_prefix(
+        self, document_id: str, knowledge_base_id: str
+    ) -> str:
+        tag = self._generation_tag(document_id, knowledge_base_id)
+        return f"{self._visual_chunk_prefix()}{tag}:"
+
+    def _visual_chunk_key(
+        self,
+        chunk_id: str,
+        knowledge_base_id: str,
+        *,
+        document_id: Optional[str] = None,
+    ) -> str:
+        if document_id:
+            return (
+                f"{self._visual_chunk_document_prefix(document_id, knowledge_base_id)}"
+                f"{chunk_id}"
+            )
         return f"{self._visual_chunk_prefix()}{knowledge_base_id}:{chunk_id}"
 
     def _legacy_chunk_key(self, chunk_id: str) -> str:
-        return f"{self._chunk_prefix()}{chunk_id}"
+        return f"{self._legacy_chunk_prefix()}{chunk_id}"
 
     def _document_key(self, document_id: str, knowledge_base_id: str) -> str:
-        return f"{self.key_prefix}:document:{knowledge_base_id}:{document_id}:chunks"
+        tag = self._generation_tag(document_id, knowledge_base_id)
+        return f"{self.key_prefix}:document:v2:{tag}:chunks"
 
     def _legacy_document_key(self, document_id: str) -> str:
         return f"{self.key_prefix}:document:{document_id}:chunks"
@@ -1063,30 +1322,47 @@ class RedisStackRagVectorStore:
         return f"{self.key_prefix}:document:{document_id}:knowledge_bases"
 
     def _document_tables_key(self, document_id: str, knowledge_base_id: str) -> str:
-        return f"{self.key_prefix}:tables:{knowledge_base_id}:{document_id}"
+        tag = self._generation_tag(document_id, knowledge_base_id)
+        return f"{self.key_prefix}:tables:v2:{tag}"
 
     def _document_visual_key(self, document_id: str, knowledge_base_id: str) -> str:
-        return f"{self.key_prefix}:document:{knowledge_base_id}:{document_id}:visual_chunks"
+        tag = self._generation_tag(document_id, knowledge_base_id)
+        return f"{self.key_prefix}:document:v2:{tag}:visual_chunks"
 
     def _document_figures_key(self, document_id: str, knowledge_base_id: str) -> str:
-        return f"{self.key_prefix}:figures:{knowledge_base_id}:{document_id}"
+        tag = self._generation_tag(document_id, knowledge_base_id)
+        return f"{self.key_prefix}:figures:v2:{tag}"
+
+    def _figure_prefix(self, document_id: str, knowledge_base_id: str) -> str:
+        tag = self._generation_tag(document_id, knowledge_base_id)
+        return f"{self.key_prefix}:figure:v2:{tag}:"
 
     def _figure_key(
         self, knowledge_base_id: str, document_id: str, figure_id: str
     ) -> str:
-        return f"{self.key_prefix}:figure:{knowledge_base_id}:{document_id}:{figure_id}"
+        return f"{self._figure_prefix(document_id, knowledge_base_id)}{figure_id}"
+
+    def _table_prefix(self, document_id: str, knowledge_base_id: str) -> str:
+        tag = self._generation_tag(document_id, knowledge_base_id)
+        return f"{self.key_prefix}:table:v2:{tag}:"
 
     def _table_key(
         self, knowledge_base_id: str, document_id: str, table_id: str
     ) -> str:
-        return f"{self.key_prefix}:table:{knowledge_base_id}:{document_id}:{table_id}"
+        return f"{self._table_prefix(document_id, knowledge_base_id)}{table_id}"
+
+    def _table_rows_prefix(self, document_id: str, knowledge_base_id: str) -> str:
+        tag = self._generation_tag(document_id, knowledge_base_id)
+        return f"{self.key_prefix}:table_rows:v2:{tag}:"
 
     def _table_rows_key(
         self, knowledge_base_id: str, document_id: str, table_id: str
     ) -> str:
-        return (
-            f"{self.key_prefix}:table_rows:{knowledge_base_id}:{document_id}:{table_id}"
-        )
+        return f"{self._table_rows_prefix(document_id, knowledge_base_id)}{table_id}"
+
+    def _table_row_prefix(self, document_id: str, knowledge_base_id: str) -> str:
+        tag = self._generation_tag(document_id, knowledge_base_id)
+        return f"{self.key_prefix}:table_row:v2:{tag}:"
 
     def _table_row_key(
         self,
@@ -1095,10 +1371,7 @@ class RedisStackRagVectorStore:
         table_id: str,
         row_id: str,
     ) -> str:
-        return (
-            f"{self.key_prefix}:table_row:"
-            f"{knowledge_base_id}:{document_id}:{table_id}:{row_id}"
-        )
+        return f"{self._table_row_prefix(document_id, knowledge_base_id)}{table_id}:{row_id}"
 
     async def _upsert_table_sidecars_from_chunk(
         self,
@@ -1226,7 +1499,12 @@ class RedisStackRagVectorStore:
             "visual_embedding": _vector_to_bytes(visual_embedding),
         }
         await self.client.hset(
-            self._visual_chunk_key(chunk.chunk_id, knowledge_base_id), mapping=mapping
+            self._visual_chunk_key(
+                chunk.chunk_id,
+                knowledge_base_id,
+                document_id=chunk.document_id,
+            ),
+            mapping=mapping,
         )
         await self.client.sadd(
             self._document_visual_key(chunk.document_id, knowledge_base_id),
@@ -1292,7 +1570,11 @@ class RedisStackRagVectorStore:
         for raw_chunk_id in chunk_ids:
             chunk_id = _decode(raw_chunk_id)
             deleted = await self.client.delete(
-                self._visual_chunk_key(chunk_id, knowledge_base_id)
+                self._visual_chunk_key(
+                    chunk_id,
+                    knowledge_base_id,
+                    document_id=document_id,
+                )
             )
             count += int(bool(deleted))
         await self.client.delete(

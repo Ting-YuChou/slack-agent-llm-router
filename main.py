@@ -1752,6 +1752,14 @@ class LLMRouterPlatform:
                     knowledge_base_id=batch_request.knowledge_base_id,
                     metadata=batch_request.metadata,
                 )
+            except RagPayloadTooLarge as exc:
+                return JSONResponse(
+                    status_code=413,
+                    content={
+                        "error": "rag_payload_too_large",
+                        "message": str(exc),
+                    },
+                )
             except ValueError as exc:
                 return JSONResponse(
                     status_code=400,

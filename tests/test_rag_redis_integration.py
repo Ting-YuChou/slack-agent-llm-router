@@ -382,7 +382,9 @@ async def test_redis_rag_store_indexes_visual_chunks_and_cleans_sidecars():
         )
 
         figure_key = store._figure_key("school", "doc-fig", "figure-1")
-        visual_key = store._visual_chunk_key("figure-chunk", "school")
+        visual_key = store._visual_chunk_key(
+            "figure-chunk", "school", document_id="doc-fig"
+        )
         figure_payload = await store.client.hgetall(figure_key)
         visual_payload = await store.client.hgetall(visual_key)
         results = await store.search(
@@ -465,3 +467,125 @@ async def test_redis_stream_group_ack_and_pending_autoclaim():
             await client.aclose()
         elif hasattr(client, "close"):
             await client.close()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_stale_generation_cannot_overwrite_newer_sidecars(monkeypatch):
+    client = await _redis_stack_client_or_skip()
+    key_prefix = f"ragtest:{uuid.uuid4().hex}"
+    store = RedisStackRagVectorStore(
+        {
+            "embedding": {"dimensions": 4},
+            "redis": {
+                "host": os.getenv("RAG_REDIS_HOST", "localhost"),
+                "port": int(os.getenv("RAG_REDIS_PORT", "6380")),
+                "key_prefix": key_prefix,
+            },
+        }
+    )
+    try:
+        await store.initialize()
+        newer = _chunk(
+            "newer",
+            "doc-race",
+            "new generation",
+            metadata={
+                "figure_id": "figure-new",
+                "figure_sidecar": {"caption": "new"},
+            },
+        )
+        await store.upsert_chunks(
+            [newer], [[1.0, 0.0, 0.0, 0.0]], knowledge_base_id="school"
+        )
+        await store.client.set(
+            store._active_generation_key("doc-race", "school"),
+            "99999999999999999999-99999999",
+        )
+        monkeypatch.setattr(
+            "src.rag.vector_store._new_index_version",
+            lambda: "00000000000000000001-00000001",
+        )
+        stale = _chunk(
+            "stale",
+            "doc-race",
+            "stale generation",
+            metadata={
+                "figure_id": "figure-stale",
+                "figure_sidecar": {"caption": "stale"},
+            },
+        )
+
+        await store.upsert_chunks(
+            [stale], [[0.0, 1.0, 0.0, 0.0]], knowledge_base_id="school"
+        )
+
+        assert await store.client.exists(
+            store._figure_key("school", "doc-race", "figure-new")
+        )
+        assert not await store.client.exists(
+            store._figure_key("school", "doc-race", "figure-stale")
+        )
+        assert await store.client.smembers(
+            store._document_key("doc-race", "school")
+        ) == {b"newer"}
+    finally:
+        keys = [key async for key in client.scan_iter(match=f"{key_prefix}:*")]
+        if keys:
+            await client.delete(*keys)
+        await store.shutdown()
+        await client.aclose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_v1_and_v2_search_indexes_have_disjoint_key_roots():
+    client = await _redis_stack_client_or_skip()
+    prefix = f"ragisolation:{uuid.uuid4().hex}"
+    v1_index = f"{prefix}:idx:v1"
+    v2_index = f"{prefix}:idx:v2"
+    try:
+        for index_name, key_root in (
+            (v1_index, f"{prefix}:chunk:"),
+            (v2_index, f"{prefix}:v2:chunk:"),
+        ):
+            await client.execute_command(
+                "FT.CREATE",
+                index_name,
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                key_root,
+                "SCHEMA",
+                "chunk_id",
+                "TAG",
+                "SORTABLE",
+                "text",
+                "TEXT",
+            )
+        for chunk_id in ("a", "b"):
+            mapping = {"chunk_id": chunk_id, "text": f"policy {chunk_id}"}
+            await client.hset(f"{prefix}:chunk:school:{chunk_id}", mapping=mapping)
+            await client.hset(
+                f"{prefix}:v2:chunk:{{school:doc}}:{chunk_id}", mapping=mapping
+            )
+
+        v1 = await client.execute_command(
+            "FT.SEARCH", v1_index, "*", "SORTBY", "chunk_id", "ASC", "LIMIT", "0", "10"
+        )
+        v2 = await client.execute_command(
+            "FT.SEARCH", v2_index, "*", "SORTBY", "chunk_id", "ASC", "LIMIT", "0", "10"
+        )
+
+        assert v1[0] == 2
+        assert v2[0] == 2
+        assert [v1[2][1], v1[4][1]] == [b"a", b"b"]
+        assert [v2[2][1], v2[4][1]] == [b"a", b"b"]
+    finally:
+        for index_name in (v1_index, v2_index):
+            try:
+                await client.execute_command("FT.DROPINDEX", index_name, "DD")
+            except Exception:
+                pass
+        await client.aclose()
