@@ -4,11 +4,13 @@ Handles real-time data ingestion, processing, and storage to ClickHouse
 """
 
 import asyncio
+import copy
 import inspect
 import json
 import logging
 import time
 from datetime import datetime, timezone
+from collections import OrderedDict
 from typing import Dict, List, Optional, Any, Callable
 from dataclasses import dataclass, asdict, field
 import uuid
@@ -935,6 +937,9 @@ class ClickHouseManager:
             "port": config.get("port", 8123),
             "username": config.get("username", "default"),
             "password": config.get("password", ""),
+            # Dashboard queries run concurrently in worker threads. ClickHouse
+            # rejects overlapping queries that reuse one generated session id.
+            "autogenerate_session_id": False,
         }
 
         # Batch insertion settings
@@ -1041,7 +1046,7 @@ class ClickHouseManager:
             kafka_offset Int64 DEFAULT -1
         ) ENGINE = ReplacingMergeTree()
         PARTITION BY toYYYYMM(timestamp)
-        ORDER BY event_id
+        ORDER BY (timestamp, event_id)
         TTL toDateTime(timestamp) + INTERVAL 90 DAY
         """.format(
             database=self.database
@@ -1061,7 +1066,7 @@ class ClickHouseManager:
             kafka_offset Int64 DEFAULT -1
         ) ENGINE = ReplacingMergeTree()
         PARTITION BY toYYYYMMDD(timestamp)
-        ORDER BY event_id
+        ORDER BY (timestamp, service, metric_name, event_id)
         TTL toDateTime(timestamp) + INTERVAL 30 DAY
         """.format(
             database=self.database
@@ -1095,7 +1100,7 @@ class ClickHouseManager:
             kafka_offset Int64 DEFAULT -1
         ) ENGINE = ReplacingMergeTree()
         PARTITION BY toYYYYMMDD(timestamp)
-        ORDER BY event_id
+        ORDER BY (timestamp, model_name, provider, event_id)
         TTL toDateTime(timestamp) + INTERVAL 60 DAY
         """.format(
             database=self.database
@@ -1143,7 +1148,7 @@ class ClickHouseManager:
             kafka_offset Int64 DEFAULT -1
         ) ENGINE = ReplacingMergeTree()
         PARTITION BY toYYYYMMDD(timestamp)
-        ORDER BY event_id
+        ORDER BY (source_event_type, timestamp, event_id)
         TTL toDateTime(timestamp) + INTERVAL 30 DAY
         """.format(
             database=self.database
@@ -1179,7 +1184,7 @@ class ClickHouseManager:
             kafka_offset Int64 DEFAULT -1
         ) ENGINE = ReplacingMergeTree()
         PARTITION BY toYYYYMMDD(timestamp)
-        ORDER BY event_id
+        ORDER BY (timestamp, scope_type, scope_key, event_id)
         TTL toDateTime(timestamp) + INTERVAL 30 DAY
         """.format(
             database=self.database
@@ -1355,7 +1360,11 @@ class ClickHouseManager:
             raise
 
     async def get_query_analytics(
-        self, user_id: str = None, hours: int = 24
+        self,
+        user_id: Optional[str] = None,
+        hours: int = 24,
+        *,
+        raise_errors: bool = False,
     ) -> Dict[str, Any]:
         """Get query analytics for dashboard"""
         try:
@@ -1366,77 +1375,64 @@ class ClickHouseManager:
                 where_clauses.append(f"user_id = '{escaped_user_id}'")
             where_sql = " AND ".join(where_clauses)
 
-            overall_query = f"""
+            analytics_query = f"""
             SELECT
+                grouping(selected_model) AS model_grouped,
+                grouping(query_type) AS query_type_grouped,
+                selected_model,
+                query_type,
                 count() as total_queries,
                 ifNull(sum(token_count_input + token_count_output), 0) as total_tokens,
                 ifNull(sum(cost_usd), 0.0) as total_cost,
                 ifNull(avg(latency_ms), 0.0) as avg_latency,
                 if(count() = 0, 0.0, countIf(status = 'success') * 100.0 / count()) as success_rate
-            FROM {self.database}.query_logs
+            FROM {self.database}.query_logs FINAL
             WHERE {where_sql}
-            """
-            model_breakdown_query = f"""
-            SELECT
-                selected_model,
-                count() as total_queries,
-                ifNull(sum(cost_usd), 0.0) as total_cost
-            FROM {self.database}.query_logs
-            WHERE {where_sql}
-            GROUP BY selected_model
-            """
-            query_type_breakdown_query = f"""
-            SELECT
-                query_type,
-                count() as total_queries
-            FROM {self.database}.query_logs
-            WHERE {where_sql}
-            GROUP BY query_type
+            GROUP BY GROUPING SETS ((), (selected_model), (query_type))
             """
 
-            overall_result = await self._run_blocking(self.client.query, overall_query)
-            model_result = await self._run_blocking(
-                self.client.query, model_breakdown_query
-            )
-            query_type_result = await self._run_blocking(
-                self.client.query, query_type_breakdown_query
-            )
-
-            overall_row = (
-                overall_result.result_rows[0]
-                if overall_result.result_rows
-                else [0, 0, 0.0, 0.0, 0.0]
-            )
-            analytics = {
-                "total_queries": int(overall_row[0] or 0),
-                "total_tokens": int(overall_row[1] or 0),
-                "total_cost": float(overall_row[2] or 0.0),
-                "avg_latency": float(overall_row[3] or 0.0),
-                "success_rate": float(overall_row[4] or 0.0),
+            result = await self._run_blocking(self.client.query, analytics_query)
+            analytics: Dict[str, Any] = {
+                "total_queries": 0,
+                "total_tokens": 0,
+                "total_cost": 0.0,
+                "avg_latency": 0.0,
+                "success_rate": 0.0,
                 "model_breakdown": {},
                 "query_type_breakdown": {},
             }
 
-            for row in model_result.result_rows:
-                model = row[0]
-                if model not in analytics["model_breakdown"]:
-                    analytics["model_breakdown"][model] = {"queries": 0, "cost": 0.0}
-                analytics["model_breakdown"][model]["queries"] += int(row[1] or 0)
-                analytics["model_breakdown"][model]["cost"] += float(row[2] or 0.0)
-
-            for row in query_type_result.result_rows:
-                query_type = row[0]
-                if query_type not in analytics["query_type_breakdown"]:
-                    analytics["query_type_breakdown"][query_type] = 0
-                analytics["query_type_breakdown"][query_type] += int(row[1] or 0)
+            for row in result.result_rows:
+                model_grouped, query_type_grouped = int(row[0]), int(row[1])
+                if model_grouped and query_type_grouped:
+                    analytics.update(
+                        {
+                            "total_queries": int(row[4] or 0),
+                            "total_tokens": int(row[5] or 0),
+                            "total_cost": float(row[6] or 0.0),
+                            "avg_latency": float(row[7] or 0.0),
+                            "success_rate": float(row[8] or 0.0),
+                        }
+                    )
+                elif not model_grouped and query_type_grouped:
+                    analytics["model_breakdown"][row[2]] = {
+                        "queries": int(row[4] or 0),
+                        "cost": float(row[6] or 0.0),
+                    }
+                elif model_grouped and not query_type_grouped:
+                    analytics["query_type_breakdown"][row[3]] = int(row[4] or 0)
 
             return analytics
 
         except Exception as e:
             logger.error(f"Failed to get query analytics: {e}")
+            if raise_errors:
+                raise
             return {}
 
-    async def get_model_performance(self, hours: int = 24) -> List[Dict[str, Any]]:
+    async def get_model_performance(
+        self, hours: int = 24, *, raise_errors: bool = False
+    ) -> List[Dict[str, Any]]:
         """Get model performance metrics"""
         try:
             query = f"""
@@ -1449,7 +1445,7 @@ class ClickHouseManager:
                 sum(avg_tokens_per_second * requests_count) / nullIf(sum(requests_count), 0) as tokens_per_second,
                 sum(error_count) as errors,
                 sum(total_cost_usd) as total_cost
-            FROM {self.database}.model_performance
+            FROM {self.database}.model_performance FINAL
             WHERE timestamp >= now() - INTERVAL {hours} HOUR
             GROUP BY model_name, provider
             ORDER BY requests DESC, model_name ASC, provider ASC
@@ -1474,45 +1470,17 @@ class ClickHouseManager:
 
             if performance_data:
                 return performance_data
-
-            fallback_query = f"""
-            SELECT 
-                selected_model,
-                count() as requests,
-                countIf(status = 'success') * 100.0 / count() as success_rate,
-                avg(latency_ms) as avg_latency,
-                sum(token_count_input + token_count_output) / nullIf(sum(latency_ms), 0) * 1000 as tokens_per_second,
-                countIf(status != 'success') as errors,
-                sum(cost_usd) as total_cost
-            FROM {self.database}.query_logs 
-            WHERE timestamp >= now() - INTERVAL {hours} HOUR
-            GROUP BY selected_model
-            ORDER BY requests DESC
-            """
-
-            result = await self._run_blocking(self.client.query, fallback_query)
-            performance_data = []
-            for row in result.result_rows:
-                performance_data.append(
-                    {
-                        "model_name": row[0],
-                        "provider": "",
-                        "requests": row[1],
-                        "success_rate": row[2],
-                        "avg_latency_ms": row[3],
-                        "tokens_per_second": row[4],
-                        "error_count": row[5],
-                        "total_cost": row[6],
-                    }
-                )
-
-            return performance_data
+            return []
 
         except Exception as e:
             logger.error(f"Failed to get model performance: {e}")
+            if raise_errors:
+                raise
             return []
 
-    async def get_routing_guardrails(self, hours: int = 24) -> List[Dict[str, Any]]:
+    async def get_routing_guardrails(
+        self, hours: int = 24, *, raise_errors: bool = False
+    ) -> List[Dict[str, Any]]:
         """Get recent routing guardrail events persisted through the alert stream."""
         try:
             query = f"""
@@ -1524,7 +1492,7 @@ class ClickHouseManager:
                 model_name,
                 provider,
                 payload_json
-            FROM {self.database}.alert_events
+            FROM {self.database}.alert_events FINAL
             WHERE timestamp >= now() - INTERVAL {hours} HOUR
               AND source_event_type = 'routing.guardrails'
             ORDER BY timestamp DESC
@@ -1561,10 +1529,12 @@ class ClickHouseManager:
             return guardrails
         except Exception as e:
             logger.error(f"Failed to get routing guardrails: {e}")
+            if raise_errors:
+                raise
             return []
 
     async def get_routing_policy_state_events(
-        self, hours: int = 24
+        self, hours: int = 24, *, raise_errors: bool = False
     ) -> List[Dict[str, Any]]:
         """Get recent persisted routing.policy_state events for audit and tuning."""
         try:
@@ -1592,7 +1562,7 @@ class ClickHouseManager:
                 avoid_models,
                 avoid_providers,
                 payload_json
-            FROM {self.database}.routing_policy_state_events
+            FROM {self.database}.routing_policy_state_events FINAL
             WHERE timestamp >= now() - INTERVAL {hours} HOUR
             ORDER BY timestamp DESC
             LIMIT 50
@@ -1641,6 +1611,8 @@ class ClickHouseManager:
             return state_events
         except Exception as e:
             logger.error(f"Failed to get routing policy state events: {e}")
+            if raise_errors:
+                raise
             return []
 
     def shutdown(self):
@@ -2564,7 +2536,8 @@ class KafkaIngestionPipeline:
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.clickhouse_manager = ClickHouseManager(config.get("clickhouse", {}))
+        clickhouse_config = config.get("clickhouse", {})
+        self.clickhouse_manager = ClickHouseManager(clickhouse_config)
         self.producer_manager = KafkaProducerManager(config)
         self.consumer_manager = None  # Will be initialized after ClickHouse
         self._stream_handlers: Dict[str, List[Callable[[Dict[str, Any]], Any]]] = {
@@ -2574,6 +2547,22 @@ class KafkaIngestionPipeline:
             "routing_policy_state": [],
             "alerts": [],
         }
+        dashboard_config = clickhouse_config.get("dashboard", {})
+        self._dashboard_cache_ttl_seconds = max(
+            0.0, float(dashboard_config.get("cache_ttl_seconds", 5))
+        )
+        self._dashboard_cache_max_entries = max(
+            1, int(dashboard_config.get("cache_max_entries", 32))
+        )
+        self._dashboard_query_semaphore = asyncio.Semaphore(
+            max(1, int(dashboard_config.get("max_concurrent_queries", 4)))
+        )
+        self._dashboard_cache: OrderedDict[
+            tuple[int, Optional[str]], tuple[float, Dict[str, Any]]
+        ] = OrderedDict()
+        self._dashboard_inflight: Dict[
+            tuple[int, Optional[str]], asyncio.Task[Dict[str, Any]]
+        ] = {}
         self.running = False
 
     async def initialize(self):
@@ -2633,30 +2622,155 @@ class KafkaIngestionPipeline:
         await self.producer_manager.produce_error(error_data)
 
     async def get_analytics(
-        self, user_id: str = None, hours: int = 24
+        self,
+        user_id: Optional[str] = None,
+        hours: int = 24,
+        *,
+        raise_errors: bool = False,
     ) -> Dict[str, Any]:
         """Get analytics from ClickHouse"""
-        return await self.clickhouse_manager.get_query_analytics(user_id, hours)
+        if not raise_errors:
+            return await self.clickhouse_manager.get_query_analytics(user_id, hours)
+        return await self.clickhouse_manager.get_query_analytics(
+            user_id, hours, raise_errors=raise_errors
+        )
 
     async def get_query_analytics(
-        self, user_id: str = None, hours: int = 24
+        self,
+        user_id: Optional[str] = None,
+        hours: int = 24,
+        *,
+        raise_errors: bool = False,
     ) -> Dict[str, Any]:
         """Backward-compatible alias for dashboard analytics lookups."""
-        return await self.get_analytics(user_id, hours)
+        return await self.get_analytics(user_id, hours, raise_errors=raise_errors)
 
-    async def get_model_performance(self, hours: int = 24) -> List[Dict[str, Any]]:
+    async def get_model_performance(
+        self, hours: int = 24, *, raise_errors: bool = False
+    ) -> List[Dict[str, Any]]:
         """Get model performance from ClickHouse"""
-        return await self.clickhouse_manager.get_model_performance(hours)
+        if not raise_errors:
+            return await self.clickhouse_manager.get_model_performance(hours)
+        return await self.clickhouse_manager.get_model_performance(
+            hours, raise_errors=raise_errors
+        )
 
-    async def get_routing_guardrails(self, hours: int = 24) -> List[Dict[str, Any]]:
+    async def get_routing_guardrails(
+        self, hours: int = 24, *, raise_errors: bool = False
+    ) -> List[Dict[str, Any]]:
         """Get persisted routing guardrails from ClickHouse."""
-        return await self.clickhouse_manager.get_routing_guardrails(hours)
+        if not raise_errors:
+            return await self.clickhouse_manager.get_routing_guardrails(hours)
+        return await self.clickhouse_manager.get_routing_guardrails(
+            hours, raise_errors=raise_errors
+        )
 
     async def get_routing_policy_state_events(
-        self, hours: int = 24
+        self, hours: int = 24, *, raise_errors: bool = False
     ) -> List[Dict[str, Any]]:
         """Get persisted routing.policy_state events from ClickHouse."""
-        return await self.clickhouse_manager.get_routing_policy_state_events(hours)
+        if not raise_errors:
+            return await self.clickhouse_manager.get_routing_policy_state_events(hours)
+        return await self.clickhouse_manager.get_routing_policy_state_events(
+            hours, raise_errors=raise_errors
+        )
+
+    async def get_dashboard_bundle(
+        self, user_id: Optional[str] = None, hours: int = 24
+    ) -> Dict[str, Any]:
+        """Read independent dashboard sections with cache and single-flight."""
+        key = (max(int(hours), 0), user_id)
+        now = time.monotonic()
+        cached = self._dashboard_cache.get(key)
+        if cached is not None:
+            expires_at, value = cached
+            if expires_at > now:
+                self._dashboard_cache.move_to_end(key)
+                return copy.deepcopy(value)
+            self._dashboard_cache.pop(key, None)
+
+        task = self._dashboard_inflight.get(key)
+        if task is None:
+            task = asyncio.create_task(
+                self._load_dashboard_bundle_and_cleanup(
+                    key, user_id=user_id, hours=key[0]
+                )
+            )
+            self._dashboard_inflight[key] = task
+
+        return copy.deepcopy(await asyncio.shield(task))
+
+    async def _load_dashboard_bundle_and_cleanup(
+        self,
+        key: tuple[int, Optional[str]],
+        *,
+        user_id: Optional[str],
+        hours: int,
+    ) -> Dict[str, Any]:
+        try:
+            return await self._load_dashboard_bundle(user_id=user_id, hours=hours)
+        finally:
+            current = asyncio.current_task()
+            if self._dashboard_inflight.get(key) is current:
+                self._dashboard_inflight.pop(key, None)
+
+    async def _load_dashboard_bundle(
+        self, *, user_id: Optional[str], hours: int
+    ) -> Dict[str, Any]:
+        sections: Dict[str, tuple[Callable[..., Any], Dict[str, Any], Any]] = {
+            "analytics": (
+                self.get_query_analytics,
+                {"user_id": user_id, "hours": hours, "raise_errors": True},
+                {},
+            ),
+            "model_performance": (
+                self.get_model_performance,
+                {"hours": hours, "raise_errors": True},
+                [],
+            ),
+            "routing_guardrails": (
+                self.get_routing_guardrails,
+                {"hours": hours, "raise_errors": True},
+                [],
+            ),
+            "routing_policy_state": (
+                self.get_routing_policy_state_events,
+                {"hours": hours, "raise_errors": True},
+                [],
+            ),
+        }
+
+        async def load(name, method, kwargs, default):
+            async with self._dashboard_query_semaphore:
+                try:
+                    return name, await method(**kwargs), None
+                except Exception as exc:
+                    logger.error("Dashboard section %s failed: %s", name, exc)
+                    return name, copy.deepcopy(default), str(exc)
+
+        loaded = await asyncio.gather(
+            *(
+                load(name, method, kwargs, default)
+                for name, (method, kwargs, default) in sections.items()
+            )
+        )
+        bundle: Dict[str, Any] = {"errors": {}}
+        for name, value, error in loaded:
+            bundle[name] = value
+            if error is not None:
+                bundle["errors"][name] = error
+
+        if not bundle["errors"] and self._dashboard_cache_ttl_seconds > 0:
+            key = (hours, user_id)
+            self._dashboard_cache[key] = (
+                time.monotonic() + self._dashboard_cache_ttl_seconds,
+                copy.deepcopy(bundle),
+            )
+            self._dashboard_cache.move_to_end(key)
+            while len(self._dashboard_cache) > self._dashboard_cache_max_entries:
+                self._dashboard_cache.popitem(last=False)
+
+        return bundle
 
     def register_stream_handler(
         self, topic_key: str, callback: Callable[[Dict[str, Any]], Any]

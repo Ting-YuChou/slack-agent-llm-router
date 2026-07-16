@@ -719,6 +719,13 @@ class ClickHouseConfig(ConfigModel):
     username: str = "default"
     password: str = ""
     tables: Dict[str, Any] = Field(default_factory=dict)
+    dashboard: Dict[str, Any] = Field(
+        default_factory=lambda: {
+            "cache_ttl_seconds": 5,
+            "cache_max_entries": 32,
+            "max_concurrent_queries": 4,
+        }
+    )
     enabled: bool = False
 
 

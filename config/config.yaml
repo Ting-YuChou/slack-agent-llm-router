@@ -567,16 +567,38 @@ clickhouse:
   tables:
     queries:
       name: query_logs
-      engine: MergeTree
+      engine: ReplacingMergeTree
       partition_by: toYYYYMM(timestamp)
-      order_by: timestamp
+      order_by: (timestamp, event_id)
       ttl: timestamp + INTERVAL 90 DAY
     metrics:
       name: system_metrics
       engine: ReplacingMergeTree
       partition_by: toYYYYMMDD(timestamp)
-      order_by: (service, metric_name, timestamp)
+      order_by: (timestamp, service, metric_name, event_id)
       ttl: timestamp + INTERVAL 30 DAY
+    model_performance:
+      name: model_performance
+      engine: ReplacingMergeTree
+      partition_by: toYYYYMMDD(timestamp)
+      order_by: (timestamp, model_name, provider, event_id)
+      ttl: timestamp + INTERVAL 60 DAY
+    alert_events:
+      name: alert_events
+      engine: ReplacingMergeTree
+      partition_by: toYYYYMMDD(timestamp)
+      order_by: (source_event_type, timestamp, event_id)
+      ttl: timestamp + INTERVAL 30 DAY
+    routing_policy_state_events:
+      name: routing_policy_state_events
+      engine: ReplacingMergeTree
+      partition_by: toYYYYMMDD(timestamp)
+      order_by: (timestamp, scope_type, scope_key, event_id)
+      ttl: timestamp + INTERVAL 30 DAY
+  dashboard:
+    cache_ttl_seconds: 5
+    cache_max_entries: 32
+    max_concurrent_queries: 4
   enabled: false
 monitoring:
   prometheus_port: 8000
@@ -693,6 +715,7 @@ flink:
     anomaly_threshold_multiplier: 2.0
     guardrail_threshold_multiplier: 2.0
     watermark_out_of_orderness_seconds: 15
+    watermark_idleness_seconds: 60
     model_guardrails:
       high_error_rate: 0.3
       high_latency_ms: 5000
@@ -711,6 +734,8 @@ flink:
       regression_error_rate_floor: 0.1
       regression_latency_floor_ms: 4500
     rolling_policy:
+      bucket_size_seconds: 5
+      emit_interval_seconds: 5
       hot_request_count: 10
       warm_request_count: 4
       complex_total_tokens: 2400
