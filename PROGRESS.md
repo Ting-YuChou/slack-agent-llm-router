@@ -1,5 +1,12 @@
 # Project Progress
 
+## 2026-07-16 — Streaming RAG upload staging
+
+- Changed: multipart files are read in 1 MiB chunks into a same-directory `.part` file, with incremental SHA-256/size accounting, fsync, and atomic rename. Cancellation, read/write failure, and the 100 MB limit remove the partial file. JSON base64 is capped at 10 MB decoded before decode/allocation proceeds.
+- API: oversized uploads return HTTP 413 with `rag_payload_too_large`; both queued and queue-disabled background ingestion receive a durable `storage_ref` instead of retaining a multipart body in request memory.
+- Verification: RED/GREEN tests cover fixed-size reads, byte fidelity, atomic publication, overflow cleanup, decoded base64 boundaries, schema preservation, API 413 behavior, and queue-disabled storage-ref handoff. RAG/API/schema scoped regression passed (`126 passed`).
+- Follow-up: real 100 MB RSS measurement, real Redis fault injection, compose worker smoke, and full-suite verification remain.
+
 ## 2026-07-16 — Parallel RAG retrieval and bounded result payloads
 
 - Changed: text and visual query embeddings now start together; Redis keyword, vector, and visual branches run with a three-branch bound and one shared 30-second deadline. Branch failures degrade only that source and merge order remains keyword/vector/visual deterministic.

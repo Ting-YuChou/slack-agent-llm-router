@@ -1075,6 +1075,12 @@ class RagStorageConfig(ConfigModel):
     completed_file_ttl_seconds: int = Field(86400, ge=0)
 
 
+class RagUploadConfig(ConfigModel):
+    json_max_decoded_bytes: int = Field(10_000_000, ge=1)
+    multipart_max_bytes: int = Field(100_000_000, ge=1)
+    stream_chunk_bytes: int = Field(1_048_576, ge=1024, le=16_777_216)
+
+
 class RagVisualProviderConfig(ConfigModel):
     enabled: bool = False
     provider: str = ""
@@ -1144,6 +1150,7 @@ class RagConfig(ConfigModel):
         default_factory=RagIngestionQueueConfig
     )
     storage: RagStorageConfig = Field(default_factory=RagStorageConfig)
+    upload: RagUploadConfig = Field(default_factory=RagUploadConfig)
 
     @field_validator("backend")
     @classmethod

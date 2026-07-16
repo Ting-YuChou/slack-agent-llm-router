@@ -1148,6 +1148,82 @@ class TestApiApp:
         assert job_response.json()["job_id"] == "job-1"
         assert job_response.json()["status"] == "completed"
 
+    def test_rag_document_endpoint_rejects_oversized_json_with_413(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(
+            tmp_path,
+            overrides={"rag": {"enabled": True, "backend": "memory"}},
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        platform.services["rag"] = DummyRagService(
+            {
+                "enabled": True,
+                "upload": {"json_max_decoded_bytes": 4},
+            }
+        )
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/rag/documents",
+                json={
+                    "filename": "large.pdf",
+                    "content_base64": base64.b64encode(b"12345").decode("ascii"),
+                },
+            )
+
+        assert response.status_code == 413
+        assert response.json()["error"] == "rag_payload_too_large"
+
+    def test_rag_multipart_background_ingestion_uses_storage_ref(
+        self, tmp_path, patched_platform_deps
+    ):
+        class StreamingRagService(DummyRagService):
+            def __init__(self):
+                super().__init__({"enabled": True})
+                self.queued_payload = None
+                self.processed_payload = None
+
+            async def stage_uploaded_file(self, upload, **_kwargs):
+                chunks = []
+                while True:
+                    chunk = await upload.read(2)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                assert b"".join(chunks) == b"abcdef"
+                return str(tmp_path / "staged.pdf")
+
+            async def queue_document_ingestion(self, **payload):
+                self.queued_payload = payload
+                return await super().queue_document_ingestion(**payload)
+
+            async def process_ingestion_job(self, job_id, **payload):
+                self.processed_payload = payload
+                return await super().process_ingestion_job(job_id, **payload)
+
+        config_path = _write_config(
+            tmp_path,
+            overrides={"rag": {"enabled": True, "backend": "memory"}},
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        rag_service = StreamingRagService()
+        platform.services["rag"] = rag_service
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/rag/documents",
+                files={"file": ("handbook.pdf", b"abcdef", "application/pdf")},
+            )
+
+        assert response.status_code == 200
+        assert rag_service.queued_payload["storage_ref"].endswith("staged.pdf")
+        assert "content" not in rag_service.queued_payload
+        assert rag_service.processed_payload["content"] is None
+        assert rag_service.processed_payload["storage_ref"].endswith("staged.pdf")
+
     def test_rag_batch_endpoints_create_and_report_progress(
         self, tmp_path, patched_platform_deps
     ):

@@ -359,6 +359,10 @@ rag:
     staging_dir: data/rag/uploads
     cleanup_completed_files: false
     completed_file_ttl_seconds: 86400
+  upload:
+    json_max_decoded_bytes: 10000000
+    multipart_max_bytes: 100000000
+    stream_chunk_bytes: 1048576
   retrieval:
     top_k: 5
     candidate_count: 30

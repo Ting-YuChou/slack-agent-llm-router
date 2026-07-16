@@ -21,6 +21,7 @@ import secrets
 import signal
 import sys
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,7 +49,7 @@ from src.llm_router_part2_inference import InferenceEngine
 from src.llm_router_part3_policy import PolicyMaterializer, RoutingPolicyCache
 from src.llm_router_part3_pipeline import KafkaIngestionPipeline, KafkaProducerManager
 from src.llm_router_part4_monitor import MonitoringService
-from src.rag.service import RagService, decode_base64_document
+from src.rag.service import RagPayloadTooLarge, RagService, decode_base64_document
 from src.utils.logger import security_logger, setup_logging
 from src.utils.metrics import (
     INFERENCE_METRICS,
@@ -967,6 +968,13 @@ class LLMRouterPlatform:
         return self.services.get("rag")
 
     async def _parse_rag_document_request(self, request: Request) -> Dict[str, Any]:
+        rag_service = self._get_rag_service()
+        rag_config = dict(getattr(rag_service, "config", {}) or {})
+        upload_config = dict(
+            getattr(rag_service, "upload_config", None)
+            or rag_config.get("upload", {})
+            or {}
+        )
         content_type = request.headers.get("content-type", "").lower()
         if "application/json" in content_type:
             payload = await request.json()
@@ -977,12 +985,42 @@ class LLMRouterPlatform:
             metadata = payload.get("metadata") or {}
             if not isinstance(metadata, dict):
                 raise ValueError("metadata must be an object")
+            content = decode_base64_document(
+                str(encoded),
+                max_decoded_bytes=int(
+                    upload_config.get("json_max_decoded_bytes", 10_000_000)
+                ),
+            )
+            document_id = str(payload.get("document_id") or uuid.uuid4())
+            knowledge_base_id = payload.get("knowledge_base_id")
+            stage_content = getattr(rag_service, "stage_document_content", None)
+            if callable(stage_content):
+                default_kbs = list(
+                    rag_config.get("default_knowledge_base_ids", []) or []
+                )
+                resolved_kb = knowledge_base_id or (
+                    default_kbs[0] if default_kbs else "default"
+                )
+                storage_ref = await asyncio.to_thread(
+                    stage_content,
+                    content,
+                    filename=filename,
+                    knowledge_base_id=resolved_kb,
+                    document_id=document_id,
+                )
+                return {
+                    "filename": filename,
+                    "storage_ref": storage_ref,
+                    "knowledge_base_id": knowledge_base_id,
+                    "metadata": metadata,
+                    "document_id": document_id,
+                }
             return {
                 "filename": filename,
-                "content": decode_base64_document(str(encoded)),
-                "knowledge_base_id": payload.get("knowledge_base_id"),
+                "content": content,
+                "knowledge_base_id": knowledge_base_id,
                 "metadata": metadata,
-                "document_id": payload.get("document_id"),
+                "document_id": document_id,
             }
 
         if "multipart/form-data" in content_type:
@@ -1007,12 +1045,35 @@ class LLMRouterPlatform:
             filename = str(
                 getattr(upload, "filename", "") or form.get("filename") or ""
             )
+            document_id = str(form.get("document_id") or uuid.uuid4())
+            knowledge_base_id = form.get("knowledge_base_id")
+            stage_upload = getattr(rag_service, "stage_uploaded_file", None)
+            if callable(stage_upload):
+                default_kbs = list(
+                    rag_config.get("default_knowledge_base_ids", []) or []
+                )
+                resolved_kb = knowledge_base_id or (
+                    default_kbs[0] if default_kbs else "default"
+                )
+                storage_ref = await stage_upload(
+                    upload,
+                    filename=filename or "document.pdf",
+                    knowledge_base_id=resolved_kb,
+                    document_id=document_id,
+                )
+                return {
+                    "filename": filename or "document.pdf",
+                    "storage_ref": storage_ref,
+                    "knowledge_base_id": knowledge_base_id,
+                    "metadata": metadata,
+                    "document_id": document_id,
+                }
             return {
                 "filename": filename or "document.pdf",
                 "content": await upload.read(),
-                "knowledge_base_id": form.get("knowledge_base_id"),
+                "knowledge_base_id": knowledge_base_id,
                 "metadata": metadata,
-                "document_id": form.get("document_id"),
+                "document_id": document_id,
             }
 
         raise ValueError("Use application/json or multipart/form-data")
@@ -1608,13 +1669,19 @@ class LLMRouterPlatform:
                     background_tasks.add_task(
                         rag_service.process_ingestion_job,
                         job.job_id,
-                        content=payload["content"],
+                        content=payload.get("content"),
                         filename=payload["filename"],
                         knowledge_base_id=job.knowledge_base_id,
                         metadata=payload.get("metadata"),
                         document_id=job.document_id,
+                        storage_ref=payload.get("storage_ref"),
                     )
                 return job.to_dict()
+            except RagPayloadTooLarge as exc:
+                return JSONResponse(
+                    status_code=413,
+                    content={"error": "rag_payload_too_large", "message": str(exc)},
+                )
             except ValueError as exc:
                 return JSONResponse(
                     status_code=400,

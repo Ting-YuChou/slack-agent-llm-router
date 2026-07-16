@@ -45,6 +45,10 @@ JOB_STATUSES = {
 }
 
 
+class RagPayloadTooLarge(ValueError):
+    """Raised before an oversized RAG upload can enter parsing or indexing."""
+
+
 @dataclass
 class IngestionJob:
     """Ingestion job record surfaced by the API."""
@@ -190,6 +194,7 @@ class RagService:
         self.intent_gate_config = dict(self.config.get("intent_gate", {}) or {})
         self.queue_config = dict(self.config.get("ingestion_queue", {}) or {})
         self.storage_config = dict(self.config.get("storage", {}) or {})
+        self.upload_config = dict(self.config.get("upload", {}) or {})
         self.job_ttl_seconds = int(self.config.get("job_ttl_seconds", 86400))
         self.queue_enabled = bool(self.queue_config.get("enabled", False))
         self.stream_key = str(
@@ -342,7 +347,7 @@ class RagService:
         self,
         job_id: str,
         *,
-        content: bytes,
+        content: Optional[bytes],
         filename: str,
         knowledge_base_id: str,
         metadata: Optional[Dict[str, Any]] = None,
@@ -1257,6 +1262,51 @@ class RagService:
         target.write_bytes(content)
         return str(target)
 
+    async def stage_uploaded_file(
+        self,
+        upload: Any,
+        *,
+        filename: str,
+        knowledge_base_id: str,
+        document_id: str,
+    ) -> str:
+        """Stream an upload to disk and publish it with an atomic rename."""
+        safe_filename = _safe_path_component(filename or "document.pdf")
+        safe_kb = _safe_path_component(knowledge_base_id)
+        safe_document = _safe_path_component(document_id)
+        target_dir = self.staging_dir / safe_kb / safe_document
+        target_dir.mkdir(parents=True, exist_ok=True)
+        temporary = target_dir / f".{uuid.uuid4().hex}-{safe_filename}.part"
+        max_bytes = int(self.upload_config.get("multipart_max_bytes", 100_000_000))
+        chunk_bytes = max(
+            1, int(self.upload_config.get("stream_chunk_bytes", 1_048_576))
+        )
+        digest = hashlib.sha256()
+        size = 0
+        published = False
+        try:
+            with temporary.open("xb") as staged_file:
+                while True:
+                    chunk = await upload.read(chunk_bytes)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise RagPayloadTooLarge(
+                            "Multipart document exceeds the configured RAG upload limit"
+                        )
+                    digest.update(chunk)
+                    await asyncio.to_thread(staged_file.write, chunk)
+                await asyncio.to_thread(staged_file.flush)
+                await asyncio.to_thread(os.fsync, staged_file.fileno())
+            target = target_dir / f"{digest.hexdigest()}-{safe_filename}"
+            await asyncio.to_thread(os.replace, temporary, target)
+            published = True
+            return str(target)
+        finally:
+            if not published:
+                temporary.unlink(missing_ok=True)
+
     def load_staged_content(self, storage_ref: Optional[str]) -> bytes:
         if not storage_ref:
             raise ValueError("storage_ref is required for queued ingestion")
@@ -1370,11 +1420,25 @@ class RagService:
         return self._prefixed_key(f"batch:{batch_id}:jobs")
 
 
-def decode_base64_document(payload: str) -> bytes:
+def decode_base64_document(
+    payload: str, *, max_decoded_bytes: Optional[int] = None
+) -> bytes:
+    if max_decoded_bytes is not None:
+        padding = len(payload) - len(payload.rstrip("="))
+        estimated_size = (len(payload) * 3) // 4 - padding
+        if estimated_size > max_decoded_bytes:
+            raise RagPayloadTooLarge(
+                "JSON document exceeds the configured decoded RAG upload limit"
+            )
     try:
-        return base64.b64decode(payload.encode("utf-8"), validate=True)
+        decoded = base64.b64decode(payload.encode("utf-8"), validate=True)
     except (binascii.Error, ValueError) as exc:
         raise ValueError("content_base64 must be valid base64") from exc
+    if max_decoded_bytes is not None and len(decoded) > max_decoded_bytes:
+        raise RagPayloadTooLarge(
+            "JSON document exceeds the configured decoded RAG upload limit"
+        )
+    return decoded
 
 
 def _decode(value: Any) -> str:

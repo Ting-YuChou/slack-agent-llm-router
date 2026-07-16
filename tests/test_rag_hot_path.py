@@ -1,4 +1,5 @@
 import asyncio
+import base64
 from pathlib import Path
 
 import pytest
@@ -7,7 +8,7 @@ import yaml
 import main
 from src.memory import LocalHttpEmbeddingProvider, OpenAIEmbeddingProvider
 from src.rag.chunker import DocumentChunk
-from src.rag.service import RagService
+from src.rag.service import RagPayloadTooLarge, RagService, decode_base64_document
 from src.rag.vector_store import RedisStackRagVectorStore
 from src.utils.schema import PlatformConfig
 
@@ -452,3 +453,89 @@ async def test_redis_search_commands_do_not_return_embedding_payloads():
 
     assert len(store.client.commands) == 2
     assert all("embedding" not in command for command in store.client.commands)
+
+
+class _StreamingUpload:
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+        self.read_sizes = []
+
+    async def read(self, size):
+        self.read_sizes.append(size)
+        return self.chunks.pop(0) if self.chunks else b""
+
+
+@pytest.mark.asyncio
+async def test_multipart_upload_streams_to_atomic_staging_file(tmp_path):
+    service = RagService(
+        {
+            "enabled": True,
+            "backend": "memory",
+            "storage": {"staging_dir": str(tmp_path)},
+            "upload": {
+                "multipart_max_bytes": 100,
+                "stream_chunk_bytes": 4,
+            },
+        }
+    )
+    upload = _StreamingUpload([b"abcd", b"ef", b""])
+
+    storage_ref = await service.stage_uploaded_file(
+        upload,
+        filename="handbook.pdf",
+        knowledge_base_id="school",
+        document_id="doc-1",
+    )
+
+    assert Path(storage_ref).read_bytes() == b"abcdef"
+    assert upload.read_sizes == [4, 4, 4]
+    assert list(tmp_path.rglob("*.part")) == []
+
+
+@pytest.mark.asyncio
+async def test_multipart_upload_overflow_removes_partial_file(tmp_path):
+    service = RagService(
+        {
+            "enabled": True,
+            "backend": "memory",
+            "storage": {"staging_dir": str(tmp_path)},
+            "upload": {"multipart_max_bytes": 5, "stream_chunk_bytes": 4},
+        }
+    )
+
+    with pytest.raises(RagPayloadTooLarge):
+        await service.stage_uploaded_file(
+            _StreamingUpload([b"abcd", b"ef"]),
+            filename="handbook.pdf",
+            knowledge_base_id="school",
+            document_id="doc-1",
+        )
+
+    assert list(tmp_path.rglob("*.part")) == []
+    assert list(tmp_path.rglob("*.pdf")) == []
+
+
+def test_json_base64_limit_checks_decoded_size():
+    encoded = base64.b64encode(b"12345").decode("ascii")
+
+    with pytest.raises(RagPayloadTooLarge):
+        decode_base64_document(encoded, max_decoded_bytes=4)
+
+    assert decode_base64_document(encoded, max_decoded_bytes=5) == b"12345"
+
+
+def test_rag_upload_config_survives_validation():
+    config = PlatformConfig.model_validate(
+        {
+            "rag": {
+                "upload": {
+                    "json_max_decoded_bytes": 10_000_000,
+                    "multipart_max_bytes": 100_000_000,
+                    "stream_chunk_bytes": 1_048_576,
+                }
+            }
+        }
+    )
+
+    assert config.rag.upload.json_max_decoded_bytes == 10_000_000
+    assert config.rag.upload.multipart_max_bytes == 100_000_000
