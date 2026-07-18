@@ -1358,6 +1358,28 @@ class TestKafkaConsumerManager:
         assert consumer.pending_commit_offsets["routing_guardrails"] == {}
         assert consumer.awaiting_commit_offsets["routing_guardrails"] == {}
 
+    @pytest.mark.asyncio
+    async def test_shutdown_insert_failure_keeps_offset_uncommitted_and_stops_consumer(
+        self, pipeline_config, sample_query_log
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        kafka_consumer = AsyncMock()
+        consumer.consumers["queries"] = kafka_consumer
+        consumer.clickhouse.batch_insert_query_logs = AsyncMock(
+            side_effect=RuntimeError("clickhouse unavailable")
+        )
+        tp = TopicPartition("test-queries", 0)
+        consumer.batch_processors["queries"].append(sample_query_log)
+        consumer.pending_commit_offsets["queries"][tp] = 5
+
+        with pytest.raises(RuntimeError, match="clickhouse unavailable"):
+            await consumer.shutdown()
+
+        kafka_consumer.commit.assert_not_awaited()
+        kafka_consumer.stop.assert_awaited_once()
+        assert consumer.pending_commit_offsets["queries"] == {tp: 5}
+        assert consumer.batch_processors["queries"] == [sample_query_log]
+
 
 class TestKafkaIngestionPipeline:
     @pytest.mark.asyncio

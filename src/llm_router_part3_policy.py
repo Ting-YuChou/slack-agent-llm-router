@@ -653,16 +653,12 @@ class PolicyMaterializer:
             return
 
         self.running = True
-        tasks = []
-        for topic_key, consumer in self.consumers.items():
-            tasks.append(
-                asyncio.create_task(
+        async with asyncio.TaskGroup() as task_group:
+            for topic_key, consumer in self.consumers.items():
+                task_group.create_task(
                     self._supervise_consumer(topic_key, consumer),
                     name=f"policy_materializer_{topic_key}",
                 )
-            )
-
-        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _supervise_consumer(self, topic_key: str, consumer: AIOKafkaConsumer):
         """Restart policy materializer consumers after task-level failures."""
@@ -873,6 +869,11 @@ class PolicyMaterializer:
     async def shutdown(self):
         """Shutdown Kafka consumers. The shared cache is owned by the platform."""
         self.running = False
-        for consumer in self.consumers.values():
-            await consumer.stop()
+        results = await asyncio.gather(
+            *(consumer.stop() for consumer in self.consumers.values()),
+            return_exceptions=True,
+        )
         self.consumers.clear()
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise failures[0]

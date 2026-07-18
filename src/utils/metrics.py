@@ -768,6 +768,33 @@ class RagMetrics:
         )
 
 
+class SupervisionMetrics:
+    """Managed service and shutdown lifecycle metrics."""
+
+    def __init__(self):
+        self.service_failures = Counter(
+            "llm_router_service_failures_total", "Managed service failures", ["service"]
+        )
+        self.service_restarts = Counter(
+            "llm_router_service_restarts_total",
+            "Optional service restarts",
+            ["service"],
+        )
+        self.service_state = Gauge(
+            "llm_router_service_state",
+            "Managed service state (1 for current state)",
+            ["service", "state"],
+        )
+        self.shutdown_phase_duration = Histogram(
+            "llm_router_shutdown_phase_duration_seconds",
+            "Shutdown phase duration",
+            ["phase"],
+        )
+        self.shutdown_timeouts = Counter(
+            "llm_router_shutdown_timeouts_total", "Shutdown timeouts", ["phase"]
+        )
+
+
 # Global metric instances
 SYSTEM_METRICS = SystemMetrics()
 ROUTER_METRICS = RouterMetrics()
@@ -778,6 +805,7 @@ USER_METRICS = UserMetrics()
 ADMISSION_METRICS = AdmissionMetrics()
 BOUNDED_STATE_METRICS = BoundedStateMetrics()
 RAG_METRICS = RagMetrics()
+SUPERVISION_METRICS = SupervisionMetrics()
 
 
 class MetricsCollector:
@@ -1211,6 +1239,7 @@ __all__ = [
     "ADMISSION_METRICS",
     "BOUNDED_STATE_METRICS",
     "RAG_METRICS",
+    "SUPERVISION_METRICS",
     "BUSINESS_METRICS",
     "METRICS_REPORTER",
     "MetricsCollector",

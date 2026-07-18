@@ -860,3 +860,7 @@ features:
   streaming_responses: true
 pipeline:
   enabled: false
+shutdown:
+  grace_period_seconds: 75
+  api_drain_timeout_seconds: 65
+  service_stop_timeout_seconds: 15

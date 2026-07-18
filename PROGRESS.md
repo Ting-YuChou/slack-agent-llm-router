@@ -1,5 +1,13 @@
 # Project Progress
 
+## 2026-07-18 — Essential service supervision and deterministic shutdown
+
+- Supervision: API, pipeline, policy materializer, and Slack are runtime-role essential; exception or unexpected return triggers sibling cancellation, exactly-once shutdown, and exit code 1. Monitoring is optional and restarts with 1–30 second exponential backoff.
+- Internals: Kafka consumers, policy materializer, and monitoring component groups now use `TaskGroup`; Slack terminal socket failures propagate to the platform instead of returning healthy.
+- Signals: loop signal handlers only set shutdown state; the first signal drains gracefully and the second sets force-cancel and cancels managed service tasks without calling `sys.exit()` in a handler.
+- Shutdown: one lock protects shutdown, API admission stops and Uvicorn receives up to 65 seconds to drain, each service receives at most 15 seconds, global grace is 75 seconds, duplicate service objects close once, and the Kafka consumer still closes after a failed flush while leaving offsets uncommitted for replay.
+- Verification: essential failure, optional restart, concurrent shutdown, two-signal state, Slack failure propagation, failed ClickHouse flush replay, main/pipeline/policy/Slack/schema regressions passed (`204 passed, 3 deselected`).
+
 ## 2026-07-18 — Cross-process RAG staging governance
 
 - Added: job-specific staged data plus atomically written manifests, a POSIX-flocked shared usage ledger, startup reconciliation, `.part` cleanup, and a five-minute janitor.

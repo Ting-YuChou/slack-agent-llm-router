@@ -1186,6 +1186,12 @@ class RagConfig(ConfigModel):
         return normalized
 
 
+class ShutdownConfig(ConfigModel):
+    grace_period_seconds: float = Field(75.0, gt=0)
+    api_drain_timeout_seconds: float = Field(65.0, gt=0)
+    service_stop_timeout_seconds: float = Field(15.0, gt=0)
+
+
 class PlatformConfig(ConfigModel):
     api: ApiConfig = Field(default_factory=ApiConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
@@ -1203,5 +1209,6 @@ class PlatformConfig(ConfigModel):
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     performance: PerformanceConfig = Field(default_factory=PerformanceConfig)
     development: DevelopmentConfig = Field(default_factory=DevelopmentConfig)
+    shutdown: ShutdownConfig = Field(default_factory=ShutdownConfig)
     features: FeatureFlagsConfig = Field(default_factory=FeatureFlagsConfig)
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)

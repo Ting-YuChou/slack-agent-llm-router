@@ -1428,3 +1428,18 @@ async def test_slack_work_queue_bounds_running_and_queued_and_replies_busy():
 
     release.set()
     await bot._stop_work_workers()
+
+
+@pytest.mark.asyncio
+async def test_slack_start_propagates_terminal_socket_failure_and_disconnects_once():
+    bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
+    bot.socket_client = SimpleNamespace(
+        connect=AsyncMock(side_effect=RuntimeError("socket failed")),
+        disconnect=AsyncMock(),
+    )
+
+    with pytest.raises(RuntimeError, match="socket failed"):
+        await bot.start()
+
+    await bot._disconnect_socket_once()
+    bot.socket_client.disconnect.assert_awaited_once()

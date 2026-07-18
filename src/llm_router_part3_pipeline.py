@@ -1780,21 +1780,13 @@ class KafkaConsumerManager:
     async def start_consuming(self):
         """Start consuming messages from all topics"""
         self.running = True
-        tasks = []
-
-        for topic_key, consumer in self.consumers.items():
-            tasks.append(
-                asyncio.create_task(
+        async with asyncio.TaskGroup() as task_group:
+            for topic_key, consumer in self.consumers.items():
+                task_group.create_task(
                     self._supervise_consumer(topic_key, consumer),
                     name=f"kafka_consumer_{topic_key}",
                 )
-            )
-
-        # Start batch processor
-        tasks.append(asyncio.create_task(self._batch_processor()))
-
-        # Wait for all tasks
-        await asyncio.gather(*tasks, return_exceptions=True)
+            task_group.create_task(self._batch_processor(), name="kafka_batch_flush")
 
     async def _supervise_consumer(self, topic_key: str, consumer: AIOKafkaConsumer):
         """Restart a topic consumer loop when it exits unexpectedly."""
@@ -2660,12 +2652,26 @@ class KafkaConsumerManager:
     async def shutdown(self):
         """Shutdown all consumers"""
         self.running = False
-        await self.flush_pending_batches()
-        for consumer in self.consumers.values():
-            await consumer.stop()
+        failures: List[BaseException] = []
+        try:
+            await self.flush_pending_batches()
+        except BaseException as exc:
+            failures.append(exc)
+        stop_results = await asyncio.gather(
+            *(consumer.stop() for consumer in self.consumers.values()),
+            return_exceptions=True,
+        )
+        failures.extend(
+            result for result in stop_results if isinstance(result, BaseException)
+        )
         if self.dlq_producer:
-            await self.dlq_producer.stop()
+            try:
+                await self.dlq_producer.stop()
+            except BaseException as exc:
+                failures.append(exc)
         logger.info("Kafka consumers shutdown complete")
+        if failures:
+            raise failures[0]
 
 
 class KafkaIngestionPipeline:
@@ -2996,10 +3002,22 @@ class KafkaIngestionPipeline:
         logger.info("Shutting down Kafka ingestion pipeline...")
         self.running = False
 
+        failures: List[BaseException] = []
         if self.consumer_manager:
-            await self.consumer_manager.shutdown()
+            try:
+                await self.consumer_manager.shutdown()
+            except BaseException as exc:
+                failures.append(exc)
 
-        await self.producer_manager.shutdown()
-        self.clickhouse_manager.shutdown()
+        try:
+            await self.producer_manager.shutdown()
+        except BaseException as exc:
+            failures.append(exc)
+        try:
+            self.clickhouse_manager.shutdown()
+        except BaseException as exc:
+            failures.append(exc)
 
         logger.info("Kafka ingestion pipeline shutdown complete")
+        if failures:
+            raise failures[0]

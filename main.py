@@ -23,6 +23,7 @@ import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -60,6 +61,7 @@ from src.utils.metrics import (
     INFERENCE_METRICS,
     ROUTER_METRICS,
     SYSTEM_METRICS,
+    SUPERVISION_METRICS,
     USER_METRICS,
     histogram_average,
     sum_metric_by_label,
@@ -81,6 +83,13 @@ WEB_SEARCH_ENABLED_ENV_VAR = "LLM_ROUTER_WEB_SEARCH_ENABLED"
 RAG_ENABLED_ENV_VAR = "LLM_ROUTER_RAG_ENABLED"
 RAG_QUEUE_ENABLED_ENV_VAR = "LLM_ROUTER_RAG_QUEUE_ENABLED"
 PUBLIC_ENDPOINTS = {"/live", "/ready", "/health"}
+
+
+@dataclass(frozen=True)
+class ManagedServiceSpec:
+    name: str
+    criticality: str
+    shutdown_priority: int
 
 
 def resolve_config_path(config_path: Optional[str] = None) -> str:
@@ -121,6 +130,22 @@ class LLMRouterPlatform:
         self.services: Dict[str, Any] = {}
         self.processes: List[mp.Process] = []
         self.shutdown_event = asyncio.Event()
+        self.force_shutdown_event = asyncio.Event()
+        self._shutdown_lock = asyncio.Lock()
+        self._shutdown_complete = False
+        self._signal_count = 0
+        self._service_tasks: set[asyncio.Task] = set()
+        self._api_server: Optional[uvicorn.Server] = None
+        shutdown_config = dict(self.config.get("shutdown", {}) or {})
+        self.shutdown_grace_period_seconds = float(
+            shutdown_config.get("grace_period_seconds", 75)
+        )
+        self.api_drain_timeout_seconds = float(
+            shutdown_config.get("api_drain_timeout_seconds", 65)
+        )
+        self.service_stop_timeout_seconds = float(
+            shutdown_config.get("service_stop_timeout_seconds", 15)
+        )
 
         # Setup logging
         setup_logging(
@@ -374,63 +399,147 @@ class LLMRouterPlatform:
 
     async def _start_services(
         self, include_api: bool = True, include_background: bool = True
-    ):
+    ) -> int:
         """Start selected platform services."""
         self.logger.info("Starting platform services...")
 
-        tasks = []
+        managed: List[tuple[ManagedServiceSpec, Any]] = []
 
         if include_background:
             self._start_metrics_server()
 
             if "pipeline" in self.services:
-                tasks.append(
-                    asyncio.create_task(
-                        self.services["pipeline"].start(), name="kafka_pipeline"
+                managed.append(
+                    (
+                        ManagedServiceSpec("pipeline", "essential", 20),
+                        self.services["pipeline"].start,
                     )
                 )
 
             if "policy_materializer" in self.services:
-                tasks.append(
-                    asyncio.create_task(
-                        self.services["policy_materializer"].start(),
-                        name="policy_materializer",
+                managed.append(
+                    (
+                        ManagedServiceSpec("policy_materializer", "essential", 20),
+                        self.services["policy_materializer"].start,
                     )
                 )
 
             if "monitoring" in self.services:
-                tasks.append(
-                    asyncio.create_task(
-                        self.services["monitoring"].start(), name="monitoring_service"
+                managed.append(
+                    (
+                        ManagedServiceSpec("monitoring", "optional", 40),
+                        self.services["monitoring"].start,
                     )
                 )
 
             if "slack_bot" in self.services:
-                tasks.append(
-                    asyncio.create_task(
-                        self.services["slack_bot"].start(), name="slack_bot"
+                managed.append(
+                    (
+                        ManagedServiceSpec("slack_bot", "essential", 10),
+                        self.services["slack_bot"].start,
                     )
                 )
 
         if include_api:
             api_config = self.config.get("api", {})
-            tasks.append(
-                asyncio.create_task(
-                    self._start_api_server(api_config), name="api_server"
+            managed.append(
+                (
+                    ManagedServiceSpec("api", "essential", 10),
+                    lambda: self._start_api_server(api_config),
                 )
             )
 
-        if not tasks:
+        if not managed:
             self.logger.warning("No services selected to start; exiting")
-            return
+            return 0
 
         self.logger.info("Selected services started")
 
+        tasks: Dict[asyncio.Task, ManagedServiceSpec] = {}
+        for spec, starter in managed:
+            coroutine = (
+                self._run_optional_service(spec, starter)
+                if spec.criticality == "optional"
+                else self._run_essential_service(spec, starter)
+            )
+            task = asyncio.create_task(coroutine, name=f"service:{spec.name}")
+            tasks[task] = spec
+        self._service_tasks = set(tasks)
+        shutdown_waiter = asyncio.create_task(
+            self.shutdown_event.wait(), name="platform_shutdown_waiter"
+        )
+        exit_code = 0
         try:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        except Exception as e:
-            self.logger.error(f"Service error: {e}")
+            done, _ = await asyncio.wait(
+                [*tasks, shutdown_waiter], return_when=asyncio.FIRST_COMPLETED
+            )
+            if shutdown_waiter not in done:
+                for task in done:
+                    spec = tasks[task]
+                    try:
+                        task.result()
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception as exc:
+                        SUPERVISION_METRICS.service_failures.labels(
+                            service=spec.name
+                        ).inc()
+                        self.logger.error(
+                            "Essential service %s failed: %s", spec.name, exc
+                        )
+                        exit_code = 1
+                        break
+                self.shutdown_event.set()
             await self._shutdown_services()
+        finally:
+            shutdown_waiter.cancel()
+            pending = [task for task in tasks if not task.done()]
+            for task in pending:
+                task.cancel()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for task, result in zip(tasks, results):
+                if isinstance(result, BaseException) and not isinstance(
+                    result, asyncio.CancelledError
+                ):
+                    self.logger.debug(
+                        "Managed service %s terminal result: %s",
+                        tasks[task].name,
+                        result,
+                    )
+            self._service_tasks.clear()
+        return exit_code
+
+    async def _run_essential_service(self, spec: ManagedServiceSpec, starter) -> None:
+        SUPERVISION_METRICS.service_state.labels(
+            service=spec.name, state="running"
+        ).set(1)
+        await starter()
+        if not self.shutdown_event.is_set():
+            raise RuntimeError(f"{spec.name} returned unexpectedly")
+
+    async def _run_optional_service(self, spec: ManagedServiceSpec, starter) -> None:
+        backoff = 1.0
+        while not self.shutdown_event.is_set():
+            try:
+                await starter()
+                if not self.shutdown_event.is_set():
+                    raise RuntimeError(f"{spec.name} returned unexpectedly")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                SUPERVISION_METRICS.service_failures.labels(service=spec.name).inc()
+                self.logger.error(
+                    "Optional service %s failed; restarting in %.1fs: %s",
+                    spec.name,
+                    backoff,
+                    exc,
+                )
+                try:
+                    await asyncio.wait_for(self.shutdown_event.wait(), timeout=backoff)
+                except asyncio.TimeoutError:
+                    pass
+                SUPERVISION_METRICS.service_restarts.labels(service=spec.name).inc()
+                backoff = min(30.0, backoff * 2)
 
     async def _start_api_server(self, api_config: Dict):
         """Start the FastAPI server"""
@@ -442,10 +551,15 @@ class LLMRouterPlatform:
             port=api_config.get("port", 8080),
             loop="asyncio",
             log_level=api_config.get("log_level", "info"),
+            timeout_graceful_shutdown=self.api_drain_timeout_seconds,
         )
 
         server = uvicorn.Server(config)
-        await server.serve()
+        self._api_server = server
+        try:
+            await server.serve()
+        finally:
+            self._api_server = None
 
     async def _publish_system_metric_event(
         self,
@@ -1880,30 +1994,132 @@ class LLMRouterPlatform:
         return app
 
     async def _shutdown_services(self):
-        """Gracefully shutdown all services"""
-        self.logger.info("Shutting down platform services...")
-
-        for name, service in self.services.items():
+        """Gracefully stop admission, drain durable work, and close clients once."""
+        async with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            self.logger.info("Shutting down platform services...")
+            self.shutdown_event.set()
+            shutdown_task = asyncio.create_task(self._shutdown_services_ordered())
+            force_waiter = asyncio.create_task(self.force_shutdown_event.wait())
             try:
-                if hasattr(service, "shutdown"):
-                    await service.shutdown()
-                self.logger.info(f"Service {name} shutdown successfully")
-            except Exception as e:
-                self.logger.error(f"Error shutting down service {name}: {e}")
+                done, _ = await asyncio.wait(
+                    {shutdown_task, force_waiter},
+                    timeout=self.shutdown_grace_period_seconds,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if shutdown_task in done:
+                    await shutdown_task
+                else:
+                    shutdown_task.cancel()
+                    await asyncio.gather(shutdown_task, return_exceptions=True)
+                    if force_waiter in done:
+                        self.logger.warning("Platform shutdown force-cancelled")
+                    else:
+                        self.logger.error(
+                            "Platform shutdown exceeded global grace period"
+                        )
+                        SUPERVISION_METRICS.shutdown_timeouts.labels(
+                            phase="global"
+                        ).inc()
+            finally:
+                force_waiter.cancel()
+                await asyncio.gather(force_waiter, return_exceptions=True)
+                self._shutdown_complete = True
+                self.logger.info("Platform shutdown complete")
 
-        self.logger.info("Platform shutdown complete")
+    async def _shutdown_services_ordered(self) -> None:
+        if self._api_server is not None:
+            self._api_server.should_exit = True
+        slack = self.services.get("slack_bot")
+        if slack is not None and hasattr(slack, "_accepting_work"):
+            slack._accepting_work = False
+        for producer_name in ("event_producer",):
+            producer = self.services.get(producer_name)
+            if producer is not None and hasattr(producer, "_accepting"):
+                producer._accepting = False
+
+        api_task = next(
+            (task for task in self._service_tasks if task.get_name() == "service:api"),
+            None,
+        )
+        if api_task is not None and not api_task.done():
+            started_at = time.monotonic()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(api_task), timeout=self.api_drain_timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                api_task.cancel()
+                SUPERVISION_METRICS.shutdown_timeouts.labels(phase="api_drain").inc()
+            finally:
+                SUPERVISION_METRICS.shutdown_phase_duration.labels(
+                    phase="api_drain"
+                ).observe(time.monotonic() - started_at)
+
+        priorities = {
+            "slack_bot": 10,
+            "pipeline": 20,
+            "policy_materializer": 20,
+            "event_producer": 30,
+            "monitoring": 40,
+            "inference": 50,
+            "rag": 50,
+            "router": 50,
+            "policy_cache": 50,
+            "admission": 50,
+        }
+        ordered = sorted(
+            self.services.items(), key=lambda item: priorities.get(item[0], 50)
+        )
+        closed_ids: set[int] = set()
+        for name, service in ordered:
+            if id(service) in closed_ids:
+                continue
+            closed_ids.add(id(service))
+            shutdown = getattr(service, "shutdown", None)
+            if not callable(shutdown):
+                continue
+            try:
+                started_at = time.monotonic()
+                await asyncio.wait_for(
+                    shutdown(), timeout=self.service_stop_timeout_seconds
+                )
+                SUPERVISION_METRICS.shutdown_phase_duration.labels(phase=name).observe(
+                    time.monotonic() - started_at
+                )
+                self.logger.info("Service %s shutdown successfully", name)
+            except asyncio.TimeoutError:
+                self.logger.error("Service %s shutdown timed out", name)
+                SUPERVISION_METRICS.shutdown_timeouts.labels(phase=name).inc()
+            except Exception as exc:
+                self.logger.error("Error shutting down service %s: %s", name, exc)
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals"""
-        self.logger.info(f"Received signal {signum}, initiating shutdown...")
-        asyncio.create_task(self._shutdown_services())
-        sys.exit(0)
+        self._signal_count += 1
+        if self._signal_count == 1:
+            self.logger.info("Received signal %s, requesting graceful shutdown", signum)
+            self.shutdown_event.set()
+            return
+        self.logger.warning(
+            "Received second signal %s, force-cancelling services", signum
+        )
+        self.force_shutdown_event.set()
+        for task in list(self._service_tasks):
+            task.cancel()
 
-    async def run(self, include_api: bool = True, include_background: bool = True):
+    async def run(
+        self, include_api: bool = True, include_background: bool = True
+    ) -> int:
         """Run the selected platform services."""
         # Setup signal handlers
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        loop = asyncio.get_running_loop()
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(signum, self._signal_handler, signum, None)
+            except (NotImplementedError, RuntimeError):
+                signal.signal(signum, self._signal_handler)
 
         try:
             # Initialize and start services
@@ -1911,7 +2127,7 @@ class LLMRouterPlatform:
                 include_api=include_api,
                 include_background=include_background,
             )
-            await self._start_services(
+            return await self._start_services(
                 include_api=include_api,
                 include_background=include_background,
             )
@@ -1919,7 +2135,7 @@ class LLMRouterPlatform:
         except Exception as e:
             self.logger.error(f"Platform startup error: {e}")
             await self._shutdown_services()
-            sys.exit(1)
+            return 1
 
 
 @click.group()
@@ -1961,7 +2177,9 @@ def start(config: str, dev: bool):
         )
     else:
         platform = LLMRouterPlatform(config_path=config)
-        asyncio.run(platform.run(include_api=True, include_background=True))
+        exit_code = asyncio.run(platform.run(include_api=True, include_background=True))
+        if exit_code:
+            raise SystemExit(exit_code)
 
 
 @cli.command()
@@ -2000,7 +2218,9 @@ def start_api(config: str, dev: bool):
 def start_workers(config: str):
     """Start only enabled background services."""
     platform = LLMRouterPlatform(config_path=config)
-    asyncio.run(platform.run(include_api=False, include_background=True))
+    exit_code = asyncio.run(platform.run(include_api=False, include_background=True))
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 @cli.command()

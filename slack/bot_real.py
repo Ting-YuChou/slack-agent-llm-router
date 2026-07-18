@@ -1664,6 +1664,8 @@ class SlackBot:
         self._work_workers: List[asyncio.Task] = []
         self._work_running = 0
         self._accepting_work = True
+        self._socket_disconnect_lock = asyncio.Lock()
+        self._socket_disconnected = False
 
     async def initialize(self):
         """Initialize Slack bot"""
@@ -1733,8 +1735,9 @@ class SlackBot:
 
         except Exception as e:
             logger.error(f"Slack bot error: {e}")
+            raise
         finally:
-            await self.socket_client.disconnect()
+            await self._disconnect_socket_once()
 
     async def _handle_socket_mode_request(
         self, client: AsyncSocketModeClient, req: SocketModeRequest
@@ -2427,7 +2430,7 @@ class SlackBot:
             await asyncio.gather(*self.background_tasks, return_exceptions=True)
 
         if self.socket_client:
-            await self.socket_client.disconnect()
+            await self._disconnect_socket_once()
 
         if not self._uses_granular_redis_state():
             await self._persist_state()
@@ -2438,6 +2441,13 @@ class SlackBot:
             logger.warning("Slack memory shutdown failed", exc_info=True)
 
         logger.info("Slack bot shutdown complete")
+
+    async def _disconnect_socket_once(self) -> None:
+        async with self._socket_disconnect_lock:
+            if self._socket_disconnected or not self.socket_client:
+                return
+            await self.socket_client.disconnect()
+            self._socket_disconnected = True
 
     def _resolve_secret(self, value_key: str, env_key: str) -> Optional[str]:
         """Resolve a secret from config value or named environment variable."""

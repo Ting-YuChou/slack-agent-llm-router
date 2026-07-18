@@ -1297,15 +1297,15 @@ class MonitoringService:
         self.running = True
 
         # Start monitoring tasks
-        tasks = [
-            asyncio.create_task(self._monitoring_loop()),
-            asyncio.create_task(self.system_monitor.start_monitoring()),
-            asyncio.create_task(self._alert_checking_loop()),
-            asyncio.create_task(self._metrics_collection_loop()),
-        ]
-
-        # Wait for all tasks
-        await asyncio.gather(*tasks, return_exceptions=True)
+        async with asyncio.TaskGroup() as task_group:
+            task_group.create_task(self._monitoring_loop(), name="monitor_health")
+            task_group.create_task(
+                self.system_monitor.start_monitoring(), name="monitor_system"
+            )
+            task_group.create_task(self._alert_checking_loop(), name="monitor_alerts")
+            task_group.create_task(
+                self._metrics_collection_loop(), name="monitor_metrics"
+            )
 
     async def _monitoring_loop(self):
         """Main monitoring loop"""
