@@ -19,6 +19,7 @@ from aiokafka.structs import TopicPartition
 import redis.asyncio as redis
 
 from src.utils.metrics import PIPELINE_METRICS
+from src.utils.bounded_state import BoundedTTLMap
 
 logger = logging.getLogger(__name__)
 
@@ -41,13 +42,32 @@ class RoutingPolicyCache:
         self.local_cache_ttl_seconds = int(
             self.config.get("local_cache_ttl_seconds", 5)
         )
+        self.local_cache_max_entries = int(
+            self.config.get("local_cache_max_entries", 4096)
+        )
         self.redis_client = None
         self._initialized = False
-        self._local_cache: Dict[str, Dict[str, Any]] = {}
         self._local_guardrail_index: Dict[str, set[str]] = {
             "model": set(),
             "provider": set(),
         }
+        self._local_cache: BoundedTTLMap[str, Dict[str, Any]] = BoundedTTLMap(
+            max_entries=self.local_cache_max_entries,
+            ttl_seconds=max(1, self.local_cache_ttl_seconds),
+            on_evict=self._on_local_cache_evict,
+            metric_name="policy_l1",
+        )
+
+    def _on_local_cache_evict(
+        self, cache_key: str, value: Dict[str, Any], reason: str
+    ) -> None:
+        guardrail_prefix = f"{self.key_prefix}:guardrail:"
+        if not cache_key.startswith(guardrail_prefix):
+            return
+        remainder = cache_key[len(guardrail_prefix) :]
+        scope_type, separator, scope_key = remainder.partition(":")
+        if separator and scope_type in self._local_guardrail_index:
+            self._local_guardrail_index[scope_type].discard(scope_key)
 
     async def initialize(self):
         """Initialize Redis if the policy cache is enabled."""
@@ -101,10 +121,12 @@ class RoutingPolicyCache:
         return dict(record["value"])
 
     def _local_set(self, cache_key: str, value: Dict[str, Any], ttl_seconds: int):
-        self._local_cache[cache_key] = {
-            "value": dict(value),
-            "expires_at": time.time() + max(1, ttl_seconds),
-        }
+        ttl_seconds = max(1, ttl_seconds)
+        self._local_cache.set(
+            cache_key,
+            {"value": dict(value), "expires_at": time.time() + ttl_seconds},
+            ttl_seconds=ttl_seconds,
+        )
 
     async def _get_json(self, cache_key: str) -> Optional[Dict[str, Any]]:
         cached = self._local_get(cache_key)
@@ -456,7 +478,6 @@ class RoutingPolicyCache:
             )
             raise
 
-        self._local_guardrail_index.setdefault(scope_type, set()).add(scope_key)
         self._local_set(cache_key, payload, self.guardrail_ttl_seconds)
 
     async def get_active_guardrails(self) -> Dict[str, Any]:
@@ -632,16 +653,12 @@ class PolicyMaterializer:
             return
 
         self.running = True
-        tasks = []
-        for topic_key, consumer in self.consumers.items():
-            tasks.append(
-                asyncio.create_task(
+        async with asyncio.TaskGroup() as task_group:
+            for topic_key, consumer in self.consumers.items():
+                task_group.create_task(
                     self._supervise_consumer(topic_key, consumer),
                     name=f"policy_materializer_{topic_key}",
                 )
-            )
-
-        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _supervise_consumer(self, topic_key: str, consumer: AIOKafkaConsumer):
         """Restart policy materializer consumers after task-level failures."""
@@ -852,6 +869,11 @@ class PolicyMaterializer:
     async def shutdown(self):
         """Shutdown Kafka consumers. The shared cache is owned by the platform."""
         self.running = False
-        for consumer in self.consumers.values():
-            await consumer.stop()
+        results = await asyncio.gather(
+            *(consumer.stop() for consumer in self.consumers.values()),
+            return_exceptions=True,
+        )
         self.consumers.clear()
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise failures[0]

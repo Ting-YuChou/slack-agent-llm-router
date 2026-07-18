@@ -87,6 +87,42 @@ async def test_web_search_tool_enforces_rate_limit():
 
 
 @pytest.mark.asyncio
+async def test_web_search_cache_is_lru_bounded():
+    tool = WebSearchTool(
+        {"enabled": True, "cache_ttl_seconds": 300, "cache_max_entries": 2},
+        backend=DummyBackend(),
+    )
+
+    for query in ("one", "two", "three"):
+        await tool.search(query, user_id="same-user")
+
+    assert len(tool._cache) == 2
+    assert tool._get_cached_sources(tool._cache_key("one", None)) is None
+
+
+@pytest.mark.asyncio
+async def test_web_search_limiter_rejects_new_user_instead_of_evicting_active_quota():
+    tool = WebSearchTool(
+        {
+            "enabled": True,
+            "cache_ttl_seconds": 0,
+            "per_user_rate_limit": 2,
+            "rate_limiter_max_users": 1,
+        },
+        backend=DummyBackend(),
+    )
+
+    await tool.search("first", user_id="u1")
+    blocked = await tool.search("other", user_id="u2")
+    second = await tool.search("second", user_id="u1")
+    quota_blocked = await tool.search("third", user_id="u1")
+
+    assert blocked.blocked_reason == "web_search_rate_limiter_capacity"
+    assert second.blocked_reason is None
+    assert quota_blocked.blocked_reason == "web_search_rate_limited"
+
+
+@pytest.mark.asyncio
 async def test_web_search_tool_returns_structured_error_on_backend_failure():
     tool = WebSearchTool(
         {"enabled": True, "cache_ttl_seconds": 0},

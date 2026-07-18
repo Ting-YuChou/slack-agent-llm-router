@@ -11,7 +11,12 @@ import yaml
 import main
 from src.memory import LocalHttpEmbeddingProvider, OpenAIEmbeddingProvider
 from src.rag.chunker import DocumentChunk
-from src.rag.service import RagPayloadTooLarge, RagService, decode_base64_document
+from src.rag.service import (
+    RagPayloadTooLarge,
+    RagService,
+    RagStorageCapacityError,
+    decode_base64_document,
+)
 from src.rag.vector_store import (
     ATOMIC_GENERATION_COMMIT_LUA,
     RedisStackRagVectorStore,
@@ -46,6 +51,26 @@ class _HeartbeatStore:
 
     async def shutdown(self):
         return None
+
+
+def test_rag_local_job_and_batch_caches_are_bounded():
+    service = RagService(
+        {
+            "enabled": False,
+            "backend": "memory",
+            "local_job_cache_max_entries": 2,
+            "local_batch_cache_max_entries": 1,
+        },
+        vector_store=_HeartbeatStore(_HeartbeatRedis()),
+    )
+
+    for index in range(5):
+        service.jobs[f"job-{index}"] = object()
+        service.batches[f"batch-{index}"] = object()
+
+    assert len(service.jobs) == 2
+    assert len(service.batches) == 1
+    assert service.jobs.get("job-0") is None
 
 
 def test_rag_environment_overrides_enable_service_and_queue(tmp_path, monkeypatch):
@@ -751,14 +776,14 @@ async def test_multipart_upload_cancellation_during_publish_removes_new_target(
     )
     replace_started = threading.Event()
     allow_replace = threading.Event()
-    real_replace = __import__("os").replace
+    real_publish = service._staging_store.publish
 
-    def blocked_replace(source, target):
+    def blocked_publish(job_id, source, target):
         replace_started.set()
         assert allow_replace.wait(timeout=1)
-        real_replace(source, target)
+        return real_publish(job_id, source, target)
 
-    monkeypatch.setattr("src.rag.service.os.replace", blocked_replace)
+    monkeypatch.setattr(service._staging_store, "publish", blocked_publish)
     task = asyncio.create_task(
         service.stage_uploaded_file(
             _StreamingUpload([b"contents", b""]),
@@ -776,6 +801,136 @@ async def test_multipart_upload_cancellation_during_publish_removes_new_target(
 
     assert list(tmp_path.rglob("*.part")) == []
     assert list(tmp_path.rglob("*.pdf")) == []
+
+
+@pytest.mark.asyncio
+async def test_staging_quota_is_shared_across_service_instances(tmp_path):
+    config = {
+        "enabled": True,
+        "backend": "memory",
+        "storage": {
+            "staging_dir": str(tmp_path),
+            "max_staging_bytes": 10,
+            "high_watermark_ratio": 0.9,
+        },
+    }
+    first = RagService(config)
+    second = RagService(config)
+
+    await first.stage_uploaded_file(
+        _StreamingUpload([b"123456789", b""]),
+        filename="first.pdf",
+        knowledge_base_id="school",
+        document_id="doc-1",
+        job_id="job-1",
+    )
+
+    with pytest.raises(RagStorageCapacityError):
+        await second.stage_uploaded_file(
+            _StreamingUpload([b"x", b""]),
+            filename="second.pdf",
+            knowledge_base_id="school",
+            document_id="doc-2",
+            job_id="job-2",
+        )
+
+    assert first._staging_store.usage_bytes() == 9
+
+
+@pytest.mark.asyncio
+async def test_staging_hard_limit_rolls_back_partial_reservation(tmp_path):
+    service = RagService(
+        {
+            "enabled": True,
+            "backend": "memory",
+            "storage": {
+                "staging_dir": str(tmp_path),
+                "max_staging_bytes": 10,
+                "high_watermark_ratio": 0.9,
+            },
+            "upload": {"multipart_max_bytes": 100, "stream_chunk_bytes": 8},
+        }
+    )
+
+    with pytest.raises(RagStorageCapacityError):
+        await service.stage_uploaded_file(
+            _StreamingUpload([b"12345678", b"4567"]),
+            filename="overflow.pdf",
+            knowledge_base_id="school",
+            document_id="doc-1",
+            job_id="job-overflow",
+        )
+
+    assert service._staging_store.usage_bytes() == 0
+    assert list(tmp_path.rglob("*.part")) == []
+
+
+def test_staging_janitor_respects_terminal_retention_and_active_lease(tmp_path):
+    now = [1_000.0]
+    service = RagService(
+        {
+            "enabled": True,
+            "backend": "memory",
+            "storage": {
+                "staging_dir": str(tmp_path),
+                "completed_file_ttl_seconds": 10,
+                "failed_file_ttl_seconds": 20,
+                "orphan_file_ttl_seconds": 30,
+            },
+        }
+    )
+    service._staging_store._clock = lambda: now[0]
+    completed = service.stage_document_content(
+        b"done",
+        filename="done.pdf",
+        knowledge_base_id="school",
+        document_id="d1",
+        job_id="completed-job",
+    )
+    active = service.stage_document_content(
+        b"active",
+        filename="active.pdf",
+        knowledge_base_id="school",
+        document_id="d2",
+        job_id="active-job",
+    )
+    service._staging_store.update_status(completed, "completed")
+    service._staging_store.update_status(active, "processing")
+    now[0] += 11
+
+    service._staging_store.refresh_lease(active, "processing")
+    result = service._staging_store.run_janitor()
+
+    assert result["deleted"] == 1
+    assert not Path(completed).exists()
+    assert Path(active).exists()
+
+
+def test_staging_reconcile_does_not_delete_another_process_active_upload(tmp_path):
+    first = RagService(
+        {
+            "enabled": True,
+            "backend": "memory",
+            "storage": {"staging_dir": str(tmp_path)},
+        }
+    )
+    part_path, _ = first._staging_store.begin("active-job", "upload.pdf")
+    first._staging_store.reserve("active-job", 4)
+    part_path.write_bytes(b"part")
+
+    second = RagService(
+        {
+            "enabled": True,
+            "backend": "memory",
+            "storage": {"staging_dir": str(tmp_path)},
+        }
+    )
+    result = second._staging_store.reconcile()
+
+    assert result["bytes"] == 4
+    assert part_path.exists()
+    assert (tmp_path / "active-job.manifest.json").exists()
+    first._staging_store.rollback("active-job")
 
 
 def test_json_base64_limit_checks_decoded_size():

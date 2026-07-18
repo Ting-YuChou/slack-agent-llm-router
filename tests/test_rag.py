@@ -130,6 +130,8 @@ class FakeStreamRedis:
         self.groups = set()
         self.acked = []
         self.zsets = {}
+        self.expirations = {}
+        self.xadd_kwargs = []
 
     async def get(self, key):
         return self.values.get(key)
@@ -144,6 +146,10 @@ class FakeStreamRedis:
     async def sadd(self, key, member):
         self.sets.setdefault(key, set()).add(member)
 
+    async def expire(self, key, ttl):
+        self.expirations[key] = ttl
+        return True
+
     async def smembers(self, key):
         return set(self.sets.get(key, set()))
 
@@ -151,7 +157,8 @@ class FakeStreamRedis:
         self.groups.add((stream, group))
         self.streams.setdefault(stream, [])
 
-    async def xadd(self, stream, fields, **_kwargs):
+    async def xadd(self, stream, fields, **kwargs):
+        self.xadd_kwargs.append((stream, kwargs))
         entries = self.streams.setdefault(stream, [])
         message_id = f"{len(entries) + 1}-0"
         entries.append((message_id, dict(fields)))
@@ -1110,6 +1117,40 @@ async def test_queue_ingestion_stages_file_creates_job_and_xadds_stream(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_post_xadd_job_refresh_failure_preserves_durable_file_and_message(
+    tmp_path, monkeypatch
+):
+    service = _queued_rag_service(tmp_path)
+    await service.initialize()
+    client = service.vector_store.client
+    real_setex = client.setex
+    calls = 0
+
+    async def fail_second_setex(key, ttl, value):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ConnectionError("metadata refresh failed after XADD")
+        await real_setex(key, ttl, value)
+
+    monkeypatch.setattr(client, "setex", fail_second_setex)
+
+    job = await service.queue_document_ingestion(
+        content=b"durable contents",
+        filename="handbook.md",
+        knowledge_base_id="school",
+        document_id="doc-1",
+    )
+
+    assert calls == 2
+    assert len(client.streams[service.stream_key]) == 1
+    assert service.load_staged_content(job.storage_ref) == b"durable contents"
+    persisted = await service.get_job(job.job_id)
+    assert persisted is not None
+    assert persisted.storage_ref == job.storage_ref
+
+
+@pytest.mark.asyncio
 async def test_worker_success_marks_completed_and_acks_stream_message(tmp_path):
     service = _queued_rag_service(tmp_path)
     await service.initialize()
@@ -1218,6 +1259,10 @@ async def test_worker_exhausts_retries_to_dead_letter_stream(tmp_path):
     dlq = service.vector_store.client.streams[service.dead_letter_stream_key]
     assert dlq[0][1]["job_id"] == job.job_id
     assert "parser exploded" in dlq[0][1]["error"]
+    assert service.vector_store.client.xadd_kwargs[-1] == (
+        service.dead_letter_stream_key,
+        {"maxlen": 10000, "approximate": True},
+    )
 
 
 @pytest.mark.asyncio

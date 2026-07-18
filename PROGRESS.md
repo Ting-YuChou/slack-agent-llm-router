@@ -1,5 +1,49 @@
 # Project Progress
 
+## 2026-07-18 — Bounded-state independent-review hardening
+
+- RAG: an upload now holds a job-specific POSIX lease for its full `.part` lifetime, so startup reconciliation in another process preserves active bytes. Production emits a typed cleanup proof only for deterministic pre-durability failures such as a missing queue Redis client; ambiguous Redis I/O preserves the file. Once `XADD` succeeds, a metadata refresh failure preserves the staged file and durable stream work instead of causing worker data loss.
+- Shutdown and Kafka: Slack worker cleanup now runs in `finally` even when its drain timeout cancels the stop task; Kafka installs a rebalance listener and reapplies an existing pause to every new assignment and restarted consumer before further processing.
+- Stress truthfulness: the 100,000-event contract now sends all events to a max-poll-aware fake broker, blocks the production ClickHouse insert path, observes repeated real consumer pause/resume cycles, verifies failure requeue, records all inserted offsets in order, drains broker backlog to zero, and requires the exact final commit of 100,000.
+- Verification: reviewer-finding regressions and the production-path stress contract pass. Full-suite and independent re-review results are recorded after the final gate below.
+
+## 2026-07-18 — Bounded-state stress and full verification
+
+- Added: `scripts/stress_bounded_state.py`, a production-path 100,000-event outage contract that exercises Kafka buffer admission, the shared bounded TTL/LRU map, durable flush/commit, RSS sampling, and shutdown timing.
+- Measured: 100,000 events were offered to the broker fixture; the production consumer plateaued at 5,000 in-process rows while ClickHouse was blocked. The failed insert restored all 5,000 detached rows, recovery then drained and inserted all 100,000 offsets in order, committed offset 100,000, and left zero broker backlog. The 4,096-entry cache stayed exactly at capacity, RSS plateaued, and shutdown completed in under one millisecond in this deterministic fixture.
+- Verification: full pytest passed with temporary local Redis (`548 passed, 11 skipped`); full Black and Flake8, configured mypy, compileall, Compose config, stress contract, and `git diff --check` passed. The temporary Redis container was removed after verification.
+
+## 2026-07-18 — Essential service supervision and deterministic shutdown
+
+- Supervision: API, pipeline, policy materializer, and Slack are runtime-role essential; exception or unexpected return triggers sibling cancellation, exactly-once shutdown, and exit code 1. Monitoring is optional and restarts with 1–30 second exponential backoff.
+- Internals: Kafka consumers, policy materializer, and monitoring component groups now use `TaskGroup`; Slack terminal socket failures propagate to the platform instead of returning healthy.
+- Signals: loop signal handlers only set shutdown state; the first signal drains gracefully and the second sets force-cancel and cancels managed service tasks without calling `sys.exit()` in a handler.
+- Shutdown: one lock protects shutdown, API admission stops and Uvicorn receives up to 65 seconds to drain, each service receives at most 15 seconds, global grace is 75 seconds, duplicate service objects close once, and the Kafka consumer still closes after a failed flush while leaving offsets uncommitted for replay.
+- Verification: essential failure, optional restart, concurrent shutdown, two-signal state, Slack failure propagation, failed ClickHouse flush replay, main/pipeline/policy/Slack/schema regressions passed (`204 passed, 3 deselected`).
+
+## 2026-07-18 — Cross-process RAG staging governance
+
+- Added: job-specific staged data plus atomically written manifests, a POSIX-flocked shared usage ledger, startup reconciliation, `.part` cleanup, and a five-minute janitor.
+- Capacity: new uploads are rejected at the 90% high watermark; streaming reservations cannot cross the 10 GiB hard limit. Failure and cancellation remove partial/just-published files and roll back reserved bytes; API capacity denial is the additive HTTP 507 `rag_storage_capacity` response.
+- Retention: completed files expire after 24 hours; failed/dead-letter files and inactive queued/running/retrying leases expire after seven days. Every persisted job status refreshes the manifest and active lease, and failed/dead-letter Redis job records remain available for the same retention horizon.
+- Observability: staged bytes/files, high-watermark/hard-limit rejections, and janitor outcomes are exported as low-cardinality metrics.
+- Verification: shared-instance quota, hard-limit rollback, cancellation, 24h/7d lease semantics, bounded DLQ, RAG API 507, RAG service, main, and schema regressions passed (`143 passed`).
+
+## 2026-07-18 — Bounded local state and Slack work admission
+
+- Added: a shared monotonic `BoundedTTLMap` with TTL-first pruning, LRU capacity eviction, response-safe copies at call sites, eviction callbacks, and low-cardinality entry/capacity/age/eviction metrics.
+- Bounded: policy L1 (4,096), RAG jobs (1,000), RAG batches (100), web-search cache (512), and web-search limiter users (10,000). Active limiter users are never evicted to reset quota; new users receive a distinct capacity denial.
+- Slack: replaced one-task-per-envelope fan-out with 16 fixed workers and a 256-item FIFO. Overflow is ACKed then receives a bounded-time visible busy reply; queue/running/reject/reply metrics were added.
+- RAG Redis hygiene: batch membership now shares the batch TTL and dead-letter writes use bounded approximate `MAXLEN 10000`.
+- Verification: bounded-state, policy, web-search, RAG, schema, and non-integration Slack regressions passed (`127 passed, 3 deselected`); the three deselected tests require the external Redis fixture already noted in baseline.
+
+## 2026-07-18 — Lossless Kafka consumer backpressure
+
+- Changed: introduced per-topic `BatchBufferState` with pending, in-flight, and awaiting-commit state; Kafka partitions pause at a 5,000-row high watermark and resume at 2,500 rows, including newly assigned partitions while paused.
+- Isolation: ClickHouse flushes run with a four-topic concurrency bound, inspect every result before reporting failures, preserve row order on insert failure, and retry commit-only failures without duplicate inserts.
+- Bounded I/O: ClickHouse connections now default to a 2-second connect timeout and 10-second send/receive timeout.
+- Verification: RED/GREEN backpressure, in-flight accounting, concurrent-topic flush, durability regression, and schema tests passed (`93 passed`); touched-file Black, Flake8, and `git diff --check` passed.
+
 ## 2026-07-16 — RAG hot-path review hardening
 
 - Correctness: embedding batch failures now retry through the scalar provider and fail ingestion before cutover if any required vector remains unavailable. Redis stages chunks plus table, row, figure, and visual resources under one document hash tag, validates every staging key, and switches them in one Lua execution; stale generations return a distinct result and cannot mutate the active document.

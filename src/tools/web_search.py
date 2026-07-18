@@ -1,12 +1,14 @@
 """Application-side web search tool."""
 
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from src.tools.backends import TavilyBackend
 from src.tools.base import Tool
 from src.utils.schema import ResponseSource, ToolCall, WebSearchOptions
+from src.utils.bounded_state import BoundedTTLMap
 
 
 @dataclass
@@ -28,9 +30,16 @@ class WebSearchTool(Tool):
         self.backend = backend or TavilyBackend(self.config)
         self.per_user_rate_limit = int(self.config.get("per_user_rate_limit", 20))
         self._rate_window_seconds = 3600
-        self._user_request_times: Dict[str, List[float]] = {}
+        self._rate_limiter_max_users = int(
+            self.config.get("rate_limiter_max_users", 10000)
+        )
+        self._user_request_times: Dict[str, deque[float]] = {}
         self._cache_ttl_seconds = int(self.config.get("cache_ttl_seconds", 300))
-        self._cache: Dict[str, tuple[float, List[ResponseSource]]] = {}
+        self._cache = BoundedTTLMap[str, List[ResponseSource]](
+            max_entries=int(self.config.get("cache_max_entries", 512)),
+            ttl_seconds=max(0, self._cache_ttl_seconds),
+            metric_name="web_search_cache",
+        )
 
     async def search(
         self,
@@ -130,19 +139,28 @@ class WebSearchTool(Tool):
         )
 
     def _check_rate_limit(self, user_id: str) -> Optional[str]:
-        now = time.time()
+        now = time.monotonic()
         window_start = now - self._rate_window_seconds
-        request_times = [
-            timestamp
-            for timestamp in self._user_request_times.get(user_id, [])
-            if timestamp >= window_start
-        ]
-        if len(request_times) >= self.per_user_rate_limit:
+        request_times = self._user_request_times.get(user_id)
+        if request_times is None:
+            self._prune_expired_users(window_start)
+            if len(self._user_request_times) >= self._rate_limiter_max_users:
+                return "web_search_rate_limiter_capacity"
+            request_times = deque()
             self._user_request_times[user_id] = request_times
+        while request_times and request_times[0] < window_start:
+            request_times.popleft()
+        if len(request_times) >= self.per_user_rate_limit:
             return "web_search_rate_limited"
         request_times.append(now)
-        self._user_request_times[user_id] = request_times
         return None
+
+    def _prune_expired_users(self, window_start: float) -> None:
+        for existing_user, request_times in list(self._user_request_times.items()):
+            while request_times and request_times[0] < window_start:
+                request_times.popleft()
+            if not request_times:
+                self._user_request_times.pop(existing_user, None)
 
     def _cache_key(self, query: str, options: Optional[WebSearchOptions]) -> str:
         options_payload = options.model_dump(mode="json") if options else {}
@@ -154,20 +172,17 @@ class WebSearchTool(Tool):
         cached = self._cache.get(cache_key)
         if not cached:
             return None
-        cached_at, sources = cached
-        if time.time() - cached_at > self._cache_ttl_seconds:
-            self._cache.pop(cache_key, None)
-            return None
-        return [source.model_copy(deep=True) for source in sources]
+        return [source.model_copy(deep=True) for source in cached]
 
     def _set_cached_sources(
         self, cache_key: str, sources: List[ResponseSource]
     ) -> None:
         if self._cache_ttl_seconds <= 0:
             return
-        self._cache[cache_key] = (
-            time.time(),
+        self._cache.set(
+            cache_key,
             [source.model_copy(deep=True) for source in sources],
+            ttl_seconds=self._cache_ttl_seconds,
         )
 
     async def close(self) -> None:

@@ -646,7 +646,9 @@ class WebSearchToolConfig(ConfigModel):
     timeout_seconds: float = Field(5.0, gt=0)
     max_results: int = Field(5, ge=1, le=10)
     cache_ttl_seconds: int = Field(300, ge=0)
+    cache_max_entries: int = Field(512, ge=1)
     per_user_rate_limit: int = Field(20, ge=1)
+    rate_limiter_max_users: int = Field(10000, ge=1)
     search_depth: str = Field("basic", pattern=r"^(basic|advanced)$")
     include_answer: bool = False
     max_results_per_domain: int = Field(2, ge=1)
@@ -691,6 +693,10 @@ class KafkaConsumerConfig(ConfigModel):
     auto_offset_reset: str = "latest"
     enable_auto_commit: bool = False
     max_poll_records: int = Field(500, ge=1)
+    batch_size: int = Field(100, ge=1)
+    batch_high_watermark_rows: int = Field(5000, ge=1)
+    batch_low_watermark_rows: int = Field(2500, ge=0)
+    max_concurrent_flushes: int = Field(4, ge=1)
     dlq_enabled: bool = True
     supervisor_initial_backoff_seconds: float = Field(1.0, gt=0)
     supervisor_max_backoff_seconds: float = Field(30.0, gt=0)
@@ -718,6 +724,8 @@ class ClickHouseConfig(ConfigModel):
     database: str = "llm_router"
     username: str = "default"
     password: str = ""
+    connect_timeout_seconds: float = Field(2.0, gt=0)
+    send_receive_timeout_seconds: float = Field(10.0, gt=0)
     tables: Dict[str, Any] = Field(default_factory=dict)
     dashboard: Dict[str, Any] = Field(
         default_factory=lambda: {
@@ -767,6 +775,12 @@ class SlackContextConfig(ConfigModel):
         if normalized not in {"thread_first"}:
             raise ValueError("strategy must be one of: thread_first")
         return normalized
+
+
+class SlackWorkQueueConfig(ConfigModel):
+    capacity: int = Field(256, ge=1)
+    concurrency: int = Field(16, ge=1)
+    overload_reply_timeout_seconds: float = Field(2.0, gt=0)
 
 
 class SlackMemorySearchConfig(ConfigModel):
@@ -838,6 +852,7 @@ class SlackConfig(ConfigModel):
         default_factory=SlackRateLimitingConfig
     )
     context: SlackContextConfig = Field(default_factory=SlackContextConfig)
+    work_queue: SlackWorkQueueConfig = Field(default_factory=SlackWorkQueueConfig)
     state_backend: str = "memory"
     state_file: str = "data/slack_state.json"
     state_key_prefix: str = "slack_state"
@@ -875,6 +890,7 @@ class PolicyCacheConfig(ConfigModel):
     request_ttl_seconds: int = Field(300, ge=1)
     user_ttl_seconds: int = Field(900, ge=1)
     local_cache_ttl_seconds: int = Field(5, ge=0)
+    local_cache_max_entries: int = Field(4096, ge=1)
     redis: Dict[str, Any] = Field(default_factory=dict)
     consumer: Dict[str, Any] = Field(default_factory=dict)
 
@@ -1065,6 +1081,7 @@ class RagIngestionQueueConfig(ConfigModel):
     max_attempts: int = Field(3, ge=1)
     retry_backoff_seconds: float = Field(30.0, ge=0.0)
     stream_maxlen: int = Field(10000, ge=0)
+    dead_letter_maxlen: int = Field(10000, ge=1)
     heartbeat_interval_seconds: float = Field(5.0, gt=0.0)
     heartbeat_ttl_seconds: int = Field(15, ge=1)
 
@@ -1073,6 +1090,11 @@ class RagStorageConfig(ConfigModel):
     staging_dir: str = "data/rag/uploads"
     cleanup_completed_files: bool = False
     completed_file_ttl_seconds: int = Field(86400, ge=0)
+    failed_file_ttl_seconds: int = Field(604800, ge=1)
+    orphan_file_ttl_seconds: int = Field(604800, ge=1)
+    janitor_interval_seconds: float = Field(300.0, gt=0)
+    max_staging_bytes: int = Field(10737418240, ge=1)
+    high_watermark_ratio: float = Field(0.9, gt=0.0, le=1.0)
 
 
 class RagUploadConfig(ConfigModel):
@@ -1137,6 +1159,9 @@ class RagConfig(ConfigModel):
     backend: str = "redis_stack"
     auto_retrieve: bool = True
     default_knowledge_base_ids: List[str] = Field(default_factory=list)
+    local_job_cache_max_entries: int = Field(1000, ge=1)
+    local_batch_cache_max_entries: int = Field(100, ge=1)
+    job_ttl_seconds: int = Field(86400, ge=60)
     parser: RagParserConfig = Field(default_factory=RagParserConfig)
     chunking: RagChunkingConfig = Field(default_factory=RagChunkingConfig)
     embedding: RagEmbeddingConfig = Field(default_factory=RagEmbeddingConfig)
@@ -1161,6 +1186,12 @@ class RagConfig(ConfigModel):
         return normalized
 
 
+class ShutdownConfig(ConfigModel):
+    grace_period_seconds: float = Field(75.0, gt=0)
+    api_drain_timeout_seconds: float = Field(65.0, gt=0)
+    service_stop_timeout_seconds: float = Field(15.0, gt=0)
+
+
 class PlatformConfig(ConfigModel):
     api: ApiConfig = Field(default_factory=ApiConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
@@ -1178,5 +1209,6 @@ class PlatformConfig(ConfigModel):
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     performance: PerformanceConfig = Field(default_factory=PerformanceConfig)
     development: DevelopmentConfig = Field(default_factory=DevelopmentConfig)
+    shutdown: ShutdownConfig = Field(default_factory=ShutdownConfig)
     features: FeatureFlagsConfig = Field(default_factory=FeatureFlagsConfig)
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)

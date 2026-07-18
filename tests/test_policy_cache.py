@@ -5,6 +5,39 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 
+def test_policy_l1_is_bounded_and_guardrail_index_tracks_eviction():
+    cache = RoutingPolicyCache(
+        {
+            "enabled": False,
+            "local_cache_ttl_seconds": 30,
+            "local_cache_max_entries": 2,
+        }
+    )
+    cache._local_guardrail_index["model"].update({"m1", "m2"})
+    cache._local_set(cache._guardrail_cache_key("model", "m1"), {"id": 1}, 30)
+    cache._local_set(cache._guardrail_cache_key("model", "m2"), {"id": 2}, 30)
+    cache._local_set(cache._cache_key("request", "r1"), {"id": 3}, 30)
+
+    assert len(cache._local_cache) == 2
+    assert "m1" not in cache._local_guardrail_index["model"]
+    assert cache._local_get(cache._guardrail_cache_key("model", "m1")) is None
+
+
+@pytest.mark.asyncio
+async def test_redis_guardrails_do_not_accumulate_redundant_local_index():
+    cache = RoutingPolicyCache(
+        {"enabled": True, "local_cache_ttl_seconds": 30, "guardrail_ttl_seconds": 30}
+    )
+    cache.redis_client = MagicMock()
+    cache.redis_client.pipeline.return_value.execute = AsyncMock(return_value=[True, 1])
+
+    await cache.materialize_routing_guardrail(
+        {"scope_type": "model", "scope_key": "gpt-5"}
+    )
+
+    assert cache._local_guardrail_index["model"] == set()
+
+
 @pytest.mark.asyncio
 async def test_policy_cache_keeps_fast_lane_hints_request_scoped():
     cache = RoutingPolicyCache(

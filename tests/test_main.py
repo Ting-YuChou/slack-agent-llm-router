@@ -1,14 +1,17 @@
 import base64
 import asyncio
 import json
+import signal
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import yaml
 from fastapi.testclient import TestClient
 
 import main
+from src.rag.service import RagService as RealRagService
 from src.utils.schema import InferenceResponse
 
 
@@ -688,6 +691,108 @@ class TestPlatformInitialization:
         assert "slack_bot" in platform.services
         assert platform.services["slack_bot"].services is platform.services
 
+    @pytest.mark.asyncio
+    async def test_essential_service_failure_cancels_siblings_and_returns_nonzero(
+        self, tmp_path, patched_platform_deps
+    ):
+        class FailedPipeline:
+            def __init__(self):
+                self.shutdown_calls = 0
+
+            async def start(self):
+                raise RuntimeError("pipeline crashed")
+
+            async def shutdown(self):
+                self.shutdown_calls += 1
+
+        class WaitingSlack:
+            def __init__(self):
+                self.cancelled = asyncio.Event()
+                self.shutdown_calls = 0
+
+            async def start(self):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled.set()
+                    raise
+
+            async def shutdown(self):
+                self.shutdown_calls += 1
+
+        platform = main.LLMRouterPlatform(config_path=str(_write_config(tmp_path)))
+        pipeline = FailedPipeline()
+        slack = WaitingSlack()
+        platform.services.update({"pipeline": pipeline, "slack_bot": slack})
+
+        exit_code = await platform._start_services(
+            include_api=False, include_background=True
+        )
+
+        assert exit_code == 1
+        assert slack.cancelled.is_set()
+        assert pipeline.shutdown_calls == 1
+        assert slack.shutdown_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_optional_monitoring_failure_restarts_until_shutdown(
+        self, tmp_path, patched_platform_deps
+    ):
+        class FlakyMonitoring:
+            def __init__(self):
+                self.starts = 0
+                self.restarted = asyncio.Event()
+                self.shutdown_calls = 0
+
+            async def start(self):
+                self.starts += 1
+                if self.starts == 1:
+                    raise RuntimeError("monitor failed")
+                self.restarted.set()
+                await asyncio.Event().wait()
+
+            async def shutdown(self):
+                self.shutdown_calls += 1
+
+        platform = main.LLMRouterPlatform(config_path=str(_write_config(tmp_path)))
+        monitoring = FlakyMonitoring()
+        platform.services["monitoring"] = monitoring
+        start_task = asyncio.create_task(
+            platform._start_services(include_api=False, include_background=True)
+        )
+        await asyncio.wait_for(monitoring.restarted.wait(), timeout=2)
+        platform.shutdown_event.set()
+
+        assert await start_task == 0
+        assert monitoring.starts == 2
+        assert monitoring.shutdown_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_shutdown_is_exactly_once_across_concurrent_callers(
+        self, tmp_path, patched_platform_deps
+    ):
+        service = SimpleNamespace(shutdown=AsyncMock())
+        platform = main.LLMRouterPlatform(config_path=str(_write_config(tmp_path)))
+        platform.services["service"] = service
+
+        await asyncio.gather(
+            platform._shutdown_services(), platform._shutdown_services()
+        )
+
+        service.shutdown.assert_awaited_once()
+
+    def test_signal_handler_sets_events_without_exiting(
+        self, tmp_path, patched_platform_deps
+    ):
+        platform = main.LLMRouterPlatform(config_path=str(_write_config(tmp_path)))
+
+        platform._signal_handler(signal.SIGTERM, None)
+        assert platform.shutdown_event.is_set()
+        assert not platform.force_shutdown_event.is_set()
+
+        platform._signal_handler(signal.SIGTERM, None)
+        assert platform.force_shutdown_event.is_set()
+
 
 class TestApiApp:
     def test_live_endpoint_is_public_and_ready_endpoint_reports_missing_services(
@@ -1223,6 +1328,61 @@ class TestApiApp:
         assert "content" not in rag_service.queued_payload
         assert rag_service.processed_payload["content"] is None
         assert rag_service.processed_payload["storage_ref"].endswith("staged.pdf")
+
+    def test_rag_staging_capacity_returns_507(self, tmp_path, patched_platform_deps):
+        class FullRagService(DummyRagService):
+            async def stage_uploaded_file(self, upload, **_kwargs):
+                raise main.RagStorageCapacityError("staging is full")
+
+        config_path = _write_config(
+            tmp_path,
+            overrides={"rag": {"enabled": True, "backend": "memory"}},
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        platform.services["rag"] = FullRagService({"enabled": True})
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/rag/documents",
+                files={"file": ("handbook.pdf", b"abcdef", "application/pdf")},
+            )
+
+        assert response.status_code == 507
+        assert response.json() == {
+            "error": "rag_storage_capacity",
+            "message": "staging is full",
+        }
+
+    def test_rag_queue_failure_cleans_published_staging_file(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(
+            tmp_path,
+            overrides={"rag": {"enabled": True, "backend": "memory"}},
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        staging_dir = tmp_path / "staging"
+        rag_service = RealRagService(
+            {
+                "enabled": True,
+                "backend": "memory",
+                "ingestion_queue": {"enabled": True},
+                "storage": {"staging_dir": str(staging_dir)},
+            }
+        )
+        platform.services["rag"] = rag_service
+
+        with TestClient(platform._create_fastapi_app()) as client:
+            response = client.post(
+                "/rag/documents",
+                files={"file": ("handbook.pdf", b"abcdef", "application/pdf")},
+            )
+
+        assert response.status_code == 500
+        assert list(staging_dir.glob("*.manifest.json")) == []
+        assert list(staging_dir.glob("*.pdf")) == []
+        assert rag_service._staging_store.usage_bytes() == 0
 
     def test_rag_batch_endpoints_create_and_report_progress(
         self, tmp_path, patched_platform_deps

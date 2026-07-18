@@ -541,6 +541,24 @@ class PipelineMetrics:
             ["topic"],
         )
 
+        self.consumer_buffer_rows = Gauge(
+            "llm_router_kafka_consumer_buffer_rows",
+            "Pending and in-flight ClickHouse rows held by a Kafka consumer",
+            ["topic"],
+        )
+
+        self.consumer_paused_partitions = Gauge(
+            "llm_router_kafka_consumer_paused_partitions",
+            "Kafka partitions paused by ClickHouse backlog backpressure",
+            ["topic"],
+        )
+
+        self.consumer_backpressure_transitions = Counter(
+            "llm_router_kafka_consumer_backpressure_transitions_total",
+            "Kafka consumer pause and resume transitions",
+            ["topic", "action"],
+        )
+
         self.dead_letter_messages = Counter(
             "llm_router_kafka_dead_letter_messages_total",
             "Kafka messages published to dead-letter topics",
@@ -638,6 +656,23 @@ class SlackMetrics:
             "llm_router_slack_errors_total", "Total Slack bot errors", ["error_type"]
         )
 
+        self.work_queue_depth = Gauge(
+            "llm_router_slack_work_queue_depth", "Queued Slack request work"
+        )
+        self.work_running = Gauge(
+            "llm_router_slack_work_running", "Slack request work currently running"
+        )
+        self.work_rejected = Counter(
+            "llm_router_slack_work_rejected_total",
+            "Slack work rejected before processing",
+            ["reason"],
+        )
+        self.busy_replies = Counter(
+            "llm_router_slack_busy_replies_total",
+            "Slack overload replies",
+            ["outcome"],
+        )
+
         # Conversation metrics
         self.conversation_length = Histogram(
             "llm_router_slack_conversation_length",
@@ -685,6 +720,81 @@ class UserMetrics:
         )
 
 
+class BoundedStateMetrics:
+    """Low-cardinality process-local state capacity metrics."""
+
+    def __init__(self):
+        self.entries = Gauge(
+            "llm_router_bounded_state_entries",
+            "Current bounded state entries",
+            ["state"],
+        )
+        self.capacity = Gauge(
+            "llm_router_bounded_state_capacity",
+            "Configured bounded state capacity",
+            ["state"],
+        )
+        self.oldest_item_age = Gauge(
+            "llm_router_bounded_state_oldest_item_age_seconds",
+            "Age of the oldest bounded state entry",
+            ["state"],
+        )
+        self.evictions = Counter(
+            "llm_router_bounded_state_evictions_total",
+            "Bounded state evictions",
+            ["state", "reason"],
+        )
+
+
+class RagMetrics:
+    """RAG staging lifecycle metrics."""
+
+    def __init__(self):
+        self.staged_bytes = Gauge(
+            "llm_router_rag_staged_bytes", "Bytes reserved in RAG staging"
+        )
+        self.staged_files = Gauge(
+            "llm_router_rag_staged_files", "Files tracked in RAG staging"
+        )
+        self.storage_rejections = Counter(
+            "llm_router_rag_storage_rejections_total",
+            "RAG staging admission rejections",
+            ["reason"],
+        )
+        self.janitor_outcomes = Counter(
+            "llm_router_rag_janitor_outcomes_total",
+            "RAG staging janitor outcomes",
+            ["outcome"],
+        )
+
+
+class SupervisionMetrics:
+    """Managed service and shutdown lifecycle metrics."""
+
+    def __init__(self):
+        self.service_failures = Counter(
+            "llm_router_service_failures_total", "Managed service failures", ["service"]
+        )
+        self.service_restarts = Counter(
+            "llm_router_service_restarts_total",
+            "Optional service restarts",
+            ["service"],
+        )
+        self.service_state = Gauge(
+            "llm_router_service_state",
+            "Managed service state (1 for current state)",
+            ["service", "state"],
+        )
+        self.shutdown_phase_duration = Histogram(
+            "llm_router_shutdown_phase_duration_seconds",
+            "Shutdown phase duration",
+            ["phase"],
+        )
+        self.shutdown_timeouts = Counter(
+            "llm_router_shutdown_timeouts_total", "Shutdown timeouts", ["phase"]
+        )
+
+
 # Global metric instances
 SYSTEM_METRICS = SystemMetrics()
 ROUTER_METRICS = RouterMetrics()
@@ -693,6 +803,9 @@ PIPELINE_METRICS = PipelineMetrics()
 SLACK_METRICS = SlackMetrics()
 USER_METRICS = UserMetrics()
 ADMISSION_METRICS = AdmissionMetrics()
+BOUNDED_STATE_METRICS = BoundedStateMetrics()
+RAG_METRICS = RagMetrics()
+SUPERVISION_METRICS = SupervisionMetrics()
 
 
 class MetricsCollector:
@@ -1124,6 +1237,9 @@ __all__ = [
     "SLACK_METRICS",
     "USER_METRICS",
     "ADMISSION_METRICS",
+    "BOUNDED_STATE_METRICS",
+    "RAG_METRICS",
+    "SUPERVISION_METRICS",
     "BUSINESS_METRICS",
     "METRICS_REPORTER",
     "MetricsCollector",

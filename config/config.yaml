@@ -295,6 +295,8 @@ tools:
     max_results: 5
     per_user_rate_limit: 20
     cache_ttl_seconds: 300
+    cache_max_entries: 512
+    rate_limiter_max_users: 10000
     search_depth: basic
     include_answer: false
     max_results_per_domain: 2
@@ -305,6 +307,9 @@ rag:
   backend: redis_stack
   auto_retrieve: true
   default_knowledge_base_ids: []
+  local_job_cache_max_entries: 1000
+  local_batch_cache_max_entries: 100
+  job_ttl_seconds: 86400
   parser:
     provider: docling
     allow_cloud_fallback: false
@@ -353,12 +358,18 @@ rag:
     max_attempts: 3
     retry_backoff_seconds: 30
     stream_maxlen: 10000
+    dead_letter_maxlen: 10000
     heartbeat_interval_seconds: 5
     heartbeat_ttl_seconds: 15
   storage:
     staging_dir: data/rag/uploads
     cleanup_completed_files: false
     completed_file_ttl_seconds: 86400
+    failed_file_ttl_seconds: 604800
+    orphan_file_ttl_seconds: 604800
+    janitor_interval_seconds: 300
+    max_staging_bytes: 10737418240
+    high_watermark_ratio: 0.9
   upload:
     json_max_decoded_bytes: 10000000
     multipart_max_bytes: 100000000
@@ -565,6 +576,10 @@ kafka:
     auto_offset_reset: latest
     enable_auto_commit: false
     max_poll_records: 500
+    batch_size: 100
+    batch_high_watermark_rows: 5000
+    batch_low_watermark_rows: 2500
+    max_concurrent_flushes: 4
     dlq_enabled: true
     supervisor_initial_backoff_seconds: 1
     supervisor_max_backoff_seconds: 30
@@ -579,6 +594,8 @@ clickhouse:
   database: llm_router
   username: default
   password: ''
+  connect_timeout_seconds: 2
+  send_receive_timeout_seconds: 10
   tables:
     queries:
       name: query_logs
@@ -642,6 +659,10 @@ slack:
   channels:
   - general
   - ai-testing
+  work_queue:
+    capacity: 256
+    concurrency: 16
+    overload_reply_timeout_seconds: 2
   response_settings:
     max_response_length: 2000
     typing_indicator: true
@@ -781,6 +802,7 @@ policy_cache:
   user_ttl_seconds: 900
   guardrail_ttl_seconds: 180
   local_cache_ttl_seconds: 5
+  local_cache_max_entries: 4096
   redis:
     host: localhost
     port: 6379
@@ -838,3 +860,7 @@ features:
   streaming_responses: true
 pipeline:
   enabled: false
+shutdown:
+  grace_period_seconds: 75
+  api_drain_timeout_seconds: 65
+  service_stop_timeout_seconds: 15
