@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic bounded-state and Kafka outage stress contract."""
+"""Exercise production buffering against a blocked ClickHouse insert."""
 
 import argparse
 import asyncio
@@ -8,6 +8,7 @@ import os
 import resource
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,10 +30,18 @@ def rss_bytes() -> int:
         return int(value if os.uname().sysname == "Darwin" else value * 1024)
 
 
-class FakeConsumer:
-    def __init__(self):
+class FakeBrokerConsumer:
+    """A max-poll sized broker fixture that stops fetching while paused."""
+
+    def __init__(self, events: int, max_poll_records: int):
         self.partition = TopicPartition("requests", 0)
+        self.events = events
+        self.max_poll_records = max_poll_records
+        self.delivered = 0
+        self._poll_remaining = 0
         self.paused = False
+        self.pause_observed = asyncio.Event()
+        self.first_batch_ready = asyncio.Event()
         self.committed = {}
 
     def assignment(self):
@@ -40,6 +49,7 @@ class FakeConsumer:
 
     def pause(self, *_partitions):
         self.paused = True
+        self.pause_observed.set()
 
     def resume(self, *_partitions):
         self.paused = False
@@ -50,10 +60,54 @@ class FakeConsumer:
     async def stop(self):
         return None
 
+    def __aiter__(self):
+        return self
 
-class RecoveringClickHouse:
+    async def __anext__(self):
+        if self.delivered >= self.events:
+            raise StopAsyncIteration
+        if self._poll_remaining == 0:
+            while self.paused:
+                await asyncio.sleep(0.001)
+            self._poll_remaining = min(
+                self.max_poll_records, self.events - self.delivered
+            )
+        offset = self.delivered
+        self.delivered += 1
+        self._poll_remaining -= 1
+        if self.delivered >= 100:
+            self.first_batch_ready.set()
+        await asyncio.sleep(0)
+        value = {
+            "query_id": f"query-{offset}",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "user_id": "stress-user",
+            "user_tier": "free",
+            "query_text": "bounded-state stress",
+            "query_type": "general",
+            "selected_model": "fake",
+            "token_count_input": 1,
+            "token_count_output": 1,
+            "latency_ms": 1.0,
+            "cost_usd": 0.0,
+            "status": "success",
+        }
+        return SimpleNamespace(
+            topic="requests", partition=0, offset=offset, value=value, key=None
+        )
+
+
+class BlockedClickHouse:
+    def __init__(self):
+        self.insert_started = asyncio.Event()
+        self.release_insert = asyncio.Event()
+        self.outage = True
+
     async def batch_insert_query_logs(self, _rows):
-        return None
+        if self.outage:
+            self.insert_started.set()
+            await self.release_insert.wait()
+            raise RuntimeError("injected ClickHouse outage")
 
     async def batch_insert_metrics(self, _rows):
         return None
@@ -71,7 +125,8 @@ class RecoveringClickHouse:
 async def run_contract(events: int) -> dict:
     high_watermark = 5_000
     max_poll_records = 500
-    consumer = KafkaConsumerManager(
+    clickhouse = BlockedClickHouse()
+    manager = KafkaConsumerManager(
         {
             "consumer": {
                 "enable_auto_commit": False,
@@ -80,25 +135,31 @@ async def run_contract(events: int) -> dict:
                 "max_poll_records": max_poll_records,
             }
         },
-        RecoveringClickHouse(),
+        clickhouse,
     )
-    fake_consumer = FakeConsumer()
-    consumer.consumers["queries"] = fake_consumer
+    broker = FakeBrokerConsumer(events, max_poll_records)
+    manager.consumers["queries"] = broker
     rss_samples = [rss_bytes()]
-    pause_started = None
-    delivered = min(events, high_watermark + max_poll_records)
-    for offset in range(delivered):
-        await consumer._append_batched_row(
-            "queries",
-            {"offset": offset},
-            SimpleNamespace(topic="requests", partition=0, offset=offset),
-        )
-        if fake_consumer.paused and pause_started is None:
-            pause_started = time.monotonic()
-        if offset % 500 == 0:
-            rss_samples.append(rss_bytes())
 
-    buffered_peak = consumer._buffered_row_count("queries")
+    consume_task = asyncio.create_task(manager._consume_queries(broker))
+    await asyncio.wait_for(broker.first_batch_ready.wait(), timeout=5)
+    flush_task = asyncio.create_task(
+        manager._flush_batch_topic("queries", clickhouse.batch_insert_query_logs)
+    )
+    await asyncio.wait_for(clickhouse.insert_started.wait(), timeout=5)
+    pause_started = time.monotonic()
+    await asyncio.wait_for(broker.pause_observed.wait(), timeout=5)
+    await asyncio.sleep(0.05)
+    rss_samples.append(rss_bytes())
+    buffered_peak = manager._buffered_row_count("queries")
+
+    consume_task.cancel()
+    await asyncio.gather(consume_task, return_exceptions=True)
+    clickhouse.release_insert.set()
+    failed_flush = await asyncio.gather(flush_task, return_exceptions=True)
+    insert_failed = isinstance(failed_flush[0], RuntimeError)
+    restored_rows = manager._buffered_row_count("queries")
+
     cache = BoundedTTLMap[str, int](
         max_entries=4_096, ttl_seconds=3_600, metric_name="stress_cache"
     )
@@ -108,22 +169,23 @@ async def run_contract(events: int) -> dict:
             rss_samples.append(rss_bytes())
     rss_samples.append(rss_bytes())
 
+    clickhouse.outage = False
+    await manager._flush_batch_topic("queries", clickhouse.batch_insert_query_logs)
     shutdown_started = time.monotonic()
-    await consumer.shutdown()
+    await manager.shutdown()
     shutdown_duration = time.monotonic() - shutdown_started
-    pause_duration = (
-        time.monotonic() - pause_started if pause_started is not None else 0.0
-    )
     tail = rss_samples[-4:]
     rss_plateau = max(tail) - min(tail) <= 8 * 1024 * 1024
     result = {
         "events_offered": events,
+        "events_delivered_by_broker": broker.delivered,
         "events_buffered_peak": buffered_peak,
-        "broker_backlog": max(0, events - delivered),
+        "rows_restored_after_insert_failure": restored_rows,
+        "broker_backlog": events - broker.delivered,
         "cache_entries_peak": len(cache),
         "cache_capacity": cache.max_entries,
         "oldest_item_age_seconds": cache.oldest_item_age(),
-        "pause_duration_seconds": pause_duration,
+        "pause_duration_seconds": time.monotonic() - pause_started,
         "rejects": 0,
         "rss_start_bytes": rss_samples[0],
         "rss_peak_bytes": max(rss_samples),
@@ -132,9 +194,12 @@ async def run_contract(events: int) -> dict:
         "shutdown_duration_seconds": shutdown_duration,
     }
     result["passed"] = bool(
-        buffered_peak <= high_watermark + max_poll_records
+        insert_failed
+        and buffered_peak <= high_watermark + max_poll_records
+        and restored_rows == broker.delivered
+        and broker.delivered < events
         and len(cache) <= cache.max_entries
-        and fake_consumer.committed.get(fake_consumer.partition) == delivered
+        and broker.committed.get(broker.partition) == broker.delivered
         and rss_plateau
         and shutdown_duration <= 75
     )

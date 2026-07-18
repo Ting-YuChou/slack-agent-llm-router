@@ -1353,6 +1353,42 @@ class TestApiApp:
             "message": "staging is full",
         }
 
+    def test_rag_queue_failure_cleans_published_staging_file(
+        self, tmp_path, patched_platform_deps
+    ):
+        class FailingQueueRagService(DummyRagService):
+            def __init__(self):
+                super().__init__({"enabled": True})
+                self.cleaned = []
+
+            async def stage_uploaded_file(self, upload, **_kwargs):
+                while await upload.read(1024):
+                    pass
+                return str(tmp_path / "published.pdf")
+
+            async def queue_document_ingestion(self, **_payload):
+                raise RuntimeError("redis unavailable")
+
+            def cleanup_staged_file(self, storage_ref):
+                self.cleaned.append(storage_ref)
+
+        config_path = _write_config(
+            tmp_path,
+            overrides={"rag": {"enabled": True, "backend": "memory"}},
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        rag_service = FailingQueueRagService()
+        platform.services["rag"] = rag_service
+
+        with TestClient(platform._create_fastapi_app()) as client:
+            response = client.post(
+                "/rag/documents",
+                files={"file": ("handbook.pdf", b"abcdef", "application/pdf")},
+            )
+
+        assert response.status_code == 500
+        assert rag_service.cleaned == [str(tmp_path / "published.pdf")]
+
     def test_rag_batch_endpoints_create_and_report_progress(
         self, tmp_path, patched_platform_deps
     ):

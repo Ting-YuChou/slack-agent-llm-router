@@ -1638,6 +1638,29 @@ class BatchBufferState:
     flush_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
+class _BatchBackpressureRebalanceListener:
+    """Reapply topic backpressure as soon as partitions are assigned."""
+
+    def __init__(self, manager: "KafkaConsumerManager", topic_key: str, consumer):
+        self.manager = manager
+        self.topic_key = topic_key
+        self.consumer = consumer
+
+    async def on_partitions_revoked(self, revoked):
+        state = self.manager.batch_buffer_states.get(self.topic_key)
+        if state is None:
+            return
+        state.paused_partitions.difference_update(set(revoked or ()))
+        PIPELINE_METRICS.consumer_paused_partitions.labels(topic=self.topic_key).set(
+            len(state.paused_partitions)
+        )
+
+    async def on_partitions_assigned(self, assigned):
+        await self.manager._pause_assigned_partitions_if_needed(
+            self.topic_key, self.consumer, set(assigned or ())
+        )
+
+
 class KafkaConsumerManager:
     """Manages Kafka message consumption"""
 
@@ -1732,6 +1755,14 @@ class KafkaConsumerManager:
             topic_key: state.flush_lock
             for topic_key, state in self.batch_buffer_states.items()
         }
+        self._rebalance_listeners: Dict[str, Any] = {}
+
+    def _install_rebalance_listener(
+        self, topic_key: str, topic_name: str, consumer: AIOKafkaConsumer
+    ) -> None:
+        listener = _BatchBackpressureRebalanceListener(self, topic_key, consumer)
+        consumer.subscribe(topics=[topic_name], listener=listener)
+        self._rebalance_listeners[topic_key] = listener
 
     async def initialize(self):
         """Initialize Kafka consumers"""
@@ -1761,6 +1792,7 @@ class KafkaConsumerManager:
                 ]:
                     consumer = AIOKafkaConsumer(topic_name, **self.consumer_config)
                     await consumer.start()
+                    self._install_rebalance_listener(topic_key, topic_name, consumer)
                     self.consumers[topic_key] = consumer
                     self.topic_names_by_key[topic_key] = topic_name
                     self.consumer_task_status[topic_key] = {
@@ -1848,6 +1880,8 @@ class KafkaConsumerManager:
         consumer = AIOKafkaConsumer(topic_name, **self.consumer_config)
         await consumer.start()
         self.consumers[topic_key] = consumer
+        self._install_rebalance_listener(topic_key, topic_name, consumer)
+        await self._refresh_batch_backpressure(topic_key)
         return consumer
 
     async def _run_consumer(self, topic_key: str, consumer: AIOKafkaConsumer):
@@ -2469,6 +2503,20 @@ class KafkaConsumerManager:
     def _buffered_row_count(self, topic_key: str) -> int:
         state = self.batch_buffer_states[topic_key]
         return len(state.pending_rows) + state.inflight_rows
+
+    async def _pause_assigned_partitions_if_needed(
+        self, topic_key: str, consumer: Any, partitions: set[TopicPartition]
+    ) -> None:
+        state = self.batch_buffer_states.get(topic_key)
+        if state is None or not state.paused or not partitions:
+            return
+        pause_result = consumer.pause(*partitions)
+        if inspect.isawaitable(pause_result):
+            await pause_result
+        state.paused_partitions.update(partitions)
+        PIPELINE_METRICS.consumer_paused_partitions.labels(topic=topic_key).set(
+            len(state.paused_partitions)
+        )
 
     async def _refresh_batch_backpressure(self, topic_key: str):
         """Pause or resume the topic consumer based on its durable-write backlog."""

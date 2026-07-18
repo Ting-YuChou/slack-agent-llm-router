@@ -2737,13 +2737,23 @@ class SlackBot:
         if not self._work_workers:
             return
         self._accepting_work = False
-        await self._work_queue.join()
-        workers, self._work_workers = self._work_workers, []
-        for worker in workers:
-            worker.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
-        SLACK_METRICS.work_queue_depth.set(0)
-        SLACK_METRICS.work_running.set(0)
+        try:
+            await self._work_queue.join()
+        finally:
+            workers, self._work_workers = self._work_workers, []
+            while True:
+                try:
+                    self._work_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                else:
+                    self._work_queue.task_done()
+                    SLACK_METRICS.work_rejected.labels(reason="shutdown").inc()
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            SLACK_METRICS.work_queue_depth.set(0)
+            SLACK_METRICS.work_running.set(0)
 
     async def _enqueue_work(self, item: SlackWorkItem) -> bool:
         if not self._accepting_work:

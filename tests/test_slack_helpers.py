@@ -13,6 +13,7 @@ from slack.bot_real import (
     RedisSlackStateStore,
     SlackBot,
     SlackMessageHandler,
+    SlackWorkItem,
     UserManager,
 )
 from src.utils.schema import (
@@ -1428,6 +1429,38 @@ async def test_slack_work_queue_bounds_running_and_queued_and_replies_busy():
 
     release.set()
     await bot._stop_work_workers()
+
+
+@pytest.mark.asyncio
+async def test_slack_worker_shutdown_cancellation_still_cancels_workers_and_drains_queue():
+    bot = SlackBot(
+        {"channels": [], "work_queue": {"capacity": 2, "concurrency": 1}},
+        inference_engine=SimpleNamespace(),
+    )
+    started = asyncio.Event()
+
+    async def blocked_event(_event):
+        started.set()
+        await asyncio.Event().wait()
+
+    bot._handle_event = blocked_event
+    bot._start_work_workers()
+    item = lambda index: SlackWorkItem(
+        kind="event", name=f"event-{index}", payload={"index": index}
+    )
+    await bot._enqueue_work(item(1))
+    await started.wait()
+    await bot._enqueue_work(item(2))
+
+    stop_task = asyncio.create_task(bot._stop_work_workers())
+    await asyncio.sleep(0)
+    stop_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stop_task
+
+    assert bot._work_workers == []
+    assert bot._work_queue.empty()
+    assert bot._work_running == 0
 
 
 @pytest.mark.asyncio

@@ -35,6 +35,7 @@ class RagStagingStore:
         self.orphan_ttl = int(config.get("orphan_file_ttl_seconds", 604_800))
         self._lock_path = self.root / ".staging.lock"
         self._ledger_path = self.root / ".usage.json"
+        self._leases: Dict[str, Any] = {}
 
     def ensure_reconciled(self) -> None:
         if not self._reconciled:
@@ -52,6 +53,42 @@ class RagStagingStore:
 
     def _manifest_path(self, job_id: str) -> Path:
         return self.root / f"{job_id}.manifest.json"
+
+    def _lease_path(self, job_id: str) -> Path:
+        return self.root / f".{job_id}.lease.lock"
+
+    def _acquire_lease(self, job_id: str) -> None:
+        lease_file = self._lease_path(job_id).open("a+")
+        try:
+            fcntl.flock(lease_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            lease_file.close()
+            raise
+        self._leases[job_id] = lease_file
+
+    def _release_lease(self, job_id: str) -> None:
+        lease_file = self._leases.pop(job_id, None)
+        if lease_file is not None:
+            fcntl.flock(lease_file.fileno(), fcntl.LOCK_UN)
+            lease_file.close()
+        self._lease_path(job_id).unlink(missing_ok=True)
+
+    def _lease_is_active(self, job_id: str) -> bool:
+        if job_id in self._leases:
+            return True
+        lease_path = self._lease_path(job_id)
+        if not lease_path.exists():
+            return False
+        lease_file = lease_path.open("a+")
+        try:
+            try:
+                fcntl.flock(lease_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(lease_file.fileno(), fcntl.LOCK_UN)
+            return False
+        finally:
+            lease_file.close()
 
     def _read_json(self, path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -89,22 +126,27 @@ class RagStagingStore:
         self.ensure_reconciled()
         data_path = self.root / f"{job_id}-{filename}"
         part_path = self.root / f".{job_id}-{filename}.part"
-        with self._locked():
-            usage = self._usage_unlocked()
-            if usage >= int(self.max_bytes * self.high_watermark_ratio):
-                RAG_METRICS.storage_rejections.labels(reason="high_watermark").inc()
-                raise StagingCapacityError("RAG staging high watermark reached")
-            manifest = {
-                "job_id": job_id,
-                "bytes": 0,
-                "status": "queued",
-                "updated_at": self._clock(),
-                "expires_at": self._clock() + self.orphan_ttl,
-                "data_path": str(data_path),
-                "part_path": str(part_path),
-            }
-            self._atomic_json(self._manifest_path(job_id), manifest)
-            self._update_file_metric()
+        self._acquire_lease(job_id)
+        try:
+            with self._locked():
+                usage = self._usage_unlocked()
+                if usage >= int(self.max_bytes * self.high_watermark_ratio):
+                    RAG_METRICS.storage_rejections.labels(reason="high_watermark").inc()
+                    raise StagingCapacityError("RAG staging high watermark reached")
+                manifest = {
+                    "job_id": job_id,
+                    "bytes": 0,
+                    "status": "queued",
+                    "updated_at": self._clock(),
+                    "expires_at": self._clock() + self.orphan_ttl,
+                    "data_path": str(data_path),
+                    "part_path": str(part_path),
+                }
+                self._atomic_json(self._manifest_path(job_id), manifest)
+                self._update_file_metric()
+        except BaseException:
+            self._release_lease(job_id)
+            raise
         return part_path, data_path
 
     def reserve(self, job_id: str, amount: int) -> None:
@@ -132,6 +174,7 @@ class RagStagingStore:
             manifest["data_path"] = str(data_path)
             manifest["updated_at"] = self._clock()
             self._atomic_json(manifest_path, manifest)
+        self._release_lease(job_id)
         return str(data_path)
 
     def rollback(self, job_id: str) -> None:
@@ -146,6 +189,7 @@ class RagStagingStore:
             )
             manifest_path.unlink(missing_ok=True)
             self._update_file_metric()
+        self._release_lease(job_id)
 
     def stage_bytes(self, job_id: str, filename: str, content: bytes) -> str:
         part_path, data_path = self.begin(job_id, filename)
@@ -220,21 +264,42 @@ class RagStagingStore:
     def reconcile(self) -> Dict[str, int]:
         removed_parts = 0
         with self._locked():
-            for part_path in self.root.rglob("*.part"):
-                part_path.unlink(missing_ok=True)
-                removed_parts += 1
             usage = 0
+            referenced_parts = set()
             for manifest_path in list(self.root.glob("*.manifest.json")):
                 manifest = self._read_json(manifest_path, {})
-                data_path = Path(manifest.get("data_path", ""))
-                if not data_path.is_file():
+                job_id = str(manifest.get("job_id") or "")
+                data_path_value = manifest.get("data_path")
+                part_path_value = manifest.get("part_path")
+                data_path = Path(data_path_value) if data_path_value else None
+                part_path = Path(part_path_value) if part_path_value else None
+                if data_path is not None and data_path.is_file():
+                    size = data_path.stat().st_size
+                    manifest["bytes"] = size
+                    manifest["part_path"] = None
+                    self._atomic_json(manifest_path, manifest)
+                    usage += size
+                    continue
+                if (
+                    part_path is not None
+                    and part_path.is_file()
+                    and self._lease_is_active(job_id)
+                ):
+                    referenced_parts.add(part_path.resolve())
+                    usage += int(manifest.get("bytes", 0))
+                    continue
+                if part_path is not None and part_path.is_file():
+                    part_path.unlink(missing_ok=True)
+                    removed_parts += 1
+                self._lease_path(job_id).unlink(missing_ok=True)
+                if data_path is None or not data_path.is_file():
                     manifest_path.unlink(missing_ok=True)
                     continue
-                size = data_path.stat().st_size
-                manifest["bytes"] = size
-                manifest["part_path"] = None
-                self._atomic_json(manifest_path, manifest)
-                usage += size
+            for part_path in self.root.rglob("*.part"):
+                if part_path.resolve() in referenced_parts:
+                    continue
+                part_path.unlink(missing_ok=True)
+                removed_parts += 1
             self._set_usage_unlocked(usage)
             self._update_file_metric()
             self._reconciled = True

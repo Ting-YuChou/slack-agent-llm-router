@@ -906,6 +906,33 @@ def test_staging_janitor_respects_terminal_retention_and_active_lease(tmp_path):
     assert Path(active).exists()
 
 
+def test_staging_reconcile_does_not_delete_another_process_active_upload(tmp_path):
+    first = RagService(
+        {
+            "enabled": True,
+            "backend": "memory",
+            "storage": {"staging_dir": str(tmp_path)},
+        }
+    )
+    part_path, _ = first._staging_store.begin("active-job", "upload.pdf")
+    first._staging_store.reserve("active-job", 4)
+    part_path.write_bytes(b"part")
+
+    second = RagService(
+        {
+            "enabled": True,
+            "backend": "memory",
+            "storage": {"staging_dir": str(tmp_path)},
+        }
+    )
+    result = second._staging_store.reconcile()
+
+    assert result["bytes"] == 4
+    assert part_path.exists()
+    assert (tmp_path / "active-job.manifest.json").exists()
+    first._staging_store.rollback("active-job")
+
+
 def test_json_base64_limit_checks_decoded_size():
     encoded = base64.b64encode(b"12345").decode("ascii")
 

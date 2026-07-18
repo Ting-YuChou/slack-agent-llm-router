@@ -1789,7 +1789,23 @@ class LLMRouterPlatform:
                 )
             try:
                 payload = await self._parse_rag_document_request(request)
-                job = await rag_service.queue_document_ingestion(**payload)
+                try:
+                    job = await rag_service.queue_document_ingestion(**payload)
+                except BaseException:
+                    storage_ref = payload.get("storage_ref")
+                    if storage_ref:
+                        cleanup_task = asyncio.create_task(
+                            asyncio.to_thread(
+                                rag_service.cleanup_staged_file, storage_ref
+                            ),
+                            name="cleanup_unqueued_rag_upload",
+                        )
+                        try:
+                            await asyncio.shield(cleanup_task)
+                        except asyncio.CancelledError:
+                            await cleanup_task
+                            raise
+                    raise
                 if not getattr(rag_service, "queue_enabled", False):
                     background_tasks.add_task(
                         rag_service.process_ingestion_job,

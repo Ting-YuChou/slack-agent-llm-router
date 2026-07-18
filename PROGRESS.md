@@ -1,9 +1,16 @@
 # Project Progress
 
+## 2026-07-18 — Bounded-state independent-review hardening
+
+- RAG: an upload now holds a job-specific POSIX lease for its full `.part` lifetime, so startup reconciliation in another process preserves active bytes; failed or cancelled Redis job persistence immediately removes the already-published file and rolls back shared capacity.
+- Shutdown and Kafka: Slack worker cleanup now runs in `finally` even when its drain timeout cancels the stop task; Kafka installs a rebalance listener and reapplies an existing pause to every new assignment and restarted consumer before further processing.
+- Stress truthfulness: the 100,000-event contract now sends all events to a max-poll-aware fake broker, blocks the production ClickHouse insert path, observes the real consumer pause, verifies failure requeue and exact offset commit after recovery, and measures the actual remaining broker queue.
+- Verification: reviewer-finding regressions and the production-path stress contract pass. Full-suite and independent re-review results are recorded after the final gate below.
+
 ## 2026-07-18 — Bounded-state stress and full verification
 
 - Added: `scripts/stress_bounded_state.py`, a production-path 100,000-event outage contract that exercises Kafka buffer admission, the shared bounded TTL/LRU map, durable flush/commit, RSS sampling, and shutdown timing.
-- Measured: 100,000 offered events plateaued at exactly 5,500 in-process Kafka rows (5,000 high watermark + 500 max poll), leaving 94,500 in broker backlog with zero drops; the 4,096-entry cache stayed exactly at capacity. RSS plateaued at 154.1 MB and shutdown completed in 0.00046 seconds.
+- Measured: 100,000 events were offered to the broker fixture; the production consumer paused at 5,000 in-process rows, leaving 95,000 in the broker with zero drops. The blocked ClickHouse insert failed and restored all 5,000 rows in order, recovery committed offset 5,000, and the 4,096-entry cache stayed exactly at capacity. RSS plateaued and shutdown completed in under one millisecond in this deterministic fixture.
 - Verification: full pytest passed with temporary local Redis (`548 passed, 11 skipped`); full Black and Flake8, configured mypy, compileall, Compose config, stress contract, and `git diff --check` passed. The temporary Redis container was removed after verification.
 
 ## 2026-07-18 — Essential service supervision and deterministic shutdown

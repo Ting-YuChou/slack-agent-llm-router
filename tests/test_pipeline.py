@@ -1293,6 +1293,23 @@ class TestKafkaConsumerManager:
         assert consumer.batch_buffer_states["queries"].paused is False
 
     @pytest.mark.asyncio
+    async def test_rebalance_listener_immediately_pauses_new_assignment(
+        self, pipeline_config
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        kafka_consumer = MagicMock()
+        consumer._install_rebalance_listener("queries", "test-queries", kafka_consumer)
+        consumer.batch_buffer_states["queries"].paused = True
+        partitions = {TopicPartition("test-queries", 1)}
+
+        await consumer._rebalance_listeners["queries"].on_partitions_assigned(
+            partitions
+        )
+
+        kafka_consumer.pause.assert_called_once_with(*partitions)
+        assert consumer.batch_buffer_states["queries"].paused_partitions == partitions
+
+    @pytest.mark.asyncio
     async def test_flush_pending_batches_allows_other_topics_to_finish_before_raising(
         self, pipeline_config, sample_query_log
     ):
