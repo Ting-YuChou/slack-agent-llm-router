@@ -11,6 +11,7 @@ import yaml
 from fastapi.testclient import TestClient
 
 import main
+from src.rag.service import RagService as RealRagService
 from src.utils.schema import InferenceResponse
 
 
@@ -1356,30 +1357,20 @@ class TestApiApp:
     def test_rag_queue_failure_cleans_published_staging_file(
         self, tmp_path, patched_platform_deps
     ):
-        class FailingQueueRagService(DummyRagService):
-            def __init__(self):
-                super().__init__({"enabled": True})
-                self.cleaned = []
-
-            async def stage_uploaded_file(self, upload, **_kwargs):
-                while await upload.read(1024):
-                    pass
-                return str(tmp_path / "published.pdf")
-
-            async def queue_document_ingestion(self, **_payload):
-                error = RuntimeError("redis unavailable before persistence")
-                error.safe_to_cleanup_staging = True
-                raise error
-
-            def cleanup_staged_file(self, storage_ref):
-                self.cleaned.append(storage_ref)
-
         config_path = _write_config(
             tmp_path,
             overrides={"rag": {"enabled": True, "backend": "memory"}},
         )
         platform = main.LLMRouterPlatform(config_path=str(config_path))
-        rag_service = FailingQueueRagService()
+        staging_dir = tmp_path / "staging"
+        rag_service = RealRagService(
+            {
+                "enabled": True,
+                "backend": "memory",
+                "ingestion_queue": {"enabled": True},
+                "storage": {"staging_dir": str(staging_dir)},
+            }
+        )
         platform.services["rag"] = rag_service
 
         with TestClient(platform._create_fastapi_app()) as client:
@@ -1389,7 +1380,9 @@ class TestApiApp:
             )
 
         assert response.status_code == 500
-        assert rag_service.cleaned == [str(tmp_path / "published.pdf")]
+        assert list(staging_dir.glob("*.manifest.json")) == []
+        assert list(staging_dir.glob("*.pdf")) == []
+        assert rag_service._staging_store.usage_bytes() == 0
 
     def test_rag_batch_endpoints_create_and_report_progress(
         self, tmp_path, patched_platform_deps

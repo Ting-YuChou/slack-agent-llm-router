@@ -54,6 +54,12 @@ class RagStorageCapacityError(StagingCapacityError):
     """Raised when the shared RAG staging volume is at capacity."""
 
 
+class RagQueuePreDurabilityError(RuntimeError):
+    """A queue submission failure proven to precede every durable side effect."""
+
+    safe_to_cleanup_staging = True
+
+
 @dataclass
 class IngestionJob:
     """Ingestion job record surfaced by the API."""
@@ -814,7 +820,9 @@ class RagService:
     ) -> str:
         client = self._job_client()
         if not client:
-            raise RuntimeError("Redis client is required for RAG ingestion queue")
+            raise RagQueuePreDurabilityError(
+                "Redis client is required for RAG ingestion queue"
+            )
         await self._ensure_stream_group()
         resolved_attempt = int(
             attempt if attempt is not None else max(job.attempts + 1, 1)

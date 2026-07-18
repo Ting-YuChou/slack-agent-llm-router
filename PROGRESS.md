@@ -2,7 +2,7 @@
 
 ## 2026-07-18 — Bounded-state independent-review hardening
 
-- RAG: an upload now holds a job-specific POSIX lease for its full `.part` lifetime, so startup reconciliation in another process preserves active bytes. Cleanup is allowed only for explicitly pre-durability failures; once `XADD` succeeds, a metadata refresh failure preserves the staged file and durable stream work instead of causing worker data loss.
+- RAG: an upload now holds a job-specific POSIX lease for its full `.part` lifetime, so startup reconciliation in another process preserves active bytes. Production emits a typed cleanup proof only for deterministic pre-durability failures such as a missing queue Redis client; ambiguous Redis I/O preserves the file. Once `XADD` succeeds, a metadata refresh failure preserves the staged file and durable stream work instead of causing worker data loss.
 - Shutdown and Kafka: Slack worker cleanup now runs in `finally` even when its drain timeout cancels the stop task; Kafka installs a rebalance listener and reapplies an existing pause to every new assignment and restarted consumer before further processing.
 - Stress truthfulness: the 100,000-event contract now sends all events to a max-poll-aware fake broker, blocks the production ClickHouse insert path, observes repeated real consumer pause/resume cycles, verifies failure requeue, records all inserted offsets in order, drains broker backlog to zero, and requires the exact final commit of 100,000.
 - Verification: reviewer-finding regressions and the production-path stress contract pass. Full-suite and independent re-review results are recorded after the final gate below.
