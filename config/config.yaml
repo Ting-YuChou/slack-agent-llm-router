@@ -365,6 +365,11 @@ rag:
     staging_dir: data/rag/uploads
     cleanup_completed_files: false
     completed_file_ttl_seconds: 86400
+    failed_file_ttl_seconds: 604800
+    orphan_file_ttl_seconds: 604800
+    janitor_interval_seconds: 300
+    max_staging_bytes: 10737418240
+    high_watermark_ratio: 0.9
   upload:
     json_max_decoded_bytes: 10000000
     multipart_max_bytes: 100000000

@@ -1090,6 +1090,11 @@ class RagStorageConfig(ConfigModel):
     staging_dir: str = "data/rag/uploads"
     cleanup_completed_files: bool = False
     completed_file_ttl_seconds: int = Field(86400, ge=0)
+    failed_file_ttl_seconds: int = Field(604800, ge=1)
+    orphan_file_ttl_seconds: int = Field(604800, ge=1)
+    janitor_interval_seconds: float = Field(300.0, gt=0)
+    max_staging_bytes: int = Field(10737418240, ge=1)
+    high_watermark_ratio: float = Field(0.9, gt=0.0, le=1.0)
 
 
 class RagUploadConfig(ConfigModel):

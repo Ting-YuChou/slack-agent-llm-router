@@ -3,7 +3,6 @@
 import asyncio
 import base64
 import binascii
-import hashlib
 import json
 import logging
 import os
@@ -19,6 +18,7 @@ from src.memory import EmbeddingProvider, build_embedding_provider
 from src.rag.chunker import DocumentChunk, build_chunker
 from src.rag.parser import build_document_parser
 from src.rag.reranker import Reranker, build_reranker
+from src.rag.staging import RagStagingStore, StagingCapacityError
 from src.rag.vector_store import RagSearchResult, build_vector_store
 from src.rag.visual import (
     FigureCropper,
@@ -48,6 +48,10 @@ JOB_STATUSES = {
 
 class RagPayloadTooLarge(ValueError):
     """Raised before an oversized RAG upload can enter parsing or indexing."""
+
+
+class RagStorageCapacityError(StagingCapacityError):
+    """Raised when the shared RAG staging volume is at capacity."""
 
 
 @dataclass
@@ -237,6 +241,17 @@ class RagService:
         self.cleanup_completed_files = bool(
             self.storage_config.get("cleanup_completed_files", False)
         )
+        self.failed_file_ttl_seconds = int(
+            self.storage_config.get("failed_file_ttl_seconds", 604800)
+        )
+        self.orphan_file_ttl_seconds = int(
+            self.storage_config.get("orphan_file_ttl_seconds", 604800)
+        )
+        self.janitor_interval_seconds = float(
+            self.storage_config.get("janitor_interval_seconds", 300)
+        )
+        self._staging_store = RagStagingStore(self.staging_dir, self.storage_config)
+        self._janitor_task: Optional[asyncio.Task] = None
         self.parser = parser or build_document_parser(self.parser_config)
         self.chunker = build_chunker(self.chunking_config)
         self.embedding_provider = embedding_provider or build_embedding_provider(
@@ -263,10 +278,14 @@ class RagService:
     async def initialize(self):
         if not self.enabled:
             return
+        await asyncio.to_thread(self._staging_store.ensure_reconciled)
         await self.vector_store.initialize()
         if self.queue_enabled:
             self.staging_dir.mkdir(parents=True, exist_ok=True)
             await self._ensure_stream_group()
+        self._janitor_task = asyncio.create_task(
+            self._staging_janitor_loop(), name="rag_staging_janitor"
+        )
         if self._visual_enabled() and hasattr(self.figure_cropper, "assets_dir"):
             self.figure_cropper.assets_dir.mkdir(parents=True, exist_ok=True)
         self._initialized = True
@@ -274,6 +293,10 @@ class RagService:
     async def shutdown(self):
         if not self.enabled:
             return
+        if self._janitor_task:
+            self._janitor_task.cancel()
+            await asyncio.gather(self._janitor_task, return_exceptions=True)
+            self._janitor_task = None
         await self.vector_store.shutdown()
         close_embedding_provider = getattr(self.embedding_provider, "close", None)
         if callable(close_embedding_provider):
@@ -319,6 +342,7 @@ class RagService:
         document_id: Optional[str] = None,
         batch_id: Optional[str] = None,
         storage_ref: Optional[str] = None,
+        job_id: Optional[str] = None,
     ) -> IngestionJob:
         if not self.enabled:
             raise RuntimeError("RAG service is disabled")
@@ -328,6 +352,7 @@ class RagService:
         if content is None and not storage_ref:
             raise ValueError("content or storage_ref is required")
 
+        resolved_job_id = job_id or str(uuid.uuid4())
         resolved_document_id = document_id or str(uuid.uuid4())
         resolved_kb_id = knowledge_base_id or self._default_write_kb()
         resolved_storage_ref = storage_ref
@@ -337,11 +362,12 @@ class RagService:
                 filename=filename,
                 knowledge_base_id=resolved_kb_id,
                 document_id=resolved_document_id,
+                job_id=resolved_job_id,
             )
         elif self.queue_enabled and resolved_storage_ref:
             self._resolve_staged_path(resolved_storage_ref)
         job = IngestionJob(
-            job_id=str(uuid.uuid4()),
+            job_id=resolved_job_id,
             document_id=resolved_document_id,
             filename=filename,
             knowledge_base_id=resolved_kb_id,
@@ -425,8 +451,6 @@ class RagService:
             job.last_error = None
             job.updated_at = datetime.now()
             await self._save_job(job)
-            if job.storage_ref and self.cleanup_completed_files:
-                self.cleanup_staged_file(job.storage_ref)
             return job
         except Exception as exc:
             job.status = "failed"
@@ -1301,10 +1325,12 @@ class RagService:
                 new_status=job.status,
             )
             setattr(job, "_persisted_status", job.status)
+            self._update_staging_manifest(job)
             return
+        job_ttl = self._job_retention_ttl(job.status)
         await client.setex(
             self._job_key(job.job_id),
-            self.job_ttl_seconds,
+            job_ttl,
             json.dumps(job.to_dict(), sort_keys=True),
         )
         await self._update_batch_for_status_change(
@@ -1313,6 +1339,20 @@ class RagService:
             new_status=job.status,
         )
         setattr(job, "_persisted_status", job.status)
+        self._update_staging_manifest(job)
+
+    def _job_retention_ttl(self, status: str) -> int:
+        if status in {"completed", "completed_with_warnings"}:
+            return int(self.storage_config.get("completed_file_ttl_seconds", 86400))
+        return max(self.job_ttl_seconds, self.failed_file_ttl_seconds)
+
+    def _update_staging_manifest(self, job: IngestionJob) -> None:
+        if not job.storage_ref:
+            return
+        try:
+            self._staging_store.update_status(job.storage_ref, job.status)
+        except FileNotFoundError:
+            logger.debug("No staging manifest for job %s", job.job_id)
 
     async def _stored_job_status(self, job_id: str) -> Optional[str]:
         existing = self.jobs.get(job_id)
@@ -1350,16 +1390,16 @@ class RagService:
         filename: str,
         knowledge_base_id: str,
         document_id: str,
+        job_id: Optional[str] = None,
     ) -> str:
         safe_filename = _safe_path_component(filename or "document.pdf")
-        safe_kb = _safe_path_component(knowledge_base_id)
-        safe_document = _safe_path_component(document_id)
-        content_hash = hashlib.sha256(content).hexdigest()
-        target_dir = self.staging_dir / safe_kb / safe_document
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / f"{content_hash}-{safe_filename}"
-        target.write_bytes(content)
-        return str(target)
+        resolved_job_id = _safe_path_component(job_id or str(uuid.uuid4()))
+        try:
+            return self._staging_store.stage_bytes(
+                resolved_job_id, safe_filename, content
+            )
+        except StagingCapacityError as exc:
+            raise RagStorageCapacityError(str(exc)) from exc
 
     async def stage_uploaded_file(
         self,
@@ -1368,23 +1408,23 @@ class RagService:
         filename: str,
         knowledge_base_id: str,
         document_id: str,
+        job_id: Optional[str] = None,
     ) -> str:
         """Stream an upload to disk and publish it with an atomic rename."""
         safe_filename = _safe_path_component(filename or "document.pdf")
-        safe_kb = _safe_path_component(knowledge_base_id)
-        safe_document = _safe_path_component(document_id)
-        target_dir = self.staging_dir / safe_kb / safe_document
-        target_dir.mkdir(parents=True, exist_ok=True)
-        temporary = target_dir / f".{uuid.uuid4().hex}-{safe_filename}.part"
+        resolved_job_id = _safe_path_component(job_id or str(uuid.uuid4()))
         max_bytes = int(self.upload_config.get("multipart_max_bytes", 100_000_000))
         chunk_bytes = max(
             1, int(self.upload_config.get("stream_chunk_bytes", 1_048_576))
         )
-        digest = hashlib.sha256()
         size = 0
         published = False
-        target: Optional[Path] = None
-        target_existed = False
+        try:
+            temporary, target = self._staging_store.begin(
+                resolved_job_id, safe_filename
+            )
+        except StagingCapacityError as exc:
+            raise RagStorageCapacityError(str(exc)) from exc
         try:
             with temporary.open("xb") as staged_file:
                 while True:
@@ -1396,18 +1436,20 @@ class RagService:
                         raise RagPayloadTooLarge(
                             "Multipart document exceeds the configured RAG upload limit"
                         )
-                    digest.update(chunk)
+                    try:
+                        self._staging_store.reserve(resolved_job_id, len(chunk))
+                    except StagingCapacityError as exc:
+                        raise RagStorageCapacityError(str(exc)) from exc
                     await asyncio.to_thread(staged_file.write, chunk)
                 await asyncio.to_thread(staged_file.flush)
                 await asyncio.to_thread(os.fsync, staged_file.fileno())
-            target = target_dir / f"{digest.hexdigest()}-{safe_filename}"
-            target_existed = target.exists()
-            if target_existed:
-                temporary.unlink(missing_ok=True)
-                published = True
-                return str(target)
             publish_task = asyncio.create_task(
-                asyncio.to_thread(os.replace, temporary, target)
+                asyncio.to_thread(
+                    self._staging_store.publish,
+                    resolved_job_id,
+                    temporary,
+                    target,
+                )
             )
             try:
                 await asyncio.shield(publish_task)
@@ -1416,14 +1458,13 @@ class RagService:
                 # for its deterministic outcome, then remove an otherwise
                 # unreferenced target before propagating cancellation.
                 await publish_task
-                if not target_existed:
-                    target.unlink(missing_ok=True)
+                self._staging_store.rollback(resolved_job_id)
                 raise
             published = True
-            return str(target)
+            return publish_task.result()
         finally:
             if not published:
-                temporary.unlink(missing_ok=True)
+                self._staging_store.rollback(resolved_job_id)
 
     def load_staged_content(self, storage_ref: Optional[str]) -> bytes:
         if not storage_ref:
@@ -1436,11 +1477,21 @@ class RagService:
 
     def cleanup_staged_file(self, storage_ref: str) -> None:
         try:
-            self._resolve_staged_path(storage_ref).unlink(missing_ok=True)
+            self._staging_store.delete(storage_ref)
         except Exception:
             logger.debug(
                 "Failed to clean staged RAG file %s", storage_ref, exc_info=True
             )
+
+    async def _staging_janitor_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.janitor_interval_seconds)
+            try:
+                await asyncio.to_thread(self._staging_store.run_janitor)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("RAG staging janitor failed", exc_info=True)
 
     def _resolve_staged_path(self, storage_ref: str) -> Path:
         base = self.staging_dir.resolve()

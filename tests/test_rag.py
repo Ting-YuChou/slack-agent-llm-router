@@ -130,6 +130,8 @@ class FakeStreamRedis:
         self.groups = set()
         self.acked = []
         self.zsets = {}
+        self.expirations = {}
+        self.xadd_kwargs = []
 
     async def get(self, key):
         return self.values.get(key)
@@ -144,6 +146,10 @@ class FakeStreamRedis:
     async def sadd(self, key, member):
         self.sets.setdefault(key, set()).add(member)
 
+    async def expire(self, key, ttl):
+        self.expirations[key] = ttl
+        return True
+
     async def smembers(self, key):
         return set(self.sets.get(key, set()))
 
@@ -151,7 +157,8 @@ class FakeStreamRedis:
         self.groups.add((stream, group))
         self.streams.setdefault(stream, [])
 
-    async def xadd(self, stream, fields, **_kwargs):
+    async def xadd(self, stream, fields, **kwargs):
+        self.xadd_kwargs.append((stream, kwargs))
         entries = self.streams.setdefault(stream, [])
         message_id = f"{len(entries) + 1}-0"
         entries.append((message_id, dict(fields)))
@@ -1218,6 +1225,10 @@ async def test_worker_exhausts_retries_to_dead_letter_stream(tmp_path):
     dlq = service.vector_store.client.streams[service.dead_letter_stream_key]
     assert dlq[0][1]["job_id"] == job.job_id
     assert "parser exploded" in dlq[0][1]["error"]
+    assert service.vector_store.client.xadd_kwargs[-1] == (
+        service.dead_letter_stream_key,
+        {"maxlen": 10000, "approximate": True},
+    )
 
 
 @pytest.mark.asyncio

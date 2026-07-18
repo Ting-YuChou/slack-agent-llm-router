@@ -1224,6 +1224,31 @@ class TestApiApp:
         assert rag_service.processed_payload["content"] is None
         assert rag_service.processed_payload["storage_ref"].endswith("staged.pdf")
 
+    def test_rag_staging_capacity_returns_507(self, tmp_path, patched_platform_deps):
+        class FullRagService(DummyRagService):
+            async def stage_uploaded_file(self, upload, **_kwargs):
+                raise main.RagStorageCapacityError("staging is full")
+
+        config_path = _write_config(
+            tmp_path,
+            overrides={"rag": {"enabled": True, "backend": "memory"}},
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        platform.services["rag"] = FullRagService({"enabled": True})
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/rag/documents",
+                files={"file": ("handbook.pdf", b"abcdef", "application/pdf")},
+            )
+
+        assert response.status_code == 507
+        assert response.json() == {
+            "error": "rag_storage_capacity",
+            "message": "staging is full",
+        }
+
     def test_rag_batch_endpoints_create_and_report_progress(
         self, tmp_path, patched_platform_deps
     ):

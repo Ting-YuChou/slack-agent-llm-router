@@ -746,6 +746,28 @@ class BoundedStateMetrics:
         )
 
 
+class RagMetrics:
+    """RAG staging lifecycle metrics."""
+
+    def __init__(self):
+        self.staged_bytes = Gauge(
+            "llm_router_rag_staged_bytes", "Bytes reserved in RAG staging"
+        )
+        self.staged_files = Gauge(
+            "llm_router_rag_staged_files", "Files tracked in RAG staging"
+        )
+        self.storage_rejections = Counter(
+            "llm_router_rag_storage_rejections_total",
+            "RAG staging admission rejections",
+            ["reason"],
+        )
+        self.janitor_outcomes = Counter(
+            "llm_router_rag_janitor_outcomes_total",
+            "RAG staging janitor outcomes",
+            ["outcome"],
+        )
+
+
 # Global metric instances
 SYSTEM_METRICS = SystemMetrics()
 ROUTER_METRICS = RouterMetrics()
@@ -755,6 +777,7 @@ SLACK_METRICS = SlackMetrics()
 USER_METRICS = UserMetrics()
 ADMISSION_METRICS = AdmissionMetrics()
 BOUNDED_STATE_METRICS = BoundedStateMetrics()
+RAG_METRICS = RagMetrics()
 
 
 class MetricsCollector:
@@ -1187,6 +1210,7 @@ __all__ = [
     "USER_METRICS",
     "ADMISSION_METRICS",
     "BOUNDED_STATE_METRICS",
+    "RAG_METRICS",
     "BUSINESS_METRICS",
     "METRICS_REPORTER",
     "MetricsCollector",

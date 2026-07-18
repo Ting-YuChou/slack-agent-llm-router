@@ -33,6 +33,7 @@ logs/
 # Data outputs
 data/processed/
 data/cache/
+data/rag/uploads/
 queries/logs.csv
 flink/logs.csv
 

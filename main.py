@@ -49,7 +49,12 @@ from src.llm_router_part2_inference import InferenceEngine
 from src.llm_router_part3_policy import PolicyMaterializer, RoutingPolicyCache
 from src.llm_router_part3_pipeline import KafkaIngestionPipeline, KafkaProducerManager
 from src.llm_router_part4_monitor import MonitoringService
-from src.rag.service import RagPayloadTooLarge, RagService, decode_base64_document
+from src.rag.service import (
+    RagPayloadTooLarge,
+    RagService,
+    RagStorageCapacityError,
+    decode_base64_document,
+)
 from src.utils.logger import security_logger, setup_logging
 from src.utils.metrics import (
     INFERENCE_METRICS,
@@ -992,6 +997,7 @@ class LLMRouterPlatform:
                 ),
             )
             document_id = str(payload.get("document_id") or uuid.uuid4())
+            job_id = str(uuid.uuid4())
             knowledge_base_id = payload.get("knowledge_base_id")
             stage_content = getattr(rag_service, "stage_document_content", None)
             if callable(stage_content):
@@ -1007,6 +1013,7 @@ class LLMRouterPlatform:
                     filename=filename,
                     knowledge_base_id=resolved_kb,
                     document_id=document_id,
+                    job_id=job_id,
                 )
                 return {
                     "filename": filename,
@@ -1014,6 +1021,7 @@ class LLMRouterPlatform:
                     "knowledge_base_id": knowledge_base_id,
                     "metadata": metadata,
                     "document_id": document_id,
+                    "job_id": job_id,
                 }
             return {
                 "filename": filename,
@@ -1046,6 +1054,7 @@ class LLMRouterPlatform:
                 getattr(upload, "filename", "") or form.get("filename") or ""
             )
             document_id = str(form.get("document_id") or uuid.uuid4())
+            job_id = str(uuid.uuid4())
             knowledge_base_id = form.get("knowledge_base_id")
             stage_upload = getattr(rag_service, "stage_uploaded_file", None)
             if callable(stage_upload):
@@ -1060,6 +1069,7 @@ class LLMRouterPlatform:
                     filename=filename or "document.pdf",
                     knowledge_base_id=resolved_kb,
                     document_id=document_id,
+                    job_id=job_id,
                 )
                 return {
                     "filename": filename or "document.pdf",
@@ -1067,6 +1077,7 @@ class LLMRouterPlatform:
                     "knowledge_base_id": knowledge_base_id,
                     "metadata": metadata,
                     "document_id": document_id,
+                    "job_id": job_id,
                 }
             return {
                 "filename": filename or "document.pdf",
@@ -1677,6 +1688,14 @@ class LLMRouterPlatform:
                         storage_ref=payload.get("storage_ref"),
                     )
                 return job.to_dict()
+            except RagStorageCapacityError as exc:
+                return JSONResponse(
+                    status_code=507,
+                    content={
+                        "error": "rag_storage_capacity",
+                        "message": str(exc),
+                    },
+                )
             except RagPayloadTooLarge as exc:
                 return JSONResponse(
                     status_code=413,

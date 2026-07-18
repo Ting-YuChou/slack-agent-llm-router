@@ -1,5 +1,13 @@
 # Project Progress
 
+## 2026-07-18 — Cross-process RAG staging governance
+
+- Added: job-specific staged data plus atomically written manifests, a POSIX-flocked shared usage ledger, startup reconciliation, `.part` cleanup, and a five-minute janitor.
+- Capacity: new uploads are rejected at the 90% high watermark; streaming reservations cannot cross the 10 GiB hard limit. Failure and cancellation remove partial/just-published files and roll back reserved bytes; API capacity denial is the additive HTTP 507 `rag_storage_capacity` response.
+- Retention: completed files expire after 24 hours; failed/dead-letter files and inactive queued/running/retrying leases expire after seven days. Every persisted job status refreshes the manifest and active lease, and failed/dead-letter Redis job records remain available for the same retention horizon.
+- Observability: staged bytes/files, high-watermark/hard-limit rejections, and janitor outcomes are exported as low-cardinality metrics.
+- Verification: shared-instance quota, hard-limit rollback, cancellation, 24h/7d lease semantics, bounded DLQ, RAG API 507, RAG service, main, and schema regressions passed (`143 passed`).
+
 ## 2026-07-18 — Bounded local state and Slack work admission
 
 - Added: a shared monotonic `BoundedTTLMap` with TTL-first pruning, LRU capacity eviction, response-safe copies at call sites, eviction callbacks, and low-cardinality entry/capacity/age/eviction metrics.
