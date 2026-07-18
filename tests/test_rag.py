@@ -1117,6 +1117,40 @@ async def test_queue_ingestion_stages_file_creates_job_and_xadds_stream(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_post_xadd_job_refresh_failure_preserves_durable_file_and_message(
+    tmp_path, monkeypatch
+):
+    service = _queued_rag_service(tmp_path)
+    await service.initialize()
+    client = service.vector_store.client
+    real_setex = client.setex
+    calls = 0
+
+    async def fail_second_setex(key, ttl, value):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ConnectionError("metadata refresh failed after XADD")
+        await real_setex(key, ttl, value)
+
+    monkeypatch.setattr(client, "setex", fail_second_setex)
+
+    job = await service.queue_document_ingestion(
+        content=b"durable contents",
+        filename="handbook.md",
+        knowledge_base_id="school",
+        document_id="doc-1",
+    )
+
+    assert calls == 2
+    assert len(client.streams[service.stream_key]) == 1
+    assert service.load_staged_content(job.storage_ref) == b"durable contents"
+    persisted = await service.get_job(job.job_id)
+    assert persisted is not None
+    assert persisted.storage_ref == job.storage_ref
+
+
+@pytest.mark.asyncio
 async def test_worker_success_marks_completed_and_acks_stream_message(tmp_path):
     service = _queued_rag_service(tmp_path)
     await service.initialize()

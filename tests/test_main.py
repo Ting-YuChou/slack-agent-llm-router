@@ -1367,7 +1367,9 @@ class TestApiApp:
                 return str(tmp_path / "published.pdf")
 
             async def queue_document_ingestion(self, **_payload):
-                raise RuntimeError("redis unavailable")
+                error = RuntimeError("redis unavailable before persistence")
+                error.safe_to_cleanup_staging = True
+                raise error
 
             def cleanup_staged_file(self, storage_ref):
                 self.cleaned.append(storage_ref)

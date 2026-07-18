@@ -53,6 +53,7 @@ class FakeBrokerConsumer:
 
     def resume(self, *_partitions):
         self.paused = False
+        self.pause_observed.clear()
 
     async def commit(self, offsets):
         self.committed.update(offsets)
@@ -102,12 +103,14 @@ class BlockedClickHouse:
         self.insert_started = asyncio.Event()
         self.release_insert = asyncio.Event()
         self.outage = True
+        self.inserted_offsets = []
 
     async def batch_insert_query_logs(self, _rows):
         if self.outage:
             self.insert_started.set()
             await self.release_insert.wait()
             raise RuntimeError("injected ClickHouse outage")
+        self.inserted_offsets.extend(row.kafka_offset for row in _rows)
 
     async def batch_insert_metrics(self, _rows):
         return None
@@ -152,9 +155,8 @@ async def run_contract(events: int) -> dict:
     await asyncio.sleep(0.05)
     rss_samples.append(rss_bytes())
     buffered_peak = manager._buffered_row_count("queries")
+    delivered_at_first_pause = broker.delivered
 
-    consume_task.cancel()
-    await asyncio.gather(consume_task, return_exceptions=True)
     clickhouse.release_insert.set()
     failed_flush = await asyncio.gather(flush_task, return_exceptions=True)
     insert_failed = isinstance(failed_flush[0], RuntimeError)
@@ -171,6 +173,20 @@ async def run_contract(events: int) -> dict:
 
     clickhouse.outage = False
     await manager._flush_batch_topic("queries", clickhouse.batch_insert_query_logs)
+    while not consume_task.done():
+        pause_wait = asyncio.create_task(broker.pause_observed.wait())
+        done, _ = await asyncio.wait(
+            {consume_task, pause_wait}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if pause_wait in done:
+            await manager._flush_batch_topic(
+                "queries", clickhouse.batch_insert_query_logs
+            )
+        else:
+            pause_wait.cancel()
+            await asyncio.gather(pause_wait, return_exceptions=True)
+    await consume_task
+    await manager._flush_batch_topic("queries", clickhouse.batch_insert_query_logs)
     shutdown_started = time.monotonic()
     await manager.shutdown()
     shutdown_duration = time.monotonic() - shutdown_started
@@ -182,6 +198,8 @@ async def run_contract(events: int) -> dict:
         "events_buffered_peak": buffered_peak,
         "rows_restored_after_insert_failure": restored_rows,
         "broker_backlog": events - broker.delivered,
+        "events_inserted": len(clickhouse.inserted_offsets),
+        "insertion_order_preserved": clickhouse.inserted_offsets == list(range(events)),
         "cache_entries_peak": len(cache),
         "cache_capacity": cache.max_entries,
         "oldest_item_age_seconds": cache.oldest_item_age(),
@@ -196,10 +214,11 @@ async def run_contract(events: int) -> dict:
     result["passed"] = bool(
         insert_failed
         and buffered_peak <= high_watermark + max_poll_records
-        and restored_rows == broker.delivered
-        and broker.delivered < events
+        and restored_rows == delivered_at_first_pause
+        and broker.delivered == events
+        and clickhouse.inserted_offsets == list(range(events))
         and len(cache) <= cache.max_entries
-        and broker.committed.get(broker.partition) == broker.delivered
+        and broker.committed.get(broker.partition) == events
         and rss_plateau
         and shutdown_duration <= 75
     )

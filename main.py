@@ -1791,9 +1791,9 @@ class LLMRouterPlatform:
                 payload = await self._parse_rag_document_request(request)
                 try:
                     job = await rag_service.queue_document_ingestion(**payload)
-                except BaseException:
+                except BaseException as exc:
                     storage_ref = payload.get("storage_ref")
-                    if storage_ref:
+                    if storage_ref and getattr(exc, "safe_to_cleanup_staging", False):
                         cleanup_task = asyncio.create_task(
                             asyncio.to_thread(
                                 rag_service.cleanup_staged_file, storage_ref

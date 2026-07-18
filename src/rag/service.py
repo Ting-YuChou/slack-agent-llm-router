@@ -836,7 +836,18 @@ class RagService:
         job.stream_message_id = _decode(message_id)
         job.status = "queued"
         job.updated_at = datetime.now()
-        await self._save_job(job)
+        try:
+            await self._save_job(job)
+        except Exception:
+            # The stream entry is already durable and contains every field the
+            # worker needs. Deleting its staged file would turn a recoverable
+            # metadata refresh failure into guaranteed data loss. The initial
+            # job record written before XADD remains the worker/API fallback.
+            logger.warning(
+                "RAG job %s was enqueued but its stream metadata refresh failed",
+                job.job_id,
+                exc_info=True,
+            )
         return job.stream_message_id
 
     async def run_ingestion_workers(self):
