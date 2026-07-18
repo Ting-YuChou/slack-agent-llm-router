@@ -48,6 +48,26 @@ class _HeartbeatStore:
         return None
 
 
+def test_rag_local_job_and_batch_caches_are_bounded():
+    service = RagService(
+        {
+            "enabled": False,
+            "backend": "memory",
+            "local_job_cache_max_entries": 2,
+            "local_batch_cache_max_entries": 1,
+        },
+        vector_store=_HeartbeatStore(_HeartbeatRedis()),
+    )
+
+    for index in range(5):
+        service.jobs[f"job-{index}"] = object()
+        service.batches[f"batch-{index}"] = object()
+
+    assert len(service.jobs) == 2
+    assert len(service.batches) == 1
+    assert service.jobs.get("job-0") is None
+
+
 def test_rag_environment_overrides_enable_service_and_queue(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(

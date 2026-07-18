@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -1374,3 +1375,56 @@ class TestSlackStateStores:
         )
         assert "user: hello" in restored
         assert second_bot._is_active_thread("C1", "T1") is True
+
+
+@pytest.mark.asyncio
+async def test_slack_work_queue_bounds_running_and_queued_and_replies_busy():
+    bot = SlackBot(
+        {
+            "channels": [],
+            "work_queue": {
+                "capacity": 1,
+                "concurrency": 1,
+                "overload_reply_timeout_seconds": 1,
+            },
+        },
+        inference_engine=SimpleNamespace(),
+    )
+    bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+    socket_client = SimpleNamespace(send_socket_mode_response=AsyncMock())
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_event(event):
+        started.set()
+        await release.wait()
+
+    bot._handle_event = blocked_event
+    bot._start_work_workers()
+
+    def request(index):
+        return SimpleNamespace(
+            envelope_id=f"e-{index}",
+            type="events_api",
+            payload={
+                "event": {
+                    "type": "app_mention",
+                    "channel": "C1",
+                    "user": "U1",
+                    "ts": str(index),
+                }
+            },
+        )
+
+    await bot._handle_socket_mode_request(socket_client, request(1))
+    await started.wait()
+    await bot._handle_socket_mode_request(socket_client, request(2))
+    await bot._handle_socket_mode_request(socket_client, request(3))
+
+    assert bot._work_running == 1
+    assert bot._work_queue.qsize() == 1
+    bot.web_client.chat_postMessage.assert_awaited_once()
+    assert "busy" in bot.web_client.chat_postMessage.await_args.kwargs["text"].lower()
+
+    release.set()
+    await bot._stop_work_workers()

@@ -26,6 +26,7 @@ from src.rag.visual import (
     build_visual_processor,
     compose_figure_text,
 )
+from src.utils.bounded_state import BoundedTTLMap
 from src.utils.schema import ResponseSource, ToolCall
 
 logger = logging.getLogger(__name__)
@@ -221,6 +222,9 @@ class RagService:
             0.0, float(self.queue_config.get("retry_backoff_seconds", 30))
         )
         self.stream_maxlen = int(self.queue_config.get("stream_maxlen", 10000))
+        self.dead_letter_maxlen = int(
+            self.queue_config.get("dead_letter_maxlen", 10000)
+        )
         self.heartbeat_interval_seconds = float(
             self.queue_config.get("heartbeat_interval_seconds", 5)
         )
@@ -244,8 +248,16 @@ class RagService:
         )
         self.figure_cropper = figure_cropper or FigureCropper(self.visual_config)
         self.vector_store = vector_store or build_vector_store(self.config)
-        self.jobs: Dict[str, IngestionJob] = {}
-        self.batches: Dict[str, IngestionBatch] = {}
+        self.jobs: BoundedTTLMap[str, IngestionJob] = BoundedTTLMap(
+            max_entries=int(self.config.get("local_job_cache_max_entries", 1000)),
+            ttl_seconds=max(1, self.job_ttl_seconds),
+            metric_name="rag_jobs",
+        )
+        self.batches: BoundedTTLMap[str, IngestionBatch] = BoundedTTLMap(
+            max_entries=int(self.config.get("local_batch_cache_max_entries", 100)),
+            ttl_seconds=max(1, self.job_ttl_seconds),
+            metric_name="rag_batches",
+        )
         self._initialized = False
 
     async def initialize(self):
@@ -1033,6 +1045,8 @@ class RagService:
                 "error": error,
                 "created_at": datetime.now().isoformat(),
             },
+            maxlen=self.dead_letter_maxlen,
+            approximate=True,
         )
         await self.ack_stream_message(message_id)
 
@@ -1475,6 +1489,9 @@ class RagService:
             await client.delete(self._batch_jobs_key(batch.batch_id))
             for job_id in batch.job_ids:
                 await client.sadd(self._batch_jobs_key(batch.batch_id), job_id)
+            await client.expire(
+                self._batch_jobs_key(batch.batch_id), self.job_ttl_seconds
+            )
 
     async def _load_batch(self, batch_id: str) -> Optional[IngestionBatch]:
         client = self._job_client()

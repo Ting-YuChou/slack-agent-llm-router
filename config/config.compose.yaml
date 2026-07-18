@@ -230,6 +230,8 @@ tools:
     max_results: 5
     per_user_rate_limit: 20
     cache_ttl_seconds: 300
+    cache_max_entries: 512
+    rate_limiter_max_users: 10000
     search_depth: basic
     include_answer: false
     max_results_per_domain: 2
@@ -241,6 +243,9 @@ rag:
   backend: redis_stack
   auto_retrieve: true
   default_knowledge_base_ids: []
+  local_job_cache_max_entries: 1000
+  local_batch_cache_max_entries: 100
+  job_ttl_seconds: 86400
   parser:
     provider: docling
     allow_cloud_fallback: false
@@ -289,6 +294,7 @@ rag:
     max_attempts: 3
     retry_backoff_seconds: 30
     stream_maxlen: 10000
+    dead_letter_maxlen: 10000
     heartbeat_interval_seconds: 5
     heartbeat_ttl_seconds: 15
   storage:
@@ -557,6 +563,10 @@ slack:
   channels:
     - general
     - ai-testing
+  work_queue:
+    capacity: 256
+    concurrency: 16
+    overload_reply_timeout_seconds: 2
   response_settings:
     max_response_length: 2000
     typing_indicator: true
@@ -677,6 +687,7 @@ policy_cache:
   request_ttl_seconds: 300
   user_ttl_seconds: 900
   local_cache_ttl_seconds: 5
+  local_cache_max_entries: 4096
   redis:
     host: redis
     port: 6379

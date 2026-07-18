@@ -1,5 +1,13 @@
 # Project Progress
 
+## 2026-07-18 — Bounded local state and Slack work admission
+
+- Added: a shared monotonic `BoundedTTLMap` with TTL-first pruning, LRU capacity eviction, response-safe copies at call sites, eviction callbacks, and low-cardinality entry/capacity/age/eviction metrics.
+- Bounded: policy L1 (4,096), RAG jobs (1,000), RAG batches (100), web-search cache (512), and web-search limiter users (10,000). Active limiter users are never evicted to reset quota; new users receive a distinct capacity denial.
+- Slack: replaced one-task-per-envelope fan-out with 16 fixed workers and a 256-item FIFO. Overflow is ACKed then receives a bounded-time visible busy reply; queue/running/reject/reply metrics were added.
+- RAG Redis hygiene: batch membership now shares the batch TTL and dead-letter writes use bounded approximate `MAXLEN 10000`.
+- Verification: bounded-state, policy, web-search, RAG, schema, and non-integration Slack regressions passed (`127 passed, 3 deselected`); the three deselected tests require the external Redis fixture already noted in baseline.
+
 ## 2026-07-18 — Lossless Kafka consumer backpressure
 
 - Changed: introduced per-topic `BatchBufferState` with pending, in-flight, and awaiting-commit state; Kafka partitions pause at a 5,000-row high watermark and resume at 2,500 rows, including newly assigned partitions while paused.

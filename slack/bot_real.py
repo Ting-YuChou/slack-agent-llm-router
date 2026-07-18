@@ -38,6 +38,14 @@ MEMORY_SLASH_ONLY_MESSAGE = (
     "Memory commands are only available through Slack slash commands. "
     "Use `/llm remember`, `/llm memories`, or `/llm forget`."
 )
+SLACK_BUSY_MESSAGE = "The LLM Router is busy right now. Please retry in a moment."
+
+
+@dataclass(frozen=True)
+class SlackWorkItem:
+    kind: str
+    payload: Dict[str, Any]
+    name: str
 
 
 class SlackStateStore:
@@ -1645,6 +1653,17 @@ class SlackBot:
         self.running = False
         self.started_at: Optional[datetime] = None
         self.background_tasks: Set[asyncio.Task] = set()
+        work_queue_config = dict(config.get("work_queue", {}) or {})
+        self._work_queue = asyncio.Queue(
+            maxsize=max(1, int(work_queue_config.get("capacity", 256)))
+        )
+        self._work_concurrency = max(1, int(work_queue_config.get("concurrency", 16)))
+        self._overload_reply_timeout_seconds = float(
+            work_queue_config.get("overload_reply_timeout_seconds", 2)
+        )
+        self._work_workers: List[asyncio.Task] = []
+        self._work_running = 0
+        self._accepting_work = True
 
     async def initialize(self):
         """Initialize Slack bot"""
@@ -1701,6 +1720,7 @@ class SlackBot:
         try:
             # Start socket mode client
             await self.socket_client.connect()
+            self._start_work_workers()
 
             # Start cleanup task
             self._spawn_background_task(
@@ -1729,15 +1749,22 @@ class SlackBot:
                 team_id = self._extract_team_id(req.payload)
                 if team_id and "_team_id" not in event:
                     event["_team_id"] = team_id
-                self._spawn_background_task(
-                    self._handle_event(event),
-                    f"slack_event:{event.get('type', 'unknown')}",
+                await self._enqueue_work(
+                    SlackWorkItem(
+                        kind="event",
+                        payload=event,
+                        name=f"slack_event:{event.get('type', 'unknown')}",
+                    )
                 )
 
             elif req.type == "slash_commands":
                 command = req.payload
-                self._spawn_background_task(
-                    self._handle_slash_command(command), "slack_slash_command"
+                await self._enqueue_work(
+                    SlackWorkItem(
+                        kind="slash",
+                        payload=command,
+                        name="slack_slash_command",
+                    )
                 )
 
         except Exception as e:
@@ -2390,6 +2417,8 @@ class SlackBot:
         """Shutdown the Slack bot"""
         logger.info("Shutting down Slack bot...")
         self.running = False
+        self._accepting_work = False
+        await self._stop_work_workers()
 
         for task in list(self.background_tasks):
             task.cancel()
@@ -2682,6 +2711,87 @@ class SlackBot:
         self.background_tasks.add(task)
         task.add_done_callback(self._finalize_background_task)
         return task
+
+    def _start_work_workers(self) -> None:
+        if self._work_workers:
+            return
+        self._accepting_work = True
+        self._work_workers = [
+            asyncio.create_task(
+                self._work_worker(index), name=f"slack_work_worker:{index}"
+            )
+            for index in range(self._work_concurrency)
+        ]
+
+    async def _stop_work_workers(self) -> None:
+        if not self._work_workers:
+            return
+        self._accepting_work = False
+        await self._work_queue.join()
+        workers, self._work_workers = self._work_workers, []
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        SLACK_METRICS.work_queue_depth.set(0)
+        SLACK_METRICS.work_running.set(0)
+
+    async def _enqueue_work(self, item: SlackWorkItem) -> bool:
+        if not self._accepting_work:
+            await self._reply_busy(item)
+            return False
+        try:
+            self._work_queue.put_nowait(item)
+        except asyncio.QueueFull:
+            SLACK_METRICS.work_rejected.labels(reason="capacity").inc()
+            await self._reply_busy(item)
+            return False
+        SLACK_METRICS.work_queue_depth.set(self._work_queue.qsize())
+        return True
+
+    async def _work_worker(self, index: int) -> None:
+        while True:
+            item = await self._work_queue.get()
+            self._work_running += 1
+            SLACK_METRICS.work_queue_depth.set(self._work_queue.qsize())
+            SLACK_METRICS.work_running.set(self._work_running)
+            try:
+                if item.kind == "slash":
+                    await self._handle_slash_command(item.payload)
+                else:
+                    await self._handle_event(item.payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Slack work item failed: %s", item.name)
+            finally:
+                self._work_running -= 1
+                SLACK_METRICS.work_running.set(self._work_running)
+                self._work_queue.task_done()
+
+    async def _reply_busy(self, item: SlackWorkItem) -> None:
+        async def send_reply():
+            channel = item.payload.get("channel") or item.payload.get("channel_id")
+            user = item.payload.get("user") or item.payload.get("user_id")
+            if item.kind == "slash" and hasattr(self.web_client, "chat_postEphemeral"):
+                await self.web_client.chat_postEphemeral(
+                    channel=channel, user=user, text=SLACK_BUSY_MESSAGE
+                )
+                return
+            kwargs = {"channel": channel, "text": SLACK_BUSY_MESSAGE}
+            thread_ts = item.payload.get("thread_ts") or item.payload.get("ts")
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+            await self.web_client.chat_postMessage(**kwargs)
+
+        try:
+            await asyncio.wait_for(
+                send_reply(), timeout=self._overload_reply_timeout_seconds
+            )
+        except Exception:
+            SLACK_METRICS.busy_replies.labels(outcome="failed").inc()
+            logger.warning("Failed to send Slack overload reply", exc_info=True)
+        else:
+            SLACK_METRICS.busy_replies.labels(outcome="sent").inc()
 
     def _finalize_background_task(self, task: asyncio.Task):
         """Log unexpected background task failures and drop completed tasks."""

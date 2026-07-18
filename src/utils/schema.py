@@ -646,7 +646,9 @@ class WebSearchToolConfig(ConfigModel):
     timeout_seconds: float = Field(5.0, gt=0)
     max_results: int = Field(5, ge=1, le=10)
     cache_ttl_seconds: int = Field(300, ge=0)
+    cache_max_entries: int = Field(512, ge=1)
     per_user_rate_limit: int = Field(20, ge=1)
+    rate_limiter_max_users: int = Field(10000, ge=1)
     search_depth: str = Field("basic", pattern=r"^(basic|advanced)$")
     include_answer: bool = False
     max_results_per_domain: int = Field(2, ge=1)
@@ -775,6 +777,12 @@ class SlackContextConfig(ConfigModel):
         return normalized
 
 
+class SlackWorkQueueConfig(ConfigModel):
+    capacity: int = Field(256, ge=1)
+    concurrency: int = Field(16, ge=1)
+    overload_reply_timeout_seconds: float = Field(2.0, gt=0)
+
+
 class SlackMemorySearchConfig(ConfigModel):
     max_results: int = Field(5, ge=1)
     max_context_chars: int = Field(2000, ge=1)
@@ -844,6 +852,7 @@ class SlackConfig(ConfigModel):
         default_factory=SlackRateLimitingConfig
     )
     context: SlackContextConfig = Field(default_factory=SlackContextConfig)
+    work_queue: SlackWorkQueueConfig = Field(default_factory=SlackWorkQueueConfig)
     state_backend: str = "memory"
     state_file: str = "data/slack_state.json"
     state_key_prefix: str = "slack_state"
@@ -881,6 +890,7 @@ class PolicyCacheConfig(ConfigModel):
     request_ttl_seconds: int = Field(300, ge=1)
     user_ttl_seconds: int = Field(900, ge=1)
     local_cache_ttl_seconds: int = Field(5, ge=0)
+    local_cache_max_entries: int = Field(4096, ge=1)
     redis: Dict[str, Any] = Field(default_factory=dict)
     consumer: Dict[str, Any] = Field(default_factory=dict)
 
@@ -1071,6 +1081,7 @@ class RagIngestionQueueConfig(ConfigModel):
     max_attempts: int = Field(3, ge=1)
     retry_backoff_seconds: float = Field(30.0, ge=0.0)
     stream_maxlen: int = Field(10000, ge=0)
+    dead_letter_maxlen: int = Field(10000, ge=1)
     heartbeat_interval_seconds: float = Field(5.0, gt=0.0)
     heartbeat_ttl_seconds: int = Field(15, ge=1)
 
@@ -1143,6 +1154,9 @@ class RagConfig(ConfigModel):
     backend: str = "redis_stack"
     auto_retrieve: bool = True
     default_knowledge_base_ids: List[str] = Field(default_factory=list)
+    local_job_cache_max_entries: int = Field(1000, ge=1)
+    local_batch_cache_max_entries: int = Field(100, ge=1)
+    job_ttl_seconds: int = Field(86400, ge=60)
     parser: RagParserConfig = Field(default_factory=RagParserConfig)
     chunking: RagChunkingConfig = Field(default_factory=RagChunkingConfig)
     embedding: RagEmbeddingConfig = Field(default_factory=RagEmbeddingConfig)

@@ -656,6 +656,23 @@ class SlackMetrics:
             "llm_router_slack_errors_total", "Total Slack bot errors", ["error_type"]
         )
 
+        self.work_queue_depth = Gauge(
+            "llm_router_slack_work_queue_depth", "Queued Slack request work"
+        )
+        self.work_running = Gauge(
+            "llm_router_slack_work_running", "Slack request work currently running"
+        )
+        self.work_rejected = Counter(
+            "llm_router_slack_work_rejected_total",
+            "Slack work rejected before processing",
+            ["reason"],
+        )
+        self.busy_replies = Counter(
+            "llm_router_slack_busy_replies_total",
+            "Slack overload replies",
+            ["outcome"],
+        )
+
         # Conversation metrics
         self.conversation_length = Histogram(
             "llm_router_slack_conversation_length",
@@ -703,6 +720,32 @@ class UserMetrics:
         )
 
 
+class BoundedStateMetrics:
+    """Low-cardinality process-local state capacity metrics."""
+
+    def __init__(self):
+        self.entries = Gauge(
+            "llm_router_bounded_state_entries",
+            "Current bounded state entries",
+            ["state"],
+        )
+        self.capacity = Gauge(
+            "llm_router_bounded_state_capacity",
+            "Configured bounded state capacity",
+            ["state"],
+        )
+        self.oldest_item_age = Gauge(
+            "llm_router_bounded_state_oldest_item_age_seconds",
+            "Age of the oldest bounded state entry",
+            ["state"],
+        )
+        self.evictions = Counter(
+            "llm_router_bounded_state_evictions_total",
+            "Bounded state evictions",
+            ["state", "reason"],
+        )
+
+
 # Global metric instances
 SYSTEM_METRICS = SystemMetrics()
 ROUTER_METRICS = RouterMetrics()
@@ -711,6 +754,7 @@ PIPELINE_METRICS = PipelineMetrics()
 SLACK_METRICS = SlackMetrics()
 USER_METRICS = UserMetrics()
 ADMISSION_METRICS = AdmissionMetrics()
+BOUNDED_STATE_METRICS = BoundedStateMetrics()
 
 
 class MetricsCollector:
@@ -1142,6 +1186,7 @@ __all__ = [
     "SLACK_METRICS",
     "USER_METRICS",
     "ADMISSION_METRICS",
+    "BOUNDED_STATE_METRICS",
     "BUSINESS_METRICS",
     "METRICS_REPORTER",
     "MetricsCollector",
