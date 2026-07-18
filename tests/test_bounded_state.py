@@ -25,3 +25,14 @@ def test_bounded_ttl_map_get_refreshes_lru_order_without_refreshing_ttl():
     assert list(state.keys()) == ["first", "third"]
     now[0] = 10.0
     assert state.get("first") is None
+
+
+def test_bounded_ttl_map_repeated_overwrite_does_not_grow_expiry_heaps():
+    state = BoundedTTLMap(max_entries=2, ttl_seconds=3600)
+
+    for index in range(10_000):
+        state["hot-key"] = index
+
+    assert len(state) == 1
+    assert len(state._expiry_heap) <= 8
+    assert len(state._created_heap) <= 8

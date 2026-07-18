@@ -1,5 +1,11 @@
 # Project Progress
 
+## 2026-07-18 — Bounded-state stress and full verification
+
+- Added: `scripts/stress_bounded_state.py`, a production-path 100,000-event outage contract that exercises Kafka buffer admission, the shared bounded TTL/LRU map, durable flush/commit, RSS sampling, and shutdown timing.
+- Measured: 100,000 offered events plateaued at exactly 5,500 in-process Kafka rows (5,000 high watermark + 500 max poll), leaving 94,500 in broker backlog with zero drops; the 4,096-entry cache stayed exactly at capacity. RSS plateaued at 154.1 MB and shutdown completed in 0.00046 seconds.
+- Verification: full pytest passed with temporary local Redis (`548 passed, 11 skipped`); full Black and Flake8, configured mypy, compileall, Compose config, stress contract, and `git diff --check` passed. The temporary Redis container was removed after verification.
+
 ## 2026-07-18 — Essential service supervision and deterministic shutdown
 
 - Supervision: API, pipeline, policy materializer, and Slack are runtime-role essential; exception or unexpected return triggers sibling cancellation, exactly-once shutdown, and exit code 1. Monitoring is optional and restarts with 1–30 second exponential backoff.
