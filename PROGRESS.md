@@ -1,5 +1,12 @@
 # Project Progress
 
+## 2026-07-18 — Lossless Kafka consumer backpressure
+
+- Changed: introduced per-topic `BatchBufferState` with pending, in-flight, and awaiting-commit state; Kafka partitions pause at a 5,000-row high watermark and resume at 2,500 rows, including newly assigned partitions while paused.
+- Isolation: ClickHouse flushes run with a four-topic concurrency bound, inspect every result before reporting failures, preserve row order on insert failure, and retry commit-only failures without duplicate inserts.
+- Bounded I/O: ClickHouse connections now default to a 2-second connect timeout and 10-second send/receive timeout.
+- Verification: RED/GREEN backpressure, in-flight accounting, concurrent-topic flush, durability regression, and schema tests passed (`93 passed`); touched-file Black, Flake8, and `git diff --check` passed.
+
 ## 2026-07-16 — RAG hot-path review hardening
 
 - Correctness: embedding batch failures now retry through the scalar provider and fail ingestion before cutover if any required vector remains unavailable. Redis stages chunks plus table, row, figure, and visual resources under one document hash tag, validates every staging key, and switches them in one Lua execution; stale generations return a distinct result and cannot mutate the active document.

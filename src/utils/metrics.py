@@ -541,6 +541,24 @@ class PipelineMetrics:
             ["topic"],
         )
 
+        self.consumer_buffer_rows = Gauge(
+            "llm_router_kafka_consumer_buffer_rows",
+            "Pending and in-flight ClickHouse rows held by a Kafka consumer",
+            ["topic"],
+        )
+
+        self.consumer_paused_partitions = Gauge(
+            "llm_router_kafka_consumer_paused_partitions",
+            "Kafka partitions paused by ClickHouse backlog backpressure",
+            ["topic"],
+        )
+
+        self.consumer_backpressure_transitions = Counter(
+            "llm_router_kafka_consumer_backpressure_transitions_total",
+            "Kafka consumer pause and resume transitions",
+            ["topic", "action"],
+        )
+
         self.dead_letter_messages = Counter(
             "llm_router_kafka_dead_letter_messages_total",
             "Kafka messages published to dead-letter topics",

@@ -565,6 +565,10 @@ kafka:
     auto_offset_reset: latest
     enable_auto_commit: false
     max_poll_records: 500
+    batch_size: 100
+    batch_high_watermark_rows: 5000
+    batch_low_watermark_rows: 2500
+    max_concurrent_flushes: 4
     dlq_enabled: true
     supervisor_initial_backoff_seconds: 1
     supervisor_max_backoff_seconds: 30
@@ -579,6 +583,8 @@ clickhouse:
   database: llm_router
   username: default
   password: ''
+  connect_timeout_seconds: 2
+  send_receive_timeout_seconds: 10
   tables:
     queries:
       name: query_logs

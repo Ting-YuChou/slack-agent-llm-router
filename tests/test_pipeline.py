@@ -1237,6 +1237,99 @@ class TestKafkaConsumerManager:
         assert peak_active == 1
 
     @pytest.mark.asyncio
+    async def test_batch_backpressure_counts_inflight_rows_and_resumes_at_low_watermark(
+        self, pipeline_config, sample_query_log
+    ):
+        pipeline_config["consumer"].update(
+            {
+                "batch_high_watermark_rows": 3,
+                "batch_low_watermark_rows": 1,
+            }
+        )
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        kafka_consumer = MagicMock()
+        partitions = {TopicPartition("test-queries", 0)}
+        kafka_consumer.assignment.return_value = partitions
+        kafka_consumer.commit = AsyncMock()
+        consumer.consumers["queries"] = kafka_consumer
+        insert_started = asyncio.Event()
+        release_insert = asyncio.Event()
+
+        async def blocked_insert(batch):
+            insert_started.set()
+            await release_insert.wait()
+
+        consumer.clickhouse.batch_insert_query_logs = blocked_insert
+        first = SimpleNamespace(topic="test-queries", partition=0, offset=0)
+        await consumer._append_batched_row("queries", sample_query_log, first)
+        flush_task = asyncio.create_task(
+            consumer._flush_batch_topic(
+                "queries", consumer.clickhouse.batch_insert_query_logs
+            )
+        )
+        await insert_started.wait()
+
+        await consumer._append_batched_row(
+            "queries",
+            MagicMock(name="second"),
+            SimpleNamespace(topic="test-queries", partition=0, offset=1),
+        )
+        await consumer._append_batched_row(
+            "queries",
+            MagicMock(name="third"),
+            SimpleNamespace(topic="test-queries", partition=0, offset=2),
+        )
+
+        kafka_consumer.pause.assert_called_once_with(*partitions)
+        assert consumer.batch_buffer_states["queries"].paused is True
+
+        release_insert.set()
+        await flush_task
+        await consumer._flush_batch_topic(
+            "queries", consumer.clickhouse.batch_insert_query_logs
+        )
+
+        kafka_consumer.resume.assert_called_once_with(*partitions)
+        assert consumer.batch_buffer_states["queries"].paused is False
+
+    @pytest.mark.asyncio
+    async def test_flush_pending_batches_allows_other_topics_to_finish_before_raising(
+        self, pipeline_config, sample_query_log
+    ):
+        pipeline_config["consumer"]["max_concurrent_flushes"] = 2
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        blocked = asyncio.Event()
+        release = asyncio.Event()
+        metrics_finished = asyncio.Event()
+
+        async def blocked_query_insert(batch):
+            blocked.set()
+            await release.wait()
+            raise RuntimeError("query insert failed")
+
+        async def metrics_insert(batch):
+            metrics_finished.set()
+
+        consumer.clickhouse.batch_insert_query_logs = blocked_query_insert
+        consumer.clickhouse.batch_insert_metrics = metrics_insert
+        consumer.batch_processors["queries"].append(sample_query_log)
+        consumer.batch_processors["metrics"].append(MagicMock(name="metric"))
+
+        flush_task = asyncio.create_task(consumer.flush_pending_batches())
+        await blocked.wait()
+        await asyncio.wait_for(metrics_finished.wait(), timeout=0.5)
+        release.set()
+
+        with pytest.raises(RuntimeError, match="query insert failed"):
+            await flush_task
+
+    def test_clickhouse_connection_has_bounded_network_timeouts(self, pipeline_config):
+        manager = ClickHouseManager(pipeline_config["clickhouse"])
+
+        assert manager.connection_params["connect_timeout"] == 2
+        assert manager.connection_params["send_receive_timeout"] == 10
+
+    @pytest.mark.asyncio
     async def test_flush_pending_batches_commits_routing_guardrail_offsets(
         self, pipeline_config
     ):

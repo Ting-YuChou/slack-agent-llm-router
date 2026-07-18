@@ -691,6 +691,10 @@ class KafkaConsumerConfig(ConfigModel):
     auto_offset_reset: str = "latest"
     enable_auto_commit: bool = False
     max_poll_records: int = Field(500, ge=1)
+    batch_size: int = Field(100, ge=1)
+    batch_high_watermark_rows: int = Field(5000, ge=1)
+    batch_low_watermark_rows: int = Field(2500, ge=0)
+    max_concurrent_flushes: int = Field(4, ge=1)
     dlq_enabled: bool = True
     supervisor_initial_backoff_seconds: float = Field(1.0, gt=0)
     supervisor_max_backoff_seconds: float = Field(30.0, gt=0)
@@ -718,6 +722,8 @@ class ClickHouseConfig(ConfigModel):
     database: str = "llm_router"
     username: str = "default"
     password: str = ""
+    connect_timeout_seconds: float = Field(2.0, gt=0)
+    send_receive_timeout_seconds: float = Field(10.0, gt=0)
     tables: Dict[str, Any] = Field(default_factory=dict)
     dashboard: Dict[str, Any] = Field(
         default_factory=lambda: {

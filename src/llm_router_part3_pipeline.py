@@ -937,6 +937,8 @@ class ClickHouseManager:
             "port": config.get("port", 8123),
             "username": config.get("username", "default"),
             "password": config.get("password", ""),
+            "connect_timeout": config.get("connect_timeout_seconds", 2),
+            "send_receive_timeout": config.get("send_receive_timeout_seconds", 10),
             # Dashboard queries run concurrently in worker threads. ClickHouse
             # rejects overlapping queries that reuse one generated session id.
             "autogenerate_session_id": False,
@@ -1622,6 +1624,20 @@ class ClickHouseManager:
             logger.info("ClickHouse connection closed")
 
 
+@dataclass
+class BatchBufferState:
+    """Per-topic persistence backlog and backpressure state."""
+
+    pending_rows: List[Any] = field(default_factory=list)
+    pending_offsets: Dict[TopicPartition, int] = field(default_factory=dict)
+    awaiting_commit_offsets: Dict[TopicPartition, int] = field(default_factory=dict)
+    inflight_rows: int = 0
+    oldest_enqueued_at: Optional[float] = None
+    paused: bool = False
+    paused_partitions: set[TopicPartition] = field(default_factory=set)
+    flush_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
 class KafkaConsumerManager:
     """Manages Kafka message consumption"""
 
@@ -1663,13 +1679,22 @@ class KafkaConsumerManager:
         self.consumer_restart_counts: Dict[str, int] = {}
 
         # Batch processing
+        batched_topics = (
+            "queries",
+            "metrics",
+            "analytics_model_metrics_1m",
+            "routing_guardrails",
+            "routing_policy_state",
+            "alerts",
+        )
+        self.batch_buffer_states = {
+            topic_key: BatchBufferState() for topic_key in batched_topics
+        }
+        # Compatibility views retained for callers and diagnostics that inspect
+        # the old public dictionaries. BatchBufferState remains authoritative.
         self.batch_processors = {
-            "queries": [],
-            "metrics": [],
-            "analytics_model_metrics_1m": [],
-            "routing_guardrails": [],
-            "routing_policy_state": [],
-            "alerts": [],
+            topic_key: state.pending_rows
+            for topic_key, state in self.batch_buffer_states.items()
         }
         self.observers: Dict[str, List[Callable[[Dict[str, Any]], Any]]] = {
             "requests_enriched": [],
@@ -1678,17 +1703,34 @@ class KafkaConsumerManager:
             "routing_policy_state": [],
             "alerts": [],
         }
-        self.batch_size = 100
+        self.batch_size = int(consumer_section.get("batch_size", 100))
+        self.batch_high_watermark_rows = int(
+            consumer_section.get("batch_high_watermark_rows", 5000)
+        )
+        self.batch_low_watermark_rows = int(
+            consumer_section.get("batch_low_watermark_rows", 2500)
+        )
+        if not 0 <= self.batch_low_watermark_rows < self.batch_high_watermark_rows:
+            raise ValueError(
+                "batch_low_watermark_rows must be non-negative and below "
+                "batch_high_watermark_rows"
+            )
+        self.max_concurrent_flushes = max(
+            1, int(consumer_section.get("max_concurrent_flushes", 4))
+        )
         self.last_batch_time = time.time()
         self.running = False
         self.pending_commit_offsets: Dict[str, Dict[TopicPartition, int]] = {
-            topic_key: {} for topic_key in self.batch_processors
+            topic_key: state.pending_offsets
+            for topic_key, state in self.batch_buffer_states.items()
         }
         self.awaiting_commit_offsets: Dict[str, Dict[TopicPartition, int]] = {
-            topic_key: {} for topic_key in self.batch_processors
+            topic_key: state.awaiting_commit_offsets
+            for topic_key, state in self.batch_buffer_states.items()
         }
         self.batch_flush_locks: Dict[str, asyncio.Lock] = {
-            topic_key: asyncio.Lock() for topic_key in self.batch_processors
+            topic_key: state.flush_lock
+            for topic_key, state in self.batch_buffer_states.items()
         }
 
     async def initialize(self):
@@ -1863,8 +1905,7 @@ class KafkaConsumerManager:
                     )
 
                     # Add to batch
-                    self.batch_processors["queries"].append(query_log)
-                    self._track_commit_offset("queries", message)
+                    await self._append_batched_row("queries", query_log, message)
                     self._record_successful_consume("queries", consumer, message)
 
                     PIPELINE_METRICS.messages_consumed.labels(topic="queries").inc()
@@ -1926,8 +1967,7 @@ class KafkaConsumerManager:
                     )
 
                     # Add to batch
-                    self.batch_processors["metrics"].append(metric_entry)
-                    self._track_commit_offset("metrics", message)
+                    await self._append_batched_row("metrics", metric_entry, message)
                     self._record_successful_consume("metrics", consumer, message)
 
                     PIPELINE_METRICS.messages_consumed.labels(topic="metrics").inc()
@@ -2273,10 +2313,9 @@ class KafkaConsumerManager:
                         data,
                         kafka_metadata=self._kafka_event_metadata(message),
                     )
-                    self.batch_processors["analytics_model_metrics_1m"].append(
-                        metric_entry
+                    await self._append_batched_row(
+                        "analytics_model_metrics_1m", metric_entry, message
                     )
-                    self._track_commit_offset("analytics_model_metrics_1m", message)
                     await self._notify_observers("analytics_model_metrics_1m", data)
                     self._record_successful_consume(
                         "analytics_model_metrics_1m", consumer, message
@@ -2307,8 +2346,7 @@ class KafkaConsumerManager:
                         data,
                         kafka_metadata=self._kafka_event_metadata(message),
                     )
-                    self.batch_processors["alerts"].append(alert_entry)
-                    self._track_commit_offset("alerts", message)
+                    await self._append_batched_row("alerts", alert_entry, message)
                     await self._notify_observers("alerts", data)
                     self._record_successful_consume("alerts", consumer, message)
 
@@ -2335,8 +2373,9 @@ class KafkaConsumerManager:
                         data,
                         kafka_metadata=self._kafka_event_metadata(message),
                     )
-                    self.batch_processors["routing_guardrails"].append(guardrail_entry)
-                    self._track_commit_offset("routing_guardrails", message)
+                    await self._append_batched_row(
+                        "routing_guardrails", guardrail_entry, message
+                    )
                     await self._notify_observers("routing_guardrails", data)
                     self._record_successful_consume(
                         "routing_guardrails", consumer, message
@@ -2367,8 +2406,9 @@ class KafkaConsumerManager:
                         data,
                         kafka_metadata=self._kafka_event_metadata(message),
                     )
-                    self.batch_processors["routing_policy_state"].append(state_entry)
-                    self._track_commit_offset("routing_policy_state", message)
+                    await self._append_batched_row(
+                        "routing_policy_state", state_entry, message
+                    )
                     await self._notify_observers("routing_policy_state", data)
                     self._record_successful_consume(
                         "routing_policy_state", consumer, message
@@ -2415,6 +2455,84 @@ class KafkaConsumerManager:
 
         await self.flush_pending_batches()
 
+    def _replace_pending_rows(self, topic_key: str, rows: List[Any]):
+        state = self.batch_buffer_states[topic_key]
+        state.pending_rows = rows
+        self.batch_processors[topic_key] = rows
+
+    def _replace_pending_offsets(
+        self, topic_key: str, offsets: Dict[TopicPartition, int]
+    ):
+        state = self.batch_buffer_states[topic_key]
+        state.pending_offsets = offsets
+        self.pending_commit_offsets[topic_key] = offsets
+
+    def _replace_awaiting_offsets(
+        self, topic_key: str, offsets: Dict[TopicPartition, int]
+    ):
+        state = self.batch_buffer_states[topic_key]
+        state.awaiting_commit_offsets = offsets
+        self.awaiting_commit_offsets[topic_key] = offsets
+
+    def _buffered_row_count(self, topic_key: str) -> int:
+        state = self.batch_buffer_states[topic_key]
+        return len(state.pending_rows) + state.inflight_rows
+
+    async def _refresh_batch_backpressure(self, topic_key: str):
+        """Pause or resume the topic consumer based on its durable-write backlog."""
+        state = self.batch_buffer_states[topic_key]
+        buffered_rows = self._buffered_row_count(topic_key)
+        PIPELINE_METRICS.consumer_buffer_rows.labels(topic=topic_key).set(buffered_rows)
+        consumer = self.consumers.get(topic_key)
+        if consumer is None:
+            return
+
+        assignment = getattr(consumer, "assignment", None)
+        if assignment is None:
+            return
+        assigned = assignment()
+        if inspect.isawaitable(assigned):
+            assigned = await assigned
+        partitions = set(assigned or ())
+        if buffered_rows >= self.batch_high_watermark_rows or (
+            state.paused and buffered_rows > self.batch_low_watermark_rows
+        ):
+            newly_assigned = partitions - state.paused_partitions
+            if newly_assigned:
+                pause_result = consumer.pause(*newly_assigned)
+                if inspect.isawaitable(pause_result):
+                    await pause_result
+                state.paused_partitions.update(newly_assigned)
+            was_paused = state.paused
+            state.paused = True
+            PIPELINE_METRICS.consumer_paused_partitions.labels(topic=topic_key).set(
+                len(state.paused_partitions)
+            )
+            if not was_paused:
+                PIPELINE_METRICS.consumer_backpressure_transitions.labels(
+                    topic=topic_key, action="pause"
+                ).inc()
+        elif state.paused and buffered_rows <= self.batch_low_watermark_rows:
+            if partitions:
+                resume_result = consumer.resume(*partitions)
+                if inspect.isawaitable(resume_result):
+                    await resume_result
+            state.paused = False
+            state.paused_partitions.clear()
+            PIPELINE_METRICS.consumer_paused_partitions.labels(topic=topic_key).set(0)
+            PIPELINE_METRICS.consumer_backpressure_transitions.labels(
+                topic=topic_key, action="resume"
+            ).inc()
+
+    async def _append_batched_row(self, topic_key: str, row: Any, message: Any):
+        """Append one row and apply lossless consumer backpressure."""
+        state = self.batch_buffer_states[topic_key]
+        state.pending_rows.append(row)
+        if state.oldest_enqueued_at is None:
+            state.oldest_enqueued_at = time.monotonic()
+        self._track_commit_offset(topic_key, message)
+        await self._refresh_batch_backpressure(topic_key)
+
     def _track_commit_offset(self, topic_key: str, message: Any):
         """Track the latest offset eligible for commit after durable write."""
         topic = getattr(message, "topic", None)
@@ -2457,60 +2575,79 @@ class KafkaConsumerManager:
                 await self._commit_offsets(
                     topic_key, self.awaiting_commit_offsets[topic_key]
                 )
-                self.awaiting_commit_offsets[topic_key].clear()
+                self._replace_awaiting_offsets(topic_key, {})
 
             batch = self.batch_processors.get(topic_key, [])
             offsets = self.pending_commit_offsets.get(topic_key, {})
             if not batch:
+                await self._refresh_batch_backpressure(topic_key)
                 return
 
             # Swap both buffers before the first I/O await. Consumers can continue
             # appending to the new buffers while this detached batch is persisted.
-            self.batch_processors[topic_key] = []
-            self.pending_commit_offsets[topic_key] = {}
+            state = self.batch_buffer_states[topic_key]
+            self._replace_pending_rows(topic_key, [])
+            self._replace_pending_offsets(topic_key, {})
+            state.inflight_rows = len(batch)
+            state.oldest_enqueued_at = None
+            await self._refresh_batch_backpressure(topic_key)
 
             try:
                 await insert_method(batch)
             except Exception:
-                self.batch_processors[topic_key] = (
-                    batch + self.batch_processors[topic_key]
+                self._replace_pending_rows(
+                    topic_key, batch + self.batch_processors[topic_key]
                 )
                 current_offsets = self.pending_commit_offsets[topic_key]
                 for partition, offset in offsets.items():
                     current_offsets[partition] = max(
                         offset, current_offsets.get(partition, offset)
                     )
+                state.inflight_rows = 0
+                state.oldest_enqueued_at = time.monotonic()
+                await self._refresh_batch_backpressure(topic_key)
                 raise
 
-            self.awaiting_commit_offsets[topic_key] = offsets
+            state.inflight_rows = 0
+            self._replace_awaiting_offsets(topic_key, offsets)
+            await self._refresh_batch_backpressure(topic_key)
             if self.awaiting_commit_offsets[topic_key]:
                 await self._commit_offsets(
                     topic_key, self.awaiting_commit_offsets[topic_key]
                 )
-                self.awaiting_commit_offsets[topic_key].clear()
+                self._replace_awaiting_offsets(topic_key, {})
 
     async def flush_pending_batches(self):
         """Flush any pending Kafka batches to ClickHouse immediately"""
-        await self._flush_batch_topic(
-            "queries", self.clickhouse.batch_insert_query_logs
+        flushes = (
+            ("queries", self.clickhouse.batch_insert_query_logs),
+            ("metrics", self.clickhouse.batch_insert_metrics),
+            (
+                "analytics_model_metrics_1m",
+                self.clickhouse.batch_insert_model_performance,
+            ),
+            ("routing_guardrails", self.clickhouse.batch_insert_alert_events),
+            (
+                "routing_policy_state",
+                self.clickhouse.batch_insert_routing_policy_state,
+            ),
+            ("alerts", self.clickhouse.batch_insert_alert_events),
         )
-        await self._flush_batch_topic("metrics", self.clickhouse.batch_insert_metrics)
-        await self._flush_batch_topic(
-            "analytics_model_metrics_1m",
-            self.clickhouse.batch_insert_model_performance,
-        )
-        await self._flush_batch_topic(
-            "routing_guardrails", self.clickhouse.batch_insert_alert_events
-        )
-        await self._flush_batch_topic(
-            "routing_policy_state",
-            self.clickhouse.batch_insert_routing_policy_state,
-        )
-        await self._flush_batch_topic(
-            "alerts", self.clickhouse.batch_insert_alert_events
+        semaphore = asyncio.Semaphore(self.max_concurrent_flushes)
+
+        async def limited_flush(topic_key, insert_method):
+            async with semaphore:
+                await self._flush_batch_topic(topic_key, insert_method)
+
+        results = await asyncio.gather(
+            *(limited_flush(topic_key, method) for topic_key, method in flushes),
+            return_exceptions=True,
         )
 
         self.last_batch_time = time.time()
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise failures[0]
 
     def _deserialize_message(self, message: bytes) -> Dict[str, Any]:
         """Deserialize message from JSON bytes"""
