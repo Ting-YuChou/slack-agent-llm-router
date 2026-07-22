@@ -469,3 +469,38 @@ python -m pytest tests/test_pipeline.py -q
 ## Deployment Notes
 
 `python main.py deploy --output .` can generate deployment artifacts, but the checked-in repo should be treated as the source of truth for local development, not the generated templates.
+
+### RAG on S3 and SQS
+
+The default RAG ingestion path remains `local + redis_stream`. Production can independently migrate source documents to S3 and then ingestion work to SQS:
+
+```yaml
+rag:
+  enabled: true
+  storage:
+    backend: s3
+    s3:
+      bucket: slack-llm-router-production-rag-ACCOUNT_ID
+      region: us-west-2
+      environment: production
+  ingestion_queue:
+    enabled: true
+    backend: sqs
+    sqs:
+      queue_url: https://sqs.us-west-2.amazonaws.com/ACCOUNT_ID/slack-llm-router-production-rag
+      region: us-west-2
+```
+
+Create the AWS resources with the checked-in module under `infra/aws/rag`, and attach its API and worker IAM policy outputs to the corresponding workloads. AWS credentials are resolved only through boto3's standard workload credential chain.
+
+For direct uploads, call `POST /rag/uploads` with the filename, byte length, and base64-encoded SHA-256 digest. Upload using the returned signed PUT request and headers, then call `POST /rag/uploads/{job_id}/complete`. Existing `/rag/documents` requests remain supported as an API-proxied compatibility path.
+
+The live smoke test is intentionally disabled unless it is pointed at an isolated bucket and queue:
+
+```bash
+RAG_AWS_SMOKE_CONFIRM=1 \
+RAG_AWS_BUCKET=... \
+RAG_AWS_QUEUE_URL=... \
+AWS_REGION=us-west-2 \
+python -m pytest tests/test_rag_aws_live.py -q
+```

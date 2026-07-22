@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import os
@@ -18,7 +19,9 @@ from src.memory import EmbeddingProvider, build_embedding_provider
 from src.rag.chunker import DocumentChunk, build_chunker
 from src.rag.parser import build_document_parser
 from src.rag.reranker import Reranker, build_reranker
+from src.rag.queue import QueueDelivery, SqsIngestionQueue
 from src.rag.staging import RagStagingStore, StagingCapacityError
+from src.rag.storage import RagObjectRef, S3ObjectStore
 from src.rag.vector_store import RagSearchResult, build_vector_store
 from src.rag.visual import (
     FigureCropper,
@@ -26,6 +29,7 @@ from src.rag.visual import (
     build_visual_processor,
     compose_figure_text,
 )
+from src.utils.metrics import RAG_METRICS
 from src.utils.bounded_state import BoundedTTLMap
 from src.utils.schema import ResponseSource, ToolCall
 
@@ -39,6 +43,8 @@ TERMINAL_JOB_STATUSES = {
 }
 
 JOB_STATUSES = {
+    "awaiting_upload",
+    "enqueue_pending",
     "queued",
     "running",
     "retrying",
@@ -48,6 +54,10 @@ JOB_STATUSES = {
 
 class RagPayloadTooLarge(ValueError):
     """Raised before an oversized RAG upload can enter parsing or indexing."""
+
+
+class RagIdempotencyConflict(ValueError):
+    """Raised when an idempotency key is reused for a different upload request."""
 
 
 class RagStorageCapacityError(StagingCapacityError):
@@ -79,6 +89,10 @@ class IngestionJob:
     stream_message_id: Optional[str] = None
     batch_id: Optional[str] = None
     storage_ref: Optional[str] = None
+    source: Dict[str, Any] = field(default_factory=dict)
+    dispatch_id: Optional[str] = None
+    index_version: Optional[str] = None
+    upload_request_fingerprint: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
@@ -100,6 +114,10 @@ class IngestionJob:
             "stream_message_id": self.stream_message_id,
             "batch_id": self.batch_id,
             "storage_ref": self.storage_ref,
+            "source": dict(self.source),
+            "dispatch_id": self.dispatch_id,
+            "index_version": self.index_version,
+            "upload_request_fingerprint": self.upload_request_fingerprint,
             "metadata": dict(self.metadata),
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
@@ -123,6 +141,10 @@ class IngestionJob:
             stream_message_id=payload.get("stream_message_id"),
             batch_id=payload.get("batch_id"),
             storage_ref=payload.get("storage_ref"),
+            source=dict(payload.get("source") or {}),
+            dispatch_id=payload.get("dispatch_id"),
+            index_version=payload.get("index_version"),
+            upload_request_fingerprint=payload.get("upload_request_fingerprint"),
             metadata=dict(payload.get("metadata") or {}),
             created_at=_parse_datetime(payload.get("created_at")),
             updated_at=_parse_datetime(payload.get("updated_at")),
@@ -188,6 +210,8 @@ class RagService:
         reranker: Optional[Reranker] = None,
         visual_processor: Optional[VisualProcessor] = None,
         figure_cropper: Optional[FigureCropper] = None,
+        object_store: Optional[Any] = None,
+        ingestion_queue: Optional[Any] = None,
     ):
         self.config = dict(config or {})
         self.enabled = bool(self.config.get("enabled", False))
@@ -208,6 +232,22 @@ class RagService:
         self.upload_config = dict(self.config.get("upload", {}) or {})
         self.job_ttl_seconds = int(self.config.get("job_ttl_seconds", 86400))
         self.queue_enabled = bool(self.queue_config.get("enabled", False))
+        self.storage_backend = str(
+            self.storage_config.get("backend") or "local"
+        ).lower()
+        self.queue_backend = str(
+            self.queue_config.get("backend") or "redis_stream"
+        ).lower()
+        if (
+            self.queue_enabled
+            and self.queue_backend == "sqs"
+            and self.storage_backend != "s3"
+        ):
+            raise ValueError("local storage cannot be combined with sqs ingestion")
+        if self.storage_backend not in {"local", "s3"}:
+            raise ValueError("rag.storage.backend must be local or s3")
+        if self.queue_backend not in {"redis_stream", "sqs"}:
+            raise ValueError("rag.ingestion_queue.backend must be redis_stream or sqs")
         self.stream_key = str(
             self.queue_config.get("stream_key")
             or self._prefixed_key("ingestion:stream")
@@ -241,6 +281,13 @@ class RagService:
         self.heartbeat_ttl_seconds = int(
             self.queue_config.get("heartbeat_ttl_seconds", 15)
         )
+        self.sqs_config = dict(self.queue_config.get("sqs", {}) or {})
+        self.sqs_visibility_timeout_seconds = int(
+            self.sqs_config.get("visibility_timeout_seconds", 900)
+        )
+        self.sqs_heartbeat_interval_seconds = float(
+            self.sqs_config.get("heartbeat_interval_seconds", 60)
+        )
         self.staging_dir = Path(
             self.storage_config.get("staging_dir") or "data/rag/uploads"
         )
@@ -256,7 +303,21 @@ class RagService:
         self.janitor_interval_seconds = float(
             self.storage_config.get("janitor_interval_seconds", 300)
         )
-        self._staging_store = RagStagingStore(self.staging_dir, self.storage_config)
+        self._staging_store = (
+            RagStagingStore(self.staging_dir, self.storage_config)
+            if self.storage_backend == "local"
+            else None
+        )
+        self.object_store = object_store
+        if self.storage_backend == "s3" and self.object_store is None:
+            self.object_store = S3ObjectStore(
+                dict(self.storage_config.get("s3", {}) or {})
+            )
+        self.ingestion_queue = ingestion_queue
+        if self.queue_backend == "sqs" and self.ingestion_queue is None:
+            self.ingestion_queue = SqsIngestionQueue(
+                dict(self.queue_config.get("sqs", {}) or {})
+            )
         self._janitor_task: Optional[asyncio.Task] = None
         self.parser = parser or build_document_parser(self.parser_config)
         self.chunker = build_chunker(self.chunking_config)
@@ -269,6 +330,8 @@ class RagService:
         )
         self.figure_cropper = figure_cropper or FigureCropper(self.visual_config)
         self.vector_store = vector_store or build_vector_store(self.config)
+        self._index_generation_lock = asyncio.Lock()
+        self._last_local_index_generation = 0
         self.jobs: BoundedTTLMap[str, IngestionJob] = BoundedTTLMap(
             max_entries=int(self.config.get("local_job_cache_max_entries", 1000)),
             ttl_seconds=max(1, self.job_ttl_seconds),
@@ -280,18 +343,27 @@ class RagService:
             metric_name="rag_batches",
         )
         self._initialized = False
+        self._upload_idempotency: BoundedTTLMap[str, str] = BoundedTTLMap(
+            max_entries=int(self.config.get("upload_idempotency_max_entries", 1000)),
+            ttl_seconds=max(1, self.job_ttl_seconds),
+            metric_name="rag_upload_idempotency",
+        )
 
     async def initialize(self):
         if not self.enabled:
             return
-        await asyncio.to_thread(self._staging_store.ensure_reconciled)
+        if self._staging_store is not None:
+            await asyncio.to_thread(self._staging_store.ensure_reconciled)
         await self.vector_store.initialize()
         if self.queue_enabled:
-            self.staging_dir.mkdir(parents=True, exist_ok=True)
-            await self._ensure_stream_group()
-        self._janitor_task = asyncio.create_task(
-            self._staging_janitor_loop(), name="rag_staging_janitor"
-        )
+            if self.storage_backend == "local":
+                self.staging_dir.mkdir(parents=True, exist_ok=True)
+            if self.queue_backend == "redis_stream":
+                await self._ensure_stream_group()
+        if self._staging_store is not None:
+            self._janitor_task = asyncio.create_task(
+                self._staging_janitor_loop(), name="rag_staging_janitor"
+            )
         if self._visual_enabled() and hasattr(self.figure_cropper, "assets_dir"):
             self.figure_cropper.assets_dir.mkdir(parents=True, exist_ok=True)
         self._initialized = True
@@ -362,16 +434,39 @@ class RagService:
         resolved_document_id = document_id or str(uuid.uuid4())
         resolved_kb_id = knowledge_base_id or self._default_write_kb()
         resolved_storage_ref = storage_ref
+        resolved_source: Dict[str, Any] = {}
         if self.queue_enabled and content is not None:
-            resolved_storage_ref = self.stage_document_content(
-                content,
-                filename=filename,
-                knowledge_base_id=resolved_kb_id,
-                document_id=resolved_document_id,
-                job_id=resolved_job_id,
-            )
+            if self.storage_backend == "s3":
+                if self.object_store is None:
+                    raise RuntimeError("S3 object store is unavailable")
+                ref = await self.object_store.put_bytes(
+                    job_id=resolved_job_id, content=content
+                )
+                resolved_storage_ref = ref.uri
+                resolved_source = ref.to_dict()
+            else:
+                resolved_storage_ref = self.stage_document_content(
+                    content,
+                    filename=filename,
+                    knowledge_base_id=resolved_kb_id,
+                    document_id=resolved_document_id,
+                    job_id=resolved_job_id,
+                )
         elif self.queue_enabled and resolved_storage_ref:
-            self._resolve_staged_path(resolved_storage_ref)
+            if self.storage_backend == "local":
+                self._resolve_staged_path(resolved_storage_ref)
+            else:
+                if self.object_store is None:
+                    raise RuntimeError("S3 object store is unavailable")
+                ref = await self.object_store.complete_upload(
+                    RagObjectRef(backend="s3", uri=resolved_storage_ref)
+                )
+                resolved_storage_ref = ref.uri
+                resolved_source = ref.to_dict()
+        dispatch_id = None
+        index_version = None
+        if self.queue_backend == "sqs":
+            dispatch_id, index_version = await self._new_sqs_dispatch()
         job = IngestionJob(
             job_id=resolved_job_id,
             document_id=resolved_document_id,
@@ -380,11 +475,154 @@ class RagService:
             max_attempts=self.max_attempts,
             batch_id=batch_id,
             storage_ref=resolved_storage_ref,
+            source=resolved_source,
+            dispatch_id=dispatch_id,
+            index_version=index_version,
             metadata=dict(metadata or {}),
         )
+        if self.queue_enabled and self.queue_backend == "sqs":
+            job.status = "enqueue_pending"
         await self._save_job(job)
         if self.queue_enabled:
             await self.enqueue_ingestion_job(job)
+        return job
+
+    async def create_presigned_upload(
+        self,
+        *,
+        filename: str,
+        size_bytes: int,
+        checksum_sha256: str,
+        knowledge_base_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        document_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if self.storage_backend != "s3" or self.object_store is None:
+            raise RuntimeError("presigned uploads require the S3 storage backend")
+        if not self.queue_enabled:
+            raise RuntimeError("presigned uploads require the ingestion queue")
+        max_size = int(self.upload_config.get("multipart_max_bytes", 100_000_000))
+        if size_bytes < 1 or size_bytes > max_size:
+            raise RagPayloadTooLarge("Document exceeds the configured RAG upload limit")
+        try:
+            decoded_checksum = base64.b64decode(
+                checksum_sha256.encode("ascii"), validate=True
+            )
+        except (UnicodeEncodeError, binascii.Error, ValueError) as exc:
+            raise ValueError("checksum_sha256 must be a base64 SHA-256 digest") from exc
+        if len(decoded_checksum) != 32:
+            raise ValueError("checksum_sha256 must be a base64 SHA-256 digest")
+        resolved_kb_id = knowledge_base_id or self._default_write_kb()
+        request_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "filename": filename,
+                    "size_bytes": int(size_bytes),
+                    "checksum_sha256": checksum_sha256,
+                    "knowledge_base_id": resolved_kb_id,
+                    "metadata": dict(metadata or {}),
+                    "document_id": document_id,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        job_id = str(uuid.uuid4())
+        idempotency_redis_key = None
+        claimed_idempotency = False
+        if idempotency_key:
+            local_job_id = self._upload_idempotency.get(idempotency_key)
+            client = self._job_client()
+            if client is not None and hasattr(client, "set"):
+                key_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+                idempotency_redis_key = self._prefixed_key(
+                    f"upload:idempotency:{key_hash}"
+                )
+                claimed_idempotency = bool(
+                    await client.set(
+                        idempotency_redis_key,
+                        job_id,
+                        nx=True,
+                        ex=self.job_ttl_seconds,
+                    )
+                )
+                if not claimed_idempotency:
+                    existing = await client.get(idempotency_redis_key)
+                    local_job_id = _decode(existing) if existing else None
+            if local_job_id:
+                prior = await self.get_job(local_job_id)
+                if prior is None:
+                    raise RuntimeError("idempotent upload is still being initialized")
+                if prior.upload_request_fingerprint != request_fingerprint:
+                    raise RagIdempotencyConflict(
+                        "Idempotency-Key was already used for a different upload request"
+                    )
+                ref = RagObjectRef.from_dict(prior.source)
+                _, upload = await self.object_store.create_upload(
+                    job_id=prior.job_id,
+                    size_bytes=int(ref.size_bytes or size_bytes),
+                    checksum_sha256=str(ref.checksum_sha256 or checksum_sha256),
+                )
+                return {"job": prior, "upload": upload}
+
+        resolved_document_id = document_id or str(uuid.uuid4())
+        try:
+            dispatch_id, index_version = await self._new_sqs_dispatch()
+            ref, upload = await self.object_store.create_upload(
+                job_id=job_id,
+                size_bytes=int(size_bytes),
+                checksum_sha256=checksum_sha256,
+            )
+            job = IngestionJob(
+                job_id=job_id,
+                document_id=resolved_document_id,
+                filename=filename,
+                knowledge_base_id=resolved_kb_id,
+                status="awaiting_upload",
+                max_attempts=self.max_attempts,
+                storage_ref=ref.uri,
+                source=ref.to_dict(),
+                dispatch_id=dispatch_id,
+                index_version=index_version,
+                upload_request_fingerprint=request_fingerprint,
+                metadata=dict(metadata or {}),
+            )
+            await self._save_job(job)
+        except BaseException:
+            if claimed_idempotency and idempotency_redis_key:
+                await self._release_idempotency_claim(idempotency_redis_key, job_id)
+            raise
+        if idempotency_key:
+            self._upload_idempotency[idempotency_key] = job.job_id
+        return {"job": job, "upload": upload}
+
+    async def _release_idempotency_claim(self, key: str, job_id: str) -> None:
+        client = self._job_client()
+        if client is None:
+            return
+        current = await client.get(key)
+        if current is not None and _decode(current) == job_id:
+            await client.delete(key)
+
+    async def complete_presigned_upload(self, job_id: str) -> IngestionJob:
+        if self.storage_backend != "s3" or self.object_store is None:
+            raise RuntimeError("presigned uploads require the S3 storage backend")
+        job = await self.get_job(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        if job.status not in {"awaiting_upload", "enqueue_pending"}:
+            return job
+        ref = await self.object_store.complete_upload(
+            RagObjectRef.from_dict(job.source)
+        )
+        job.source = ref.to_dict()
+        job.storage_ref = ref.uri
+        job.status = "enqueue_pending"
+        job.updated_at = datetime.now()
+        await self._save_job(job)
+        await self._tag_job_source(job, "queued")
+        await self.enqueue_ingestion_job(job)
         return job
 
     async def process_ingestion_job(
@@ -420,7 +658,14 @@ class RagService:
             job.updated_at = datetime.now()
             await self._save_job(job)
             if content is None:
-                content = self.load_staged_content(storage_ref or job.storage_ref)
+                if job.source.get("backend") == "s3":
+                    if self.object_store is None:
+                        raise RuntimeError("S3 object store is unavailable")
+                    content = await self.object_store.load(
+                        RagObjectRef.from_dict(job.source)
+                    )
+                else:
+                    content = self.load_staged_content(storage_ref or job.storage_ref)
             parsed = await asyncio.to_thread(
                 self.parser.parse_bytes,
                 content=content,
@@ -451,6 +696,7 @@ class RagService:
                 embeddings,
                 knowledge_base_id=knowledge_base_id,
                 visual_embeddings=visual_embeddings,
+                index_version=job.index_version or job.dispatch_id,
             )
             job.status = "completed_with_warnings" if job.warnings else "completed"
             job.error = None
@@ -801,15 +1047,18 @@ class RagService:
         job = await self.get_job(job_id)
         if job is None:
             return None
-        if job.status not in {"failed", "dead_lettered", "retrying"}:
+        if job.status not in {"enqueue_pending", "failed", "dead_lettered", "retrying"}:
             raise ValueError(
-                "only failed, retrying, or dead_lettered jobs can be retried"
+                "only enqueue-pending, failed, retrying, or dead-lettered jobs can be retried"
             )
         if not job.storage_ref:
             raise ValueError("job has no staged storage_ref to retry")
-        job.status = "queued"
+        reuse_dispatch = job.status == "enqueue_pending"
+        job.status = "enqueue_pending" if self.queue_backend == "sqs" else "queued"
         job.error = None
         job.last_error = None
+        if self.queue_backend == "sqs" and not reuse_dispatch:
+            job.dispatch_id, job.index_version = await self._new_sqs_dispatch()
         job.updated_at = datetime.now()
         await self._save_job(job)
         await self.enqueue_ingestion_job(job, attempt=job.attempts + 1)
@@ -818,6 +1067,42 @@ class RagService:
     async def enqueue_ingestion_job(
         self, job: IngestionJob, attempt: Optional[int] = None
     ) -> str:
+        if self.queue_backend == "sqs":
+            if self.ingestion_queue is None:
+                raise RagQueuePreDurabilityError(
+                    "SQS client is required for RAG ingestion queue"
+                )
+            if not job.dispatch_id:
+                job.dispatch_id, job.index_version = await self._new_sqs_dispatch()
+            payload = {
+                "schema_version": 1,
+                "job_id": job.job_id,
+                "dispatch_id": job.dispatch_id,
+                "index_version": job.index_version,
+                "batch_id": job.batch_id or "",
+                "document_id": job.document_id,
+                "knowledge_base_id": job.knowledge_base_id,
+                "filename": job.filename,
+                "source": dict(job.source),
+                "attempt": int(
+                    attempt if attempt is not None else max(job.attempts + 1, 1)
+                ),
+                "created_at": datetime.now().isoformat(),
+            }
+            message_id = await self.ingestion_queue.publish(payload)
+            job.stream_message_id = str(message_id)
+            job.status = "queued"
+            job.updated_at = datetime.now()
+            try:
+                await self._save_job(job)
+            except Exception:
+                logger.warning(
+                    "RAG job %s was sent to SQS but metadata refresh failed",
+                    job.job_id,
+                    exc_info=True,
+                )
+            return job.stream_message_id
+
         client = self._job_client()
         if not client:
             raise RagQueuePreDurabilityError(
@@ -863,10 +1148,15 @@ class RagService:
             raise RuntimeError("RAG service is disabled")
         if not self.queue_enabled:
             raise RuntimeError("RAG ingestion queue is disabled")
-        await self._ensure_stream_group()
+        if self.queue_backend == "redis_stream":
+            await self._ensure_stream_group()
         workers = [
             asyncio.create_task(
-                self._worker_loop(self._consumer_name(index)),
+                (
+                    self._sqs_worker_loop(self._consumer_name(index))
+                    if self.queue_backend == "sqs"
+                    else self._worker_loop(self._consumer_name(index))
+                ),
                 name=f"rag_ingestion_worker_{index}",
             )
             for index in range(self.worker_count)
@@ -957,7 +1247,7 @@ class RagService:
         if job is None:
             await self.ack_stream_message(message_id)
             return None
-        if job.status in TERMINAL_JOB_STATUSES:
+        if job.status in {"completed", "completed_with_warnings", "dead_lettered"}:
             await self.ack_stream_message(message_id)
             return job
 
@@ -976,8 +1266,6 @@ class RagService:
                 attempt=attempt,
                 raise_on_error=True,
             )
-            await self.ack_stream_message(message_id)
-            return job
         except Exception as exc:
             latest_job = await self.get_job(job.job_id)
             await self._handle_stream_failure(
@@ -987,6 +1275,249 @@ class RagService:
                 attempt=attempt,
             )
             return await self.get_job(job.job_id)
+        await self._tag_job_source_best_effort(job, job.status)
+        await self.ack_stream_message(message_id)
+        return job
+
+    async def _sqs_worker_loop(self, consumer_name: str) -> None:
+        if self.ingestion_queue is None:
+            raise RuntimeError("SQS ingestion queue is unavailable")
+        while True:
+            deliveries = await self.ingestion_queue.receive(
+                max_messages=self.worker_concurrency
+            )
+            if not deliveries:
+                continue
+            semaphore = asyncio.Semaphore(self.worker_concurrency)
+
+            async def run_one(delivery: QueueDelivery):
+                async with semaphore:
+                    await self.process_sqs_delivery(delivery, consumer_name)
+
+            await asyncio.gather(*(run_one(delivery) for delivery in deliveries))
+
+    async def process_sqs_delivery(
+        self, delivery: QueueDelivery, consumer_name: str
+    ) -> Optional[IngestionJob]:
+        if self.ingestion_queue is None:
+            raise RuntimeError("SQS ingestion queue is unavailable")
+        payload = dict(delivery.payload)
+        job_id = str(payload.get("job_id") or "")
+        dispatch_id = str(payload.get("dispatch_id") or "")
+        if not job_id or not dispatch_id:
+            RAG_METRICS.delivery_outcomes.labels("sqs", "invalid").inc()
+            await self.ingestion_queue.extend_visibility(
+                delivery, int(self._retry_delay_seconds(delivery.receive_count))
+            )
+            return None
+        job = await self.get_job(job_id)
+        if job is None:
+            RAG_METRICS.delivery_outcomes.labels("sqs", "missing_job").inc()
+            await self._ack_sqs_best_effort(delivery)
+            return None
+        if job.dispatch_id != dispatch_id:
+            RAG_METRICS.delivery_outcomes.labels("sqs", "stale_dispatch").inc()
+            await self._ack_sqs_best_effort(delivery)
+            return job
+        if job.status in {"completed", "completed_with_warnings", "dead_lettered"}:
+            if job.status != "dead_lettered":
+                await self._ack_sqs_best_effort(delivery)
+            RAG_METRICS.delivery_outcomes.labels("sqs", "terminal").inc()
+            return job
+
+        lease = await self._acquire_sqs_processing_lease(
+            job, dispatch_id=dispatch_id, consumer_name=consumer_name
+        )
+        if lease is None:
+            RAG_METRICS.processing_lease_contention.inc()
+            RAG_METRICS.delivery_outcomes.labels("sqs", "lease_contended").inc()
+            await self.ingestion_queue.extend_visibility(
+                delivery, int(self._retry_delay_seconds(delivery.receive_count))
+            )
+            return job
+
+        processing = asyncio.create_task(
+            self.process_ingestion_job(
+                job.job_id,
+                content=None,
+                filename=job.filename,
+                knowledge_base_id=job.knowledge_base_id,
+                metadata=job.metadata,
+                document_id=job.document_id,
+                storage_ref=job.storage_ref,
+                worker_id=consumer_name,
+                stream_message_id=delivery.message_id,
+                attempt=delivery.receive_count,
+                raise_on_error=True,
+            ),
+            name=f"rag_sqs_processing:{job.job_id}",
+        )
+        heartbeat = asyncio.create_task(
+            self._sqs_delivery_heartbeat(delivery, lease[0], lease[1]),
+            name=f"rag_sqs_visibility:{job.job_id}",
+        )
+        processing_started = time.perf_counter()
+        try:
+            done, _ = await asyncio.wait(
+                {processing, heartbeat}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if processing in done:
+                result = await processing
+            else:
+                heartbeat_error = heartbeat.exception()
+                processing.cancel()
+                await asyncio.gather(processing, return_exceptions=True)
+                if heartbeat_error is not None:
+                    raise heartbeat_error
+                raise RuntimeError("SQS visibility heartbeat stopped unexpectedly")
+        except Exception as exc:
+            latest = await self.get_job(job.job_id) or job
+            latest.attempts = max(latest.attempts, delivery.receive_count)
+            latest.error = str(exc)
+            latest.last_error = str(exc)
+            latest.updated_at = datetime.now()
+            if delivery.receive_count >= latest.max_attempts:
+                latest.status = "dead_lettered"
+                await self._save_job(latest)
+                await self._tag_job_source_best_effort(latest, "dead_lettered")
+                RAG_METRICS.delivery_outcomes.labels("sqs", "dead_lettered").inc()
+                duration_outcome = "dead_lettered"
+            else:
+                latest.status = "retrying"
+                await self._save_job(latest)
+                try:
+                    await self.ingestion_queue.extend_visibility(
+                        delivery,
+                        int(self._retry_delay_seconds(delivery.receive_count)),
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to defer retry for SQS message %s",
+                        delivery.message_id,
+                        exc_info=True,
+                    )
+                RAG_METRICS.delivery_outcomes.labels("sqs", "retrying").inc()
+                duration_outcome = "retrying"
+            RAG_METRICS.processing_duration.labels("sqs", duration_outcome).observe(
+                time.perf_counter() - processing_started
+            )
+            return latest
+        else:
+            await self._tag_job_source_best_effort(result, result.status)
+            if await self._ack_sqs_best_effort(delivery):
+                RAG_METRICS.delivery_outcomes.labels("sqs", "completed").inc()
+            RAG_METRICS.processing_duration.labels("sqs", "completed").observe(
+                time.perf_counter() - processing_started
+            )
+            return result
+        finally:
+            processing.cancel()
+            heartbeat.cancel()
+            await asyncio.gather(processing, heartbeat, return_exceptions=True)
+            await self._release_sqs_processing_lease(*lease)
+
+    async def _acquire_sqs_processing_lease(
+        self,
+        job: IngestionJob,
+        *,
+        dispatch_id: str,
+        consumer_name: str,
+    ) -> Optional[tuple[str, str]]:
+        client = self._job_client()
+        if client is None or not hasattr(client, "set"):
+            raise RuntimeError("Redis is required for SQS processing leases")
+        key = self._prefixed_key(f"processing:{job.job_id}:{dispatch_id}")
+        token = f"{consumer_name}:{uuid.uuid4()}"
+        acquired = await client.set(
+            key,
+            token,
+            nx=True,
+            ex=max(
+                self.sqs_visibility_timeout_seconds,
+                int(self.sqs_heartbeat_interval_seconds * 3),
+            ),
+        )
+        return (key, token) if acquired else None
+
+    async def _release_sqs_processing_lease(self, key: str, token: str) -> None:
+        client = self._job_client()
+        if client is None:
+            return
+        if hasattr(client, "eval"):
+            await client.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                "return redis.call('del', KEYS[1]) else return 0 end",
+                1,
+                key,
+                token,
+            )
+            return
+        current = await client.get(key)
+        if current is not None and _decode(current) == token:
+            await client.delete(key)
+
+    async def _sqs_delivery_heartbeat(
+        self, delivery: QueueDelivery, lease_key: str, lease_token: str
+    ) -> None:
+        queue = self.ingestion_queue
+        if queue is None:
+            raise RuntimeError("SQS ingestion queue is unavailable")
+        while True:
+            await asyncio.sleep(self.sqs_heartbeat_interval_seconds)
+            await queue.extend_visibility(delivery, self.sqs_visibility_timeout_seconds)
+            client = self._job_client()
+            if client is None or not hasattr(client, "eval"):
+                raise RuntimeError(
+                    "Redis Lua support is required for SQS lease renewal"
+                )
+            renewed = await client.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                "return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
+                1,
+                lease_key,
+                lease_token,
+                max(
+                    self.sqs_visibility_timeout_seconds,
+                    int(self.sqs_heartbeat_interval_seconds * 3),
+                ),
+            )
+            if not renewed:
+                raise RuntimeError(
+                    "SQS processing lease was lost while extending visibility"
+                )
+
+    async def _tag_job_source(self, job: IngestionJob, status: str) -> None:
+        if job.source.get("backend") != "s3" or self.object_store is None:
+            return
+        tag = getattr(self.object_store, "tag", None)
+        if callable(tag):
+            await tag(RagObjectRef.from_dict(job.source), status)
+
+    async def _ack_sqs_best_effort(self, delivery: QueueDelivery) -> bool:
+        if self.ingestion_queue is None:
+            return False
+        try:
+            await self.ingestion_queue.ack(delivery)
+        except Exception:
+            logger.warning(
+                "SQS DeleteMessage failed for %s; leaving it for ack-only redelivery",
+                delivery.message_id,
+                exc_info=True,
+            )
+            RAG_METRICS.delivery_outcomes.labels("sqs", "ack_failed").inc()
+            return False
+        return True
+
+    async def _tag_job_source_best_effort(self, job: IngestionJob, status: str) -> None:
+        try:
+            await self._tag_job_source(job, status)
+        except Exception:
+            logger.warning(
+                "Failed to tag RAG source for job %s as %s",
+                job.job_id,
+                status,
+                exc_info=True,
+            )
 
     async def promote_due_retries(self) -> int:
         client = self._job_client()
@@ -1075,6 +1606,7 @@ class RagService:
         job.status = "dead_lettered"
         job.updated_at = datetime.now()
         await self._save_job(job)
+        await self._tag_job_source_best_effort(job, "dead_lettered")
         await client.xadd(
             self.dead_letter_stream_key,
             {
@@ -1331,6 +1863,29 @@ class RagService:
             return self.default_knowledge_base_ids[0]
         return "default"
 
+    async def _new_sqs_dispatch(self) -> tuple[str, str]:
+        dispatch_id = str(uuid.uuid4())
+        client = self._job_client()
+        if client is not None and hasattr(client, "eval"):
+            sequence = int(
+                await client.eval(
+                    "local current = redis.call('GET', KEYS[1]); "
+                    "local floor = ARGV[1]; "
+                    "if (not current) or (#current < #floor) or "
+                    "(#current == #floor and current < floor) then "
+                    "redis.call('SET', KEYS[1], floor); end; "
+                    "return redis.call('INCR', KEYS[1])",
+                    1,
+                    self._prefixed_key("index:generation_sequence"),
+                    str(time.time_ns()),
+                )
+            )
+        else:
+            async with self._index_generation_lock:
+                sequence = max(time.time_ns(), self._last_local_index_generation + 1)
+                self._last_local_index_generation = sequence
+        return dispatch_id, f"{sequence:020d}:{dispatch_id}"
+
     async def _save_job(self, job: IngestionJob) -> None:
         previous_status = getattr(job, "_persisted_status", None)
         if previous_status is None:
@@ -1366,7 +1921,7 @@ class RagService:
         return max(self.job_ttl_seconds, self.failed_file_ttl_seconds)
 
     def _update_staging_manifest(self, job: IngestionJob) -> None:
-        if not job.storage_ref:
+        if not job.storage_ref or self._staging_store is None:
             return
         try:
             self._staging_store.update_status(job.storage_ref, job.status)
@@ -1411,6 +1966,8 @@ class RagService:
         document_id: str,
         job_id: Optional[str] = None,
     ) -> str:
+        if self._staging_store is None:
+            raise RuntimeError("local staging is unavailable for the S3 backend")
         safe_filename = _safe_path_component(filename or "document.pdf")
         resolved_job_id = _safe_path_component(job_id or str(uuid.uuid4()))
         try:
@@ -1430,6 +1987,8 @@ class RagService:
         job_id: Optional[str] = None,
     ) -> str:
         """Stream an upload to disk and publish it with an atomic rename."""
+        if self._staging_store is None:
+            raise RuntimeError("local staging is unavailable for the S3 backend")
         safe_filename = _safe_path_component(filename or "document.pdf")
         resolved_job_id = _safe_path_component(job_id or str(uuid.uuid4()))
         max_bytes = int(self.upload_config.get("multipart_max_bytes", 100_000_000))
@@ -1486,6 +2045,8 @@ class RagService:
                 self._staging_store.rollback(resolved_job_id)
 
     def load_staged_content(self, storage_ref: Optional[str]) -> bytes:
+        if self._staging_store is None:
+            raise RuntimeError("local staging is unavailable for the S3 backend")
         if not storage_ref:
             raise ValueError("storage_ref is required for queued ingestion")
         path = self._resolve_staged_path(storage_ref)
@@ -1495,6 +2056,8 @@ class RagService:
         return path.read_bytes()
 
     def cleanup_staged_file(self, storage_ref: str) -> None:
+        if self._staging_store is None:
+            return
         try:
             self._staging_store.delete(storage_ref)
         except Exception:
@@ -1503,6 +2066,8 @@ class RagService:
             )
 
     async def _staging_janitor_loop(self) -> None:
+        if self._staging_store is None:
+            return
         while True:
             await asyncio.sleep(self.janitor_interval_seconds)
             try:

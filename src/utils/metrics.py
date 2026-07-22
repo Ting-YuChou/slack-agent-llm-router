@@ -766,6 +766,30 @@ class RagMetrics:
             "RAG staging janitor outcomes",
             ["outcome"],
         )
+        self.object_operations = Counter(
+            "llm_router_rag_object_operations_total",
+            "RAG source object-store operations",
+            ["backend", "operation", "outcome"],
+        )
+        self.queue_operations = Counter(
+            "llm_router_rag_queue_operations_total",
+            "RAG ingestion queue operations",
+            ["backend", "operation", "outcome"],
+        )
+        self.delivery_outcomes = Counter(
+            "llm_router_rag_delivery_outcomes_total",
+            "RAG ingestion delivery outcomes",
+            ["backend", "outcome"],
+        )
+        self.processing_lease_contention = Counter(
+            "llm_router_rag_processing_lease_contention_total",
+            "RAG deliveries deferred because another worker owns the dispatch lease",
+        )
+        self.processing_duration = Histogram(
+            "llm_router_rag_processing_duration_seconds",
+            "RAG ingestion delivery processing duration",
+            ["backend", "outcome"],
+        )
 
 
 class SupervisionMetrics:
