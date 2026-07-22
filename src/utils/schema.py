@@ -222,6 +222,15 @@ class RagQueryRequest(BaseModel):
         return v.strip()
 
 
+class RagUploadRequest(BaseModel):
+    filename: str = Field(..., min_length=1, max_length=1024)
+    size_bytes: int = Field(..., ge=1)
+    checksum_sha256: str = Field(..., min_length=1, max_length=256)
+    document_id: Optional[str] = None
+    knowledge_base_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
 class RagBatchDocument(BaseModel):
     filename: str = Field(..., min_length=1)
     content_base64: Optional[str] = None

@@ -51,11 +51,13 @@ from src.llm_router_part3_policy import PolicyMaterializer, RoutingPolicyCache
 from src.llm_router_part3_pipeline import KafkaIngestionPipeline, KafkaProducerManager
 from src.llm_router_part4_monitor import MonitoringService
 from src.rag.service import (
+    RagIdempotencyConflict,
     RagPayloadTooLarge,
     RagService,
     RagStorageCapacityError,
     decode_base64_document,
 )
+from src.rag.storage import RagObjectIntegrityError
 from src.utils.logger import security_logger, setup_logging
 from src.utils.metrics import (
     INFERENCE_METRICS,
@@ -72,6 +74,7 @@ from src.utils.schema import (
     QueryRequest,
     RagBatchRequest,
     RagQueryRequest,
+    RagUploadRequest,
 )
 from slack.bot import SlackBot
 
@@ -1114,7 +1117,10 @@ class LLMRouterPlatform:
             job_id = str(uuid.uuid4())
             knowledge_base_id = payload.get("knowledge_base_id")
             stage_content = getattr(rag_service, "stage_document_content", None)
-            if callable(stage_content):
+            if (
+                callable(stage_content)
+                and getattr(rag_service, "storage_backend", "local") != "s3"
+            ):
                 default_kbs = list(
                     rag_config.get("default_knowledge_base_ids", []) or []
                 )
@@ -1171,7 +1177,10 @@ class LLMRouterPlatform:
             job_id = str(uuid.uuid4())
             knowledge_base_id = form.get("knowledge_base_id")
             stage_upload = getattr(rag_service, "stage_uploaded_file", None)
-            if callable(stage_upload):
+            if (
+                callable(stage_upload)
+                and getattr(rag_service, "storage_backend", "local") != "s3"
+            ):
                 default_kbs = list(
                     rag_config.get("default_knowledge_base_ids", []) or []
                 )
@@ -1193,9 +1202,25 @@ class LLMRouterPlatform:
                     "document_id": document_id,
                     "job_id": job_id,
                 }
+            max_bytes = int(upload_config.get("multipart_max_bytes", 100_000_000))
+            declared_size = getattr(upload, "size", None)
+            if declared_size is not None and int(declared_size) > max_bytes:
+                raise RagPayloadTooLarge(
+                    "Document exceeds the configured RAG upload limit"
+                )
+            content = bytearray()
+            while True:
+                chunk = await upload.read(min(1024 * 1024, max_bytes + 1))
+                if not chunk:
+                    break
+                content.extend(chunk)
+                if len(content) > max_bytes:
+                    raise RagPayloadTooLarge(
+                        "Document exceeds the configured RAG upload limit"
+                    )
             return {
                 "filename": filename or "document.pdf",
-                "content": await upload.read(),
+                "content": bytes(content),
                 "knowledge_base_id": knowledge_base_id,
                 "metadata": metadata,
                 "document_id": document_id,
@@ -1775,6 +1800,99 @@ class LLMRouterPlatform:
                 if active_requests is not None and active_request_recorded:
                     active_requests.labels(endpoint=endpoint).dec()
                 await self._release_admission_reservation(route_reservation)
+
+        @app.post("/rag/uploads")
+        async def create_rag_upload(
+            upload_request: RagUploadRequest,
+            request: Request,
+        ):
+            rag_service = self._get_rag_service()
+            if rag_service is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "rag_disabled"},
+                )
+            try:
+                result = await rag_service.create_presigned_upload(
+                    filename=upload_request.filename,
+                    size_bytes=upload_request.size_bytes,
+                    checksum_sha256=upload_request.checksum_sha256,
+                    knowledge_base_id=upload_request.knowledge_base_id,
+                    metadata=upload_request.metadata,
+                    document_id=upload_request.document_id,
+                    idempotency_key=request.headers.get("Idempotency-Key"),
+                )
+                return JSONResponse(
+                    status_code=201,
+                    content=jsonable_encoder(
+                        {
+                            "job": result["job"].to_dict(),
+                            "upload": result["upload"],
+                        }
+                    ),
+                )
+            except RagPayloadTooLarge as exc:
+                return JSONResponse(
+                    status_code=413,
+                    content={"error": "rag_payload_too_large", "message": str(exc)},
+                )
+            except RagIdempotencyConflict as exc:
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": "rag_idempotency_conflict", "message": str(exc)},
+                )
+            except (ValueError, RagObjectIntegrityError) as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_rag_upload", "message": str(exc)},
+                )
+            except RuntimeError as exc:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "rag_upload_unavailable", "message": str(exc)},
+                )
+
+        @app.post("/rag/uploads/{job_id}/complete")
+        async def complete_rag_upload(job_id: str):
+            rag_service = self._get_rag_service()
+            if rag_service is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "rag_disabled"},
+                )
+            try:
+                job = await rag_service.complete_presigned_upload(job_id)
+                return JSONResponse(
+                    status_code=202,
+                    content=jsonable_encoder(job.to_dict()),
+                )
+            except KeyError:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": "rag_upload_not_found"},
+                )
+            except RagObjectIntegrityError as exc:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "rag_upload_integrity_mismatch",
+                        "message": str(exc),
+                    },
+                )
+            except RuntimeError as exc:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "rag_upload_unavailable", "message": str(exc)},
+                )
+            except Exception:
+                self.logger.exception("RAG upload completion failed")
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": "rag_upload_completion_failed",
+                        "message": "Upload completion failed",
+                    },
+                )
 
         @app.post("/rag/documents")
         async def ingest_rag_document(

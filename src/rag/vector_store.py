@@ -169,13 +169,24 @@ class InMemoryRagVectorStore:
         *,
         knowledge_base_id: str,
         visual_embeddings: Optional[Sequence[Optional[Sequence[float]]]] = None,
+        index_version: Optional[str] = None,
     ) -> int:
         if not chunks:
             return 0
         now = datetime.now()
         document_id = chunks[0].document_id
+        index_version = index_version or _new_index_version()
+        existing_items = [
+            item
+            for item in self.items.values()
+            if item.chunk.document_id == document_id
+            and item.knowledge_base_id == knowledge_base_id
+        ]
+        if existing_items and all(
+            item.index_version == index_version for item in existing_items
+        ):
+            return len(existing_items)
         await self.delete_document(document_id, knowledge_base_id)
-        index_version = _new_index_version()
         visual_embeddings = visual_embeddings or [None] * len(chunks)
         for chunk, embedding, visual_embedding in zip(
             chunks, embeddings, visual_embeddings
@@ -480,6 +491,7 @@ class RedisStackRagVectorStore:
         *,
         knowledge_base_id: str,
         visual_embeddings: Optional[Sequence[Optional[Sequence[float]]]] = None,
+        index_version: Optional[str] = None,
     ) -> int:
         if not self.client or not chunks:
             return 0
@@ -490,7 +502,17 @@ class RedisStackRagVectorStore:
             )
         now_ts = time.time()
         document_id = chunks[0].document_id
-        index_version = _new_index_version()
+        requested_index_version = index_version
+        index_version = index_version or _new_index_version()
+        if requested_index_version is not None:
+            active_generation = await self.client.get(
+                self._active_generation_key(document_id, knowledge_base_id)
+            )
+            if (
+                active_generation is not None
+                and _decode(active_generation) == index_version
+            ):
+                return len(chunks)
         visual_embeddings = visual_embeddings or [None] * len(chunks)
         staging_set = self._staging_generation_key(
             document_id, knowledge_base_id, index_version

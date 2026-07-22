@@ -347,6 +347,7 @@ rag:
     staging_ttl_seconds: 86400
   ingestion_queue:
     enabled: false
+    backend: redis_stream
     stream_key: rag:ingestion:stream
     group_name: rag-ingestion-workers
     dead_letter_stream_key: rag:ingestion:dead_letter
@@ -361,15 +362,28 @@ rag:
     dead_letter_maxlen: 10000
     heartbeat_interval_seconds: 5
     heartbeat_ttl_seconds: 15
+    sqs:
+      queue_url:
+      region: us-west-2
+      wait_time_seconds: 20
+      visibility_timeout_seconds: 900
+      heartbeat_interval_seconds: 60
   storage:
+    backend: local
     staging_dir: data/rag/uploads
     cleanup_completed_files: false
     completed_file_ttl_seconds: 86400
-    failed_file_ttl_seconds: 604800
+    failed_file_ttl_seconds: 1209600
     orphan_file_ttl_seconds: 604800
     janitor_interval_seconds: 300
     max_staging_bytes: 10737418240
     high_watermark_ratio: 0.9
+    s3:
+      bucket:
+      region: us-west-2
+      environment: development
+      prefix: rag
+      presign_ttl_seconds: 900
   upload:
     json_max_decoded_bytes: 10000000
     multipart_max_bytes: 100000000

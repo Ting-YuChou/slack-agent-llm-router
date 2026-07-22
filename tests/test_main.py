@@ -1253,6 +1253,70 @@ class TestApiApp:
         assert job_response.json()["job_id"] == "job-1"
         assert job_response.json()["status"] == "completed"
 
+    def test_rag_presigned_upload_endpoints_create_and_complete_job(
+        self, tmp_path, patched_platform_deps
+    ):
+        class PresignedRagService(DummyRagService):
+            def __init__(self):
+                super().__init__({"enabled": True})
+                self.create_payload = None
+
+            async def create_presigned_upload(self, **payload):
+                self.create_payload = payload
+                job = SimpleNamespace(
+                    job_id="job-upload-1",
+                    status="awaiting_upload",
+                    to_dict=lambda: {
+                        "job_id": "job-upload-1",
+                        "status": job.status,
+                    },
+                )
+                self.jobs[job.job_id] = job
+                return {
+                    "job": job,
+                    "upload": {
+                        "method": "PUT",
+                        "url": "https://upload.test/presigned",
+                        "headers": {"x-amz-checksum-sha256": "checksum"},
+                        "expires_in": 900,
+                    },
+                }
+
+            async def complete_presigned_upload(self, job_id):
+                job = self.jobs[job_id]
+                job.status = "queued"
+                return job
+
+        config_path = _write_config(
+            tmp_path,
+            overrides={"rag": {"enabled": True, "backend": "memory"}},
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        rag_service = PresignedRagService()
+        platform.services["rag"] = rag_service
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            created = client.post(
+                "/rag/uploads",
+                headers={"Idempotency-Key": "upload-once"},
+                json={
+                    "filename": "handbook.pdf",
+                    "size_bytes": 8,
+                    "checksum_sha256": "checksum",
+                    "knowledge_base_id": "school",
+                    "metadata": {"title": "Handbook"},
+                },
+            )
+            completed = client.post("/rag/uploads/job-upload-1/complete")
+
+        assert created.status_code == 201
+        assert created.json()["job"]["status"] == "awaiting_upload"
+        assert created.json()["upload"]["method"] == "PUT"
+        assert rag_service.create_payload["idempotency_key"] == "upload-once"
+        assert completed.status_code == 202
+        assert completed.json()["status"] == "queued"
+
     def test_rag_document_endpoint_rejects_oversized_json_with_413(
         self, tmp_path, patched_platform_deps
     ):
@@ -1328,6 +1392,28 @@ class TestApiApp:
         assert "content" not in rag_service.queued_payload
         assert rag_service.processed_payload["content"] is None
         assert rag_service.processed_payload["storage_ref"].endswith("staged.pdf")
+
+    def test_rag_s3_legacy_multipart_upload_is_bounded(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(
+            tmp_path,
+            overrides={"rag": {"enabled": True, "backend": "memory"}},
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+        rag_service = DummyRagService({"enabled": True})
+        rag_service.storage_backend = "s3"
+        rag_service.upload_config = {"multipart_max_bytes": 4}
+        platform.services["rag"] = rag_service
+
+        with TestClient(platform._create_fastapi_app()) as client:
+            response = client.post(
+                "/rag/documents",
+                files={"file": ("large.pdf", b"12345", "application/pdf")},
+            )
+
+        assert response.status_code == 413
+        assert response.json()["error"] == "rag_payload_too_large"
 
     def test_rag_staging_capacity_returns_507(self, tmp_path, patched_platform_deps):
         class FullRagService(DummyRagService):
