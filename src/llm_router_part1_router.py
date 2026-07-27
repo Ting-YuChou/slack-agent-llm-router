@@ -518,6 +518,73 @@ class ModelRouter:
                 confidence=0.0,
             )
 
+    async def select_model_with_capability(
+        self,
+        request: QueryRequest,
+        capability: str,
+        *,
+        exclude_models: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """Select a policy-eligible model that explicitly declares a capability."""
+        candidates = await self.eligible_models_with_capability(
+            request, capability, exclude_models=exclude_models
+        )
+        return candidates[0] if candidates else None
+
+    async def eligible_models_with_capability(
+        self,
+        request: QueryRequest,
+        capability: str,
+        *,
+        exclude_models: Optional[List[str]] = None,
+    ) -> List[str]:
+        """Return policy-eligible capability candidates in routing priority order."""
+        context = await self._build_query_context(request)
+        excluded = set(exclude_models or [])
+        candidates = self._filter_models_for_context(
+            [
+                name
+                for name, model in self.models.items()
+                if name not in excluded
+                and capability.lower()
+                in {value.lower() for value in model.capabilities}
+            ],
+            context,
+        )
+        if not candidates:
+            return []
+        return sorted(
+            candidates,
+            key=lambda model_name: self._score_model(model_name, context),
+            reverse=True,
+        )
+
+    async def eligible_models_without_capability(
+        self,
+        request: QueryRequest,
+        capability: str,
+        *,
+        exclude_models: Optional[List[str]] = None,
+    ) -> List[str]:
+        """Return policy-eligible models that do not declare a capability."""
+        context = await self._build_query_context(request)
+        excluded = set(exclude_models or [])
+        candidates = self._filter_models_for_context(
+            [
+                name
+                for name, model in self.models.items()
+                if name not in excluded
+                and capability.lower()
+                not in {value.lower() for value in model.capabilities}
+            ],
+            context,
+        )
+        return sorted(
+            candidates,
+            key=lambda model_name: self._score_model(model_name, context),
+            reverse=True,
+        )
+
     async def _build_query_context(self, request: QueryRequest) -> Dict[str, Any]:
         """Build comprehensive context for routing decisions"""
         # Classify query type
@@ -684,6 +751,12 @@ class ModelRouter:
 
         if request.context:
             prompt_parts.append(f"Context: {request.context}")
+        rag_context = (request.metadata or {}).get("rag_context")
+        if rag_context:
+            prompt_parts.append(str(rag_context))
+        web_search_context = (request.metadata or {}).get("web_search_context")
+        if web_search_context:
+            prompt_parts.append(str(web_search_context))
         prompt_parts.append(f"Query: {request.query}")
 
         return self.token_counter.count_tokens("\n\n".join(prompt_parts))

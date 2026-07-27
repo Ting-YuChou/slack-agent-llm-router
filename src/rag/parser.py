@@ -1,5 +1,6 @@
 """Document parsing contracts for school-document RAG ingestion."""
 
+import copy
 import hashlib
 import logging
 import tempfile
@@ -163,11 +164,8 @@ class DoclingParser(DocumentParser):
         if not payload:
             return []
 
-        raw_blocks: List[Dict[str, Any]] = []
-        for key in ("texts", "tables", "pictures", "groups"):
-            values = payload.get(key)
-            if isinstance(values, list):
-                raw_blocks.extend(value for value in values if isinstance(value, dict))
+        raw_blocks = _ordered_docling_blocks(payload)
+        page_dimensions = _docling_page_dimensions(payload)
 
         blocks = []
         for index, raw in enumerate(raw_blocks, start=1):
@@ -189,7 +187,41 @@ class DoclingParser(DocumentParser):
                 continue
             block_metadata = {
                 "raw_label": str(raw.get("label") or ""),
+                "source_block_id": str(
+                    raw.get("self_ref") or raw.get("id") or f"block-{index}"
+                ),
+                "document_order": index,
+                "provenance": copy_provenance(raw.get("prov")),
             }
+            font_size = _safe_float(
+                raw.get("font_size")
+                or raw.get("fontSize")
+                or _nested_value(raw, "style", "font_size")
+            )
+            if font_size is not None:
+                block_metadata["font_size"] = font_size
+            parent_ref = _reference_value(raw.get("parent"))
+            if parent_ref:
+                block_metadata["parent_ref"] = parent_ref
+            child_refs = [
+                value
+                for value in (
+                    _reference_value(child) for child in raw.get("children") or []
+                )
+                if value
+            ]
+            if child_refs:
+                block_metadata["child_refs"] = child_refs
+            page_height = _page_dimension(raw, "page_height", "height")
+            if page_height is None:
+                page_height = page_dimensions.get(page, {}).get("height")
+            if page_height is not None:
+                block_metadata["page_height"] = page_height
+            page_width = _page_dimension(raw, "page_width", "width")
+            if page_width is None:
+                page_width = page_dimensions.get(page, {}).get("width")
+            if page_width is not None:
+                block_metadata["page_width"] = page_width
             if table_metadata:
                 block_metadata["table"] = table_metadata
             if block_type == "figure":
@@ -227,6 +259,149 @@ def build_document_parser(config: Dict[str, Any]) -> DocumentParser:
     if provider == "text":
         return TextDocumentParser()
     return DoclingParser(config)
+
+
+def _ordered_docling_blocks(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    collected: List[Dict[str, Any]] = []
+    by_ref: Dict[str, Dict[str, Any]] = {}
+    for key in ("texts", "tables", "pictures", "groups"):
+        values = payload.get(key)
+        if not isinstance(values, list):
+            continue
+        for raw in values:
+            if not isinstance(raw, dict):
+                continue
+            collected.append(raw)
+            reference = str(raw.get("self_ref") or raw.get("id") or "").strip()
+            if reference:
+                by_ref[reference] = raw
+
+    ordered: List[Dict[str, Any]] = []
+    seen: set[int] = set()
+
+    def visit(reference: str) -> None:
+        raw = by_ref.get(reference)
+        if raw is None or id(raw) in seen:
+            return
+        ordered.append(raw)
+        seen.add(id(raw))
+        for nested in raw.get("children") or []:
+            visit(_reference_value(nested))
+
+    body = payload.get("body")
+    body_payload = body if isinstance(body, dict) else {}
+    for child in body_payload.get("children") or []:
+        visit(_reference_value(child))
+    fallback_blocks = [raw for raw in collected if id(raw) not in seen]
+    page_dimensions = _docling_page_dimensions(payload)
+    for raw in sorted(
+        fallback_blocks,
+        key=lambda value: _fallback_docling_order_key(value, page_dimensions),
+    ):
+        if id(raw) not in seen:
+            ordered.append(raw)
+    return ordered
+
+
+def _fallback_docling_order_key(
+    raw: Dict[str, Any],
+    page_dimensions: Dict[int, Dict[str, float]],
+) -> tuple[Any, ...]:
+    page, bbox = _extract_page_bbox(raw)
+    explicit_order = _safe_float(raw.get("reading_order"))
+    if explicit_order is not None:
+        return page, 0, explicit_order, 0.0
+    if not bbox:
+        return page, 2, float("inf"), float("inf")
+    low = min(float(bbox[1]), float(bbox[3]))
+    high = max(float(bbox[1]), float(bbox[3]))
+    provenance = raw.get("prov")
+    candidates = provenance if isinstance(provenance, list) else [provenance]
+    first = _as_dict(candidates[0]) if candidates else {}
+    provenance_bbox = first.get("bbox") if isinstance(first.get("bbox"), dict) else {}
+    origin = str(
+        first.get("coord_origin") or provenance_bbox.get("coord_origin") or ""
+    ).lower()
+    if "bottom" in origin:
+        height = page_dimensions.get(page, {}).get("height")
+        vertical = float(height) - high if height else -high
+    else:
+        vertical = low
+    return page, 1, vertical, min(float(bbox[0]), float(bbox[2]))
+
+
+def copy_provenance(value: Any) -> List[Dict[str, Any]]:
+    if isinstance(value, list):
+        return [copy.deepcopy(item) for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        return [copy.deepcopy(value)]
+    return []
+
+
+def _reference_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    payload = _as_dict(value)
+    return str(
+        payload.get("$ref")
+        or payload.get("cref")
+        or payload.get("self_ref")
+        or payload.get("ref")
+        or ""
+    ).strip()
+
+
+def _nested_value(payload: Dict[str, Any], *keys: str) -> Any:
+    value: Any = payload
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _page_dimension(raw: Dict[str, Any], *keys: str) -> Optional[float]:
+    provenance = raw.get("prov")
+    candidates = provenance if isinstance(provenance, list) else [provenance]
+    for candidate in [*candidates, raw]:
+        payload = _as_dict(candidate)
+        for key in keys:
+            value = _safe_float(payload.get(key))
+            if value is not None and value > 0:
+                return value
+    return None
+
+
+def _docling_page_dimensions(
+    payload: Dict[str, Any],
+) -> Dict[int, Dict[str, float]]:
+    """Extract page geometry from Docling's document-level pages mapping."""
+    pages = payload.get("pages")
+    if isinstance(pages, dict):
+        values = pages.items()
+    elif isinstance(pages, list):
+        values = enumerate(pages, start=1)
+    else:
+        return {}
+
+    dimensions: Dict[int, Dict[str, float]] = {}
+    for fallback_page, raw_page in values:
+        page = _as_dict(raw_page)
+        size = _as_dict(page.get("size"))
+        page_no = _safe_int(
+            page.get("page_no") or page.get("page") or fallback_page,
+            _safe_int(fallback_page, 1),
+        )
+        width = _safe_float(size.get("width") or page.get("width"))
+        height = _safe_float(size.get("height") or page.get("height"))
+        values_for_page = {
+            key: value
+            for key, value in (("width", width), ("height", height))
+            if value is not None and value > 0
+        }
+        if values_for_page:
+            dimensions[page_no] = values_for_page
+    return dimensions
 
 
 def _decode_text(content: bytes) -> str:

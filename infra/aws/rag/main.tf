@@ -99,6 +99,18 @@ resource "aws_s3_bucket_lifecycle_configuration" "rag" {
   }
 
   rule {
+    id     = "expire-asset-staged"
+    status = "Enabled"
+    filter {
+      tag {
+        key   = "state"
+        value = "asset_staged"
+      }
+    }
+    expiration { days = 1 }
+  }
+
+  rule {
     id     = "expire-completed"
     status = "Enabled"
     filter {
@@ -164,6 +176,18 @@ resource "aws_s3_bucket_lifecycle_configuration" "rag" {
     filter {}
     noncurrent_version_expiration { noncurrent_days = 14 }
   }
+
+  rule {
+    id     = "expire-staged-asset-versions"
+    status = "Enabled"
+    filter {
+      prefix = "rag/${var.environment}/assets/"
+    }
+    expiration {
+      expired_object_delete_marker = true
+    }
+    noncurrent_version_expiration { noncurrent_days = 1 }
+  }
 }
 
 resource "aws_s3_bucket_policy" "rag" {
@@ -225,7 +249,28 @@ resource "aws_iam_policy" "api" {
           "s3:PutObjectTagging",
           "s3:PutObjectVersionTagging"
         ]
-        Resource = "${aws_s3_bucket.rag.arn}/rag/${var.environment}/*"
+        Resource = "${aws_s3_bucket.rag.arn}/rag/${var.environment}/*/source"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:DeleteObject",
+          "s3:DeleteObjectVersion"
+        ]
+        Resource = "${aws_s3_bucket.rag.arn}/rag/${var.environment}/assets/*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:ListBucket",
+          "s3:ListBucketVersions"
+        ]
+        Resource = aws_s3_bucket.rag.arn
+        Condition = {
+          StringLike = {
+            "s3:prefix" = "rag/${var.environment}/assets/*"
+          }
+        }
       },
       {
         Effect   = "Allow"
@@ -255,7 +300,31 @@ resource "aws_iam_policy" "worker" {
           "s3:PutObjectTagging",
           "s3:PutObjectVersionTagging"
         ]
-        Resource = "${aws_s3_bucket.rag.arn}/rag/${var.environment}/*"
+        Resource = "${aws_s3_bucket.rag.arn}/rag/${var.environment}/*/source"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:DeleteObjectVersion",
+          "s3:PutObjectTagging",
+          "s3:PutObjectVersionTagging"
+        ]
+        Resource = "${aws_s3_bucket.rag.arn}/rag/${var.environment}/assets/*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:ListBucket",
+          "s3:ListBucketVersions"
+        ]
+        Resource = aws_s3_bucket.rag.arn
+        Condition = {
+          StringLike = {
+            "s3:prefix" = "rag/${var.environment}/assets/*"
+          }
+        }
       },
       {
         Effect   = "Allow"
@@ -265,6 +334,29 @@ resource "aws_iam_policy" "worker" {
       {
         Effect   = "Allow"
         Action   = ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey"]
+        Resource = aws_kms_key.rag.arn
+      }
+    ]
+  })
+  tags = local.tags
+}
+
+resource "aws_iam_policy" "inference" {
+  name = "${local.name}-inference"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:GetObjectVersion"
+        ]
+        Resource = "${aws_s3_bucket.rag.arn}/rag/${var.environment}/assets/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
         Resource = aws_kms_key.rag.arn
       }
     ]

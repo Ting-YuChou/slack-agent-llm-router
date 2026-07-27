@@ -1,5 +1,3 @@
-from unittest.mock import AsyncMock
-
 import pytest
 
 from src.llm_router_part1_router import (
@@ -115,6 +113,29 @@ class TestModelRouter:
 
         assert context["token_count"] > len(request.query.split())
         assert "Context: one two three four five" in counted_prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_capability_filter_counts_rag_context_near_model_limit(
+        self, router_config
+    ):
+        router = ModelRouter(router_config)
+        router.classifier.classify_query = lambda _query: (QueryType.GENERAL, 0.9)
+        router.models["mistral-7b"].capabilities.append("vision")
+        router.models["gpt-5"].capabilities.append("vision")
+        router.token_counter.count_tokens = (
+            lambda prompt, _model="default": 5000 if "RAG context" in prompt else 1000
+        )
+        request = QueryRequest(
+            query="Explain the chart",
+            user_id="u1",
+            user_tier=UserTier.PREMIUM,
+            metadata={"rag_context": "RAG context"},
+        )
+
+        candidates = await router.eligible_models_with_capability(request, "vision")
+
+        assert "mistral-7b" not in candidates
+        assert "gpt-5" in candidates
 
     @pytest.mark.asyncio
     async def test_build_query_context_marks_required_web_search(self, router_config):

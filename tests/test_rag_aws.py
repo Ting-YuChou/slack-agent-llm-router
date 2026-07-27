@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -17,6 +18,7 @@ from src.rag.storage import (
 )
 from src.utils.metrics import RAG_METRICS
 from src.rag.vector_store import InMemoryRagVectorStore
+from src.memory import HashEmbeddingProvider
 
 
 class FakeS3Body:
@@ -649,7 +651,61 @@ async def test_sqs_worker_does_not_process_without_dispatch_lease(
 
     assert processed == []
     assert queue.acked == []
-    assert queue.visibility == [("message-1", 30)]
+    assert queue.visibility == [("message-1", service.sqs_visibility_timeout_seconds)]
+
+
+@pytest.mark.asyncio
+async def test_sqs_contended_duplicate_waits_for_owner_then_acks_terminal(
+    tmp_path, monkeypatch
+):
+    service, queue = _sqs_service(tmp_path)
+    job = IngestionJob(
+        job_id="job-1",
+        document_id="doc-1",
+        filename="handbook.pdf",
+        knowledge_base_id="school",
+        status="queued",
+        dispatch_id="dispatch-1",
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    process_calls = []
+
+    async def get_job(_job_id):
+        return job
+
+    async def process(*_args, **_kwargs):
+        process_calls.append(True)
+        started.set()
+        await release.wait()
+        job.status = "completed"
+        return job
+
+    monkeypatch.setattr(service, "get_job", get_job)
+    monkeypatch.setattr(service, "process_ingestion_job", process)
+    owner = asyncio.create_task(
+        service.process_sqs_delivery(_delivery(job), "worker-1")
+    )
+    await started.wait()
+
+    contended = await service.process_sqs_delivery(
+        _delivery(job, receive_count=2), "worker-2"
+    )
+    release.set()
+    await owner
+    duplicate = QueueDelivery(
+        message_id="message-duplicate",
+        receipt_handle="receipt-duplicate",
+        receive_count=3,
+        payload=_delivery(job).payload,
+    )
+    terminal = await service.process_sqs_delivery(duplicate, "worker-2")
+
+    assert contended is job
+    assert terminal.status == "completed"
+    assert process_calls == [True]
+    assert queue.visibility == [("message-1", service.sqs_visibility_timeout_seconds)]
+    assert queue.acked == ["message-1", "message-duplicate"]
 
 
 @pytest.mark.asyncio
@@ -697,6 +753,59 @@ async def test_sqs_processing_lease_release_is_compare_and_delete(tmp_path):
     await service._release_sqs_processing_lease(*lease)
 
     assert service.vector_store.client.eval_calls
+
+
+@pytest.mark.asyncio
+async def test_redis_stream_reclaim_does_not_overlap_same_dispatch(
+    tmp_path, monkeypatch
+):
+    service, _queue = _sqs_service(tmp_path)
+    service.heartbeat_interval_seconds = 60
+    service.pending_idle_ms = 100
+    job = IngestionJob(
+        job_id="job-1",
+        document_id="doc-1",
+        filename="handbook.pdf",
+        knowledge_base_id="school",
+        status="queued",
+        dispatch_id="dispatch-1",
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    process_calls = []
+    acked = []
+
+    async def get_job(_job_id):
+        return job
+
+    async def process(*_args, **_kwargs):
+        process_calls.append(True)
+        started.set()
+        await release.wait()
+        job.status = "completed"
+        return job
+
+    async def ack(message_id):
+        acked.append(message_id)
+        return 1
+
+    monkeypatch.setattr(service, "get_job", get_job)
+    monkeypatch.setattr(service, "process_ingestion_job", process)
+    monkeypatch.setattr(service, "ack_stream_message", ack)
+
+    first = asyncio.create_task(
+        service.process_stream_message("message-1", {"job_id": "job-1"}, "worker-1")
+    )
+    await started.wait()
+    reclaimed = await service.process_stream_message(
+        "message-1", {"job_id": "job-1"}, "worker-2"
+    )
+    release.set()
+    await first
+
+    assert reclaimed is job
+    assert process_calls == [True]
+    assert acked == ["message-1"]
 
 
 @pytest.mark.asyncio
@@ -931,6 +1040,173 @@ def test_rag_aws_metrics_cover_storage_queue_and_delivery_outcomes():
     assert RAG_METRICS.queue_operations
     assert RAG_METRICS.delivery_outcomes
     assert RAG_METRICS.processing_lease_contention
+    assert RAG_METRICS.duplicate_noops
+    assert RAG_METRICS.duplicate_deliveries
+    assert RAG_METRICS.index_commits
+
+
+def test_ingestion_job_round_trips_benchmark_timestamps():
+    started = datetime.now(timezone.utc) - timedelta(seconds=3)
+    processing = started + timedelta(seconds=1)
+    terminal = processing + timedelta(seconds=2)
+    job = IngestionJob(
+        job_id="job-timestamps",
+        document_id="doc-1",
+        filename="handbook.pdf",
+        knowledge_base_id="school",
+        dispatch_started_at=started,
+        processing_started_at=processing,
+        terminal_at=terminal,
+    )
+
+    restored = IngestionJob.from_dict(job.to_dict())
+
+    assert restored.dispatch_started_at == started
+    assert restored.processing_started_at == processing
+    assert restored.terminal_at == terminal
+
+
+@pytest.mark.asyncio
+async def test_sqs_enqueue_records_dispatch_start_before_publish(tmp_path):
+    service, queue = _sqs_service(tmp_path)
+    job = IngestionJob(
+        job_id="job-dispatch-clock",
+        document_id="doc-1",
+        filename="handbook.pdf",
+        knowledge_base_id="school",
+        storage_ref="s3://bucket/rag/test/job-dispatch-clock/source",
+        source={
+            "backend": "s3",
+            "uri": "s3://bucket/rag/test/job-dispatch-clock/source",
+        },
+    )
+    await service._save_job(job)
+
+    await service.enqueue_ingestion_job(job)
+
+    stored = await service.get_job(job.job_id)
+    assert stored.dispatch_started_at is not None
+    assert stored.dispatch_started_at <= datetime.now(timezone.utc)
+    assert queue.published[-1]["job_id"] == job.job_id
+
+
+@pytest.mark.asyncio
+async def test_manual_retry_resets_dispatch_benchmark_timestamps(tmp_path):
+    service, _queue = _sqs_service(tmp_path)
+    old_started = datetime.now(timezone.utc) - timedelta(minutes=2)
+    job = IngestionJob(
+        job_id="job-retry-clock",
+        document_id="doc-1",
+        filename="handbook.pdf",
+        knowledge_base_id="school",
+        status="dead_lettered",
+        dispatch_id="old-dispatch",
+        storage_ref="s3://bucket/rag/test/job-retry-clock/source",
+        source={"backend": "s3", "uri": "s3://bucket/rag/test/job-retry-clock/source"},
+        dispatch_started_at=old_started,
+        processing_started_at=old_started + timedelta(seconds=1),
+        terminal_at=old_started + timedelta(seconds=2),
+    )
+    await service._save_job(job)
+
+    retried = await service.retry_job(job.job_id)
+
+    assert retried.dispatch_id != "old-dispatch"
+    assert retried.dispatch_started_at is not None
+    assert retried.dispatch_started_at > old_started
+    assert retried.processing_started_at is None
+    assert retried.terminal_at is None
+
+
+@pytest.mark.asyncio
+async def test_last_sqs_failure_records_terminal_timestamp(tmp_path, monkeypatch):
+    service, _queue = _sqs_service(tmp_path)
+    job = IngestionJob(
+        job_id="job-terminal-clock",
+        document_id="doc-1",
+        filename="handbook.pdf",
+        knowledge_base_id="school",
+        dispatch_id="dispatch-1",
+        source={
+            "backend": "s3",
+            "uri": "s3://bucket/rag/test/job-terminal-clock/source",
+        },
+    )
+    await service._save_job(job)
+
+    async def fail(*_args, **_kwargs):
+        raise RuntimeError("permanent parse failure")
+
+    monkeypatch.setattr(service, "process_ingestion_job", fail)
+    result = await service.process_sqs_delivery(
+        _delivery(job, receive_count=3), "worker-1"
+    )
+
+    assert result.status == "dead_lettered"
+    assert result.terminal_at is not None
+
+
+@pytest.mark.asyncio
+async def test_same_generation_noop_increments_duplicate_commit_metric():
+    store = InMemoryRagVectorStore()
+    chunk = DocumentChunk(
+        chunk_id="chunk-duplicate",
+        document_id="doc-duplicate",
+        text="handbook",
+        page_start=1,
+        page_end=1,
+        block_ids=[],
+        block_types=[],
+        metadata={},
+    )
+    metric = RAG_METRICS.duplicate_noops.labels("memory", "same_generation")
+    before = metric._value.get()
+
+    await store.upsert_chunks(
+        [chunk], [[1.0]], knowledge_base_id="school", index_version="dispatch-1"
+    )
+    await store.upsert_chunks(
+        [chunk], [[1.0]], knowledge_base_id="school", index_version="dispatch-1"
+    )
+
+    assert metric._value.get() == before + 1
+
+
+@pytest.mark.asyncio
+async def test_successful_ingestion_records_processing_and_terminal_timestamps(
+    tmp_path,
+):
+    service = RagService(
+        {
+            "enabled": True,
+            "backend": "memory",
+            "storage": {"backend": "local", "staging_dir": str(tmp_path)},
+            "ingestion_queue": {"enabled": False, "backend": "redis_stream"},
+        },
+        embedding_provider=HashEmbeddingProvider(),
+        vector_store=InMemoryRagVectorStore(),
+    )
+    dispatched = datetime.now(timezone.utc) - timedelta(seconds=1)
+    job = IngestionJob(
+        job_id="job-success-clock",
+        document_id="doc-success-clock",
+        filename="handbook.txt",
+        knowledge_base_id="school",
+        dispatch_started_at=dispatched,
+    )
+    await service._save_job(job)
+
+    result = await service.process_ingestion_job(
+        job.job_id,
+        content=b"A sufficiently descriptive school handbook paragraph.",
+        filename=job.filename,
+        knowledge_base_id=job.knowledge_base_id,
+        document_id=job.document_id,
+    )
+
+    assert result.status == "completed"
+    assert result.processing_started_at >= dispatched
+    assert result.terminal_at >= result.processing_started_at
 
 
 @pytest.mark.asyncio

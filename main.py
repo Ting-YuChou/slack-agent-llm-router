@@ -123,6 +123,17 @@ def _env_flag_enabled(value: Optional[str]) -> Optional[bool]:
     return None
 
 
+def _public_rag_record(value: Any) -> Dict[str, Any]:
+    """Serialize RAG API records without internal durable asset references."""
+    public_serializer = getattr(value, "to_public_dict", None)
+    if callable(public_serializer):
+        return public_serializer()
+    serializer = getattr(value, "to_dict", None)
+    payload = serializer() if callable(serializer) else dict(value)
+    payload.pop("asset_refs", None)
+    return payload
+
+
 class LLMRouterPlatform:
     """Main orchestrator for the LLM Router Platform"""
 
@@ -1826,7 +1837,7 @@ class LLMRouterPlatform:
                     status_code=201,
                     content=jsonable_encoder(
                         {
-                            "job": result["job"].to_dict(),
+                            "job": _public_rag_record(result["job"]),
                             "upload": result["upload"],
                         }
                     ),
@@ -1853,7 +1864,7 @@ class LLMRouterPlatform:
                 )
 
         @app.post("/rag/uploads/{job_id}/complete")
-        async def complete_rag_upload(job_id: str):
+        async def complete_rag_upload(job_id: str, request: Request):
             rag_service = self._get_rag_service()
             if rag_service is None:
                 return JSONResponse(
@@ -1861,10 +1872,23 @@ class LLMRouterPlatform:
                     content={"error": "rag_disabled"},
                 )
             try:
-                job = await rag_service.complete_presigned_upload(job_id)
+                dispatch_value = request.headers.get("X-RAG-Dispatch-Started-At")
+                if dispatch_value:
+                    dispatch_started_at = datetime.fromisoformat(
+                        dispatch_value.replace("Z", "+00:00")
+                    )
+                    if dispatch_started_at.tzinfo is None:
+                        dispatch_started_at = dispatch_started_at.replace(
+                            tzinfo=timezone.utc
+                        )
+                else:
+                    dispatch_started_at = datetime.now(timezone.utc)
+                job = await rag_service.complete_presigned_upload(
+                    job_id, dispatch_started_at=dispatch_started_at
+                )
                 return JSONResponse(
                     status_code=202,
-                    content=jsonable_encoder(job.to_dict()),
+                    content=jsonable_encoder(_public_rag_record(job)),
                 )
             except KeyError:
                 return JSONResponse(
@@ -1876,6 +1900,14 @@ class LLMRouterPlatform:
                     status_code=409,
                     content={
                         "error": "rag_upload_integrity_mismatch",
+                        "message": str(exc),
+                    },
+                )
+            except ValueError as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_dispatch_timestamp",
                         "message": str(exc),
                     },
                 )
@@ -1935,7 +1967,7 @@ class LLMRouterPlatform:
                         document_id=job.document_id,
                         storage_ref=payload.get("storage_ref"),
                     )
-                return job.to_dict()
+                return _public_rag_record(job)
             except RagStorageCapacityError as exc:
                 return JSONResponse(
                     status_code=507,
@@ -1978,7 +2010,7 @@ class LLMRouterPlatform:
                     status_code=404,
                     content={"error": "rag_job_not_found"},
                 )
-            return job.to_dict()
+            return _public_rag_record(job)
 
         @app.post("/rag/jobs/{job_id}/retry")
         async def retry_rag_job(job_id: str):
@@ -2000,7 +2032,7 @@ class LLMRouterPlatform:
                     status_code=404,
                     content={"error": "rag_job_not_found"},
                 )
-            return job.to_dict()
+            return _public_rag_record(job)
 
         @app.post("/rag/batches")
         async def create_rag_batch(batch_request: RagBatchRequest):
@@ -2037,7 +2069,7 @@ class LLMRouterPlatform:
                     status_code=503,
                     content={"error": "rag_batch_unavailable", "message": str(exc)},
                 )
-            return batch.to_dict()
+            return _public_rag_record(batch)
 
         @app.get("/rag/batches/{batch_id}")
         async def get_rag_batch(batch_id: str):

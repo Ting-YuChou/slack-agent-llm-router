@@ -1,11 +1,12 @@
 import json
 import os
+import time
 import uuid
 
 import pytest
 
 from src.rag.chunker import DocumentChunk
-from src.rag.vector_store import RedisStackRagVectorStore
+from src.rag.vector_store import RedisStackRagVectorStore, StaleGenerationError
 
 
 async def _redis_stack_client_or_skip():
@@ -351,8 +352,6 @@ async def test_redis_rag_store_indexes_visual_chunks_and_cleans_sidecars():
         "visual": {
             "caption": "A diagram explaining registration steps.",
             "ocr_text": "Registration flow text inside the diagram.",
-            "visual_embedding_provider": "fake_visual",
-            "visual_embedding": [1.0, 0.0, 0.0, 0.0],
         },
     }
 
@@ -371,13 +370,11 @@ async def test_redis_rag_store_indexes_visual_chunks_and_cleans_sidecars():
                         "image_ref": figure["image_ref"],
                         "figure_caption": figure["visual"]["caption"],
                         "figure_ocr_text": figure["visual"]["ocr_text"],
-                        "visual_embedding_provider": "fake_visual",
                         "figure_sidecar": figure,
                     },
                 )
             ],
             [[0.0, 1.0, 0.0, 0.0]],
-            visual_embeddings=[[1.0, 0.0, 0.0, 0.0]],
             knowledge_base_id="school",
         )
 
@@ -393,35 +390,31 @@ async def test_redis_rag_store_indexes_visual_chunks_and_cleans_sidecars():
             knowledge_base_ids=["school"],
             limit=3,
             candidate_count=10,
-            keyword_weight=0.0,
+            keyword_weight=1.0,
             vector_weight=0.0,
             recency_weight=0.0,
             min_score=0.0,
-            visual_embedding=[1.0, 0.0, 0.0, 0.0],
-            visual_weight=1.0,
-            visual_min_score=0.0,
         )
 
         await store.upsert_chunks(
             [_chunk("replacement", "doc-fig", "replacement text")],
             [[0.0, 1.0, 0.0, 0.0]],
-            visual_embeddings=[None],
             knowledge_base_id="school",
         )
         figure_exists_after_reindex = await store.client.exists(figure_key)
         visual_exists_after_reindex = await store.client.exists(visual_key)
 
         assert figure_payload
-        assert visual_payload
+        assert not visual_payload
         assert json.loads(figure_payload[b"figure_json"])["figure_id"] == "figure-1"
         assert results
         assert results[0].chunk.metadata["is_figure"] is True
-        assert results[0].match_source == "visual"
+        assert results[0].match_source == "keyword"
         assert figure_exists_after_reindex == 0
         assert visual_exists_after_reindex == 0
     finally:
         if store.client:
-            for index_name in (store.index_name, store.visual_index_name):
+            for index_name in (store.index_name,):
                 try:
                     await store.client.execute_command("FT.DROPINDEX", index_name, "DD")
                 except Exception:
@@ -516,9 +509,10 @@ async def test_stale_generation_cannot_overwrite_newer_sidecars(monkeypatch):
             },
         )
 
-        await store.upsert_chunks(
-            [stale], [[0.0, 1.0, 0.0, 0.0]], knowledge_base_id="school"
-        )
+        with pytest.raises(StaleGenerationError):
+            await store.upsert_chunks(
+                [stale], [[0.0, 1.0, 0.0, 0.0]], knowledge_base_id="school"
+            )
 
         assert await store.client.exists(
             store._figure_key("school", "doc-race", "figure-new")
@@ -529,6 +523,88 @@ async def test_stale_generation_cannot_overwrite_newer_sidecars(monkeypatch):
         assert await store.client.smembers(
             store._document_key("doc-race", "school")
         ) == {b"newer"}
+    finally:
+        keys = [key async for key in client.scan_iter(match=f"{key_prefix}:*")]
+        if keys:
+            await client.delete(*keys)
+        await store.shutdown()
+        await client.aclose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_monotonic_generation_replaces_legacy_uuid_and_asset_ref():
+    client = await _redis_stack_client_or_skip()
+    key_prefix = f"ragtest:{uuid.uuid4().hex}"
+    store = RedisStackRagVectorStore(
+        {
+            "embedding": {"dimensions": 4},
+            "redis": {
+                "host": os.getenv("RAG_REDIS_HOST", "localhost"),
+                "port": int(os.getenv("RAG_REDIS_PORT", "6380")),
+                "key_prefix": key_prefix,
+            },
+        }
+    )
+    try:
+        await store.initialize()
+        legacy = _chunk(
+            "legacy",
+            "doc-legacy",
+            "legacy generation",
+            metadata={
+                "figure_id": "figure-1",
+                "figure_sidecar": {
+                    "figure_id": "figure-1",
+                    "asset_ref": {
+                        "uri": "rag-asset://kb/doc/legacy/figure.png",
+                        "version_id": "legacy-version",
+                    },
+                },
+            },
+        )
+        await store.upsert_chunks(
+            [legacy],
+            [[1.0, 0.0, 0.0, 0.0]],
+            knowledge_base_id="school",
+            index_version="a1234567-b123-c123-d123-e123456789ab",
+        )
+        replacement = _chunk(
+            "replacement",
+            "doc-legacy",
+            "new generation",
+            metadata={
+                "figure_id": "figure-1",
+                "figure_sidecar": {
+                    "figure_id": "figure-1",
+                    "asset_ref": {
+                        "uri": "rag-asset://kb/doc/new/figure.png",
+                        "version_id": "new-version",
+                    },
+                },
+            },
+        )
+        generation = f"{time.time_ns():020d}:{uuid.uuid4()}"
+
+        await store.upsert_chunks(
+            [replacement],
+            [[0.0, 1.0, 0.0, 0.0]],
+            knowledge_base_id="school",
+            index_version=generation,
+        )
+
+        assert await store.client.smembers(
+            store._document_key("doc-legacy", "school")
+        ) == {b"replacement"}
+        figure = await store.client.hgetall(
+            store._figure_key("school", "doc-legacy", "figure-1")
+        )
+        sidecar = json.loads(figure[b"figure_json"])
+        assert sidecar["asset_ref"]["version_id"] == "new-version"
+        assert (
+            await store.client.get(store._active_generation_key("doc-legacy", "school"))
+            == generation.encode()
+        )
     finally:
         keys = [key async for key in client.scan_iter(match=f"{key_prefix}:*")]
         if keys:

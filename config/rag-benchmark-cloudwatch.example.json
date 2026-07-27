@@ -1,0 +1,48 @@
+{
+  "queries": [
+    {
+      "key": "ecs_cpu",
+      "namespace": "AWS/ECS",
+      "metric_name": "CPUUtilization",
+      "dimensions": {"ClusterName": "REPLACE", "ServiceName": "REPLACE"}
+    },
+    {
+      "key": "ecs_memory",
+      "namespace": "AWS/ECS",
+      "metric_name": "MemoryUtilization",
+      "dimensions": {"ClusterName": "REPLACE", "ServiceName": "REPLACE"}
+    },
+    {
+      "key": "redis_cpu",
+      "namespace": "AWS/ElastiCache",
+      "metric_name": "EngineCPUUtilization",
+      "dimensions": {"CacheClusterId": "REPLACE", "CacheNodeId": "0001"}
+    },
+    {
+      "key": "redis_latency",
+      "namespace": "AWS/ElastiCache",
+      "metric_name": "SuccessfulReadRequestLatency",
+      "dimensions": {"CacheClusterId": "REPLACE"}
+    },
+    {
+      "key": "embedding_qps",
+      "namespace": "RAG/Embedding",
+      "metric_name": "RequestsPerSecond",
+      "dimensions": {"Endpoint": "REPLACE"}
+    },
+    {
+      "key": "embedding_p95",
+      "namespace": "RAG/Embedding",
+      "metric_name": "Latency",
+      "dimensions": {"Endpoint": "REPLACE"},
+      "stat": "p95"
+    },
+    {
+      "key": "embedding_errors",
+      "namespace": "RAG/Embedding",
+      "metric_name": "Errors",
+      "dimensions": {"Endpoint": "REPLACE"},
+      "stat": "Sum"
+    }
+  ]
+}

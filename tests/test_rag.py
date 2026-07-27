@@ -89,6 +89,8 @@ class FakeFigureCropper:
                     "height": 240,
                     "crop_scope": "bbox",
                     "crop_status": "completed",
+                    "media_type": "image/png",
+                    "_image_bytes": b"png-bytes",
                 }
             )
         return []
@@ -103,23 +105,15 @@ class FakeVisualProcessor:
 
     async def process_figure(self, _figure):
         if not self.include_text:
-            return VisualFigureResult(
-                visual_embedding=[1.0, 0.0],
-                visual_embedding_provider="fake_visual",
-            )
+            return VisualFigureResult()
         return VisualFigureResult(
             ocr_text="Registration flow text inside the diagram.",
             caption="A diagram explaining registration steps.",
             diagram_summary="Students select classes, confirm enrollment, then pay fees.",
             chart_summary="",
-            visual_embedding=[1.0, 0.0],
             ocr_provider="fake_ocr",
             caption_provider="fake_caption",
-            visual_embedding_provider="fake_visual",
         )
-
-    async def embed_query(self, _query):
-        return [1.0, 0.0]
 
 
 class FakeStreamRedis:
@@ -132,12 +126,21 @@ class FakeStreamRedis:
         self.zsets = {}
         self.expirations = {}
         self.xadd_kwargs = []
+        self.sequence = 0
 
     async def get(self, key):
         return self.values.get(key)
 
     async def setex(self, key, _ttl, value):
         self.values[key] = value
+
+    async def set(self, key, value, **kwargs):
+        if kwargs.get("nx") and key in self.values:
+            return False
+        self.values[key] = value
+        if kwargs.get("ex") is not None:
+            self.expirations[key] = int(kwargs["ex"])
+        return True
 
     async def delete(self, key):
         self.values.pop(key, None)
@@ -149,6 +152,18 @@ class FakeStreamRedis:
     async def expire(self, key, ttl):
         self.expirations[key] = ttl
         return True
+
+    async def eval(self, script, _numkeys, key, token, *args):
+        if "INCR" in script:
+            self.sequence = max(self.sequence, int(token)) + 1
+            return self.sequence
+        if self.values.get(key) != token:
+            return 0
+        if "expire" in script:
+            await self.expire(key, int(args[0]))
+            return 1
+        await self.delete(key)
+        return 1
 
     async def smembers(self, key):
         return set(self.sets.get(key, set()))
@@ -505,7 +520,7 @@ def test_chunker_emits_image_chunk_from_figure_metadata():
     assert chunks[0].metadata["is_figure"] is True
     assert chunks[0].metadata["figure_id"] == "pictures-0"
     assert chunks[0].metadata["image_ref"].endswith("pictures-0.png")
-    assert chunks[0].metadata["visual_embedding"] == [1.0, 0.0]
+    assert "visual_embedding" not in chunks[0].metadata
     assert "registration steps" in chunks[0].text
 
 
@@ -771,14 +786,12 @@ async def test_image_aware_rag_ingests_and_retrieves_figure_chunk():
             "retrieval": {
                 "top_k": 3,
                 "candidate_count": 5,
-                "keyword_weight": 0.0,
-                "vector_weight": 0.0,
+                "keyword_weight": 0.5,
+                "vector_weight": 0.5,
                 "recency_weight": 0.0,
             },
             "visual": {
                 "enabled": True,
-                "embedding": {"enabled": True, "dimensions": 2},
-                "retrieval": {"weight": 1.0, "min_score": 0.0},
                 "storage": {"assets_dir": "data/rag/assets"},
             },
         },
@@ -807,14 +820,13 @@ async def test_image_aware_rag_ingests_and_retrieves_figure_chunk():
     assert job.status == "completed"
     assert job.chunks_indexed == 1
     assert results
-    assert results[0].match_source == "visual"
+    assert results[0].match_source in {"vector", "keyword", "hybrid"}
     assert results[0].chunk.metadata["is_figure"] is True
     assert "Caption: A diagram explaining registration steps." in context
     assert "OCR text: Registration flow text inside the diagram." in context
     assert sources[0].figure_id == "pictures-0"
     assert sources[0].image_ref.endswith("pictures-0.png")
     assert deleted == 1
-    assert cropper.deleted == [("doc-figure", "school")]
 
 
 @pytest.mark.asyncio
@@ -829,14 +841,12 @@ async def test_image_only_visual_chunk_is_indexable_without_caption_or_ocr():
             "retrieval": {
                 "top_k": 1,
                 "candidate_count": 5,
-                "keyword_weight": 0.0,
+                "keyword_weight": 1.0,
                 "vector_weight": 0.0,
                 "recency_weight": 0.0,
             },
             "visual": {
                 "enabled": True,
-                "embedding": {"enabled": True, "dimensions": 2},
-                "retrieval": {"weight": 1.0, "min_score": 0.0},
             },
         },
         parser=FigureParser(),
@@ -853,15 +863,14 @@ async def test_image_only_visual_chunk_is_indexable_without_caption_or_ocr():
         knowledge_base_id="school",
         document_id="doc-figure",
     )
-    results = await service.retrieve(
-        "visual-only figure", knowledge_base_ids=["school"]
-    )
+    results = await service.retrieve("Figure pictures-0", knowledge_base_ids=["school"])
 
-    assert job.status == "completed"
+    assert job.status == "completed_with_warnings"
     assert job.chunks_indexed == 1
     assert results
     assert results[0].chunk.metadata["is_figure"] is True
-    assert results[0].match_source == "visual"
+    assert results[0].match_source == "keyword"
+    assert "no OCR or caption text" in " ".join(job.warnings)
 
 
 @pytest.mark.asyncio
@@ -1117,6 +1126,33 @@ async def test_queue_ingestion_stages_file_creates_job_and_xadds_stream(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_redis_stream_manual_retry_starts_new_generation_after_activation_failure(
+    tmp_path,
+):
+    service = _queued_rag_service(tmp_path)
+    await service.initialize()
+    job = await service.queue_document_ingestion(
+        content=b"figure source",
+        filename="report.pdf",
+        knowledge_base_id="school",
+        document_id="doc-1",
+    )
+    job.status = "failed"
+    job.dispatch_id = "old-dispatch"
+    job.index_version = "old-generation"
+    job.asset_refs = [
+        {"uri": "rag-asset://school/doc-1/old-generation/figures/one.png"}
+    ]
+    await service._save_job(job)
+
+    retried = await service.retry_job(job.job_id)
+
+    assert retried.dispatch_id != "old-dispatch"
+    assert retried.index_version != "old-generation"
+    assert retried.asset_refs == []
+
+
+@pytest.mark.asyncio
 async def test_post_xadd_job_refresh_failure_preserves_durable_file_and_message(
     tmp_path, monkeypatch
 ):
@@ -1154,7 +1190,7 @@ async def test_post_xadd_job_refresh_failure_preserves_durable_file_and_message(
 async def test_worker_success_marks_completed_and_acks_stream_message(tmp_path):
     service = _queued_rag_service(tmp_path)
     await service.initialize()
-    job = await service.queue_document_ingestion(
+    await service.queue_document_ingestion(
         content=b"Tuition deadline is May 1.",
         filename="handbook.md",
         knowledge_base_id="school",

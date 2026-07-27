@@ -566,24 +566,16 @@ def test_rag_batch_and_indexing_config_survive_validation():
 
 
 @pytest.mark.asyncio
-async def test_query_text_and_visual_embeddings_start_concurrently():
-    both_started = asyncio.Event()
+async def test_query_only_uses_text_embedding_and_never_visual_embedding():
     started = set()
 
     async def mark_started(name, value):
         started.add(name)
-        if len(started) == 2:
-            both_started.set()
-        await asyncio.wait_for(both_started.wait(), timeout=0.1)
         return value
 
     class TextProvider:
         async def embed(self, _text):
             return await mark_started("text", [1.0])
-
-    class VisualProvider:
-        async def embed_query(self, _text):
-            return await mark_started("visual", [1.0])
 
     class Store:
         def __init__(self):
@@ -592,7 +584,7 @@ async def test_query_text_and_visual_embeddings_start_concurrently():
 
         async def search(self, _query, embedding, **kwargs):
             self.embedding = embedding
-            self.visual_embedding = kwargs["visual_embedding"]
+            self.visual_embedding = kwargs.get("visual_embedding")
             return []
 
     store = Store()
@@ -600,17 +592,16 @@ async def test_query_text_and_visual_embeddings_start_concurrently():
         {
             "enabled": True,
             "backend": "memory",
-            "visual": {"enabled": True, "embedding": {"enabled": True}},
+            "visual": {"enabled": True},
         },
         embedding_provider=TextProvider(),
-        visual_processor=VisualProvider(),
         vector_store=store,
     )
 
     assert await service.retrieve("tuition") == []
-    assert started == {"text", "visual"}
+    assert started == {"text"}
     assert store.embedding == [1.0]
-    assert store.visual_embedding == [1.0]
+    assert store.visual_embedding is None
 
 
 @pytest.mark.asyncio
@@ -654,7 +645,7 @@ async def test_redis_retrieval_branches_run_concurrently_and_degrade_independent
 
     async def branch(name, *, fail=False):
         started.add(name)
-        if len(started) == 3:
+        if len(started) == 2:
             all_started.set()
         await asyncio.wait_for(all_started.wait(), timeout=0.1)
         if fail:
@@ -663,7 +654,6 @@ async def test_redis_retrieval_branches_run_concurrently_and_degrade_independent
 
     store._keyword_search = lambda *_args: branch("keyword")
     store._vector_search = lambda *_args: branch("vector", fail=True)
-    store._visual_search = lambda *_args: branch("visual")
 
     results = await store.search(
         "tuition",
@@ -675,12 +665,10 @@ async def test_redis_retrieval_branches_run_concurrently_and_degrade_independent
         vector_weight=0.6,
         recency_weight=0.05,
         min_score=0.0,
-        visual_embedding=[1.0],
-        visual_weight=0.4,
     )
 
     assert results == []
-    assert started == {"keyword", "vector", "visual"}
+    assert started == {"keyword", "vector"}
 
 
 @pytest.mark.asyncio

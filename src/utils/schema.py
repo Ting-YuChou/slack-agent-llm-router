@@ -1,9 +1,16 @@
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 
 class UserTier(str, Enum):
@@ -102,6 +109,8 @@ class ToolCall(BaseModel):
 
 
 class QueryRequest(BaseModel):
+    _rag_images: List[Any] = PrivateAttr(default_factory=list)
+
     # Required fields
     query: str = Field(..., min_length=1, max_length=50000)
     user_id: str = Field(..., min_length=1)
@@ -187,6 +196,7 @@ class InferenceResponse(BaseModel):
     # Error handling
     error: Optional[str] = None
     finish_reason: str = "stop"
+    warnings: List[str] = Field(default_factory=list)
 
     # Timestamps
     timestamp: datetime = Field(default_factory=datetime.now)
@@ -319,6 +329,7 @@ class ModelConfig(BaseModel):
             "translation",
             "tool_use",
             "web_search",
+            "vision",
         }
         for cap in v:
             if cap not in valid_capabilities:
@@ -1018,6 +1029,16 @@ class RagChunkingConfig(ConfigModel):
     max_chunk_chars: int = Field(6000, ge=500)
 
 
+class RagLayoutNormalizationConfig(ConfigModel):
+    enabled: bool = True
+    repeated_block_min_pages: int = Field(3, ge=2)
+    repeated_block_min_ratio: float = Field(0.60, gt=0.0, le=1.0)
+    top_margin_ratio: float = Field(0.10, ge=0.0, le=0.5)
+    bottom_margin_ratio: float = Field(0.10, ge=0.0, le=0.5)
+    page_seam_margin_ratio: float = Field(0.20, ge=0.0, le=0.5)
+    unresolved_policy: str = "preserve_with_warning"
+
+
 class RagEmbeddingConfig(ConfigModel):
     provider: str = "local_http"
     model: str = "BAAI/bge-m3"
@@ -1136,6 +1157,13 @@ class RagVisualStorageConfig(ConfigModel):
     assets_dir: str = "data/rag/assets"
 
 
+class RagAnswerImagesConfig(ConfigModel):
+    enabled: bool = True
+    max_images: int = Field(3, ge=0, le=3)
+    max_bytes: int = Field(5_000_000, ge=1)
+    max_long_edge_pixels: int = Field(1568, ge=64)
+
+
 class RagVisualConfig(ConfigModel):
     enabled: bool = False
     required: bool = False
@@ -1161,6 +1189,13 @@ class RagVisualConfig(ConfigModel):
         default_factory=RagVisualRetrievalConfig
     )
     storage: RagVisualStorageConfig = Field(default_factory=RagVisualStorageConfig)
+    answer_images: RagAnswerImagesConfig = Field(default_factory=RagAnswerImagesConfig)
+
+    @model_validator(mode="after")
+    def reject_enabled_legacy_embedding(self):
+        if self.embedding.enabled:
+            raise ValueError("rag.visual.embedding.enabled=true is no longer supported")
+        return self
 
 
 class RagConfig(ConfigModel):
@@ -1172,6 +1207,9 @@ class RagConfig(ConfigModel):
     local_batch_cache_max_entries: int = Field(100, ge=1)
     job_ttl_seconds: int = Field(86400, ge=60)
     parser: RagParserConfig = Field(default_factory=RagParserConfig)
+    layout_normalization: RagLayoutNormalizationConfig = Field(
+        default_factory=RagLayoutNormalizationConfig
+    )
     chunking: RagChunkingConfig = Field(default_factory=RagChunkingConfig)
     embedding: RagEmbeddingConfig = Field(default_factory=RagEmbeddingConfig)
     redis: RagRedisConfig = Field(default_factory=RagRedisConfig)

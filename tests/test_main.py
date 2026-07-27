@@ -1282,7 +1282,7 @@ class TestApiApp:
                     },
                 }
 
-            async def complete_presigned_upload(self, job_id):
+            async def complete_presigned_upload(self, job_id, **_kwargs):
                 job = self.jobs[job_id]
                 job.status = "queued"
                 return job
