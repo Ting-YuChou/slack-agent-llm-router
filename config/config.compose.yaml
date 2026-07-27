@@ -121,6 +121,7 @@ router:
         - analysis
         - tool_use
         - web_search
+        - vision
     claude-sonnet-4-6:
       provider: anthropic
       api_key_env: ANTHROPIC_API_KEY
@@ -133,6 +134,7 @@ router:
         - analysis
         - tool_use
         - web_search
+        - vision
   routing_rules:
     - condition: user_tier == 'enterprise'
       models:
@@ -255,6 +257,14 @@ rag:
     ocr_languages: []
     table_structure_enabled: true
     converter_kwargs: {}
+  layout_normalization:
+    enabled: true
+    repeated_block_min_pages: 3
+    repeated_block_min_ratio: 0.60
+    top_margin_ratio: 0.10
+    bottom_margin_ratio: 0.10
+    page_seam_margin_ratio: 0.20
+    unresolved_policy: preserve_with_warning
   chunking:
     strategy: hybrid
     chunk_size_tokens: 900
@@ -360,19 +370,13 @@ rag:
       model: Qwen/Qwen2.5-VL-7B-Instruct
       url:
       timeout: 30
-    embedding:
-      enabled: false
-      provider: nomic_multimodal
-      model: nomic-ai/nomic-embed-multimodal-3b
-      url:
-      dimensions: 1024
-      timeout: 30
-    retrieval:
-      top_k: 5
-      weight: 0.4
-      min_score: 0.0
     storage:
       assets_dir: data/rag/assets
+    answer_images:
+      enabled: true
+      max_images: 3
+      max_bytes: 5000000
+      max_long_edge_pixels: 1568
   intent_gate:
     strong_terms:
       - academic calendar

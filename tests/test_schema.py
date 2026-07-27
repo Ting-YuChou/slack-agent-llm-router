@@ -16,6 +16,7 @@ from src.utils.schema import (
     ProviderEndpointConfig,
     ProviderSchedulerConfig,
     QueryRequest,
+    RagConfig,
     RagPolicy,
     ResponseSource,
     SystemMetric,
@@ -159,6 +160,40 @@ def test_model_config_accepts_tool_capabilities():
     )
 
     assert "web_search" in model.capabilities
+
+
+def test_model_config_accepts_vision_capability():
+    model = ModelConfig(
+        name="vision-model",
+        provider="openai",
+        max_tokens=1000,
+        cost_per_token=0,
+        priority=1,
+        capabilities=["general", "vision"],
+    )
+
+    assert "vision" in model.capabilities
+
+
+def test_rag_config_rejects_enabled_legacy_visual_embedding():
+    with pytest.raises(ValueError, match="no longer supported"):
+        RagConfig(
+            visual={
+                "enabled": True,
+                "embedding": {"enabled": True},
+            }
+        )
+
+
+def test_rag_config_accepts_disabled_legacy_visual_embedding():
+    config = RagConfig(
+        visual={
+            "enabled": True,
+            "embedding": {"enabled": False},
+        }
+    )
+
+    assert config.visual.embedding.enabled is False
 
 
 def test_system_metric_name_validation():
@@ -494,7 +529,7 @@ def test_platform_config_accepts_rag_config():
                 "enabled": True,
                 "crop_dpi": 180,
                 "embedding": {
-                    "enabled": True,
+                    "enabled": False,
                     "provider": "nomic_multimodal",
                     "dimensions": 1024,
                 },
@@ -512,6 +547,7 @@ def test_platform_config_accepts_rag_config():
     assert config.rag.visual.enabled is True
     assert config.rag.visual.embedding.provider == "nomic_multimodal"
     assert config.rag.visual.embedding.dimensions == 1024
+    assert config.rag.visual.answer_images.max_images == 3
     assert config.rag.ingestion_queue.enabled is True
     assert config.rag.ingestion_queue.concurrency == 2
     assert config.rag.storage.staging_dir == "data/rag/uploads"
@@ -571,3 +607,16 @@ def test_compose_and_default_config_keep_flink_topics_in_sync():
 
     assert expected_topic_keys.issubset(default_topics)
     assert expected_topic_keys.issubset(compose_topics)
+
+
+def test_checked_in_configs_keep_docling_converter_kwargs_under_parser():
+    root = Path(__file__).resolve().parents[1]
+    for filename in ("config.yaml", "config.compose.yaml"):
+        payload = yaml.safe_load(
+            (root / "config" / filename).read_text(encoding="utf-8")
+        )
+        rag = payload["rag"]
+        validated = RagConfig.model_validate(rag)
+
+        assert validated.parser.converter_kwargs == {}
+        assert "converter_kwargs" not in rag["layout_normalization"]

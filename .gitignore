@@ -34,6 +34,7 @@ logs/
 data/processed/
 data/cache/
 data/rag/uploads/
+benchmark-results/
 queries/logs.csv
 flink/logs.csv
 

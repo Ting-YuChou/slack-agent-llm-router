@@ -1,5 +1,6 @@
 """Image-aware helpers for school-document RAG ingestion."""
 
+import base64
 import hashlib
 import json
 import logging
@@ -25,10 +26,8 @@ class VisualFigureResult:
     chart_summary: str = ""
     structured_json: Any = None
     warnings: List[str] = field(default_factory=list)
-    visual_embedding: Optional[List[float]] = None
     ocr_provider: str = ""
     caption_provider: str = ""
-    visual_embedding_provider: str = ""
 
     def to_metadata(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -44,10 +43,7 @@ class VisualFigureResult:
             "warnings": self.warnings,
             "ocr_provider": self.ocr_provider,
             "caption_provider": self.caption_provider,
-            "visual_embedding_provider": self.visual_embedding_provider,
         }
-        if self.visual_embedding is not None:
-            payload["visual_embedding"] = list(self.visual_embedding)
         return payload
 
 
@@ -103,14 +99,6 @@ class FigureCropper:
             return [warning]
 
         try:
-            target_dir = (
-                self.assets_dir
-                / _safe_path_part(knowledge_base_id)
-                / _safe_path_part(parsed_document.document_id)
-                / "figures"
-            )
-            _clear_directory(target_dir)
-            target_dir.mkdir(parents=True, exist_ok=True)
             scale = max(self.crop_dpi, 72) / 72.0
             matrix = fitz.Matrix(scale, scale)
             for block in figures:
@@ -123,7 +111,12 @@ class FigureCropper:
                     continue
                 page = pdf[page_index]
                 crop_scope = "bbox" if getattr(block, "bbox", None) else "page"
-                clip = _fitz_clip_rect(fitz, page.rect, getattr(block, "bbox", None))
+                clip = _fitz_clip_rect(
+                    fitz,
+                    page.rect,
+                    getattr(block, "bbox", None),
+                    getattr(block, "metadata", None),
+                )
                 if clip is None:
                     crop_scope = "page"
                 pixmap = page.get_pixmap(matrix=matrix, clip=clip, alpha=False)
@@ -135,12 +128,11 @@ class FigureCropper:
                     figure["crop_warning"] = "figure crop is below min_crop_pixels"
                     warnings.append(figure["crop_warning"])
                     continue
-                image_path = target_dir / f"{_safe_path_part(figure['figure_id'])}.png"
-                pixmap.save(str(image_path))
-                image_bytes = image_path.read_bytes()
+                image_bytes = pixmap.tobytes("png")
                 figure.update(
                     {
-                        "image_ref": str(image_path),
+                        "_image_bytes": image_bytes,
+                        "media_type": "image/png",
                         "content_hash": hashlib.sha256(image_bytes).hexdigest(),
                         "width": pixmap.width,
                         "height": pixmap.height,
@@ -167,9 +159,6 @@ class VisualProcessor:
     async def process_figure(self, figure: Dict[str, Any]) -> VisualFigureResult:
         return VisualFigureResult()
 
-    async def embed_query(self, query: str) -> Optional[List[float]]:
-        return None
-
 
 class LocalHttpVisualProcessor(VisualProcessor):
     """Calls optional local HTTP services for OCR/captioning/visual embeddings."""
@@ -178,14 +167,23 @@ class LocalHttpVisualProcessor(VisualProcessor):
         self.config = dict(config or {})
         self.ocr_config = dict(self.config.get("ocr", {}) or {})
         self.caption_config = dict(self.config.get("caption", {}) or {})
-        self.embedding_config = dict(self.config.get("embedding", {}) or {})
 
     async def process_figure(self, figure: Dict[str, Any]) -> VisualFigureResult:
         result = VisualFigureResult(
             ocr_provider=str(self.ocr_config.get("provider") or ""),
             caption_provider=str(self.caption_config.get("provider") or ""),
-            visual_embedding_provider=str(self.embedding_config.get("provider") or ""),
         )
+        image_bytes = figure.get("_image_bytes")
+        image_base64 = (
+            base64.b64encode(image_bytes).decode("ascii")
+            if isinstance(image_bytes, bytes)
+            else None
+        )
+        safe_figure = {
+            key: _json_safe(value)
+            for key, value in figure.items()
+            if not str(key).startswith("_")
+        }
         if self.ocr_config.get("enabled", False):
             ocr_payload = await self._call_provider(
                 self.ocr_config,
@@ -193,7 +191,9 @@ class LocalHttpVisualProcessor(VisualProcessor):
                     "task": "document_parse",
                     "model": self.ocr_config.get("model"),
                     "image_ref": figure.get("image_ref"),
-                    "figure": _json_safe(figure),
+                    "image_base64": image_base64,
+                    "media_type": figure.get("media_type") or "image/png",
+                    "figure": safe_figure,
                 },
             )
             self._merge_ocr_payload(result, ocr_payload)
@@ -204,36 +204,13 @@ class LocalHttpVisualProcessor(VisualProcessor):
                     "task": "caption_chart_diagram",
                     "model": self.caption_config.get("model"),
                     "image_ref": figure.get("image_ref"),
-                    "figure": _json_safe(figure),
+                    "image_base64": image_base64,
+                    "media_type": figure.get("media_type") or "image/png",
+                    "figure": safe_figure,
                 },
             )
             self._merge_caption_payload(result, caption_payload)
-        if self.embedding_config.get("enabled", False):
-            embedding_payload = await self._call_provider(
-                self.embedding_config,
-                {
-                    "task": "retrieval.document",
-                    "model": self.embedding_config.get("model"),
-                    "input": [{"image_ref": figure.get("image_ref")}],
-                    "image_ref": figure.get("image_ref"),
-                },
-            )
-            result.visual_embedding = _extract_embedding(embedding_payload)
         return result
-
-    async def embed_query(self, query: str) -> Optional[List[float]]:
-        if not self.embedding_config.get("enabled", False):
-            return None
-        payload = await self._call_provider(
-            self.embedding_config,
-            {
-                "task": "retrieval.query",
-                "model": self.embedding_config.get("model"),
-                "input": [{"text": query}],
-                "query": query,
-            },
-        )
-        return _extract_embedding(payload)
 
     async def _call_provider(
         self, provider_config: Dict[str, Any], payload: Dict[str, Any]
@@ -248,13 +225,25 @@ class LocalHttpVisualProcessor(VisualProcessor):
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload, timeout=timeout) as response:
                     if response.status >= 400:
-                        text = await response.text()
-                        raise RuntimeError(f"{response.status}: {text[:200]}")
+                        raise RuntimeError(
+                            f"visual provider returned HTTP {response.status}"
+                        )
                     data = await response.json()
                     return data if isinstance(data, dict) else {}
         except Exception as exc:
-            logger.info("Visual provider unavailable at %s: %s", url, exc)
-            return {"warnings": [str(exc)]}
+            error_type = type(exc).__name__
+            logger.info(
+                "Visual provider unavailable at %s (%s)",
+                url,
+                error_type,
+            )
+            if isinstance(exc, RuntimeError) and str(exc).startswith(
+                "visual provider returned HTTP "
+            ):
+                warning = str(exc)
+            else:
+                warning = f"visual provider request failed ({error_type})"
+            return {"warnings": [warning]}
 
     def _merge_ocr_payload(
         self, result: VisualFigureResult, payload: Dict[str, Any]
@@ -301,13 +290,39 @@ def compose_figure_text(block: Any) -> str:
         value = visual.get(key)
         if isinstance(value, str) and value.strip():
             parts.append(f"{title}: {' '.join(value.split())}")
+    detected_labels = _detected_element_labels(visual.get("detected_elements"))
+    if detected_labels:
+        parts.append(f"Detected labels: {'; '.join(detected_labels)}")
     for key in ("chart_data", "structured_json"):
         value = visual.get(key)
         if value:
             parts.append(f"{key}: {json.dumps(_json_safe(value), sort_keys=True)}")
-    if not parts and visual.get("visual_embedding") is not None:
-        parts.append(f"Figure on page {getattr(block, 'page', figure.get('page', 1))}")
     return "\n".join(parts)
+
+
+def _detected_element_labels(value: Any) -> List[str]:
+    """Render bounded semantic labels without indexing geometry payloads."""
+    if not isinstance(value, list):
+        return []
+    labels: List[str] = []
+    seen = set()
+    for element in value[:100]:
+        if not isinstance(element, dict):
+            continue
+        semantic_parts = []
+        for key in ("label", "text", "content", "name", "value"):
+            item = element.get(key)
+            if isinstance(item, (str, int, float)):
+                normalized = " ".join(str(item).split())[:300]
+                if normalized and normalized not in semantic_parts:
+                    semantic_parts.append(normalized)
+        rendered = " | ".join(semantic_parts)
+        if rendered and rendered not in seen:
+            seen.add(rendered)
+            labels.append(rendered)
+        if sum(len(label) for label in labels) >= 4000:
+            break
+    return labels
 
 
 def _figure_metadata(block: Any) -> Dict[str, Any]:
@@ -354,10 +369,31 @@ def _stable_figure_id(
     return f"figure-{hashlib.sha1(payload.encode('utf-8')).hexdigest()[:12]}"
 
 
-def _fitz_clip_rect(fitz: Any, page_rect: Any, bbox: Optional[Sequence[float]]) -> Any:
+def _fitz_clip_rect(
+    fitz: Any,
+    page_rect: Any,
+    bbox: Optional[Sequence[float]],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Any:
     if not bbox or len(bbox) != 4:
         return None
-    rect = fitz.Rect([float(value) for value in bbox])
+    values = [float(value) for value in bbox]
+    provenance = (metadata or {}).get("provenance") or []
+    first = provenance[0] if provenance and isinstance(provenance[0], dict) else {}
+    provenance_bbox = first.get("bbox") if isinstance(first.get("bbox"), dict) else {}
+    origin = str(
+        first.get("coord_origin")
+        or provenance_bbox.get("coord_origin")
+        or (metadata or {}).get("coord_origin")
+        or ""
+    ).lower()
+    if "bottom" in origin:
+        page_height = float(page_rect.height)
+        low = min(values[1], values[3])
+        high = max(values[1], values[3])
+        values[1] = page_height - high
+        values[3] = page_height - low
+    rect = fitz.Rect(values)
     rect = rect & page_rect
     if rect.is_empty or rect.width <= 0 or rect.height <= 0:
         return None

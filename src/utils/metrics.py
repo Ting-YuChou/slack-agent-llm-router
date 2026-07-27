@@ -3,7 +3,7 @@ Prometheus metrics definitions for LLM Router Platform
 Comprehensive metrics collection for monitoring and observability
 """
 
-from prometheus_client import Counter, Gauge, Histogram, Summary, Info, Enum
+from prometheus_client import Counter, Gauge, Histogram, Info, Enum
 from prometheus_client.metrics import MetricWrapperBase
 import time
 from typing import Dict, List, Optional, Any
@@ -781,6 +781,21 @@ class RagMetrics:
             "RAG ingestion delivery outcomes",
             ["backend", "outcome"],
         )
+        self.duplicate_noops = Counter(
+            "llm_router_rag_duplicate_noops_total",
+            "RAG indexing deliveries safely skipped because a generation was active",
+            ["backend", "reason"],
+        )
+        self.duplicate_deliveries = Counter(
+            "llm_router_rag_duplicate_deliveries_total",
+            "RAG deliveries absorbed after the dispatch had reached terminal state",
+            ["backend", "reason"],
+        )
+        self.index_commits = Counter(
+            "llm_router_rag_index_commits_total",
+            "RAG document generations atomically committed to the active index",
+            ["backend"],
+        )
         self.processing_lease_contention = Counter(
             "llm_router_rag_processing_lease_contention_total",
             "RAG deliveries deferred because another worker owns the dispatch lease",
@@ -789,6 +804,21 @@ class RagMetrics:
             "llm_router_rag_processing_duration_seconds",
             "RAG ingestion delivery processing duration",
             ["backend", "outcome"],
+        )
+        self.layout_outcomes = Counter(
+            "llm_router_rag_layout_outcomes_total",
+            "RAG layout normalization outcomes",
+            ["outcome"],
+        )
+        self.figure_outcomes = Counter(
+            "llm_router_rag_figure_outcomes_total",
+            "RAG figure indexing and preservation outcomes",
+            ["outcome"],
+        )
+        self.vision_outcomes = Counter(
+            "llm_router_rag_vision_outcomes_total",
+            "RAG vision routing and fallback outcomes",
+            ["outcome"],
         )
 
 

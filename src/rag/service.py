@@ -6,22 +6,31 @@ import binascii
 import hashlib
 import json
 import logging
+import math
 import os
 import socket
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from src.memory import EmbeddingProvider, build_embedding_provider
 from src.rag.chunker import DocumentChunk, build_chunker
+from src.rag.normalizer import DocumentLayoutNormalizer
 from src.rag.parser import build_document_parser
 from src.rag.reranker import Reranker, build_reranker
 from src.rag.queue import QueueDelivery, SqsIngestionQueue
 from src.rag.staging import RagStagingStore, StagingCapacityError
-from src.rag.storage import RagObjectRef, S3ObjectStore
+from src.rag.storage import (
+    LocalRagAssetStore,
+    RagAssetRef,
+    RagObjectRef,
+    S3ObjectStore,
+    S3RagAssetStore,
+)
 from src.rag.vector_store import RagSearchResult, build_vector_store
 from src.rag.visual import (
     FigureCropper,
@@ -70,6 +79,21 @@ class RagQueuePreDurabilityError(RuntimeError):
     safe_to_cleanup_staging = True
 
 
+@dataclass(frozen=True)
+class RagImageInput:
+    """Private image materialization passed from RAG to a vision provider."""
+
+    source_rank: int
+    figure_id: str
+    page: Optional[int]
+    caption: Optional[str]
+    asset_ref: RagAssetRef
+    content: bytes
+    content_checksum_sha256: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+
+
 @dataclass
 class IngestionJob:
     """Ingestion job record surfaced by the API."""
@@ -90,12 +114,16 @@ class IngestionJob:
     batch_id: Optional[str] = None
     storage_ref: Optional[str] = None
     source: Dict[str, Any] = field(default_factory=dict)
+    asset_refs: List[Dict[str, Any]] = field(default_factory=list)
     dispatch_id: Optional[str] = None
     index_version: Optional[str] = None
     upload_request_fingerprint: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
+    dispatch_started_at: Optional[datetime] = None
+    processing_started_at: Optional[datetime] = None
+    terminal_at: Optional[datetime] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -115,13 +143,31 @@ class IngestionJob:
             "batch_id": self.batch_id,
             "storage_ref": self.storage_ref,
             "source": dict(self.source),
+            "asset_refs": [dict(value) for value in self.asset_refs],
             "dispatch_id": self.dispatch_id,
             "index_version": self.index_version,
             "upload_request_fingerprint": self.upload_request_fingerprint,
             "metadata": dict(self.metadata),
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
+            "dispatch_started_at": (
+                self.dispatch_started_at.isoformat()
+                if self.dispatch_started_at
+                else None
+            ),
+            "processing_started_at": (
+                self.processing_started_at.isoformat()
+                if self.processing_started_at
+                else None
+            ),
+            "terminal_at": self.terminal_at.isoformat() if self.terminal_at else None,
         }
+
+    def to_public_dict(self) -> Dict[str, Any]:
+        """Serialize API-safe job state without versioned storage locations."""
+        payload = self.to_dict()
+        payload.pop("asset_refs", None)
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "IngestionJob":
@@ -142,12 +188,24 @@ class IngestionJob:
             batch_id=payload.get("batch_id"),
             storage_ref=payload.get("storage_ref"),
             source=dict(payload.get("source") or {}),
+            asset_refs=[
+                dict(value)
+                for value in payload.get("asset_refs") or []
+                if isinstance(value, dict)
+            ],
             dispatch_id=payload.get("dispatch_id"),
             index_version=payload.get("index_version"),
             upload_request_fingerprint=payload.get("upload_request_fingerprint"),
             metadata=dict(payload.get("metadata") or {}),
             created_at=_parse_datetime(payload.get("created_at")),
             updated_at=_parse_datetime(payload.get("updated_at")),
+            dispatch_started_at=_parse_optional_datetime(
+                payload.get("dispatch_started_at")
+            ),
+            processing_started_at=_parse_optional_datetime(
+                payload.get("processing_started_at")
+            ),
+            terminal_at=_parse_optional_datetime(payload.get("terminal_at")),
         )
 
 
@@ -184,6 +242,15 @@ class IngestionBatch:
             "updated_at": self.updated_at.isoformat(),
         }
 
+    def to_public_dict(
+        self, jobs: Optional[Sequence[IngestionJob]] = None
+    ) -> Dict[str, Any]:
+        payload = self.to_dict(jobs=[])
+        payload["jobs"] = (
+            [job.to_public_dict() for job in jobs] if jobs is not None else None
+        )
+        return payload
+
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "IngestionBatch":
         return cls(
@@ -211,6 +278,7 @@ class RagService:
         visual_processor: Optional[VisualProcessor] = None,
         figure_cropper: Optional[FigureCropper] = None,
         object_store: Optional[Any] = None,
+        asset_store: Optional[Any] = None,
         ingestion_queue: Optional[Any] = None,
     ):
         self.config = dict(config or {})
@@ -220,11 +288,22 @@ class RagService:
             self.config.get("default_knowledge_base_ids", []) or []
         )
         self.parser_config = dict(self.config.get("parser", {}) or {})
+        self.layout_normalization_config = dict(
+            self.config.get("layout_normalization", {}) or {}
+        )
         self.chunking_config = dict(self.config.get("chunking", {}) or {})
         self.embedding_config = dict(self.config.get("embedding", {}) or {})
         self.retrieval_config = dict(self.config.get("retrieval", {}) or {})
         self.rerank_config = dict(self.config.get("rerank", {}) or {})
         self.visual_config = dict(self.config.get("visual", {}) or {})
+        legacy_visual_embedding = dict(self.visual_config.get("embedding", {}) or {})
+        if legacy_visual_embedding.get("enabled", False):
+            raise ValueError(
+                "rag.visual.embedding.enabled=true is no longer supported; "
+                "reindex figures with OCR/caption text embeddings"
+            )
+        if "embedding" in self.visual_config or "retrieval" in self.visual_config:
+            logger.warning("rag.visual.embedding/retrieval are deprecated and ignored")
         self.redis_config = dict(self.config.get("redis", {}) or {})
         self.intent_gate_config = dict(self.config.get("intent_gate", {}) or {})
         self.queue_config = dict(self.config.get("ingestion_queue", {}) or {})
@@ -313,6 +392,15 @@ class RagService:
             self.object_store = S3ObjectStore(
                 dict(self.storage_config.get("s3", {}) or {})
             )
+        self.asset_store = asset_store
+        if self.asset_store is None:
+            if self.storage_backend == "s3":
+                self.asset_store = S3RagAssetStore(
+                    dict(self.storage_config.get("s3", {}) or {})
+                )
+            else:
+                visual_storage = dict(self.visual_config.get("storage", {}) or {})
+                self.asset_store = LocalRagAssetStore(visual_storage)
         self.ingestion_queue = ingestion_queue
         if self.queue_backend == "sqs" and self.ingestion_queue is None:
             self.ingestion_queue = SqsIngestionQueue(
@@ -320,6 +408,9 @@ class RagService:
             )
         self._janitor_task: Optional[asyncio.Task] = None
         self.parser = parser or build_document_parser(self.parser_config)
+        self.layout_normalizer = DocumentLayoutNormalizer(
+            self.layout_normalization_config
+        )
         self.chunker = build_chunker(self.chunking_config)
         self.embedding_provider = embedding_provider or build_embedding_provider(
             self.embedding_config
@@ -465,7 +556,7 @@ class RagService:
                 resolved_source = ref.to_dict()
         dispatch_id = None
         index_version = None
-        if self.queue_backend == "sqs":
+        if self.queue_enabled:
             dispatch_id, index_version = await self._new_sqs_dispatch()
         job = IngestionJob(
             job_id=resolved_job_id,
@@ -479,6 +570,9 @@ class RagService:
             dispatch_id=dispatch_id,
             index_version=index_version,
             metadata=dict(metadata or {}),
+            dispatch_started_at=(
+                datetime.now(timezone.utc) if self.queue_enabled else None
+            ),
         )
         if self.queue_enabled and self.queue_backend == "sqs":
             job.status = "enqueue_pending"
@@ -605,7 +699,12 @@ class RagService:
         if current is not None and _decode(current) == job_id:
             await client.delete(key)
 
-    async def complete_presigned_upload(self, job_id: str) -> IngestionJob:
+    async def complete_presigned_upload(
+        self,
+        job_id: str,
+        *,
+        dispatch_started_at: Optional[datetime] = None,
+    ) -> IngestionJob:
         if self.storage_backend != "s3" or self.object_store is None:
             raise RuntimeError("presigned uploads require the S3 storage backend")
         job = await self.get_job(job_id)
@@ -619,6 +718,12 @@ class RagService:
         job.source = ref.to_dict()
         job.storage_ref = ref.uri
         job.status = "enqueue_pending"
+        if job.dispatch_started_at is None:
+            job.dispatch_started_at = dispatch_started_at or datetime.now(timezone.utc)
+            if job.dispatch_started_at.tzinfo is None:
+                job.dispatch_started_at = job.dispatch_started_at.replace(
+                    tzinfo=timezone.utc
+                )
         job.updated_at = datetime.now()
         await self._save_job(job)
         await self._tag_job_source(job, "queued")
@@ -651,12 +756,42 @@ class RagService:
             )
         try:
             job.status = "running"
+            if not job.index_version:
+                dispatch_id, index_version = await self._new_sqs_dispatch()
+                job.dispatch_id = job.dispatch_id or dispatch_id
+                job.index_version = index_version
+            if job.processing_started_at is None:
+                job.processing_started_at = datetime.now(timezone.utc)
             job.worker_id = worker_id
             job.stream_message_id = stream_message_id
             if attempt is not None:
                 job.attempts = max(job.attempts, int(attempt))
             job.updated_at = datetime.now()
             await self._save_job(job)
+            if job.asset_refs and await self.vector_store.is_generation_active(
+                document_id,
+                knowledge_base_id,
+                str(job.index_version),
+            ):
+                for payload in job.asset_refs:
+                    await self.asset_store.activate(RagAssetRef.from_dict(payload))
+                try:
+                    await self.asset_store.delete_other_generations(
+                        document_id,
+                        knowledge_base_id,
+                        str(job.index_version),
+                    )
+                except Exception as exc:
+                    job.warnings.append(
+                        f"Failed to clean previous figure asset generations: {exc}"
+                    )
+                job.status = "completed_with_warnings" if job.warnings else "completed"
+                job.error = None
+                job.last_error = None
+                job.terminal_at = datetime.now(timezone.utc)
+                job.updated_at = datetime.now()
+                await self._save_job(job)
+                return job
             if content is None:
                 if job.source.get("backend") == "s3":
                     if self.object_store is None:
@@ -676,31 +811,57 @@ class RagService:
                     "knowledge_base_id": knowledge_base_id,
                 },
             )
-            visual_warnings = await self._process_visual_blocks(
+            normalization = await asyncio.to_thread(
+                self.layout_normalizer.normalize, parsed
+            )
+            for outcome, count in normalization.stats.items():
+                if count:
+                    RAG_METRICS.layout_outcomes.labels(outcome).inc(count)
+            parsed = normalization.document
+            visual_warnings, asset_refs = await self._process_visual_blocks(
                 content=content,
                 filename=filename,
                 parsed=parsed,
                 knowledge_base_id=knowledge_base_id,
+                document_id=document_id,
+                index_version=job.index_version,
             )
             chunks = self.chunker.chunk(parsed)
             if not chunks:
                 raise ValueError("Document parsing produced no indexable text chunks")
             embeddings, warnings = await self._embed_chunks(chunks)
-            (
-                visual_embeddings,
-                visual_embedding_warnings,
-            ) = await self._embed_visual_chunks(chunks)
-            job.warnings = [*visual_warnings, *warnings, *visual_embedding_warnings]
+            job.warnings = [
+                *normalization.warnings,
+                *visual_warnings,
+                *warnings,
+            ]
+            job.asset_refs = [asset_ref.to_dict() for asset_ref in asset_refs]
+            # Persist exact versioned refs before the Redis generation cutover.
+            # A post-commit retry can then activate the referenced versions rather
+            # than upload replacements that Redis does not point to.
+            await self._save_job(job)
             job.chunks_indexed = await self.vector_store.upsert_chunks(
                 chunks,
                 embeddings,
                 knowledge_base_id=knowledge_base_id,
-                visual_embeddings=visual_embeddings,
                 index_version=job.index_version or job.dispatch_id,
             )
+            for asset_ref in asset_refs:
+                await self.asset_store.activate(asset_ref)
+            try:
+                await self.asset_store.delete_other_generations(
+                    document_id,
+                    knowledge_base_id,
+                    job.index_version,
+                )
+            except Exception as exc:
+                job.warnings.append(
+                    f"Failed to clean previous figure asset generations: {exc}"
+                )
             job.status = "completed_with_warnings" if job.warnings else "completed"
             job.error = None
             job.last_error = None
+            job.terminal_at = datetime.now(timezone.utc)
             job.updated_at = datetime.now()
             await self._save_job(job)
             return job
@@ -708,6 +869,8 @@ class RagService:
             job.status = "failed"
             job.error = str(exc)
             job.last_error = str(exc)
+            if not raise_on_error:
+                job.terminal_at = datetime.now(timezone.utc)
             job.updated_at = datetime.now()
             await self._save_job(job)
             logger.exception("RAG ingestion failed for %s", filename)
@@ -730,15 +893,17 @@ class RagService:
             0.001, float(self.retrieval_config.get("deadline_seconds", 30))
         )
         try:
-            async with asyncio.timeout(deadline_seconds):
-                return await self._retrieve_within_deadline(
+            return await asyncio.wait_for(
+                self._retrieve_within_deadline(
                     query,
                     knowledge_base_ids=knowledge_base_ids,
                     max_results=max_results,
                     candidate_count=candidate_count,
                     min_score=min_score,
-                )
-        except TimeoutError:
+                ),
+                timeout=deadline_seconds,
+            )
+        except asyncio.TimeoutError:
             logger.warning(
                 "RAG retrieval exceeded its %.3fs shared deadline",
                 deadline_seconds,
@@ -754,16 +919,12 @@ class RagService:
         candidate_count: Optional[int] = None,
         min_score: Optional[float] = None,
     ) -> List[RagSearchResult]:
-        embedding, visual_embedding = await asyncio.gather(
-            self._safe_embed(query),
-            self._safe_visual_query_embed(query),
-        )
+        embedding = await self._safe_embed(query)
         effective_kbs = self._effective_knowledge_base_ids(knowledge_base_ids)
         top_k = int(max_results or self.retrieval_config.get("top_k", 5))
         first_stage_candidate_count = int(
             candidate_count or self.retrieval_config.get("candidate_count", 30)
         )
-        visual_retrieval = dict(self.visual_config.get("retrieval", {}) or {})
         rerank_top_n = int(self.rerank_config.get("top_n", top_k))
         rerank_enabled = self._rerank_enabled()
         first_stage_limit = (
@@ -784,12 +945,6 @@ class RagService:
                 min_score
                 if min_score is not None
                 else self.retrieval_config.get("min_score", 0.0)
-            ),
-            visual_embedding=visual_embedding,
-            visual_weight=float(visual_retrieval.get("weight", 0.4)),
-            visual_min_score=float(visual_retrieval.get("min_score", 0.0)),
-            visual_candidate_count=int(
-                visual_retrieval.get("top_k", first_stage_candidate_count)
             ),
         )
         if rerank_enabled:
@@ -916,6 +1071,116 @@ class RagService:
             )
         return sources
 
+    async def materialize_image_inputs(
+        self,
+        results: Sequence[RagSearchResult],
+        *,
+        max_images: int = 3,
+        max_bytes: int = 5_000_000,
+        max_long_edge_pixels: int = 1568,
+    ) -> tuple[List[RagImageInput], List[str]]:
+        """Select direct then related figures and privately load verified bytes."""
+        candidates: List[tuple[int, int, Dict[str, Any]]] = []
+        for rank, result in enumerate(results, start=1):
+            metadata = result.chunk.metadata
+            if metadata.get("is_figure") and metadata.get("asset_ref"):
+                candidates.append((0, rank, metadata))
+        for rank, result in enumerate(results, start=1):
+            for related in result.chunk.metadata.get("related_figures", []):
+                if isinstance(related, dict) and related.get("asset_ref"):
+                    distance = abs(
+                        int(related.get("page") or result.chunk.page_start)
+                        - int(result.chunk.page_start)
+                    )
+                    candidates.append((1, rank * 100 + distance, related))
+
+        images: List[RagImageInput] = []
+        warnings: List[str] = []
+        seen: set[tuple[str, str]] = set()
+        for _, order, candidate in sorted(candidates, key=lambda item: item[:2]):
+            if len(images) >= max_images:
+                break
+            figure_id = str(candidate.get("figure_id") or "")
+            try:
+                ref = RagAssetRef.from_dict(dict(candidate["asset_ref"]))
+            except (TypeError, ValueError) as exc:
+                warnings.append(f"Invalid figure asset {figure_id}: {exc}")
+                continue
+            identity = (ref.index_version, figure_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            try:
+                content = await self.asset_store.load(ref)
+                content, width, height = await asyncio.to_thread(
+                    self._prepare_provider_image,
+                    content,
+                    ref,
+                    max_bytes,
+                    max_long_edge_pixels,
+                )
+            except Exception as exc:
+                warnings.append(f"Figure {figure_id} materialization failed: {exc}")
+                continue
+            visual = candidate.get("visual") or {}
+            images.append(
+                RagImageInput(
+                    source_rank=max(1, order if order < 100 else order // 100),
+                    figure_id=figure_id,
+                    page=int(candidate.get("page") or 0) or None,
+                    caption=(
+                        candidate.get("figure_caption") or visual.get("caption") or None
+                    ),
+                    asset_ref=ref,
+                    content=content,
+                    content_checksum_sha256=base64.b64encode(
+                        hashlib.sha256(content).digest()
+                    ).decode("ascii"),
+                    width=width,
+                    height=height,
+                )
+            )
+        return images, warnings
+
+    def _prepare_provider_image(
+        self,
+        content: bytes,
+        ref: RagAssetRef,
+        max_bytes: int,
+        max_long_edge_pixels: int,
+    ) -> tuple[bytes, int, int]:
+        if (
+            len(content) <= max_bytes
+            and max(ref.width, ref.height) <= max_long_edge_pixels
+        ):
+            return content, ref.width, ref.height
+        try:
+            from PIL import Image
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError(
+                "Pillow is required to resize large RAG figures"
+            ) from exc
+        with Image.open(BytesIO(content)) as image:
+            image.load()
+            scale = min(
+                1.0,
+                max_long_edge_pixels / max(image.width, image.height),
+            )
+            while scale > 0.1:
+                resized = image.resize(
+                    (
+                        max(1, int(image.width * scale)),
+                        max(1, int(image.height * scale)),
+                    )
+                )
+                output = BytesIO()
+                resized.save(output, format="PNG", optimize=True)
+                payload = output.getvalue()
+                if len(payload) <= max_bytes:
+                    return payload, resized.width, resized.height
+                scale *= 0.8
+        raise ValueError(f"asset cannot be reduced below {max_bytes} bytes")
+
     def tool_call_from_results(
         self,
         query: str,
@@ -950,18 +1215,16 @@ class RagService:
     ) -> int:
         if not self.enabled:
             raise RuntimeError("RAG service is disabled")
-        deleted = await self.vector_store.delete_document(
-            document_id, knowledge_base_id
+        knowledge_base_ids = (
+            [knowledge_base_id]
+            if knowledge_base_id
+            else await self.vector_store.knowledge_base_ids_for_document(document_id)
         )
-        if self._visual_enabled():
-            if knowledge_base_id:
-                self.figure_cropper.delete_document_assets(
-                    document_id, knowledge_base_id
-                )
-            else:
-                for kb_id in self._effective_knowledge_base_ids(None):
-                    self.figure_cropper.delete_document_assets(document_id, kb_id)
-        return deleted
+        # Keep the Redis document->KB mapping until all durable assets are gone.
+        # It is the retry manifest for an unscoped delete if S3 fails transiently.
+        for kb_id in knowledge_base_ids:
+            await self.asset_store.delete_document(document_id, kb_id)
+        return await self.vector_store.delete_document(document_id, knowledge_base_id)
 
     async def create_batch(
         self,
@@ -1041,7 +1304,7 @@ class RagService:
             job = await self.get_job(job_id)
             if job:
                 jobs.append(job)
-        return batch.to_dict(jobs=jobs)
+        return batch.to_public_dict(jobs=jobs)
 
     async def retry_job(self, job_id: str) -> Optional[IngestionJob]:
         job = await self.get_job(job_id)
@@ -1057,8 +1320,13 @@ class RagService:
         job.status = "enqueue_pending" if self.queue_backend == "sqs" else "queued"
         job.error = None
         job.last_error = None
-        if self.queue_backend == "sqs" and not reuse_dispatch:
+        if not reuse_dispatch:
             job.dispatch_id, job.index_version = await self._new_sqs_dispatch()
+        if not reuse_dispatch:
+            job.dispatch_started_at = datetime.now(timezone.utc)
+            job.processing_started_at = None
+            job.terminal_at = None
+            job.asset_refs = []
         job.updated_at = datetime.now()
         await self._save_job(job)
         await self.enqueue_ingestion_job(job, attempt=job.attempts + 1)
@@ -1067,6 +1335,10 @@ class RagService:
     async def enqueue_ingestion_job(
         self, job: IngestionJob, attempt: Optional[int] = None
     ) -> str:
+        if job.dispatch_started_at is None:
+            job.dispatch_started_at = datetime.now(timezone.utc)
+            job.updated_at = datetime.now()
+            await self._save_job(job)
         if self.queue_backend == "sqs":
             if self.ingestion_queue is None:
                 raise RagQueuePreDurabilityError(
@@ -1252,8 +1524,25 @@ class RagService:
             return job
 
         attempt = int(decoded_fields.get("attempt") or job.attempts + 1)
-        try:
-            job = await self.process_ingestion_job(
+        lease_ttl_seconds = max(
+            int(math.ceil(self.pending_idle_ms / 1000.0)) + 1,
+            int(self.heartbeat_interval_seconds * 3),
+        )
+        lease = await self._acquire_processing_lease(
+            job,
+            dispatch_id=str(job.dispatch_id or job.index_version or job.job_id),
+            consumer_name=consumer_name,
+            ttl_seconds=lease_ttl_seconds,
+        )
+        if lease is None:
+            RAG_METRICS.processing_lease_contention.inc()
+            RAG_METRICS.delivery_outcomes.labels(
+                "redis_stream", "lease_contended"
+            ).inc()
+            return job
+
+        processing = asyncio.create_task(
+            self.process_ingestion_job(
                 job.job_id,
                 content=None,
                 filename=job.filename,
@@ -1265,7 +1554,33 @@ class RagService:
                 stream_message_id=message_id,
                 attempt=attempt,
                 raise_on_error=True,
+            ),
+            name=f"rag_stream_processing:{job.job_id}",
+        )
+        heartbeat = asyncio.create_task(
+            self._processing_lease_heartbeat(
+                lease[0],
+                lease[1],
+                ttl_seconds=lease_ttl_seconds,
+                interval_seconds=self.heartbeat_interval_seconds,
+            ),
+            name=f"rag_stream_lease:{job.job_id}",
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {processing, heartbeat}, return_when=asyncio.FIRST_COMPLETED
             )
+            if processing in done:
+                job = await processing
+            else:
+                heartbeat_error = heartbeat.exception()
+                processing.cancel()
+                await asyncio.gather(processing, return_exceptions=True)
+                if heartbeat_error is not None:
+                    raise heartbeat_error
+                raise RuntimeError(
+                    "Redis Stream processing lease heartbeat stopped unexpectedly"
+                )
         except Exception as exc:
             latest_job = await self.get_job(job.job_id)
             await self._handle_stream_failure(
@@ -1275,9 +1590,15 @@ class RagService:
                 attempt=attempt,
             )
             return await self.get_job(job.job_id)
-        await self._tag_job_source_best_effort(job, job.status)
-        await self.ack_stream_message(message_id)
-        return job
+        else:
+            await self._tag_job_source_best_effort(job, job.status)
+            await self.ack_stream_message(message_id)
+            return job
+        finally:
+            processing.cancel()
+            heartbeat.cancel()
+            await asyncio.gather(processing, heartbeat, return_exceptions=True)
+            await self._release_sqs_processing_lease(*lease)
 
     async def _sqs_worker_loop(self, consumer_name: str) -> None:
         if self.ingestion_queue is None:
@@ -1322,6 +1643,9 @@ class RagService:
         if job.status in {"completed", "completed_with_warnings", "dead_lettered"}:
             if job.status != "dead_lettered":
                 await self._ack_sqs_best_effort(delivery)
+                RAG_METRICS.duplicate_deliveries.labels(
+                    "sqs", "terminal_dispatch"
+                ).inc()
             RAG_METRICS.delivery_outcomes.labels("sqs", "terminal").inc()
             return job
 
@@ -1332,7 +1656,7 @@ class RagService:
             RAG_METRICS.processing_lease_contention.inc()
             RAG_METRICS.delivery_outcomes.labels("sqs", "lease_contended").inc()
             await self.ingestion_queue.extend_visibility(
-                delivery, int(self._retry_delay_seconds(delivery.receive_count))
+                delivery, self.sqs_visibility_timeout_seconds
             )
             return job
 
@@ -1378,6 +1702,7 @@ class RagService:
             latest.updated_at = datetime.now()
             if delivery.receive_count >= latest.max_attempts:
                 latest.status = "dead_lettered"
+                latest.terminal_at = datetime.now(timezone.utc)
                 await self._save_job(latest)
                 await self._tag_job_source_best_effort(latest, "dead_lettered")
                 RAG_METRICS.delivery_outcomes.labels("sqs", "dead_lettered").inc()
@@ -1423,19 +1748,34 @@ class RagService:
         dispatch_id: str,
         consumer_name: str,
     ) -> Optional[tuple[str, str]]:
+        return await self._acquire_processing_lease(
+            job,
+            dispatch_id=dispatch_id,
+            consumer_name=consumer_name,
+            ttl_seconds=max(
+                self.sqs_visibility_timeout_seconds,
+                int(self.sqs_heartbeat_interval_seconds * 3),
+            ),
+        )
+
+    async def _acquire_processing_lease(
+        self,
+        job: IngestionJob,
+        *,
+        dispatch_id: str,
+        consumer_name: str,
+        ttl_seconds: int,
+    ) -> Optional[tuple[str, str]]:
         client = self._job_client()
         if client is None or not hasattr(client, "set"):
-            raise RuntimeError("Redis is required for SQS processing leases")
+            raise RuntimeError("Redis is required for RAG processing leases")
         key = self._prefixed_key(f"processing:{job.job_id}:{dispatch_id}")
         token = f"{consumer_name}:{uuid.uuid4()}"
         acquired = await client.set(
             key,
             token,
             nx=True,
-            ex=max(
-                self.sqs_visibility_timeout_seconds,
-                int(self.sqs_heartbeat_interval_seconds * 3),
-            ),
+            ex=max(int(ttl_seconds), 1),
         )
         return (key, token) if acquired else None
 
@@ -1465,15 +1805,7 @@ class RagService:
         while True:
             await asyncio.sleep(self.sqs_heartbeat_interval_seconds)
             await queue.extend_visibility(delivery, self.sqs_visibility_timeout_seconds)
-            client = self._job_client()
-            if client is None or not hasattr(client, "eval"):
-                raise RuntimeError(
-                    "Redis Lua support is required for SQS lease renewal"
-                )
-            renewed = await client.eval(
-                "if redis.call('get', KEYS[1]) == ARGV[1] then "
-                "return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
-                1,
+            await self._renew_processing_lease(
                 lease_key,
                 lease_token,
                 max(
@@ -1481,10 +1813,35 @@ class RagService:
                     int(self.sqs_heartbeat_interval_seconds * 3),
                 ),
             )
-            if not renewed:
-                raise RuntimeError(
-                    "SQS processing lease was lost while extending visibility"
-                )
+
+    async def _processing_lease_heartbeat(
+        self,
+        lease_key: str,
+        lease_token: str,
+        *,
+        ttl_seconds: int,
+        interval_seconds: float,
+    ) -> None:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            await self._renew_processing_lease(lease_key, lease_token, ttl_seconds)
+
+    async def _renew_processing_lease(
+        self, lease_key: str, lease_token: str, ttl_seconds: int
+    ) -> None:
+        client = self._job_client()
+        if client is None or not hasattr(client, "eval"):
+            raise RuntimeError("Redis Lua support is required for lease renewal")
+        renewed = await client.eval(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
+            1,
+            lease_key,
+            lease_token,
+            max(int(ttl_seconds), 1),
+        )
+        if not renewed:
+            raise RuntimeError("RAG processing lease was lost")
 
     async def _tag_job_source(self, job: IngestionJob, status: str) -> None:
         if job.source.get("backend") != "s3" or self.object_store is None:
@@ -1604,6 +1961,7 @@ class RagService:
             return
 
         job.status = "dead_lettered"
+        job.terminal_at = datetime.now(timezone.utc)
         job.updated_at = datetime.now()
         await self._save_job(job)
         await self._tag_job_source_best_effort(job, "dead_lettered")
@@ -1640,7 +1998,7 @@ class RagService:
                 "page_end": result.chunk.page_end,
                 "section_path": result.chunk.section_path,
                 "snippet": " ".join(result.chunk.text.split())[:1000],
-                "metadata": result.chunk.metadata,
+                "metadata": _public_rag_metadata(result.chunk.metadata),
                 "index_version": result.index_version,
             }
             for index, result in enumerate(results, start=1)
@@ -1730,9 +2088,11 @@ class RagService:
         filename: str,
         parsed: Any,
         knowledge_base_id: str,
-    ) -> List[str]:
+        document_id: str,
+        index_version: str,
+    ) -> tuple[List[str], List[RagAssetRef]]:
         if not self._visual_enabled():
-            return []
+            return [], []
         warnings = await asyncio.to_thread(
             self.figure_cropper.crop_figures,
             content=content,
@@ -1747,8 +2107,34 @@ class RagService:
             and isinstance(getattr(block, "metadata", None), dict)
             and isinstance(block.metadata.get("figure"), dict)
         ]
+        asset_refs: List[RagAssetRef] = []
         for block in figure_blocks:
             figure = block.metadata["figure"]
+            image_bytes = figure.get("_image_bytes")
+            if isinstance(image_bytes, bytes):
+                try:
+                    asset_ref = await self.asset_store.put(
+                        knowledge_base_id=knowledge_base_id,
+                        document_id=document_id,
+                        index_version=index_version,
+                        figure_id=str(figure.get("figure_id") or "figure"),
+                        content=image_bytes,
+                        media_type=str(figure.get("media_type") or "image/png"),
+                        width=int(figure.get("width") or 0),
+                        height=int(figure.get("height") or 0),
+                    )
+                    figure["asset_ref"] = asset_ref.to_dict()
+                    figure["image_ref"] = asset_ref.uri
+                    asset_refs.append(asset_ref)
+                except Exception as exc:
+                    warning = (
+                        f"Figure asset storage failed for "
+                        f"{figure.get('figure_id')}: {exc}"
+                    )
+                    warnings.append(warning)
+                    figure.setdefault("visual", {}).setdefault("warnings", []).append(
+                        warning
+                    )
             try:
                 result = await self.visual_processor.process_figure(figure)
             except Exception as exc:
@@ -1757,37 +2143,51 @@ class RagService:
                 )
                 warnings.append(warning)
                 figure.setdefault("visual", {})["warnings"] = [warning]
-                continue
-            figure["visual"] = result.to_metadata()
-            warnings.extend(result.warnings)
+            else:
+                figure["visual"] = result.to_metadata()
+                warnings.extend(result.warnings)
+            finally:
+                # Crop bytes are available to OCR/caption only and must never be
+                # persisted in chunk metadata, sidecars, logs, or Redis.
+                figure.pop("_image_bytes", None)
+            if not figure.get("asset_ref"):
+                warning = f"Figure {figure.get('figure_id')} has no durable image asset"
+                warnings.append(warning)
+                figure.setdefault("visual", {}).setdefault("warnings", []).append(
+                    warning
+                )
             block.text = compose_figure_text(block)
+            if not block.text.strip():
+                figure["index_status"] = (
+                    "related_only" if figure.get("asset_ref") else "skipped_with_reason"
+                )
+                warning = f"Figure {figure.get('figure_id')} has no OCR or caption text"
+                warnings.append(warning)
+                figure.setdefault("visual", {}).setdefault("warnings", []).append(
+                    warning
+                )
+                block.text = (
+                    f"Figure {figure.get('figure_id')} on page "
+                    f"{figure.get('page') or block.page}; OCR/caption unavailable."
+                )
+            else:
+                figure["index_status"] = "indexed"
+            RAG_METRICS.figure_outcomes.labels(figure["index_status"]).inc()
+        figure_sidecars = {
+            str(block.metadata["figure"].get("figure_id")): block.metadata["figure"]
+            for block in figure_blocks
+        }
+        for block in getattr(parsed, "blocks", []):
+            related_ids = block.metadata.get("related_figure_ids", [])
+            if related_ids:
+                block.metadata["related_figures"] = [
+                    figure_sidecars[str(figure_id)]
+                    for figure_id in related_ids
+                    if str(figure_id) in figure_sidecars
+                ]
         if warnings and self.visual_config.get("required", False):
             raise RuntimeError("; ".join(warnings))
-        return warnings
-
-    async def _embed_visual_chunks(
-        self, chunks: Sequence[DocumentChunk]
-    ) -> tuple[List[Optional[List[float]]], List[str]]:
-        visual_embeddings: List[Optional[List[float]]] = []
-        failures = 0
-        for chunk in chunks:
-            embedding = chunk.metadata.get("visual_embedding")
-            if isinstance(embedding, list):
-                try:
-                    visual_embeddings.append([float(value) for value in embedding])
-                    continue
-                except (TypeError, ValueError):
-                    pass
-            if chunk.metadata.get("is_figure"):
-                failures += 1
-            visual_embeddings.append(None)
-        warnings = []
-        if failures and self._visual_embedding_enabled():
-            warnings.append(
-                f"Visual embedding unavailable for {failures} figure chunks; "
-                "indexed affected chunks for OCR/caption text retrieval only."
-            )
-        return visual_embeddings, warnings
+        return warnings, asset_refs
 
     async def _safe_embed(self, text: str) -> Optional[List[float]]:
         try:
@@ -1799,28 +2199,8 @@ class RagService:
             logger.info("RAG embedding unavailable; using keyword-only search: %s", exc)
             return None
 
-    async def _safe_visual_query_embed(self, query: str) -> Optional[List[float]]:
-        if not self._visual_embedding_enabled():
-            return None
-        try:
-            visual_embedding_config = dict(
-                self.visual_config.get("embedding", {}) or {}
-            )
-            return await asyncio.wait_for(
-                self.visual_processor.embed_query(query),
-                timeout=float(visual_embedding_config.get("timeout", 30)),
-            )
-        except Exception as exc:
-            logger.info("RAG visual embedding unavailable: %s", exc)
-            return None
-
     def _visual_enabled(self) -> bool:
         return bool(self.visual_config.get("enabled", False))
-
-    def _visual_embedding_enabled(self) -> bool:
-        return self._visual_enabled() and bool(
-            dict(self.visual_config.get("embedding", {}) or {}).get("enabled", False)
-        )
 
     def _rerank_enabled(self) -> bool:
         return bool(self.rerank_config.get("enabled", False))
@@ -2203,6 +2583,23 @@ def _decode(value: Any) -> str:
     return str(value)
 
 
+def _public_rag_metadata(value: Any) -> Any:
+    """Remove durable asset coordinates while retaining opaque image handles."""
+    if isinstance(value, list):
+        return [_public_rag_metadata(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    output: Dict[str, Any] = {}
+    for key, item in value.items():
+        if key == "asset_ref" and isinstance(item, dict):
+            uri = item.get("uri")
+            if isinstance(uri, str) and uri.startswith("rag-asset://"):
+                output.setdefault("image_ref", uri)
+            continue
+        output[key] = _public_rag_metadata(item)
+    return output
+
+
 def _parse_datetime(value: Any) -> datetime:
     if isinstance(value, datetime):
         return value
@@ -2212,6 +2609,21 @@ def _parse_datetime(value: Any) -> datetime:
         except ValueError:
             pass
     return datetime.now()
+
+
+def _parse_optional_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        parsed = value
+    elif value:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _safe_path_component(value: str) -> str:

@@ -2,7 +2,7 @@
 
 import hashlib
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from src.rag.parser import DocumentBlock, ParsedDocument
 from src.rag.visual import compose_figure_text
@@ -49,6 +49,12 @@ class StructureAwareChunker:
                 continue
 
             if block.block_type in self.HEADER_BLOCK_TYPES:
+                if current_blocks:
+                    chunks.append(
+                        self._build_chunk(document, current_blocks, current_section)
+                    )
+                    current_blocks = []
+                    current_tokens = 0
                 current_section = self._next_section_path(current_section, block.text)
 
             block_tokens = self._estimate_tokens(block.text)
@@ -120,7 +126,7 @@ class StructureAwareChunker:
         figure["section_path"] = list(section_path)
         visual = dict(figure.get("visual") or {})
         text = block.text.strip() or compose_figure_text(block)
-        if not text and visual.get("visual_embedding") is None:
+        if not text:
             return []
         base_metadata = {
             **dict(document.metadata or {}),
@@ -129,9 +135,10 @@ class StructureAwareChunker:
             "is_figure": True,
             "figure_id": figure_id,
             "image_ref": figure.get("image_ref"),
+            "asset_ref": figure.get("asset_ref"),
+            "figure_index_status": figure.get("index_status"),
             "ocr_provider": visual.get("ocr_provider"),
             "caption_provider": visual.get("caption_provider"),
-            "visual_embedding_provider": visual.get("visual_embedding_provider"),
             "bbox": figure.get("bbox") or block.bbox,
             "page": figure.get("page") or block.page,
             "figure_caption": visual.get("caption"),
@@ -140,8 +147,6 @@ class StructureAwareChunker:
             "figure_diagram_summary": visual.get("diagram_summary"),
             "figure_sidecar": figure,
         }
-        if visual.get("visual_embedding") is not None:
-            base_metadata["visual_embedding"] = list(visual["visual_embedding"])
         return [
             self._chunk_from_table_parts(
                 document=document,
@@ -272,12 +277,13 @@ class StructureAwareChunker:
         section_path: List[str],
         metadata: Dict[str, Any],
     ) -> DocumentChunk:
+        source_pages = self._source_pages(block)
         return DocumentChunk(
             chunk_id=self._chunk_id(document.document_id, block_ids, text),
             document_id=document.document_id,
             text=text[: self.max_chunk_chars],
-            page_start=block.page,
-            page_end=block.page,
+            page_start=min(source_pages),
+            page_end=max(source_pages),
             block_ids=block_ids,
             block_types=[block.block_type],
             bboxes=[block.bbox] if block.bbox else [],
@@ -295,8 +301,36 @@ class StructureAwareChunker:
         block_ids = [self._block_id(block) for block in blocks]
         chunk_id = self._chunk_id(document.document_id, block_ids, text)
         bboxes = [block.bbox for block in blocks if block.bbox]
-        page_start = min(block.page for block in blocks)
-        page_end = max(block.page for block in blocks)
+        source_pages = [page for block in blocks for page in self._source_pages(block)]
+        page_start = min(source_pages)
+        page_end = max(source_pages)
+        layout_metadata: Dict[str, Any] = {"source_pages": sorted(set(source_pages))}
+        if any(bool(block.metadata.get("is_unresolved_footnote")) for block in blocks):
+            layout_metadata["is_unresolved_footnote"] = True
+        linked_footnotes = [
+            value
+            for block in blocks
+            for value in block.metadata.get("linked_footnote_block_ids", [])
+        ]
+        if linked_footnotes:
+            layout_metadata["linked_footnote_block_ids"] = linked_footnotes
+        related_figures = [
+            value
+            for block in blocks
+            for value in block.metadata.get("related_figure_ids", [])
+        ]
+        if related_figures:
+            layout_metadata["related_figure_ids"] = list(
+                dict.fromkeys(str(value) for value in related_figures)
+            )
+        related_figure_sidecars = [
+            value
+            for block in blocks
+            for value in block.metadata.get("related_figures", [])
+            if isinstance(value, dict)
+        ]
+        if related_figure_sidecars:
+            layout_metadata["related_figures"] = related_figure_sidecars
         return DocumentChunk(
             chunk_id=chunk_id,
             document_id=document.document_id,
@@ -311,6 +345,7 @@ class StructureAwareChunker:
                 **dict(document.metadata or {}),
                 "filename": document.filename,
                 "content_hash": document.content_hash,
+                **layout_metadata,
             },
         )
 
@@ -392,12 +427,22 @@ class StructureAwareChunker:
             return False
         visual = figure.get("visual")
         return isinstance(visual, dict) and bool(
-            visual.get("visual_embedding")
-            or visual.get("ocr_text")
+            visual.get("ocr_text")
             or visual.get("caption")
             or visual.get("chart_summary")
             or visual.get("diagram_summary")
         )
+
+    def _source_pages(self, block: DocumentBlock) -> List[int]:
+        values = block.metadata.get("source_pages") if block.metadata else None
+        pages = []
+        if isinstance(values, list):
+            for value in values:
+                try:
+                    pages.append(max(1, int(value)))
+                except (TypeError, ValueError):
+                    continue
+        return sorted(set(pages)) or [max(1, int(block.page))]
 
 
 def build_chunker(config: Dict[str, Any]) -> StructureAwareChunker:

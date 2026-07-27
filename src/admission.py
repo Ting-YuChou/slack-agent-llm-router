@@ -1032,8 +1032,7 @@ class RedisAdmissionController:
             0.001,
             int(self.redis_config.get("socket_timeout_ms", 100)) / 1000.0,
         )
-        async with asyncio.timeout(timeout_seconds):
-            return await awaitable
+        return await asyncio.wait_for(awaitable, timeout=timeout_seconds)
 
     def _global_active_specs(self) -> List[ActiveSpec]:
         global_limits = dict(self.config.get("global_limits", {}) or {})

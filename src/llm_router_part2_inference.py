@@ -4,6 +4,7 @@ Handles inference requests across OpenAI, Anthropic, and vLLM providers
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -33,8 +34,7 @@ from transformers import AutoTokenizer
 from src.admission import AdmissionRejectedError
 from src.llm_router_part1_router import ModelRouter
 from src.provider_scheduler import ProviderCapacityScheduler, RequestExecutionBudget
-from src.utils.logger import setup_logging
-from src.utils.metrics import INFERENCE_METRICS
+from src.utils.metrics import INFERENCE_METRICS, RAG_METRICS
 from src.utils.schema import (
     AttachmentType,
     QueryRequest,
@@ -561,6 +561,16 @@ class ResponseCache:
                     else None,
                 }
             )
+        rag_image_signatures = [
+            {
+                "figure_id": image.figure_id,
+                "index_version": image.asset_ref.index_version,
+                "checksum_sha256": (
+                    image.content_checksum_sha256 or image.asset_ref.checksum_sha256
+                ),
+            }
+            for image in getattr(request, "_rag_images", [])
+        ]
 
         key_payload = {
             "cache_scope": self.scope,
@@ -580,6 +590,7 @@ class ResponseCache:
             "conversation_id": request.conversation_id,
             "metadata": self._cacheable_metadata(request.metadata or {}),
             "attachments": attachment_signatures,
+            "rag_images": rag_image_signatures,
         }
         if self.scope != "shared":
             key_payload["user_id"] = request.user_id
@@ -854,15 +865,40 @@ class OpenAIProvider(BaseInferenceProvider):
 
         except Exception as e:
             logger.error(f"OpenAI streaming error: {e}")
-            yield f"Error: {str(e)}"
+            raise
 
     def _build_response_request_kwargs(
         self, request: QueryRequest, model_name: str, prompt: str
     ) -> Dict[str, Any]:
         """Build OpenAI Responses API kwargs, including optional prompt-cache hints."""
+        provider_input: Any = prompt
+        rag_images = getattr(request, "_rag_images", [])
+        if rag_images:
+            content: List[Dict[str, Any]] = []
+            for image in rag_images:
+                label = (
+                    f"[S{image.source_rank}] Figure {image.figure_id}, "
+                    f"page {image.page or 'unknown'}"
+                )
+                if image.caption:
+                    label += f": {image.caption}"
+                content.extend(
+                    [
+                        {"type": "input_text", "text": label},
+                        {
+                            "type": "input_image",
+                            "image_url": (
+                                f"data:{image.asset_ref.media_type};base64,"
+                                + base64.b64encode(image.content).decode("ascii")
+                            ),
+                        },
+                    ]
+                )
+            content.append({"type": "input_text", "text": prompt})
+            provider_input = [{"role": "user", "content": content}]
         request_kwargs: Dict[str, Any] = {
             "model": model_name,
-            "input": prompt,
+            "input": provider_input,
             "instructions": None,
             "max_output_tokens": request.max_tokens,
         }
@@ -1068,10 +1104,35 @@ class AnthropicProvider(BaseInferenceProvider):
 
         except Exception as e:
             logger.error(f"Anthropic streaming error: {e}")
-            yield f"Error: {str(e)}"
+            raise
 
     def _build_messages(self, request: QueryRequest) -> List[Dict[str, Any]]:
         """Build Anthropic messages with an optional cache breakpoint."""
+        rag_images = getattr(request, "_rag_images", [])
+        if rag_images:
+            content: List[Dict[str, Any]] = []
+            for image in rag_images:
+                label = (
+                    f"[S{image.source_rank}] Figure {image.figure_id}, "
+                    f"page {image.page or 'unknown'}"
+                )
+                if image.caption:
+                    label += f": {image.caption}"
+                content.extend(
+                    [
+                        {"type": "text", "text": label},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": image.asset_ref.media_type,
+                                "data": base64.b64encode(image.content).decode("ascii"),
+                            },
+                        },
+                    ]
+                )
+            content.append({"type": "text", "text": self._build_prompt(request)})
+            return [{"role": "user", "content": content}]
         sections = self._build_prompt_sections(request)
         if not self._prompt_cache_enabled() or not sections.static_cache_prefix:
             return [{"role": "user", "content": self._build_prompt(request)}]
@@ -1860,6 +1921,16 @@ class SingleFlightCoordinator:
                     else None,
                 }
             )
+        rag_image_signatures = [
+            {
+                "figure_id": image.figure_id,
+                "index_version": image.asset_ref.index_version,
+                "checksum_sha256": (
+                    image.content_checksum_sha256 or image.asset_ref.checksum_sha256
+                ),
+            }
+            for image in getattr(request, "_rag_images", [])
+        ]
 
         payload = {
             "model_name": model_name,
@@ -1879,6 +1950,7 @@ class SingleFlightCoordinator:
             "conversation_id": request.conversation_id,
             "metadata": request.metadata,
             "attachments": attachment_signatures,
+            "rag_images": rag_image_signatures,
         }
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
@@ -2065,6 +2137,10 @@ class InferenceEngine:
                     start_time,
                 )
                 return response
+            routing_decision = await self._prepare_rag_images(
+                request, routing_decision, rag_result
+            )
+            model_name = routing_decision.selected_model
 
             # Step 4: Optionally enrich current-info requests with web search.
             web_search_result = await self._run_web_search_if_needed(
@@ -2291,6 +2367,127 @@ class InferenceEngine:
             required_no_hits=request.rag_policy == RagPolicy.REQUIRED and not results,
         )
 
+    async def _prepare_rag_images(
+        self,
+        request: QueryRequest,
+        routing_decision: Any,
+        rag_result: Optional[SimpleNamespace],
+    ) -> Any:
+        if not rag_result or not rag_result.results:
+            return routing_decision
+        if not hasattr(self.rag_service, "materialize_image_inputs"):
+            return routing_decision
+        visual_config = getattr(self.rag_service, "visual_config", {}) or {}
+        answer_config = dict(visual_config.get("answer_images", {}) or {})
+        if answer_config.get("enabled", True) is False:
+            return routing_decision
+        images, warnings = await self.rag_service.materialize_image_inputs(
+            rag_result.results,
+            max_images=int(answer_config.get("max_images", 3)),
+            max_bytes=int(answer_config.get("max_bytes", 5_000_000)),
+            max_long_edge_pixels=int(answer_config.get("max_long_edge_pixels", 1568)),
+        )
+        request.metadata = dict(request.metadata or {})
+        if warnings:
+            request.metadata["rag_warnings"] = [
+                *request.metadata.get("rag_warnings", []),
+                *warnings,
+            ]
+            rag_result.warnings = list(request.metadata["rag_warnings"])
+        if not images:
+            if warnings:
+                warning = (
+                    "rag_vision_fallback: image materialization failed; used text only"
+                )
+                request.metadata["rag_warnings"] = [
+                    *request.metadata.get("rag_warnings", []),
+                    warning,
+                ]
+                rag_result.warnings = list(request.metadata["rag_warnings"])
+                RAG_METRICS.vision_outcomes.labels(
+                    "text_only_materialization_failure"
+                ).inc()
+            return routing_decision
+
+        selected = routing_decision.selected_model
+        selected_info = self.router.get_model_info(selected) or {}
+        capabilities = {
+            value.lower()
+            for value in selected_info.get("config", {}).get("capabilities", [])
+        }
+        if "vision" not in capabilities:
+            if hasattr(self.router, "eligible_models_with_capability"):
+                eligible_vision_models = (
+                    await self.router.eligible_models_with_capability(
+                        request,
+                        "vision",
+                        exclude_models=[selected],
+                    )
+                )
+                vision_model = (
+                    eligible_vision_models[0] if eligible_vision_models else None
+                )
+                request.metadata["rag_vision_fallback_models"] = eligible_vision_models[
+                    1:
+                ]
+            else:
+                vision_model = await self.router.select_model_with_capability(
+                    request,
+                    "vision",
+                    exclude_models=[selected],
+                )
+            if not vision_model:
+                request.metadata["rag_warnings"] = [
+                    *request.metadata.get("rag_warnings", []),
+                    "rag_vision_fallback: no policy-eligible vision model",
+                ]
+                rag_result.warnings = list(request.metadata["rag_warnings"])
+                RAG_METRICS.vision_outcomes.labels("text_only_no_model").inc()
+                return routing_decision
+            request.metadata["rag_original_model"] = selected
+            routing_decision = self._build_capability_routing_decision(
+                routing_decision, selected, vision_model
+            )
+            RAG_METRICS.vision_outcomes.labels("rerouted").inc()
+        else:
+            if hasattr(self.router, "eligible_models_with_capability"):
+                request.metadata[
+                    "rag_vision_fallback_models"
+                ] = await self.router.eligible_models_with_capability(
+                    request,
+                    "vision",
+                    exclude_models=[selected],
+                )
+                if hasattr(self.router, "eligible_models_without_capability"):
+                    request.metadata[
+                        "rag_text_fallback_models"
+                    ] = await self.router.eligible_models_without_capability(
+                        request,
+                        "vision",
+                        exclude_models=[
+                            selected,
+                            *request.metadata["rag_vision_fallback_models"],
+                        ],
+                    )
+            RAG_METRICS.vision_outcomes.labels("selected_model").inc()
+        request._rag_images = images
+        return routing_decision
+
+    def _build_capability_routing_decision(
+        self, routing_decision: Any, original_model: str, selected_model: str
+    ) -> Any:
+        reason = (
+            f"{getattr(routing_decision, 'routing_reason', 'RAG route')}; "
+            f"vision reroute from {original_model} to {selected_model}"
+        )
+        if hasattr(routing_decision, "model_copy"):
+            return routing_decision.model_copy(
+                update={"selected_model": selected_model, "routing_reason": reason}
+            )
+        payload = dict(vars(routing_decision))
+        payload.update(selected_model=selected_model, routing_reason=reason)
+        return SimpleNamespace(**payload)
+
     def _should_run_rag(self, request: QueryRequest, routing_decision: Any) -> bool:
         if not self.rag_service or not getattr(self.rag_service, "enabled", False):
             return False
@@ -2414,6 +2611,10 @@ class InferenceEngine:
         if result is None:
             return
         response.sources = [*response.sources, *list(result.sources)]
+        response.warnings = [
+            *response.warnings,
+            *list(getattr(result, "warnings", []) or []),
+        ]
         if result.tool_call:
             response.tool_calls = [*response.tool_calls, result.tool_call]
             response.tool_latency_ms += result.tool_call.latency_ms
@@ -2426,6 +2627,10 @@ class InferenceEngine:
         if result is None:
             return
         response.sources = [*response.sources, *list(result.sources)]
+        response.warnings = [
+            *response.warnings,
+            *list(getattr(result, "warnings", []) or []),
+        ]
         if result.tool_call:
             response.tool_calls = [*response.tool_calls, result.tool_call]
             response.tool_latency_ms += result.latency_ms
@@ -2455,6 +2660,10 @@ class InferenceEngine:
                 )
                 yield "文件庫沒有足夠資訊可以回答這個問題。"
                 return
+            routing_decision = await self._prepare_rag_images(
+                request, routing_decision, rag_result
+            )
+            model_name = routing_decision.selected_model
             await self._run_web_search_if_needed(request, routing_decision)
 
             cached_response = await self._get_cached_inference_response(
@@ -2474,6 +2683,12 @@ class InferenceEngine:
             # Get provider
             provider = self._get_provider_for_model(model_name)
             if not provider:
+                if getattr(request, "_rag_images", []):
+                    response, _, _ = await self._execute_pre_token_vision_fallback(
+                        request, routing_decision, model_name
+                    )
+                    yield response.response_text
+                    return
                 yield f"Error: No provider available for model: {model_name}"
                 return
 
@@ -2485,6 +2700,8 @@ class InferenceEngine:
             )
             request_started_at_ms = int(time.time() * 1000)
             lease = None
+            pre_token_failure: Optional[Exception] = None
+            emitted_token = False
             try:
                 lease = await self.scheduler.acquire(
                     request=request,
@@ -2496,6 +2713,7 @@ class InferenceEngine:
                 )
                 try:
                     async for chunk in provider.stream_response(request, model_name):
+                        emitted_token = True
                         yield chunk
                 except asyncio.CancelledError:
                     raise
@@ -2507,7 +2725,9 @@ class InferenceEngine:
                         request_started_at_ms=request_started_at_ms,
                         circuit_permit=lease.circuit_permit,
                     )
-                    raise
+                    if emitted_token or not getattr(request, "_rag_images", []):
+                        raise
+                    pre_token_failure = exc
                 else:
                     await self.scheduler.record_success(
                         provider=str(provider_name),
@@ -2515,9 +2735,21 @@ class InferenceEngine:
                         request_started_at_ms=request_started_at_ms,
                         circuit_permit=lease.circuit_permit,
                     )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not getattr(request, "_rag_images", []):
+                    raise
+                pre_token_failure = exc
             finally:
                 if lease is not None:
                     await self.scheduler.release(lease, actual_tokens=None)
+            if pre_token_failure is not None:
+                response, _, _ = await self._execute_pre_token_vision_fallback(
+                    request, routing_decision, model_name
+                )
+                yield response.response_text
+                return
 
         except AdmissionRejectedError as exc:
             yield f"Error: {exc.decision.reason}"
@@ -2557,10 +2789,12 @@ class InferenceEngine:
                 request, routing_decision, execution_budget=None
             )
         execution_budget.ensure_available()
-        async with asyncio.timeout(execution_budget.remaining_seconds):
-            return await self._generate_response_with_fallback_unbounded(
+        return await asyncio.wait_for(
+            self._generate_response_with_fallback_unbounded(
                 request, routing_decision, execution_budget=execution_budget
-            )
+            ),
+            timeout=execution_budget.remaining_seconds,
+        )
 
     async def _generate_response_with_fallback_unbounded(
         self,
@@ -2586,6 +2820,10 @@ class InferenceEngine:
                 exclude_models=[primary_model],
             )
             if not fallback_models:
+                if getattr(request, "_rag_images", []):
+                    return await self._execute_text_only_after_vision_failure(
+                        request, routing_decision, execution_budget
+                    )
                 raise
             logger.warning(
                 "Primary model %s was rejected by provider scheduler (%s); "
@@ -2638,6 +2876,10 @@ class InferenceEngine:
                         fallback_started_at,
                     )
                     last_exception = fallback_exc
+            if getattr(request, "_rag_images", []):
+                return await self._execute_text_only_after_vision_failure(
+                    request, routing_decision, execution_budget
+                )
             raise last_exception
         except Exception as exc:
             self._record_failed_attempt(primary_model, exc, primary_started_at)
@@ -2648,6 +2890,10 @@ class InferenceEngine:
             )
 
             if not fallback_models:
+                if getattr(request, "_rag_images", []):
+                    return await self._execute_text_only_after_vision_failure(
+                        request, routing_decision, execution_budget
+                    )
                 raise
 
             logger.warning(
@@ -2702,7 +2948,69 @@ class InferenceEngine:
                     )
                     last_exception = fallback_exc
 
+            if getattr(request, "_rag_images", []):
+                return await self._execute_text_only_after_vision_failure(
+                    request, routing_decision, execution_budget
+                )
             raise last_exception
+
+    async def _execute_text_only_after_vision_failure(
+        self,
+        request: QueryRequest,
+        routing_decision: Any,
+        execution_budget: Optional[RequestExecutionBudget],
+    ) -> Tuple[InferenceResponse, str, Any]:
+        """Retry once without images only after all vision-capable routes fail."""
+        request._rag_images = []
+        request.metadata = dict(request.metadata or {})
+        warning = "rag_vision_fallback: vision providers unavailable; used text only"
+        RAG_METRICS.vision_outcomes.labels("text_only_provider_failure").inc()
+        request.metadata["rag_warnings"] = [
+            *request.metadata.get("rag_warnings", []),
+            warning,
+        ]
+        text_fallbacks = list(request.metadata.get("rag_text_fallback_models") or [])
+        model_name = str(
+            request.metadata.get("rag_original_model")
+            or (text_fallbacks[0] if text_fallbacks else None)
+            or routing_decision.selected_model
+        )
+        response = await self._execute_model_request(
+            request, model_name, execution_budget=execution_budget
+        )
+        response.warnings = [*response.warnings, warning]
+        return (
+            response,
+            model_name,
+            self._build_capability_routing_decision(
+                routing_decision,
+                routing_decision.selected_model,
+                model_name,
+            ),
+        )
+
+    async def _execute_pre_token_vision_fallback(
+        self,
+        request: QueryRequest,
+        routing_decision: Any,
+        failed_model: str,
+    ) -> Tuple[InferenceResponse, str, Any]:
+        """Retry another vision route, then downgrade before any token is emitted."""
+        candidates = self._get_local_fallback_models(
+            request,
+            routing_decision,
+            exclude_models=[failed_model],
+        )
+        if candidates:
+            fallback_decision = self._build_capability_routing_decision(
+                routing_decision, failed_model, candidates[0]
+            )
+            return await self._generate_response_with_fallback(
+                request, fallback_decision
+            )
+        return await self._execute_text_only_after_vision_failure(
+            request, routing_decision, execution_budget=None
+        )
 
     async def _execute_model_request(
         self,
@@ -2802,7 +3110,7 @@ class InferenceEngine:
         routing_decision: Any,
         exclude_models: Optional[List[str]] = None,
     ) -> List[str]:
-        """Return local vLLM candidates that can safely replace a failed model."""
+        """Return capability-safe fallback candidates for the current request."""
         selected_model = routing_decision.selected_model
         selected_model_info = self.router.get_model_info(selected_model)
         if not selected_model_info:
@@ -2811,6 +3119,36 @@ class InferenceEngine:
         selected_provider = selected_model_info["config"]["provider"].lower()
         exclude = set(exclude_models or [])
         context = self._build_local_fallback_context(request, routing_decision)
+        if getattr(request, "_rag_images", []):
+            policy_candidates = request.metadata.get("rag_vision_fallback_models")
+            if policy_candidates is not None:
+                return [
+                    model_name
+                    for model_name in policy_candidates
+                    if model_name not in exclude
+                    and self._get_provider_for_model(model_name) is not None
+                ]
+            ranked = []
+            for model_name, model_config in getattr(self.router, "models", {}).items():
+                if model_name in exclude:
+                    continue
+                if "vision" not in {
+                    capability.lower() for capability in model_config.capabilities
+                }:
+                    continue
+                if model_config.provider not in self.providers:
+                    continue
+                if context["token_count"] > model_config.max_tokens:
+                    continue
+                if not self.router._check_user_access(
+                    model_config, context["user_tier"]
+                ):
+                    continue
+                ranked.append(
+                    (self.router._score_model(model_name, context), model_name)
+                )
+            ranked.sort(reverse=True)
+            return [model_name for _, model_name in ranked]
 
         if selected_provider == "vllm":
             return self._get_configured_vllm_model_fallbacks(

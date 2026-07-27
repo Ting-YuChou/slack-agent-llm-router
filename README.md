@@ -504,3 +504,8 @@ RAG_AWS_QUEUE_URL=... \
 AWS_REGION=us-west-2 \
 python -m pytest tests/test_rag_aws_live.py -q
 ```
+
+The reproducible worker-scaling benchmark is documented in
+[`docs/rag-s3-sqs-benchmark.md`](docs/rag-s3-sqs-benchmark.md). It drives the
+full presign, S3 PUT, complete, SQS, worker, and terminal-poll workflow rather
+than treating upload creation as a single endpoint load test.

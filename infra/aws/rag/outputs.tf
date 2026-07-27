@@ -6,3 +6,4 @@ output "dlq_url" { value = aws_sqs_queue.dlq.id }
 output "kms_key_arn" { value = aws_kms_key.rag.arn }
 output "api_policy_arn" { value = aws_iam_policy.api.arn }
 output "worker_policy_arn" { value = aws_iam_policy.worker.arn }
+output "inference_policy_arn" { value = aws_iam_policy.inference.arn }

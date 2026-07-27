@@ -425,8 +425,9 @@ class ProviderCapacityScheduler:
             execution_budget.ensure_available()
             if not execution_budget.consume_attempt():
                 execution_budget.ensure_available()
-            async with asyncio.timeout(execution_budget.remaining_seconds):
-                return await operation()
+            return await asyncio.wait_for(
+                operation(), timeout=execution_budget.remaining_seconds
+            )
 
         attempts = max(
             1, int(self.retry_config.get("max_attempts_per_request", 1) or 1)
@@ -445,7 +446,9 @@ class ProviderCapacityScheduler:
             response = None
             try:
                 request_started_at_ms = int(self._time_func() * 1000)
-                async with asyncio.timeout(budget.remaining_seconds):
+
+                async def run_attempt():
+                    nonlocal lease, local_attempt
                     lease = await self.acquire(
                         request=request,
                         model_name=model_name,
@@ -455,7 +458,11 @@ class ProviderCapacityScheduler:
                     if not budget.consume_attempt():
                         budget.ensure_available()
                     local_attempt += 1
-                    response = await operation()
+                    return await operation()
+
+                response = await asyncio.wait_for(
+                    run_attempt(), timeout=budget.remaining_seconds
+                )
                 await self.record_success(
                     provider=provider,
                     model_name=model_name,

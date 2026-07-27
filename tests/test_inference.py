@@ -2034,13 +2034,88 @@ class TestInferenceEngine:
         )
         provider = AsyncMock()
         engine.providers = {"openai": provider}
-        engine.cache.get_cached_response = AsyncMock(return_value=None)
+        engine._get_cached_inference_response = AsyncMock(return_value=None)
 
         chunks = [chunk async for chunk in engine.stream_query(sample_query_request)]
 
         assert chunks == ["Error: provider_active_requests_exceeded"]
         provider.stream_response.assert_not_called()
         assert admission.releases == []
+
+    @pytest.mark.asyncio
+    async def test_stream_query_scheduler_rejection_falls_back_before_first_token(
+        self,
+        inference_config,
+        sample_query_request,
+    ):
+        router = MagicMock()
+        decision = SimpleNamespace(
+            selected_model="gpt-5", routing_reason="vision route"
+        )
+        router.route_query = AsyncMock(return_value=decision)
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+        admission = RejectingAdmissionController(["provider rejected"])
+        engine = InferenceEngine(
+            inference_config,
+            router,
+            admission_controller=admission,
+        )
+        provider = AsyncMock()
+        engine.providers = {"openai": provider}
+        engine._get_cached_inference_response = AsyncMock(return_value=None)
+
+        async def prepare(request, route, _rag_result):
+            request._rag_images = [object()]
+            return route
+
+        engine._prepare_rag_images = AsyncMock(side_effect=prepare)
+        engine._execute_pre_token_vision_fallback = AsyncMock(
+            return_value=(
+                SimpleNamespace(response_text="text fallback"),
+                "local",
+                decision,
+            )
+        )
+
+        chunks = [chunk async for chunk in engine.stream_query(sample_query_request)]
+
+        assert chunks == ["text fallback"]
+        engine._execute_pre_token_vision_fallback.assert_awaited_once()
+        provider.stream_response.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stream_query_missing_provider_falls_back_before_first_token(
+        self,
+        inference_config,
+        sample_query_request,
+    ):
+        router = MagicMock()
+        decision = SimpleNamespace(
+            selected_model="gpt-5", routing_reason="vision route"
+        )
+        router.route_query = AsyncMock(return_value=decision)
+        router.get_model_info.return_value = {"config": {"provider": "missing"}}
+        engine = InferenceEngine(inference_config, router)
+        engine.providers = {}
+        engine._get_cached_inference_response = AsyncMock(return_value=None)
+
+        async def prepare(request, route, _rag_result):
+            request._rag_images = [object()]
+            return route
+
+        engine._prepare_rag_images = AsyncMock(side_effect=prepare)
+        engine._execute_pre_token_vision_fallback = AsyncMock(
+            return_value=(
+                SimpleNamespace(response_text="text fallback"),
+                "local",
+                decision,
+            )
+        )
+
+        chunks = [chunk async for chunk in engine.stream_query(sample_query_request)]
+
+        assert chunks == ["text fallback"]
+        engine._execute_pre_token_vision_fallback.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_process_query_publishes_error_completion_event_when_provider_missing(
