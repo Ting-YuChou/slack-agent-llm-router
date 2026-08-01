@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { classifyBash, validateWorkspacePath } from "../dist/src/policy.js";
+import { classifyBash, isApprovedSkillRead, validateWorkspacePath } from "../dist/src/policy.js";
 
 const MAX_TURNS = Number(process.env.PI_AGENT_MAX_TURNS ?? "20");
 const MAX_TOOL_CALLS = Number(process.env.PI_AGENT_MAX_TOOL_CALLS ?? "40");
@@ -9,6 +9,15 @@ const APPROVAL_TIMEOUT_MS = 300_000;
 function safeCommands(): string[] {
   try {
     const parsed = JSON.parse(process.env.PI_AGENT_SAFE_COMMANDS_JSON ?? "[]");
+    return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function approvedSkillPaths(): string[] {
+  try {
+    const parsed = JSON.parse(process.env.PI_AGENT_SKILL_PATHS_JSON ?? "[]");
     return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === "string") : [];
   } catch {
     return [];
@@ -57,6 +66,7 @@ export default function policyExtension(pi: ExtensionAPI) {
     if (["read", "write", "edit", "grep", "find", "ls"].includes(event.toolName)) {
       const input = event.input as Record<string, unknown>;
       const requestedPath = typeof input.path === "string" ? input.path : ".";
+      if (event.toolName === "read" && isApprovedSkillRead(requestedPath, approvedSkillPaths())) return undefined;
       const operation = event.toolName === "write" || event.toolName === "edit" ? "write" : "read";
       const checked = await validateWorkspacePath(ctx.cwd, requestedPath, operation);
       if (!checked.allowed) return { block: true, reason: `Path blocked by policy: ${checked.reason}` };

@@ -22,6 +22,15 @@ const BLOCKED_COMMAND_PATTERNS: Array<[RegExp, string]> = [
 
 const READ_ONLY_GIT = /^git\s+(?:status|diff|log|show|branch(?:\s+--show-current)?|rev-parse)(?:\s|$)/i;
 
+export function isApprovedSkillRead(requestedPath: string, approvedPaths: string[]): boolean {
+  if (!path.posix.isAbsolute(requestedPath) || path.posix.normalize(requestedPath) !== requestedPath) return false;
+  return approvedPaths.some((approvedPath) => (
+    approvedPath.startsWith("/opt/pi/skills/") &&
+    approvedPath.endsWith("/SKILL.md") &&
+    approvedPath === requestedPath
+  ));
+}
+
 export function classifyBash(command: string, safeCommands: string[]): BashPolicyResult {
   const normalized = command.trim().replace(/\s+/g, " ");
   for (const [pattern, reason] of BLOCKED_COMMAND_PATTERNS) {

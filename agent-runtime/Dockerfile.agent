@@ -9,6 +9,8 @@ COPY tsconfig.json tsconfig.extensions.json ./
 COPY src ./src
 COPY extensions ./extensions
 COPY plugins ./plugins
+COPY skills.lock.json ./skills.lock.json
+COPY skills ./skills
 RUN npm run build \
     && npm prune --omit=dev --ignore-scripts \
     && npm run patch-vendored-deps \

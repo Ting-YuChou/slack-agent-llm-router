@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "skills": [
+    {
+      "name": "test-gap",
+      "version": "0.1.0",
+      "integrity": "sha256:f7d9a83b0df3981dc7385a6de4c250b2dae8c9bd65850ccc190670c7a3c101ad",
+      "container_path": "/opt/pi/skills/test-gap/SKILL.md",
+      "host_path": "skills/test-gap/SKILL.md",
+      "risk_class": "workspace_write"
+    }
+  ]
+}

@@ -15,6 +15,7 @@ test("agent container is non-root, resource-limited, read-only, and internal-net
     gatewayToken: "short-token",
     extensionPaths: ["/opt/pi/extensions/policy.ts", "/opt/pi/extensions/model-gateway.ts"],
     pluginPaths: ["/opt/pi/plugins/workspace-summary.ts"],
+    skillPaths: ["/opt/pi/skills/test-gap/SKILL.md"],
     toolNames: ["read", "write", "edit", "bash", "grep", "find", "ls", "workspace_summary"],
   });
   const rendered = args.join(" ");
@@ -29,9 +30,11 @@ test("agent container is non-root, resource-limited, read-only, and internal-net
   ]) assert.match(rendered, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.doesNotMatch(rendered, /docker\.sock|OPENAI_API_KEY=[A-Za-z0-9_-]{30,}/);
   assert.match(rendered, /OPENAI_API_KEY=short-token/);
+  assert.match(rendered, /PI_AGENT_SKILL_PATHS_JSON=\["\/opt\/pi\/skills\/test-gap\/SKILL\.md"\]/);
   assert.match(rendered, /type=bind,src=\/repo-worktrees\/w1,dst=\/repo-worktrees\/w1/);
   assert.match(rendered, /\/repo\/\.git.*\/repo\/\.git.*readonly/);
   assert.match(rendered, /\/repo-worktrees\/w1\/\.git.*readonly/);
+  assert.match(rendered, /--no-skills.*--skill \/opt\/pi\/skills\/test-gap\/SKILL\.md/);
 
   const hostUserArgs = buildAgentDockerArgs({
     name: "pi-session-host-user",
@@ -44,6 +47,7 @@ test("agent container is non-root, resource-limited, read-only, and internal-net
     gatewayToken: "short-token",
     extensionPaths: [],
     pluginPaths: [],
+    skillPaths: [],
     toolNames: ["read"],
     user: "501:20",
   });

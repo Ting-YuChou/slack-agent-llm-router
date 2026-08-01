@@ -14,6 +14,7 @@ import {
 } from "./orchestrator.js";
 import { verifyPluginLock } from "./plugin-lock.js";
 import { RuntimeStateStore } from "./runtime-state.js";
+import { verifySkillLock } from "./skill-lock.js";
 import { WorktreeManager } from "./worktree-manager.js";
 
 const exec = promisify(execFile);
@@ -142,10 +143,17 @@ export async function createProductionServer() {
   }
   const containerUser = `${hostUid}:${hostGid}`;
   const lockPath = path.resolve(process.env.PI_AGENT_PLUGIN_LOCK ?? path.join(import.meta.dirname, "../../plugins.lock.json"));
+  const skillLockPath = path.resolve(process.env.PI_AGENT_SKILL_LOCK ?? path.join(import.meta.dirname, "../../skills.lock.json"));
   await mkdir(runtimeRoot, { recursive: true });
   await mkdir(worktreeRoot, { recursive: true });
   const actualImageDigest = process.env.PI_AGENT_IMAGE_DIGEST ?? await inspectImageDigest(image);
+  const imageSkillLock = await readImageFile(image, "/opt/pi/skills.lock.json");
   const lock = await verifyPluginLock(lockPath, { rootDir: path.dirname(lockPath), actualImageDigest });
+  const skillLock = await verifySkillLock(skillLockPath, {
+    rootDir: path.dirname(skillLockPath),
+    imageLockContent: imageSkillLock,
+  });
+  const integrityHealthy = lock.healthy && skillLock.healthy;
   const gitCommon = (await exec("git", ["rev-parse", "--git-common-dir"], { cwd: repoPath, encoding: "utf8" })).stdout.trim();
   const gitMetadataPath = path.resolve(repoPath, gitCommon);
   const worktrees = new WorktreeManager({
@@ -174,6 +182,7 @@ export async function createProductionServer() {
           gatewayUrl,
           extensionPaths: ["/opt/pi/extensions/policy.ts", "/opt/pi/extensions/model-gateway.ts"],
           pluginPaths: lock.plugins.map((plugin) => plugin.container_path),
+          skillPaths: skillLock.skills.map((skill) => skill.container_path),
           toolNames: ["read", "write", "edit", "bash", "grep", "find", "ls", ...lock.plugins.flatMap((plugin) => plugin.enabled_tools)],
           continueSession: session.restored,
           safeCommands: parseSafeCommands(process.env.PI_AGENT_SAFE_COMMANDS),
@@ -188,16 +197,18 @@ export async function createProductionServer() {
   return createAgentHttpServer({
     orchestrator,
     token,
-    acceptRuns: () => lock.healthy,
+    acceptRuns: () => integrityHealthy,
     health: () => ({
-      status: lock.healthy ? "healthy" : "unhealthy",
+      status: integrityHealthy ? "healthy" : "unhealthy",
       runtime: "pi-coding-agent",
       version: "0.83.0",
       provider: "openai",
       model: "gpt-5",
       tools: ["read", "write", "edit", "bash", "grep", "find", "ls", ...lock.plugins.flatMap((plugin) => plugin.enabled_tools)],
       plugin_integrity: lock.healthy ? "verified" : "failed",
-      errors: lock.healthy ? [] : lock.errors,
+      skills: skillLock.skills.map((skill) => skill.name),
+      skill_integrity: skillLock.healthy ? "verified" : "failed",
+      errors: integrityHealthy ? [] : [...lock.errors, ...skillLock.errors],
     }),
   });
 }
@@ -207,6 +218,17 @@ async function inspectImageDigest(image: string): Promise<string> {
     return (await exec("docker", ["image", "inspect", "--format={{.Id}}", image], { encoding: "utf8" })).stdout.trim();
   } catch {
     return "missing";
+  }
+}
+
+async function readImageFile(image: string, filePath: string): Promise<string> {
+  try {
+    return (await exec("docker", [
+      "run", "--rm", "--network", "none", "--read-only",
+      "--entrypoint", "cat", image, filePath,
+    ], { encoding: "utf8" })).stdout;
+  } catch {
+    return "";
   }
 }
 

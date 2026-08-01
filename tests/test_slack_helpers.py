@@ -259,6 +259,7 @@ class TestSlackMessageHandler:
         status_text = await handler._handle_status_command([], "u1", "c1", None)
 
         assert "/llm agent <task>" in help_text
+        assert "/skill:test-gap" in help_text
         assert "Agent Runtime:" in status_text
         assert "Healthy" in status_text
         agent_runtime.health.assert_awaited_once()

@@ -15,6 +15,7 @@ export interface AgentContainerOptions {
   gatewayToken: string;
   extensionPaths: string[];
   pluginPaths: string[];
+  skillPaths: string[];
   toolNames: string[];
   continueSession?: boolean;
   safeCommands?: string[];
@@ -44,6 +45,7 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     "--env", "PI_AGENT_MAX_TOOL_CALLS=40",
     "--env", "PI_AGENT_BASH_TIMEOUT_MS=300000",
     "--env", `PI_AGENT_SAFE_COMMANDS_JSON=${JSON.stringify(options.safeCommands ?? [])}`,
+    "--env", `PI_AGENT_SKILL_PATHS_JSON=${JSON.stringify(options.skillPaths)}`,
     "--mount", `type=bind,src=${options.worktreePath},dst=${options.worktreePath}`,
     "--mount", `type=bind,src=${options.worktreePath}/.git,dst=${options.worktreePath}/.git,readonly`,
     "--mount", `type=bind,src=${options.gitMetadataPath},dst=${options.gitMetadataPath},readonly`,
@@ -64,6 +66,7 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
   ];
   if (options.continueSession) args.push("--continue");
   for (const extension of [...options.extensionPaths, ...options.pluginPaths]) args.push("-e", extension);
+  for (const skill of options.skillPaths) args.push("--skill", skill);
   return args;
 }
 

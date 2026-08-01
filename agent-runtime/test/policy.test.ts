@@ -7,8 +7,19 @@ import { test } from "node:test";
 import {
   ApprovalStore,
   classifyBash,
+  isApprovedSkillRead,
   validateWorkspacePath,
 } from "../src/policy.js";
+
+test("only exact immutable allowlisted skill files may be read outside the workspace", () => {
+  const approved = ["/opt/pi/skills/test-gap/SKILL.md"];
+
+  assert.equal(isApprovedSkillRead("/opt/pi/skills/test-gap/SKILL.md", approved), true);
+  assert.equal(isApprovedSkillRead("/opt/pi/skills/test-gap/../secret/SKILL.md", approved), false);
+  assert.equal(isApprovedSkillRead("/opt/pi/skills/test-gap/SKILL.md/extra", approved), false);
+  assert.equal(isApprovedSkillRead("/etc/passwd", approved), false);
+  assert.equal(isApprovedSkillRead("skills/test-gap/SKILL.md", approved), false);
+});
 
 test("read-only and configured test commands are classified safely", () => {
   assert.deepEqual(classifyBash("git status --short", ["npm test"]), {

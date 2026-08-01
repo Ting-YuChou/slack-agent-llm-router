@@ -1180,6 +1180,7 @@ Mention me in a channel, use `/llm ...`, or reply inside an active bot thread.
 • `/llm web <query>` - Search the web before answering
 • `/llm fast <query>` - Prefer an explicit low-latency route for this query
 • `/llm agent <task>` - Start a stateful Pi coding agent in an isolated worktree
+• `/llm agent /skill:test-gap <task>` - Run the approved test-gap workflow
 • `/llm agent status|stop|close` - Inspect or control your latest Agent session
 • `/llm remember <text>` - Save an explicit long-term memory
 • `/llm memories [query]` - List or search your memories

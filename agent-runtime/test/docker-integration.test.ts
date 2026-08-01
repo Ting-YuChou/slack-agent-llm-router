@@ -17,7 +17,7 @@ async function command(command: string, args: string[], cwd?: string): Promise<s
   return (await exec(command, args, { cwd, encoding: "utf8" })).stdout.trim();
 }
 
-test("real Pi tools request approval and write only in the isolated worktree", { skip: !enabled, timeout: 60_000 }, async () => {
+test("real Pi expands an allowlisted skill, requests approval, and writes only in the isolated worktree", { skip: !enabled, timeout: 60_000 }, async () => {
   const suffix = Math.random().toString(16).slice(2, 10);
   const network = `pi-integration-${suffix}`;
   const gateway = `model-gateway-${suffix}`;
@@ -42,7 +42,9 @@ const usage = {input_tokens:1,output_tokens:1,total_tokens:2,input_tokens_detail
 function send(res, events) { res.writeHead(200,{"content-type":"text/event-stream"}); for(const e of events) res.write("data: "+JSON.stringify(e)+"\n\n"); res.end("data: [DONE]\n\n"); }
 http.createServer((req,res)=>{ let body=""; req.on("data",c=>body+=c); req.on("end",()=>{
   call++;
-  if(call===1){ const item={type:"function_call",id:"fc_1",call_id:"call_1",name:"write",arguments:'{"path":"agent.txt","content":"written by pi\\n"}',status:"completed"}; send(res,[
+  if(call===1){
+    if(!body.includes("Close one concrete coverage gap")){ res.writeHead(400); res.end("skill was not expanded"); return; }
+    const item={type:"function_call",id:"fc_1",call_id:"call_1",name:"write",arguments:'{"path":"agent.txt","content":"written by pi\\n"}',status:"completed"}; send(res,[
     {type:"response.created",response:{id:"resp_1"}},
     {type:"response.output_item.added",output_index:0,item},
     {type:"response.function_call_arguments.done",output_index:0,arguments:item.arguments},
@@ -77,6 +79,7 @@ http.createServer((req,res)=>{ let body=""; req.on("data",c=>body+=c); req.on("e
         gatewayUrl: "http://model-gateway:8080/v1",
         extensionPaths: ["/opt/pi/extensions/policy.ts", "/opt/pi/extensions/model-gateway.ts"],
         pluginPaths: ["/opt/pi/plugins/workspace-summary.ts"],
+        skillPaths: ["/opt/pi/skills/test-gap/SKILL.md"],
         toolNames: ["read", "write", "edit", "bash", "grep", "find", "ls", "workspace_summary"],
         user: `${hostUid}:${hostGid}`,
       },
@@ -88,7 +91,7 @@ http.createServer((req,res)=>{ let body=""; req.on("data",c=>body+=c); req.on("e
         if (event.type === "error") resolveSettled();
       },
     );
-    piProcess.prompt("run-1", "Create agent.txt with the requested content.");
+    piProcess.prompt("run-1", "/skill:test-gap Create agent.txt with the requested content.");
     await settled;
 
     assert.equal(await readFile(path.join(isolated.path, "agent.txt"), "utf8"), "written by pi\n");

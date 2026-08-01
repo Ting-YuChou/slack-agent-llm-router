@@ -319,7 +319,7 @@ make demo-agent-install
 make demo-agent-images
 ```
 
-The image target verifies the pinned plugin checksum, builds the hardened Agent
+The image target verifies the pinned plugin and Skill checksums, builds the hardened Agent
 image, and records that exact local image digest in `agent-runtime/plugins.lock.json`.
 Review unexpected lock changes before starting the demo. Run the launcher as a
 regular host user, not root, so the container can write only to that user's
@@ -352,6 +352,9 @@ Try these two paths:
   a dedicated branch, host worktree, and hardened container. Read-only tools run
   automatically. The first edit and non-allowlisted shell commands require an
   owner-only Slack approval.
+- `/llm agent /skill:test-gap 找出一個測試缺口並修正` — explicitly invokes
+  the bundled `test-gap` Skill. Pi may also select it from its description and
+  read that exact immutable `SKILL.md` automatically.
 - Reply normally inside that bot thread to continue the same Pi session.
 - `/llm agent status`, `/llm agent stop`, and `/llm agent close` inspect or
   control your latest session without consuming query quota.
@@ -364,10 +367,20 @@ failed, and timed-out prompts roll their isolated worktree back to the previous
 successful commit. Agent failures never silently fall back to Chat mode.
 
 The bundled tools are `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`.
-Extensions and plugins are discovery-disabled; only entries pinned by exact
-version/checksum in `agent-runtime/plugins.lock.json` are loaded. Plugins remain
-trusted code and are contained to reduce host impact, not treated as a sandbox
-boundary by themselves.
+Extensions, plugins, and Skills are discovery-disabled. Only plugins pinned in
+`agent-runtime/plugins.lock.json` and Skills pinned in
+`agent-runtime/skills.lock.json` are loaded by explicit container arguments.
+The runtime validates each Skill's name, exact version, path, frontmatter, and
+SHA-256 checksum before accepting coding runs. The model may read only the exact
+approved `SKILL.md` paths outside the worktree; write/edit access remains blocked.
+Plugins and Skill instructions remain trusted content and are contained to reduce
+host impact, not treated as sandbox boundaries by themselves.
+
+To add another Skill, place its reviewed `SKILL.md` under
+`agent-runtime/skills/<name>/`, add an exact-version entry and SHA-256 checksum
+to `agent-runtime/skills.lock.json`, then rebuild with `make demo-agent-images`.
+There is no Slack or runtime install/update command; a checksum mismatch makes
+health unhealthy and blocks new Agent runs.
 
 ### Prerequisites
 
