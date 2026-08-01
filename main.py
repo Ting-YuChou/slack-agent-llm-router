@@ -45,6 +45,7 @@ from src.admission import (
     AdmissionReservation,
     RedisAdmissionController,
 )
+from src.agent_runtime import AgentRuntimeClient
 from src.llm_router_part1_router import ModelRouter
 from src.llm_router_part2_inference import InferenceEngine
 from src.llm_router_part3_policy import PolicyMaterializer, RoutingPolicyCache
@@ -340,6 +341,10 @@ class LLMRouterPlatform:
 
     async def _initialize_background_services(self):
         """Initialize enabled background services."""
+        agent_config = dict(self.config.get("agent", {}) or {})
+        if agent_config.get("enabled", False):
+            self.services["agent_runtime"] = AgentRuntimeClient(agent_config)
+
         if self._service_enabled("pipeline"):
             self.services["pipeline"] = KafkaIngestionPipeline(
                 config=self._build_pipeline_config()

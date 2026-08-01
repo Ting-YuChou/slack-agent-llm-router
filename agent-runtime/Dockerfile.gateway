@@ -1,0 +1,9 @@
+FROM node:22.22.0-bookworm-slim
+
+WORKDIR /opt/gateway
+COPY dist ./dist
+RUN groupadd --gid 10002 gateway && useradd --uid 10002 --gid 10002 --no-create-home gateway \
+    && chown -R 10002:10002 /opt/gateway
+
+USER 10002:10002
+ENTRYPOINT ["node", "/opt/gateway/dist/src/model-gateway.js"]

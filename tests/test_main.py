@@ -292,6 +292,15 @@ class DummySlackBot:
         return None
 
 
+class DummyAgentRuntimeClient:
+    def __init__(self, config):
+        self.config = config
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+
+
 class DummyEventProducer:
     def __init__(self, config):
         self.config = config
@@ -690,6 +699,35 @@ class TestPlatformInitialization:
 
         assert "slack_bot" in platform.services
         assert platform.services["slack_bot"].services is platform.services
+
+    @pytest.mark.asyncio
+    async def test_initialize_services_adds_agent_runtime_client_when_enabled(
+        self, tmp_path, monkeypatch, patched_platform_deps
+    ):
+        monkeypatch.setattr(
+            main,
+            "AgentRuntimeClient",
+            DummyAgentRuntimeClient,
+            raising=False,
+        )
+        config_path = _write_config(
+            tmp_path,
+            overrides={
+                "slack": {"enabled": True},
+                "agent": {
+                    "enabled": True,
+                    "base_url": "http://127.0.0.1:3001",
+                },
+            },
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+
+        await platform._initialize_services(include_api=False, include_background=True)
+
+        assert "agent_runtime" in platform.services
+        assert platform.services["agent_runtime"].config["base_url"] == (
+            "http://127.0.0.1:3001"
+        )
 
     @pytest.mark.asyncio
     async def test_essential_service_failure_cancels_siblings_and_returns_nonzero(

@@ -510,6 +510,26 @@ def test_platform_config_accepts_tavily_web_search_config():
     assert config.tools.web_search.max_results_per_domain == 1
 
 
+def test_platform_config_validates_agent_runtime_settings():
+    config = PlatformConfig.model_validate(
+        {
+            "agent": {
+                "enabled": True,
+                "base_url": "http://127.0.0.1:3001",
+                "token_env": "AGENT_RUNTIME_TOKEN",
+                "connect_timeout_seconds": 2,
+                "request_timeout_seconds": 910,
+            }
+        }
+    )
+
+    assert config.agent.enabled is True
+    assert config.agent.base_url == "http://127.0.0.1:3001"
+    assert config.agent.token_env == "AGENT_RUNTIME_TOKEN"
+    assert config.agent.connect_timeout_seconds == 2
+    assert config.agent.request_timeout_seconds == 910
+
+
 def test_platform_config_accepts_rag_config():
     config = PlatformConfig(
         rag={

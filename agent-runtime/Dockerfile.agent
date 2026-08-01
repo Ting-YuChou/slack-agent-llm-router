@@ -1,0 +1,24 @@
+FROM node:22.22.0-bookworm-slim
+
+WORKDIR /opt/pi
+ENV PATH="/opt/pi/node_modules/.bin:${PATH}"
+COPY package.json package-lock.json ./
+COPY scripts ./scripts
+RUN npm ci --ignore-scripts
+COPY tsconfig.json tsconfig.extensions.json ./
+COPY src ./src
+COPY extensions ./extensions
+COPY plugins ./plugins
+COPY skills.lock.json ./skills.lock.json
+COPY skills ./skills
+RUN npm run build \
+    && npm prune --omit=dev --ignore-scripts \
+    && npm run patch-vendored-deps \
+    && npm audit --omit=dev --audit-level=high
+
+RUN groupadd --gid 10001 pi && useradd --uid 10001 --gid 10001 --no-create-home pi \
+    && mkdir -p /var/lib/pi-session /tmp/pi-home \
+    && chown -R 10001:10001 /var/lib/pi-session /tmp/pi-home /opt/pi
+
+USER 10001:10001
+ENTRYPOINT []
