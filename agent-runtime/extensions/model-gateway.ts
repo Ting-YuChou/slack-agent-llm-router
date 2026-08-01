@@ -1,5 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+import { AGENT_MODEL_CONFIG } from "../dist/src/agent-model.js";
+
 export default function modelGatewayExtension(pi: ExtensionAPI) {
   const baseUrl = process.env.PI_MODEL_GATEWAY_URL;
   if (!baseUrl || !baseUrl.startsWith("http://model-gateway:")) {
@@ -8,5 +10,7 @@ export default function modelGatewayExtension(pi: ExtensionAPI) {
   pi.registerProvider("openai", {
     baseUrl,
     apiKey: "$OPENAI_API_KEY",
+    api: "openai-responses",
+    models: [AGENT_MODEL_CONFIG],
   });
 }

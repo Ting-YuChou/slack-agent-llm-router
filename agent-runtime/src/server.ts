@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { DockerPiProcess } from "./container-runtime.js";
+import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT } from "./agent-model.js";
 import { issueGatewayToken } from "./gateway-token.js";
 import {
   CodingAgentOrchestrator,
@@ -188,7 +189,7 @@ export async function createProductionServer() {
           safeCommands: parseSafeCommands(process.env.PI_AGENT_SAFE_COMMANDS),
           user: containerUser,
         },
-        (runId) => issueGatewayToken({ runId, model: "gpt-5", expiresAt: Date.now() + 16 * 60_000 }, gatewaySecret),
+        (runId) => issueGatewayToken({ runId, model: AGENT_MODEL_ID, expiresAt: Date.now() + 16 * 60_000 }, gatewaySecret),
         onEvent,
       );
     },
@@ -203,7 +204,8 @@ export async function createProductionServer() {
       runtime: "pi-coding-agent",
       version: "0.83.0",
       provider: "openai",
-      model: "gpt-5",
+      model: AGENT_MODEL_ID,
+      reasoning_effort: AGENT_REASONING_EFFORT,
       tools: ["read", "write", "edit", "bash", "grep", "find", "ls", ...lock.plugins.flatMap((plugin) => plugin.enabled_tools)],
       plugin_integrity: lock.healthy ? "verified" : "failed",
       skills: skillLock.skills.map((skill) => skill.name),

@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 
 import { PiRpcBridge, RpcProtocolError, type PublicRunEvent } from "./pi-rpc.js";
 import type { AgentProcess } from "./orchestrator.js";
+import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT } from "./agent-model.js";
 
 export interface AgentContainerOptions {
   name: string;
@@ -55,7 +56,8 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     "pi",
     "--mode", "rpc",
     "--provider", "openai",
-    "--model", "gpt-5",
+    "--model", AGENT_MODEL_ID,
+    "--thinking", AGENT_REASONING_EFFORT,
     "--session-dir", "/var/lib/pi-session",
     "--approve",
     "--no-extensions",

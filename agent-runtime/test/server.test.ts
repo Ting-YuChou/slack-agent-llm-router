@@ -31,7 +31,7 @@ function fixture() {
   const server = createAgentHttpServer({
     orchestrator: orchestrator as any,
     token: "runtime-secret",
-    health: () => ({ status: "healthy", runtime: "pi-coding-agent", model: "gpt-5", tools: ["read", "write", "edit", "bash", "grep", "find", "ls"] }),
+    health: () => ({ status: "healthy", runtime: "pi-coding-agent", model: "gpt-5.6-luna", reasoning_effort: "max", tools: ["read", "write", "edit", "bash", "grep", "find", "ls"] }),
   });
   return { server, calls };
 }

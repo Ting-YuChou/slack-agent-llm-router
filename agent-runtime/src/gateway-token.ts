@@ -1,8 +1,10 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
+import { AGENT_MODEL_ID } from "./agent-model.js";
+
 export interface GatewayClaims {
   runId: string;
-  model: "gpt-5";
+  model: typeof AGENT_MODEL_ID;
   expiresAt: number;
 }
 
@@ -31,11 +33,11 @@ export function verifyGatewayToken(token: string, secret: string, now = Date.now
     return null;
   }
   if (
-    !isRecord(claims) || claims.model !== "gpt-5" ||
+    !isRecord(claims) || claims.model !== AGENT_MODEL_ID ||
     typeof claims.runId !== "string" || !claims.runId ||
     typeof claims.expiresAt !== "number" || claims.expiresAt < now
   ) return null;
-  return { runId: claims.runId, model: "gpt-5", expiresAt: claims.expiresAt };
+  return { runId: claims.runId, model: AGENT_MODEL_ID, expiresAt: claims.expiresAt };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
