@@ -79,6 +79,13 @@ def test_demo_manifest_declares_socket_mode_command_and_events():
 
 
 def test_demo_runner_starts_agent_sidecar_then_worker_runtime(tmp_path):
+    fake_repo = tmp_path / "clean-repo"
+    launcher = fake_repo / "scripts" / "run_slack_demo.sh"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text(
+        (ROOT / "scripts" / "run_slack_demo.sh").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
     fake_python = tmp_path / "python"
     fake_python.write_text(
         "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\"\n",
@@ -123,8 +130,8 @@ fi
         "DEMO_TEST_MODE": "1",
     }
     result = subprocess.run(
-        ["bash", str(ROOT / "scripts" / "run_slack_demo.sh")],
-        cwd=ROOT,
+        ["bash", str(launcher)],
+        cwd=fake_repo,
         env=env,
         text=True,
         capture_output=True,

@@ -82,7 +82,7 @@ if (( node_major < 22 || (node_major == 22 && node_minor < 19) )); then
   printf 'Pi agent runtime requires Node >=22.19.0; found %s.\n' "${node_version}" >&2
   exit 2
 fi
-if [[ ! -d "${agent_runtime_dir}/node_modules" ]]; then
+if [[ "${DEMO_TEST_MODE:-0}" != 1 ]] && [[ ! -d "${agent_runtime_dir}/node_modules" ]]; then
   printf 'Agent runtime dependencies are missing. Run: make demo-agent-install\n' >&2
   exit 2
 fi
