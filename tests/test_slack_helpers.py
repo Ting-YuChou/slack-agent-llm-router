@@ -105,6 +105,234 @@ class TestConversationHelpers:
 
 class TestSlackMessageHandler:
     @pytest.mark.asyncio
+    async def test_agent_command_creates_thread_session_without_chat_history(self):
+        agent_runtime = SimpleNamespace(
+            create_session=AsyncMock(
+                return_value={
+                    "session_id": "session-1",
+                    "run_id": "run-1",
+                    "status": "starting",
+                }
+            )
+        )
+        inference_engine = SimpleNamespace(process_query=AsyncMock())
+        conversation_manager = ConversationManager({})
+        bot = SlackBot(
+            {"channels": []},
+            inference_engine=inference_engine,
+            services={"agent_runtime": agent_runtime},
+        )
+        bot.conversation_manager = conversation_manager
+        bot._monitor_agent_run = AsyncMock()
+        client = SimpleNamespace(
+            chat_postMessage=AsyncMock(return_value={"ts": "100.1"}),
+            chat_update=AsyncMock(),
+        )
+        handler = SlackMessageHandler(bot)
+
+        response = await handler._handle_command(
+            "agent fix the failing test",
+            "U1",
+            "C1",
+            None,
+            client=client,
+            team_id="T1",
+        )
+
+        assert response == ""
+        agent_runtime.create_session.assert_awaited_once_with(
+            "T1", "C1", "100.1", "U1", "fix the failing test"
+        )
+        inference_engine.process_query.assert_not_awaited()
+        assert conversation_manager.get_conversation_summary("U1", "C1") == ""
+        assert bot.agent_runs["run-1"]["thread_ts"] == "100.1"
+
+    @pytest.mark.asyncio
+    async def test_agent_command_without_task_returns_usage_without_runtime_call(self):
+        agent_runtime = SimpleNamespace(create_session=AsyncMock())
+        inference_engine = SimpleNamespace(process_query=AsyncMock())
+        bot = SimpleNamespace(
+            user_manager=UserManager(),
+            conversation_manager=ConversationManager({}),
+            inference_engine=inference_engine,
+            agent_runtime_client=agent_runtime,
+        )
+        handler = SlackMessageHandler(bot)
+
+        response = await handler._handle_command("agent", "u1", "c1", None, client=None)
+
+        assert response == "Usage: `/llm agent <task>`"
+        agent_runtime.create_session.assert_not_awaited()
+        inference_engine.process_query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_agent_status_stop_close_do_not_consume_quota(self):
+        runtime = SimpleNamespace(
+            get_run=AsyncMock(return_value={"run_id": "R1", "status": "running"}),
+            cancel=AsyncMock(),
+            close_session=AsyncMock(),
+        )
+        bot = SlackBot(
+            {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+        )
+        bot.agent_user_runs["U1"] = {
+            "run_id": "R1",
+            "session_id": "S1",
+            "thread_ts": "1",
+            "channel_id": "C1",
+            "owner_user_id": "U1",
+        }
+        handler = SlackMessageHandler(bot)
+
+        assert handler.command_consumes_query_quota("agent status") is False
+        assert handler.command_consumes_query_quota("agent stop") is False
+        assert handler.command_consumes_query_quota("agent close") is False
+        assert (
+            "running"
+            in (
+                await handler._handle_command("agent status", "U1", "C1", None, None)
+            ).lower()
+        )
+        await handler._handle_command("agent stop", "U1", "C1", None, None)
+        await handler._handle_command("agent close", "U1", "C1", None, None)
+
+        runtime.cancel.assert_awaited_once_with("R1", "U1")
+        runtime.close_session.assert_awaited_once_with("S1", "U1")
+
+    @pytest.mark.asyncio
+    async def test_agent_thread_followup_resumes_same_sidecar_session(self):
+        runtime = SimpleNamespace(
+            create_session=AsyncMock(
+                return_value={"session_id": "S1", "run_id": "R2", "status": "starting"}
+            )
+        )
+        inference = SimpleNamespace(process_query=AsyncMock())
+        bot = SlackBot({"channels": []}, inference, services={"agent_runtime": runtime})
+        bot._monitor_agent_run = AsyncMock()
+        bot._track_agent_run(
+            {"session_id": "S1", "run_id": "R1", "status": "starting"},
+            team_id="T1",
+            channel_id="C1",
+            thread_ts="100.1",
+            owner_user_id="U1",
+        )
+        handler = SlackMessageHandler(bot)
+
+        response = await handler.handle_message(
+            {
+                "text": "also add a regression test",
+                "user": "U1",
+                "channel": "C1",
+                "thread_ts": "100.1",
+                "_team_id": "T1",
+            },
+            SimpleNamespace(),
+        )
+
+        assert "R2" in response
+        runtime.create_session.assert_awaited_once_with(
+            "T1", "C1", "100.1", "U1", "also add a regression test"
+        )
+        inference.process_query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_help_and_status_expose_agent_mode_and_runtime_health(self):
+        agent_runtime = SimpleNamespace(health=AsyncMock(return_value=True))
+        bot = SimpleNamespace(
+            user_manager=UserManager(),
+            conversation_manager=ConversationManager({}),
+            inference_engine=SimpleNamespace(),
+            agent_runtime_client=agent_runtime,
+            get_system_status=AsyncMock(
+                return_value={
+                    "healthy": True,
+                    "available_models": ["gpt-5"],
+                    "avg_response_time": 10,
+                    "uptime": "1m",
+                }
+            ),
+            get_user_stats=AsyncMock(return_value={}),
+        )
+        handler = SlackMessageHandler(bot)
+
+        help_text = await handler._handle_help_command([], "u1", "c1", None)
+        status_text = await handler._handle_status_command([], "u1", "c1", None)
+
+        assert "/llm agent <task>" in help_text
+        assert "Agent Runtime:" in status_text
+        assert "Healthy" in status_text
+        agent_runtime.health.assert_awaited_once()
+
+    def test_agent_response_formats_code_delivery_and_respects_limit(self):
+        response = SlackMessageHandler._format_agent_response(
+            {
+                "answer": "a" * 500,
+                "changed_files": ["src/a.py"],
+                "diff_stat": "1 file changed, 2 insertions(+)",
+                "branch": "pi-agent/20260801-r1",
+                "commit": "a" * 40,
+                "cherry_pick": "git cherry-pick " + "a" * 40,
+            },
+            max_length=360,
+        )
+
+        assert len(response) <= 360
+        assert "src/a.py" in response
+        assert "git cherry-pick" in response
+
+
+class TestSlackAgentApprovals:
+    @pytest.mark.asyncio
+    async def test_interactive_request_is_acked_before_approval_work_is_queued(self):
+        bot = SlackBot({"channels": []}, SimpleNamespace())
+        bot._enqueue_work = AsyncMock(return_value=True)
+        socket_client = SimpleNamespace(send_socket_mode_response=AsyncMock())
+        request = SimpleNamespace(
+            envelope_id="E1",
+            type="interactive",
+            payload={"type": "block_actions", "actions": []},
+        )
+
+        await bot._handle_socket_mode_request(socket_client, request)
+
+        socket_client.send_socket_mode_response.assert_awaited_once()
+        item = bot._enqueue_work.await_args.args[0]
+        assert item.kind == "interactive"
+
+    @pytest.mark.asyncio
+    async def test_only_session_owner_can_press_approval_button(self):
+        runtime = SimpleNamespace(decide=AsyncMock())
+        bot = SlackBot(
+            {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+        )
+        bot.web_client = SimpleNamespace(chat_postEphemeral=AsyncMock())
+        bot.agent_runs["R1"] = {
+            "run_id": "R1",
+            "session_id": "S1",
+            "channel_id": "C1",
+            "thread_ts": "1",
+            "owner_user_id": "U1",
+        }
+        payload = {
+            "user": {"id": "U2"},
+            "channel": {"id": "C1"},
+            "actions": [
+                {
+                    "action_id": "pi_agent_approve",
+                    "value": '{"run_id":"R1","session_id":"S1","approval_id":"A1"}',
+                }
+            ],
+        }
+
+        await bot._handle_agent_interactive(payload)
+
+        runtime.decide.assert_not_awaited()
+        assert (
+            "Only the user"
+            in bot.web_client.chat_postEphemeral.await_args.kwargs["text"]
+        )
+
+    @pytest.mark.asyncio
     async def test_settings_command_updates_preferences(self):
         bot = SimpleNamespace(
             user_manager=UserManager(),
@@ -954,6 +1182,34 @@ class TestSlackBot:
 
         assert bot._is_query_event({"text": "!llm write a Python function"}) is True
         assert bot._is_query_event({"text": "!llm help"}) is False
+        assert bot._is_query_event({"text": "!llm agent research transformers"}) is True
+
+    @pytest.mark.asyncio
+    async def test_slash_agent_command_is_rejected_when_query_quota_is_exhausted(self):
+        agent_runtime = SimpleNamespace(run=AsyncMock())
+        bot = SlackBot(
+            {"channels": []},
+            inference_engine=SimpleNamespace(),
+            services={"agent_runtime": agent_runtime},
+        )
+        bot.web_client = SimpleNamespace(
+            chat_postEphemeral=AsyncMock(),
+            chat_postMessage=AsyncMock(),
+        )
+        bot.user_manager.check_rate_limit = lambda *_args, **_kwargs: False
+
+        await bot._handle_slash_command(
+            {
+                "channel_id": "C1",
+                "channel_name": "general",
+                "user_id": "U1",
+                "text": "agent research transformers",
+            }
+        )
+
+        agent_runtime.run.assert_not_awaited()
+        response = bot.web_client.chat_postEphemeral.await_args.kwargs["text"]
+        assert "rate limit" in response.lower()
 
     @pytest.mark.asyncio
     async def test_process_message_passes_resolved_attachments_to_query(

@@ -1115,6 +1115,37 @@ class TestResponseCache:
 
 class TestInferenceEngine:
     @pytest.mark.asyncio
+    async def test_initialize_skips_explicitly_disabled_providers(self):
+        router = MagicMock()
+        engine = InferenceEngine(
+            {
+                "openai": {"enabled": False},
+                "anthropic": {"enabled": False},
+                "vllm": {
+                    "enabled": False,
+                    "base_url": "http://127.0.0.1:8001",
+                },
+            },
+            router,
+        )
+        engine.context_compressor.initialize = AsyncMock()
+        engine.cache.initialize = AsyncMock()
+
+        with (
+            patch("src.llm_router_part2_inference.OpenAIProvider") as openai_provider,
+            patch(
+                "src.llm_router_part2_inference.AnthropicProvider"
+            ) as anthropic_provider,
+            patch("src.llm_router_part2_inference.vLLMProvider") as vllm_provider,
+        ):
+            await engine.initialize()
+
+        openai_provider.assert_not_called()
+        anthropic_provider.assert_not_called()
+        vllm_provider.assert_not_called()
+        assert engine.providers == {}
+
+    @pytest.mark.asyncio
     async def test_fallback_cache_lookup_cannot_outlive_request_deadline(
         self, sample_query_request, inference_response_factory
     ):

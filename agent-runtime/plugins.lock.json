@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "image_digest": "sha256:5355f944cfb31a2dbd620afb2809bfd74c606f9f456767531f836322d39f97ce",
+  "plugins": [
+    {
+      "id": "workspace-summary",
+      "source": "builtin:workspace-summary",
+      "version": "0.1.0",
+      "integrity": "sha256:b869fdcb32468c863484197f1489c060b5bd2692098fbc2173c9edffecb2bcfc",
+      "container_path": "/opt/pi/plugins/workspace-summary.ts",
+      "host_path": "plugins/workspace-summary.ts",
+      "enabled_tools": [
+        "workspace_summary"
+      ],
+      "risk_class": "read_only"
+    }
+  ]
+}

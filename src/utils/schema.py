@@ -544,6 +544,7 @@ class ProviderModelFallbackConfig(ConfigModel):
 
 
 class ProviderEndpointConfig(ConfigModel):
+    enabled: bool = True
     base_url: Optional[str] = None
     host: Optional[str] = None
     port: Optional[int] = Field(None, ge=1, le=65535)
@@ -1239,6 +1240,14 @@ class ShutdownConfig(ConfigModel):
     service_stop_timeout_seconds: float = Field(15.0, gt=0)
 
 
+class AgentRuntimeConfig(ConfigModel):
+    enabled: bool = False
+    base_url: str = "http://127.0.0.1:3001"
+    token_env: str = "AGENT_RUNTIME_TOKEN"
+    connect_timeout_seconds: float = Field(2.0, gt=0)
+    request_timeout_seconds: float = Field(910.0, gt=0)
+
+
 class PlatformConfig(ConfigModel):
     api: ApiConfig = Field(default_factory=ApiConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
@@ -1259,3 +1268,4 @@ class PlatformConfig(ConfigModel):
     shutdown: ShutdownConfig = Field(default_factory=ShutdownConfig)
     features: FeatureFlagsConfig = Field(default_factory=FeatureFlagsConfig)
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
+    agent: AgentRuntimeConfig = Field(default_factory=AgentRuntimeConfig)

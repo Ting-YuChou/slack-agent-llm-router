@@ -2028,12 +2028,14 @@ class InferenceEngine:
             self.tool_registry.register(self.web_search_tool)
 
         # Initialize providers based on configuration
-        if "openai" in self.config:
-            self.providers["openai"] = OpenAIProvider(self.config["openai"])
+        openai_config = dict(self.config.get("openai", {}) or {})
+        if "openai" in self.config and openai_config.get("enabled", True):
+            self.providers["openai"] = OpenAIProvider(openai_config)
             await self.providers["openai"].initialize()
 
-        if "anthropic" in self.config:
-            self.providers["anthropic"] = AnthropicProvider(self.config["anthropic"])
+        anthropic_config = dict(self.config.get("anthropic", {}) or {})
+        if "anthropic" in self.config and anthropic_config.get("enabled", True):
+            self.providers["anthropic"] = AnthropicProvider(anthropic_config)
             await self.providers["anthropic"].initialize()
 
         vllm_config = dict(self.config.get("vllm", {}) or {})
@@ -2048,7 +2050,7 @@ class InferenceEngine:
 
     def _vllm_configured(self, config: Dict[str, Any]) -> bool:
         """Return whether a usable vLLM endpoint has been configured."""
-        if not config:
+        if not config or not config.get("enabled", True):
             return False
 
         if config.get("base_url"):

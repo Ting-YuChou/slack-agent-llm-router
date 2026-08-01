@@ -1,0 +1,140 @@
+api:
+  rate_limiting:
+    enabled: false
+
+logging:
+  level: INFO
+  file: logs/slack_demo.log
+
+agent:
+  enabled: true
+  base_url: http://127.0.0.1:3001
+  token_env: AGENT_RUNTIME_TOKEN
+  connect_timeout_seconds: 2
+  request_timeout_seconds: 910
+
+router:
+  default_model: gpt-5
+  routing_strategy: intelligent
+  fast_lane_models:
+    - gpt-5
+  scoring:
+    local_simple_task_bonus: 0
+  models:
+    gpt-5:
+      provider: openai
+      api_key_env: OPENAI_API_KEY
+      max_tokens: 128000
+      cost_per_token: 3.0e-05
+      priority: 1
+      capabilities:
+        - general
+        - reasoning
+        - coding
+        - analysis
+        - writing
+        - math
+        - translation
+        - tool_use
+        - vision
+  routing_rules: []
+
+inference:
+  openai:
+    enabled: true
+    base_url: https://api.openai.com/v1
+    timeout: 60
+    max_retries: 3
+  anthropic:
+    enabled: false
+  vllm:
+    enabled: false
+  compression:
+    enabled: false
+  cache:
+    enabled: false
+    backend: memory
+  single_flight:
+    enabled: false
+  scheduler:
+    enabled: false
+    queue_enabled: false
+
+tools:
+  web_search:
+    enabled: false
+
+rag:
+  enabled: false
+
+kafka:
+  enabled: false
+
+clickhouse:
+  enabled: false
+
+monitoring:
+  enabled: false
+
+slack:
+  enabled: true
+  bot_token_env: SLACK_BOT_TOKEN
+  app_token_env: SLACK_APP_TOKEN
+  signing_secret_env: SLACK_SIGNING_SECRET
+  channels:
+    - ai-testing
+  work_queue:
+    capacity: 32
+    concurrency: 2
+    overload_reply_timeout_seconds: 2
+  response_settings:
+    max_response_length: 2000
+    typing_indicator: true
+    thread_replies: true
+  rate_limiting:
+    requests_per_hour: 100
+    burst_requests: 5
+  context:
+    enabled: true
+    strategy: thread_first
+    max_thread_messages: 20
+    max_channel_messages: 10
+    max_context_chars: 4000
+    include_bot_messages: false
+    timeout_seconds: 3
+    fail_open: true
+  attachments:
+    enabled: true
+    max_files: 10
+    max_file_size_bytes: 10000000
+    download_timeout_seconds: 30
+  state_backend: memory
+  memory:
+    enabled: false
+    backend: memory
+
+streamlit:
+  enabled: false
+
+flink:
+  enabled: false
+
+policy_cache:
+  enabled: false
+
+security:
+  api_keys:
+    enabled: false
+  cors:
+    enabled: false
+
+features:
+  context_compression: false
+  semantic_caching: false
+  batch_processing: false
+  multi_modal: false
+  function_calling: false
+  streaming_responses: false
+
+pipeline:
+  enabled: false

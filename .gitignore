@@ -22,6 +22,7 @@ venv/
 # Packaging / build
 build/
 dist/
+node_modules/
 site/
 htmlcov/
 .coverage*
@@ -29,6 +30,8 @@ htmlcov/
 # Logs / runtime artifacts
 logs/
 *.log
+.pi-agent-runtime/
+.pi-agent-worktrees/
 
 # Data outputs
 data/processed/

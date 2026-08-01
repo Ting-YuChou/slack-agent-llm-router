@@ -1,7 +1,7 @@
 PYTHON ?= python
 DOCKER_COMPOSE ?= docker compose
 
-.PHONY: up down api api-dev workers loadtest-api loadtest-redis-control-plane cleanup-v1-provider-scheduler-keys smoke smoke-kafka smoke-web-search smoke-redis-stack-memory smoke-flink smoke-flink-runtime smoke-flink-analytics smoke-flink-analytics-runtime integration integration-kafka integration-flink integration-flink-runtime integration-flink-analytics integration-flink-analytics-runtime
+.PHONY: up down api api-dev workers demo-agent-install demo-agent-images demo-slack loadtest-api loadtest-redis-control-plane cleanup-v1-provider-scheduler-keys smoke smoke-kafka smoke-web-search smoke-redis-stack-memory smoke-flink smoke-flink-runtime smoke-flink-analytics smoke-flink-analytics-runtime integration integration-kafka integration-flink integration-flink-runtime integration-flink-analytics integration-flink-analytics-runtime
 
 up:
 	$(DOCKER_COMPOSE) up -d --build redis-stack kafka clickhouse flink-jobmanager flink-taskmanager
@@ -17,6 +17,19 @@ api-dev:
 
 workers:
 	$(PYTHON) main.py start-workers
+
+demo-agent-install:
+	npm --prefix agent-runtime ci --ignore-scripts
+	npm --prefix agent-runtime run patch-vendored-deps
+
+demo-agent-images:
+	npm --prefix agent-runtime run build
+	docker build -f agent-runtime/Dockerfile.agent -t slack-pi-agent:0.83.0 agent-runtime
+	npm --prefix agent-runtime run lock-image -- slack-pi-agent:0.83.0
+	docker build -f agent-runtime/Dockerfile.gateway -t slack-pi-model-gateway:0.1.0 agent-runtime
+
+demo-slack:
+	bash scripts/run_slack_demo.sh
 
 loadtest-api:
 	$(PYTHON) scripts/loadtest_api_baseline.py

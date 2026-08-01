@@ -295,9 +295,84 @@ the regular response-cache Redis on `6379`.
 
 ## Quick Start
 
+### Single-Model Slack Demo
+
+This is the smallest live demo with two execution modes in the same Slack bot:
+normal queries use the existing Python ModelRouter, while `/llm agent <task>`
+uses Pi's coding-agent runtime with isolated `read`, `write`, `edit`, `bash`,
+`grep`, `find`, and `ls` tools.
+Both modes use one OpenAI model. Redis, Kafka, ClickHouse, Flink, RAG, Tavily
+web search, response cache, and the provider scheduler are disabled in
+[config/config.demo.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.demo.yaml).
+
+1. In Slack, create an app **from a manifest** and paste
+   [slack/app-manifest.demo.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/slack/app-manifest.demo.yaml).
+2. Install the app to the workspace.
+3. Under **Basic Information → App-Level Tokens**, generate an app token with
+   `connections:write`. Keep the resulting `xapp-` token.
+4. Invite the bot to `#ai-testing`. If you use another channel, update
+   `slack.channels` in the demo config.
+5. Install the pinned Pi runtime dependencies and build the two local images once:
+
+```bash
+make demo-agent-install
+make demo-agent-images
+```
+
+The image target verifies the pinned plugin checksum, builds the hardened Agent
+image, and records that exact local image digest in `agent-runtime/plugins.lock.json`.
+Review unexpected lock changes before starting the demo. Run the launcher as a
+regular host user, not root, so the container can write only to that user's
+dedicated worktree and Pi session directory.
+
+6. Create the local secret file:
+
+```bash
+cp config/demo.env.example .env.demo
+```
+
+Fill in `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`, and `SLACK_APP_TOKEN`, then start
+the demo:
+
+```bash
+make demo-slack
+```
+
+`make demo-slack` starts a loopback-only host orchestrator, a model-only gateway,
+and the Slack worker. It creates an internal Docker network so Agent containers
+cannot reach the general internet. The gateway owns the real OpenAI key; each
+Agent prompt receives only a short-lived token restricted to `gpt-5` Responses
+requests. All managed processes and containers are stopped together. No public
+webhook or tunnel is required because the app uses Socket Mode.
+
+Try these two paths:
+
+- `/llm explain Transformer` — normal Chat mode through ModelRouter.
+- `/llm agent 找出一個測試缺口並修正` — starts a stateful Pi coding agent in
+  a dedicated branch, host worktree, and hardened container. Read-only tools run
+  automatically. The first edit and non-allowlisted shell commands require an
+  owner-only Slack approval.
+- Reply normally inside that bot thread to continue the same Pi session.
+- `/llm agent status`, `/llm agent stop`, and `/llm agent close` inspect or
+  control your latest session without consuming query quota.
+
+Each new coding prompt counts as one Slack query; internal model turns and tools
+do not. A successful prompt is committed on its `pi-agent/...` branch and Slack
+shows the changed files, diff stat, commit, and cherry-pick command. The runtime
+never pushes, merges, or modifies the current checkout. Rejected, cancelled,
+failed, and timed-out prompts roll their isolated worktree back to the previous
+successful commit. Agent failures never silently fall back to Chat mode.
+
+The bundled tools are `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`.
+Extensions and plugins are discovery-disabled; only entries pinned by exact
+version/checksum in `agent-runtime/plugins.lock.json` are loaded. Plugins remain
+trusted code and are contained to reduce host impact, not treated as a sandbox
+boundary by themselves.
+
 ### Prerequisites
 
 - Python 3.9+
+- Node.js 22.19+
 - Docker / Docker Compose
 - OpenAI and/or Anthropic API key if you want live model responses
 - optional GPU and local model server if you want `vLLM`
@@ -397,6 +472,7 @@ python main.py start --config config/config.yaml
 
 - [config/config.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.yaml): host-run configuration, includes optional local `vLLM`
 - [config/config.compose.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.compose.yaml): compose runtime configuration, uses service names like `redis`, `kafka`, `clickhouse`
+- [config/config.demo.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.demo.yaml): single-provider Slack demo with external infrastructure disabled
 
 Important defaults in `config/config.yaml`:
 

@@ -20,6 +20,14 @@ from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
 import httpx
 
+from src.agent_runtime import (
+    AgentRuntimeBusy,
+    AgentRuntimeConflict,
+    AgentRuntimeError,
+    AgentRuntimeTimeout,
+    AgentRuntimeUnauthorized,
+    AgentRuntimeUnavailable,
+)
 from src.memory import MemoryManager, build_memory_scope
 from src.utils.schema import (
     Attachment,
@@ -731,6 +739,7 @@ class SlackMessageHandler:
             "clear": self._handle_clear_command,
             "web": self._handle_web_command,
             "fast": self._handle_fast_command,
+            "agent": self._handle_agent_command,
             "remember": self._handle_remember_command,
             "memories": self._handle_memories_command,
             "forget": self._handle_forget_command,
@@ -753,6 +762,17 @@ class SlackMessageHandler:
             return True
         command_name = normalized.split(maxsplit=1)[0].lower()
         return command_name in self.commands
+
+    def command_consumes_query_quota(self, command_text: str) -> bool:
+        """Return whether a command performs a model-backed query."""
+        normalized = (command_text or "").strip()
+        if not normalized:
+            return False
+        command_name = normalized.split(maxsplit=1)[0].lower()
+        if command_name == "agent":
+            parts = normalized.split()
+            return len(parts) < 2 or parts[1].lower() not in {"status", "stop", "close"}
+        return command_name not in self.commands
 
     async def handle_message(
         self, event: Dict[str, Any], client: AsyncWebClient
@@ -785,6 +805,19 @@ class SlackMessageHandler:
 
         if not text and attachments:
             text = self._build_attachment_only_query(attachments)
+
+        is_agent_thread = getattr(self.bot, "_is_agent_thread", lambda *_args: False)
+        if event.get("thread_ts") and is_agent_thread(
+            channel_id, event.get("thread_ts")
+        ):
+            return await self._start_agent_prompt(
+                text,
+                user_id,
+                channel_id,
+                client,
+                team_id=team_id,
+                thread_ts=event.get("thread_ts"),
+            )
 
         # Regular query - process through inference engine
         return await self._handle_query(
@@ -876,6 +909,15 @@ class SlackMessageHandler:
                     thread_ts=thread_ts,
                     command_surface=command_surface,
                 )
+            if command == "agent":
+                return await self._handle_agent_command(
+                    args,
+                    user_id,
+                    channel_id,
+                    client,
+                    team_id=team_id,
+                    thread_ts=thread_ts,
+                )
             return await self.commands[command](args, user_id, channel_id, client)
         return await self._handle_query(
             command_text,
@@ -947,6 +989,177 @@ class SlackMessageHandler:
             message_ts=message_ts,
         )
 
+    async def _handle_agent_command(
+        self,
+        args: List[str],
+        user_id: str,
+        channel_id: str,
+        client: AsyncWebClient,
+        team_id: Optional[str] = None,
+        thread_ts: Optional[str] = None,
+    ) -> str:
+        """Start or control a stateful Pi coding-agent thread."""
+        task = " ".join(args).strip()
+        if not task:
+            return "Usage: `/llm agent <task>`"
+
+        runtime = getattr(self.bot, "agent_runtime_client", None)
+        if runtime is None:
+            return "Agent mode is currently disabled."
+
+        action = args[0].lower()
+        if action in {"status", "stop", "close"} and len(args) == 1:
+            tracked = self.bot._agent_run_for(user_id, channel_id, thread_ts)
+            if not tracked:
+                return "No active Agent session was found for you."
+            try:
+                if action == "status":
+                    run = await runtime.get_run(tracked["run_id"])
+                    return self._format_agent_status(run)
+                if action == "stop":
+                    await runtime.cancel(tracked["run_id"], user_id)
+                    return f"Agent run `{tracked['run_id']}` is stopping."
+                await runtime.close_session(tracked["session_id"], user_id)
+                self.bot._forget_agent_session(tracked)
+                return f"Agent session `{tracked['session_id']}` is closed; its branch and commits were kept."
+            except AgentRuntimeConflict:
+                return "That Agent action has already completed or is no longer valid."
+            except AgentRuntimeUnauthorized:
+                return "Only the Agent session owner can perform that action."
+            except AgentRuntimeError:
+                return "Agent mode could not complete that control action."
+
+        return await self._start_agent_prompt(
+            task,
+            user_id,
+            channel_id,
+            client,
+            team_id=team_id,
+            thread_ts=thread_ts,
+        )
+
+    async def _start_agent_prompt(
+        self,
+        task: str,
+        user_id: str,
+        channel_id: str,
+        client: AsyncWebClient,
+        *,
+        team_id: Optional[str],
+        thread_ts: Optional[str],
+    ) -> str:
+        runtime = getattr(self.bot, "agent_runtime_client", None)
+        if runtime is None:
+            return "Agent mode is currently disabled."
+
+        root_ts = thread_ts
+        root_message_ts = None
+        if not root_ts and client is not None:
+            started = await client.chat_postMessage(
+                channel=channel_id,
+                text="🛠️ Pi coding agent is preparing an isolated worktree…",
+            )
+            root_ts = started.get("ts")
+            root_message_ts = root_ts
+        if not root_ts:
+            return "Agent mode needs a Slack thread to start this task."
+
+        try:
+            result = await runtime.create_session(
+                team_id or "unknown-team",
+                channel_id,
+                root_ts,
+                user_id,
+                task,
+            )
+        except AgentRuntimeBusy:
+            message = (
+                "Agent mode is busy right now. Chat mode was not used as fallback."
+            )
+        except AgentRuntimeTimeout:
+            message = "Agent mode timed out while starting. Chat mode was not used as fallback."
+        except AgentRuntimeUnavailable:
+            message = "Agent mode is temporarily unavailable. Chat mode was not used as fallback."
+        except AgentRuntimeError:
+            logger.warning("Agent runtime could not complete the Slack task")
+            message = "Agent mode could not start this task. Chat mode was not used as fallback."
+        else:
+            tracked = self.bot._track_agent_run(
+                result,
+                team_id=team_id or "unknown-team",
+                channel_id=channel_id,
+                thread_ts=root_ts,
+                owner_user_id=user_id,
+            )
+            if (
+                root_message_ts
+                and client is not None
+                and hasattr(client, "chat_update")
+            ):
+                await client.chat_update(
+                    channel=channel_id,
+                    ts=root_message_ts,
+                    text=(
+                        f"🛠️ Pi coding agent started run `{result['run_id']}`.\n"
+                        "Read-only exploration is automatic; edits and risky shell commands require approval here."
+                    ),
+                )
+            self.bot._spawn_background_task(
+                self.bot._monitor_agent_run(tracked),
+                f"pi_agent_monitor:{result['run_id']}",
+            )
+            if root_message_ts:
+                return ""
+            return f"🛠️ Agent run `{result['run_id']}` started."
+
+        if root_message_ts and client is not None and hasattr(client, "chat_update"):
+            await client.chat_update(
+                channel=channel_id, ts=root_message_ts, text=message
+            )
+            return ""
+        return message
+
+    @staticmethod
+    def _format_agent_response(
+        result: Dict[str, Any], max_length: Optional[int] = None
+    ) -> str:
+        answer = str(result.get("answer", "")).strip()
+        detail_sections = []
+        changed_files = [str(item) for item in result.get("changed_files", [])]
+        if changed_files:
+            detail_sections.append(
+                "*Changed files:*\n"
+                + "\n".join(f"• `{item}`" for item in changed_files[:50])
+            )
+        if result.get("diff_stat"):
+            detail_sections.append(f"*Diff:* `{result['diff_stat']}`")
+        delivery = []
+        if result.get("branch"):
+            delivery.append(f"Branch: `{result['branch']}`")
+        if result.get("commit"):
+            delivery.append(f"Commit: `{result['commit']}`")
+        if result.get("cherry_pick"):
+            delivery.append(f"Apply: `{result['cherry_pick']}`")
+        if delivery:
+            detail_sections.append("*Delivery:*\n" + "\n".join(delivery))
+
+        details = "\n\n".join(detail_sections)
+        response = "\n\n".join(section for section in (answer, details) if section)
+        if max_length is None or len(response) <= max_length:
+            return response
+
+        if details and len(details) < max_length:
+            available_answer_chars = max_length - len(details) - 2
+            if available_answer_chars > 1:
+                truncated_answer = answer[: available_answer_chars - 1].rstrip() + "…"
+                return f"{truncated_answer}\n\n{details}"
+            return details[:max_length]
+        return response[: max(0, max_length - 1)].rstrip() + "…"
+
+    @staticmethod
+    def _format_agent_status(run: Dict[str, Any]) -> str:
+        return f"Agent run `{run.get('run_id', 'unknown')}` is *{run.get('status', 'unknown')}*."
+
     async def _handle_help_command(
         self, args: List[str], user_id: str, channel_id: str, client: AsyncWebClient
     ) -> str:
@@ -966,6 +1179,8 @@ Mention me in a channel, use `/llm ...`, or reply inside an active bot thread.
 • `/llm clear` - Clear conversation history
 • `/llm web <query>` - Search the web before answering
 • `/llm fast <query>` - Prefer an explicit low-latency route for this query
+• `/llm agent <task>` - Start a stateful Pi coding agent in an isolated worktree
+• `/llm agent status|stop|close` - Inspect or control your latest Agent session
 • `/llm remember <text>` - Save an explicit long-term memory
 • `/llm memories [query]` - List or search your memories
 • `/llm forget <memory_id|all>` - Delete saved memories
@@ -1086,6 +1301,13 @@ Mention me in a channel, use `/llm ...`, or reply inside an active bot thread.
 
             # Get user stats
             user_stats = await self.bot.get_user_stats(user_id)
+            runtime = getattr(self.bot, "agent_runtime_client", None)
+            if runtime is None:
+                agent_health = "⚪ Disabled"
+            else:
+                agent_health = (
+                    "🟢 Healthy" if await runtime.health() else "🔴 Unavailable"
+                )
 
             status_text = f"""
 📊 *System Status*
@@ -1094,6 +1316,7 @@ Mention me in a channel, use `/llm ...`, or reply inside an active bot thread.
 *Active Models:* {len(system_health.get('available_models', []))}
 *Response Time:* {system_health.get('avg_response_time', 0):.0f}ms
 *Uptime:* {system_health.get('uptime', 'Unknown')}
+*Agent Runtime:* {agent_health}
 
 *Your Usage (Last 24h):*
 📝 Queries: {user_stats.get('queries_24h', 0)}
@@ -1606,6 +1829,7 @@ class SlackBot:
             "monitoring"
         )
         self.analytics_service = analytics_service or resolved_services.get("pipeline")
+        self.agent_runtime_client = resolved_services.get("agent_runtime")
 
         tier_settings = config.get("user_tiers", {})
         default_user_tier = tier_settings.get("default", UserTier.FREE.value)
@@ -1647,6 +1871,9 @@ class SlackBot:
         self.state_lock = asyncio.Lock()
         self.active_threads: Dict[str, datetime] = {}
         self.active_thread_timeout = self.conversation_manager.session_timeout
+        self.agent_threads: Dict[str, Dict[str, Any]] = {}
+        self.agent_runs: Dict[str, Dict[str, Any]] = {}
+        self.agent_user_runs: Dict[str, Dict[str, Any]] = {}
 
         # Running state
         self.initialized = False
@@ -1770,6 +1997,17 @@ class SlackBot:
                     )
                 )
 
+            elif (
+                req.type == "interactive" and req.payload.get("type") == "block_actions"
+            ):
+                await self._enqueue_work(
+                    SlackWorkItem(
+                        kind="interactive",
+                        payload=req.payload,
+                        name="slack_agent_approval",
+                    )
+                )
+
         except Exception as e:
             logger.error(f"Error handling socket mode request: {e}")
 
@@ -1797,10 +2035,39 @@ class SlackBot:
             return
 
         thread_ts = event.get("thread_ts")
+        if thread_ts and not self._is_agent_thread(channel_id, thread_ts):
+            await self._restore_agent_thread(event)
         if not thread_ts or not self._is_active_thread(channel_id, thread_ts):
             return
 
         await self._process_message(event)
+
+    async def _restore_agent_thread(self, event: Dict[str, Any]):
+        runtime = self.agent_runtime_client
+        if runtime is None or not hasattr(runtime, "lookup_session"):
+            return
+        channel_id = event.get("channel")
+        thread_ts = event.get("thread_ts")
+        team_id = self._extract_team_id(event) or "unknown-team"
+        try:
+            session = await runtime.lookup_session(team_id, channel_id, thread_ts)
+        except AgentRuntimeError:
+            return
+        if not session:
+            return
+        tracked = {
+            "session_id": session["session_id"],
+            "run_id": session.get("run_id"),
+            "team_id": team_id,
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "owner_user_id": session["owner_user_id"],
+        }
+        self.agent_threads[self._thread_key(channel_id, thread_ts)] = tracked
+        self.agent_user_runs[session["owner_user_id"]] = tracked
+        if session.get("run_id"):
+            self.agent_runs[session["run_id"]] = tracked
+        self._mark_thread_active(channel_id, thread_ts)
 
     async def _handle_mention_event(self, event: Dict[str, Any]):
         """Handle app mentions"""
@@ -1841,7 +2108,13 @@ class SlackBot:
         )
         if callable(message_handler_is_supported_command):
             is_supported_command = message_handler_is_supported_command(command_text)
-        if not is_supported_command:
+        consumes_query_quota = not is_supported_command
+        message_handler_consumes_query_quota = getattr(
+            self.message_handler, "command_consumes_query_quota", None
+        )
+        if callable(message_handler_consumes_query_quota):
+            consumes_query_quota = message_handler_consumes_query_quota(command_text)
+        if consumes_query_quota:
             rate_limit_config = self._get_rate_limit_config_for_user(user_id)
             if not self.user_manager.check_rate_limit(user_id, rate_limit_config):
                 await self._post_command_response(
@@ -1863,8 +2136,9 @@ class SlackBot:
             command_surface="slash",
         )
 
-        await self._post_command_response(channel_id, user_id, response_text)
-        if not is_supported_command:
+        if response_text:
+            await self._post_command_response(channel_id, user_id, response_text)
+        if consumes_query_quota:
             await self._persist_message_state(
                 user_id=user_id,
                 conversation_key=self._conversation_context_key(
@@ -2562,6 +2836,191 @@ class SlackBot:
         """Build a stable key for active thread tracking."""
         return f"{channel_id}:{thread_ts}"
 
+    def _is_agent_thread(
+        self, channel_id: Optional[str], thread_ts: Optional[str]
+    ) -> bool:
+        if not channel_id or not thread_ts:
+            return False
+        return self._thread_key(channel_id, thread_ts) in self.agent_threads
+
+    def _track_agent_run(
+        self,
+        accepted: Dict[str, Any],
+        *,
+        team_id: str,
+        channel_id: str,
+        thread_ts: str,
+        owner_user_id: str,
+    ) -> Dict[str, Any]:
+        tracked = {
+            "session_id": accepted["session_id"],
+            "run_id": accepted["run_id"],
+            "team_id": team_id,
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "owner_user_id": owner_user_id,
+        }
+        self.agent_threads[self._thread_key(channel_id, thread_ts)] = tracked
+        self.agent_runs[accepted["run_id"]] = tracked
+        self.agent_user_runs[owner_user_id] = tracked
+        self._mark_thread_active(channel_id, thread_ts)
+        return tracked
+
+    def _agent_run_for(
+        self,
+        user_id: str,
+        channel_id: Optional[str],
+        thread_ts: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        if channel_id and thread_ts:
+            tracked = self.agent_threads.get(self._thread_key(channel_id, thread_ts))
+            if tracked and tracked.get("owner_user_id") == user_id:
+                return tracked
+        return self.agent_user_runs.get(user_id)
+
+    def _forget_agent_session(self, tracked: Dict[str, Any]):
+        self.agent_runs.pop(tracked.get("run_id"), None)
+        self.agent_threads.pop(
+            self._thread_key(
+                tracked.get("channel_id", ""), tracked.get("thread_ts", "")
+            ),
+            None,
+        )
+        if self.agent_user_runs.get(tracked.get("owner_user_id")) is tracked:
+            self.agent_user_runs.pop(tracked.get("owner_user_id"), None)
+
+    async def _monitor_agent_run(self, tracked: Dict[str, Any]):
+        runtime = self.agent_runtime_client
+        if runtime is None or self.web_client is None:
+            return
+        try:
+            run = await runtime.wait_for_update(tracked["run_id"])
+        except AgentRuntimeError:
+            logger.warning("Agent run monitor failed for %s", tracked["run_id"])
+            await self.web_client.chat_postMessage(
+                channel=tracked["channel_id"],
+                thread_ts=tracked["thread_ts"],
+                text="Agent status could not be retrieved; Chat mode was not used as fallback.",
+            )
+            return
+
+        if run.get("status") == "awaiting_approval":
+            approval = next(
+                (
+                    event
+                    for event in reversed(run.get("events", []))
+                    if event.get("type") == "approval"
+                ),
+                None,
+            )
+            if not approval:
+                return
+            value = json.dumps(
+                {
+                    "run_id": run["run_id"],
+                    "session_id": run["session_id"],
+                    "approval_id": approval["approval_id"],
+                },
+                separators=(",", ":"),
+            )
+            await self.web_client.chat_postMessage(
+                channel=tracked["channel_id"],
+                thread_ts=tracked["thread_ts"],
+                text=f"Approval required: {approval.get('title', 'Agent action')}",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": (
+                                f"*{approval.get('title', 'Approval required')}*\n"
+                                f"```{str(approval.get('detail', ''))[:3000]}```\n"
+                                "Only the session owner can decide. This request expires in 5 minutes."
+                            ),
+                        },
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "action_id": "pi_agent_approve",
+                                "text": {"type": "plain_text", "text": "Approve"},
+                                "style": "primary",
+                                "value": value,
+                            },
+                            {
+                                "type": "button",
+                                "action_id": "pi_agent_reject",
+                                "text": {"type": "plain_text", "text": "Reject"},
+                                "style": "danger",
+                                "value": value,
+                            },
+                        ],
+                    },
+                ],
+            )
+            return
+
+        max_length = int(
+            self.config.get("response_settings", {}).get("max_response_length", 2000)
+        )
+        await self.web_client.chat_postMessage(
+            channel=tracked["channel_id"],
+            thread_ts=tracked["thread_ts"],
+            text=self.message_handler._format_agent_response(
+                run, max_length=max_length
+            ),
+        )
+
+    async def _handle_agent_interactive(self, payload: Dict[str, Any]):
+        actions = payload.get("actions") or []
+        if not actions:
+            return
+        action = actions[0]
+        if action.get("action_id") not in {"pi_agent_approve", "pi_agent_reject"}:
+            return
+        user_id = payload.get("user", {}).get("id")
+        channel_id = payload.get("channel", {}).get("id")
+        try:
+            value = json.loads(action.get("value", "{}"))
+            tracked = self.agent_runs.get(value["run_id"])
+        except (KeyError, TypeError, ValueError):
+            tracked = None
+        if not tracked:
+            return
+        if tracked.get("owner_user_id") != user_id:
+            if hasattr(self.web_client, "chat_postEphemeral"):
+                await self.web_client.chat_postEphemeral(
+                    channel=channel_id,
+                    user=user_id,
+                    text="Only the user who started this Agent session can approve it.",
+                )
+            return
+        decision = "approve" if action["action_id"] == "pi_agent_approve" else "reject"
+        try:
+            await self.agent_runtime_client.decide(
+                value["run_id"], value["approval_id"], user_id, decision
+            )
+        except AgentRuntimeUnauthorized:
+            await self.web_client.chat_postEphemeral(
+                channel=channel_id,
+                user=user_id,
+                text="Only the Agent session owner can approve this action.",
+            )
+            return
+        except AgentRuntimeConflict:
+            await self.web_client.chat_postEphemeral(
+                channel=channel_id,
+                user=user_id,
+                text="This approval has expired or was already used.",
+            )
+            return
+        self._spawn_background_task(
+            self._monitor_agent_run(tracked),
+            f"pi_agent_monitor:{value['run_id']}",
+        )
+
     def _mark_thread_active(self, channel_id: Optional[str], thread_ts: Optional[str]):
         """Mark a bot thread as active for follow-up replies."""
         if not channel_id or not thread_ts:
@@ -2644,6 +3103,16 @@ class SlackBot:
         normalized = (text or "").strip()
         if not normalized:
             return False
+        extract_command_text = getattr(
+            self.message_handler, "extract_prefixed_command_text", None
+        )
+        consumes_query_quota = getattr(
+            self.message_handler, "command_consumes_query_quota", None
+        )
+        if callable(extract_command_text) and callable(consumes_query_quota):
+            command_text = extract_command_text(normalized)
+            if command_text is not None:
+                return consumes_query_quota(command_text)
         return not self._is_supported_inline_command(normalized)
 
     def _is_query_event(self, event: Dict[str, Any]) -> bool:
@@ -2777,6 +3246,8 @@ class SlackBot:
             try:
                 if item.kind == "slash":
                     await self._handle_slash_command(item.payload)
+                elif item.kind == "interactive":
+                    await self._handle_agent_interactive(item.payload)
                 else:
                     await self._handle_event(item.payload)
             except asyncio.CancelledError:
@@ -2918,7 +3389,7 @@ class SlackBot:
         """Extract Slack team/workspace id from event or command payloads."""
         if not payload:
             return None
-        for key in ("team_id", "team"):
+        for key in ("team_id", "team", "_team_id"):
             value = payload.get(key)
             if value:
                 return str(value)
