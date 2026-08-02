@@ -41,6 +41,10 @@ const http = require("node:http"); let call = 0;
 const usage = {input_tokens:1,output_tokens:1,total_tokens:2,input_tokens_details:{cached_tokens:0}};
 function send(res, events) { res.writeHead(200,{"content-type":"text/event-stream"}); for(const e of events) res.write("data: "+JSON.stringify(e)+"\n\n"); res.end("data: [DONE]\n\n"); }
 http.createServer((req,res)=>{ let body=""; req.on("data",c=>body+=c); req.on("end",()=>{
+  const request = JSON.parse(body);
+  if(request.model!=="gpt-5.6-luna" || request.reasoning?.effort!=="max"){
+    res.writeHead(400); res.end("expected gpt-5.6-luna with max reasoning"); return;
+  }
   call++;
   if(call===1){
     if(!body.includes("Close one concrete coverage gap")){ res.writeHead(400); res.end("skill was not expanded"); return; }

@@ -341,8 +341,9 @@ make demo-slack
 `make demo-slack` starts a loopback-only host orchestrator, a model-only gateway,
 and the Slack worker. It creates an internal Docker network so Agent containers
 cannot reach the general internet. The gateway owns the real OpenAI key; each
-Agent prompt receives only a short-lived token restricted to `gpt-5` Responses
-requests. All managed processes and containers are stopped together. No public
+Agent prompt receives only a short-lived token restricted to `gpt-5.6-luna`
+Responses requests with `reasoning.effort: max`. All managed processes and
+containers are stopped together. No public
 webhook or tunnel is required because the app uses Socket Mode.
 
 Try these two paths:

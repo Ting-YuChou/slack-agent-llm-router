@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 
+import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT } from "./agent-model.js";
 import { verifyGatewayToken } from "./gateway-token.js";
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
@@ -15,7 +16,11 @@ export function createModelGateway(options: {
   const fetchFn = options.fetchFn ?? fetch;
   return createServer(async (request, response) => {
     if (request.method === "GET" && request.url === "/health") {
-      sendJson(response, 200, { status: "healthy", model: "gpt-5" });
+      sendJson(response, 200, {
+        status: "healthy",
+        model: AGENT_MODEL_ID,
+        reasoning_effort: AGENT_REASONING_EFFORT,
+      });
       return;
     }
     if (request.method !== "POST" || request.url !== "/v1/responses") {
@@ -33,9 +38,14 @@ export function createModelGateway(options: {
     try {
       rawBody = await readBody(request);
       const body = JSON.parse(rawBody.toString("utf8"));
-      if (!body || typeof body !== "object" || body.model !== "gpt-5") throw new Error("invalid model");
+      if (!validateAgentModelRequest(body)) throw new Error("invalid model request");
     } catch {
-      sendJson(response, 400, { error: { code: "invalid_request", message: "Only gpt-5 Responses requests are allowed" } });
+      sendJson(response, 400, {
+        error: {
+          code: "invalid_request",
+          message: `Only ${AGENT_MODEL_ID} Responses requests with ${AGENT_REASONING_EFFORT} reasoning are allowed`,
+        },
+      });
       return;
     }
     try {
@@ -60,6 +70,16 @@ export function createModelGateway(options: {
       sendJson(response, 502, { error: { code: "upstream_unavailable", message: "Model provider unavailable" } });
     }
   });
+}
+
+export function validateAgentModelRequest(body: unknown): boolean {
+  if (!isRecord(body) || body.model !== AGENT_MODEL_ID) return false;
+  const reasoning = body.reasoning;
+  return isRecord(reasoning) && reasoning.effort === AGENT_REASONING_EFFORT;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function readBody(request: IncomingMessage): Promise<Buffer> {

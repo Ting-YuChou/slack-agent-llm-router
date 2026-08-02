@@ -26,7 +26,7 @@ test("agent container is non-root, resource-limited, read-only, and internal-net
     "--pids-limit 256", "--network pi-model-only",
     "--tmpfs /tmp:rw,noexec,nosuid,size=536870912",
     "--no-extensions", "--no-skills", "--no-prompt-templates",
-    "--mode rpc", "--provider openai", "--model gpt-5",
+    "--mode rpc", "--provider openai", "--model gpt-5.6-luna", "--thinking max",
   ]) assert.match(rendered, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.doesNotMatch(rendered, /docker\.sock|OPENAI_API_KEY=[A-Za-z0-9_-]{30,}/);
   assert.match(rendered, /OPENAI_API_KEY=short-token/);
