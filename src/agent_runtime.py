@@ -66,17 +66,21 @@ class AgentRuntimeClient:
             transport=transport,
         )
 
-    async def health(self) -> bool:
+    async def health_details(self) -> Optional[Dict[str, Any]]:
         try:
             response = await asyncio.wait_for(
                 self._client.get("/health"), timeout=self._health_timeout_seconds
             )
             if response.status_code != 200:
-                return False
+                return None
             payload = response.json()
-            return isinstance(payload, dict) and payload.get("status") == "healthy"
+            return payload if isinstance(payload, dict) else None
         except (asyncio.TimeoutError, httpx.HTTPError, ValueError):
-            return False
+            return None
+
+    async def health(self) -> bool:
+        payload = await self.health_details()
+        return payload is not None and payload.get("status") == "healthy"
 
     async def create_session(
         self,
@@ -85,17 +89,22 @@ class AgentRuntimeClient:
         thread_ts: str,
         user_id: str,
         prompt: str,
+        *,
+        model: Optional[str] = None,
     ) -> Dict[str, Any]:
+        payload = {
+            "team_id": team_id,
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "user_id": user_id,
+            "prompt": prompt,
+        }
+        if model:
+            payload["model"] = model
         result = await self._request(
             "POST",
             "/v1/sessions",
-            json={
-                "team_id": team_id,
-                "channel_id": channel_id,
-                "thread_ts": thread_ts,
-                "user_id": user_id,
-                "prompt": prompt,
-            },
+            json=payload,
             expected_status=202,
         )
         return self._validate_accepted(result)

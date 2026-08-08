@@ -999,8 +999,7 @@ class SlackMessageHandler:
         thread_ts: Optional[str] = None,
     ) -> str:
         """Start or control a stateful Pi coding-agent thread."""
-        task = " ".join(args).strip()
-        if not task:
+        if not args:
             return "Usage: `/llm agent <task>`"
 
         runtime = getattr(self.bot, "agent_runtime_client", None)
@@ -1029,6 +1028,22 @@ class SlackMessageHandler:
             except AgentRuntimeError:
                 return "Agent mode could not complete that control action."
 
+        model = None
+        task_args = list(args)
+        if task_args[0] == "--model":
+            if len(task_args) < 3:
+                return "Usage: `/llm agent --model <provider/model> <task>`"
+            model = task_args[1]
+            task_args = task_args[2:]
+        elif task_args[0].startswith("--model="):
+            model = task_args[0].split("=", 1)[1].strip()
+            task_args = task_args[1:]
+            if not model or not task_args:
+                return "Usage: `/llm agent --model <provider/model> <task>`"
+        task = " ".join(task_args).strip()
+        if not task:
+            return "Usage: `/llm agent [--model provider/model] <task>`"
+
         return await self._start_agent_prompt(
             task,
             user_id,
@@ -1036,6 +1051,7 @@ class SlackMessageHandler:
             client,
             team_id=team_id,
             thread_ts=thread_ts,
+            model=model,
         )
 
     async def _start_agent_prompt(
@@ -1047,6 +1063,7 @@ class SlackMessageHandler:
         *,
         team_id: Optional[str],
         thread_ts: Optional[str],
+        model: Optional[str] = None,
     ) -> str:
         runtime = getattr(self.bot, "agent_runtime_client", None)
         if runtime is None:
@@ -1065,13 +1082,17 @@ class SlackMessageHandler:
             return "Agent mode needs a Slack thread to start this task."
 
         try:
-            result = await runtime.create_session(
+            create_args = (
                 team_id or "unknown-team",
                 channel_id,
                 root_ts,
                 user_id,
                 task,
             )
+            if model:
+                result = await runtime.create_session(*create_args, model=model)
+            else:
+                result = await runtime.create_session(*create_args)
         except AgentRuntimeBusy:
             message = (
                 "Agent mode is busy right now. Chat mode was not used as fallback."
@@ -1100,7 +1121,8 @@ class SlackMessageHandler:
                     channel=channel_id,
                     ts=root_message_ts,
                     text=(
-                        f"🛠️ Pi coding agent started run `{result['run_id']}`.\n"
+                        f"🛠️ Pi coding agent started run `{result['run_id']}`"
+                        f"{f' with `{model}`' if model else ''}.\n"
                         "Read-only exploration is automatic; edits and risky shell commands require approval here."
                     ),
                 )
@@ -1158,7 +1180,11 @@ class SlackMessageHandler:
 
     @staticmethod
     def _format_agent_status(run: Dict[str, Any]) -> str:
-        return f"Agent run `{run.get('run_id', 'unknown')}` is *{run.get('status', 'unknown')}*."
+        model = "/".join(
+            item for item in (run.get("provider"), run.get("model")) if item
+        )
+        suffix = f" using `{model}`" if model else ""
+        return f"Agent run `{run.get('run_id', 'unknown')}` is *{run.get('status', 'unknown')}*{suffix}."
 
     async def _handle_help_command(
         self, args: List[str], user_id: str, channel_id: str, client: AsyncWebClient
@@ -1179,7 +1205,9 @@ Mention me in a channel, use `/llm ...`, or reply inside an active bot thread.
 • `/llm clear` - Clear conversation history
 • `/llm web <query>` - Search the web before answering
 • `/llm fast <query>` - Prefer an explicit low-latency route for this query
-• `/llm agent <task>` - Start a stateful Pi coding agent in an isolated worktree
+• `/llm agent <task>` - Start a stateful Pi coding agent with the default model
+• `/llm agent --model anthropic/claude-sonnet-4-6 <task>` - Select an Agent model
+• Agent models: `openai/gpt-5.6-luna`, `anthropic/claude-sonnet-4-6`, `opencode-go/deepseek-v4-pro`
 • `/llm agent /skill:test-gap <task>` - Run the approved test-gap workflow
 • `/llm agent status|stop|close` - Inspect or control your latest Agent session
 • `/llm remember <text>` - Save an explicit long-term memory
@@ -1303,12 +1331,31 @@ Mention me in a channel, use `/llm ...`, or reply inside an active bot thread.
             # Get user stats
             user_stats = await self.bot.get_user_stats(user_id)
             runtime = getattr(self.bot, "agent_runtime_client", None)
+            agent_models = ""
             if runtime is None:
                 agent_health = "⚪ Disabled"
             else:
-                agent_health = (
-                    "🟢 Healthy" if await runtime.health() else "🔴 Unavailable"
-                )
+                health_details = getattr(runtime, "health_details", None)
+                if health_details is not None:
+                    details = await health_details()
+                    agent_health = (
+                        "🟢 Healthy"
+                        if details and details.get("status") == "healthy"
+                        else "🔴 Unavailable"
+                    )
+                    configured = [
+                        str(model.get("ref"))
+                        for model in (details or {}).get("models", [])
+                        if isinstance(model, dict)
+                        and model.get("configured")
+                        and model.get("ref")
+                    ]
+                    if configured:
+                        agent_models = f"\n*Agent Models:* {', '.join(f'`{model}`' for model in configured)}"
+                else:
+                    agent_health = (
+                        "🟢 Healthy" if await runtime.health() else "🔴 Unavailable"
+                    )
 
             status_text = f"""
 📊 *System Status*
@@ -1318,6 +1365,7 @@ Mention me in a channel, use `/llm ...`, or reply inside an active bot thread.
 *Response Time:* {system_health.get('avg_response_time', 0):.0f}ms
 *Uptime:* {system_health.get('uptime', 'Unknown')}
 *Agent Runtime:* {agent_health}
+{agent_models}
 
 *Your Usage (Last 24h):*
 📝 Queries: {user_stats.get('queries_24h', 0)}

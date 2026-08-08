@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "image_digest": "sha256:1a47fad916d88cbf61d42ee0fc2b8726766318509901ba2392bd46dd4efcb5cd",
+  "image_digest": "sha256:6ddbde26bf0c8d1429bd082efdabcb9a8ba419204e85b3005365aa7a8d83374f",
   "plugins": [
     {
       "id": "workspace-summary",
@@ -11,6 +11,18 @@
       "host_path": "plugins/workspace-summary.ts",
       "enabled_tools": [
         "workspace_summary"
+      ],
+      "risk_class": "read_only"
+    },
+    {
+      "id": "lsp",
+      "source": "builtin:lsp",
+      "version": "0.1.0",
+      "integrity": "sha256:30bd7d4f2f043fb36daadb7d1dafbb34a54b69ce83d602365b7fd8c44a5f7521",
+      "container_path": "/opt/pi/plugins/lsp.ts",
+      "host_path": "plugins/lsp.ts",
+      "enabled_tools": [
+        "lsp"
       ],
       "risk_class": "read_only"
     }

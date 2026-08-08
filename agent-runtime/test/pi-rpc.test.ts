@@ -41,6 +41,7 @@ test("bridge maps tool, approval, final answer, and settled events", () => {
   });
 
   bridge.feed(Buffer.from([
+    JSON.stringify({ type: "turn_start" }),
     JSON.stringify({ type: "tool_execution_start", toolCallId: "t1", toolName: "read", args: { path: "src/a.ts" } }),
     JSON.stringify({ type: "extension_ui_request", id: "approval-1", method: "confirm", title: "Allow edit?", message: "src/a.ts" }),
     JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Done" }, { type: "thinking", thinking: "hidden" }] } }),
@@ -49,7 +50,7 @@ test("bridge maps tool, approval, final answer, and settled events", () => {
   bridge.respondToUi("approval-1", true);
   bridge.abort("abort-1");
 
-  assert.deepEqual(emitted.map((event: any) => event.type), ["tool", "approval", "answer", "settled"]);
+  assert.deepEqual(emitted.map((event: any) => event.type), ["turn", "tool", "approval", "answer", "settled"]);
   assert.doesNotMatch(JSON.stringify(emitted), /hidden|thinking/);
   assert.deepEqual(JSON.parse(writes[0]), { type: "extension_ui_response", id: "approval-1", confirmed: true });
   assert.deepEqual(JSON.parse(writes[1]), { id: "abort-1", type: "abort" });

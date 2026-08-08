@@ -11,8 +11,8 @@ test("runtime metadata is atomically persisted and active runs become interrupte
   const store = new RuntimeStateStore(path.join(root, "state.json"));
   await store.save({
     schema_version: 1,
-    sessions: [{ id: "S1", key: "T:C:1", ownerUserId: "U1", worktreePath: "/w", branch: "b", baselineCommit: "a", closed: false, lastActivity: Date.now(), activeRunId: "R1" }],
-    runs: [{ run_id: "R1", session_id: "S1", status: "running", answer: "", owner_user_id: "U1", created_at: "x", updated_at: "x", tool_count: 1, turn_count: 1, events: [] }],
+    sessions: [{ id: "S1", key: "T:C:1", ownerUserId: "U1", modelRef: "anthropic/claude-sonnet-4-6", worktreePath: "/w", branch: "b", baselineCommit: "a", closed: false, lastActivity: Date.now(), activeRunId: "R1" }],
+    runs: [{ run_id: "R1", session_id: "S1", status: "running", answer: "", owner_user_id: "U1", provider: "anthropic", model: "claude-sonnet-4-6", reasoning_effort: "max", created_at: "x", updated_at: "x", tool_count: 1, turn_count: 1, events: [] }],
   });
 
   const loaded = await store.load();
@@ -20,6 +20,7 @@ test("runtime metadata is atomically persisted and active runs become interrupte
   assert.equal(loaded.runs[0].status, "interrupted");
   assert.equal(loaded.runs[0].error?.code, "runtime_restarted");
   assert.equal(loaded.sessions[0].activeRunId, undefined);
+  assert.equal(loaded.sessions[0].modelRef, "anthropic/claude-sonnet-4-6");
 });
 
 test("audit records older than seven days and closed sessions older than 24 hours are pruned", async () => {

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 
+import { listAgentModels, resolveAgentModel } from "./agent-model.js";
 import { ApprovalStore } from "./policy.js";
 import type { PublicRunEvent } from "./pi-rpc.js";
 import type { RuntimeStateStore } from "./runtime-state.js";
@@ -39,6 +40,7 @@ export interface SessionInput {
   thread_ts: string;
   user_id: string;
   prompt: string;
+  model?: string;
 }
 
 export interface RunRecord {
@@ -47,6 +49,9 @@ export interface RunRecord {
   status: RunStatus;
   answer: string;
   owner_user_id: string;
+  provider?: string;
+  model?: string;
+  reasoning_effort?: string;
   created_at: string;
   updated_at: string;
   tool_count: number;
@@ -79,6 +84,7 @@ interface SessionRecord {
   id: string;
   key: string;
   ownerUserId: string;
+  modelRef: string;
   worktreePath: string;
   branch: string;
   baselineCommit: string;
@@ -90,9 +96,10 @@ interface SessionRecord {
 
 export class CodingAgentOrchestrator {
   private readonly worktrees: Worktrees;
-  private readonly startProcess: (session: { id: string; worktreePath: string; restored?: boolean }, onEvent: (event: PublicRunEvent) => void) => Promise<AgentProcess>;
+  private readonly startProcess: (session: { id: string; worktreePath: string; modelRef: string; restored?: boolean }, onEvent: (event: PublicRunEvent) => void) => Promise<AgentProcess>;
   private readonly maxActiveSessions: number;
   private readonly deadlineMs: number;
+  private readonly availableModelRefs: Set<string>;
   private readonly stateStore?: RuntimeStateStore;
   private readonly approvals = new ApprovalStore();
   private readonly sessions = new Map<string, SessionRecord>();
@@ -109,11 +116,13 @@ export class CodingAgentOrchestrator {
     maxActiveSessions?: number;
     deadlineMs?: number;
     stateStore?: RuntimeStateStore;
+    availableModelRefs?: string[];
   }) {
     this.worktrees = options.worktrees;
     this.startProcess = options.startProcess;
     this.maxActiveSessions = options.maxActiveSessions ?? 2;
     this.deadlineMs = options.deadlineMs ?? 15 * 60_000;
+    this.availableModelRefs = new Set(options.availableModelRefs ?? listAgentModels().map((model) => model.ref));
     this.stateStore = options.stateStore;
   }
 
@@ -134,11 +143,12 @@ export class CodingAgentOrchestrator {
         await this.worktrees.rollback(saved.worktreePath, saved.baselineCommit);
       }
       let session!: SessionRecord;
+      const modelRef = saved.modelRef ?? resolveAgentModel().ref;
       const process = await this.startProcess(
-        { id: saved.id, worktreePath: saved.worktreePath, restored: true },
+        { id: saved.id, worktreePath: saved.worktreePath, modelRef, restored: true },
         (event) => this.handleProcessEvent(session.id, event),
       );
-      session = { ...saved, process };
+      session = { ...saved, modelRef, process };
       this.sessions.set(session.id, session);
       this.threadSessions.set(session.key, session.id);
     }
@@ -147,12 +157,24 @@ export class CodingAgentOrchestrator {
 
   async createSession(input: SessionInput): Promise<{ session_id: string; run_id: string; status: "starting" }> {
     validateSessionInput(input);
+    let requestedModel;
+    try {
+      requestedModel = resolveAgentModel(input.model);
+    } catch (error) {
+      throw new RuntimeError("Requested Agent model is not allowlisted", "invalid_model", 400, { cause: error });
+    }
+    if (!this.availableModelRefs.has(requestedModel.ref)) {
+      throw new RuntimeError("Requested model provider is not configured", "provider_not_configured", 503);
+    }
     const key = `${input.team_id}:${input.channel_id}:${input.thread_ts}`;
     const existingId = this.threadSessions.get(key);
     if (existingId) {
       const existing = this.sessions.get(existingId);
       if (existing && !existing.closed) {
         if (existing.ownerUserId !== input.user_id) throw new RuntimeForbiddenError("Only the session owner can submit prompts");
+        if (input.model && existing.modelRef !== requestedModel.ref) {
+          throw new RuntimeConflictError("An existing Agent session cannot switch models");
+        }
         return this.prompt(existing.id, input.prompt, input.user_id);
       }
     }
@@ -170,7 +192,7 @@ export class CodingAgentOrchestrator {
       let process: AgentProcess;
       try {
         process = await this.startProcess(
-          { id: sessionId, worktreePath: worktree.path },
+          { id: sessionId, worktreePath: worktree.path, modelRef: requestedModel.ref },
           (event) => this.handleProcessEvent(session.id, event),
         );
       } catch (error) {
@@ -181,6 +203,7 @@ export class CodingAgentOrchestrator {
         id: sessionId,
         key,
         ownerUserId: input.user_id,
+        modelRef: requestedModel.ref,
         worktreePath: worktree.path,
         branch: worktree.branch,
         baselineCommit: worktree.baselineCommit,
@@ -203,6 +226,9 @@ export class CodingAgentOrchestrator {
     const session = this.requireSession(sessionId);
     if (session.ownerUserId !== userId) throw new RuntimeForbiddenError("Only the session owner can submit prompts");
     if (session.activeRunId) throw new RuntimeConflictError();
+    if (!this.availableModelRefs.has(session.modelRef)) {
+      throw new RuntimeError("Session model provider is not configured", "provider_not_configured", 503);
+    }
     if (!prompt.trim()) throw new RuntimeError("prompt is required", "invalid_request", 400);
     const runId = randomUUID();
     this.startRun(session, runId, prompt);
@@ -230,6 +256,7 @@ export class CodingAgentOrchestrator {
       run_id: session.activeRunId,
       owner_user_id: session.ownerUserId,
       branch: session.branch,
+      model_ref: session.modelRef,
       active: Boolean(session.activeRunId),
     };
   }
@@ -301,12 +328,16 @@ export class CodingAgentOrchestrator {
 
   private startRun(session: SessionRecord, runId: string, prompt: string): void {
     const now = new Date().toISOString();
+    const model = resolveAgentModel(session.modelRef);
     const run: RunRecord = {
       run_id: runId,
       session_id: session.id,
       status: "running",
       answer: "",
       owner_user_id: session.ownerUserId,
+      provider: model.provider,
+      model: model.id,
+      reasoning_effort: model.reasoningEffort,
       created_at: now,
       updated_at: now,
       tool_count: 0,
@@ -328,6 +359,11 @@ export class CodingAgentOrchestrator {
     if (!session?.activeRunId) return;
     const run = this.runs.get(session.activeRunId);
     if (!run || isTerminal(run.status)) return;
+    if (event.type === "turn") {
+      run.turn_count += 1;
+      void this.persistState();
+      return;
+    }
     if (event.type === "approval") {
       const approval = this.approvals.create({
         runId: run.run_id,
@@ -470,6 +506,7 @@ export class CodingAgentOrchestrator {
         id: session.id,
         key: session.key,
         ownerUserId: session.ownerUserId,
+        modelRef: session.modelRef,
         worktreePath: session.worktreePath,
         branch: session.branch,
         baselineCommit: session.baselineCommit,

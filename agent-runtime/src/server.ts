@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { DockerPiProcess } from "./container-runtime.js";
-import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT } from "./agent-model.js";
+import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT, listAgentModels, resolveAgentModel } from "./agent-model.js";
 import { issueGatewayToken } from "./gateway-token.js";
 import {
   CodingAgentOrchestrator,
@@ -136,7 +136,15 @@ export async function createProductionServer() {
   const worktreeRoot = path.resolve(process.env.PI_AGENT_WORKTREE_ROOT ?? path.join(repoPath, ".pi-agent-worktrees"));
   const image = process.env.PI_AGENT_IMAGE ?? "slack-pi-agent:0.83.0";
   const network = process.env.PI_AGENT_NETWORK ?? "pi-model-only";
-  const gatewayUrl = process.env.PI_MODEL_GATEWAY_URL ?? "http://model-gateway:8080/v1";
+  const gatewayUrl = process.env.PI_MODEL_GATEWAY_URL ?? "http://model-gateway:8080";
+  const configuredProviders = new Set(
+    (process.env.PI_AGENT_CONFIGURED_PROVIDERS ?? "openai")
+      .split(",")
+      .map((provider) => provider.trim())
+      .filter(Boolean),
+  );
+  const configuredModels = listAgentModels().filter((model) => configuredProviders.has(model.provider));
+  if (configuredModels.length === 0) throw new Error("At least one Agent model provider must be configured");
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
   if (hostUid === undefined || hostGid === undefined || hostUid === 0) {
@@ -169,7 +177,9 @@ export async function createProductionServer() {
     stateStore,
     maxActiveSessions: positiveInteger(process.env.PI_AGENT_MAX_CONCURRENCY, 2),
     deadlineMs: positiveInteger(process.env.PI_AGENT_DEADLINE_MS, 15 * 60_000),
+    availableModelRefs: configuredModels.map((model) => model.ref),
     startProcess: async (session, onEvent) => {
+      const model = resolveAgentModel(session.modelRef);
       const sessionStatePath = path.join(runtimeRoot, "sessions", session.id);
       await mkdir(sessionStatePath, { recursive: true });
       return new DockerPiProcess(
@@ -181,6 +191,7 @@ export async function createProductionServer() {
           gitMetadataPath,
           sessionStatePath,
           gatewayUrl,
+          modelRef: model.ref,
           extensionPaths: ["/opt/pi/extensions/policy.ts", "/opt/pi/extensions/model-gateway.ts"],
           pluginPaths: lock.plugins.map((plugin) => plugin.container_path),
           skillPaths: skillLock.skills.map((skill) => skill.container_path),
@@ -189,7 +200,16 @@ export async function createProductionServer() {
           safeCommands: parseSafeCommands(process.env.PI_AGENT_SAFE_COMMANDS),
           user: containerUser,
         },
-        (runId) => issueGatewayToken({ runId, model: AGENT_MODEL_ID, expiresAt: Date.now() + 16 * 60_000 }, gatewaySecret),
+        (runId) => {
+          return issueGatewayToken({
+            runId,
+            provider: model.provider,
+            model: model.id,
+            api: model.api,
+            reasoningEffort: model.reasoningEffort,
+            expiresAt: Date.now() + 16 * 60_000,
+          }, gatewaySecret);
+        },
         onEvent,
       );
     },
@@ -206,6 +226,13 @@ export async function createProductionServer() {
       provider: "openai",
       model: AGENT_MODEL_ID,
       reasoning_effort: AGENT_REASONING_EFFORT,
+      models: listAgentModels().map((model) => ({
+        ref: model.ref,
+        provider: model.provider,
+        model: model.id,
+        reasoning_effort: model.reasoningEffort,
+        configured: configuredProviders.has(model.provider),
+      })),
       tools: ["read", "write", "edit", "bash", "grep", "find", "ls", ...lock.plugins.flatMap((plugin) => plugin.enabled_tools)],
       plugin_integrity: lock.healthy ? "verified" : "failed",
       skills: skillLock.skills.map((skill) => skill.name),

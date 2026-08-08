@@ -300,8 +300,9 @@ the regular response-cache Redis on `6379`.
 This is the smallest live demo with two execution modes in the same Slack bot:
 normal queries use the existing Python ModelRouter, while `/llm agent <task>`
 uses Pi's coding-agent runtime with isolated `read`, `write`, `edit`, `bash`,
-`grep`, `find`, and `ls` tools.
-Both modes use one OpenAI model. Redis, Kafka, ClickHouse, Flink, RAG, Tavily
+`grep`, `find`, `ls`, and read-only `lsp` tools.
+Chat mode keeps the single OpenAI demo route; Agent sessions can explicitly use
+an allowlisted OpenAI, Anthropic, or OpenCode Go model. Redis, Kafka, ClickHouse, Flink, RAG, Tavily
 web search, response cache, and the provider scheduler are disabled in
 [config/config.demo.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.demo.yaml).
 
@@ -331,8 +332,9 @@ dedicated worktree and Pi session directory.
 cp config/demo.env.example .env.demo
 ```
 
-Fill in `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`, and `SLACK_APP_TOKEN`, then start
-the demo:
+Fill in `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`, and `SLACK_APP_TOKEN`. Add
+`ANTHROPIC_API_KEY` or `OPENCODE_API_KEY` only when you want those optional
+Agent providers, then start the demo:
 
 ```bash
 make demo-slack
@@ -340,9 +342,9 @@ make demo-slack
 
 `make demo-slack` starts a loopback-only host orchestrator, a model-only gateway,
 and the Slack worker. It creates an internal Docker network so Agent containers
-cannot reach the general internet. The gateway owns the real OpenAI key; each
-Agent prompt receives only a short-lived token restricted to `gpt-5.6-luna`
-Responses requests with `reasoning.effort: max`. All managed processes and
+cannot reach the general internet. The gateway owns the real provider keys; each
+Agent prompt receives only a short-lived token bound to one allowlisted provider,
+model, API protocol, run ID, and reasoning setting. All managed processes and
 containers are stopped together. No public
 webhook or tunnel is required because the app uses Socket Mode.
 
@@ -353,6 +355,10 @@ Try these two paths:
   a dedicated branch, host worktree, and hardened container. Read-only tools run
   automatically. The first edit and non-allowlisted shell commands require an
   owner-only Slack approval.
+- `/llm agent --model anthropic/claude-sonnet-4-6 找出測試問題` — creates a
+  session bound to Anthropic. The other explicit choices are
+  `openai/gpt-5.6-luna` and `opencode-go/deepseek-v4-pro`. A thread cannot
+  switch models after its session is created.
 - `/llm agent /skill:test-gap 找出一個測試缺口並修正` — explicitly invokes
   the bundled `test-gap` Skill. Pi may also select it from its description and
   read that exact immutable `SKILL.md` automatically.
@@ -368,6 +374,11 @@ failed, and timed-out prompts roll their isolated worktree back to the previous
 successful commit. Agent failures never silently fall back to Chat mode.
 
 The bundled tools are `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`.
+The locked `lsp` plugin adds diagnostics, definition, references, hover,
+document-symbol, and workspace-symbol queries for TypeScript/JavaScript and
+Python. It bundles exact versions of `typescript-language-server` and `pyright`,
+rejects paths outside the worktree or protected files, caps responses, and does
+not expose rename, code actions, execute-command, or workspace edits.
 Extensions, plugins, and Skills are discovery-disabled. Only plugins pinned in
 `agent-runtime/plugins.lock.json` and Skills pinned in
 `agent-runtime/skills.lock.json` are loaded by explicit container arguments.

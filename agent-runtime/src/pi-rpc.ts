@@ -1,4 +1,5 @@
 export type PublicRunEvent =
+  | { type: "turn" }
   | { type: "tool"; phase: "start" | "end"; tool_call_id: string; tool: string; input?: Record<string, unknown>; is_error?: boolean }
   | { type: "approval"; approval_id: string; title: string; detail: string; timeout_ms?: number }
   | { type: "answer"; text: string }
@@ -35,6 +36,7 @@ export class RpcJsonlDecoder {
 
 export function sanitizeRpcEvent(record: Record<string, unknown>): PublicRunEvent | null {
   const type = record.type;
+  if (type === "turn_start") return { type: "turn" };
   if (type === "message_update") {
     const delta = isRecord(record.assistantMessageEvent) ? record.assistantMessageEvent : {};
     const deltaType = delta.type;

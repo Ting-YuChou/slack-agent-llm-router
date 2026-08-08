@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 
 import { PiRpcBridge, RpcProtocolError, type PublicRunEvent } from "./pi-rpc.js";
 import type { AgentProcess } from "./orchestrator.js";
-import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT } from "./agent-model.js";
+import { resolveAgentModel } from "./agent-model.js";
 
 export interface AgentContainerOptions {
   name: string;
@@ -14,6 +14,7 @@ export interface AgentContainerOptions {
   sessionStatePath: string;
   gatewayUrl: string;
   gatewayToken: string;
+  modelRef: string;
   extensionPaths: string[];
   pluginPaths: string[];
   skillPaths: string[];
@@ -26,6 +27,7 @@ export interface AgentContainerOptions {
 const exec = promisify(execFile);
 
 export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
+  const model = resolveAgentModel(options.modelRef);
   const args = [
     "run", "--rm", "-i",
     "--name", options.name,
@@ -40,7 +42,7 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     "--pids-limit", "256",
     "--tmpfs", "/tmp:rw,noexec,nosuid,size=536870912",
     "--env", `HOME=/tmp/pi-home`,
-    "--env", `OPENAI_API_KEY=${options.gatewayToken}`,
+    "--env", `${model.credentialEnv}=${options.gatewayToken}`,
     "--env", `PI_MODEL_GATEWAY_URL=${options.gatewayUrl}`,
     "--env", "PI_AGENT_MAX_TURNS=20",
     "--env", "PI_AGENT_MAX_TOOL_CALLS=40",
@@ -55,9 +57,9 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     options.image,
     "pi",
     "--mode", "rpc",
-    "--provider", "openai",
-    "--model", AGENT_MODEL_ID,
-    "--thinking", AGENT_REASONING_EFFORT,
+    "--provider", model.provider,
+    "--model", model.id,
+    "--thinking", model.reasoningEffort,
     "--session-dir", "/var/lib/pi-session",
     "--approve",
     "--no-extensions",

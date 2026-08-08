@@ -95,6 +95,10 @@ if [[ -z "${MODEL_GATEWAY_SIGNING_SECRET:-}" ]]; then
 fi
 export AGENT_RUNTIME_TOKEN MODEL_GATEWAY_SIGNING_SECRET
 export PI_AGENT_REPO_PATH="${PI_AGENT_REPO_PATH:-${repo_root}}"
+configured_providers="openai"
+if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then configured_providers="${configured_providers},anthropic"; fi
+if [[ -n "${OPENCODE_API_KEY:-}" ]]; then configured_providers="${configured_providers},opencode-go"; fi
+export PI_AGENT_CONFIGURED_PROVIDERS="${configured_providers}"
 
 cd "${repo_root}"
 npm --prefix "${agent_runtime_dir}" run build
@@ -132,13 +136,15 @@ if [[ "${DEMO_TEST_MODE:-0}" != 1 ]]; then
     --pids-limit 128 \
     --tmpfs /tmp:rw,noexec,nosuid,size=67108864 \
     --env OPENAI_API_KEY \
+    --env ANTHROPIC_API_KEY \
+    --env OPENCODE_API_KEY \
     --env MODEL_GATEWAY_SIGNING_SECRET \
     "${gateway_image}" >/dev/null
   gateway_started=true
   docker network connect bridge "${gateway_container}"
 fi
 
-node "${agent_runtime_dir}/dist/src/server.js" &
+env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u OPENCODE_API_KEY node "${agent_runtime_dir}/dist/src/server.js" &
 agent_pid=$!
 agent_health_url="${AGENT_RUNTIME_HEALTH_URL:-http://127.0.0.1:3001/health}"
 agent_ready=false
@@ -156,7 +162,8 @@ if [[ "${agent_ready}" != true ]]; then
   exit 1
 fi
 
-"${PYTHON:-python}" main.py start-workers --config config/config.demo.yaml &
+env -u ANTHROPIC_API_KEY -u OPENCODE_API_KEY \
+  "${PYTHON:-python}" main.py start-workers --config config/config.demo.yaml &
 worker_pid=$!
 if wait "${worker_pid}"; then worker_status=0; else worker_status=$?; fi
 worker_pid=""
