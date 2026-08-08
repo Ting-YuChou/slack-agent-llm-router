@@ -63,7 +63,7 @@ export default function policyExtension(pi: ExtensionAPI) {
       return { block: true, reason: `Tool call limit of ${MAX_TOOL_CALLS} exceeded` };
     }
 
-    if (["read", "write", "edit", "grep", "find", "ls"].includes(event.toolName)) {
+    if (["read", "write", "edit", "grep", "find", "ls", "lsp"].includes(event.toolName)) {
       const input = event.input as Record<string, unknown>;
       const requestedPath = typeof input.path === "string" ? input.path : ".";
       if (event.toolName === "read" && isApprovedSkillRead(requestedPath, approvedSkillPaths())) return undefined;

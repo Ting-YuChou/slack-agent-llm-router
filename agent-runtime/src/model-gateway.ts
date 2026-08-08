@@ -2,15 +2,21 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 
-import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT } from "./agent-model.js";
+import {
+  listAgentModels,
+  resolveAgentModel,
+  type AgentModelSpec,
+  type AgentProvider,
+} from "./agent-model.js";
 import { verifyGatewayToken } from "./gateway-token.js";
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
-const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
+
+export type ProviderApiKeys = Partial<Record<AgentProvider, string>>;
 
 export function createModelGateway(options: {
   signingSecret: string;
-  openaiApiKey: string;
+  providerApiKeys: ProviderApiKeys;
   fetchFn?: typeof fetch;
 }) {
   const fetchFn = options.fetchFn ?? fetch;
@@ -18,48 +24,53 @@ export function createModelGateway(options: {
     if (request.method === "GET" && request.url === "/health") {
       sendJson(response, 200, {
         status: "healthy",
-        model: AGENT_MODEL_ID,
-        reasoning_effort: AGENT_REASONING_EFFORT,
+        providers: listAgentModels().map((model) => ({
+          provider: model.provider,
+          model: model.id,
+          configured: Boolean(options.providerApiKeys[model.provider]),
+        })),
       });
       return;
     }
-    if (request.method !== "POST" || request.url !== "/v1/responses") {
+    if (request.method !== "POST") {
       sendJson(response, 404, { error: { code: "not_found", message: "Endpoint not found" } });
       return;
     }
-    const authorization = request.headers.authorization ?? "";
-    const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+    const token = extractToken(request);
     const claims = verifyGatewayToken(token, options.signingSecret);
     if (!claims) {
       sendJson(response, 401, { error: { code: "invalid_gateway_token", message: "Invalid gateway token" } });
+      return;
+    }
+    const model = resolveAgentModel(`${claims.provider}/${claims.model}`);
+    if (request.url !== model.gatewayPath) {
+      sendJson(response, 403, { error: { code: "provider_path_mismatch", message: "Gateway token cannot use this provider path" } });
+      return;
+    }
+    const providerApiKey = options.providerApiKeys[model.provider];
+    if (!providerApiKey) {
+      sendJson(response, 503, { error: { code: "provider_not_configured", message: "Requested model provider is not configured" } });
       return;
     }
     let rawBody: Buffer;
     try {
       rawBody = await readBody(request);
       const body = JSON.parse(rawBody.toString("utf8"));
-      if (!validateAgentModelRequest(body)) throw new Error("invalid model request");
+      if (!validateAgentModelRequest(body, model)) throw new Error("invalid model request");
     } catch {
       sendJson(response, 400, {
-        error: {
-          code: "invalid_request",
-          message: `Only ${AGENT_MODEL_ID} Responses requests with ${AGENT_REASONING_EFFORT} reasoning are allowed`,
-        },
+        error: { code: "invalid_request", message: "Request does not match the token-bound model configuration" },
       });
       return;
     }
     try {
-      const upstream = await fetchFn(OPENAI_RESPONSES_URL, {
+      const upstream = await fetchFn(model.upstreamUrl, {
         method: "POST",
-        headers: {
-          authorization: `Bearer ${options.openaiApiKey}`,
-          "content-type": "application/json",
-          "x-pi-run-id": claims.runId,
-        },
+        headers: upstreamHeaders(request, model, providerApiKey, claims.runId),
         body: rawBody.toString("utf8"),
       });
       const headers: Record<string, string> = { "cache-control": "no-store" };
-      for (const name of ["content-type", "openai-request-id", "x-request-id"]) {
+      for (const name of ["content-type", "openai-request-id", "request-id", "x-request-id"]) {
         const value = upstream.headers.get(name);
         if (value) headers[name] = value;
       }
@@ -72,10 +83,43 @@ export function createModelGateway(options: {
   });
 }
 
-export function validateAgentModelRequest(body: unknown): boolean {
-  if (!isRecord(body) || body.model !== AGENT_MODEL_ID) return false;
-  const reasoning = body.reasoning;
-  return isRecord(reasoning) && reasoning.effort === AGENT_REASONING_EFFORT;
+export function validateAgentModelRequest(body: unknown, model: AgentModelSpec): boolean {
+  if (!isRecord(body) || body.model !== model.id) return false;
+  if (model.api === "openai-responses") {
+    return isRecord(body.reasoning) && body.reasoning.effort === model.reasoningEffort;
+  }
+  if (model.api === "anthropic-messages") {
+    return isRecord(body.output_config) && body.output_config.effort === model.reasoningEffort;
+  }
+  return isRecord(body.thinking)
+    && body.thinking.type === "enabled"
+    && body.reasoning_effort === model.reasoningEffort;
+}
+
+function extractToken(request: IncomingMessage): string {
+  const authorization = request.headers.authorization ?? "";
+  if (authorization.startsWith("Bearer ")) return authorization.slice(7);
+  const apiKey = request.headers["x-api-key"];
+  return typeof apiKey === "string" ? apiKey : "";
+}
+
+function upstreamHeaders(
+  request: IncomingMessage,
+  model: AgentModelSpec,
+  apiKey: string,
+  runId: string,
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    "x-pi-run-id": runId,
+  };
+  for (const name of ["accept", "anthropic-version", "anthropic-beta"]) {
+    const value = request.headers[name];
+    if (typeof value === "string") headers[name] = value;
+  }
+  if (model.provider === "anthropic") headers["x-api-key"] = apiKey;
+  else headers.authorization = `Bearer ${apiKey}`;
+  return headers;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -102,7 +146,13 @@ function sendJson(response: ServerResponse, status: number, payload: unknown): v
 const entrypoint = process.argv[1] ? pathToFileURL(process.argv[1]).href : undefined;
 if (entrypoint === import.meta.url) {
   const signingSecret = process.env.MODEL_GATEWAY_SIGNING_SECRET ?? "";
-  const openaiApiKey = process.env.OPENAI_API_KEY ?? "";
-  if (!signingSecret || !openaiApiKey) throw new Error("MODEL_GATEWAY_SIGNING_SECRET and OPENAI_API_KEY are required");
-  createModelGateway({ signingSecret, openaiApiKey }).listen(8080, "0.0.0.0");
+  const providerApiKeys: ProviderApiKeys = {
+    openai: process.env.OPENAI_API_KEY,
+    anthropic: process.env.ANTHROPIC_API_KEY,
+    "opencode-go": process.env.OPENCODE_API_KEY,
+  };
+  if (!signingSecret || !Object.values(providerApiKeys).some(Boolean)) {
+    throw new Error("MODEL_GATEWAY_SIGNING_SECRET and at least one provider API key are required");
+  }
+  createModelGateway({ signingSecret, providerApiKeys }).listen(8080, "0.0.0.0");
 }

@@ -1,14 +1,21 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
-import { AGENT_MODEL_ID } from "./agent-model.js";
+import {
+  resolveAgentModel,
+  type AgentModelApi,
+  type AgentProvider,
+} from "./agent-model.js";
 
 export interface GatewayClaims {
   runId: string;
-  model: typeof AGENT_MODEL_ID;
+  provider: AgentProvider;
+  model: string;
+  api: AgentModelApi;
+  reasoningEffort: "max";
   expiresAt: number;
 }
 
-export function issueGatewayToken(claims: { runId: string; model: string; expiresAt: number }, secret: string): string {
+export function issueGatewayToken(claims: GatewayClaims, secret: string): string {
   if (!secret) throw new Error("Gateway signing secret is required");
   const payload = Buffer.from(JSON.stringify(claims)).toString("base64url");
   const signature = createHmac("sha256", secret).update(payload).digest("base64url");
@@ -33,11 +40,27 @@ export function verifyGatewayToken(token: string, secret: string, now = Date.now
     return null;
   }
   if (
-    !isRecord(claims) || claims.model !== AGENT_MODEL_ID ||
+    !isRecord(claims) ||
     typeof claims.runId !== "string" || !claims.runId ||
+    typeof claims.provider !== "string" || typeof claims.model !== "string" ||
+    typeof claims.api !== "string" || claims.reasoningEffort !== "max" ||
     typeof claims.expiresAt !== "number" || claims.expiresAt < now
   ) return null;
-  return { runId: claims.runId, model: AGENT_MODEL_ID, expiresAt: claims.expiresAt };
+  let model;
+  try {
+    model = resolveAgentModel(`${claims.provider}/${claims.model}`);
+  } catch {
+    return null;
+  }
+  if (model.api !== claims.api || model.reasoningEffort !== claims.reasoningEffort) return null;
+  return {
+    runId: claims.runId,
+    provider: model.provider,
+    model: model.id,
+    api: model.api,
+    reasoningEffort: model.reasoningEffort,
+    expiresAt: claims.expiresAt,
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

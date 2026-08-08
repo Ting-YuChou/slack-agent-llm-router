@@ -22,6 +22,7 @@ function fixture() {
     rollback: [] as string[],
     commits: 0,
     commitImpl: async () => "b".repeat(40),
+    startedModels: [] as string[],
   };
   const worktrees = {
     create: async () => ({ path: "/managed/w1", branch: "pi-agent/20260801-run", baselineCommit: "a".repeat(40) }),
@@ -32,12 +33,70 @@ function fixture() {
   };
   const orchestrator = new CodingAgentOrchestrator({
     worktrees,
-    startProcess: async (_session, onEvent) => { process.handler = onEvent; return process; },
+    startProcess: async (session, onEvent) => {
+      calls.startedModels.push(session.modelRef);
+      process.handler = onEvent;
+      return process;
+    },
     maxActiveSessions: 2,
     deadlineMs: 10_000,
   });
   return { orchestrator, process, calls };
 }
+
+test("a new session binds its allowlisted model and the same thread cannot switch providers", async () => {
+  const { orchestrator, process, calls } = fixture();
+  const first = await orchestrator.createSession({
+    team_id: "T1",
+    channel_id: "C1",
+    thread_ts: "model-thread",
+    user_id: "U1",
+    prompt: "fix it",
+    model: "anthropic/claude-sonnet-4-6",
+  });
+
+  assert.deepEqual(calls.startedModels, ["anthropic/claude-sonnet-4-6"]);
+  assert.equal(orchestrator.getRun(first.run_id).model, "claude-sonnet-4-6");
+  assert.equal(orchestrator.getRun(first.run_id).provider, "anthropic");
+  assert.equal(orchestrator.lookupSession({ team_id: "T1", channel_id: "C1", thread_ts: "model-thread" })?.model_ref,
+    "anthropic/claude-sonnet-4-6");
+
+  process.emit({ type: "settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+  await assert.rejects(orchestrator.createSession({
+    team_id: "T1",
+    channel_id: "C1",
+    thread_ts: "model-thread",
+    user_id: "U1",
+    prompt: "continue",
+    model: "openai/gpt-5.6-luna",
+  }), /cannot switch/i);
+});
+
+test("a model without a configured provider key is rejected before creating a worktree", async () => {
+  let creates = 0;
+  const orchestrator = new CodingAgentOrchestrator({
+    worktrees: {
+      create: async () => { creates += 1; return { path: "/w", branch: "b", baselineCommit: "base" }; },
+      inspectDiff: async () => ({ files: [], bytes: 0, stat: "" }),
+      commit: async () => "base",
+      rollback: async () => undefined,
+      remove: async () => undefined,
+    },
+    startProcess: async () => new FakeProcess(),
+    availableModelRefs: ["openai/gpt-5.6-luna"],
+  });
+
+  await assert.rejects(orchestrator.createSession({
+    team_id: "T", channel_id: "C", thread_ts: "missing-key", user_id: "U", prompt: "fix",
+    model: "anthropic/claude-sonnet-4-6",
+  }), (error: unknown) => {
+    assert.equal((error as { code?: string }).code, "provider_not_configured");
+    assert.equal((error as { statusCode?: number }).statusCode, 503);
+    return true;
+  });
+  assert.equal(creates, 0);
+});
 
 test("creates an async thread session and commits only after Pi settles", async () => {
   const { orchestrator, process, calls } = fixture();
@@ -55,6 +114,16 @@ test("creates an async thread session and commits only after Pi settles", async 
   assert.deepEqual(run.changed_files, ["src/a.ts"]);
   assert.equal(run.commit, "b".repeat(40));
   assert.equal(calls.commits, 1);
+});
+
+test("counts Pi model turns without exposing thinking content", async () => {
+  const { orchestrator, process } = fixture();
+  const accepted = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "turns", user_id: "U", prompt: "inspect" });
+
+  process.emit({ type: "turn" });
+  process.emit({ type: "turn" });
+
+  assert.equal(orchestrator.getRun(accepted.run_id).turn_count, 2);
 });
 
 test("approval is one-time, owner-bound, and resumes the exact Pi UI request", async () => {

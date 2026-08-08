@@ -14,7 +14,8 @@ test("runtime pins the Pi coding agent package", () => {
   const packageJson = JSON.parse(readFileSync(packagePath, "utf8"));
 
   assert.equal(packageJson.dependencies["@earendil-works/pi-coding-agent"], "0.83.0");
-  assert.equal(packageJson.dependencies["brace-expansion"], "5.0.8");
+  assert.equal(packageJson.dependencies["brace-expansion"], "5.0.9");
+  assert.equal(packageJson.dependencies.undici, "8.10.0");
 });
 
 test("runtime ships explicit policy extension, plugin and skill locks, and container image", () => {

@@ -88,7 +88,11 @@ def test_demo_runner_starts_agent_sidecar_then_worker_runtime(tmp_path):
     )
     fake_python = tmp_path / "python"
     fake_python.write_text(
-        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\"\n",
+        "#!/usr/bin/env bash\n"
+        "printf 'agent-keys:%s:%s openai:%s\\n' "
+        '"${ANTHROPIC_API_KEY-unset}" "${OPENCODE_API_KEY-unset}" '
+        '"${OPENAI_API_KEY-unset}"\n'
+        "printf '%s\\n' \"$*\"\n",
         encoding="utf-8",
     )
     fake_python.chmod(0o755)
@@ -123,6 +127,8 @@ fi
         "PYTHON": str(fake_python),
         "DEMO_ENV_FILE": str(tmp_path / "does-not-exist"),
         "OPENAI_API_KEY": "test-openai",
+        "ANTHROPIC_API_KEY": "test-anthropic",
+        "OPENCODE_API_KEY": "test-opencode",
         "SLACK_BOT_TOKEN": "xoxb-test",
         "SLACK_APP_TOKEN": "xapp-test",
         "AGENT_RUNTIME_TOKEN": "runtime-test",
@@ -141,6 +147,7 @@ fi
     assert result.returncode == 0, result.stderr
     assert "npm --prefix" in result.stdout
     assert "agent-runtime node" in result.stdout
+    assert "agent-keys:unset:unset openai:test-openai" in result.stdout
     assert result.stdout.strip().endswith(
         "main.py start-workers --config config/config.demo.yaml"
     )
@@ -275,6 +282,8 @@ def test_demo_env_and_makefile_include_agent_setup():
 
     assert "AGENT_RUNTIME_TOKEN=" in env_example
     assert "MODEL_GATEWAY_SIGNING_SECRET=" in env_example
+    assert "ANTHROPIC_API_KEY=" in env_example
+    assert "OPENCODE_API_KEY=" in env_example
     assert "demo-agent-install:" in makefile
     assert "npm --prefix agent-runtime ci --ignore-scripts" in makefile
     assert "demo-agent-images:" in makefile
@@ -285,3 +294,7 @@ def test_demo_gateway_uses_the_hostname_required_by_agent_policy():
     launcher = (ROOT / "scripts" / "run_slack_demo.sh").read_text(encoding="utf-8")
 
     assert "--network-alias model-gateway" in launcher
+    assert "--env ANTHROPIC_API_KEY" in launcher
+    assert "--env OPENCODE_API_KEY" in launcher
+    assert "PI_AGENT_CONFIGURED_PROVIDERS" in launcher
+    assert "env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u OPENCODE_API_KEY" in launcher
