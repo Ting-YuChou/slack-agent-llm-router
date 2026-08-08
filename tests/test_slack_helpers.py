@@ -166,13 +166,17 @@ class TestSlackMessageHandler:
         inference_engine.process_query.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_agent_command_selects_provider_model_without_putting_flag_in_prompt(self):
+    async def test_agent_command_selects_provider_model_without_putting_flag_in_prompt(
+        self,
+    ):
         runtime = SimpleNamespace(
             create_session=AsyncMock(
                 return_value={"session_id": "S1", "run_id": "R1", "status": "starting"}
             )
         )
-        bot = SlackBot({"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime})
+        bot = SlackBot(
+            {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+        )
         bot._monitor_agent_run = AsyncMock()
         handler = SlackMessageHandler(bot)
         client = SimpleNamespace(
@@ -191,7 +195,11 @@ class TestSlackMessageHandler:
 
         assert response == ""
         runtime.create_session.assert_awaited_once_with(
-            "T1", "C1", "100.1", "U1", "fix the tests",
+            "T1",
+            "C1",
+            "100.1",
+            "U1",
+            "fix the tests",
             model="anthropic/claude-sonnet-4-6",
         )
 
@@ -297,21 +305,25 @@ class TestSlackMessageHandler:
     @pytest.mark.asyncio
     async def test_status_lists_configured_agent_provider_models(self):
         agent_runtime = SimpleNamespace(
-            health_details=AsyncMock(return_value={
-                "status": "healthy",
-                "models": [
-                    {"ref": "openai/gpt-5.6-luna", "configured": True},
-                    {"ref": "anthropic/claude-sonnet-4-6", "configured": False},
-                    {"ref": "opencode-go/deepseek-v4-pro", "configured": True},
-                ],
-            })
+            health_details=AsyncMock(
+                return_value={
+                    "status": "healthy",
+                    "models": [
+                        {"ref": "openai/gpt-5.6-luna", "configured": True},
+                        {"ref": "anthropic/claude-sonnet-4-6", "configured": False},
+                        {"ref": "opencode-go/deepseek-v4-pro", "configured": True},
+                    ],
+                }
+            )
         )
         bot = SimpleNamespace(
             user_manager=UserManager(),
             conversation_manager=ConversationManager({}),
             inference_engine=SimpleNamespace(),
             agent_runtime_client=agent_runtime,
-            get_system_status=AsyncMock(return_value={"healthy": True, "available_models": []}),
+            get_system_status=AsyncMock(
+                return_value={"healthy": True, "available_models": []}
+            ),
             get_user_stats=AsyncMock(return_value={}),
         )
         handler = SlackMessageHandler(bot)
