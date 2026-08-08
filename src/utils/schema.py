@@ -798,6 +798,19 @@ class SlackContextConfig(ConfigModel):
         return normalized
 
 
+class SlackAgentContextConfig(ConfigModel):
+    enabled: bool = True
+    max_thread_messages: int = Field(20, ge=1, le=100)
+    max_message_chars: int = Field(4000, ge=1)
+    max_resources: int = Field(10, ge=0, le=20)
+    max_resource_bytes: int = Field(262144, ge=1)
+    max_resource_chars: int = Field(8000, ge=0)
+    max_total_chars: int = Field(12000, ge=1)
+    timeout_seconds: float = Field(10.0, gt=0)
+    include_bot_messages: bool = False
+    fail_open: bool = True
+
+
 class SlackWorkQueueConfig(ConfigModel):
     capacity: int = Field(256, ge=1)
     concurrency: int = Field(16, ge=1)
@@ -873,6 +886,9 @@ class SlackConfig(ConfigModel):
         default_factory=SlackRateLimitingConfig
     )
     context: SlackContextConfig = Field(default_factory=SlackContextConfig)
+    agent_context: SlackAgentContextConfig = Field(
+        default_factory=SlackAgentContextConfig
+    )
     work_queue: SlackWorkQueueConfig = Field(default_factory=SlackWorkQueueConfig)
     state_backend: str = "memory"
     state_file: str = "data/slack_state.json"

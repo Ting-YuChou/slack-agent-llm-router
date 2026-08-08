@@ -1,11 +1,12 @@
 import asyncio
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 
 from src.memory import HashEmbeddingProvider, InMemoryMemoryStore, MemoryManager
+from slack.agent_bootstrap import AgentBootstrapContext
 from slack.bot_real import (
     ConversationContext,
     ConversationManager,
@@ -146,6 +147,77 @@ class TestSlackMessageHandler:
         inference_engine.process_query.assert_not_awaited()
         assert conversation_manager.get_conversation_summary("U1", "C1") == ""
         assert bot.agent_runs["run-1"]["thread_ts"] == "100.1"
+
+    @pytest.mark.asyncio
+    async def test_agent_no_thread_context_flag_sends_only_task(self):
+        agent_runtime = SimpleNamespace(
+            create_session=AsyncMock(
+                return_value={
+                    "session_id": "session-1",
+                    "run_id": "run-1",
+                    "status": "starting",
+                }
+            )
+        )
+        bot = SlackBot(
+            {"channels": []},
+            inference_engine=SimpleNamespace(process_query=AsyncMock()),
+            services={"agent_runtime": agent_runtime},
+        )
+        bot._monitor_agent_run = AsyncMock()
+        bot.agent_bootstrap_builder = SimpleNamespace(build=AsyncMock())
+        handler = SlackMessageHandler(bot)
+
+        await handler._handle_command(
+            "agent --no-thread-context fix the test",
+            "U1",
+            "C1",
+            "100.1",
+            client=SimpleNamespace(),
+            team_id="T1",
+            message_ts="100.2",
+        )
+
+        assert agent_runtime.create_session.await_args.args[4] == "fix the test"
+        bot.agent_bootstrap_builder.build.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_inline_agent_command_bootstraps_prior_thread_once(self):
+        runtime = SimpleNamespace(
+            create_session=AsyncMock(
+                return_value={"session_id": "S1", "run_id": "R1", "status": "starting"}
+            )
+        )
+        bot = SlackBot(
+            {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+        )
+        bot._monitor_agent_run = AsyncMock()
+        bot.agent_bootstrap_builder = SimpleNamespace(
+            build=AsyncMock(
+                return_value=AgentBootstrapContext(prompt="context plus current task")
+            )
+        )
+        handler = SlackMessageHandler(bot)
+
+        await handler._handle_command(
+            "agent fix the test",
+            "U1",
+            "C1",
+            "100.1",
+            client=SimpleNamespace(),
+            team_id="T1",
+            message_ts="100.2",
+        )
+
+        bot.agent_bootstrap_builder.build.assert_awaited_once_with(
+            ANY,
+            channel_id="C1",
+            thread_ts="100.1",
+            owner_user_id="U1",
+            task="fix the test",
+            latest_ts="100.2",
+        )
+        assert runtime.create_session.await_args.args[4] == "context plus current task"
 
     @pytest.mark.asyncio
     async def test_agent_command_without_task_returns_usage_without_runtime_call(self):
@@ -298,6 +370,8 @@ class TestSlackMessageHandler:
 
         assert "/llm agent <task>" in help_text
         assert "/skill:test-gap" in help_text
+        assert "Run Pi Agent" in help_text
+        assert "--no-thread-context" in help_text
         assert "Agent Runtime:" in status_text
         assert "Healthy" in status_text
         agent_runtime.health.assert_awaited_once()
@@ -353,6 +427,327 @@ class TestSlackMessageHandler:
 
 
 class TestSlackAgentApprovals:
+    @pytest.mark.asyncio
+    async def test_agent_model_cache_refresh_uses_runtime_health(self):
+        runtime = SimpleNamespace(health_details=AsyncMock(return_value={"models": []}))
+        bot = SlackBot(
+            {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+        )
+
+        await bot._refresh_agent_model_cache()
+
+        runtime.health_details.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_message_shortcut_is_acked_and_opens_agent_modal(self):
+        runtime = SimpleNamespace(
+            cached_configured_models=lambda: [
+                "openai/gpt-5.6-luna",
+                "anthropic/claude-sonnet-4-6",
+            ]
+        )
+        bot = SlackBot(
+            {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+        )
+        bot.web_client = SimpleNamespace(
+            conversations_info=AsyncMock(
+                return_value={
+                    "ok": True,
+                    "channel": {"is_channel": True, "is_private": False},
+                }
+            ),
+            views_open=AsyncMock(),
+        )
+        socket_client = SimpleNamespace(send_socket_mode_response=AsyncMock())
+        request = SimpleNamespace(
+            envelope_id="E-shortcut",
+            type="interactive",
+            payload={
+                "type": "message_action",
+                "callback_id": "run_pi_agent_from_thread",
+                "trigger_id": "trigger-1",
+                "team": {"id": "T1"},
+                "user": {"id": "U1"},
+                "channel": {"id": "C1"},
+                "message": {"ts": "100.2", "thread_ts": "100.1"},
+            },
+        )
+
+        await bot._handle_socket_mode_request(socket_client, request)
+
+        socket_client.send_socket_mode_response.assert_awaited_once()
+        bot.web_client.views_open.assert_awaited_once()
+        modal = bot.web_client.views_open.await_args.kwargs["view"]
+        assert modal["callback_id"] == "run_pi_agent_from_thread_submit"
+        assert modal["private_metadata"]
+        model_block = next(
+            block for block in modal["blocks"] if block.get("block_id") == "agent_model"
+        )
+        assert len(model_block["element"]["options"]) == 2
+        assert "initial_option" not in model_block["element"]
+
+    @pytest.mark.asyncio
+    async def test_message_shortcut_rejects_private_channels(self):
+        bot = SlackBot({"channels": []}, SimpleNamespace())
+        bot.web_client = SimpleNamespace(
+            conversations_info=AsyncMock(
+                return_value={
+                    "ok": True,
+                    "channel": {"is_channel": True, "is_private": True},
+                }
+            ),
+            views_open=AsyncMock(),
+        )
+
+        await bot._handle_agent_shortcut(
+            {
+                "trigger_id": "trigger-1",
+                "team": {"id": "T1"},
+                "user": {"id": "U1"},
+                "channel": {"id": "GPRIVATE"},
+                "message": {"ts": "100.1"},
+            }
+        )
+
+        bot.web_client.views_open.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_modal_submission_rechecks_public_channel_before_context_fetch(self):
+        bot = SlackBot({"channels": []}, SimpleNamespace())
+        bot.web_client = SimpleNamespace(
+            conversations_info=AsyncMock(
+                side_effect=[
+                    {
+                        "ok": True,
+                        "channel": {"is_channel": True, "is_private": False},
+                    },
+                    {
+                        "ok": True,
+                        "channel": {"is_channel": True, "is_private": True},
+                    },
+                ]
+            ),
+            views_open=AsyncMock(),
+        )
+        bot.agent_bootstrap_builder = SimpleNamespace(build=AsyncMock())
+        await bot._handle_agent_shortcut(
+            {
+                "trigger_id": "trigger-1",
+                "team": {"id": "T1"},
+                "user": {"id": "U1"},
+                "channel": {"id": "C1"},
+                "message": {"ts": "100.1"},
+            }
+        )
+        nonce = bot.web_client.views_open.await_args.kwargs["view"]["private_metadata"]
+
+        await bot._handle_agent_view_submission(
+            {
+                "user": {"id": "U1"},
+                "view": {
+                    "private_metadata": nonce,
+                    "state": {
+                        "values": {
+                            "agent_task": {"task": {"value": "private task"}},
+                            "agent_context": {
+                                "include": {"selected_options": [{"value": "include"}]}
+                            },
+                        }
+                    },
+                },
+            }
+        )
+
+        bot.agent_bootstrap_builder.build.assert_not_awaited()
+        assert bot.user_manager.rate_limits.get("U1", []) == []
+
+    @pytest.mark.asyncio
+    async def test_view_submission_is_acked_before_agent_work_is_queued(self):
+        bot = SlackBot({"channels": []}, SimpleNamespace())
+        bot._enqueue_work = AsyncMock(return_value=True)
+        socket_client = SimpleNamespace(send_socket_mode_response=AsyncMock())
+        request = SimpleNamespace(
+            envelope_id="E-view",
+            type="interactive",
+            payload={
+                "type": "view_submission",
+                "view": {"callback_id": "run_pi_agent_from_thread_submit"},
+                "user": {"id": "U1"},
+            },
+        )
+
+        await bot._handle_socket_mode_request(socket_client, request)
+
+        socket_client.send_socket_mode_response.assert_awaited_once()
+        item = bot._enqueue_work.await_args.args[0]
+        assert item.kind == "agent_view"
+
+    @pytest.mark.asyncio
+    async def test_wrong_user_cannot_consume_agent_shortcut_nonce(self):
+        runtime = SimpleNamespace(create_session=AsyncMock())
+        bot = SlackBot(
+            {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+        )
+        bot.web_client = SimpleNamespace(
+            conversations_info=AsyncMock(
+                return_value={
+                    "ok": True,
+                    "channel": {"is_channel": True, "is_private": False},
+                }
+            ),
+            views_open=AsyncMock(),
+        )
+        await bot._handle_agent_shortcut(
+            {
+                "trigger_id": "trigger-1",
+                "team": {"id": "T1"},
+                "user": {"id": "U1"},
+                "channel": {"id": "C1"},
+                "message": {"ts": "100.1"},
+            }
+        )
+        nonce = bot.web_client.views_open.await_args.kwargs["view"]["private_metadata"]
+
+        await bot._handle_agent_view_submission(
+            {
+                "user": {"id": "U2"},
+                "view": {
+                    "private_metadata": nonce,
+                    "state": {
+                        "values": {"agent_task": {"task": {"value": "malicious task"}}}
+                    },
+                },
+            }
+        )
+
+        runtime.create_session.assert_not_awaited()
+        assert nonce in bot.agent_shortcut_nonces
+
+    @pytest.mark.asyncio
+    async def test_modal_submission_bootstraps_thread_and_starts_selected_model(self):
+        runtime = SimpleNamespace(
+            cached_configured_models=lambda: ["openai/gpt-5.6-luna"],
+            create_session=AsyncMock(
+                return_value={
+                    "session_id": "session-1",
+                    "run_id": "run-1",
+                    "status": "starting",
+                }
+            ),
+        )
+        bot = SlackBot(
+            {"channels": [], "agent_context": {"enabled": True}},
+            SimpleNamespace(),
+            services={"agent_runtime": runtime},
+        )
+        bot.web_client = SimpleNamespace(
+            conversations_info=AsyncMock(
+                return_value={
+                    "ok": True,
+                    "channel": {"is_channel": True, "is_private": False},
+                }
+            ),
+            views_open=AsyncMock(),
+            chat_postMessage=AsyncMock(return_value={"ts": "status-1"}),
+            chat_update=AsyncMock(),
+        )
+        bot._monitor_agent_run = AsyncMock()
+        bot.agent_bootstrap_builder = SimpleNamespace(
+            build=AsyncMock(
+                return_value=AgentBootstrapContext(
+                    prompt="bounded bootstrap prompt",
+                    context="context",
+                    message_count=3,
+                    resource_count=2,
+                    truncated=True,
+                    warnings=["canvas_body_unavailable:F1"],
+                )
+            )
+        )
+        await bot._handle_agent_shortcut(
+            {
+                "type": "message_action",
+                "callback_id": "run_pi_agent_from_thread",
+                "trigger_id": "trigger-1",
+                "team": {"id": "T1"},
+                "user": {"id": "U1"},
+                "channel": {"id": "C1"},
+                "message": {"ts": "100.2", "thread_ts": "100.1"},
+            }
+        )
+        nonce = bot.web_client.views_open.await_args.kwargs["view"]["private_metadata"]
+        payload = {
+            "type": "view_submission",
+            "team": {"id": "T1"},
+            "user": {"id": "U1"},
+            "view": {
+                "callback_id": "run_pi_agent_from_thread_submit",
+                "private_metadata": nonce,
+                "state": {
+                    "values": {
+                        "agent_task": {"task": {"value": "Implement the thread todo"}},
+                        "agent_model": {
+                            "model": {
+                                "selected_option": {"value": "openai/gpt-5.6-luna"}
+                            }
+                        },
+                        "agent_context": {
+                            "include": {"selected_options": [{"value": "include"}]}
+                        },
+                    }
+                },
+            },
+        }
+
+        await bot._handle_agent_view_submission(payload)
+
+        bot.agent_bootstrap_builder.build.assert_awaited_once()
+        assert runtime.create_session.await_args.args == (
+            "T1",
+            "C1",
+            "100.1",
+            "U1",
+            "bounded bootstrap prompt",
+        )
+        assert runtime.create_session.await_args.kwargs == {
+            "model": "openai/gpt-5.6-luna"
+        }
+        status = bot.web_client.chat_update.await_args.kwargs["text"]
+        assert "Loaded 3 prior Slack messages and 2 resources" in status
+        assert "truncated" in status
+        assert "canvas_body_unavailable:F1" in status
+        assert len(bot.user_manager.rate_limits["U1"]) == 1
+
+        await bot._handle_agent_view_submission(payload)
+
+        runtime.create_session.assert_awaited_once()
+        assert len(bot.user_manager.rate_limits["U1"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_non_owner_agent_thread_message_is_rejected_before_quota(self):
+        bot = SlackBot({"channels": []}, SimpleNamespace())
+        bot.web_client = SimpleNamespace(chat_postEphemeral=AsyncMock())
+        bot.agent_threads["C1:100.1"] = {
+            "owner_user_id": "U1",
+            "channel_id": "C1",
+            "thread_ts": "100.1",
+        }
+        bot._process_message = AsyncMock()
+
+        await bot._handle_message_event(
+            {
+                "type": "message",
+                "channel": "C1",
+                "thread_ts": "100.1",
+                "ts": "100.2",
+                "user": "U2",
+                "text": "do something",
+            }
+        )
+
+        bot._process_message.assert_not_awaited()
+        bot.web_client.chat_postEphemeral.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_interactive_request_is_acked_before_approval_work_is_queued(self):
         bot = SlackBot({"channels": []}, SimpleNamespace())

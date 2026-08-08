@@ -308,7 +308,9 @@ web search, response cache, and the provider scheduler are disabled in
 
 1. In Slack, create an app **from a manifest** and paste
    [slack/app-manifest.demo.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/slack/app-manifest.demo.yaml).
-2. Install the app to the workspace.
+2. Install the app to the workspace. When updating an existing demo app,
+   re-apply the manifest and reinstall it so the message shortcut and new
+   `lists:read` scope are granted.
 3. Under **Basic Information → App-Level Tokens**, generate an app token with
    `connections:write`. Keep the resulting `xapp-` token.
 4. Invite the bot to `#ai-testing`. If you use another channel, update
@@ -355,6 +357,11 @@ Try these two paths:
   a dedicated branch, host worktree, and hardened container. Read-only tools run
   automatically. The first edit and non-allowlisted shell commands require an
   owner-only Slack approval.
+- From an existing Slack message or thread, open the message actions menu and
+  choose **Run Pi Agent**. The modal lets the owner enter a task, choose a cached
+  configured Agent model, and include a bounded snapshot of that thread.
+- `/llm agent --no-thread-context <task>` explicitly starts without loading
+  previous Slack thread messages.
 - `/llm agent --model anthropic/claude-sonnet-4-6 找出測試問題` — creates a
   session bound to Anthropic. The other explicit choices are
   `openai/gpt-5.6-luna` and `opencode-go/deepseek-v4-pro`. A thread cannot
@@ -372,6 +379,16 @@ shows the changed files, diff stat, commit, and cherry-pick command. The runtime
 never pushes, merges, or modifies the current checkout. Rejected, cancelled,
 failed, and timed-out prompts roll their isolated worktree back to the previous
 successful commit. Agent failures never silently fall back to Chat mode.
+
+Agent bootstrap context is read-only reference data. The default limits are 20
+messages, 10 resources, 4,000 message characters, 8,000 resource characters,
+and 12,000 characters total. UTF-8 text/code files and up to 100 current Slack
+List rows can be included. Binary files are represented only by skipped-resource
+warnings. Canvas uses the title, metadata, and Slack-provided AI summary when
+available; the public Canvas API does not provide a reliable full-body export,
+so the body is reported as unavailable. Context fetch failures are visible in
+Slack; with the demo's `fail_open: true`, the Agent starts task-only instead of
+silently guessing what the missing thread contained.
 
 The bundled tools are `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`.
 The locked `lsp` plugin adds diagnostics, definition, references, hover,

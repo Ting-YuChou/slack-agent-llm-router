@@ -35,6 +35,16 @@ def test_demo_config_is_single_provider_and_needs_no_infrastructure():
     assert config.slack.app_token_env == "SLACK_APP_TOKEN"
     assert config.slack.state_backend == "memory"
     assert config.slack.memory.enabled is False
+    assert config.slack.agent_context.enabled is True
+    assert config.slack.agent_context.max_thread_messages == 20
+    assert config.slack.agent_context.max_message_chars == 4000
+    assert config.slack.agent_context.max_resources == 10
+    assert config.slack.agent_context.max_resource_bytes == 262144
+    assert config.slack.agent_context.max_resource_chars == 8000
+    assert config.slack.agent_context.max_total_chars == 12000
+    assert config.slack.agent_context.timeout_seconds == 10
+    assert config.slack.agent_context.include_bot_messages is False
+    assert config.slack.agent_context.fail_open is True
 
     assert config.kafka.enabled is False
     assert config.clickhouse.enabled is False
@@ -64,6 +74,14 @@ def test_demo_manifest_declares_socket_mode_command_and_events():
             "should_escape": False,
         }
     ]
+    assert manifest["features"]["shortcuts"] == [
+        {
+            "name": "Run Pi Agent",
+            "type": "message",
+            "callback_id": "run_pi_agent_from_thread",
+            "description": "Start a Pi coding agent with this Slack thread as context",
+        }
+    ]
     assert set(manifest["settings"]["event_subscriptions"]["bot_events"]) == {
         "app_mention",
         "message.channels",
@@ -75,6 +93,7 @@ def test_demo_manifest_declares_socket_mode_command_and_events():
         "chat:write",
         "commands",
         "files:read",
+        "lists:read",
     }.issubset(set(manifest["oauth_config"]["scopes"]["bot"]))
 
 

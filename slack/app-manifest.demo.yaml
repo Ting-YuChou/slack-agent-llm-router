@@ -15,6 +15,11 @@ features:
       description: Ask the single-model LLM Router demo
       usage_hint: help | agent <task|status|stop|close> | your question
       should_escape: false
+  shortcuts:
+    - name: Run Pi Agent
+      type: message
+      callback_id: run_pi_agent_from_thread
+      description: Start a Pi coding agent with this Slack thread as context
 
 oauth_config:
   scopes:
@@ -25,6 +30,7 @@ oauth_config:
       - chat:write
       - commands
       - files:read
+      - lists:read
 
 settings:
   event_subscriptions:
