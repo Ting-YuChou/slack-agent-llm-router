@@ -28,6 +28,16 @@ from src.agent_runtime import (
     AgentRuntimeUnauthorized,
     AgentRuntimeUnavailable,
 )
+from slack.agent_bootstrap import (
+    AgentBootstrapBuilder,
+    AgentBootstrapContext,
+    AgentBootstrapFetchError,
+)
+from slack.agent_shortcut import (
+    AgentShortcutNonce,
+    build_agent_shortcut_modal,
+    parse_agent_shortcut_submission,
+)
 from src.memory import MemoryManager, build_memory_scope
 from src.utils.schema import (
     Attachment,
@@ -917,6 +927,7 @@ class SlackMessageHandler:
                     client,
                     team_id=team_id,
                     thread_ts=thread_ts,
+                    message_ts=message_ts,
                 )
             return await self.commands[command](args, user_id, channel_id, client)
         return await self._handle_query(
@@ -997,6 +1008,7 @@ class SlackMessageHandler:
         client: AsyncWebClient,
         team_id: Optional[str] = None,
         thread_ts: Optional[str] = None,
+        message_ts: Optional[str] = None,
     ) -> str:
         """Start or control a stateful Pi coding-agent thread."""
         if not args:
@@ -1029,23 +1041,44 @@ class SlackMessageHandler:
                 return "Agent mode could not complete that control action."
 
         model = None
+        include_thread_context = True
         task_args = list(args)
-        if task_args[0] == "--model":
-            if len(task_args) < 3:
-                return "Usage: `/llm agent --model <provider/model> <task>`"
-            model = task_args[1]
-            task_args = task_args[2:]
-        elif task_args[0].startswith("--model="):
-            model = task_args[0].split("=", 1)[1].strip()
-            task_args = task_args[1:]
-            if not model or not task_args:
-                return "Usage: `/llm agent --model <provider/model> <task>`"
+        while task_args and task_args[0].startswith("--"):
+            option = task_args.pop(0)
+            if option == "--no-thread-context":
+                include_thread_context = False
+                continue
+            if option == "--model":
+                if not task_args:
+                    return "Usage: `/llm agent --model <provider/model> <task>`"
+                model = task_args.pop(0).strip()
+                continue
+            if option.startswith("--model="):
+                model = option.split("=", 1)[1].strip()
+                if model:
+                    continue
+            return "Usage: `/llm agent [--model provider/model] [--no-thread-context] <task>`"
         task = " ".join(task_args).strip()
         if not task:
             return "Usage: `/llm agent [--model provider/model] <task>`"
 
-        return await self._start_agent_prompt(
-            task,
+        bootstrap = AgentBootstrapContext(prompt=task)
+        builder = getattr(self.bot, "agent_bootstrap_builder", None)
+        if include_thread_context and thread_ts and message_ts and builder is not None:
+            try:
+                bootstrap = await builder.build(
+                    client,
+                    channel_id=channel_id,
+                    thread_ts=thread_ts,
+                    owner_user_id=user_id,
+                    task=task,
+                    latest_ts=message_ts,
+                )
+            except AgentBootstrapFetchError as exc:
+                return f"Agent mode did not start because Slack thread context could not be loaded: `{exc}`."
+
+        response = await self._start_agent_prompt(
+            bootstrap.prompt,
             user_id,
             channel_id,
             client,
@@ -1053,6 +1086,12 @@ class SlackMessageHandler:
             thread_ts=thread_ts,
             model=model,
         )
+        if bootstrap.error:
+            response += (
+                "\nAgent started without prior Slack thread context: "
+                f"`{bootstrap.error}`."
+            )
+        return response
 
     async def _start_agent_prompt(
         self,
@@ -1207,6 +1246,8 @@ Mention me in a channel, use `/llm ...`, or reply inside an active bot thread.
 • `/llm fast <query>` - Prefer an explicit low-latency route for this query
 • `/llm agent <task>` - Start a stateful Pi coding agent with the default model
 • `/llm agent --model anthropic/claude-sonnet-4-6 <task>` - Select an Agent model
+• Use the message shortcut *Run Pi Agent* to start from an existing Slack thread
+• `/llm agent --no-thread-context <task>` - Start without loading prior thread messages
 • Agent models: `openai/gpt-5.6-luna`, `anthropic/claude-sonnet-4-6`, `opencode-go/deepseek-v4-pro`
 • `/llm agent /skill:test-gap <task>` - Run the approved test-gap workflow
 • `/llm agent status|stop|close` - Inspect or control your latest Agent session
@@ -1907,6 +1948,7 @@ class SlackBot:
         self.context_settings = self._resolve_context_settings(
             config.get("context", {})
         )
+        self.agent_context_settings = dict(config.get("agent_context", {}) or {})
         self.attachment_settings = {
             "enabled": True,
             "max_files": 10,
@@ -1914,6 +1956,10 @@ class SlackBot:
             "download_timeout_seconds": 30,
         }
         self.attachment_settings.update(config.get("attachments", {}))
+        self.agent_bootstrap_builder = AgentBootstrapBuilder(
+            self.agent_context_settings,
+            bot_token=self._resolve_secret("bot_token", "bot_token_env"),
+        )
         self.state_store = build_slack_state_store(
             resolve_slack_state_store_config(config)
         )
@@ -1923,6 +1969,7 @@ class SlackBot:
         self.agent_threads: Dict[str, Dict[str, Any]] = {}
         self.agent_runs: Dict[str, Dict[str, Any]] = {}
         self.agent_user_runs: Dict[str, Dict[str, Any]] = {}
+        self.agent_shortcut_nonces: Dict[str, AgentShortcutNonce] = {}
 
         # Running state
         self.initialized = False
@@ -1964,6 +2011,11 @@ class SlackBot:
             # Get bot user ID
             auth_response = await self.web_client.auth_test()
             self.bot_user_id = auth_response["user_id"]
+            self.agent_bootstrap_builder = AgentBootstrapBuilder(
+                self.agent_context_settings,
+                bot_user_id=self.bot_user_id,
+                bot_token=bot_token,
+            )
 
             # Register event handlers
             self.socket_client.socket_mode_request_listeners.append(
@@ -1979,6 +2031,7 @@ class SlackBot:
             else:
                 self._warn_if_memory_uses_shared_redis()
             await self._resolve_allowed_channels()
+            await self._refresh_agent_model_cache()
             self.initialized = True
 
             logger.info(
@@ -1999,6 +2052,10 @@ class SlackBot:
             # Start socket mode client
             await self.socket_client.connect()
             self._start_work_workers()
+            self._spawn_background_task(
+                self._refresh_agent_model_cache_periodically(),
+                "slack_agent_model_cache_refresh",
+            )
 
             # Start cleanup task
             self._spawn_background_task(
@@ -2056,6 +2113,25 @@ class SlackBot:
                         name="slack_agent_approval",
                     )
                 )
+            elif (
+                req.type == "interactive"
+                and req.payload.get("type") == "message_action"
+                and req.payload.get("callback_id") == "run_pi_agent_from_thread"
+            ):
+                await self._handle_agent_shortcut(req.payload)
+            elif (
+                req.type == "interactive"
+                and req.payload.get("type") == "view_submission"
+                and req.payload.get("view", {}).get("callback_id")
+                == "run_pi_agent_from_thread_submit"
+            ):
+                await self._enqueue_work(
+                    SlackWorkItem(
+                        kind="agent_view",
+                        payload=req.payload,
+                        name="slack_agent_shortcut_submission",
+                    )
+                )
 
         except Exception as e:
             logger.error(f"Error handling socket mode request: {e}")
@@ -2086,6 +2162,19 @@ class SlackBot:
         thread_ts = event.get("thread_ts")
         if thread_ts and not self._is_agent_thread(channel_id, thread_ts):
             await self._restore_agent_thread(event)
+        if thread_ts and self._is_agent_thread(channel_id, thread_ts):
+            tracked = self.agent_threads.get(self._thread_key(channel_id, thread_ts))
+            if tracked and tracked.get("owner_user_id") != event.get("user"):
+                if hasattr(self.web_client, "chat_postEphemeral"):
+                    await self.web_client.chat_postEphemeral(
+                        channel=channel_id,
+                        user=event.get("user"),
+                        text=(
+                            "Only the user who started this Agent session can send "
+                            "coding prompts in this thread."
+                        ),
+                    )
+                return
         if not thread_ts or not self._is_active_thread(channel_id, thread_ts):
             return
 
@@ -3022,6 +3111,182 @@ class SlackBot:
             ),
         )
 
+    async def _handle_agent_shortcut(self, payload: Dict[str, Any]) -> None:
+        """Open the Agent bootstrap modal while the Slack trigger is still valid."""
+        trigger_id = payload.get("trigger_id")
+        team_id = payload.get("team", {}).get("id") or self._extract_team_id(payload)
+        user_id = payload.get("user", {}).get("id")
+        channel_id = payload.get("channel", {}).get("id")
+        message = payload.get("message", {}) or {}
+        selected_ts = message.get("ts")
+        thread_ts = message.get("thread_ts") or selected_ts
+        if not all((trigger_id, team_id, user_id, channel_id, selected_ts, thread_ts)):
+            return
+        if not await self._is_channel_allowed(channel_id):
+            return
+        if not await self._is_public_agent_channel(channel_id):
+            return
+
+        now = time.time()
+        self.agent_shortcut_nonces = {
+            key: value
+            for key, value in self.agent_shortcut_nonces.items()
+            if value.expires_at > now
+        }
+        nonce = uuid.uuid4().hex
+        self.agent_shortcut_nonces[nonce] = AgentShortcutNonce(
+            team_id=team_id,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            selected_message_ts=selected_ts,
+            owner_user_id=user_id,
+            expires_at=now + 300,
+        )
+
+        runtime = self.agent_runtime_client
+        cached_models = getattr(runtime, "cached_configured_models", None)
+        model_refs = list(cached_models()) if callable(cached_models) else []
+        await self.web_client.views_open(
+            trigger_id=trigger_id,
+            view=build_agent_shortcut_modal(nonce, model_refs),
+        )
+
+    async def _is_public_agent_channel(self, channel_id: str) -> bool:
+        """Fail closed unless Slack confirms a non-shared public channel."""
+        method = getattr(self.web_client, "conversations_info", None)
+        if not callable(method):
+            logger.warning("Cannot verify public channel for Agent shortcut")
+            return False
+        try:
+            response = await method(channel=channel_id)
+            if not response.get("ok", True):
+                return False
+            channel = response.get("channel", {}) or {}
+            return bool(channel.get("is_channel")) and not any(
+                channel.get(flag)
+                for flag in (
+                    "is_private",
+                    "is_im",
+                    "is_mpim",
+                    "is_shared",
+                    "is_ext_shared",
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Failed to verify public channel for Agent shortcut", exc_info=True
+            )
+            return False
+
+    async def _refresh_agent_model_cache(self) -> None:
+        runtime = self.agent_runtime_client
+        health_details = getattr(runtime, "health_details", None)
+        if not callable(health_details):
+            return
+        try:
+            await health_details()
+        except Exception:
+            logger.warning("Agent model health cache refresh failed", exc_info=True)
+
+    async def _refresh_agent_model_cache_periodically(self) -> None:
+        while self.running:
+            await asyncio.sleep(60)
+            if self.running:
+                await self._refresh_agent_model_cache()
+
+    async def _handle_agent_view_submission(self, payload: Dict[str, Any]) -> None:
+        """Consume a one-shot modal nonce and start one quota-counted Agent prompt."""
+        view = payload.get("view", {}) or {}
+        nonce_value = str(view.get("private_metadata") or "")
+        nonce = self.agent_shortcut_nonces.get(nonce_value)
+        user_id = payload.get("user", {}).get("id")
+        if not nonce:
+            return
+        if nonce.expires_at <= time.time():
+            self.agent_shortcut_nonces.pop(nonce_value, None)
+            return
+        if nonce.owner_user_id != user_id:
+            return
+        self.agent_shortcut_nonces.pop(nonce_value, None)
+
+        submission = parse_agent_shortcut_submission(view)
+        if not submission.task:
+            return
+        if not await self._is_public_agent_channel(nonce.channel_id):
+            return
+
+        rate_limit_config = self._get_rate_limit_config_for_user(user_id)
+        if not self.user_manager.check_rate_limit(user_id, rate_limit_config):
+            await self._post_command_response(
+                nonce.channel_id, user_id, self._build_rate_limit_message(user_id)
+            )
+            return
+
+        status = await self.web_client.chat_postMessage(
+            channel=nonce.channel_id,
+            thread_ts=nonce.thread_ts,
+            text="🛠️ Pi coding agent is loading the Slack thread snapshot…",
+        )
+        status_ts = status.get("ts")
+        bootstrap = AgentBootstrapContext(prompt=submission.task)
+        if submission.include_context:
+            try:
+                bootstrap = await self.agent_bootstrap_builder.build(
+                    self.web_client,
+                    channel_id=nonce.channel_id,
+                    thread_ts=nonce.thread_ts,
+                    owner_user_id=user_id,
+                    task=submission.task,
+                )
+            except AgentBootstrapFetchError as exc:
+                if status_ts:
+                    await self.web_client.chat_update(
+                        channel=nonce.channel_id,
+                        ts=status_ts,
+                        text=(
+                            "Agent mode did not start because Slack thread context "
+                            f"could not be loaded: `{exc}`."
+                        ),
+                    )
+                return
+
+        response = await self.message_handler._start_agent_prompt(
+            bootstrap.prompt,
+            user_id,
+            nonce.channel_id,
+            self.web_client,
+            team_id=nonce.team_id,
+            thread_ts=nonce.thread_ts,
+            model=submission.model,
+        )
+        details = []
+        if submission.include_context:
+            details.append(
+                f"Loaded {bootstrap.message_count} prior Slack messages and "
+                f"{bootstrap.resource_count} resources."
+            )
+            if bootstrap.truncated:
+                details.append("Context truncated to configured limits.")
+            if bootstrap.error:
+                details.append(
+                    f"Started without prior Slack context: `{bootstrap.error}`."
+                )
+            if bootstrap.warnings:
+                details.append(
+                    "Skipped or partial resources: `"
+                    + "`, `".join(bootstrap.warnings[:10])
+                    + "`."
+                )
+            details.append("Loaded context was sent to the selected model provider.")
+        final_status = "\n".join(part for part in (response, *details) if part)
+        if status_ts:
+            await self.web_client.chat_update(
+                channel=nonce.channel_id,
+                ts=status_ts,
+                text=final_status,
+            )
+        await self._persist_message_state(user_id=user_id)
+
     async def _handle_agent_interactive(self, payload: Dict[str, Any]):
         actions = payload.get("actions") or []
         if not actions:
@@ -3297,6 +3562,8 @@ class SlackBot:
                     await self._handle_slash_command(item.payload)
                 elif item.kind == "interactive":
                     await self._handle_agent_interactive(item.payload)
+                elif item.kind == "agent_view":
+                    await self._handle_agent_view_submission(item.payload)
                 else:
                     await self._handle_event(item.payload)
             except asyncio.CancelledError:

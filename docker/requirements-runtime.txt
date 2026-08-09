@@ -17,7 +17,7 @@ redis==5.0.8
 boto3>=1.35.0,<2.0.0
 aiokafka==0.10.0
 clickhouse-connect==0.8.18
-slack-sdk==3.35.0
+slack-sdk==3.43.0
 python-multipart>=0.0.20
 
 tiktoken==0.12.0

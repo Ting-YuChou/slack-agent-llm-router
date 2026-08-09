@@ -103,6 +103,17 @@ slack:
     include_bot_messages: false
     timeout_seconds: 3
     fail_open: true
+  agent_context:
+    enabled: true
+    max_thread_messages: 20
+    max_message_chars: 4000
+    max_resources: 10
+    max_resource_bytes: 262144
+    max_resource_chars: 8000
+    max_total_chars: 12000
+    timeout_seconds: 10
+    include_bot_messages: false
+    fail_open: true
   attachments:
     enabled: true
     max_files: 10

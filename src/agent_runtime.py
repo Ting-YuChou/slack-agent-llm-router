@@ -59,6 +59,7 @@ class AgentRuntimeClient:
         request_timeout = float(config.get("request_timeout_seconds", 910))
         token_env = str(config.get("token_env", "AGENT_RUNTIME_TOKEN"))
         self._token = os.getenv(token_env, "")
+        self._health_cache: Optional[Dict[str, Any]] = None
         self._health_timeout_seconds = min(connect_timeout, 2.0)
         self._client = httpx.AsyncClient(
             base_url=base_url,
@@ -74,9 +75,21 @@ class AgentRuntimeClient:
             if response.status_code != 200:
                 return None
             payload = response.json()
-            return payload if isinstance(payload, dict) else None
+            if isinstance(payload, dict):
+                self._health_cache = payload
+                return payload
+            return None
         except (asyncio.TimeoutError, httpx.HTTPError, ValueError):
             return None
+
+    def cached_configured_models(self) -> List[str]:
+        """Return the last healthy model allowlist without blocking a Slack trigger."""
+        models = (self._health_cache or {}).get("models", [])
+        return [
+            str(model["ref"])
+            for model in models
+            if isinstance(model, dict) and model.get("configured") and model.get("ref")
+        ]
 
     async def health(self) -> bool:
         payload = await self.health_details()

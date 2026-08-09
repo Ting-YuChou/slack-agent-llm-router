@@ -85,7 +85,33 @@ async def test_health_details_reports_provider_readiness(monkeypatch):
     runtime = client(lambda _request: httpx.Response(200, json=payload), monkeypatch)
 
     assert await runtime.health_details() == payload
+    assert runtime.cached_configured_models() == ["openai/gpt-5.6-luna"]
     assert await runtime.health() is True
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_health_refresh_keeps_last_configured_model_cache(monkeypatch):
+    responses = iter(
+        [
+            httpx.Response(
+                200,
+                json={
+                    "status": "healthy",
+                    "models": [
+                        {"ref": "openai/gpt-5.6-luna", "configured": True},
+                        {"ref": "anthropic/claude-sonnet-4-6", "configured": False},
+                    ],
+                },
+            ),
+            httpx.Response(503),
+        ]
+    )
+    runtime = client(lambda _request: next(responses), monkeypatch)
+
+    await runtime.health_details()
+    assert await runtime.health_details() is None
+    assert runtime.cached_configured_models() == ["openai/gpt-5.6-luna"]
     await runtime.close()
 
 
