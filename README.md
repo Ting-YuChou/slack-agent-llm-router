@@ -372,6 +372,26 @@ Try these two paths:
 - Reply normally inside that bot thread to continue the same Pi session.
 - `/llm agent status`, `/llm agent stop`, and `/llm agent close` inspect or
   control your latest session without consuming query quota.
+- `/llm agent history`, `/llm agent tree`, and `/llm agent stats` show sanitized
+  Pi turn metadata, checkpoint commits, context usage, and compaction state.
+  History includes a **View tree** button; its one-time owner-bound modal displays
+  at most 20 recent turns and only offers completed checkpoints for fork.
+- `/llm agent compact [instructions]` runs Pi's native manual compaction as a
+  five-minute maintenance run. Manual compaction counts as one Slack query;
+  automatic threshold/overflow compaction and retry do not add quota usage.
+- `/llm agent fork <turn-number>` (or the tree modal) creates a new Slack root,
+  Pi session, `pi-agent/...` branch, and writable worktree from that completed
+  turn's exact Pi leaf and Git commit. The child is idle until its owner replies
+  with the next task; parent and child never share a writable worktree.
+
+Tree ancestry and the active marker come from Pi's native session tree, including
+compaction and rollback branches; Slack only joins that tree to sanitized task and
+Git checkpoint metadata. Fork/history/tree do not consume query quota, but retained
+sessions are bounded to 20 per owner by default to prevent unbounded worktree and
+session-file allocation. Override that operational bound with
+`PI_AGENT_MAX_RETAINED_SESSIONS_PER_OWNER`. Sessions idle for more than 24 hours are
+reaped during new-session/fork admission and by a 15-minute background sweep
+(`PI_AGENT_EXPIRY_SWEEP_MS`); their Git branches and commits remain.
 
 Each new coding prompt counts as one Slack query; internal model turns and tools
 do not. A successful prompt is committed on its `pi-agent/...` branch and Slack
@@ -379,6 +399,19 @@ shows the changed files, diff stat, commit, and cherry-pick command. The runtime
 never pushes, merges, or modifies the current checkout. Rejected, cancelled,
 failed, and timed-out prompts roll their isolated worktree back to the previous
 successful commit. Agent failures never silently fall back to Chat mode.
+Pi and Git checkpoints are persisted together before and after every prompt. On
+reject, cancel, timeout, runtime restart, or model failure, the container is
+stopped before Git returns to the prompt baseline and Pi branches back from the
+pre-prompt leaf. If either side cannot be restored, the session becomes
+`needs_attention` and blocks new prompts, compaction, and fork instead of letting
+conversation state diverge from files. Existing runtime state is migrated only
+when its dedicated Pi directory contains one unambiguous JSONL session file.
+An interrupted maintenance compaction is reconciled from that exact Pi file
+without touching Git; if its current leaf cannot be verified, the session becomes
+`needs_attention`. Expiry, explicit close, and partially created forks first
+persist a `cleanupPending` tombstone, so partial worktree/Pi deletion remains
+non-promptable and is retried idempotently after restart or on the next cleanup
+sweep.
 
 Agent bootstrap context is read-only reference data. The default limits are 20
 messages, 10 resources, 4,000 message characters, 8,000 resource characters,

@@ -94,3 +94,28 @@ test("ignored protected files can never pass final diff validation", async () =>
   await manager.rollback(created.path, created.baselineCommit);
   await assert.rejects(readFile(path.join(created.path, ".env.local"), "utf8"));
 });
+
+test("fork worktrees start from the selected checkpoint commit instead of current HEAD", async () => {
+  const { repo, worktrees } = await fixture();
+  const checkpoint = await git(repo, "rev-parse", "HEAD");
+  await writeFile(path.join(repo, "tracked.txt"), "newer parent\n");
+  await git(repo, "add", "tracked.txt");
+  await git(repo, "commit", "-m", "newer parent");
+  const manager = new WorktreeManager({ repoPath: repo, worktreeRoot: worktrees, baseRef: "HEAD" });
+
+  const child = await manager.create("fork-child", checkpoint);
+
+  assert.equal(child.baselineCommit, checkpoint);
+  assert.equal(await readFile(path.join(child.path, "tracked.txt"), "utf8"), "base\n");
+});
+
+test("worktree removal is idempotent for retryable cleanup tombstones", async () => {
+  const { repo, worktrees } = await fixture();
+  const manager = new WorktreeManager({ repoPath: repo, worktreeRoot: worktrees, baseRef: "HEAD" });
+  const created = await manager.create("cleanup-retry");
+
+  await manager.remove(created.path);
+  await manager.remove(created.path);
+
+  assert.doesNotMatch(await git(repo, "worktree", "list", "--porcelain"), /cleanup-retry/);
+});

@@ -38,6 +38,11 @@ from slack.agent_shortcut import (
     build_agent_shortcut_modal,
     parse_agent_shortcut_submission,
 )
+from slack.agent_tree import (
+    AgentTreeNonce,
+    build_agent_tree_modal,
+    parse_tree_fork_submission,
+)
 from src.memory import MemoryManager, build_memory_scope
 from src.utils.schema import (
     Attachment,
@@ -781,7 +786,15 @@ class SlackMessageHandler:
         command_name = normalized.split(maxsplit=1)[0].lower()
         if command_name == "agent":
             parts = normalized.split()
-            return len(parts) < 2 or parts[1].lower() not in {"status", "stop", "close"}
+            return len(parts) < 2 or parts[1].lower() not in {
+                "status",
+                "stop",
+                "close",
+                "history",
+                "tree",
+                "stats",
+                "fork",
+            }
         return command_name not in self.commands
 
     async def handle_message(
@@ -1025,6 +1038,11 @@ class SlackMessageHandler:
                 return "No active Agent session was found for you."
             try:
                 if action == "status":
+                    if not tracked.get("run_id"):
+                        return (
+                            f"Agent session `{tracked['session_id']}` is idle and ready "
+                            "for its next task."
+                        )
                     run = await runtime.get_run(tracked["run_id"])
                     return self._format_agent_status(run)
                 if action == "stop":
@@ -1039,6 +1057,79 @@ class SlackMessageHandler:
                 return "Only the Agent session owner can perform that action."
             except AgentRuntimeError:
                 return "Agent mode could not complete that control action."
+
+        if action in {"history", "tree", "stats"} and len(args) == 1:
+            tracked = self.bot._agent_run_for(user_id, channel_id, thread_ts)
+            if not tracked:
+                return "No Agent session was found for you."
+            try:
+                if action == "stats":
+                    stats = await runtime.get_stats(tracked["session_id"], user_id)
+                    return self._format_agent_stats(stats)
+                tree = await runtime.get_tree(tracked["session_id"], user_id)
+                text, blocks = self._format_agent_history(tree, tracked)
+                if client is not None and hasattr(client, "chat_postEphemeral"):
+                    await client.chat_postEphemeral(
+                        channel=channel_id,
+                        user=user_id,
+                        thread_ts=tracked.get("thread_ts"),
+                        text=text,
+                        blocks=blocks,
+                    )
+                    return ""
+                return text
+            except AgentRuntimeUnauthorized:
+                return "Only the Agent session owner can inspect this session."
+            except AgentRuntimeConflict:
+                return (
+                    "This Agent session is busy; retry after the current run settles."
+                )
+            except AgentRuntimeError:
+                return "Agent session history is temporarily unavailable."
+
+        if action == "compact":
+            tracked = self.bot._agent_run_for(user_id, channel_id, thread_ts)
+            if not tracked:
+                return "No Agent session was found for you."
+            instructions = " ".join(args[1:]).strip() or None
+            try:
+                accepted = await runtime.compact(
+                    tracked["session_id"], user_id, instructions
+                )
+            except AgentRuntimeUnauthorized:
+                return "Only the Agent session owner can compact this session."
+            except AgentRuntimeConflict:
+                return "This Agent session cannot compact while it is busy or needs attention."
+            except AgentRuntimeError:
+                return "Agent session compaction could not start."
+            compact_run = self.bot._track_agent_run(
+                accepted,
+                team_id=tracked.get("team_id") or team_id or "unknown-team",
+                channel_id=tracked["channel_id"],
+                thread_ts=tracked["thread_ts"],
+                owner_user_id=user_id,
+            )
+            compact_run["kind"] = "compaction"
+            self.bot._spawn_background_task(
+                self.bot._monitor_agent_run(compact_run),
+                f"pi_agent_compaction:{accepted['run_id']}",
+            )
+            return f"Agent compaction run `{accepted['run_id']}` started."
+
+        if action == "fork":
+            if len(args) != 2 or not args[1].isdigit():
+                return "Usage: `/llm agent fork <turn-number>`"
+            tracked = self.bot._agent_run_for(user_id, channel_id, thread_ts)
+            if not tracked:
+                return "No Agent session was found for you."
+            return await self._fork_agent_turn(
+                tracked,
+                int(args[1]),
+                user_id,
+                channel_id,
+                client,
+                team_id or tracked.get("team_id") or "unknown-team",
+            )
 
         model = None
         include_thread_context = True
@@ -1085,6 +1176,7 @@ class SlackMessageHandler:
             team_id=team_id,
             thread_ts=thread_ts,
             model=model,
+            display_prompt=task if bootstrap.prompt != task else None,
         )
         if bootstrap.error:
             response += (
@@ -1092,6 +1184,143 @@ class SlackMessageHandler:
                 f"`{bootstrap.error}`."
             )
         return response
+
+    async def _fork_agent_turn(
+        self,
+        tracked: Dict[str, Any],
+        turn_number: int,
+        user_id: str,
+        channel_id: str,
+        client: AsyncWebClient,
+        team_id: str,
+    ) -> str:
+        """Create one Slack root and one isolated child session from a checkpoint."""
+        if client is None or not hasattr(client, "chat_postMessage"):
+            return "Agent fork needs an interactive Slack client."
+        if not await self.bot._is_public_agent_channel(channel_id):
+            return "Agent fork is only available in public, non-shared channels."
+        try:
+            tree = await self.bot.agent_runtime_client.get_tree(
+                tracked["session_id"], user_id
+            )
+            source = next(
+                (
+                    turn
+                    for turn in tree.get("turns", [])
+                    if turn.get("number") == turn_number
+                ),
+                None,
+            )
+            if not source or not source.get("forkable"):
+                return "That turn does not have a completed checkpoint to fork."
+            root = await client.chat_postMessage(
+                channel=channel_id,
+                text=(
+                    "🌿 Pi Agent fork is preparing an independent session from "
+                    f"turn {turn_number} in thread `{tracked['thread_ts']}`…"
+                ),
+            )
+            child_thread_ts = root.get("ts")
+            if not child_thread_ts:
+                return "Slack did not return a thread for the Agent fork."
+            child = await self.bot.agent_runtime_client.fork_session(
+                tracked["session_id"],
+                user_id,
+                source["run_id"],
+                team_id=team_id,
+                channel_id=channel_id,
+                thread_ts=child_thread_ts,
+            )
+            self.bot._track_forked_agent_session(
+                child,
+                team_id=team_id,
+                channel_id=channel_id,
+                thread_ts=child_thread_ts,
+                owner_user_id=user_id,
+            )
+            await client.chat_update(
+                channel=channel_id,
+                ts=child_thread_ts,
+                text=(
+                    f"🌿 Pi Agent fork created from turn {turn_number}.\n"
+                    f"Branch: `{child['branch']}`\n"
+                    f"Baseline: `{child['baseline_commit']}`\n"
+                    f"Model: `{child['model_ref']}`\n"
+                    "Please reply in this thread with the next coding task."
+                ),
+            )
+            return ""
+        except AgentRuntimeUnauthorized:
+            return "Only the Agent session owner can fork this session."
+        except AgentRuntimeConflict:
+            message = "Agent fork could not start because the session is busy or needs attention."
+        except AgentRuntimeBusy:
+            message = (
+                "Agent fork capacity is full; close an older Agent session and retry."
+            )
+        except AgentRuntimeError:
+            message = "Agent fork could not create an isolated child session."
+        if "child_thread_ts" in locals() and child_thread_ts:
+            await client.chat_update(
+                channel=channel_id, ts=child_thread_ts, text=message
+            )
+            return ""
+        return message
+
+    @staticmethod
+    def _format_agent_history(
+        tree: Dict[str, Any], tracked: Dict[str, Any]
+    ) -> tuple[str, List[Dict[str, Any]]]:
+        turns = [turn for turn in tree.get("turns", []) if isinstance(turn, dict)][-20:]
+        lines = []
+        for turn in turns:
+            marker = "●" if turn.get("active") else "○"
+            commit = str(turn.get("commit") or "")[:8]
+            forkable = " · forkable" if turn.get("forkable") else ""
+            suffix = f" · `{commit}`" if commit else ""
+            lines.append(
+                f"{marker} Turn {turn.get('number', '?')} · {turn.get('status', 'unknown')}"
+                f"{suffix}{forkable}\n  {str(turn.get('task_preview') or '')[:160]}"
+            )
+        text = "*Pi Agent history*\n" + ("\n".join(lines) or "No turns yet.")
+        value = json.dumps(
+            {
+                "session_id": tracked["session_id"],
+                "channel_id": tracked["channel_id"],
+                "thread_ts": tracked["thread_ts"],
+            },
+            separators=(",", ":"),
+        )
+        return text, [
+            {"type": "section", "text": {"type": "mrkdwn", "text": text[:3000]}},
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "action_id": "pi_agent_view_tree",
+                        "text": {"type": "plain_text", "text": "View tree"},
+                        "value": value,
+                    }
+                ],
+            },
+        ]
+
+    @staticmethod
+    def _format_agent_stats(stats: Dict[str, Any]) -> str:
+        context = stats.get("context_usage") or {}
+        percent = context.get("percent")
+        context_text = f"{percent}%" if percent is not None else "unavailable"
+        return (
+            "*Pi Agent session stats*\n"
+            f"Messages: {stats.get('total_messages', 0)} "
+            f"({stats.get('user_messages', 0)} user / "
+            f"{stats.get('assistant_messages', 0)} assistant)\n"
+            f"Tool calls: {stats.get('tool_calls', 0)}\n"
+            f"Context usage: {context_text}\n"
+            f"Compactions: {stats.get('compaction_count', 0)} "
+            f"(auto {'on' if stats.get('auto_compaction_enabled') else 'off'})"
+        )
 
     async def _start_agent_prompt(
         self,
@@ -1103,6 +1332,7 @@ class SlackMessageHandler:
         team_id: Optional[str],
         thread_ts: Optional[str],
         model: Optional[str] = None,
+        display_prompt: Optional[str] = None,
     ) -> str:
         runtime = getattr(self.bot, "agent_runtime_client", None)
         if runtime is None:
@@ -1129,9 +1359,12 @@ class SlackMessageHandler:
                 task,
             )
             if model:
-                result = await runtime.create_session(*create_args, model=model)
+                create_kwargs = {"model": model}
             else:
-                result = await runtime.create_session(*create_args)
+                create_kwargs = {}
+            if display_prompt:
+                create_kwargs["display_prompt"] = display_prompt
+            result = await runtime.create_session(*create_args, **create_kwargs)
         except AgentRuntimeBusy:
             message = (
                 "Agent mode is busy right now. Chat mode was not used as fallback."
@@ -1251,6 +1484,9 @@ Mention me in a channel, use `/llm ...`, or reply inside an active bot thread.
 • Agent models: `openai/gpt-5.6-luna`, `anthropic/claude-sonnet-4-6`, `opencode-go/deepseek-v4-pro`
 • `/llm agent /skill:test-gap <task>` - Run the approved test-gap workflow
 • `/llm agent status|stop|close` - Inspect or control your latest Agent session
+• `/llm agent history|tree|stats` - Inspect sanitized Pi turns and context usage
+• `/llm agent compact [instructions]` - Compact Pi context (counts as one query)
+• `/llm agent fork <turn-number>` - Create an independent child thread and worktree
 • `/llm remember <text>` - Save an explicit long-term memory
 • `/llm memories [query]` - List or search your memories
 • `/llm forget <memory_id|all>` - Delete saved memories
@@ -1970,6 +2206,7 @@ class SlackBot:
         self.agent_runs: Dict[str, Dict[str, Any]] = {}
         self.agent_user_runs: Dict[str, Dict[str, Any]] = {}
         self.agent_shortcut_nonces: Dict[str, AgentShortcutNonce] = {}
+        self.agent_tree_nonces: Dict[str, AgentTreeNonce] = {}
 
         # Running state
         self.initialized = False
@@ -2130,6 +2367,19 @@ class SlackBot:
                         kind="agent_view",
                         payload=req.payload,
                         name="slack_agent_shortcut_submission",
+                    )
+                )
+            elif (
+                req.type == "interactive"
+                and req.payload.get("type") == "view_submission"
+                and req.payload.get("view", {}).get("callback_id")
+                == "pi_agent_tree_fork_submit"
+            ):
+                await self._enqueue_work(
+                    SlackWorkItem(
+                        kind="agent_tree_fork",
+                        payload=req.payload,
+                        name="slack_agent_tree_fork_submission",
                     )
                 )
 
@@ -3004,6 +3254,32 @@ class SlackBot:
         self._mark_thread_active(channel_id, thread_ts)
         return tracked
 
+    def _track_forked_agent_session(
+        self,
+        child: Dict[str, Any],
+        *,
+        team_id: str,
+        channel_id: str,
+        thread_ts: str,
+        owner_user_id: str,
+    ) -> Dict[str, Any]:
+        """Track an idle child session without inventing a coding run."""
+        tracked = {
+            "session_id": child["session_id"],
+            "run_id": None,
+            "team_id": team_id,
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "owner_user_id": owner_user_id,
+            "branch": child.get("branch"),
+            "parent_session_id": child.get("parent_session_id"),
+            "fork_source_run_id": child.get("fork_source_run_id"),
+        }
+        self.agent_threads[self._thread_key(channel_id, thread_ts)] = tracked
+        self.agent_user_runs[owner_user_id] = tracked
+        self._mark_thread_active(channel_id, thread_ts)
+        return tracked
+
     def _agent_run_for(
         self,
         user_id: str,
@@ -3103,12 +3379,22 @@ class SlackBot:
         max_length = int(
             self.config.get("response_settings", {}).get("max_response_length", 2000)
         )
+        if tracked.get("kind") == "compaction":
+            if run.get("status") == "completed":
+                response_text = "Pi Agent session compaction completed."
+            else:
+                response_text = (
+                    "Pi Agent session compaction did not complete: "
+                    f"`{run.get('status', 'failed')}`."
+                )
+        else:
+            response_text = self.message_handler._format_agent_response(
+                run, max_length=max_length
+            )
         await self.web_client.chat_postMessage(
             channel=tracked["channel_id"],
             thread_ts=tracked["thread_ts"],
-            text=self.message_handler._format_agent_response(
-                run, max_length=max_length
-            ),
+            text=response_text,
         )
 
     async def _handle_agent_shortcut(self, payload: Dict[str, Any]) -> None:
@@ -3258,6 +3544,7 @@ class SlackBot:
             team_id=nonce.team_id,
             thread_ts=nonce.thread_ts,
             model=submission.model,
+            display_prompt=submission.task,
         )
         details = []
         if submission.include_context:
@@ -3292,6 +3579,9 @@ class SlackBot:
         if not actions:
             return
         action = actions[0]
+        if action.get("action_id") == "pi_agent_view_tree":
+            await self._open_agent_tree_modal(payload, action)
+            return
         if action.get("action_id") not in {"pi_agent_approve", "pi_agent_reject"}:
             return
         user_id = payload.get("user", {}).get("id")
@@ -3334,6 +3624,146 @@ class SlackBot:
             self._monitor_agent_run(tracked),
             f"pi_agent_monitor:{value['run_id']}",
         )
+
+    async def _open_agent_tree_modal(
+        self, payload: Dict[str, Any], action: Dict[str, Any]
+    ) -> None:
+        """Open a sanitized tree modal only for the tracked session owner."""
+        try:
+            value = json.loads(action.get("value") or "{}")
+        except (TypeError, ValueError):
+            return
+        user_id = payload.get("user", {}).get("id")
+        team_id = payload.get("team", {}).get("id") or self._extract_team_id(payload)
+        channel_id = value.get("channel_id")
+        thread_ts = value.get("thread_ts")
+        session_id = value.get("session_id")
+        trigger_id = payload.get("trigger_id")
+        tracked = self.agent_threads.get(self._thread_key(channel_id, thread_ts))
+        if not all(
+            (user_id, team_id, channel_id, thread_ts, session_id, trigger_id, tracked)
+        ):
+            return
+        if (
+            tracked.get("owner_user_id") != user_id
+            or tracked.get("session_id") != session_id
+        ):
+            return
+        try:
+            tree = await self.agent_runtime_client.get_tree(session_id, user_id)
+        except AgentRuntimeError:
+            return
+        now = time.time()
+        self.agent_tree_nonces = {
+            key: item
+            for key, item in self.agent_tree_nonces.items()
+            if item.expires_at > now
+        }
+        nonce_value = uuid.uuid4().hex
+        self.agent_tree_nonces[nonce_value] = AgentTreeNonce(
+            team_id=team_id,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            session_id=session_id,
+            owner_user_id=user_id,
+            expires_at=now + 300,
+        )
+        await self.web_client.views_open(
+            trigger_id=trigger_id,
+            view=build_agent_tree_modal(nonce_value, tree),
+        )
+
+    async def _handle_agent_tree_fork_submission(self, payload: Dict[str, Any]) -> None:
+        """Consume an owner-bound tree nonce and create one isolated child thread."""
+        view = payload.get("view", {}) or {}
+        nonce_value = str(view.get("private_metadata") or "")
+        nonce = self.agent_tree_nonces.get(nonce_value)
+        user_id = payload.get("user", {}).get("id")
+        if not nonce:
+            return
+        if nonce.expires_at <= time.time():
+            self.agent_tree_nonces.pop(nonce_value, None)
+            return
+        if nonce.owner_user_id != user_id:
+            return
+        tracked = self.agent_threads.get(
+            self._thread_key(nonce.channel_id, nonce.thread_ts)
+        )
+        if (
+            not tracked
+            or tracked.get("session_id") != nonce.session_id
+            or tracked.get("owner_user_id") != user_id
+        ):
+            return
+        self.agent_tree_nonces.pop(nonce_value, None)
+        source_run_id = parse_tree_fork_submission(view)
+        if not source_run_id:
+            return
+        if not await self._is_public_agent_channel(nonce.channel_id):
+            return
+        try:
+            tree = await self.agent_runtime_client.get_tree(nonce.session_id, user_id)
+            source = next(
+                (
+                    turn
+                    for turn in tree.get("turns", [])
+                    if turn.get("run_id") == source_run_id
+                    and turn.get("forkable") is True
+                ),
+                None,
+            )
+            if not source:
+                return
+            root = await self.web_client.chat_postMessage(
+                channel=nonce.channel_id,
+                text=(
+                    "🌿 Pi Agent fork is preparing an independent session from "
+                    f"turn {source.get('number', '?')} in thread `{nonce.thread_ts}`…"
+                ),
+            )
+            child_thread_ts = root.get("ts")
+            if not child_thread_ts:
+                return
+            child = await self.agent_runtime_client.fork_session(
+                nonce.session_id,
+                user_id,
+                source_run_id,
+                team_id=nonce.team_id,
+                channel_id=nonce.channel_id,
+                thread_ts=child_thread_ts,
+            )
+            self._track_forked_agent_session(
+                child,
+                team_id=nonce.team_id,
+                channel_id=nonce.channel_id,
+                thread_ts=child_thread_ts,
+                owner_user_id=user_id,
+            )
+            await self.web_client.chat_update(
+                channel=nonce.channel_id,
+                ts=child_thread_ts,
+                text=(
+                    f"🌿 Pi Agent fork created from turn {source.get('number', '?')}.\n"
+                    f"Branch: `{child['branch']}`\n"
+                    f"Baseline: `{child['baseline_commit']}`\n"
+                    f"Model: `{child['model_ref']}`\n"
+                    "Please reply in this thread with the next coding task."
+                ),
+            )
+        except AgentRuntimeBusy:
+            if "child_thread_ts" in locals() and child_thread_ts:
+                await self.web_client.chat_update(
+                    channel=nonce.channel_id,
+                    ts=child_thread_ts,
+                    text="Agent fork capacity is full; close an older Agent session and retry.",
+                )
+        except AgentRuntimeError:
+            if "child_thread_ts" in locals() and child_thread_ts:
+                await self.web_client.chat_update(
+                    channel=nonce.channel_id,
+                    ts=child_thread_ts,
+                    text="Agent fork could not create an isolated child session.",
+                )
 
     def _mark_thread_active(self, channel_id: Optional[str], thread_ts: Optional[str]):
         """Mark a bot thread as active for follow-up replies."""
@@ -3564,6 +3994,8 @@ class SlackBot:
                     await self._handle_agent_interactive(item.payload)
                 elif item.kind == "agent_view":
                     await self._handle_agent_view_submission(item.payload)
+                elif item.kind == "agent_tree_fork":
+                    await self._handle_agent_tree_fork_submission(item.payload)
                 else:
                     await self._handle_event(item.payload)
             except asyncio.CancelledError:

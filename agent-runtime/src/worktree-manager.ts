@@ -37,13 +37,13 @@ export class WorktreeManager {
     this.baseRef = options.baseRef;
   }
 
-  async create(runId: string): Promise<WorktreeInfo> {
+  async create(runId: string, startCommit?: string): Promise<WorktreeInfo> {
     await mkdir(this.worktreeRoot, { recursive: true });
     const safeId = runId.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64) || "run";
     const date = new Date().toISOString().slice(0, 10).replaceAll("-", "");
     const branch = `pi-agent/${date}-${safeId}`;
     const worktreePath = path.join(this.worktreeRoot, `${date}-${safeId}`);
-    const baselineCommit = await this.git(this.repoPath, "rev-parse", "--verify", `${this.baseRef}^{commit}`);
+    const baselineCommit = await this.git(this.repoPath, "rev-parse", "--verify", `${startCommit ?? this.baseRef}^{commit}`);
     try {
       await this.git(this.repoPath, "worktree", "add", "-b", branch, worktreePath, baselineCommit);
     } catch (error) {
@@ -108,8 +108,21 @@ export class WorktreeManager {
   }
 
   async remove(worktreePath: string): Promise<void> {
-    await this.assertManagedPath(worktreePath);
-    await this.git(this.repoPath, "worktree", "remove", "--force", path.resolve(worktreePath));
+    const resolved = path.resolve(worktreePath);
+    await this.assertManagedRemovalPath(resolved);
+    try {
+      await this.git(this.repoPath, "worktree", "remove", "--force", resolved);
+    } catch (error) {
+      try {
+        await stat(resolved);
+      } catch (statError) {
+        if (isMissingFileError(statError)) {
+          await this.git(this.repoPath, "worktree", "prune", "--expire=now");
+          return;
+        }
+      }
+      throw new WorktreeError("Unable to remove isolated Git worktree", { cause: error });
+    }
   }
 
   private async assertManagedPath(candidate: string): Promise<void> {
@@ -117,6 +130,22 @@ export class WorktreeManager {
     const root = await realpath(this.worktreeRoot);
     if (resolved === root || !resolved.startsWith(`${root}${path.sep}`)) {
       throw new WorktreeError("Refusing to operate outside the managed worktree root");
+    }
+  }
+
+  private async assertManagedRemovalPath(candidate: string): Promise<void> {
+    const root = await realpath(this.worktreeRoot);
+    const resolved = path.resolve(candidate);
+    if (resolved === root || !resolved.startsWith(`${root}${path.sep}`)) {
+      throw new WorktreeError("Refusing to remove outside the managed worktree root");
+    }
+    try {
+      const actual = await realpath(resolved);
+      if (actual === root || !actual.startsWith(`${root}${path.sep}`)) {
+        throw new WorktreeError("Refusing to remove outside the managed worktree root");
+      }
+    } catch (error) {
+      if (!isMissingFileError(error)) throw error;
     }
   }
 
@@ -155,6 +184,11 @@ export class WorktreeManager {
     });
     return result.stdout;
   }
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return typeof error === "object" && error !== null &&
+    "code" in error && (error as { code?: string }).code === "ENOENT";
 }
 
 function isProtectedChangedPath(file: string): boolean {

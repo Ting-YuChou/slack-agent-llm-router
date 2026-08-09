@@ -710,7 +710,8 @@ class TestSlackAgentApprovals:
             "bounded bootstrap prompt",
         )
         assert runtime.create_session.await_args.kwargs == {
-            "model": "openai/gpt-5.6-luna"
+            "model": "openai/gpt-5.6-luna",
+            "display_prompt": "Implement the thread todo",
         }
         status = bot.web_client.chat_update.await_args.kwargs["text"]
         assert "Loaded 3 prior Slack messages and 2 resources" in status

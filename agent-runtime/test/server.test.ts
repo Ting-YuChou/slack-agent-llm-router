@@ -27,6 +27,10 @@ function fixture() {
     decide: (...args: any[]) => calls.push(["decide", ...args]),
     cancel: async (...args: any[]) => calls.push(["cancel", ...args]),
     closeSession: async (...args: any[]) => calls.push(["close", ...args]),
+    getTree: async (...args: any[]) => { calls.push(["tree", ...args]); return { session_id: "S1", active_leaf_id: "leaf", turns: [], lineage: {}, truncated: false }; },
+    getStats: async (...args: any[]) => { calls.push(["stats", ...args]); return { session_id: "S1", total_messages: 2, auto_compaction_enabled: true, compaction_count: 0 }; },
+    compact: async (...args: any[]) => { calls.push(["compact", ...args]); return { session_id: "S1", run_id: "RC", status: "starting" }; },
+    fork: async (...args: any[]) => { calls.push(["fork", ...args]); return { session_id: "S2", branch: "pi-agent/child", baseline_commit: "abc" }; },
   };
   const server = createAgentHttpServer({
     orchestrator: orchestrator as any,
@@ -87,4 +91,30 @@ test("stable errors are sanitized and preserve 409/404 mapping", async () => {
   assert.equal((await missing.json()).error.code, "not_found");
   assert.equal(invalid.status, 400);
   assert.doesNotMatch(await invalid.text(), /stack|syntaxerror/i);
+});
+
+test("tree, stats, compaction, and fork endpoints preserve owner identity and async status", async () => {
+  const { server, calls } = fixture();
+  const base = await listen(server);
+  const headers = { authorization: "Bearer runtime-secret", "content-type": "application/json" };
+  const tree = await fetch(`${base}/v1/sessions/S1/tree?user_id=U1`, { headers });
+  const stats = await fetch(`${base}/v1/sessions/S1/stats?user_id=U1`, { headers });
+  const compact = await fetch(`${base}/v1/sessions/S1/compact`, {
+    method: "POST", headers, body: JSON.stringify({ user_id: "U1", custom_instructions: "Preserve decisions" }),
+  });
+  const fork = await fetch(`${base}/v1/sessions/S1/forks`, {
+    method: "POST", headers, body: JSON.stringify({ user_id: "U1", source_run_id: "R1", team_id: "T1", channel_id: "C1", thread_ts: "2" }),
+  });
+  await close(server);
+
+  assert.equal(tree.status, 200);
+  assert.equal(stats.status, 200);
+  assert.equal(compact.status, 202);
+  assert.equal(fork.status, 202);
+  assert.deepEqual(calls.slice(-4), [
+    ["tree", "S1", "U1"],
+    ["stats", "S1", "U1"],
+    ["compact", "S1", "U1", "Preserve decisions"],
+    ["fork", "S1", { user_id: "U1", source_run_id: "R1", team_id: "T1", channel_id: "C1", thread_ts: "2" }],
+  ]);
 });

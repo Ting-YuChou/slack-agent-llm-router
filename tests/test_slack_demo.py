@@ -70,7 +70,7 @@ def test_demo_manifest_declares_socket_mode_command_and_events():
         {
             "command": "/llm",
             "description": "Ask the single-model LLM Router demo",
-            "usage_hint": "help | agent <task|status|stop|close> | your question",
+            "usage_hint": "help | agent <task|history|stats|compact|fork> | your question",
             "should_escape": False,
         }
     ]

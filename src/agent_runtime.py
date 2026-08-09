@@ -9,7 +9,9 @@ import httpx
 
 
 class AgentRuntimeError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: Optional[str] = None):
+        super().__init__(message)
+        self.code = code
 
 
 class AgentRuntimeTimeout(AgentRuntimeError):
@@ -104,6 +106,7 @@ class AgentRuntimeClient:
         prompt: str,
         *,
         model: Optional[str] = None,
+        display_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:
         payload = {
             "team_id": team_id,
@@ -114,6 +117,8 @@ class AgentRuntimeClient:
         }
         if model:
             payload["model"] = model
+        if display_prompt:
+            payload["display_prompt"] = display_prompt
         result = await self._request(
             "POST",
             "/v1/sessions",
@@ -159,6 +164,110 @@ class AgentRuntimeClient:
             expected_status=202,
         )
         return self._validate_accepted(result)
+
+    async def get_tree(self, session_id: str, user_id: str) -> Dict[str, Any]:
+        result = await self._request(
+            "GET",
+            f"/v1/sessions/{session_id}/tree",
+            params={"user_id": user_id},
+        )
+        if (
+            not isinstance(result, dict)
+            or result.get("session_id") != session_id
+            or not isinstance(result.get("turns"), list)
+            or not isinstance(result.get("truncated"), bool)
+            or not isinstance(result.get("lineage"), dict)
+        ):
+            raise AgentRuntimeInvalidResponse(
+                "Agent runtime returned invalid session tree data"
+            )
+        for turn in result["turns"]:
+            if not isinstance(turn, dict) or not all(
+                isinstance(turn.get(field), expected_type)
+                for field, expected_type in (
+                    ("number", int),
+                    ("run_id", str),
+                    ("status", str),
+                    ("task_preview", str),
+                    ("forkable", bool),
+                )
+            ):
+                raise AgentRuntimeInvalidResponse(
+                    "Agent runtime returned invalid session tree data"
+                )
+        return result
+
+    async def get_stats(self, session_id: str, user_id: str) -> Dict[str, Any]:
+        result = await self._request(
+            "GET",
+            f"/v1/sessions/{session_id}/stats",
+            params={"user_id": user_id},
+        )
+        if (
+            not isinstance(result, dict)
+            or result.get("session_id") != session_id
+            or not isinstance(result.get("auto_compaction_enabled"), bool)
+            or not isinstance(result.get("compaction_count"), int)
+        ):
+            raise AgentRuntimeInvalidResponse(
+                "Agent runtime returned invalid session statistics"
+            )
+        return result
+
+    async def compact(
+        self,
+        session_id: str,
+        user_id: str,
+        custom_instructions: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"user_id": user_id}
+        if custom_instructions:
+            payload["custom_instructions"] = custom_instructions
+        result = await self._request(
+            "POST",
+            f"/v1/sessions/{session_id}/compact",
+            json=payload,
+            expected_status=202,
+        )
+        return self._validate_accepted(result)
+
+    async def fork_session(
+        self,
+        session_id: str,
+        user_id: str,
+        source_run_id: str,
+        *,
+        team_id: str,
+        channel_id: str,
+        thread_ts: str,
+    ) -> Dict[str, Any]:
+        result = await self._request(
+            "POST",
+            f"/v1/sessions/{session_id}/forks",
+            json={
+                "user_id": user_id,
+                "source_run_id": source_run_id,
+                "team_id": team_id,
+                "channel_id": channel_id,
+                "thread_ts": thread_ts,
+            },
+            expected_status=202,
+        )
+        if not isinstance(result, dict) or not all(
+            isinstance(result.get(field), str)
+            for field in (
+                "session_id",
+                "branch",
+                "baseline_commit",
+                "parent_session_id",
+                "fork_source_run_id",
+                "model_ref",
+            )
+        ):
+            raise AgentRuntimeInvalidResponse(
+                "Agent runtime returned invalid fork data"
+            )
+        return result
 
     async def get_run(self, run_id: str) -> Dict[str, Any]:
         result = await self._request("GET", f"/v1/runs/{run_id}")
@@ -265,9 +374,10 @@ class AgentRuntimeClient:
         path: str,
         *,
         json: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, str]] = None,
         expected_status: int = 200,
     ) -> Any:
-        response = await self._send(method, path, json=json)
+        response = await self._send(method, path, json=json, params=params)
         if response.status_code != expected_status:
             self._raise_for_error(response)
         try:
@@ -308,15 +418,20 @@ class AgentRuntimeClient:
         error = payload.get("error", {}) if isinstance(payload, dict) else {}
         code = error.get("code") if isinstance(error, dict) else None
         if response.status_code == 401:
-            raise AgentRuntimeUnauthorized("Agent runtime authentication failed")
+            raise AgentRuntimeUnauthorized(
+                "Agent runtime authentication failed", code=code
+            )
         if response.status_code == 409:
-            raise AgentRuntimeConflict("Agent runtime rejected a conflicting action")
+            raise AgentRuntimeConflict(
+                "Agent runtime rejected a conflicting action", code=code
+            )
         if response.status_code == 429:
-            raise AgentRuntimeBusy("Agent runtime is busy")
+            raise AgentRuntimeBusy("Agent runtime is busy", code=code)
         if response.status_code == 504 or code == "run_timeout":
-            raise AgentRuntimeTimeout("Agent runtime request timed out")
+            raise AgentRuntimeTimeout("Agent runtime request timed out", code=code)
         raise AgentRuntimeError(
-            f"Agent runtime rejected the request with status {response.status_code}"
+            f"Agent runtime rejected the request with status {response.status_code}",
+            code=code,
         )
 
     @staticmethod

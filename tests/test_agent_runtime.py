@@ -188,8 +188,9 @@ async def test_stable_error_mapping(monkeypatch, status, code, expected):
         ),
         monkeypatch,
     )
-    with pytest.raises(expected):
+    with pytest.raises(expected) as exc_info:
         await runtime.create_session("T", "C", "1", "U", "task")
+    assert exc_info.value.code == code
     await runtime.close()
 
 
@@ -228,3 +229,123 @@ async def test_lookup_restores_thread_session_after_slack_restart(monkeypatch):
     await runtime.close()
 
     assert session["session_id"] == "S1"
+
+
+@pytest.mark.asyncio
+async def test_tree_stats_compact_and_fork_contracts_are_validated(monkeypatch):
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content) if request.content else None
+        calls.append((request.method, request.url.path, dict(request.url.params), body))
+        if request.url.path.endswith("/tree"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "S1",
+                    "active_leaf_id": "leaf-1",
+                    "turns": [
+                        {
+                            "number": 1,
+                            "run_id": "R1",
+                            "status": "completed",
+                            "task_preview": "fix",
+                            "forkable": True,
+                        }
+                    ],
+                    "lineage": {},
+                    "truncated": False,
+                },
+            )
+        if request.url.path.endswith("/stats"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "S1",
+                    "total_messages": 2,
+                    "auto_compaction_enabled": True,
+                    "compaction_count": 0,
+                },
+            )
+        if request.url.path.endswith("/compact"):
+            return httpx.Response(
+                202,
+                json={"session_id": "S1", "run_id": "RC", "status": "starting"},
+            )
+        return httpx.Response(
+            202,
+            json={
+                "session_id": "S2",
+                "branch": "pi-agent/child",
+                "baseline_commit": "abc",
+                "parent_session_id": "S1",
+                "fork_source_run_id": "R1",
+                "model_ref": "openai/gpt-5.6-luna",
+            },
+        )
+
+    runtime = client(handler, monkeypatch)
+    tree = await runtime.get_tree("S1", "U1")
+    stats = await runtime.get_stats("S1", "U1")
+    compact = await runtime.compact("S1", "U1", "Keep decisions")
+    fork = await runtime.fork_session(
+        "S1",
+        "U1",
+        "R1",
+        team_id="T1",
+        channel_id="C1",
+        thread_ts="2",
+    )
+    await runtime.close()
+
+    assert tree["turns"][0]["run_id"] == "R1"
+    assert stats["auto_compaction_enabled"] is True
+    assert compact["run_id"] == "RC"
+    assert fork["session_id"] == "S2"
+    assert calls == [
+        ("GET", "/v1/sessions/S1/tree", {"user_id": "U1"}, None),
+        ("GET", "/v1/sessions/S1/stats", {"user_id": "U1"}, None),
+        (
+            "POST",
+            "/v1/sessions/S1/compact",
+            {},
+            {"user_id": "U1", "custom_instructions": "Keep decisions"},
+        ),
+        (
+            "POST",
+            "/v1/sessions/S1/forks",
+            {},
+            {
+                "user_id": "U1",
+                "source_run_id": "R1",
+                "team_id": "T1",
+                "channel_id": "C1",
+                "thread_ts": "2",
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_session_sends_a_separate_safe_display_prompt(monkeypatch):
+    captured = {}
+
+    def handler(request):
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            202, json={"session_id": "S1", "run_id": "R1", "status": "starting"}
+        )
+
+    runtime = client(handler, monkeypatch)
+    await runtime.create_session(
+        "T1",
+        "C1",
+        "1",
+        "U1",
+        "untrusted Slack context plus task",
+        display_prompt="implement the todo",
+    )
+    await runtime.close()
+
+    assert captured["prompt"] == "untrusted Slack context plus task"
+    assert captured["display_prompt"] == "implement the todo"
