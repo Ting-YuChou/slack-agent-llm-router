@@ -86,6 +86,7 @@ http.createServer((req,res)=>{ let body=""; req.on("data",c=>body+=c); req.on("e
         pluginPaths: ["/opt/pi/plugins/workspace-summary.ts"],
         skillPaths: ["/opt/pi/skills/test-gap/SKILL.md"],
         toolNames: ["read", "write", "edit", "bash", "grep", "find", "ls", "workspace_summary"],
+        piSessionId: "44444444-4444-4444-8444-444444444444",
         user: `${hostUid}:${hostGid}`,
       },
       () => "fake-run-token",

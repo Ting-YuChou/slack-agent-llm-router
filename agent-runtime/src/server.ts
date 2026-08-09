@@ -15,6 +15,7 @@ import {
 } from "./orchestrator.js";
 import { verifyPluginLock } from "./plugin-lock.js";
 import { RuntimeStateStore } from "./runtime-state.js";
+import { PiSessionStore } from "./pi-session-store.js";
 import { verifySkillLock } from "./skill-lock.js";
 import { WorktreeManager } from "./worktree-manager.js";
 
@@ -79,6 +80,48 @@ export function createAgentHttpServer(options: ServerOptions) {
         const body = asRecord(await readJson(request));
         await options.orchestrator.closeSession(decodeURIComponent(closeMatch[1]), requiredString(body.user_id, "user_id"));
         sendJson(response, 202, { status: "closed" });
+        return;
+      }
+      const treeMatch = /^\/v1\/sessions\/([^/]+)\/tree$/.exec(url.pathname);
+      if (request.method === "GET" && treeMatch) {
+        const result = await options.orchestrator.getTree(
+          decodeURIComponent(treeMatch[1]),
+          requiredString(url.searchParams.get("user_id"), "user_id"),
+        );
+        sendJson(response, 200, result);
+        return;
+      }
+      const statsMatch = /^\/v1\/sessions\/([^/]+)\/stats$/.exec(url.pathname);
+      if (request.method === "GET" && statsMatch) {
+        const result = await options.orchestrator.getStats(
+          decodeURIComponent(statsMatch[1]),
+          requiredString(url.searchParams.get("user_id"), "user_id"),
+        );
+        sendJson(response, 200, result);
+        return;
+      }
+      const compactMatch = /^\/v1\/sessions\/([^/]+)\/compact$/.exec(url.pathname);
+      if (request.method === "POST" && compactMatch) {
+        const body = asRecord(await readJson(request));
+        const result = await options.orchestrator.compact(
+          decodeURIComponent(compactMatch[1]),
+          requiredString(body.user_id, "user_id"),
+          optionalString(body.custom_instructions, "custom_instructions"),
+        );
+        sendJson(response, 202, result);
+        return;
+      }
+      const forkMatch = /^\/v1\/sessions\/([^/]+)\/forks$/.exec(url.pathname);
+      if (request.method === "POST" && forkMatch) {
+        const body = asRecord(await readJson(request));
+        const result = await options.orchestrator.fork(decodeURIComponent(forkMatch[1]), {
+          user_id: requiredString(body.user_id, "user_id"),
+          source_run_id: requiredString(body.source_run_id, "source_run_id"),
+          team_id: requiredString(body.team_id, "team_id"),
+          channel_id: requiredString(body.channel_id, "channel_id"),
+          thread_ts: requiredString(body.thread_ts, "thread_ts"),
+        });
+        sendJson(response, 202, result);
         return;
       }
       const runMatch = /^\/v1\/runs\/([^/]+)$/.exec(url.pathname);
@@ -172,10 +215,16 @@ export async function createProductionServer() {
   });
   await cleanupOrphanAgentContainers();
   const stateStore = new RuntimeStateStore(path.join(runtimeRoot, "runtime-state.json"));
+  const piSessions = new PiSessionStore(path.join(runtimeRoot, "sessions"));
   const orchestrator = new CodingAgentOrchestrator({
     worktrees,
+    piSessions,
     stateStore,
     maxActiveSessions: positiveInteger(process.env.PI_AGENT_MAX_CONCURRENCY, 2),
+    maxRetainedSessionsPerOwner: positiveInteger(
+      process.env.PI_AGENT_MAX_RETAINED_SESSIONS_PER_OWNER,
+      20,
+    ),
     deadlineMs: positiveInteger(process.env.PI_AGENT_DEADLINE_MS, 15 * 60_000),
     availableModelRefs: configuredModels.map((model) => model.ref),
     startProcess: async (session, onEvent) => {
@@ -196,7 +245,8 @@ export async function createProductionServer() {
           pluginPaths: lock.plugins.map((plugin) => plugin.container_path),
           skillPaths: skillLock.skills.map((skill) => skill.container_path),
           toolNames: ["read", "write", "edit", "bash", "grep", "find", "ls", ...lock.plugins.flatMap((plugin) => plugin.enabled_tools)],
-          continueSession: session.restored,
+          piSessionId: session.piSessionId,
+          piSessionFile: session.piSessionFile,
           safeCommands: parseSafeCommands(process.env.PI_AGENT_SAFE_COMMANDS),
           user: containerUser,
         },
@@ -215,7 +265,7 @@ export async function createProductionServer() {
     },
   });
   await orchestrator.restore();
-  return createAgentHttpServer({
+  const server = createAgentHttpServer({
     orchestrator,
     token,
     acceptRuns: () => integrityHealthy,
@@ -240,6 +290,15 @@ export async function createProductionServer() {
       errors: integrityHealthy ? [] : [...lock.errors, ...skillLock.errors],
     }),
   });
+  const cleanupInterval = setInterval(
+    () => void orchestrator.cleanupExpiredSessions().catch(() => {
+      logEvent("agent_session_expiry_failed", { error_code: "cleanup_failed" });
+    }),
+    positiveInteger(process.env.PI_AGENT_EXPIRY_SWEEP_MS, 15 * 60_000),
+  );
+  cleanupInterval.unref();
+  server.once("close", () => clearInterval(cleanupInterval));
+  return server;
 }
 
 async function inspectImageDigest(image: string): Promise<string> {
@@ -294,6 +353,11 @@ function asRecord(value: unknown): Record<string, unknown> {
 function requiredString(value: unknown, name: string): string {
   if (typeof value !== "string" || !value.trim()) throw new RuntimeError(`${name} is required`, "invalid_request", 400);
   return value.trim();
+}
+function optionalString(value: unknown, name: string): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "string") throw new RuntimeError(`${name} must be a string`, "invalid_request", 400);
+  return value.trim() || undefined;
 }
 function sendJson(response: ServerResponse, status: number, payload: unknown): void {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });

@@ -14,6 +14,14 @@ export interface PersistedSession {
   closed: boolean;
   lastActivity: number;
   activeRunId?: string;
+  piSessionId?: string;
+  piSessionFile?: string;
+  piLeafId?: string | null;
+  parentSessionId?: string;
+  forkSourceRunId?: string;
+  needsAttention?: boolean;
+  activeCheckpointRunId?: string;
+  cleanupPending?: boolean;
 }
 
 export interface RuntimeState {
@@ -69,7 +77,7 @@ export class RuntimeStateStore {
 
   async save(state: RuntimeState): Promise<void> {
     const snapshot = JSON.stringify(state, null, 2);
-    this.writeChain = this.writeChain.then(async () => {
+    this.writeChain = this.writeChain.catch(() => undefined).then(async () => {
       await mkdir(path.dirname(this.filePath), { recursive: true });
       const temporary = `${this.filePath}.tmp`;
       await writeFile(temporary, snapshot, { encoding: "utf8", mode: 0o600 });
