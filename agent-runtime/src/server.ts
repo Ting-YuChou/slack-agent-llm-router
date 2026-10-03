@@ -139,7 +139,7 @@ export async function createProductionServer() {
   const repoPath = path.resolve(process.env.PI_AGENT_REPO_PATH ?? process.cwd());
   const runtimeRoot = path.resolve(process.env.PI_AGENT_STATE_ROOT ?? path.join(repoPath, ".pi-agent-runtime"));
   const worktreeRoot = path.resolve(process.env.PI_AGENT_WORKTREE_ROOT ?? path.join(repoPath, ".pi-agent-worktrees"));
-  const image = process.env.PI_AGENT_IMAGE ?? "slack-pi-agent:0.83.0";
+  const image = process.env.PI_AGENT_IMAGE ?? "slack-pi-agent:1.0.1";
   const network = process.env.PI_AGENT_NETWORK ?? "pi-model-only";
   const gatewayUrl = process.env.PI_MODEL_GATEWAY_URL ?? "http://model-gateway:8080";
   const configuredProviders = new Set(
@@ -232,7 +232,7 @@ export async function createProductionServer() {
     health: () => ({
       status: integrityHealthy ? "healthy" : "unhealthy",
       runtime: "pi-coding-agent",
-      version: "0.83.0",
+      version: "1.0.1",
       provider: "openai",
       model: AGENT_MODEL_ID,
       reasoning_effort: AGENT_REASONING_EFFORT,

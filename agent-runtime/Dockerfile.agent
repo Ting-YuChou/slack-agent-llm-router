@@ -13,7 +13,6 @@ COPY skills.lock.json ./skills.lock.json
 COPY skills ./skills
 RUN npm run build \
     && npm prune --omit=dev --ignore-scripts \
-    && npm run patch-vendored-deps \
     && npm audit --omit=dev --audit-level=high
 
 RUN groupadd --gid 10001 pi && useradd --uid 10001 --gid 10001 --no-create-home pi \
