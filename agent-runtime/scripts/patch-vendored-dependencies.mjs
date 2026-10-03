@@ -13,15 +13,15 @@ if (!piLockEntry) throw new Error("Pi package is missing from package-lock.json"
 const patches = [
   {
     name: "brace-expansion",
-    version: "5.0.9",
-    resolved: "https://registry.npmjs.org/brace-expansion/-/brace-expansion-5.0.9.tgz",
-    integrity: "sha512-ScQ4IuvIEF1TMlP7Zt+vjJ//9zlPb2SDcxWxM3bk8s6t6GGdJ7KO1dCcTidOPJKePW30LE/2cT7wCyPho9/Wxg==",
+    version: "5.0.12",
+    resolved: "https://registry.npmjs.org/brace-expansion/-/brace-expansion-5.0.12.tgz",
+    integrity: "sha512-YovQ3rzhaLMIrDjNDMkNS01tea93qhEhG5xy8f6+R0l+dw3Ki+5sCoIoI942iuLZTHWogWktgwVDhU09iNEimQ==",
   },
   {
     name: "undici",
-    version: "8.10.0",
-    resolved: "https://registry.npmjs.org/undici/-/undici-8.10.0.tgz",
-    integrity: "sha512-HvltHd7avK13QIw/oLe4qoOLyoVSoafqJ2jYOrtMRBkbYT31eiBQ8O0ehRKZiEZCMEyLFQNIADpgCWC5fALvYQ==",
+    version: "8.11.2",
+    resolved: "https://registry.npmjs.org/undici/-/undici-8.11.2.tgz",
+    integrity: "sha512-u4UB2/IrKdU6lFxumHmmo1a3fCQO5tzQllRorfoRS63txhrB7xTpSn1PftwC4qEHkOaqP95fCWW4lJzwErwzhQ==",
   },
 ];
 
@@ -47,12 +47,13 @@ for (const patch of patches) {
   }
   const lockKey = `node_modules/@earendil-works/pi-coding-agent/node_modules/${patch.name}`;
   const lockEntry = lock.packages?.[lockKey];
-  if (!lockEntry) throw new Error(`Pi vendored ${patch.name} is missing from package-lock.json`);
-  Object.assign(lockEntry, {
-    version: patch.version,
-    resolved: patch.resolved,
-    integrity: patch.integrity,
-  });
+  if (lockEntry) {
+    Object.assign(lockEntry, {
+      version: patch.version,
+      resolved: patch.resolved,
+      integrity: patch.integrity,
+    });
+  }
   if (typeof piPackage.dependencies?.[patch.name] === "string") {
     piPackage.dependencies[patch.name] = patch.version;
     piLockEntry.dependencies[patch.name] = patch.version;
