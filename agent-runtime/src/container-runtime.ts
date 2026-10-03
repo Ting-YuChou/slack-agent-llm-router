@@ -4,6 +4,8 @@ import { promisify } from "node:util";
 import { PiRpcBridge, RpcProtocolError, type PublicRunEvent } from "./pi-rpc.js";
 import type { AgentProcess } from "./orchestrator.js";
 import { resolveAgentModel } from "./agent-model.js";
+import type { AgentReasoningEffort } from "./agent-model.js";
+import type { RouteDecision } from "./jev-router.js";
 
 export interface AgentContainerOptions {
   name: string;
@@ -15,6 +17,7 @@ export interface AgentContainerOptions {
   gatewayUrl: string;
   gatewayToken: string;
   modelRef: string;
+  reasoningEffort?: AgentReasoningEffort;
   extensionPaths: string[];
   pluginPaths: string[];
   skillPaths: string[];
@@ -59,7 +62,7 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     "--mode", "rpc",
     "--provider", model.provider,
     "--model", model.id,
-    "--thinking", model.reasoningEffort,
+    "--thinking", options.reasoningEffort ?? model.reasoningEffort,
     "--session-dir", "/var/lib/pi-session",
     "--approve",
     "--no-extensions",
@@ -82,12 +85,12 @@ export class DockerPiProcess implements AgentProcess {
   private activeContainerName?: string;
   private stopping?: Promise<void>;
   private readonly options: Omit<AgentContainerOptions, "gatewayToken">;
-  private readonly tokenForRun: (runId: string) => string;
+  private readonly tokenForRun: (runId: string, route: RouteDecision) => string;
   private readonly onEvent: (event: PublicRunEvent) => void;
 
   constructor(
     options: Omit<AgentContainerOptions, "gatewayToken">,
-    tokenForRun: (runId: string) => string,
+    tokenForRun: (runId: string, route: RouteDecision) => string,
     onEvent: (event: PublicRunEvent) => void,
   ) {
     this.options = options;
@@ -96,7 +99,7 @@ export class DockerPiProcess implements AgentProcess {
     this.hasSession = options.continueSession ?? false;
   }
 
-  private start(runId: string): void {
+  private start(runId: string, route: RouteDecision): void {
     if (this.child && this.child.exitCode === null) throw new Error("Pi container is already active");
     this.closing = false;
     const containerName = `${this.options.name}-${runId.slice(0, 8)}`;
@@ -104,7 +107,9 @@ export class DockerPiProcess implements AgentProcess {
     const child = spawn("docker", buildAgentDockerArgs({
       ...this.options,
       name: containerName,
-      gatewayToken: this.tokenForRun(runId),
+      modelRef: route.modelRef,
+      reasoningEffort: route.effort,
+      gatewayToken: this.tokenForRun(runId, route),
       continueSession: this.hasSession,
     }), {
       stdio: ["pipe", "pipe", "pipe"],
@@ -142,20 +147,32 @@ export class DockerPiProcess implements AgentProcess {
         child.kill("SIGTERM");
       }
     });
-    child.on("error", () => this.onEvent({ type: "error", code: "container_start_failed", message: "Agent container could not start" }));
+    child.on("error", () => {
+      bridge.failPending();
+      this.onEvent({ type: "error", code: "container_start_failed", message: "Agent container could not start" });
+    });
     child.on("exit", (code) => {
+      bridge.failPending();
       if (this.child === child) this.activeContainerName = undefined;
       if (!this.closing && code !== 0) this.onEvent({ type: "error", code: "container_exited", message: "Agent container exited unexpectedly" });
     });
     child.stderr.resume();
   }
 
-  prompt(runId: string, prompt: string): void {
+  prompt(runId: string, prompt: string, route?: RouteDecision): void {
+    const selected = route ?? { modelRef: this.options.modelRef, effort: resolveAgentModel(this.options.modelRef).reasoningEffort, source: "explicit" };
+    const startPrompt = () => {
+      this.start(runId, selected);
+      const model = resolveAgentModel(selected.modelRef);
+      void this.bridge!.configureAndPrompt(runId, prompt, model.provider, model.id, selected.effort).catch(() => {
+        this.onEvent({ type: "error", code: "pi_configuration_failed", message: "Pi model configuration could not be verified" });
+        void this.stopActiveContainer();
+      });
+    };
     if (this.child && this.child.exitCode === null) {
       const previous = this.child;
       previous.once("exit", () => {
-        this.start(runId);
-        this.bridge!.prompt(runId, prompt);
+        startPrompt();
       });
       if (!this.closing) {
         this.closing = true;
@@ -163,8 +180,7 @@ export class DockerPiProcess implements AgentProcess {
       }
       return;
     }
-    this.start(runId);
-    this.bridge!.prompt(runId, prompt);
+    startPrompt();
   }
   decide(rpcUiId: string, approved: boolean): void { this.bridge?.respondToUi(rpcUiId, approved); }
   async abort(runId: string): Promise<void> {

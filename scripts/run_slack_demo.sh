@@ -162,7 +162,7 @@ if [[ "${agent_ready}" != true ]]; then
   exit 1
 fi
 
-env -u ANTHROPIC_API_KEY -u OPENCODE_API_KEY \
+env -u ANTHROPIC_API_KEY -u OPENCODE_API_KEY -u OPENROUTER_API_KEY \
   "${PYTHON:-python}" main.py start-workers --config config/config.demo.yaml &
 worker_pid=$!
 if wait "${worker_pid}"; then worker_status=0; else worker_status=$?; fi

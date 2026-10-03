@@ -85,7 +85,9 @@ def build_agent_shortcut_modal(nonce: str, model_refs: List[str]) -> Dict[str, A
                         "text": (
                             "Selected thread content is read-only reference data and "
                             "will be sent to the selected model provider. Agent tool "
-                            "approvals and workspace policy still apply."
+                            "approvals and workspace policy still apply. When Jev "
+                            "routing is enabled, only your task text is also sent "
+                            "to OpenRouter for model selection."
                         ),
                     }
                 ],

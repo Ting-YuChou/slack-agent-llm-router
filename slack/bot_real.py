@@ -789,6 +789,7 @@ class SlackMessageHandler:
     ) -> Optional[str]:
         """Handle incoming message"""
         text = event.get("text", "").strip()
+        routing_text = text
         user_id = event.get("user")
         channel_id = event.get("channel")
         thread_ts = event.get("thread_ts") or event.get("ts")
@@ -827,6 +828,7 @@ class SlackMessageHandler:
                 client,
                 team_id=team_id,
                 thread_ts=event.get("thread_ts"),
+                routing_text=routing_text,
             )
 
         # Regular query - process through inference engine
@@ -1085,6 +1087,7 @@ class SlackMessageHandler:
             team_id=team_id,
             thread_ts=thread_ts,
             model=model,
+            routing_text=task,
         )
         if bootstrap.error:
             response += (
@@ -1103,6 +1106,7 @@ class SlackMessageHandler:
         team_id: Optional[str],
         thread_ts: Optional[str],
         model: Optional[str] = None,
+        routing_text: Optional[str] = None,
     ) -> str:
         runtime = getattr(self.bot, "agent_runtime_client", None)
         if runtime is None:
@@ -1128,10 +1132,12 @@ class SlackMessageHandler:
                 user_id,
                 task,
             )
+            create_kwargs = {}
             if model:
-                result = await runtime.create_session(*create_args, model=model)
-            else:
-                result = await runtime.create_session(*create_args)
+                create_kwargs["model"] = model
+            if routing_text:
+                create_kwargs["routing_text"] = routing_text
+            result = await runtime.create_session(*create_args, **create_kwargs)
         except AgentRuntimeBusy:
             message = (
                 "Agent mode is busy right now. Chat mode was not used as fallback."
@@ -3258,6 +3264,7 @@ class SlackBot:
             team_id=nonce.team_id,
             thread_ts=nonce.thread_ts,
             model=submission.model,
+            routing_text=submission.task,
         )
         details = []
         if submission.include_context:

@@ -1,5 +1,6 @@
 export type PublicRunEvent =
   | { type: "turn" }
+  | { type: "usage"; cost_usd: number }
   | { type: "tool"; phase: "start" | "end"; tool_call_id: string; tool: string; input?: Record<string, unknown>; is_error?: boolean }
   | { type: "approval"; approval_id: string; title: string; detail: string; timeout_ms?: number }
   | { type: "answer"; text: string }
@@ -103,6 +104,8 @@ export class PiRpcBridge {
   private readonly decoder = new RpcJsonlDecoder();
   private readonly writeLine: (line: string) => void;
   private readonly onEvent: (event: PublicRunEvent) => void;
+  private readonly pending = new Map<string, { command: string; resolve: (response: Record<string, unknown>) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  private sequence = 0;
 
   constructor(options: { writeLine: (line: string) => void; onEvent: (event: PublicRunEvent) => void }) {
     this.writeLine = options.writeLine;
@@ -111,6 +114,23 @@ export class PiRpcBridge {
 
   feed(chunk: Buffer | string): void {
     for (const record of this.decoder.push(chunk)) {
+      if (record.type === "message_end" && isRecord(record.message)) {
+        const usage = isRecord(record.message.usage) ? record.message.usage : {};
+        const cost = isRecord(usage.cost) ? usage.cost : {};
+        if (record.message.role === "assistant" && typeof cost.total === "number" && Number.isFinite(cost.total) && cost.total >= 0) {
+          this.onEvent({ type: "usage", cost_usd: cost.total });
+        }
+      }
+      if (record.type === "response" && typeof record.id === "string") {
+        const pending = this.pending.get(record.id);
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pending.delete(record.id);
+          if (record.command !== pending.command || record.success !== true) pending.reject(new RpcProtocolError(`Pi RPC ${pending.command} failed`));
+          else pending.resolve(record);
+          continue;
+        }
+      }
       const event = sanitizeRpcEvent(record);
       if (event) this.onEvent(event);
     }
@@ -118,6 +138,38 @@ export class PiRpcBridge {
 
   prompt(id: string, message: string): void {
     this.send({ id, type: "prompt", message });
+  }
+
+  async configureAndPrompt(id: string, message: string, provider: string, model: string, effort: string): Promise<void> {
+    await this.command("set_model", { provider, modelId: model });
+    await this.command("set_thinking_level", { level: effort });
+    const state = await this.command("get_state", {});
+    const data = isRecord(state.data) ? state.data : {};
+    const activeModel = isRecord(data.model) ? data.model : {};
+    if (activeModel.provider !== provider || activeModel.id !== model || data.thinkingLevel !== effort) {
+      throw new RpcProtocolError("Pi state mismatch after model configuration");
+    }
+    this.prompt(id, message);
+  }
+
+  failPending(): void {
+    for (const [id, pending] of this.pending) {
+      clearTimeout(pending.timer);
+      pending.reject(new RpcProtocolError(`Pi RPC ${pending.command} interrupted`));
+      this.pending.delete(id);
+    }
+  }
+
+  private command(type: string, fields: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const id = `route-${++this.sequence}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new RpcProtocolError(`Pi RPC ${type} timed out`));
+      }, 5_000);
+      this.pending.set(id, { command: type, resolve, reject, timer });
+      this.send({ id, type, ...fields });
+    });
   }
 
   respondToUi(id: string, approved: boolean): void {

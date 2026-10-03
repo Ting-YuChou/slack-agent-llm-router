@@ -74,6 +74,21 @@ async def test_create_session_can_select_an_allowlisted_agent_model(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_create_session_sends_routing_text_separately_from_full_prompt(monkeypatch):
+    captured = {}
+
+    def handler(request):
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(202, json={"session_id": "S1", "run_id": "R1", "status": "starting"})
+
+    runtime = client(handler, monkeypatch)
+    await runtime.create_session("T1", "C1", "1.0", "U1", "context plus task", routing_text="fix the test")
+    await runtime.close()
+    assert captured["body"]["prompt"] == "context plus task"
+    assert captured["body"]["routing_text"] == "fix the test"
+
+
+@pytest.mark.asyncio
 async def test_health_details_reports_provider_readiness(monkeypatch):
     payload = {
         "status": "healthy",

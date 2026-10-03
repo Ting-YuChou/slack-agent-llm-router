@@ -35,3 +35,10 @@ test("gateway refuses token claims outside the allowlisted model registry", () =
   }, "secret");
   assert.equal(verifyGatewayToken(token, "secret", 1_000), null);
 });
+
+test("gateway accepts Sol high and rejects low effort for an unsupported provider", () => {
+  const sol = issueGatewayToken({ runId: "r", provider: "openai", model: "gpt-5.6-sol", api: "openai-responses", reasoningEffort: "high", expiresAt: 2000 } as any, "secret");
+  const anthropic = issueGatewayToken({ runId: "r", provider: "anthropic", model: "claude-sonnet-4-6", api: "anthropic-messages", reasoningEffort: "low", expiresAt: 2000 } as any, "secret");
+  assert.equal(verifyGatewayToken(sol, "secret", 1000)?.reasoningEffort, "high");
+  assert.equal(verifyGatewayToken(anthropic, "secret", 1000), null);
+});

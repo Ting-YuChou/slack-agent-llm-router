@@ -58,3 +58,15 @@ test("agent container is non-root, resource-limited, read-only, and internal-net
   assert.match(hostUserArgs.join(" "), /OPENCODE_API_KEY=short-token/);
   assert.match(hostUserArgs.join(" "), /--provider opencode-go --model deepseek-v4-pro --thinking max/);
 });
+
+test("selected Sol run starts Pi with Sol high while retaining the internal gateway", () => {
+  const args = buildAgentDockerArgs({
+    name: "pi-sol", image: "pi-agent:0.83.0", network: "pi-model-only",
+    worktreePath: "/worktree", gitMetadataPath: "/repo/.git", sessionStatePath: "/state",
+    gatewayUrl: "http://model-gateway:8080", gatewayToken: "run-token",
+    modelRef: "openai/gpt-5.6-sol", reasoningEffort: "high",
+    extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
+  } as any);
+  assert.match(args.join(" "), /--provider openai --model gpt-5\.6-sol --thinking high/);
+  assert.match(args.join(" "), /OPENAI_API_KEY=run-token/);
+});

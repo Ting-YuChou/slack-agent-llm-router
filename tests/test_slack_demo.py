@@ -108,9 +108,9 @@ def test_demo_runner_starts_agent_sidecar_then_worker_runtime(tmp_path):
     fake_python = tmp_path / "python"
     fake_python.write_text(
         "#!/usr/bin/env bash\n"
-        "printf 'agent-keys:%s:%s openai:%s\\n' "
+        "printf 'agent-keys:%s:%s openai:%s openrouter:%s\\n' "
         '"${ANTHROPIC_API_KEY-unset}" "${OPENCODE_API_KEY-unset}" '
-        '"${OPENAI_API_KEY-unset}"\n'
+        '"${OPENAI_API_KEY-unset}" "${OPENROUTER_API_KEY-unset}"\n'
         "printf '%s\\n' \"$*\"\n",
         encoding="utf-8",
     )
@@ -122,6 +122,7 @@ if [[ "${1:-}" == "--version" ]]; then
   printf 'v22.22.3\\n'
 else
   printf 'agent-runtime node\\n'
+  printf 'openrouter:%s\\n' "${OPENROUTER_API_KEY:+present}"
 fi
 """,
         encoding="utf-8",
@@ -148,6 +149,7 @@ fi
         "OPENAI_API_KEY": "test-openai",
         "ANTHROPIC_API_KEY": "test-anthropic",
         "OPENCODE_API_KEY": "test-opencode",
+        "OPENROUTER_API_KEY": "test-openrouter",
         "SLACK_BOT_TOKEN": "xoxb-test",
         "SLACK_APP_TOKEN": "xapp-test",
         "AGENT_RUNTIME_TOKEN": "runtime-test",
@@ -166,7 +168,8 @@ fi
     assert result.returncode == 0, result.stderr
     assert "npm --prefix" in result.stdout
     assert "agent-runtime node" in result.stdout
-    assert "agent-keys:unset:unset openai:test-openai" in result.stdout
+    assert "openrouter:present" in result.stdout
+    assert "agent-keys:unset:unset openai:test-openai openrouter:unset" in result.stdout
     assert result.stdout.strip().endswith(
         "main.py start-workers --config config/config.demo.yaml"
     )

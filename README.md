@@ -336,7 +336,11 @@ cp config/demo.env.example .env.demo
 
 Fill in `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`, and `SLACK_APP_TOKEN`. Add
 `ANTHROPIC_API_KEY` or `OPENCODE_API_KEY` only when you want those optional
-Agent providers, then start the demo:
+Agent providers. Jev routing is off by default. To collect routing decisions
+without changing the selected model, set `OPENROUTER_API_KEY` and
+`PI_AGENT_JEV_MODE=shadow`; use `on` only after the evaluation below.
+The OpenRouter key stays in the host Agent Runtime and is removed from the
+Slack worker environment. Then start the demo:
 
 ```bash
 make demo-slack
@@ -362,16 +366,29 @@ Try these two paths:
   configured Agent model, and include a bounded snapshot of that thread.
 - `/llm agent --no-thread-context <task>` explicitly starts without loading
   previous Slack thread messages.
-- `/llm agent --model anthropic/claude-sonnet-4-6 找出測試問題` — creates a
-  session bound to Anthropic. The other explicit choices are
-  `openai/gpt-5.6-luna` and `opencode-go/deepseek-v4-pro`. A thread cannot
-  switch models after its session is created.
+- `/llm agent --model openai/gpt-5.6-sol 找出測試問題` — creates a session fixed
+  to Sol at `max` effort. Other explicit choices are `openai/gpt-5.6-luna`,
+  `anthropic/claude-sonnet-4-6`, and `opencode-go/deepseek-v4-pro`.
+  Explicit-model sessions stay fixed. Automatic sessions can choose Luna or
+  Sol again for each follow-up run.
 - `/llm agent /skill:test-gap 找出一個測試缺口並修正` — explicitly invokes
   the bundled `test-gap` Skill. Pi may also select it from its description and
   read that exact immutable `SKILL.md` automatically.
 - Reply normally inside that bot thread to continue the same Pi session.
 - `/llm agent status`, `/llm agent stop`, and `/llm agent close` inspect or
   control your latest session without consuming query quota.
+
+With Jev enabled, only the current task text (up to 4,000 characters) goes to
+OpenRouter. High-confidence read-only work uses Luna `low`, a small patch uses
+Luna `medium`, and complex work uses Sol `high`. Unclear, low-confidence, or
+failed classifications use Luna `max`. The full Slack bootstrap context goes
+only to Pi. Run records expose the decision, latency, selected model, and
+estimated cost without retaining routing text. Before enabling `on`, collect
+at least 50 `shadow` decisions and compare 20 tasks in each of the three
+categories against Luna `max` on isolated worktrees. Enable automatic routing
+only if eligible tasks finish at least 10% faster at the median with no quality
+regression; require the complex-task Sol group to improve separately. Confirm
+the OpenAI key can call Sol before that trial.
 
 Each new coding prompt counts as one Slack query; internal model turns and tools
 do not. A successful prompt is committed on its `pi-agent/...` branch and Slack

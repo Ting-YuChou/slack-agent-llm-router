@@ -8,6 +8,7 @@ export interface PersistedSession {
   key: string;
   ownerUserId: string;
   modelRef?: string;
+  autoRouting?: boolean;
   worktreePath: string;
   branch: string;
   baselineCommit: string;
