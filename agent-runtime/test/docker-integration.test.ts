@@ -80,7 +80,7 @@ http.createServer((req,res)=>{ let body=""; req.on("data",c=>body+=c); req.on("e
     piProcess = new DockerPiProcess(
       {
         name: `pi-integration-${suffix}`,
-        image: "slack-pi-agent:0.83.0",
+        image: "slack-pi-agent:1.0.1",
         network,
         worktreePath: isolated.path,
         gitMetadataPath: path.join(repo, ".git"),
@@ -119,6 +119,94 @@ http.createServer((req,res)=>{ let body=""; req.on("data",c=>body+=c); req.on("e
 
     assert.ok(
       events.some((event) => event.type === "answer" && /written by pi/i.test(event.text)),
+      JSON.stringify(events),
+    );
+    assert.ok(!events.some((event) => event.type === "error"), JSON.stringify(events));
+  } finally {
+    await piProcess?.close();
+    await command("docker", ["stop", gateway]).catch(() => "");
+    await command("docker", ["network", "rm", network]).catch(() => "");
+    await worktrees.remove(isolated.path).catch(() => undefined);
+  }
+});
+
+test("Pi 1.0.1 resumes a session persisted by Pi 0.83", { skip: !enabled, timeout: 60_000 }, async () => {
+  const suffix = Math.random().toString(16).slice(2, 10);
+  const network = `pi-legacy-${suffix}`;
+  const gateway = `model-gateway-legacy-${suffix}`;
+  const repo = await mkdtemp(path.join(tmpdir(), "pi-legacy-repo-"));
+  const worktreeRoot = await mkdtemp(path.join(tmpdir(), "pi-legacy-worktrees-"));
+  const sessionStatePath = await mkdtemp(path.join(tmpdir(), "pi-legacy-state-"));
+  await command("git", ["init", "-b", "main"], repo);
+  await writeFile(path.join(repo, "README.md"), "base\n");
+  await command("git", ["add", "README.md"], repo);
+  await command("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base"], repo);
+  const worktrees = new WorktreeManager({ repoPath: repo, worktreeRoot, baseRef: "HEAD" });
+  const isolated = await worktrees.create(`legacy-${suffix}`);
+  const fixture = await readFile(new URL("../../test/fixtures/pi-0.83-session.jsonl", import.meta.url), "utf8");
+  await writeFile(
+    path.join(sessionStatePath, "legacy-session.jsonl"),
+    fixture.replace("__WORKTREE__", isolated.path),
+  );
+  const hostUid = process.getuid?.();
+  const hostGid = process.getgid?.();
+  assert.notEqual(hostUid, undefined);
+  assert.notEqual(hostGid, undefined);
+  assert.notEqual(hostUid, 0, "integration test must run as a non-root host user");
+
+  const fakeGatewayScript = String.raw`
+const http = require("node:http");
+const usage = {input_tokens:1,output_tokens:1,total_tokens:2,input_tokens_details:{cached_tokens:0}};
+http.createServer((req,res)=>{ let body=""; req.on("data",c=>body+=c); req.on("end",()=>{
+  if(!body.includes("legacy-session-marker-083")){ res.writeHead(400); res.end("legacy session history was not restored"); return; }
+  const text="Restored legacy-session-marker-083.";
+  const item={type:"message",id:"msg_restored",role:"assistant",status:"completed",content:[{type:"output_text",text,annotations:[]}],phase:"final_answer"};
+  res.writeHead(200,{"content-type":"text/event-stream"});
+  for(const event of [
+    {type:"response.created",response:{id:"resp_restored"}},
+    {type:"response.output_item.added",output_index:0,item},
+    {type:"response.output_text.delta",output_index:0,content_index:0,delta:text},
+    {type:"response.output_item.done",output_index:0,item},
+    {type:"response.completed",response:{id:"resp_restored",status:"completed",output:[item],usage}}
+  ]) res.write("data: "+JSON.stringify(event)+"\n\n");
+  res.end("data: [DONE]\n\n");
+});}).listen(8080,"0.0.0.0");`;
+
+  let piProcess: DockerPiProcess | undefined;
+  try {
+    await command("docker", ["network", "create", "--internal", network]);
+    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", "node:22.22.0-bookworm-slim", "node", "-e", fakeGatewayScript]);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const events: PublicRunEvent[] = [];
+    let resolveSettled!: () => void;
+    const settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
+    piProcess = new DockerPiProcess(
+      {
+        name: `pi-legacy-${suffix}`,
+        image: "slack-pi-agent:1.0.1",
+        network,
+        worktreePath: isolated.path,
+        gitMetadataPath: path.join(repo, ".git"),
+        sessionStatePath,
+        gatewayUrl: "http://model-gateway:8080",
+        modelRef: "openai/gpt-5.6-luna",
+        extensionPaths: ["/opt/pi/extensions/model-gateway.ts"],
+        pluginPaths: [],
+        skillPaths: [],
+        toolNames: ["read"],
+        continueSession: true,
+        user: `${hostUid}:${hostGid}`,
+      },
+      () => "fake-run-token",
+      (event) => {
+        events.push(event);
+        if (event.type === "settled" || event.type === "error") resolveSettled();
+      },
+    );
+    piProcess.prompt("legacy-follow-up", "Repeat the marker from the previous turn.");
+    await settled;
+    assert.ok(
+      events.some((event) => event.type === "answer" && /legacy-session-marker-083/.test(event.text)),
       JSON.stringify(events),
     );
     assert.ok(!events.some((event) => event.type === "error"), JSON.stringify(events));

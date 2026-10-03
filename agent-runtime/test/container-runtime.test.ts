@@ -61,7 +61,7 @@ test("agent container is non-root, resource-limited, read-only, and internal-net
 
 test("selected Sol run starts Pi with Sol high while retaining the internal gateway", () => {
   const args = buildAgentDockerArgs({
-    name: "pi-sol", image: "pi-agent:0.83.0", network: "pi-model-only",
+    name: "pi-sol", image: "pi-agent:1.0.1", network: "pi-model-only",
     worktreePath: "/worktree", gitMetadataPath: "/repo/.git", sessionStatePath: "/state",
     gatewayUrl: "http://model-gateway:8080", gatewayToken: "run-token",
     modelRef: "openai/gpt-5.6-sol", reasoningEffort: "high",

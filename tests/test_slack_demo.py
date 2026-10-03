@@ -309,7 +309,7 @@ def test_demo_env_and_makefile_include_agent_setup():
     assert "demo-agent-install:" in makefile
     assert "npm --prefix agent-runtime ci --ignore-scripts" in makefile
     assert "demo-agent-images:" in makefile
-    assert "run lock-image -- slack-pi-agent:0.83.0" in makefile
+    assert "run lock-image -- slack-pi-agent:1.0.1" in makefile
 
 
 def test_demo_gateway_uses_the_hostname_required_by_agent_policy():
