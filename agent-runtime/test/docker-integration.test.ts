@@ -17,7 +17,7 @@ async function command(command: string, args: string[], cwd?: string): Promise<s
   return (await exec(command, args, { cwd, encoding: "utf8" })).stdout.trim();
 }
 
-test("real Pi expands an allowlisted skill, requests approval, and writes only in the isolated worktree", { skip: !enabled, timeout: 60_000 }, async () => {
+test("real Pi preserves its session while switching from Luna max to Sol high", { skip: !enabled, timeout: 60_000 }, async () => {
   const suffix = Math.random().toString(16).slice(2, 10);
   const network = `pi-integration-${suffix}`;
   const gateway = `model-gateway-${suffix}`;
@@ -42,9 +42,13 @@ const usage = {input_tokens:1,output_tokens:1,total_tokens:2,input_tokens_detail
 function send(res, events) { res.writeHead(200,{"content-type":"text/event-stream"}); for(const e of events) res.write("data: "+JSON.stringify(e)+"\n\n"); res.end("data: [DONE]\n\n"); }
 http.createServer((req,res)=>{ let body=""; req.on("data",c=>body+=c); req.on("end",()=>{
   const request = JSON.parse(body);
-  if(request.model!=="gpt-5.6-luna" || request.reasoning?.effort!=="max"){
-    res.writeHead(400); res.end("expected gpt-5.6-luna with max reasoning"); return;
+  const expected = call < 2
+    ? {model:"gpt-5.6-luna",effort:"max"}
+    : {model:"gpt-5.6-sol",effort:"high"};
+  if(request.model!==expected.model || request.reasoning?.effort!==expected.effort){
+    res.writeHead(400); res.end("unexpected model or reasoning effort"); return;
   }
+  if(call >= 2 && !body.includes("written by pi")){ res.writeHead(400); res.end("session history was not restored"); return; }
   call++;
   if(call===1){
     if(!body.includes("Close one concrete coverage gap")){ res.writeHead(400); res.end("skill was not expanded"); return; }
@@ -55,10 +59,11 @@ http.createServer((req,res)=>{ let body=""; req.on("data",c=>body+=c); req.on("e
     {type:"response.output_item.done",output_index:0,item},
     {type:"response.completed",response:{id:"resp_1",status:"completed",output:[item],usage}}
   ]); return; }
-  const item={type:"message",id:"msg_1",role:"assistant",status:"completed",content:[{type:"output_text",text:"Implemented the requested file.",annotations:[]}],phase:"final_answer"}; send(res,[
+  const text=call===2 ? "Implemented the requested file." : "agent.txt contains written by pi.";
+  const item={type:"message",id:"msg_1",role:"assistant",status:"completed",content:[{type:"output_text",text,annotations:[]}],phase:"final_answer"}; send(res,[
     {type:"response.created",response:{id:"resp_2"}},
     {type:"response.output_item.added",output_index:0,item},
-    {type:"response.output_text.delta",output_index:0,content_index:0,delta:"Implemented the requested file."},
+    {type:"response.output_text.delta",output_index:0,content_index:0,delta:text},
     {type:"response.output_item.done",output_index:0,item},
     {type:"response.completed",response:{id:"resp_2",status:"completed",output:[item],usage}}
   ]);
@@ -71,7 +76,7 @@ http.createServer((req,res)=>{ let body=""; req.on("data",c=>body+=c); req.on("e
     await new Promise((resolve) => setTimeout(resolve, 500));
     const events: PublicRunEvent[] = [];
     let resolveSettled!: () => void;
-    const settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
+    let settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
     piProcess = new DockerPiProcess(
       {
         name: `pi-integration-${suffix}`,
@@ -103,6 +108,20 @@ http.createServer((req,res)=>{ let body=""; req.on("data",c=>body+=c); req.on("e
     assert.ok(events.some((event) => event.type === "approval"));
     assert.ok(events.some((event) => event.type === "tool" && event.tool === "write"));
     assert.doesNotMatch(JSON.stringify(events), /thinking|chain.of.thought/i);
+
+    settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
+    piProcess.prompt("run-2", "Read agent.txt and confirm its content.", {
+      modelRef: "openai/gpt-5.6-sol",
+      effort: "high",
+      source: "jev",
+    });
+    await settled;
+
+    assert.ok(
+      events.some((event) => event.type === "answer" && /written by pi/i.test(event.text)),
+      JSON.stringify(events),
+    );
+    assert.ok(!events.some((event) => event.type === "error"), JSON.stringify(events));
   } finally {
     await piProcess?.close();
     await command("docker", ["stop", gateway]).catch(() => "");

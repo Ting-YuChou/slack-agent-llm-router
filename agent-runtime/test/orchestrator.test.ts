@@ -6,17 +6,17 @@ import { CodingAgentOrchestrator, RuntimeConflictError, RuntimeForbiddenError } 
 
 class FakeProcess {
   handler: (event: PublicRunEvent) => void = () => undefined;
-  prompts: Array<{ runId: string; prompt: string }> = [];
+  prompts: Array<{ runId: string; prompt: string; route?: { modelRef: string; effort: string } }> = [];
   decisions: Array<{ id: string; approved: boolean }> = [];
   aborted: string[] = [];
-  prompt(runId: string, prompt: string) { this.prompts.push({ runId, prompt }); }
+  prompt(runId: string, prompt: string, route?: { modelRef: string; effort: string }) { this.prompts.push({ runId, prompt, route }); }
   decide(id: string, approved: boolean) { this.decisions.push({ id, approved }); }
   async abort(runId: string) { this.aborted.push(runId); }
   async close() {}
   emit(event: PublicRunEvent) { this.handler(event); }
 }
 
-function fixture() {
+function fixture(router?: { route(text?: string): Promise<any> }) {
   const process = new FakeProcess();
   const calls = {
     rollback: [] as string[],
@@ -33,16 +33,61 @@ function fixture() {
   };
   const orchestrator = new CodingAgentOrchestrator({
     worktrees,
-    startProcess: async (session, onEvent) => {
+    startProcess: async (session: { modelRef: string }, onEvent: (event: PublicRunEvent) => void) => {
       calls.startedModels.push(session.modelRef);
       process.handler = onEvent;
       return process;
     },
     maxActiveSessions: 2,
     deadlineMs: 10_000,
-  });
+    router,
+  } as any);
   return { orchestrator, process, calls };
 }
+
+test("automatic session selects Sol for a complex run and Luna for its follow-up", async () => {
+  const decisions = [
+    { modelRef: "openai/gpt-5.6-sol", effort: "high", source: "jev", label: "complex" },
+    { modelRef: "openai/gpt-5.6-luna", effort: "low", source: "jev", label: "read_only" },
+  ];
+  const { orchestrator, process } = fixture({ route: async () => decisions.shift()! });
+  const first = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "route", user_id: "U", prompt: "full context", routing_text: "refactor everything" } as any);
+  assert.equal(orchestrator.getRun(first.run_id).model, "gpt-5.6-sol");
+  assert.equal(process.prompts[0].route?.effort, "high");
+  process.emit({ type: "usage", cost_usd: 0.42 });
+  assert.equal(orchestrator.getRun(first.run_id).estimated_cost_usd, 0.42);
+  process.emit({ type: "settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = await (orchestrator as any).prompt(first.session_id, "inspect result", "U", "inspect result");
+  assert.equal(orchestrator.getRun(second.run_id).model, "gpt-5.6-luna");
+  assert.equal(process.prompts[1].route?.effort, "low");
+});
+
+test("explicit Sol session ignores Jev and keeps Sol max on follow-up", async () => {
+  let calls = 0;
+  const { orchestrator, process } = fixture({ route: async () => { calls++; throw new Error("should not classify"); } });
+  const first = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "manual-sol", user_id: "U", prompt: "fix", model: "openai/gpt-5.6-sol", routing_text: "fix" } as any);
+  assert.equal(process.prompts[0].route?.effort, "max");
+  process.emit({ type: "settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+  await (orchestrator as any).prompt(first.session_id, "continue", "U", "continue");
+  assert.equal(process.prompts[1].route?.modelRef, "openai/gpt-5.6-sol");
+  assert.equal(calls, 0);
+});
+
+test("session API rejects non-string routing text", async () => {
+  const { orchestrator } = fixture();
+  await assert.rejects(orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "bad-route", user_id: "U", prompt: "fix", routing_text: { secret: "value" } } as any),
+    (error: unknown) => (error as { statusCode?: number }).statusCode === 400);
+});
+
+test("a Jev client failure cannot prevent the default Luna run", async () => {
+  const { orchestrator } = fixture({ route: async () => { throw new Error("Jev unavailable"); } });
+  const result = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "fallback", user_id: "U", prompt: "inspect", routing_text: "inspect" });
+  const run = orchestrator.getRun(result.run_id);
+  assert.equal(run.model, "gpt-5.6-luna");
+  assert.equal(run.reasoning_effort, "max");
+});
 
 test("a new session binds its allowlisted model and the same thread cannot switch providers", async () => {
   const { orchestrator, process, calls } = fixture();
@@ -260,6 +305,89 @@ test("restore rolls back the latest interrupted prompt before starting Pi", asyn
   });
   await orchestrator.restore();
   assert.deepEqual(order, ["rollback:base", "start"]);
+});
+
+test("legacy restored sessions stay fixed at their saved model and max effort", async () => {
+  const process = new FakeProcess();
+  const state = {
+    schema_version: 1 as const,
+    sessions: [{ id: "legacy", key: "T:C:legacy", ownerUserId: "U", modelRef: "openai/gpt-5.6-sol", worktreePath: "/managed/w", branch: "b", baselineCommit: "base", closed: false, lastActivity: Date.now() }],
+    runs: [],
+  };
+  const orchestrator = new CodingAgentOrchestrator({
+    worktrees: {
+      create: async () => ({ path: "", branch: "", baselineCommit: "" }),
+      inspectDiff: async () => ({ files: [], bytes: 0, stat: "" }),
+      commit: async () => "",
+      rollback: async () => undefined,
+      remove: async () => undefined,
+    },
+    stateStore: { load: async () => state, save: async () => undefined, takeExpiredSessions: () => [] } as any,
+    router: { route: async () => ({ modelRef: "openai/gpt-5.6-luna", effort: "low", source: "jev" }) },
+    startProcess: async (_session, onEvent) => { process.handler = onEvent; return process; },
+  });
+  await orchestrator.restore();
+  await orchestrator.prompt("legacy", "continue", "U", "inspect only");
+  assert.deepEqual(process.prompts[0]?.route, { modelRef: "openai/gpt-5.6-sol", effort: "max", source: "explicit" });
+});
+
+test("restored automatic sessions reroute each follow-up", async () => {
+  const process = new FakeProcess();
+  const state = {
+    schema_version: 1 as const,
+    sessions: [{ id: "auto", key: "T:C:auto", ownerUserId: "U", modelRef: "openai/gpt-5.6-sol", autoRouting: true, worktreePath: "/managed/w", branch: "b", baselineCommit: "base", closed: false, lastActivity: Date.now() }],
+    runs: [],
+  };
+  const orchestrator = new CodingAgentOrchestrator({
+    worktrees: {
+      create: async () => ({ path: "", branch: "", baselineCommit: "" }),
+      inspectDiff: async () => ({ files: [], bytes: 0, stat: "" }),
+      commit: async () => "",
+      rollback: async () => undefined,
+      remove: async () => undefined,
+    },
+    stateStore: { load: async () => state, save: async () => undefined, takeExpiredSessions: () => [] } as any,
+    router: { route: async () => ({ modelRef: "openai/gpt-5.6-luna", effort: "low", source: "jev" }) },
+    startProcess: async (_session, onEvent) => { process.handler = onEvent; return process; },
+  });
+  await orchestrator.restore();
+  await orchestrator.prompt("auto", "continue", "U", "inspect only");
+  assert.deepEqual(process.prompts[0]?.route, { modelRef: "openai/gpt-5.6-luna", effort: "low", source: "jev" });
+});
+
+test("session close is rejected while a routed follow-up is pending", async () => {
+  let releaseRoute!: (decision: any) => void;
+  let routeCalls = 0;
+  const { orchestrator, process } = fixture({ route: async () => {
+    routeCalls += 1;
+    if (routeCalls === 1) return { modelRef: "openai/gpt-5.6-luna", effort: "max", source: "fallback" };
+    return new Promise((resolve) => { releaseRoute = resolve; });
+  } });
+  const first = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "close-race", user_id: "U", prompt: "first", routing_text: "first" });
+  process.emit({ type: "settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const pendingPrompt = orchestrator.prompt(first.session_id, "follow up", "U", "follow up");
+  await new Promise((resolve) => setImmediate(resolve));
+  await assert.rejects(orchestrator.closeSession(first.session_id, "U"), RuntimeConflictError);
+  releaseRoute({ modelRef: "openai/gpt-5.6-sol", effort: "high", source: "jev" });
+  await pendingPrompt;
+});
+
+test("routed follow-up is rejected while session close is pending", async () => {
+  const { orchestrator, process } = fixture();
+  const first = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "prompt-race", user_id: "U", prompt: "first" });
+  process.emit({ type: "settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+  let releaseClose!: () => void;
+  const closeGate = new Promise<void>((resolve) => { releaseClose = resolve; });
+  process.close = async () => { await closeGate; };
+
+  const pendingClose = orchestrator.closeSession(first.session_id, "U");
+  await new Promise((resolve) => setImmediate(resolve));
+  await assert.rejects(orchestrator.prompt(first.session_id, "follow up", "U", "follow up"), RuntimeConflictError);
+  releaseClose();
+  await pendingClose;
 });
 
 test("parallel first prompts in the same Slack thread create only one session", async () => {

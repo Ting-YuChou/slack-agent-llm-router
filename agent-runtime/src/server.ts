@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 
 import { DockerPiProcess } from "./container-runtime.js";
 import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT, listAgentModels, resolveAgentModel } from "./agent-model.js";
+import { JevRouter, type JevMode } from "./jev-router.js";
 import { issueGatewayToken } from "./gateway-token.js";
 import {
   CodingAgentOrchestrator,
@@ -66,10 +67,14 @@ export function createAgentHttpServer(options: ServerOptions) {
       const promptMatch = /^\/v1\/sessions\/([^/]+)\/prompts$/.exec(url.pathname);
       if (request.method === "POST" && promptMatch) {
         const body = asRecord(await readJson(request));
+        if (body.routing_text !== undefined && typeof body.routing_text !== "string") {
+          throw new RuntimeError("routing_text must be a string", "invalid_request", 400);
+        }
         const result = await options.orchestrator.prompt(
           decodeURIComponent(promptMatch[1]),
           requiredString(body.prompt, "prompt"),
           requiredString(body.user_id, "user_id"),
+          typeof body.routing_text === "string" ? body.routing_text : undefined,
         );
         sendJson(response, 202, result);
         return;
@@ -144,6 +149,9 @@ export async function createProductionServer() {
       .filter(Boolean),
   );
   const configuredModels = listAgentModels().filter((model) => configuredProviders.has(model.provider));
+  const jevMode = process.env.PI_AGENT_JEV_MODE ?? "off";
+  if (!["off", "shadow", "on"].includes(jevMode)) throw new Error("PI_AGENT_JEV_MODE must be off, shadow, or on");
+  const router = new JevRouter({ mode: jevMode as JevMode, apiKey: process.env.OPENROUTER_API_KEY });
   if (configuredModels.length === 0) throw new Error("At least one Agent model provider must be configured");
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
@@ -178,6 +186,7 @@ export async function createProductionServer() {
     maxActiveSessions: positiveInteger(process.env.PI_AGENT_MAX_CONCURRENCY, 2),
     deadlineMs: positiveInteger(process.env.PI_AGENT_DEADLINE_MS, 15 * 60_000),
     availableModelRefs: configuredModels.map((model) => model.ref),
+    router,
     startProcess: async (session, onEvent) => {
       const model = resolveAgentModel(session.modelRef);
       const sessionStatePath = path.join(runtimeRoot, "sessions", session.id);
@@ -200,13 +209,14 @@ export async function createProductionServer() {
           safeCommands: parseSafeCommands(process.env.PI_AGENT_SAFE_COMMANDS),
           user: containerUser,
         },
-        (runId) => {
+        (runId, route) => {
+          const selectedModel = resolveAgentModel(route.modelRef);
           return issueGatewayToken({
             runId,
-            provider: model.provider,
-            model: model.id,
-            api: model.api,
-            reasoningEffort: model.reasoningEffort,
+            provider: selectedModel.provider,
+            model: selectedModel.id,
+            api: selectedModel.api,
+            reasoningEffort: route.effort,
             expiresAt: Date.now() + 16 * 60_000,
           }, gatewaySecret);
         },

@@ -14,6 +14,10 @@ test("gateway validates each request against the token-bound model and reasoning
 
   assert.equal(validateAgentModelRequest({ model: openai.id, reasoning: { effort: "max" } }, openai), true);
   assert.equal(validateAgentModelRequest({ model: openai.id, reasoning: { effort: "high" } }, openai), false);
+  const sol = resolveAgentModel("openai/gpt-5.6-sol");
+  assert.equal(validateAgentModelRequest({ model: sol.id, reasoning: { effort: "high" } }, sol, "high"), true);
+  assert.equal(validateAgentModelRequest({ model: openai.id, reasoning: { effort: "high" } }, sol, "high"), false);
+  assert.equal(validateAgentModelRequest({ model: sol.id, reasoning: { effort: "max" } }, sol, "high"), false);
   assert.equal(validateAgentModelRequest({ model: anthropic.id, output_config: { effort: "max" } }, anthropic), true);
   assert.equal(validateAgentModelRequest({ model: anthropic.id, output_config: { effort: "high" } }, anthropic), false);
   assert.equal(validateAgentModelRequest({
@@ -82,6 +86,54 @@ test("gateway routes only the token-bound provider path and injects that provide
     });
     assert.equal(wrongPath.status, 403);
     assert.equal(calls.length, 1);
+  } finally {
+    gateway.close();
+    await once(gateway, "close");
+  }
+});
+
+test("gateway accepts token-bound requests for both OpenAI models", async () => {
+  const signingSecret = "signing-secret";
+  const forwarded: Array<{ model: string; effort: string }> = [];
+  const gateway = createModelGateway({
+    signingSecret,
+    providerApiKeys: { openai: "real-openai" },
+    fetchFn: async (_input, init) => {
+      const body = JSON.parse(String(init?.body));
+      forwarded.push({ model: body.model, effort: body.reasoning.effort });
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  gateway.listen(0, "127.0.0.1");
+  await once(gateway, "listening");
+  const port = (gateway.address() as AddressInfo).port;
+  const cases = [
+    { ref: "openai/gpt-5.6-luna", effort: "max" as const },
+    { ref: "openai/gpt-5.6-sol", effort: "high" as const },
+  ];
+
+  try {
+    for (const item of cases) {
+      const model = resolveAgentModel(item.ref);
+      const token = issueGatewayToken({
+        runId: `run-${model.id}`,
+        provider: model.provider,
+        model: model.id,
+        api: model.api,
+        reasoningEffort: item.effort,
+        expiresAt: Date.now() + 60_000,
+      }, signingSecret);
+      const response = await fetch(`http://127.0.0.1:${port}${model.gatewayPath}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ model: model.id, reasoning: { effort: item.effort }, input: "test" }),
+      });
+      assert.equal(response.status, 200);
+    }
+    assert.deepEqual(forwarded, [
+      { model: "gpt-5.6-luna", effort: "max" },
+      { model: "gpt-5.6-sol", effort: "high" },
+    ]);
   } finally {
     gateway.close();
     await once(gateway, "close");

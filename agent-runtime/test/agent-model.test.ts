@@ -2,23 +2,33 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  buildGatewayProviderRegistrations,
   DEFAULT_AGENT_MODEL_REF,
   gatewayProviderConfig,
   listAgentModels,
   resolveAgentModel,
 } from "../src/agent-model.js";
 
-test("agent model registry exposes one allowlisted model for each supported provider", () => {
+test("Pi provider registrations contain both OpenAI models in one provider entry", () => {
+  const registrations = buildGatewayProviderRegistrations("http://model-gateway:8080");
+  const openai = registrations.filter((registration) => registration.provider === "openai");
+  assert.equal(openai.length, 1);
+  assert.deepEqual(openai[0]?.models.map((model) => model.id), ["gpt-5.6-luna", "gpt-5.6-sol"]);
+});
+
+test("agent model registry exposes Luna and Sol through the OpenAI provider", () => {
   const models = listAgentModels();
 
-  assert.deepEqual(models.map((model) => model.provider), ["openai", "anthropic", "opencode-go"]);
+  assert.deepEqual(models.map((model) => model.provider), ["openai", "openai", "anthropic", "opencode-go"]);
   assert.deepEqual(models.map((model) => model.ref), [
     "openai/gpt-5.6-luna",
+    "openai/gpt-5.6-sol",
     "anthropic/claude-sonnet-4-6",
     "opencode-go/deepseek-v4-pro",
   ]);
   assert.ok(models.every((model) => model.reasoningEffort === "max"));
   assert.ok(models.every((model) => model.gatewayPath.startsWith("/")));
+  assert.equal(resolveAgentModel("openai/gpt-5.6-sol").api, "openai-responses");
 });
 
 test("gateway provider configuration keeps each Pi adapter on its fixed internal path", () => {

@@ -1,6 +1,7 @@
 export type AgentProvider = "openai" | "anthropic" | "opencode-go";
 export type AgentModelApi = "openai-responses" | "anthropic-messages" | "openai-completions";
 export type AgentCredentialEnv = "OPENAI_API_KEY" | "ANTHROPIC_API_KEY" | "OPENCODE_API_KEY";
+export type AgentReasoningEffort = "low" | "medium" | "high" | "max";
 
 export interface AgentModelSpec {
   ref: string;
@@ -32,7 +33,27 @@ const MODELS: readonly AgentModelSpec[] = [
     upstreamUrl: "https://api.openai.com/v1/responses",
     reasoningEffort: "max",
     input: ["text", "image"],
-    cost: { input: 1, output: 6, cacheRead: 0.1, cacheWrite: 1.25 },
+    cost: { input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25 },
+    contextWindow: 1_050_000,
+    maxTokens: 128_000,
+    thinkingLevelMap: {
+      off: "none", minimal: null, low: "low", medium: "medium",
+      high: "high", xhigh: "xhigh", max: "max",
+    },
+    compat: { supportsStrictMode: true, supportsOpenAIGrammarTools: true },
+  },
+  {
+    ref: "openai/gpt-5.6-sol",
+    provider: "openai",
+    id: "gpt-5.6-sol",
+    name: "GPT-5.6 Sol",
+    api: "openai-responses",
+    credentialEnv: "OPENAI_API_KEY",
+    gatewayPath: "/openai/v1/responses",
+    upstreamUrl: "https://api.openai.com/v1/responses",
+    reasoningEffort: "max",
+    input: ["text", "image"],
+    cost: { input: 4, output: 20, cacheRead: 0.4, cacheWrite: 5 },
     contextWindow: 1_050_000,
     maxTokens: 128_000,
     thinkingLevelMap: {
@@ -97,6 +118,10 @@ export function resolveAgentModel(ref?: string): AgentModelSpec {
   return { ...model };
 }
 
+export function supportsAgentEffort(model: AgentModelSpec, effort: string): effort is AgentReasoningEffort {
+  return ["low", "medium", "high", "max"].includes(effort) && model.thinkingLevelMap[effort] === effort;
+}
+
 export function gatewayProviderConfig(baseUrl: string, ref: string): {
   provider: AgentProvider;
   api: AgentModelApi;
@@ -112,6 +137,25 @@ export function gatewayProviderConfig(baseUrl: string, ref: string): {
     apiKey: `$${model.credentialEnv}`,
     baseUrl: `${root}${suffix}`,
   };
+}
+
+export function buildGatewayProviderRegistrations(baseUrl: string): Array<{
+  provider: AgentProvider;
+  api: AgentModelApi;
+  apiKey: `$${AgentCredentialEnv}`;
+  baseUrl: string;
+  models: AgentModelSpec[];
+}> {
+  const grouped = new Map<AgentProvider, AgentModelSpec[]>();
+  for (const model of listAgentModels()) {
+    const models = grouped.get(model.provider) ?? [];
+    models.push(model);
+    grouped.set(model.provider, models);
+  }
+  return [...grouped.values()].map((models) => ({
+    ...gatewayProviderConfig(baseUrl, models[0].ref),
+    models,
+  }));
 }
 
 // Backward-compatible aliases for the current default model.

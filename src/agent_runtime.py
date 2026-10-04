@@ -104,6 +104,7 @@ class AgentRuntimeClient:
         prompt: str,
         *,
         model: Optional[str] = None,
+        routing_text: Optional[str] = None,
     ) -> Dict[str, Any]:
         payload = {
             "team_id": team_id,
@@ -114,6 +115,8 @@ class AgentRuntimeClient:
         }
         if model:
             payload["model"] = model
+        if routing_text is not None:
+            payload["routing_text"] = routing_text
         result = await self._request(
             "POST",
             "/v1/sessions",
@@ -150,12 +153,20 @@ class AgentRuntimeClient:
         return session if payload["found"] and isinstance(session, dict) else None
 
     async def prompt(
-        self, session_id: str, prompt: str, user_id: str
+        self,
+        session_id: str,
+        prompt: str,
+        user_id: str,
+        *,
+        routing_text: Optional[str] = None,
     ) -> Dict[str, Any]:
+        payload = {"prompt": prompt, "user_id": user_id}
+        if routing_text is not None:
+            payload["routing_text"] = routing_text
         result = await self._request(
             "POST",
             f"/v1/sessions/{session_id}/prompts",
-            json={"prompt": prompt, "user_id": user_id},
+            json=payload,
             expected_status=202,
         )
         return self._validate_accepted(result)

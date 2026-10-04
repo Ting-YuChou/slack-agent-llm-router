@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import { listAgentModels, resolveAgentModel } from "./agent-model.js";
+import type { RouteDecision } from "./jev-router.js";
 import { ApprovalStore } from "./policy.js";
 import type { PublicRunEvent } from "./pi-rpc.js";
 import type { RuntimeStateStore } from "./runtime-state.js";
@@ -41,6 +42,7 @@ export interface SessionInput {
   user_id: string;
   prompt: string;
   model?: string;
+  routing_text?: string;
 }
 
 export interface RunRecord {
@@ -52,6 +54,8 @@ export interface RunRecord {
   provider?: string;
   model?: string;
   reasoning_effort?: string;
+  routing?: RouteDecision;
+  estimated_cost_usd?: number;
   created_at: string;
   updated_at: string;
   tool_count: number;
@@ -66,7 +70,7 @@ export interface RunRecord {
 }
 
 export interface AgentProcess {
-  prompt(runId: string, prompt: string): void;
+  prompt(runId: string, prompt: string, route: RouteDecision): void;
   decide(rpcUiId: string, approved: boolean): void;
   abort(runId: string): Promise<void>;
   close(): Promise<void>;
@@ -85,6 +89,7 @@ interface SessionRecord {
   key: string;
   ownerUserId: string;
   modelRef: string;
+  autoRouting: boolean;
   worktreePath: string;
   branch: string;
   baselineCommit: string;
@@ -101,6 +106,7 @@ export class CodingAgentOrchestrator {
   private readonly deadlineMs: number;
   private readonly availableModelRefs: Set<string>;
   private readonly stateStore?: RuntimeStateStore;
+  private readonly router?: { route(text?: string): Promise<RouteDecision> };
   private readonly approvals = new ApprovalStore();
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly threadSessions = new Map<string, string>();
@@ -108,6 +114,8 @@ export class CodingAgentOrchestrator {
   private readonly deadlines = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly terminalClaims = new Set<string>();
   private readonly pendingThreadKeys = new Set<string>();
+  private readonly pendingSessionIds = new Set<string>();
+  private readonly closingSessionIds = new Set<string>();
   private startingSessions = 0;
 
   constructor(options: {
@@ -117,6 +125,7 @@ export class CodingAgentOrchestrator {
     deadlineMs?: number;
     stateStore?: RuntimeStateStore;
     availableModelRefs?: string[];
+    router?: { route(text?: string): Promise<RouteDecision> };
   }) {
     this.worktrees = options.worktrees;
     this.startProcess = options.startProcess;
@@ -124,6 +133,7 @@ export class CodingAgentOrchestrator {
     this.deadlineMs = options.deadlineMs ?? 15 * 60_000;
     this.availableModelRefs = new Set(options.availableModelRefs ?? listAgentModels().map((model) => model.ref));
     this.stateStore = options.stateStore;
+    this.router = options.router;
   }
 
   async restore(): Promise<void> {
@@ -148,7 +158,7 @@ export class CodingAgentOrchestrator {
         { id: saved.id, worktreePath: saved.worktreePath, modelRef, restored: true },
         (event) => this.handleProcessEvent(session.id, event),
       );
-      session = { ...saved, modelRef, process };
+      session = { ...saved, modelRef, autoRouting: saved.autoRouting === true, process };
       this.sessions.set(session.id, session);
       this.threadSessions.set(session.key, session.id);
     }
@@ -156,6 +166,7 @@ export class CodingAgentOrchestrator {
   }
 
   async createSession(input: SessionInput): Promise<{ session_id: string; run_id: string; status: "starting" }> {
+    const requestedAt = new Date().toISOString();
     validateSessionInput(input);
     let requestedModel;
     try {
@@ -172,10 +183,10 @@ export class CodingAgentOrchestrator {
       const existing = this.sessions.get(existingId);
       if (existing && !existing.closed) {
         if (existing.ownerUserId !== input.user_id) throw new RuntimeForbiddenError("Only the session owner can submit prompts");
-        if (input.model && existing.modelRef !== requestedModel.ref) {
+        if (input.model && (existing.autoRouting || existing.modelRef !== requestedModel.ref)) {
           throw new RuntimeConflictError("An existing Agent session cannot switch models");
         }
-        return this.prompt(existing.id, input.prompt, input.user_id);
+        return this.prompt(existing.id, input.prompt, input.user_id, input.routing_text);
       }
     }
     if (this.pendingThreadKeys.has(key)) throw new RuntimeConflictError("This Slack thread is already creating a session");
@@ -187,12 +198,14 @@ export class CodingAgentOrchestrator {
     this.pendingThreadKeys.add(key);
     this.startingSessions += 1;
     try {
+      const autoRouting = !input.model;
+      const route = await this.selectRoute(autoRouting, requestedModel.ref, input.routing_text);
       const worktree = await this.worktrees.create(runId);
       let session!: SessionRecord;
       let process: AgentProcess;
       try {
         process = await this.startProcess(
-          { id: sessionId, worktreePath: worktree.path, modelRef: requestedModel.ref },
+          { id: sessionId, worktreePath: worktree.path, modelRef: route.modelRef },
           (event) => this.handleProcessEvent(session.id, event),
         );
       } catch (error) {
@@ -203,7 +216,8 @@ export class CodingAgentOrchestrator {
         id: sessionId,
         key,
         ownerUserId: input.user_id,
-        modelRef: requestedModel.ref,
+        modelRef: route.modelRef,
+        autoRouting,
         worktreePath: worktree.path,
         branch: worktree.branch,
         baselineCommit: worktree.baselineCommit,
@@ -213,7 +227,7 @@ export class CodingAgentOrchestrator {
       };
       this.sessions.set(sessionId, session);
       this.threadSessions.set(key, sessionId);
-      this.startRun(session, runId, input.prompt);
+      this.startRun(session, runId, input.prompt, route, requestedAt);
       await this.persistState();
       return { session_id: sessionId, run_id: runId, status: "starting" };
     } finally {
@@ -222,18 +236,43 @@ export class CodingAgentOrchestrator {
     }
   }
 
-  async prompt(sessionId: string, prompt: string, userId: string): Promise<{ session_id: string; run_id: string; status: "starting" }> {
+  async prompt(sessionId: string, prompt: string, userId: string, routingText?: string): Promise<{ session_id: string; run_id: string; status: "starting" }> {
+    const requestedAt = new Date().toISOString();
     const session = this.requireSession(sessionId);
     if (session.ownerUserId !== userId) throw new RuntimeForbiddenError("Only the session owner can submit prompts");
-    if (session.activeRunId) throw new RuntimeConflictError();
+    if (session.activeRunId || this.pendingSessionIds.has(sessionId) || this.closingSessionIds.has(sessionId)) {
+      throw new RuntimeConflictError();
+    }
     if (!this.availableModelRefs.has(session.modelRef)) {
       throw new RuntimeError("Session model provider is not configured", "provider_not_configured", 503);
     }
     if (!prompt.trim()) throw new RuntimeError("prompt is required", "invalid_request", 400);
-    const runId = randomUUID();
-    this.startRun(session, runId, prompt);
-    await this.persistState();
-    return { session_id: sessionId, run_id: runId, status: "starting" };
+    this.pendingSessionIds.add(sessionId);
+    try {
+      const route = await this.selectRoute(session.autoRouting, session.modelRef, routingText);
+      const runId = randomUUID();
+      if (session.autoRouting) session.modelRef = route.modelRef;
+      this.startRun(session, runId, prompt, route, requestedAt);
+      await this.persistState();
+      return { session_id: sessionId, run_id: runId, status: "starting" };
+    } finally {
+      this.pendingSessionIds.delete(sessionId);
+    }
+  }
+
+  private async selectRoute(autoRouting: boolean, modelRef: string, routingText?: string): Promise<RouteDecision> {
+    if (!autoRouting) return { modelRef, effort: "max", source: "explicit" };
+    let decision: RouteDecision;
+    try {
+      decision = this.router ? await this.router.route(routingText)
+        : { modelRef: "openai/gpt-5.6-luna", effort: "max", source: "off" };
+    } catch {
+      return { modelRef: "openai/gpt-5.6-luna", effort: "max", source: "fallback", reason: "jev_unavailable" };
+    }
+    if (!this.availableModelRefs.has(decision.modelRef)) {
+      return { modelRef: "openai/gpt-5.6-luna", effort: "max", source: "fallback", reason: "model_not_configured" };
+    }
+    return decision;
   }
 
   getRun(runId: string): RunRecord {
@@ -314,21 +353,29 @@ export class CodingAgentOrchestrator {
   async closeSession(sessionId: string, userId: string): Promise<void> {
     const session = this.requireSession(sessionId);
     if (session.ownerUserId !== userId) throw new RuntimeForbiddenError();
-    if (session.activeRunId) await this.cancel(session.activeRunId, userId);
-    await session.process.close();
-    await this.worktrees.remove(session.worktreePath);
-    session.closed = true;
-    this.threadSessions.delete(session.key);
-    await this.persistState();
+    if (this.pendingSessionIds.has(sessionId)) {
+      throw new RuntimeConflictError("Session is starting a prompt");
+    }
+    if (this.closingSessionIds.has(sessionId)) throw new RuntimeConflictError("Session is already closing");
+    this.closingSessionIds.add(sessionId);
+    try {
+      if (session.activeRunId) await this.cancel(session.activeRunId, userId);
+      await session.process.close();
+      await this.worktrees.remove(session.worktreePath);
+      session.closed = true;
+      this.threadSessions.delete(session.key);
+      await this.persistState();
+    } finally {
+      this.closingSessionIds.delete(sessionId);
+    }
   }
 
   listEvents(runId: string, after = 0): Array<Record<string, unknown>> {
     return this.getRun(runId).events.slice(Math.max(0, after));
   }
 
-  private startRun(session: SessionRecord, runId: string, prompt: string): void {
-    const now = new Date().toISOString();
-    const model = resolveAgentModel(session.modelRef);
+  private startRun(session: SessionRecord, runId: string, prompt: string, route: RouteDecision, requestedAt: string): void {
+    const model = resolveAgentModel(route.modelRef);
     const run: RunRecord = {
       run_id: runId,
       session_id: session.id,
@@ -337,9 +384,11 @@ export class CodingAgentOrchestrator {
       owner_user_id: session.ownerUserId,
       provider: model.provider,
       model: model.id,
-      reasoning_effort: model.reasoningEffort,
-      created_at: now,
-      updated_at: now,
+      reasoning_effort: route.effort,
+      routing: route,
+      estimated_cost_usd: route.jevCostUsd ?? 0,
+      created_at: requestedAt,
+      updated_at: requestedAt,
       tool_count: 0,
       turn_count: 0,
       events: [{ type: "status", status: "starting" }],
@@ -348,7 +397,7 @@ export class CodingAgentOrchestrator {
     this.runs.set(runId, run);
     session.activeRunId = runId;
     session.lastActivity = Date.now();
-    session.process.prompt(runId, prompt.trim());
+    session.process.prompt(runId, prompt.trim(), route);
     const deadline = setTimeout(() => void this.timeoutRun(session, run), this.deadlineMs);
     deadline.unref();
     this.deadlines.set(runId, deadline);
@@ -359,6 +408,11 @@ export class CodingAgentOrchestrator {
     if (!session?.activeRunId) return;
     const run = this.runs.get(session.activeRunId);
     if (!run || isTerminal(run.status)) return;
+    if (event.type === "usage") {
+      run.estimated_cost_usd = (run.estimated_cost_usd ?? 0) + event.cost_usd;
+      void this.persistState();
+      return;
+    }
     if (event.type === "turn") {
       run.turn_count += 1;
       void this.persistState();
@@ -507,6 +561,7 @@ export class CodingAgentOrchestrator {
         key: session.key,
         ownerUserId: session.ownerUserId,
         modelRef: session.modelRef,
+        autoRouting: session.autoRouting,
         worktreePath: session.worktreePath,
         branch: session.branch,
         baselineCommit: session.baselineCommit,
@@ -524,6 +579,9 @@ function validateSessionInput(input: SessionInput): void {
     if (typeof field !== "string" || !field.trim()) throw new RuntimeError("Required session field is missing", "invalid_request", 400);
   }
   if (input.prompt.length > 20_000) throw new RuntimeError("Prompt is too large", "invalid_request", 400);
+  if (input.routing_text !== undefined && typeof input.routing_text !== "string") {
+    throw new RuntimeError("routing_text must be a string", "invalid_request", 400);
+  }
 }
 
 function isTerminal(status: RunStatus): boolean {

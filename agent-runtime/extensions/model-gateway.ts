@@ -1,15 +1,15 @@
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 
-import { gatewayProviderConfig, listAgentModels } from "../dist/src/agent-model.js";
+import { buildGatewayProviderRegistrations } from "../dist/src/agent-model.js";
 
 export default function modelGatewayExtension(pi: ExtensionAPI) {
   const gatewayUrl = process.env.PI_MODEL_GATEWAY_URL;
   if (!gatewayUrl || !/^http:\/\/model-gateway:\d+$/.test(gatewayUrl)) {
     throw new Error("PI_MODEL_GATEWAY_URL must target the internal model gateway root");
   }
-  for (const model of listAgentModels()) {
-    const gateway = gatewayProviderConfig(gatewayUrl, model.ref);
-    const modelConfig: ProviderModelConfig = {
+  for (const registration of buildGatewayProviderRegistrations(gatewayUrl)) {
+    const { models } = registration;
+    const modelConfigs: ProviderModelConfig[] = models.map((model) => ({
       id: model.id,
       name: model.name,
       api: model.api,
@@ -20,12 +20,12 @@ export default function modelGatewayExtension(pi: ExtensionAPI) {
       contextWindow: model.contextWindow,
       maxTokens: model.maxTokens,
       compat: model.compat,
-    };
-    pi.registerProvider(model.provider, {
-      baseUrl: gateway.baseUrl,
-      apiKey: gateway.apiKey,
-      api: gateway.api,
-      models: [modelConfig],
+    }));
+    pi.registerProvider(registration.provider, {
+      baseUrl: registration.baseUrl,
+      apiKey: registration.apiKey,
+      api: registration.api,
+      models: modelConfigs,
     });
   }
 }

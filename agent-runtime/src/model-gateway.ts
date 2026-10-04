@@ -7,6 +7,7 @@ import {
   resolveAgentModel,
   type AgentModelSpec,
   type AgentProvider,
+  type AgentReasoningEffort,
 } from "./agent-model.js";
 import { verifyGatewayToken } from "./gateway-token.js";
 
@@ -56,7 +57,7 @@ export function createModelGateway(options: {
     try {
       rawBody = await readBody(request);
       const body = JSON.parse(rawBody.toString("utf8"));
-      if (!validateAgentModelRequest(body, model)) throw new Error("invalid model request");
+      if (!validateAgentModelRequest(body, model, claims.reasoningEffort)) throw new Error("invalid model request");
     } catch {
       sendJson(response, 400, {
         error: { code: "invalid_request", message: "Request does not match the token-bound model configuration" },
@@ -83,17 +84,17 @@ export function createModelGateway(options: {
   });
 }
 
-export function validateAgentModelRequest(body: unknown, model: AgentModelSpec): boolean {
+export function validateAgentModelRequest(body: unknown, model: AgentModelSpec, effort: AgentReasoningEffort = model.reasoningEffort): boolean {
   if (!isRecord(body) || body.model !== model.id) return false;
   if (model.api === "openai-responses") {
-    return isRecord(body.reasoning) && body.reasoning.effort === model.reasoningEffort;
+    return isRecord(body.reasoning) && body.reasoning.effort === effort;
   }
   if (model.api === "anthropic-messages") {
-    return isRecord(body.output_config) && body.output_config.effort === model.reasoningEffort;
+    return isRecord(body.output_config) && body.output_config.effort === effort;
   }
   return isRecord(body.thinking)
     && body.thinking.type === "enabled"
-    && body.reasoning_effort === model.reasoningEffort;
+    && body.reasoning_effort === effort;
 }
 
 function extractToken(request: IncomingMessage): string {

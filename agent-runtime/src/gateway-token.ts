@@ -2,8 +2,10 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 
 import {
   resolveAgentModel,
+  supportsAgentEffort,
   type AgentModelApi,
   type AgentProvider,
+  type AgentReasoningEffort,
 } from "./agent-model.js";
 
 export interface GatewayClaims {
@@ -11,7 +13,7 @@ export interface GatewayClaims {
   provider: AgentProvider;
   model: string;
   api: AgentModelApi;
-  reasoningEffort: "max";
+  reasoningEffort: AgentReasoningEffort;
   expiresAt: number;
 }
 
@@ -43,7 +45,7 @@ export function verifyGatewayToken(token: string, secret: string, now = Date.now
     !isRecord(claims) ||
     typeof claims.runId !== "string" || !claims.runId ||
     typeof claims.provider !== "string" || typeof claims.model !== "string" ||
-    typeof claims.api !== "string" || claims.reasoningEffort !== "max" ||
+    typeof claims.api !== "string" || typeof claims.reasoningEffort !== "string" ||
     typeof claims.expiresAt !== "number" || claims.expiresAt < now
   ) return null;
   let model;
@@ -52,13 +54,13 @@ export function verifyGatewayToken(token: string, secret: string, now = Date.now
   } catch {
     return null;
   }
-  if (model.api !== claims.api || model.reasoningEffort !== claims.reasoningEffort) return null;
+  if (model.api !== claims.api || !supportsAgentEffort(model, claims.reasoningEffort)) return null;
   return {
     runId: claims.runId,
     provider: model.provider,
     model: model.id,
     api: model.api,
-    reasoningEffort: model.reasoningEffort,
+    reasoningEffort: claims.reasoningEffort,
     expiresAt: claims.expiresAt,
   };
 }
