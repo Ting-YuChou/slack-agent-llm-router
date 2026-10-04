@@ -66,7 +66,7 @@ test("selected Sol run starts Pi with Sol high while retaining the internal gate
     gatewayUrl: "http://model-gateway:8080", gatewayToken: "run-token",
     modelRef: "openai/gpt-5.6-sol", reasoningEffort: "high",
     extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
-  } as any);
+  });
   assert.match(args.join(" "), /--provider openai --model gpt-5\.6-sol --thinking high/);
   assert.match(args.join(" "), /OPENAI_API_KEY=run-token/);
 });
@@ -99,4 +99,26 @@ test("MCP is absent when off and explicitly loads only the trusted builtin path 
   assert.match(rendered, /PI_AGENT_MCP_TOOLS_JSON=\["get_file_contents","search_code"\]/);
   assert.match(rendered, /--no-extensions.*-e builtin:mcp.*-e \/opt\/pi\/extensions\/mcp-bootstrap\.ts/);
   assert.match(rendered, /--tools read,mcp__github__get_file_contents/);
+});
+
+test("run-time Jev exposes codemode with only a short-lived classifier gateway token", () => {
+  const base = {
+    name: "pi-jev", image: "pi-agent:1.0.1", network: "pi-model-only",
+    worktreePath: "/worktree", gitMetadataPath: "/repo/.git", sessionStatePath: "/state",
+    gatewayUrl: "http://model-gateway:8080", gatewayToken: "chat-run-token",
+    modelRef: "openai/gpt-5.6-luna", extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
+  };
+  const off = buildAgentDockerArgs(base);
+  assert.doesNotMatch(off.join(" "), /builtin:codemode|OPENROUTER_API_KEY|PI_AGENT_JEV_CLASSIFIER_MODE/);
+
+  const enabled = buildAgentDockerArgs({
+    ...base,
+    classifierGatewayToken: "classifier-run-token",
+  });
+  const rendered = enabled.join(" ");
+  assert.match(rendered, /OPENROUTER_API_KEY=classifier-run-token/);
+  assert.match(rendered, /PI_AGENT_JEV_CLASSIFIER_MODE=on/);
+  assert.match(rendered, /--no-extensions.*-e builtin:codemode/);
+  assert.match(rendered, /--tools read,codemode/);
+  assert.doesNotMatch(rendered, /OPENROUTER_API_KEY=sk-or-/);
 });

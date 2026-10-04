@@ -3,7 +3,7 @@ import type { Server } from "node:http";
 import { test } from "node:test";
 
 import { RuntimeConflictError, RuntimeNotFoundError } from "../src/orchestrator.js";
-import { createAgentHttpServer } from "../src/server.js";
+import { createAgentHttpServer, parseJevClassifierMode } from "../src/server.js";
 
 async function listen(server: Server): Promise<string> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -35,6 +35,14 @@ function fixture() {
   });
   return { server, calls };
 }
+
+test("run-time Jev classifier mode is explicit and defaults off", () => {
+  assert.equal(parseJevClassifierMode(undefined), "off");
+  assert.equal(parseJevClassifierMode(""), "off");
+  assert.equal(parseJevClassifierMode("off"), "off");
+  assert.equal(parseJevClassifierMode("on"), "on");
+  assert.throws(() => parseJevClassifierMode("shadow"), /off or on/i);
+});
 
 test("health is public while every session/run endpoint requires bearer auth", async () => {
   const { server } = fixture();
