@@ -1201,8 +1201,7 @@ class SlackMessageHandler:
         if result.get("diff_stat"):
             detail_sections.append(f"*Diff:* `{result['diff_stat']}`")
         if all(
-            result.get(field)
-            for field in ("mcp_server", "mcp_tool", "mcp_repository")
+            result.get(field) for field in ("mcp_server", "mcp_tool", "mcp_repository")
         ):
             mcp_status = (
                 "succeeded"

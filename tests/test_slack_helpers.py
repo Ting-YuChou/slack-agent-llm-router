@@ -142,7 +142,11 @@ class TestSlackMessageHandler:
 
         assert response == ""
         agent_runtime.create_session.assert_awaited_once_with(
-            "T1", "C1", "100.1", "U1", "fix the failing test",
+            "T1",
+            "C1",
+            "100.1",
+            "U1",
+            "fix the failing test",
             routing_text="fix the failing test",
         )
         inference_engine.process_query.assert_not_awaited()
@@ -219,7 +223,9 @@ class TestSlackMessageHandler:
             latest_ts="100.2",
         )
         assert runtime.create_session.await_args.args[4] == "context plus current task"
-        assert runtime.create_session.await_args.kwargs["routing_text"] == "fix the test"
+        assert (
+            runtime.create_session.await_args.kwargs["routing_text"] == "fix the test"
+        )
 
     @pytest.mark.asyncio
     async def test_agent_command_without_task_returns_usage_without_runtime_call(self):
@@ -344,34 +350,53 @@ class TestSlackMessageHandler:
 
         assert "R2" in response
         runtime.create_session.assert_awaited_once_with(
-            "T1", "C1", "100.1", "U1", "also add a regression test",
+            "T1",
+            "C1",
+            "100.1",
+            "U1",
+            "also add a regression test",
             routing_text="also add a regression test",
         )
         inference.process_query.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_attachment_only_agent_followup_does_not_route_attachment_summary(self):
+    async def test_attachment_only_agent_followup_does_not_route_attachment_summary(
+        self,
+    ):
         runtime = SimpleNamespace(
             create_session=AsyncMock(
                 return_value={"session_id": "S1", "run_id": "R2", "status": "starting"}
             )
         )
-        bot = SlackBot({"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime})
+        bot = SlackBot(
+            {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+        )
         bot._monitor_agent_run = AsyncMock()
         bot._track_agent_run(
             {"session_id": "S1", "run_id": "R1", "status": "starting"},
-            team_id="T1", channel_id="C1", thread_ts="100.1", owner_user_id="U1",
+            team_id="T1",
+            channel_id="C1",
+            thread_ts="100.1",
+            owner_user_id="U1",
         )
         handler = SlackMessageHandler(bot)
         handler._build_attachment_only_query = lambda _attachments: "attachment summary"
 
         await handler.handle_message(
-            {"text": "", "user": "U1", "channel": "C1", "thread_ts": "100.1",
-             "_team_id": "T1", "_query_attachments": [{"name": "private.pdf"}]},
+            {
+                "text": "",
+                "user": "U1",
+                "channel": "C1",
+                "thread_ts": "100.1",
+                "_team_id": "T1",
+                "_query_attachments": [{"name": "private.pdf"}],
+            },
             SimpleNamespace(),
         )
 
-        runtime.create_session.assert_awaited_once_with("T1", "C1", "100.1", "U1", "attachment summary")
+        runtime.create_session.assert_awaited_once_with(
+            "T1", "C1", "100.1", "U1", "attachment summary"
+        )
 
     @pytest.mark.asyncio
     async def test_help_and_status_expose_agent_mode_and_runtime_health(self):
@@ -455,7 +480,9 @@ class TestSlackMessageHandler:
 
         assert len(response) <= 360
         assert "src/a.py" in response
-        assert "`github` / `get_file_contents` / `acme/widgets` / *succeeded*" in response
+        assert (
+            "`github` / `get_file_contents` / `acme/widgets` / *succeeded*" in response
+        )
         assert "git cherry-pick" in response
 
 
