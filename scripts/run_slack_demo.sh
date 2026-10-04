@@ -5,14 +5,22 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 env_file="${DEMO_ENV_FILE:-${repo_root}/.env.demo}"
 agent_runtime_dir="${repo_root}/agent-runtime"
-agent_image="${PI_AGENT_IMAGE:-slack-pi-agent:0.83.0}"
+agent_image="${PI_AGENT_IMAGE:-slack-pi-agent:1.0.1}"
 gateway_image="${PI_MODEL_GATEWAY_IMAGE:-slack-pi-model-gateway:0.1.0}"
+mcp_gateway_image="${PI_MCP_GATEWAY_IMAGE:-slack-pi-mcp-gateway:0.1.0}"
+github_mcp_image="${GITHUB_MCP_IMAGE:-ghcr.io/github/github-mcp-server@sha256:7aaeeec9ae4fe9a736d100c1ff0798f3c219b5009e05f5d3945fcacb13cc196b}"
 agent_network="${PI_AGENT_NETWORK:-pi-model-only}"
+mcp_egress_network="${PI_MCP_EGRESS_NETWORK:-pi-mcp-egress}"
 gateway_container="${PI_MODEL_GATEWAY_CONTAINER:-slack-pi-model-gateway}"
+mcp_gateway_container="${PI_MCP_GATEWAY_CONTAINER:-slack-pi-mcp-gateway}"
+github_mcp_container="${GITHUB_MCP_CONTAINER:-slack-github-mcp}"
 agent_pid=""
 worker_pid=""
 gateway_started=false
 network_created=false
+mcp_network_created=false
+mcp_gateway_started=false
+github_mcp_started=false
 cleanup_started=false
 
 stop_child() {
@@ -39,7 +47,10 @@ cleanup() {
       if [[ -n "${container_id}" ]]; then docker stop "${container_id}" >/dev/null 2>&1 || true; fi
     done < <(docker ps -q --filter label=slack-pi-agent-session=true 2>/dev/null || true)
     if [[ "${gateway_started}" == true ]]; then docker stop "${gateway_container}" >/dev/null 2>&1 || true; fi
+    if [[ "${mcp_gateway_started}" == true ]]; then docker stop "${mcp_gateway_container}" >/dev/null 2>&1 || true; fi
+    if [[ "${github_mcp_started}" == true ]]; then docker stop "${github_mcp_container}" >/dev/null 2>&1 || true; fi
     if [[ "${network_created}" == true ]]; then docker network rm "${agent_network}" >/dev/null 2>&1 || true; fi
+    if [[ "${mcp_network_created}" == true ]]; then docker network rm "${mcp_egress_network}" >/dev/null 2>&1 || true; fi
   fi
 }
 trap cleanup EXIT
@@ -93,8 +104,29 @@ fi
 if [[ -z "${MODEL_GATEWAY_SIGNING_SECRET:-}" ]]; then
   MODEL_GATEWAY_SIGNING_SECRET="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))')"
 fi
+export PI_AGENT_MCP_MODE="${PI_AGENT_MCP_MODE:-off}"
+if [[ "${PI_AGENT_MCP_MODE}" == github_read_only ]] && [[ -z "${MCP_GATEWAY_SIGNING_SECRET:-}" ]]; then
+  MCP_GATEWAY_SIGNING_SECRET="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))')"
+fi
 export AGENT_RUNTIME_TOKEN MODEL_GATEWAY_SIGNING_SECRET
+if [[ "${PI_AGENT_MCP_MODE}" == github_read_only ]]; then export MCP_GATEWAY_SIGNING_SECRET; fi
 export PI_AGENT_REPO_PATH="${PI_AGENT_REPO_PATH:-${repo_root}}"
+export PI_AGENT_MCP_GATEWAY_URL="${PI_AGENT_MCP_GATEWAY_URL:-http://mcp-gateway:8090/mcp}"
+if [[ "${PI_AGENT_MCP_MODE}" == github_read_only ]]; then
+  for name in PI_AGENT_GITHUB_REPOSITORIES GITHUB_APP_ID GITHUB_APP_INSTALLATION_ID GITHUB_APP_PRIVATE_KEY_PATH; do
+    if [[ -z "${!name:-}" ]]; then
+      printf 'Missing required GitHub MCP setting: %s\n' "${name}" >&2
+      exit 2
+    fi
+  done
+  if [[ ! -f "${GITHUB_APP_PRIVATE_KEY_PATH}" ]]; then
+    printf 'GitHub App private key does not exist: %s\n' "${GITHUB_APP_PRIVATE_KEY_PATH}" >&2
+    exit 2
+  fi
+elif [[ "${PI_AGENT_MCP_MODE}" != off ]]; then
+  printf 'PI_AGENT_MCP_MODE must be off or github_read_only for this release.\n' >&2
+  exit 2
+fi
 configured_providers="openai"
 if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then configured_providers="${configured_providers},anthropic"; fi
 if [[ -n "${OPENCODE_API_KEY:-}" ]]; then configured_providers="${configured_providers},opencode-go"; fi
@@ -108,7 +140,9 @@ if [[ "${DEMO_TEST_MODE:-0}" != 1 ]]; then
     printf 'Docker is not running or is not accessible.\n' >&2
     exit 2
   fi
-  for image in "${agent_image}" "${gateway_image}"; do
+  images=("${agent_image}" "${gateway_image}")
+  if [[ "${PI_AGENT_MCP_MODE}" == github_read_only ]]; then images+=("${mcp_gateway_image}" "${github_mcp_image}"); fi
+  for image in "${images[@]}"; do
     if ! docker image inspect "${image}" >/dev/null 2>&1; then
       printf 'Missing demo image %s. Run: make demo-agent-images\n' "${image}" >&2
       exit 2
@@ -142,9 +176,58 @@ if [[ "${DEMO_TEST_MODE:-0}" != 1 ]]; then
     "${gateway_image}" >/dev/null
   gateway_started=true
   docker network connect bridge "${gateway_container}"
+  if [[ "${PI_AGENT_MCP_MODE}" == github_read_only ]]; then
+    if ! docker network inspect "${mcp_egress_network}" >/dev/null 2>&1; then
+      docker network create "${mcp_egress_network}" >/dev/null
+      mcp_network_created=true
+    fi
+    docker run --detach --rm \
+      --name "${github_mcp_container}" \
+      --label slack-github-mcp=true \
+      --network "${mcp_egress_network}" \
+      --network-alias github-mcp \
+      --read-only \
+      --cap-drop ALL \
+      --security-opt no-new-privileges \
+      --cpus 1 \
+      --memory 512m \
+      --pids-limit 128 \
+      --tmpfs /tmp:rw,noexec,nosuid,size=67108864 \
+      --env GITHUB_READ_ONLY=1 \
+      --env GITHUB_LOCKDOWN_MODE=1 \
+      --env GITHUB_TOOLSETS=repos,issues,pull_requests \
+      --env GITHUB_TOOLS=get_file_contents,search_code,issue_read,list_issues,pull_request_read,list_pull_requests \
+      "${github_mcp_image}" http --listen-host 0.0.0.0 --port 8082 >/dev/null
+    github_mcp_started=true
+    docker run --detach --rm \
+      --name "${mcp_gateway_container}" \
+      --label slack-pi-mcp-gateway=true \
+      --network "${agent_network}" \
+      --network-alias mcp-gateway \
+      --publish 127.0.0.1:8090:8090 \
+      --read-only \
+      --user 10003:10003 \
+      --cap-drop ALL \
+      --security-opt no-new-privileges \
+      --cpus 1 \
+      --memory 512m \
+      --pids-limit 128 \
+      --tmpfs /tmp:rw,noexec,nosuid,size=67108864 \
+      --mount "type=bind,src=${GITHUB_APP_PRIVATE_KEY_PATH},dst=/run/secrets/github-app.pem,readonly" \
+      --env MCP_GATEWAY_SIGNING_SECRET \
+      --env GITHUB_APP_ID \
+      --env GITHUB_APP_INSTALLATION_ID \
+      --env GITHUB_APP_PRIVATE_KEY_PATH=/run/secrets/github-app.pem \
+      --env GITHUB_MCP_UPSTREAM_URL=http://github-mcp:8082/mcp \
+      "${mcp_gateway_image}" >/dev/null
+    mcp_gateway_started=true
+    docker network connect "${mcp_egress_network}" "${mcp_gateway_container}"
+  fi
 fi
 
-env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u OPENCODE_API_KEY node "${agent_runtime_dir}/dist/src/server.js" &
+env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u OPENCODE_API_KEY \
+  -u GITHUB_APP_ID -u GITHUB_APP_INSTALLATION_ID -u GITHUB_APP_PRIVATE_KEY_PATH \
+  node "${agent_runtime_dir}/dist/src/server.js" &
 agent_pid=$!
 agent_health_url="${AGENT_RUNTIME_HEALTH_URL:-http://127.0.0.1:3001/health}"
 agent_ready=false
@@ -163,6 +246,8 @@ if [[ "${agent_ready}" != true ]]; then
 fi
 
 env -u ANTHROPIC_API_KEY -u OPENCODE_API_KEY -u OPENROUTER_API_KEY \
+  -u MCP_GATEWAY_SIGNING_SECRET -u GITHUB_APP_ID -u GITHUB_APP_INSTALLATION_ID \
+  -u GITHUB_APP_PRIVATE_KEY_PATH -u PI_AGENT_GITHUB_REPOSITORIES \
   "${PYTHON:-python}" main.py start-workers --config config/config.demo.yaml &
 worker_pid=$!
 if wait "${worker_pid}"; then worker_status=0; else worker_status=$?; fi

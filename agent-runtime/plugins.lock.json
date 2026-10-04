@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "image_digest": "sha256:06c8b3baa9df3a7dbaab506ae02ed8164dc8d96809afa459a777fdccfd9e97a3",
+  "image_digest": "sha256:5c3c093827d58884a04ab1ae67d83ef7342e41bb748ae7daaba2b81e6a9015a8",
   "plugins": [
     {
       "id": "workspace-summary",

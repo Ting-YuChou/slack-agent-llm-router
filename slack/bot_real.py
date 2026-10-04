@@ -1200,6 +1200,21 @@ class SlackMessageHandler:
             )
         if result.get("diff_stat"):
             detail_sections.append(f"*Diff:* `{result['diff_stat']}`")
+        if all(
+            result.get(field) for field in ("mcp_server", "mcp_tool", "mcp_repository")
+        ):
+            mcp_status = (
+                "succeeded"
+                if result.get("mcp_success") is True
+                else "failed"
+                if result.get("mcp_success") is False
+                else "started"
+            )
+            detail_sections.append(
+                "*MCP:* "
+                f"`{result['mcp_server']}` / `{result['mcp_tool']}` / "
+                f"`{result['mcp_repository']}` / *{mcp_status}*"
+            )
         delivery = []
         if result.get("branch"):
             delivery.append(f"Branch: `{result['branch']}`")

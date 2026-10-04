@@ -467,6 +467,10 @@ class TestSlackMessageHandler:
                 "answer": "a" * 500,
                 "changed_files": ["src/a.py"],
                 "diff_stat": "1 file changed, 2 insertions(+)",
+                "mcp_server": "github",
+                "mcp_tool": "get_file_contents",
+                "mcp_repository": "acme/widgets",
+                "mcp_success": True,
                 "branch": "pi-agent/20260801-r1",
                 "commit": "a" * 40,
                 "cherry_pick": "git cherry-pick " + "a" * 40,
@@ -476,6 +480,9 @@ class TestSlackMessageHandler:
 
         assert len(response) <= 360
         assert "src/a.py" in response
+        assert (
+            "`github` / `get_file_contents` / `acme/widgets` / *succeeded*" in response
+        )
         assert "git cherry-pick" in response
 
 

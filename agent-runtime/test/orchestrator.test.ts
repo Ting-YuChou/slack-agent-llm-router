@@ -41,6 +41,7 @@ function fixture(router?: { route(text?: string): Promise<any> }) {
     maxActiveSessions: 2,
     deadlineMs: 10_000,
     router,
+    mcpRepository: "acme/widgets",
   } as any);
   return { orchestrator, process, calls };
 }
@@ -169,6 +170,28 @@ test("counts Pi model turns without exposing thinking content", async () => {
   process.emit({ type: "turn" });
 
   assert.equal(orchestrator.getRun(accepted.run_id).turn_count, 2);
+});
+
+test("run audit stores sanitized GitHub MCP metadata and clears unfinished call timing", async () => {
+  const { orchestrator, process } = fixture();
+  const accepted = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "mcp", user_id: "U", prompt: "inspect" });
+  process.emit({ type: "tool", phase: "start", tool_call_id: "m1", tool: "mcp__github__get_file_contents" });
+  process.emit({ type: "tool", phase: "end", tool_call_id: "m1", tool: "mcp__github__get_file_contents", is_error: false, result_bytes: 123 });
+  const run = orchestrator.getRun(accepted.run_id);
+  assert.equal(run.mcp_server, "github");
+  assert.equal(run.mcp_tool, "get_file_contents");
+  assert.equal(run.mcp_repository, "acme/widgets");
+  assert.equal(run.mcp_success, true);
+  assert.equal(run.mcp_error_code, null);
+  assert.equal(run.mcp_result_bytes, 123);
+  assert.equal(typeof run.mcp_latency_ms, "number");
+  assert.equal(JSON.stringify(run.events).includes("arguments"), false);
+  assert.deepEqual(run.events.slice(-2).map((event) => event.type), ["mcp", "mcp"]);
+  process.emit({ type: "tool", phase: "start", tool_call_id: "m2", tool: "mcp__github__search_code" });
+  assert.equal((orchestrator as any).mcpToolStarts.size, 1);
+  process.emit({ type: "error", code: "container_exited", message: "stopped" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal((orchestrator as any).mcpToolStarts.size, 0);
 });
 
 test("approval is one-time, owner-bound, and resumes the exact Pi UI request", async () => {
