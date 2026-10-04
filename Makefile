@@ -26,6 +26,7 @@ demo-agent-images:
 	docker build -f agent-runtime/Dockerfile.agent -t slack-pi-agent:1.0.1 agent-runtime
 	npm --prefix agent-runtime run lock-image -- slack-pi-agent:1.0.1
 	docker build -f agent-runtime/Dockerfile.gateway -t slack-pi-model-gateway:0.1.0 agent-runtime
+	docker build -f agent-runtime/Dockerfile.mcp-gateway -t slack-pi-mcp-gateway:0.1.0 agent-runtime
 
 demo-slack:
 	bash scripts/run_slack_demo.sh

@@ -6,6 +6,7 @@ import type { AgentProcess } from "./orchestrator.js";
 import { resolveAgentModel } from "./agent-model.js";
 import type { AgentReasoningEffort } from "./agent-model.js";
 import type { RouteDecision } from "./jev-router.js";
+import type { McpRunConfig } from "./mcp-config.js";
 
 export interface AgentContainerOptions {
   name: string;
@@ -25,6 +26,7 @@ export interface AgentContainerOptions {
   continueSession?: boolean;
   safeCommands?: string[];
   user?: string;
+  mcp?: McpRunConfig;
 }
 
 const exec = promisify(execFile);
@@ -64,7 +66,7 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     "--model", model.id,
     "--thinking", options.reasoningEffort ?? model.reasoningEffort,
     "--session-dir", "/var/lib/pi-session",
-    "--approve",
+    "--no-approve",
     "--no-extensions",
     "--no-skills",
     "--no-prompt-templates",
@@ -72,6 +74,15 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     "--tools", options.toolNames.join(","),
   ];
   if (options.continueSession) args.push("--continue");
+  if (options.mcp) {
+    args.splice(args.indexOf("--mount"), 0,
+      "--env", `PI_AGENT_MCP_MODE=${options.mcp.mode}`,
+      "--env", `PI_AGENT_MCP_GATEWAY_URL=${options.mcp.gatewayUrl}`,
+      "--env", `PI_AGENT_MCP_TOKEN=${options.mcp.token}`,
+      "--env", `PI_AGENT_MCP_TOOLS_JSON=${JSON.stringify(options.mcp.tools)}`,
+    );
+    args.push("-e", "builtin:mcp", "-e", "/opt/pi/extensions/mcp-bootstrap.ts");
+  }
   for (const extension of [...options.extensionPaths, ...options.pluginPaths]) args.push("-e", extension);
   for (const skill of options.skillPaths) args.push("--skill", skill);
   return args;
