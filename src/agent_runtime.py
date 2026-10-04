@@ -153,7 +153,12 @@ class AgentRuntimeClient:
         return session if payload["found"] and isinstance(session, dict) else None
 
     async def prompt(
-        self, session_id: str, prompt: str, user_id: str, *, routing_text: Optional[str] = None
+        self,
+        session_id: str,
+        prompt: str,
+        user_id: str,
+        *,
+        routing_text: Optional[str] = None,
     ) -> Dict[str, Any]:
         payload = {"prompt": prompt, "user_id": user_id}
         if routing_text is not None:
