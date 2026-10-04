@@ -6,6 +6,8 @@ import type { AgentProcess } from "./orchestrator.js";
 import { resolveAgentModel } from "./agent-model.js";
 import type { AgentReasoningEffort } from "./agent-model.js";
 import type { RouteDecision } from "./jev-router.js";
+import type { McpRunConfig } from "./mcp-config.js";
+import { namespacedMcpToolNames } from "./mcp-config.js";
 
 export interface AgentContainerOptions {
   name: string;
@@ -16,6 +18,7 @@ export interface AgentContainerOptions {
   sessionStatePath: string;
   gatewayUrl: string;
   gatewayToken: string;
+  classifierGatewayToken?: string;
   modelRef: string;
   reasoningEffort?: AgentReasoningEffort;
   extensionPaths: string[];
@@ -25,12 +28,15 @@ export interface AgentContainerOptions {
   continueSession?: boolean;
   safeCommands?: string[];
   user?: string;
+  mcp?: McpRunConfig;
 }
 
 const exec = promisify(execFile);
 
 export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
   const model = resolveAgentModel(options.modelRef);
+  const tools = [...options.toolNames];
+  if (options.classifierGatewayToken && !tools.includes("codemode")) tools.push("codemode");
   const args = [
     "run", "--rm", "-i",
     "--name", options.name,
@@ -64,14 +70,30 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     "--model", model.id,
     "--thinking", options.reasoningEffort ?? model.reasoningEffort,
     "--session-dir", "/var/lib/pi-session",
-    "--approve",
+    "--no-approve",
     "--no-extensions",
     "--no-skills",
     "--no-prompt-templates",
     "--no-themes",
-    "--tools", options.toolNames.join(","),
+    "--tools", [...tools, ...(options.mcp ? namespacedMcpToolNames("github", options.mcp.tools) : [])].join(","),
   ];
   if (options.continueSession) args.push("--continue");
+  if (options.classifierGatewayToken) {
+    args.splice(args.indexOf("--mount"), 0,
+      "--env", `OPENROUTER_API_KEY=${options.classifierGatewayToken}`,
+      "--env", "PI_AGENT_JEV_CLASSIFIER_MODE=on",
+    );
+    args.push("-e", "builtin:codemode");
+  }
+  if (options.mcp) {
+    args.splice(args.indexOf("--mount"), 0,
+      "--env", `PI_AGENT_MCP_MODE=${options.mcp.mode}`,
+      "--env", `PI_AGENT_MCP_GATEWAY_URL=${options.mcp.gatewayUrl}`,
+      "--env", `PI_AGENT_MCP_TOKEN=${options.mcp.token}`,
+      "--env", `PI_AGENT_MCP_TOOLS_JSON=${JSON.stringify(options.mcp.tools)}`,
+    );
+    args.push("-e", "builtin:mcp", "-e", "/opt/pi/extensions/mcp-bootstrap.ts");
+  }
   for (const extension of [...options.extensionPaths, ...options.pluginPaths]) args.push("-e", extension);
   for (const skill of options.skillPaths) args.push("--skill", skill);
   return args;
@@ -84,18 +106,24 @@ export class DockerPiProcess implements AgentProcess {
   private hasSession = false;
   private activeContainerName?: string;
   private stopping?: Promise<void>;
-  private readonly options: Omit<AgentContainerOptions, "gatewayToken">;
+  private readonly options: Omit<AgentContainerOptions, "gatewayToken" | "classifierGatewayToken" | "mcp"> & { mcp?: Omit<McpRunConfig, "token"> };
   private readonly tokenForRun: (runId: string, route: RouteDecision) => string;
   private readonly onEvent: (event: PublicRunEvent) => void;
+  private readonly mcpTokenForRun?: (runId: string) => string;
+  private readonly classifierTokenForRun?: (runId: string) => string;
 
   constructor(
-    options: Omit<AgentContainerOptions, "gatewayToken">,
+    options: Omit<AgentContainerOptions, "gatewayToken" | "classifierGatewayToken" | "mcp"> & { mcp?: Omit<McpRunConfig, "token"> },
     tokenForRun: (runId: string, route: RouteDecision) => string,
     onEvent: (event: PublicRunEvent) => void,
+    mcpTokenForRun?: (runId: string) => string,
+    classifierTokenForRun?: (runId: string) => string,
   ) {
     this.options = options;
     this.tokenForRun = tokenForRun;
     this.onEvent = onEvent;
+    this.mcpTokenForRun = mcpTokenForRun;
+    this.classifierTokenForRun = classifierTokenForRun;
     this.hasSession = options.continueSession ?? false;
   }
 
@@ -104,12 +132,16 @@ export class DockerPiProcess implements AgentProcess {
     this.closing = false;
     const containerName = `${this.options.name}-${runId.slice(0, 8)}`;
     this.activeContainerName = containerName;
+    const { mcp, ...baseOptions } = this.options;
+    if (mcp && !this.mcpTokenForRun) throw new Error("MCP token issuer is required when MCP is enabled");
     const child = spawn("docker", buildAgentDockerArgs({
-      ...this.options,
+      ...baseOptions,
       name: containerName,
       modelRef: route.modelRef,
       reasoningEffort: route.effort,
       gatewayToken: this.tokenForRun(runId, route),
+      ...(this.classifierTokenForRun ? { classifierGatewayToken: this.classifierTokenForRun(runId) } : {}),
+      ...(mcp ? { mcp: { ...mcp, token: this.mcpTokenForRun!(runId) } } : {}),
       continueSession: this.hasSession,
     }), {
       stdio: ["pipe", "pipe", "pipe"],

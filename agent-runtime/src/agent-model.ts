@@ -106,6 +106,14 @@ const MODELS: readonly AgentModelSpec[] = [
 ] as const;
 
 export const DEFAULT_AGENT_MODEL_REF = "openai/gpt-5.6-luna" as const;
+export const JEV_CLASSIFIER_MODEL = {
+  provider: "openrouter",
+  id: "typesafe/jev-1.13",
+  api: "typesafe-system-one",
+  credentialEnv: "OPENROUTER_API_KEY",
+  gatewayPath: "/openrouter/api/v1/systemone",
+  upstreamUrl: "https://openrouter.ai/api/v1/systemone",
+} as const;
 
 export function listAgentModels(): AgentModelSpec[] {
   return MODELS.map((model) => ({ ...model }));
@@ -156,6 +164,18 @@ export function buildGatewayProviderRegistrations(baseUrl: string): Array<{
     ...gatewayProviderConfig(baseUrl, models[0].ref),
     models,
   }));
+}
+
+export function buildClassifierGatewayProviderRegistration(baseUrl: string): {
+  provider: "openrouter";
+  apiKey: "$OPENROUTER_API_KEY";
+  baseUrl: string;
+} {
+  return {
+    provider: "openrouter",
+    apiKey: "$OPENROUTER_API_KEY",
+    baseUrl: `${baseUrl.replace(/\/$/, "")}/openrouter/api/v1`,
+  };
 }
 
 // Backward-compatible aliases for the current default model.

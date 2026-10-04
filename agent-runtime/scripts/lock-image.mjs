@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 const runtimeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const lockPath = path.join(runtimeRoot, "plugins.lock.json");
 const skillLockPath = path.join(runtimeRoot, "skills.lock.json");
-const image = process.argv[2] ?? "slack-pi-agent:0.83.0";
+const image = process.argv[2] ?? "slack-pi-agent:1.0.1";
 const lock = JSON.parse(readFileSync(lockPath, "utf8"));
 const skillLock = JSON.parse(readFileSync(skillLockPath, "utf8"));
 

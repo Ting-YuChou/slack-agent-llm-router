@@ -20,13 +20,14 @@ workers:
 
 demo-agent-install:
 	npm --prefix agent-runtime ci --ignore-scripts
-	npm --prefix agent-runtime run patch-vendored-deps
 
 demo-agent-images:
 	npm --prefix agent-runtime run build
-	docker build -f agent-runtime/Dockerfile.agent -t slack-pi-agent:0.83.0 agent-runtime
-	npm --prefix agent-runtime run lock-image -- slack-pi-agent:0.83.0
+	docker build -f agent-runtime/Dockerfile.agent -t slack-pi-agent:1.0.1 agent-runtime
+	npm --prefix agent-runtime run lock-image -- slack-pi-agent:1.0.1
 	docker build -f agent-runtime/Dockerfile.gateway -t slack-pi-model-gateway:0.1.0 agent-runtime
+	docker build -f agent-runtime/Dockerfile.mcp-gateway -t slack-pi-mcp-gateway:0.1.0 agent-runtime
+	docker pull ghcr.io/github/github-mcp-server@sha256:7aaeeec9ae4fe9a736d100c1ff0798f3c219b5009e05f5d3945fcacb13cc196b
 
 demo-slack:
 	bash scripts/run_slack_demo.sh

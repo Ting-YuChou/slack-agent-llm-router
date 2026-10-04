@@ -315,7 +315,8 @@ web search, response cache, and the provider scheduler are disabled in
    `connections:write`. Keep the resulting `xapp-` token.
 4. Invite the bot to `#ai-testing`. If you use another channel, update
    `slack.channels` in the demo config.
-5. Install the pinned Pi runtime dependencies and build the two local images once:
+5. Install the pinned Pi runtime dependencies, build the three local images,
+   and fetch the pinned official GitHub MCP image once:
 
 ```bash
 make demo-agent-install
@@ -340,11 +341,56 @@ Agent providers. Jev routing is off by default. To collect routing decisions
 without changing the selected model, set `OPENROUTER_API_KEY` and
 `PI_AGENT_JEV_MODE=shadow`; use `on` only after the evaluation below.
 The OpenRouter key stays in the host Agent Runtime and is removed from the
-Slack worker environment. Then start the demo:
+Slack worker environment. Pi 1.0.1 can also use Jev during a run for typed
+classification through its built-in `codemode` classifier API. Enable that
+separately with:
+
+```bash
+PI_AGENT_JEV_CLASSIFIER_MODE=on
+PI_AGENT_JEV_CLASSIFIER_MAX_CALLS=8
+```
+
+This enables `builtin:codemode` and the pinned
+`openrouter/typesafe/jev-1.13` classifier. The Agent container receives a
+short-lived token limited to that classifier, the current run, an expiry, and
+the configured call budget. The real OpenRouter key stays in the host runtime
+and model gateway. Classifier output may guide analysis, classification, and
+ranking; write, shell, approval, deployment, and deletion policy continues to
+be enforced outside the model. Then start the demo:
 
 ```bash
 make demo-slack
 ```
+
+### Optional read-only GitHub MCP
+
+GitHub MCP is off by default. To enable it, create a GitHub App with read access
+to **Contents**, **Issues**, and **Pull requests**, install it only on the
+repositories Pi may inspect, and set these values in `.env.demo`:
+
+```bash
+PI_AGENT_MCP_MODE=github_read_only
+PI_AGENT_GITHUB_REPOSITORIES=owner/repository
+GITHUB_APP_ID=123456
+GITHUB_APP_INSTALLATION_ID=12345678
+GITHUB_APP_PRIVATE_KEY_PATH=/absolute/path/to/github-app.private-key.pem
+```
+
+The repository list is comma-separated. The current checkout's `origin` must
+match one entry. The private key is mounted only into the MCP gateway; it is not
+placed in a Docker environment variable or shared with Pi. The gateway mints
+short-lived installation tokens and sends them to the pinned official GitHub
+MCP server. Pi remains on its internal network and receives a separate token
+bound to the run, session, Slack user, repository, mode, server, and exact tool
+allowlist.
+
+This release exposes only `get_file_contents`, `search_code`, `issue_read`,
+`list_issues`, `pull_request_read`, and `list_pull_requests`. The official server
+runs in read-only and lockdown mode, and the local gateway rejects every other
+tool or repository. Repository `.pi/mcp.json` files are not loaded. Issue creation,
+comments, PR creation or merge, workflow dispatch, and repository settings are
+unavailable. Returning `PI_AGENT_MCP_MODE` to `off` removes MCP from new Agent
+containers.
 
 `make demo-slack` starts a loopback-only host orchestrator, a model-only gateway,
 and the Slack worker. It creates an internal Docker network so Agent containers

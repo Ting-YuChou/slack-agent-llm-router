@@ -44,6 +44,16 @@ export default function policyExtension(pi: ExtensionAPI) {
   let toolCalls = 0;
   let writeApproved = false;
 
+  if (process.env.PI_AGENT_JEV_CLASSIFIER_MODE === "on") {
+    pi.on("before_agent_start", (event) => {
+      event.systemPromptOptions.sections.jev_classifier = [
+        "For semantic classification, ranking, or yes/no probability that affects only your analysis, you may use codemode models.classify with openrouter/typesafe/jev-1.13.",
+        "Prefer deterministic code for exact rules, and do not use classifier output as authorization for writes, shell commands, approvals, deployment, or deletion.",
+        "Check stopReason and use the returned probabilities; continue without Jev if the classifier is unavailable.",
+      ].join(" ");
+    });
+  }
+
   pi.on("input", () => {
     turns = 0;
     toolCalls = 0;

@@ -9,22 +9,28 @@ test("agent runtime exposes an HTTP server module", () => {
   assert.equal(existsSync(modulePath), true);
 });
 
-test("runtime pins the Pi coding agent package", () => {
+test("runtime pins the Pi 1.0.1 package set", () => {
   const packagePath = fileURLToPath(new URL("../../package.json", import.meta.url));
   const packageJson = JSON.parse(readFileSync(packagePath, "utf8"));
 
-  assert.equal(packageJson.dependencies["@earendil-works/pi-coding-agent"], "0.83.0");
+  assert.equal(packageJson.dependencies["@earendil-works/pi-agent-core"], "1.0.1");
+  assert.equal(packageJson.dependencies["@earendil-works/pi-ai"], "1.0.1");
+  assert.equal(packageJson.dependencies["@earendil-works/pi-coding-agent"], "1.0.1");
   assert.equal(packageJson.dependencies["brace-expansion"], "5.0.12");
+  assert.equal(packageJson.dependencies.typebox, "1.3.27");
   assert.equal(packageJson.dependencies.undici, "8.11.2");
+  assert.equal(packageJson.scripts["patch-vendored-deps"], undefined);
 });
 
 test("runtime ships explicit policy extension, plugin and skill locks, and container image", () => {
   for (const relative of [
     "../../extensions/policy.ts",
+    "../../extensions/mcp-bootstrap.ts",
     "../../plugins.lock.json",
     "../../skills.lock.json",
     "../../skills/test-gap/SKILL.md",
     "../../Dockerfile.agent",
+    "../../Dockerfile.mcp-gateway",
   ]) {
     assert.equal(existsSync(fileURLToPath(new URL(relative, import.meta.url))), true, relative);
   }

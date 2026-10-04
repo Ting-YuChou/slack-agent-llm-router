@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  buildClassifierGatewayProviderRegistration,
   buildGatewayProviderRegistrations,
   DEFAULT_AGENT_MODEL_REF,
   gatewayProviderConfig,
@@ -46,6 +47,14 @@ test("gateway provider configuration keeps each Pi adapter on its fixed internal
     gatewayProviderConfig("http://model-gateway:8080", "opencode-go/deepseek-v4-pro").baseUrl,
     "http://model-gateway:8080/opencode-go/v1",
   );
+});
+
+test("Jev classifier registration preserves Pi's built-in OpenRouter catalog behind the internal gateway", () => {
+  assert.deepEqual(buildClassifierGatewayProviderRegistration("http://model-gateway:8080"), {
+    provider: "openrouter",
+    apiKey: "$OPENROUTER_API_KEY",
+    baseUrl: "http://model-gateway:8080/openrouter/api/v1",
+  });
 });
 
 test("agent model resolver uses the OpenAI model by default and rejects non-allowlisted models", () => {

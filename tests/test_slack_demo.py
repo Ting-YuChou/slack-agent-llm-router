@@ -304,19 +304,66 @@ def test_demo_env_and_makefile_include_agent_setup():
 
     assert "AGENT_RUNTIME_TOKEN=" in env_example
     assert "MODEL_GATEWAY_SIGNING_SECRET=" in env_example
+    assert "MCP_GATEWAY_SIGNING_SECRET=" in env_example
+    assert "PI_AGENT_MCP_MODE=off" in env_example
+    assert "PI_AGENT_JEV_CLASSIFIER_MODE=off" in env_example
+    assert "PI_AGENT_MCP_GATEWAY_URL=http://mcp-gateway:8090/mcp" in env_example
+    assert "PI_AGENT_GITHUB_REPOSITORIES=" in env_example
     assert "ANTHROPIC_API_KEY=" in env_example
     assert "OPENCODE_API_KEY=" in env_example
     assert "demo-agent-install:" in makefile
     assert "npm --prefix agent-runtime ci --ignore-scripts" in makefile
     assert "demo-agent-images:" in makefile
-    assert "run lock-image -- slack-pi-agent:0.83.0" in makefile
+    assert "run lock-image -- slack-pi-agent:1.0.1" in makefile
+    assert (
+        "github/github-mcp-server@sha256:7aaeeec9ae4fe9a736d100c1ff0798f3c219b5009e05f5d3945fcacb13cc196b"
+        in makefile
+    )
 
 
 def test_demo_gateway_uses_the_hostname_required_by_agent_policy():
     launcher = (ROOT / "scripts" / "run_slack_demo.sh").read_text(encoding="utf-8")
+    gateway_block = launcher.split('--name "${gateway_container}"', 1)[1].split(
+        "gateway_started=true", 1
+    )[0]
 
     assert "--network-alias model-gateway" in launcher
     assert "--env ANTHROPIC_API_KEY" in launcher
     assert "--env OPENCODE_API_KEY" in launcher
+    assert "--env OPENROUTER_API_KEY" in gateway_block
     assert "PI_AGENT_CONFIGURED_PROVIDERS" in launcher
     assert "env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u OPENCODE_API_KEY" in launcher
+    assert (
+        "-u GITHUB_APP_ID -u GITHUB_APP_INSTALLATION_ID -u GITHUB_APP_PRIVATE_KEY_PATH"
+        in launcher
+    )
+    assert (
+        "-u MCP_GATEWAY_SIGNING_SECRET -u GITHUB_APP_ID -u GITHUB_APP_INSTALLATION_ID"
+        in launcher
+    )
+    assert "-u GITHUB_APP_PRIVATE_KEY_PATH -u PI_AGENT_GITHUB_REPOSITORIES" in launcher
+
+
+def test_demo_mcp_gateway_has_dual_networks_and_cleanup():
+    launcher = (ROOT / "scripts" / "run_slack_demo.sh").read_text(encoding="utf-8")
+
+    assert "--network-alias mcp-gateway" in launcher
+    assert (
+        'docker network connect "${mcp_egress_network}" "${mcp_gateway_container}"'
+        in launcher
+    )
+    assert "GITHUB_READ_ONLY=1" in launcher
+    assert "GITHUB_LOCKDOWN_MODE=1" in launcher
+    assert "GITHUB_TOOLSETS=repos,issues,pull_requests" in launcher
+    assert (
+        "GITHUB_TOOLS=get_file_contents,search_code,issue_read,list_issues,pull_request_read,list_pull_requests"
+        in launcher
+    )
+    assert (
+        '--mount "type=bind,src=${GITHUB_APP_PRIVATE_KEY_PATH},dst=/run/secrets/github-app.pem,readonly"'
+        in launcher
+    )
+    assert "--env GITHUB_APP_PRIVATE_KEY " not in launcher
+    assert 'docker stop "${mcp_gateway_container}"' in launcher
+    assert 'docker stop "${github_mcp_container}"' in launcher
+    assert 'docker network rm "${mcp_egress_network}"' in launcher
