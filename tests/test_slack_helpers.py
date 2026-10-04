@@ -480,7 +480,9 @@ class TestSlackMessageHandler:
 
         assert len(response) <= 360
         assert "src/a.py" in response
-        assert "`github` / `get_file_contents` / `acme/widgets` / *succeeded*" in response
+        assert (
+            "`github` / `get_file_contents` / `acme/widgets` / *succeeded*" in response
+        )
         assert "git cherry-pick" in response
 
 
