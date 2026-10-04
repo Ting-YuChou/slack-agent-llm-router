@@ -25,10 +25,12 @@ test("runtime pins the Pi 1.0.1 package set", () => {
 test("runtime ships explicit policy extension, plugin and skill locks, and container image", () => {
   for (const relative of [
     "../../extensions/policy.ts",
+    "../../extensions/mcp-bootstrap.ts",
     "../../plugins.lock.json",
     "../../skills.lock.json",
     "../../skills/test-gap/SKILL.md",
     "../../Dockerfile.agent",
+    "../../Dockerfile.mcp-gateway",
   ]) {
     assert.equal(existsSync(fileURLToPath(new URL(relative, import.meta.url))), true, relative);
   }
