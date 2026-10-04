@@ -8,7 +8,10 @@ import { promisify } from "node:util";
 import { DockerPiProcess } from "./container-runtime.js";
 import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT, listAgentModels, resolveAgentModel } from "./agent-model.js";
 import { JevRouter, type JevMode } from "./jev-router.js";
+import { repositoryFromRemote, parseGitHubRepositories } from "./github-repository.js";
 import { issueGatewayToken } from "./gateway-token.js";
+import { GITHUB_READ_ONLY_TOOLS, parseMcpMode } from "./mcp-config.js";
+import { issueMcpToken } from "./mcp-token.js";
 import {
   CodingAgentOrchestrator,
   RuntimeError,
@@ -142,6 +145,9 @@ export async function createProductionServer() {
   const image = process.env.PI_AGENT_IMAGE ?? "slack-pi-agent:1.0.1";
   const network = process.env.PI_AGENT_NETWORK ?? "pi-model-only";
   const gatewayUrl = process.env.PI_MODEL_GATEWAY_URL ?? "http://model-gateway:8080";
+  const mcpMode = parseMcpMode(process.env.PI_AGENT_MCP_MODE);
+  const mcpGatewayUrl = process.env.PI_AGENT_MCP_GATEWAY_URL ?? "http://mcp-gateway:8090/mcp";
+  const mcpSigningSecret = process.env.MCP_GATEWAY_SIGNING_SECRET ?? "";
   const configuredProviders = new Set(
     (process.env.PI_AGENT_CONFIGURED_PROVIDERS ?? "openai")
       .split(",")
@@ -173,6 +179,24 @@ export async function createProductionServer() {
   const integrityHealthy = lock.healthy && skillLock.healthy;
   const gitCommon = (await exec("git", ["rev-parse", "--git-common-dir"], { cwd: repoPath, encoding: "utf8" })).stdout.trim();
   const gitMetadataPath = path.resolve(repoPath, gitCommon);
+  let mcpRepository: string | undefined;
+  let mcpGatewayReachable = false;
+  if (mcpMode === "github_read_only") {
+    if (!mcpSigningSecret) throw new Error("MCP_GATEWAY_SIGNING_SECRET is required when MCP is enabled");
+    const repositories = parseGitHubRepositories(process.env.PI_AGENT_GITHUB_REPOSITORIES);
+    if (repositories.length === 0) throw new Error("PI_AGENT_GITHUB_REPOSITORIES is required when MCP is enabled");
+    const remote = (await exec("git", ["remote", "get-url", "origin"], { cwd: repoPath, encoding: "utf8" })).stdout.trim();
+    const currentRepository = repositoryFromRemote(remote);
+    mcpRepository = repositories.find((repository) => repository.toLowerCase() === currentRepository?.toLowerCase());
+    if (!mcpRepository) throw new Error("The Agent repository is not in PI_AGENT_GITHUB_REPOSITORIES");
+    mcpGatewayReachable = await probeMcpGateway(mcpGatewayUrl);
+  }
+  if (mcpMode === "github_read_only") {
+    const healthTimer = setInterval(() => {
+      void probeMcpGateway(mcpGatewayUrl).then((reachable) => { mcpGatewayReachable = reachable; });
+    }, positiveInteger(process.env.PI_AGENT_MCP_HEALTH_INTERVAL_MS, 5_000));
+    healthTimer.unref();
+  }
   const worktrees = new WorktreeManager({
     repoPath,
     worktreeRoot,
@@ -187,6 +211,7 @@ export async function createProductionServer() {
     deadlineMs: positiveInteger(process.env.PI_AGENT_DEADLINE_MS, 15 * 60_000),
     availableModelRefs: configuredModels.map((model) => model.ref),
     router,
+    mcpRepository,
     startProcess: async (session, onEvent) => {
       const model = resolveAgentModel(session.modelRef);
       const sessionStatePath = path.join(runtimeRoot, "sessions", session.id);
@@ -208,6 +233,13 @@ export async function createProductionServer() {
           continueSession: session.restored,
           safeCommands: parseSafeCommands(process.env.PI_AGENT_SAFE_COMMANDS),
           user: containerUser,
+          ...(mcpMode === "github_read_only" ? {
+            mcp: {
+              mode: "github_read_only" as const,
+              gatewayUrl: mcpGatewayUrl,
+              tools: [...GITHUB_READ_ONLY_TOOLS],
+            },
+          } : {}),
         },
         (runId, route) => {
           const selectedModel = resolveAgentModel(route.modelRef);
@@ -221,18 +253,34 @@ export async function createProductionServer() {
           }, gatewaySecret);
         },
         onEvent,
+        mcpMode === "github_read_only" ? (runId) => issueMcpToken({
+          run: runId,
+          session: session.id,
+          slackUser: session.ownerUserId,
+          repository: mcpRepository!,
+          server: "github",
+          tools: [...GITHUB_READ_ONLY_TOOLS],
+          mode: "github_read_only",
+          expiry: Date.now() + 16 * 60_000,
+        }, mcpSigningSecret) : undefined,
       );
     },
   });
   await orchestrator.restore();
+  const runtimeHealthy = () => integrityHealthy && (mcpMode === "off" || mcpGatewayReachable);
   return createAgentHttpServer({
     orchestrator,
     token,
-    acceptRuns: () => integrityHealthy,
+    acceptRuns: runtimeHealthy,
     health: () => ({
-      status: integrityHealthy ? "healthy" : "unhealthy",
+      status: runtimeHealthy() ? "healthy" : "unhealthy",
       runtime: "pi-coding-agent",
       version: "1.0.1",
+      pi_version: "1.0.1",
+      mcp_mode: mcpMode,
+      mcp_gateway_reachable: mcpGatewayReachable,
+      mcp_servers: mcpMode === "github_read_only" ? ["github"] : [],
+      mcp_tool_count: mcpMode === "github_read_only" ? GITHUB_READ_ONLY_TOOLS.length : 0,
       provider: "openai",
       model: AGENT_MODEL_ID,
       reasoning_effort: AGENT_REASONING_EFFORT,
@@ -247,9 +295,25 @@ export async function createProductionServer() {
       plugin_integrity: lock.healthy ? "verified" : "failed",
       skills: skillLock.skills.map((skill) => skill.name),
       skill_integrity: skillLock.healthy ? "verified" : "failed",
-      errors: integrityHealthy ? [] : [...lock.errors, ...skillLock.errors],
+      errors: runtimeHealthy() ? [] : [
+        ...lock.errors,
+        ...skillLock.errors,
+        ...(mcpMode !== "off" && !mcpGatewayReachable ? ["MCP gateway is unreachable"] : []),
+      ],
     }),
   });
+}
+
+async function probeMcpGateway(gatewayUrl: string): Promise<boolean> {
+  try {
+    const url = new URL(gatewayUrl);
+    const healthUrl = new URL("/healthz", url);
+    if (url.hostname === "mcp-gateway") healthUrl.hostname = "127.0.0.1";
+    const response = await fetch(healthUrl, { signal: AbortSignal.timeout(1_000) });
+    return response.ok;
+  } catch {
+    return false;
+  }
 }
 
 async function inspectImageDigest(image: string): Promise<string> {

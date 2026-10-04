@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { buildMcpRegistration, parseMcpMode } from "../src/mcp-config.js";
+import { buildMcpRegistration, namespacedMcpToolNames, parseMcpMode } from "../src/mcp-config.js";
 
 test("MCP mode defaults to off and reserves approved_write for a later release", () => {
   assert.equal(parseMcpMode(undefined), "off");
@@ -25,8 +25,15 @@ test("trusted MCP registration exposes only explicitly allowlisted direct tools"
       get_file_contents: "direct",
       search_code: "direct",
     },
-    timeout: 30_000,
+    timeout: 30,
   });
+});
+
+test("namespacedMcpToolNames matches Pi's direct MCP tool names", () => {
+  assert.deepEqual(namespacedMcpToolNames("github", ["get_file_contents", "search-code"]), [
+    "mcp__github__get_file_contents",
+    "mcp__github__search_code",
+  ]);
 });
 
 test("trusted MCP registration rejects external and credential-bearing URLs", () => {

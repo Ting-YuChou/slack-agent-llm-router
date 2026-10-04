@@ -98,4 +98,5 @@ test("MCP is absent when off and explicitly loads only the trusted builtin path 
   assert.match(rendered, /PI_AGENT_MCP_TOKEN=run-bound-mcp-token/);
   assert.match(rendered, /PI_AGENT_MCP_TOOLS_JSON=\["get_file_contents","search_code"\]/);
   assert.match(rendered, /--no-extensions.*-e builtin:mcp.*-e \/opt\/pi\/extensions\/mcp-bootstrap\.ts/);
+  assert.match(rendered, /--tools read,mcp__github__get_file_contents/);
 });

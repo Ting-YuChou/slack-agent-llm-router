@@ -7,6 +7,7 @@ import { resolveAgentModel } from "./agent-model.js";
 import type { AgentReasoningEffort } from "./agent-model.js";
 import type { RouteDecision } from "./jev-router.js";
 import type { McpRunConfig } from "./mcp-config.js";
+import { namespacedMcpToolNames } from "./mcp-config.js";
 
 export interface AgentContainerOptions {
   name: string;
@@ -71,7 +72,7 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     "--no-skills",
     "--no-prompt-templates",
     "--no-themes",
-    "--tools", options.toolNames.join(","),
+    "--tools", [...options.toolNames, ...(options.mcp ? namespacedMcpToolNames("github", options.mcp.tools) : [])].join(","),
   ];
   if (options.continueSession) args.push("--continue");
   if (options.mcp) {
@@ -95,18 +96,21 @@ export class DockerPiProcess implements AgentProcess {
   private hasSession = false;
   private activeContainerName?: string;
   private stopping?: Promise<void>;
-  private readonly options: Omit<AgentContainerOptions, "gatewayToken">;
+  private readonly options: Omit<AgentContainerOptions, "gatewayToken" | "mcp"> & { mcp?: Omit<McpRunConfig, "token"> };
   private readonly tokenForRun: (runId: string, route: RouteDecision) => string;
   private readonly onEvent: (event: PublicRunEvent) => void;
+  private readonly mcpTokenForRun?: (runId: string) => string;
 
   constructor(
-    options: Omit<AgentContainerOptions, "gatewayToken">,
+    options: Omit<AgentContainerOptions, "gatewayToken" | "mcp"> & { mcp?: Omit<McpRunConfig, "token"> },
     tokenForRun: (runId: string, route: RouteDecision) => string,
     onEvent: (event: PublicRunEvent) => void,
+    mcpTokenForRun?: (runId: string) => string,
   ) {
     this.options = options;
     this.tokenForRun = tokenForRun;
     this.onEvent = onEvent;
+    this.mcpTokenForRun = mcpTokenForRun;
     this.hasSession = options.continueSession ?? false;
   }
 
@@ -115,12 +119,15 @@ export class DockerPiProcess implements AgentProcess {
     this.closing = false;
     const containerName = `${this.options.name}-${runId.slice(0, 8)}`;
     this.activeContainerName = containerName;
+    const { mcp, ...baseOptions } = this.options;
+    if (mcp && !this.mcpTokenForRun) throw new Error("MCP token issuer is required when MCP is enabled");
     const child = spawn("docker", buildAgentDockerArgs({
-      ...this.options,
+      ...baseOptions,
       name: containerName,
       modelRef: route.modelRef,
       reasoningEffort: route.effort,
       gatewayToken: this.tokenForRun(runId, route),
+      ...(mcp ? { mcp: { ...mcp, token: this.mcpTokenForRun!(runId) } } : {}),
       continueSession: this.hasSession,
     }), {
       stdio: ["pipe", "pipe", "pipe"],

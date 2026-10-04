@@ -1,7 +1,7 @@
 export type PublicRunEvent =
   | { type: "turn" }
   | { type: "usage"; cost_usd: number }
-  | { type: "tool"; phase: "start" | "end"; tool_call_id: string; tool: string; input?: Record<string, unknown>; is_error?: boolean }
+  | { type: "tool"; phase: "start" | "end"; tool_call_id: string; tool: string; input?: Record<string, unknown>; is_error?: boolean; result_bytes?: number }
   | { type: "approval"; approval_id: string; title: string; detail: string; timeout_ms?: number }
   | { type: "answer"; text: string }
   | { type: "settled" }
@@ -56,12 +56,13 @@ export function sanitizeRpcEvent(record: Record<string, unknown>): PublicRunEven
     return text ? { type: "answer", text } : null;
   }
   if (type === "tool_execution_start") {
+    const tool = safeString(record.toolName);
     return {
       type: "tool",
       phase: "start",
       tool_call_id: safeString(record.toolCallId),
-      tool: safeString(record.toolName),
-      input: sanitizeToolInput(record.args),
+      tool,
+      ...(tool.startsWith("mcp__") ? {} : { input: sanitizeToolInput(record.args) }),
     };
   }
   if (type === "tool_execution_end") {
@@ -71,6 +72,7 @@ export function sanitizeRpcEvent(record: Record<string, unknown>): PublicRunEven
       tool_call_id: safeString(record.toolCallId),
       tool: safeString(record.toolName),
       is_error: record.isError === true,
+      result_bytes: byteSize(record.result),
     };
   }
   if (type === "extension_ui_request" && record.method === "confirm") {
@@ -87,6 +89,10 @@ export function sanitizeRpcEvent(record: Record<string, unknown>): PublicRunEven
     return { type: "error", code: "extension_error", message: "A trusted extension failed" };
   }
   return null;
+}
+
+function byteSize(value: unknown): number {
+  try { return Buffer.byteLength(JSON.stringify(value ?? null)); } catch { return 0; }
 }
 
 function sanitizeToolInput(value: unknown): Record<string, unknown> | undefined {

@@ -98,3 +98,17 @@ test("bridge forwards billed assistant cost without exposing response content", 
   bridge.feed(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], usage: { cost: { total: 0.004 } } } }) + "\n");
   assert.deepEqual(events, [{ type: "usage", cost_usd: 0.004 }]);
 });
+
+test("MCP tool events retain only names, status and result byte count", () => {
+  const start = sanitizeRpcEvent({
+    type: "tool_execution_start", toolCallId: "m1", toolName: "mcp__github__search_code",
+    args: { query: "repo:acme/widgets secret search", authorization: "Bearer secret" },
+  });
+  const end = sanitizeRpcEvent({
+    type: "tool_execution_end", toolCallId: "m1", toolName: "mcp__github__search_code",
+    result: { content: [{ type: "text", text: "private result" }] }, isError: false,
+  });
+  assert.equal(JSON.stringify(start).includes("secret"), false);
+  assert.equal((end as any).result_bytes > 0, true);
+  assert.equal(JSON.stringify(end).includes("private result"), false);
+});
