@@ -1,5 +1,14 @@
 import type { McpMode } from "./mcp-token.js";
 
+export const GITHUB_READ_ONLY_TOOLS = [
+  "get_file_contents",
+  "search_code",
+  "issue_read",
+  "list_issues",
+  "pull_request_read",
+  "list_pull_requests",
+] as const;
+
 export interface McpRunConfig {
   mode: "github_read_only";
   gatewayUrl: string;
@@ -13,6 +22,11 @@ export interface McpRegistration {
   exposure: "hidden";
   toolExposure: Record<string, "direct">;
   timeout: number;
+}
+
+export function namespacedMcpToolNames(server: string, tools: readonly string[]): string[] {
+  const namespace = server.replaceAll("-", "_");
+  return tools.map((tool) => `mcp__${namespace}__${tool.replaceAll("-", "_")}`);
 }
 
 export function parseMcpMode(value: string | undefined): McpMode {
@@ -42,6 +56,6 @@ export function buildMcpRegistration(config: McpRunConfig): McpRegistration {
     headers: { Authorization: `Bearer ${config.token}` },
     exposure: "hidden",
     toolExposure: Object.fromEntries(config.tools.map((tool) => [tool, "direct"])),
-    timeout: 30_000,
+    timeout: 30,
   };
 }

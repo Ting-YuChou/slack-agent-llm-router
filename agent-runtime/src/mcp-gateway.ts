@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
 import { verifyMcpToken, type McpClaims } from "./mcp-token.js";
+import { GITHUB_READ_ONLY_TOOLS } from "./mcp-config.js";
 
 const DEFAULT_MAX_REQUEST_BYTES = 256_000;
 const DEFAULT_MAX_RESULT_BYTES = 1_048_576;
@@ -23,20 +24,23 @@ export interface McpGatewayOptions {
   maxRequestBytes?: number;
   maxResultBytes?: number;
   onAudit?: (event: McpAuditEvent) => void;
+  upstreamHeaders?: () => Promise<Record<string, string>>;
+  healthCheck?: () => Promise<boolean>;
 }
 
 export function createMcpGatewayServer(options: McpGatewayOptions) {
   if (!options.signingSecret) throw new Error("MCP gateway signing secret is required");
   const upstreamUrl = new URL(options.upstreamUrl);
   if (!/^https?:$/.test(upstreamUrl.protocol)) throw new Error("MCP upstream URL must use HTTP(S)");
-  const sessionBindings = new Map<string, string>();
+  const sessionBindings = new Map<string, { identity: string; expiry: number }>();
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxRequestBytes = options.maxRequestBytes ?? DEFAULT_MAX_REQUEST_BYTES;
   const maxResultBytes = options.maxResultBytes ?? DEFAULT_MAX_RESULT_BYTES;
 
   return createServer(async (request, response) => {
     if (request.method === "GET" && request.url === "/healthz") {
-      sendJson(response, 200, { status: "healthy", server: "github" });
+      const healthy = await options.healthCheck?.().catch(() => false) ?? true;
+      sendJson(response, healthy ? 200 : 503, { status: healthy ? "healthy" : "unhealthy", server: "github" });
       return;
     }
     if (request.url !== "/mcp" || !["POST", "GET", "DELETE"].includes(request.method ?? "")) {
@@ -44,18 +48,22 @@ export function createMcpGatewayServer(options: McpGatewayOptions) {
       return;
     }
     const claims = authenticate(request, options.signingSecret);
-    if (!claims) {
+    if (!claims || claims.tools.some((tool) => !GITHUB_READ_ONLY_TOOLS.includes(tool as typeof GITHUB_READ_ONLY_TOOLS[number]))) {
       sendError(response, 401, "unauthorized", "A valid MCP token is required");
       return;
     }
+    for (const [sessionId, binding] of sessionBindings) {
+      if (binding.expiry < Date.now()) sessionBindings.delete(sessionId);
+    }
     const identity = `${claims.session}:${claims.run}:${claims.slackUser}`;
     const requestedSession = singleHeader(request.headers["mcp-session-id"]);
-    if (requestedSession && sessionBindings.get(requestedSession) !== identity) {
+    if (requestedSession && sessionBindings.get(requestedSession)?.identity !== identity) {
       sendError(response, 403, "session_forbidden", "MCP session is not bound to this run");
       return;
     }
     if (request.method !== "POST") {
-      await proxyStreamingRequest(request, response, upstreamUrl, timeoutMs);
+      await proxyStreamingRequest(request, response, upstreamUrl, timeoutMs, options.upstreamHeaders);
+      if (request.method === "DELETE" && requestedSession) sessionBindings.delete(requestedSession);
       return;
     }
 
@@ -74,31 +82,42 @@ export function createMcpGatewayServer(options: McpGatewayOptions) {
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       let upstream: Response;
       try {
+        const headers = upstreamHeaders(request);
+        for (const [name, value] of Object.entries(await options.upstreamHeaders?.() ?? {})) headers.set(name, value);
         upstream = await fetch(upstreamUrl, {
           method: "POST",
-          headers: upstreamHeaders(request),
+          headers,
           body: raw.toString("utf8"),
           signal: controller.signal,
         });
       } catch (error) {
+        clearTimeout(timer);
         const code = error instanceof Error && error.name === "AbortError" ? "upstream_timeout" : "upstream_unavailable";
         audit(options, claims, tool, started, false, code, 0);
         sendError(response, 502, code, "GitHub MCP is unavailable");
         return;
-      } finally {
-        clearTimeout(timer);
       }
       const contentLength = Number(upstream.headers.get("content-length") ?? "0");
       if (Number.isFinite(contentLength) && contentLength > maxResultBytes) {
+        clearTimeout(timer);
+        controller.abort();
         audit(options, claims, tool, started, false, "result_too_large", contentLength);
         sendError(response, 502, "result_too_large", "GitHub MCP result exceeded the size limit");
         return;
       }
-      const bytes = Buffer.from(await upstream.arrayBuffer());
-      if (bytes.length > maxResultBytes) {
-        audit(options, claims, tool, started, false, "result_too_large", bytes.length);
-        sendError(response, 502, "result_too_large", "GitHub MCP result exceeded the size limit");
+      let bytes: Buffer;
+      try {
+        bytes = await readResponseBody(upstream, maxResultBytes);
+      } catch (error) {
+        const tooLarge = error instanceof ResultTooLargeError;
+        const code = tooLarge ? "result_too_large" : error instanceof Error && error.name === "AbortError"
+          ? "upstream_timeout" : "upstream_unavailable";
+        audit(options, claims, tool, started, false, code, tooLarge ? error.bytes : 0);
+        sendError(response, 502, code, tooLarge
+          ? "GitHub MCP result exceeded the size limit" : "GitHub MCP is unavailable");
         return;
+      } finally {
+        clearTimeout(timer);
       }
       const contentType = upstream.headers.get("content-type") ?? "";
       let output: Buffer;
@@ -112,12 +131,12 @@ export function createMcpGatewayServer(options: McpGatewayOptions) {
       const upstreamSession = upstream.headers.get("mcp-session-id");
       if (upstreamSession) {
         const existing = sessionBindings.get(upstreamSession);
-        if (existing && existing !== identity) {
+        if (existing && existing.identity !== identity) {
           audit(options, claims, tool, started, false, "session_collision", output.length);
           sendError(response, 502, "session_collision", "GitHub MCP returned an invalid session");
           return;
         }
-        sessionBindings.set(upstreamSession, identity);
+        sessionBindings.set(upstreamSession, { identity, expiry: claims.expiry });
         response.setHeader("mcp-session-id", upstreamSession);
       }
       const protocolVersion = upstream.headers.get("mcp-protocol-version");
@@ -137,6 +156,10 @@ export function createMcpGatewayServer(options: McpGatewayOptions) {
 
 class GatewayRequestError extends Error {
   constructor(public readonly status: number, public readonly code: string, message: string) { super(message); }
+}
+
+class ResultTooLargeError extends Error {
+  constructor(public readonly bytes: number) { super("MCP result exceeded the size limit"); }
 }
 
 interface JsonRpcRequest {
@@ -206,11 +229,19 @@ function filterToolList(value: Record<string, unknown>, method: string, tools: S
   value.result.tools = value.result.tools.filter((tool) => isRecord(tool) && typeof tool.name === "string" && tools.has(tool.name));
 }
 
-async function proxyStreamingRequest(request: IncomingMessage, response: ServerResponse, upstreamUrl: URL, timeoutMs: number): Promise<void> {
+async function proxyStreamingRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  upstreamUrl: URL,
+  timeoutMs: number,
+  additionalHeaders?: () => Promise<Record<string, string>>,
+): Promise<void> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const upstream = await fetch(upstreamUrl, { method: request.method, headers: upstreamHeaders(request), signal: controller.signal });
+    const headers = upstreamHeaders(request);
+    for (const [name, value] of Object.entries(await additionalHeaders?.() ?? {})) headers.set(name, value);
+    const upstream = await fetch(upstreamUrl, { method: request.method, headers, signal: controller.signal });
     response.statusCode = upstream.status;
     for (const name of ["content-type", "mcp-session-id", "mcp-protocol-version"]) {
       const value = upstream.headers.get(name);
@@ -261,6 +292,25 @@ async function readBody(request: IncomingMessage, limit: number): Promise<Buffer
     chunks.push(bytes);
   }
   return Buffer.concat(chunks);
+}
+
+async function readResponseBody(response: Response, limit: number): Promise<Buffer> {
+  if (!response.body) return Buffer.alloc(0);
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = Buffer.from(value);
+    total += chunk.length;
+    if (total > limit) {
+      await reader.cancel().catch(() => undefined);
+      throw new ResultTooLargeError(total);
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, total);
 }
 
 function audit(options: McpGatewayOptions, claims: McpClaims, tool: string, started: number, success: boolean, errorCode: string | undefined, resultBytes: number): void {

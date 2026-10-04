@@ -56,6 +56,13 @@ export interface RunRecord {
   reasoning_effort?: string;
   routing?: RouteDecision;
   estimated_cost_usd?: number;
+  mcp_server?: string;
+  mcp_tool?: string;
+  mcp_repository?: string;
+  mcp_latency_ms?: number;
+  mcp_success?: boolean;
+  mcp_error_code?: string | null;
+  mcp_result_bytes?: number;
   created_at: string;
   updated_at: string;
   tool_count: number;
@@ -101,12 +108,13 @@ interface SessionRecord {
 
 export class CodingAgentOrchestrator {
   private readonly worktrees: Worktrees;
-  private readonly startProcess: (session: { id: string; worktreePath: string; modelRef: string; restored?: boolean }, onEvent: (event: PublicRunEvent) => void) => Promise<AgentProcess>;
+  private readonly startProcess: (session: { id: string; ownerUserId: string; worktreePath: string; modelRef: string; restored?: boolean }, onEvent: (event: PublicRunEvent) => void) => Promise<AgentProcess>;
   private readonly maxActiveSessions: number;
   private readonly deadlineMs: number;
   private readonly availableModelRefs: Set<string>;
   private readonly stateStore?: RuntimeStateStore;
   private readonly router?: { route(text?: string): Promise<RouteDecision> };
+  private readonly mcpRepository?: string;
   private readonly approvals = new ApprovalStore();
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly threadSessions = new Map<string, string>();
@@ -116,6 +124,7 @@ export class CodingAgentOrchestrator {
   private readonly pendingThreadKeys = new Set<string>();
   private readonly pendingSessionIds = new Set<string>();
   private readonly closingSessionIds = new Set<string>();
+  private readonly mcpToolStarts = new Map<string, number>();
   private startingSessions = 0;
 
   constructor(options: {
@@ -126,6 +135,7 @@ export class CodingAgentOrchestrator {
     stateStore?: RuntimeStateStore;
     availableModelRefs?: string[];
     router?: { route(text?: string): Promise<RouteDecision> };
+    mcpRepository?: string;
   }) {
     this.worktrees = options.worktrees;
     this.startProcess = options.startProcess;
@@ -134,6 +144,7 @@ export class CodingAgentOrchestrator {
     this.availableModelRefs = new Set(options.availableModelRefs ?? listAgentModels().map((model) => model.ref));
     this.stateStore = options.stateStore;
     this.router = options.router;
+    this.mcpRepository = options.mcpRepository;
   }
 
   async restore(): Promise<void> {
@@ -155,7 +166,7 @@ export class CodingAgentOrchestrator {
       let session!: SessionRecord;
       const modelRef = saved.modelRef ?? resolveAgentModel().ref;
       const process = await this.startProcess(
-        { id: saved.id, worktreePath: saved.worktreePath, modelRef, restored: true },
+        { id: saved.id, ownerUserId: saved.ownerUserId, worktreePath: saved.worktreePath, modelRef, restored: true },
         (event) => this.handleProcessEvent(session.id, event),
       );
       session = { ...saved, modelRef, autoRouting: saved.autoRouting === true, process };
@@ -205,7 +216,7 @@ export class CodingAgentOrchestrator {
       let process: AgentProcess;
       try {
         process = await this.startProcess(
-          { id: sessionId, worktreePath: worktree.path, modelRef: route.modelRef },
+          { id: sessionId, ownerUserId: input.user_id, worktreePath: worktree.path, modelRef: route.modelRef },
           (event) => this.handleProcessEvent(session.id, event),
         );
       } catch (error) {
@@ -432,7 +443,32 @@ export class CodingAgentOrchestrator {
     }
     if (event.type === "tool") {
       if (event.phase === "start") run.tool_count += 1;
-      run.events.push(event);
+      const mcpTool = /^mcp__github__(.+)$/.exec(event.tool)?.[1];
+      if (mcpTool && this.mcpRepository) {
+        const timingKey = `${sessionId}:${event.tool_call_id}`;
+        if (event.phase === "start") this.mcpToolStarts.set(timingKey, Date.now());
+        const started = this.mcpToolStarts.get(timingKey);
+        if (event.phase === "end") this.mcpToolStarts.delete(timingKey);
+        run.mcp_server = "github";
+        run.mcp_tool = mcpTool;
+        run.mcp_repository = this.mcpRepository;
+        if (event.phase === "end") {
+          run.mcp_latency_ms = started === undefined ? 0 : Math.max(0, Date.now() - started);
+          run.mcp_success = event.is_error !== true;
+          run.mcp_error_code = event.is_error === true ? "tool_error" : null;
+          run.mcp_result_bytes = event.result_bytes ?? 0;
+        }
+        run.events.push({
+          type: "mcp",
+          phase: event.phase,
+          server: "github",
+          tool: mcpTool,
+          repository: this.mcpRepository,
+          ...(event.phase === "end" ? { success: event.is_error !== true } : {}),
+        });
+      } else {
+        run.events.push(event);
+      }
       void this.persistState();
       return;
     }
@@ -527,6 +563,9 @@ export class CodingAgentOrchestrator {
     const timer = this.deadlines.get(runId);
     if (timer) clearTimeout(timer);
     this.deadlines.delete(runId);
+    for (const key of this.mcpToolStarts.keys()) {
+      if (key.startsWith(`${session.id}:`)) this.mcpToolStarts.delete(key);
+    }
     if (session.activeRunId === runId) session.activeRunId = undefined;
   }
 

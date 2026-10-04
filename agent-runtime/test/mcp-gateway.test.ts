@@ -39,16 +39,28 @@ async function post(url: string, body: unknown, bearer = token(), headers: Recor
   });
 }
 
-test("gateway exposes health and forwards initialize without credentials", async (t) => {
+test("gateway exposes health and replaces the run token with fixed GitHub upstream headers", async (t) => {
   let forwardedAuthorization: string | undefined;
+  let forwardedReadonly: string | undefined;
   const upstream = createServer((request, response) => {
     forwardedAuthorization = request.headers.authorization;
+    forwardedReadonly = request.headers["x-mcp-readonly"] as string | undefined;
     response.setHeader("content-type", "application/json");
     response.setHeader("mcp-session-id", "upstream-session");
     response.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "github", version: "test" } } }));
   });
   const upstreamUrl = await listen(upstream);
-  const gateway = createMcpGatewayServer({ signingSecret: secret, upstreamUrl: `${upstreamUrl}/mcp` });
+  const gateway = createMcpGatewayServer({
+    signingSecret: secret,
+    upstreamUrl: `${upstreamUrl}/mcp`,
+    upstreamHeaders: async () => ({
+      Authorization: "Bearer github-installation-token",
+      "X-MCP-Readonly": "true",
+      "X-MCP-Lockdown": "true",
+      "X-MCP-Toolsets": "repos,issues,pull_requests",
+      "X-MCP-Tools": baseClaims.tools.join(","),
+    }),
+  });
   const gatewayUrl = await listen(gateway);
   t.after(async () => { await close(gateway); await close(upstream); });
 
@@ -58,7 +70,21 @@ test("gateway exposes health and forwards initialize without credentials", async
   const response = await post(gatewayUrl, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("mcp-session-id"), "upstream-session");
-  assert.equal(forwardedAuthorization, undefined);
+  assert.equal(forwardedAuthorization, "Bearer github-installation-token");
+  assert.equal(forwardedReadonly, "true");
+});
+
+test("gateway health fails when GitHub token or upstream readiness fails", async (t) => {
+  const gateway = createMcpGatewayServer({
+    signingSecret: secret,
+    upstreamUrl: "http://127.0.0.1:1/mcp",
+    healthCheck: async () => false,
+  });
+  const gatewayUrl = await listen(gateway);
+  t.after(async () => { await close(gateway); });
+  const health = await fetch(`${gatewayUrl}/healthz`);
+  assert.equal(health.status, 503);
+  assert.deepEqual(await health.json(), { status: "unhealthy", server: "github" });
 });
 
 test("gateway filters tools/list and audits only sanitized metadata", async (t) => {
@@ -103,6 +129,8 @@ test("gateway enforces exact tool, repository, expiry and MCP session bindings",
   assert.equal(wrongRepo.status, 403);
   const expired = await post(gatewayUrl, { jsonrpc: "2.0", id: 5, method: "tools/list", params: {} }, token({ ...baseClaims, expiry: Date.now() - 1 }));
   assert.equal(expired.status, 401);
+  const forgedWriteAllowlist = await post(gatewayUrl, { jsonrpc: "2.0", id: 5, method: "tools/list", params: {} }, token({ ...baseClaims, tools: ["create_issue"] }));
+  assert.equal(forgedWriteAllowlist.status, 401);
   const allowed = await post(gatewayUrl, { jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "get_file_contents", arguments: { owner: "acme", repo: "widgets", path: "README.md" } } });
   assert.equal(allowed.status, 200);
   const crossSession = await post(gatewayUrl, { jsonrpc: "2.0", id: 7, method: "tools/list", params: {} }, token({ ...baseClaims, run: "run-2", session: "session-2" }), { "mcp-session-id": "bound-session" });
