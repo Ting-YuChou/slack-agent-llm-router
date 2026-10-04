@@ -341,7 +341,22 @@ Agent providers. Jev routing is off by default. To collect routing decisions
 without changing the selected model, set `OPENROUTER_API_KEY` and
 `PI_AGENT_JEV_MODE=shadow`; use `on` only after the evaluation below.
 The OpenRouter key stays in the host Agent Runtime and is removed from the
-Slack worker environment. Then start the demo:
+Slack worker environment. Pi 1.0.1 can also use Jev during a run for typed
+classification through its built-in `codemode` classifier API. Enable that
+separately with:
+
+```bash
+PI_AGENT_JEV_CLASSIFIER_MODE=on
+PI_AGENT_JEV_CLASSIFIER_MAX_CALLS=8
+```
+
+This enables `builtin:codemode` and the pinned
+`openrouter/typesafe/jev-1.13` classifier. The Agent container receives a
+short-lived token limited to that classifier, the current run, an expiry, and
+the configured call budget. The real OpenRouter key stays in the host runtime
+and model gateway. Classifier output may guide analysis, classification, and
+ranking; write, shell, approval, deployment, and deletion policy continues to
+be enforced outside the model. Then start the demo:
 
 ```bash
 make demo-slack

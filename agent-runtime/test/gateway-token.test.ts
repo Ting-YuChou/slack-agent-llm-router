@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { issueGatewayToken, verifyGatewayToken } from "../src/gateway-token.js";
+import {
+  issueClassifierGatewayToken,
+  issueGatewayToken,
+  verifyClassifierGatewayToken,
+  verifyGatewayToken,
+} from "../src/gateway-token.js";
 
 test("gateway token is short-lived and bound to run, provider, model, API, and effort", () => {
   const token = issueGatewayToken({
@@ -41,4 +46,37 @@ test("gateway accepts Sol high and rejects low effort for an unsupported provide
   const anthropic = issueGatewayToken({ runId: "r", provider: "anthropic", model: "claude-sonnet-4-6", api: "anthropic-messages", reasoningEffort: "low", expiresAt: 2000 } as any, "secret");
   assert.equal(verifyGatewayToken(sol, "secret", 1000)?.reasoningEffort, "high");
   assert.equal(verifyGatewayToken(anthropic, "secret", 1000), null);
+});
+
+test("classifier token is short-lived and bound to the allowlisted Jev operation", () => {
+  const token = issueClassifierGatewayToken({
+    kind: "classifier",
+    runId: "run-classifier",
+    provider: "openrouter",
+    model: "typesafe/jev-1.13",
+    api: "typesafe-system-one",
+    maxCalls: 6,
+    expiresAt: 2_000,
+  }, "secret");
+  assert.deepEqual(verifyClassifierGatewayToken(token, "secret", 1_000), {
+    kind: "classifier",
+    runId: "run-classifier",
+    provider: "openrouter",
+    model: "typesafe/jev-1.13",
+    api: "typesafe-system-one",
+    maxCalls: 6,
+    expiresAt: 2_000,
+  });
+  assert.equal(verifyClassifierGatewayToken(token, "secret", 2_001), null);
+  assert.equal(verifyClassifierGatewayToken(`${token}x`, "secret", 1_000), null);
+});
+
+test("classifier token rejects arbitrary classifier models and invalid call budgets", () => {
+  for (const claims of [
+    { kind: "classifier", runId: "r", provider: "openrouter", model: "~typesafe/jev-latest", api: "typesafe-system-one", maxCalls: 6, expiresAt: 2_000 },
+    { kind: "classifier", runId: "r", provider: "openrouter", model: "typesafe/jev-1.13", api: "typesafe-system-one", maxCalls: 0, expiresAt: 2_000 },
+  ]) {
+    const token = issueClassifierGatewayToken(claims as any, "secret");
+    assert.equal(verifyClassifierGatewayToken(token, "secret", 1_000), null);
+  }
 });

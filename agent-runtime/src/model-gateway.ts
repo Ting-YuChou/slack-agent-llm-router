@@ -3,24 +3,27 @@ import { Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 
 import {
+  JEV_CLASSIFIER_MODEL,
   listAgentModels,
   resolveAgentModel,
   type AgentModelSpec,
   type AgentProvider,
   type AgentReasoningEffort,
 } from "./agent-model.js";
-import { verifyGatewayToken } from "./gateway-token.js";
+import { verifyClassifierGatewayToken, verifyGatewayToken } from "./gateway-token.js";
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 
-export type ProviderApiKeys = Partial<Record<AgentProvider, string>>;
+export type ProviderApiKeys = Partial<Record<AgentProvider | "openrouter", string>>;
 
 export function createModelGateway(options: {
   signingSecret: string;
   providerApiKeys: ProviderApiKeys;
   fetchFn?: typeof fetch;
+  classifierTimeoutMs?: number;
 }) {
   const fetchFn = options.fetchFn ?? fetch;
+  const classifierCalls = new Map<string, { count: number; expiresAt: number }>();
   return createServer(async (request, response) => {
     if (request.method === "GET" && request.url === "/health") {
       sendJson(response, 200, {
@@ -38,6 +41,65 @@ export function createModelGateway(options: {
       return;
     }
     const token = extractToken(request);
+    if (request.url === JEV_CLASSIFIER_MODEL.gatewayPath) {
+      const claims = verifyClassifierGatewayToken(token, options.signingSecret);
+      if (!claims) {
+        sendJson(response, 401, { error: { code: "invalid_gateway_token", message: "Invalid gateway token" } });
+        return;
+      }
+      const providerApiKey = options.providerApiKeys.openrouter;
+      if (!providerApiKey) {
+        sendJson(response, 503, { error: { code: "provider_not_configured", message: "Requested model provider is not configured" } });
+        return;
+      }
+      let rawBody: Buffer;
+      try {
+        rawBody = await readBody(request);
+        if (rawBody.length > 128 * 1024 || !validateClassifierModelRequest(JSON.parse(rawBody.toString("utf8")))) {
+          throw new Error("invalid classifier request");
+        }
+      } catch {
+        sendJson(response, 400, {
+          error: { code: "invalid_request", message: "Request does not match the token-bound classifier configuration" },
+        });
+        return;
+      }
+      const now = Date.now();
+      for (const [runId, entry] of classifierCalls) {
+        if (entry.expiresAt < now) classifierCalls.delete(runId);
+      }
+      const budget = classifierCalls.get(claims.runId) ?? { count: 0, expiresAt: claims.expiresAt };
+      if (budget.count >= claims.maxCalls) {
+        sendJson(response, 429, {
+          error: { code: "classifier_call_budget_exhausted", message: "Classifier call budget exhausted" },
+        });
+        return;
+      }
+      classifierCalls.set(claims.runId, { count: budget.count + 1, expiresAt: claims.expiresAt });
+      try {
+        const upstream = await fetchFn(JEV_CLASSIFIER_MODEL.upstreamUrl, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${providerApiKey}`,
+            "content-type": "application/json",
+            "x-pi-run-id": claims.runId,
+          },
+          body: rawBody.toString("utf8"),
+          signal: AbortSignal.timeout(options.classifierTimeoutMs ?? 5_000),
+        });
+        const headers: Record<string, string> = { "cache-control": "no-store" };
+        for (const name of ["content-type", "request-id", "x-request-id"]) {
+          const value = upstream.headers.get(name);
+          if (value) headers[name] = value;
+        }
+        response.writeHead(upstream.status, headers);
+        if (upstream.body) Readable.fromWeb(upstream.body as never).pipe(response);
+        else response.end();
+      } catch {
+        sendJson(response, 502, { error: { code: "upstream_unavailable", message: "Model provider unavailable" } });
+      }
+      return;
+    }
     const claims = verifyGatewayToken(token, options.signingSecret);
     if (!claims) {
       sendJson(response, 401, { error: { code: "invalid_gateway_token", message: "Invalid gateway token" } });
@@ -97,6 +159,37 @@ export function validateAgentModelRequest(body: unknown, model: AgentModelSpec, 
     && body.reasoning_effort === effort;
 }
 
+export function validateClassifierModelRequest(body: unknown): boolean {
+  if (!isRecord(body) || body.model !== JEV_CLASSIFIER_MODEL.id || !isRecord(body.state) || !isRecord(body.questions)) {
+    return false;
+  }
+  const questions = Object.entries(body.questions);
+  if (questions.length < 1 || questions.length > 16) return false;
+  return questions.every(([id, value]) => {
+    if (!id || id.length > 100 || !isRecord(value) || !boundedText(value.instructions, 2_000)) return false;
+    if (value.type === "choice") {
+      if (!isRecord(value.criteria)) return false;
+      const criteria = Object.entries(value.criteria);
+      return criteria.length >= 2 && criteria.length <= 32
+        && criteria.every(([label, description]) => Boolean(label) && label.length <= 100 && boundedText(description, 2_000));
+    }
+    if (value.type === "score") {
+      return Array.isArray(value.criteria) && value.criteria.length >= 2 && value.criteria.length <= 16
+        && value.criteria.every((description) => boundedText(description, 2_000));
+    }
+    if (value.type === "noul") {
+      return isRecord(value.criteria)
+        && boundedText(value.criteria.true, 2_000)
+        && boundedText(value.criteria.false, 2_000);
+    }
+    return false;
+  });
+}
+
+function boundedText(value: unknown, maxLength: number): value is string {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= maxLength;
+}
+
 function extractToken(request: IncomingMessage): string {
   const authorization = request.headers.authorization ?? "";
   if (authorization.startsWith("Bearer ")) return authorization.slice(7);
@@ -151,6 +244,7 @@ if (entrypoint === import.meta.url) {
     openai: process.env.OPENAI_API_KEY,
     anthropic: process.env.ANTHROPIC_API_KEY,
     "opencode-go": process.env.OPENCODE_API_KEY,
+    openrouter: process.env.OPENROUTER_API_KEY,
   };
   if (!signingSecret || !Object.values(providerApiKeys).some(Boolean)) {
     throw new Error("MODEL_GATEWAY_SIGNING_SECRET and at least one provider API key are required");

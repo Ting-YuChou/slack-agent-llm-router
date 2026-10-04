@@ -172,6 +172,7 @@ if [[ "${DEMO_TEST_MODE:-0}" != 1 ]]; then
     --env OPENAI_API_KEY \
     --env ANTHROPIC_API_KEY \
     --env OPENCODE_API_KEY \
+    --env OPENROUTER_API_KEY \
     --env MODEL_GATEWAY_SIGNING_SECRET \
     "${gateway_image}" >/dev/null
   gateway_started=true

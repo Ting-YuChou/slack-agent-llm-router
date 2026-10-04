@@ -306,6 +306,7 @@ def test_demo_env_and_makefile_include_agent_setup():
     assert "MODEL_GATEWAY_SIGNING_SECRET=" in env_example
     assert "MCP_GATEWAY_SIGNING_SECRET=" in env_example
     assert "PI_AGENT_MCP_MODE=off" in env_example
+    assert "PI_AGENT_JEV_CLASSIFIER_MODE=off" in env_example
     assert "PI_AGENT_MCP_GATEWAY_URL=http://mcp-gateway:8090/mcp" in env_example
     assert "PI_AGENT_GITHUB_REPOSITORIES=" in env_example
     assert "ANTHROPIC_API_KEY=" in env_example
@@ -322,10 +323,14 @@ def test_demo_env_and_makefile_include_agent_setup():
 
 def test_demo_gateway_uses_the_hostname_required_by_agent_policy():
     launcher = (ROOT / "scripts" / "run_slack_demo.sh").read_text(encoding="utf-8")
+    gateway_block = launcher.split('--name "${gateway_container}"', 1)[1].split(
+        "gateway_started=true", 1
+    )[0]
 
     assert "--network-alias model-gateway" in launcher
     assert "--env ANTHROPIC_API_KEY" in launcher
     assert "--env OPENCODE_API_KEY" in launcher
+    assert "--env OPENROUTER_API_KEY" in gateway_block
     assert "PI_AGENT_CONFIGURED_PROVIDERS" in launcher
     assert "env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u OPENCODE_API_KEY" in launcher
     assert (

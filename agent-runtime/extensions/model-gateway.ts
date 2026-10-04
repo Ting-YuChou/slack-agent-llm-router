@@ -1,6 +1,9 @@
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 
-import { buildGatewayProviderRegistrations } from "../dist/src/agent-model.js";
+import {
+  buildClassifierGatewayProviderRegistration,
+  buildGatewayProviderRegistrations,
+} from "../dist/src/agent-model.js";
 
 export default function modelGatewayExtension(pi: ExtensionAPI) {
   const gatewayUrl = process.env.PI_MODEL_GATEWAY_URL;
@@ -26,6 +29,14 @@ export default function modelGatewayExtension(pi: ExtensionAPI) {
       apiKey: registration.apiKey,
       api: registration.api,
       models: modelConfigs,
+    });
+  }
+  if (process.env.PI_AGENT_JEV_CLASSIFIER_MODE === "on") {
+    if (!process.env.OPENROUTER_API_KEY) throw new Error("Run-time Jev classifier gateway token is required");
+    const registration = buildClassifierGatewayProviderRegistration(gatewayUrl);
+    pi.registerProvider(registration.provider, {
+      baseUrl: registration.baseUrl,
+      apiKey: registration.apiKey,
     });
   }
 }

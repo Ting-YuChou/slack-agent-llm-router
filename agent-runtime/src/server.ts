@@ -9,7 +9,7 @@ import { DockerPiProcess } from "./container-runtime.js";
 import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT, listAgentModels, resolveAgentModel } from "./agent-model.js";
 import { JevRouter, type JevMode } from "./jev-router.js";
 import { repositoryFromRemote, parseGitHubRepositories } from "./github-repository.js";
-import { issueGatewayToken } from "./gateway-token.js";
+import { issueClassifierGatewayToken, issueGatewayToken } from "./gateway-token.js";
 import { GITHUB_READ_ONLY_TOOLS, parseMcpMode } from "./mcp-config.js";
 import { issueMcpToken } from "./mcp-token.js";
 import {
@@ -157,6 +157,11 @@ export async function createProductionServer() {
   const configuredModels = listAgentModels().filter((model) => configuredProviders.has(model.provider));
   const jevMode = process.env.PI_AGENT_JEV_MODE ?? "off";
   if (!["off", "shadow", "on"].includes(jevMode)) throw new Error("PI_AGENT_JEV_MODE must be off, shadow, or on");
+  const jevClassifierMode = parseJevClassifierMode(process.env.PI_AGENT_JEV_CLASSIFIER_MODE);
+  if (jevClassifierMode === "on" && !process.env.OPENROUTER_API_KEY) {
+    throw new Error("OPENROUTER_API_KEY is required when run-time Jev classification is enabled");
+  }
+  const jevClassifierMaxCalls = positiveInteger(process.env.PI_AGENT_JEV_CLASSIFIER_MAX_CALLS, 8);
   const router = new JevRouter({ mode: jevMode as JevMode, apiKey: process.env.OPENROUTER_API_KEY });
   if (configuredModels.length === 0) throw new Error("At least one Agent model provider must be configured");
   const hostUid = process.getuid?.();
@@ -263,6 +268,15 @@ export async function createProductionServer() {
           mode: "github_read_only",
           expiry: Date.now() + 16 * 60_000,
         }, mcpSigningSecret) : undefined,
+        jevClassifierMode === "on" ? (runId) => issueClassifierGatewayToken({
+          kind: "classifier",
+          runId,
+          provider: "openrouter",
+          model: "typesafe/jev-1.13",
+          api: "typesafe-system-one",
+          maxCalls: jevClassifierMaxCalls,
+          expiresAt: Date.now() + 16 * 60_000,
+        }, gatewaySecret) : undefined,
       );
     },
   });
@@ -281,6 +295,9 @@ export async function createProductionServer() {
       mcp_gateway_reachable: mcpGatewayReachable,
       mcp_servers: mcpMode === "github_read_only" ? ["github"] : [],
       mcp_tool_count: mcpMode === "github_read_only" ? GITHUB_READ_ONLY_TOOLS.length : 0,
+      jev_classifier_mode: jevClassifierMode,
+      jev_classifier_model: jevClassifierMode === "on" ? "openrouter/typesafe/jev-1.13" : null,
+      jev_classifier_max_calls: jevClassifierMode === "on" ? jevClassifierMaxCalls : 0,
       provider: "openai",
       model: AGENT_MODEL_ID,
       reasoning_effort: AGENT_REASONING_EFFORT,
@@ -291,7 +308,11 @@ export async function createProductionServer() {
         reasoning_effort: model.reasoningEffort,
         configured: configuredProviders.has(model.provider),
       })),
-      tools: ["read", "write", "edit", "bash", "grep", "find", "ls", ...lock.plugins.flatMap((plugin) => plugin.enabled_tools)],
+      tools: [
+        "read", "write", "edit", "bash", "grep", "find", "ls",
+        ...(jevClassifierMode === "on" ? ["codemode"] : []),
+        ...lock.plugins.flatMap((plugin) => plugin.enabled_tools),
+      ],
       plugin_integrity: lock.healthy ? "verified" : "failed",
       skills: skillLock.skills.map((skill) => skill.name),
       skill_integrity: skillLock.healthy ? "verified" : "failed",
@@ -302,6 +323,14 @@ export async function createProductionServer() {
       ],
     }),
   });
+}
+
+export type JevClassifierMode = "off" | "on";
+
+export function parseJevClassifierMode(value: string | undefined): JevClassifierMode {
+  if (value === undefined || value === "" || value === "off") return "off";
+  if (value === "on") return "on";
+  throw new Error("PI_AGENT_JEV_CLASSIFIER_MODE must be off or on");
 }
 
 async function probeMcpGateway(gatewayUrl: string): Promise<boolean> {
