@@ -302,7 +302,7 @@ class TokenCounter:
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
-        self.encoders = {}
+        self.encoders: Dict[str, Any] = {}
         if enabled:
             self._initialize_encoders()
 
