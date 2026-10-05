@@ -305,8 +305,11 @@ def test_demo_env_and_makefile_include_agent_setup():
     assert "AGENT_RUNTIME_TOKEN=" in env_example
     assert "MODEL_GATEWAY_SIGNING_SECRET=" in env_example
     assert "MCP_GATEWAY_SIGNING_SECRET=" in env_example
-    assert "PI_AGENT_MCP_MODE=off" in env_example
-    assert "PI_AGENT_JEV_CLASSIFIER_MODE=off" in env_example
+    assert "PI_AGENT_JEV_MODE=on" in env_example
+    assert "PI_AGENT_JEV_CLASSIFIER_MODE=on" in env_example
+    assert "PI_AGENT_MCP_MODE=github_read_only" in env_example
+    assert "PI_AGENT_TELEMETRY_ENABLED=true" in env_example
+    assert "PI_AGENT_OTEL_ENABLED=true" in env_example
     assert "PI_AGENT_MCP_GATEWAY_URL=http://mcp-gateway:8090/mcp" in env_example
     assert "PI_AGENT_GITHUB_REPOSITORIES=" in env_example
     assert "ANTHROPIC_API_KEY=" in env_example

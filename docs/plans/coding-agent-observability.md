@@ -67,7 +67,7 @@ Collector 使用 exporter 內部 batching 與 `file_storage` persistent sending 
 - 完整 archive 結果的版本優先於後續 recovered toolResult，避免重啟後退回 truncated/unknown。test result 長期保留 command hash 和來源 ID；完整 command 和輸出在 30 天 raw tables。
 - `POST /v1/runs/{id}/feedback` 使用 runtime bearer auth、owner 檢查、terminal-run 檢查；verdict 為 accepted/needs_changes。Slack 按鈕同樣呼叫此 endpoint，與工具 approval 分开。
 - SQLite 保留 90 天 feedback receipts，使舊 click 在 publisher ACK 後重送仍不會覆蓋新回饋；`agent_feedback_current` 查最新 verdict。
-- 收集 Jev routing source/label/probability/recommendation/cost 與實際 model/effort。API 可傳 `task_id`，run 保存 baseline_commit，供同 task、同 baseline 的獨立實驗比較。預設不產生虛構 task pairing、counterfactual savings，不自動開啟 Jev on，也不加跑測試或 LLM judge。
+- 收集 Jev routing source/label/probability/recommendation/cost 與實際 model/effort。API 可傳 `task_id`，run 保存 baseline_commit，供同 task、同 baseline 的獨立實驗比較。完整 demo profile 現在明確開啟 Jev on；系統仍不產生虛構 task pairing、counterfactual savings，也不自動加跑測試或 LLM judge。
 
 ## 啟用
 

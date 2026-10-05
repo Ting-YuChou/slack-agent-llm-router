@@ -341,11 +341,11 @@ dedicated worktree and Pi session directory.
 cp config/demo.env.example .env.demo
 ```
 
-Fill in `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`, and `SLACK_APP_TOKEN`. Add
-`ANTHROPIC_API_KEY` or `OPENCODE_API_KEY` only when you want those optional
-Agent providers. Jev routing is off by default. To collect routing decisions
-without changing the selected model, set `OPENROUTER_API_KEY` and
-`PI_AGENT_JEV_MODE=shadow`; use `on` only after the evaluation below.
+Fill in `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `SLACK_BOT_TOKEN`, and
+`SLACK_APP_TOKEN`. Add `ANTHROPIC_API_KEY` or `OPENCODE_API_KEY` only when you
+want those optional Agent providers. The full demo profile enables Jev routing
+with `PI_AGENT_JEV_MODE=on`; use `shadow` when you want to collect decisions
+without changing the selected model.
 The OpenRouter key stays in the host Agent Runtime and is removed from the
 Slack worker environment. Pi 1.0.1 can also use Jev during a run for typed
 classification through its built-in `codemode` classifier API. Enable that
@@ -368,10 +368,11 @@ be enforced outside the model. Then start the demo:
 make demo-slack
 ```
 
-### Optional read-only GitHub MCP
+### Read-only GitHub MCP
 
-GitHub MCP is off by default. To enable it, create a GitHub App with read access
-to **Contents**, **Issues**, and **Pull requests**, install it only on the
+The full demo profile enables GitHub MCP and intentionally refuses to start
+until its credentials are configured. Create a GitHub App with read access to
+**Contents**, **Issues**, and **Pull requests**, install it only on the
 repositories Pi may inspect, and set these values in `.env.demo`:
 
 ```bash
