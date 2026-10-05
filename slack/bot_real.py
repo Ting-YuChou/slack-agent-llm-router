@@ -1250,49 +1250,58 @@ class SlackMessageHandler:
         self, args: List[str], user_id: str, channel_id: str, client: AsyncWebClient
     ) -> str:
         """Handle help command"""
-        help_text = """
-🤖 *LLM Router Bot Help*
-
-*Basic Usage:*
-Mention me in a channel, use `/llm ...`, or reply inside an active bot thread.
-
-*Commands:*
-• `/llm help` - Show this help message
-• `/llm settings` - View/update your preferences  
-• `/llm status` - Show system status and your usage
-• `/llm models` - List available models and their capabilities
-• `/llm analytics` - Show usage analytics (premium users)
-• `/llm clear` - Clear conversation history
-• `/llm web <query>` - Search the web before answering
-• `/llm fast <query>` - Prefer an explicit low-latency route for this query
-• `/llm agent <task>` - Start a stateful Pi coding agent with the default model
-• `/llm agent --model anthropic/claude-sonnet-4-6 <task>` - Select an Agent model
-• Use the message shortcut *Run Pi Agent* to start from an existing Slack thread
-• `/llm agent --no-thread-context <task>` - Start without loading prior thread messages
-• Agent models: `openai/gpt-5.6-luna`, `anthropic/claude-sonnet-4-6`, `opencode-go/deepseek-v4-pro`
-• `/llm agent /skill:test-gap <task>` - Run the approved test-gap workflow
-• `/llm agent status|stop|close` - Inspect or control your latest Agent session
-• `/llm remember <text>` - Save an explicit long-term memory
-• `/llm memories [query]` - List or search your memories
-• `/llm forget <memory_id|all>` - Delete saved memories
-
-*Examples:*
-• "Write a Python function to calculate fibonacci numbers"
-• "Explain quantum computing in simple terms"
-• "Analyze this CSV data: [attach file]"
-• "Help me plan a project roadmap"
-
-*Features:*
-✅ Intelligent model routing
-✅ Conversation continuity  
-✅ Context compression for long conversations
-✅ Response caching for faster replies
-✅ Usage analytics and cost tracking
-
-*User Tiers:*
-{self.bot._format_tier_limit_summary()}
-        """
-        return help_text.strip()
+        lines = [
+            "🤖 *LLM Router Bot Help*",
+            "",
+            "*Basic Usage:*",
+            "Mention me in a channel, use `/llm ...`, or reply inside an active bot thread.",
+            "",
+            "*Commands:*",
+            "• `/llm help` - Show this help message",
+            "• `/llm settings` - View/update your preferences",
+            "• `/llm status` - Show system status and your usage",
+            "• `/llm models` - List available models and their capabilities",
+            "• `/llm analytics` - Show usage analytics (premium users)",
+            "• `/llm clear` - Clear conversation history",
+            "• `/llm web <query>` - Search the web before answering",
+            "• `/llm fast <query>` - Prefer an explicit low-latency route for this query",
+        ]
+        if self.bot.agent_runtime_client is not None:
+            lines.extend(
+                [
+                    "• `/llm agent <task>` - Start a stateful Pi coding agent with the default model",
+                    "• `/llm agent --model anthropic/claude-sonnet-4-6 <task>` - Select an Agent model",
+                    "• Use the message shortcut *Run Pi Agent* to start from an existing Slack thread",
+                    "• `/llm agent --no-thread-context <task>` - Start without loading prior thread messages",
+                    "• Agent models: `openai/gpt-5.6-luna`, `openai/gpt-5.6-sol`, `anthropic/claude-sonnet-4-6`, `opencode-go/deepseek-v4-pro`",
+                    "• `/llm agent /skill:test-gap <task>` - Run the approved test-gap workflow",
+                    "• `/llm agent status|stop|close` - Inspect or control your latest Agent session",
+                ]
+            )
+        lines.extend(
+            [
+                "• `/llm remember <text>` - Save an explicit long-term memory",
+                "• `/llm memories [query]` - List or search your memories",
+                "• `/llm forget <memory_id|all>` - Delete saved memories",
+                "",
+                "*Examples:*",
+                '• "Write a Python function to calculate fibonacci numbers"',
+                '• "Explain quantum computing in simple terms"',
+                '• "Analyze this CSV data: [attach file]"',
+                '• "Help me plan a project roadmap"',
+                "",
+                "*Features:*",
+                "✅ Intelligent model routing",
+                "✅ Conversation continuity",
+                "✅ Context compression for long conversations",
+                "✅ Response caching for faster replies",
+                "✅ Usage analytics and cost tracking",
+                "",
+                "*User Tiers:*",
+                getattr(self.bot, "_format_tier_limit_summary", lambda: "")(),
+            ]
+        )
+        return "\n".join(lines)
 
     async def _handle_settings_command(
         self, args: List[str], user_id: str, channel_id: str, client: AsyncWebClient
@@ -3124,12 +3133,44 @@ class SlackBot:
         max_length = int(
             self.config.get("response_settings", {}).get("max_response_length", 2000)
         )
+        formatted = self.message_handler._format_agent_response(
+            run, max_length=max_length
+        )
+        extra = {}
+        if run.get("status") == "completed" and self.config.get("agent", {}).get(
+            "feedback_enabled", False
+        ):
+            extra["blocks"] = [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": formatted[offset : offset + 3000],
+                    },
+                }
+                for offset in range(0, len(formatted), 3000)
+            ] + [
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "action_id": action_id,
+                            "text": {"type": "plain_text", "text": label},
+                            "value": json.dumps({"run_id": run["run_id"]}),
+                        }
+                        for action_id, label in [
+                            ("pi_agent_accept_result", "Accept result"),
+                            ("pi_agent_needs_changes", "Needs changes"),
+                        ]
+                    ],
+                },
+            ]
         await self.web_client.chat_postMessage(
             channel=tracked["channel_id"],
             thread_ts=tracked["thread_ts"],
-            text=self.message_handler._format_agent_response(
-                run, max_length=max_length
-            ),
+            text=formatted,
+            **extra,
         )
 
     async def _handle_agent_shortcut(self, payload: Dict[str, Any]) -> None:
@@ -3314,6 +3355,36 @@ class SlackBot:
         if not actions:
             return
         action = actions[0]
+        if action.get("action_id") in {
+            "pi_agent_accept_result",
+            "pi_agent_needs_changes",
+        }:
+            user_id = payload.get("user", {}).get("id")
+            channel_id = payload.get("channel", {}).get("id")
+            try:
+                value = json.loads(action.get("value", "{}"))
+                verdict = (
+                    "accepted"
+                    if action["action_id"] == "pi_agent_accept_result"
+                    else "needs_changes"
+                )
+                click_id = str(
+                    action.get("action_ts") or payload.get("trigger_id") or ""
+                )
+                if not user_id or not click_id:
+                    return
+                await self.agent_runtime_client.feedback(
+                    value["run_id"], user_id, verdict, click_id
+                )
+                message = "Result feedback recorded."
+            except AgentRuntimeUnauthorized:
+                message = "Only the Agent run owner can submit result feedback."
+            except (AgentRuntimeError, KeyError, TypeError, ValueError):
+                message = "Result feedback could not be recorded. Please try again."
+            await self.web_client.chat_postEphemeral(
+                channel=channel_id, user=user_id, text=message
+            )
+            return
         if action.get("action_id") not in {"pi_agent_approve", "pi_agent_reject"}:
             return
         user_id = payload.get("user", {}).get("id")

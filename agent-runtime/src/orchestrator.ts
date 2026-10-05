@@ -43,6 +43,7 @@ export interface SessionInput {
   prompt: string;
   model?: string;
   routing_text?: string;
+  task_id?: string;
 }
 
 export interface RunRecord {
@@ -51,6 +52,10 @@ export interface RunRecord {
   status: RunStatus;
   answer: string;
   owner_user_id: string;
+  task_id?: string;
+  baseline_commit?: string;
+  capture_complete?: boolean | null;
+  capture_reasons?: string[];
   provider?: string;
   model?: string;
   reasoning_effort?: string;
@@ -127,7 +132,14 @@ export class CodingAgentOrchestrator {
   private readonly mcpToolStarts = new Map<string, number>();
   private startingSessions = 0;
 
+  private readonly captureState?: (runId: string) => { complete: boolean | null; reasons: string[] };
+  private readonly observeRun?: (run: RunRecord) => void;
+  private readonly observeLifecycle?: (runId: string, name: string, phase: "start" | "end", failed?: boolean, sessionId?: string) => void;
+
   constructor(options: {
+    captureState?: CodingAgentOrchestrator["captureState"];
+    observeRun?: (run: RunRecord) => void;
+    observeLifecycle?: CodingAgentOrchestrator["observeLifecycle"];
     worktrees: Worktrees;
     startProcess: CodingAgentOrchestrator["startProcess"];
     maxActiveSessions?: number;
@@ -137,6 +149,8 @@ export class CodingAgentOrchestrator {
     router?: { route(text?: string): Promise<RouteDecision> };
     mcpRepository?: string;
   }) {
+    this.captureState = options.captureState;
+    this.observeRun = options.observeRun; this.observeLifecycle = options.observeLifecycle;
     this.worktrees = options.worktrees;
     this.startProcess = options.startProcess;
     this.maxActiveSessions = options.maxActiveSessions ?? 2;
@@ -153,7 +167,14 @@ export class CodingAgentOrchestrator {
     for (const expired of this.stateStore.takeExpiredSessions()) {
       try { await this.worktrees.remove(expired.worktreePath); } catch { /* branch and audit metadata remain */ }
     }
-    for (const run of state.runs) this.runs.set(run.run_id, run);
+    for (const run of state.runs) {
+      if (!["running", "awaiting_approval"].includes(run.status) && run.capture_complete === undefined) {
+        const recovered = run.status === "interrupted" ? this.captureState?.(run.run_id) : undefined;
+        run.capture_complete = recovered?.complete === false ? false : null;
+        run.capture_reasons = recovered?.complete === false ? recovered.reasons : ["historical_capture_unknown"];
+      }
+      this.runs.set(run.run_id, run);
+    }
     for (const saved of state.sessions) {
       if (saved.closed) continue;
       const latestRun = state.runs
@@ -197,7 +218,7 @@ export class CodingAgentOrchestrator {
         if (input.model && (existing.autoRouting || existing.modelRef !== requestedModel.ref)) {
           throw new RuntimeConflictError("An existing Agent session cannot switch models");
         }
-        return this.prompt(existing.id, input.prompt, input.user_id, input.routing_text);
+        return this.prompt(existing.id, input.prompt, input.user_id, input.routing_text, input.task_id);
       }
     }
     if (this.pendingThreadKeys.has(key)) throw new RuntimeConflictError("This Slack thread is already creating a session");
@@ -210,8 +231,12 @@ export class CodingAgentOrchestrator {
     this.startingSessions += 1;
     try {
       const autoRouting = !input.model;
+      this.notifyLifecycle(runId, "routing", "start", false, sessionId);
       const route = await this.selectRoute(autoRouting, requestedModel.ref, input.routing_text);
+      this.notifyLifecycle(runId, "routing", "end");
+      this.notifyLifecycle(runId, "worktree_create", "start");
       const worktree = await this.worktrees.create(runId);
+      this.notifyLifecycle(runId, "worktree_create", "end");
       let session!: SessionRecord;
       let process: AgentProcess;
       try {
@@ -238,16 +263,18 @@ export class CodingAgentOrchestrator {
       };
       this.sessions.set(sessionId, session);
       this.threadSessions.set(key, sessionId);
-      this.startRun(session, runId, input.prompt, route, requestedAt);
+      this.startRun(session, runId, input.prompt, route, requestedAt, input.task_id);
       await this.persistState();
       return { session_id: sessionId, run_id: runId, status: "starting" };
+    } catch (error) {
+      this.notifyLifecycle(runId, "preparation", "end", true); throw error;
     } finally {
       this.pendingThreadKeys.delete(key);
       this.startingSessions -= 1;
     }
   }
 
-  async prompt(sessionId: string, prompt: string, userId: string, routingText?: string): Promise<{ session_id: string; run_id: string; status: "starting" }> {
+  async prompt(sessionId: string, prompt: string, userId: string, routingText?: string, taskId?: string): Promise<{ session_id: string; run_id: string; status: "starting" }> {
     const requestedAt = new Date().toISOString();
     const session = this.requireSession(sessionId);
     if (session.ownerUserId !== userId) throw new RuntimeForbiddenError("Only the session owner can submit prompts");
@@ -258,12 +285,15 @@ export class CodingAgentOrchestrator {
       throw new RuntimeError("Session model provider is not configured", "provider_not_configured", 503);
     }
     if (!prompt.trim()) throw new RuntimeError("prompt is required", "invalid_request", 400);
+    validateTaskId(taskId);
     this.pendingSessionIds.add(sessionId);
+    const runId = randomUUID();
     try {
+      this.notifyLifecycle(runId, "routing", "start", false, sessionId);
       const route = await this.selectRoute(session.autoRouting, session.modelRef, routingText);
-      const runId = randomUUID();
+      this.notifyLifecycle(runId, "routing", "end");
       if (session.autoRouting) session.modelRef = route.modelRef;
-      this.startRun(session, runId, prompt, route, requestedAt);
+      this.startRun(session, runId, prompt, route, requestedAt, taskId);
       await this.persistState();
       return { session_id: sessionId, run_id: runId, status: "starting" };
     } finally {
@@ -284,6 +314,14 @@ export class CodingAgentOrchestrator {
       return { modelRef: "openai/gpt-5.6-luna", effort: "max", source: "fallback", reason: "model_not_configured" };
     }
     return decision;
+  }
+
+  async markCaptureIncomplete(runId: string, reason: string): Promise<void> {
+    const run = this.runs.get(runId);
+    if (!run || run.capture_reasons?.includes(reason)) return;
+    run.capture_complete = false;
+    run.capture_reasons = [...(run.capture_reasons ?? []), reason];
+    await this.persistState();
   }
 
   getRun(runId: string): RunRecord {
@@ -385,7 +423,7 @@ export class CodingAgentOrchestrator {
     return this.getRun(runId).events.slice(Math.max(0, after));
   }
 
-  private startRun(session: SessionRecord, runId: string, prompt: string, route: RouteDecision, requestedAt: string): void {
+  private startRun(session: SessionRecord, runId: string, prompt: string, route: RouteDecision, requestedAt: string, taskId?: string): void {
     const model = resolveAgentModel(route.modelRef);
     const run: RunRecord = {
       run_id: runId,
@@ -393,6 +431,8 @@ export class CodingAgentOrchestrator {
       status: "running",
       answer: "",
       owner_user_id: session.ownerUserId,
+      task_id: taskId,
+      baseline_commit: session.baselineCommit,
       provider: model.provider,
       model: model.id,
       reasoning_effort: route.effort,
@@ -408,6 +448,7 @@ export class CodingAgentOrchestrator {
     this.runs.set(runId, run);
     session.activeRunId = runId;
     session.lastActivity = Date.now();
+    this.notifyRun(run);
     session.process.prompt(runId, prompt.trim(), route);
     const deadline = setTimeout(() => void this.timeoutRun(session, run), this.deadlineMs);
     deadline.unref();
@@ -493,7 +534,9 @@ export class CodingAgentOrchestrator {
         maxBytes: 1024 * 1024,
         maxSingleFileBytes: 256 * 1024,
       });
+      this.notifyLifecycle(run.run_id, "commit", "start");
       const commit = await this.worktrees.commit(session.worktreePath, `Pi agent: ${run.run_id}`);
+      this.notifyLifecycle(run.run_id, "commit", "end");
       session.baselineCommit = commit;
       run.changed_files = diff.files;
       run.diff_stat = diff.stat;
@@ -503,6 +546,7 @@ export class CodingAgentOrchestrator {
       this.updateRun(run, "completed");
       this.finishActiveRun(session, run.run_id);
     } catch {
+      this.notifyLifecycle(run.run_id, "commit", "end", true);
       run.error = { code: "commit_failed", message: "Changes remain in the isolated worktree and need attention" };
       this.updateRun(run, "failed");
       this.finishActiveRun(session, run.run_id);
@@ -537,9 +581,12 @@ export class CodingAgentOrchestrator {
   }
 
   private async safeRollback(session: SessionRecord, run: RunRecord): Promise<void> {
+    this.notifyLifecycle(run.run_id, "rollback", "start");
     try {
       await this.worktrees.rollback(session.worktreePath, session.baselineCommit);
+      this.notifyLifecycle(run.run_id, "rollback", "end");
     } catch {
+      this.notifyLifecycle(run.run_id, "rollback", "end", true);
       run.error = { code: "rollback_failed", message: "Isolated worktree needs attention" };
     }
   }
@@ -591,7 +638,29 @@ export class CodingAgentOrchestrator {
     return session;
   }
 
+  async shutdown(): Promise<void> {
+    for (const session of this.sessions.values()) {
+      if (session.activeRunId) { try { await this.cancel(session.activeRunId, session.ownerUserId); } catch { /* retain worktree if stop fails */ } }
+      try { await session.process.close(); } catch { /* stop failure already audited */ }
+    }
+  }
+
+  private notifyLifecycle(runId: string, name: string, phase: "start" | "end", failed = false, sessionId?: string): void {
+    try { this.observeLifecycle?.(runId, name, phase, failed, sessionId); } catch { /* monitoring must not fail work */ }
+  }
+
+  private notifyRun(run: RunRecord): void {
+    try {
+      if (!["running", "awaiting_approval"].includes(run.status) && run.capture_complete === undefined) {
+        const capture = this.captureState?.(run.run_id);
+        run.capture_complete = capture?.complete ?? null;
+        run.capture_reasons = capture?.reasons ?? [];
+      }
+      this.observeRun?.(structuredClone(run)); } catch { /* monitoring cannot fail agent runs */ }
+  }
+
   private async persistState(): Promise<void> {
+    for (const run of this.runs.values()) this.notifyRun(run);
     if (!this.stateStore) return;
     await this.stateStore.save({
       schema_version: 1,
@@ -613,7 +682,12 @@ export class CodingAgentOrchestrator {
   }
 }
 
+function validateTaskId(value: unknown): void {
+  if (value !== undefined && (typeof value !== "string" || !value.trim() || value.length > 128)) throw new RuntimeError("Invalid task_id", "invalid_request", 400);
+}
+
 function validateSessionInput(input: SessionInput): void {
+  validateTaskId(input.task_id);
   for (const field of [input.team_id, input.channel_id, input.thread_ts, input.user_id, input.prompt]) {
     if (typeof field !== "string" || !field.trim()) throw new RuntimeError("Required session field is missing", "invalid_request", 400);
   }

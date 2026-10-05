@@ -1,0 +1,55 @@
+extensions:
+  file_storage:
+    directory: /var/lib/otelcol/queue
+    create_directory: true
+    fsync: true
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 384
+    spike_limit_mib: 64
+exporters:
+  clickhouse:
+    endpoint: tcp://clickhouse:9000
+    database: default
+    username: ${env:CLICKHOUSE_USER}
+    password: ${env:CLICKHOUSE_PASSWORD}
+    create_schema: true
+    traces_table_name: otel_traces
+    logs_table_name: otel_logs
+    ttl: 720h
+    async_insert: false
+    timeout: 10s
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 0s
+    sending_queue:
+      enabled: true
+      storage: file_storage
+      sizer: items
+      queue_size: 100000
+      num_consumers: 2
+      batch:
+        min_size: 1000
+        max_size: 5000
+        flush_timeout: 1s
+service:
+  extensions: [file_storage, health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter]
+      exporters: [clickhouse]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter]
+      exporters: [clickhouse]

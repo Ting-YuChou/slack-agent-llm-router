@@ -430,6 +430,38 @@ class TestSlackMessageHandler:
         agent_runtime.health.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_help_hides_agent_commands_when_runtime_is_disabled(self):
+        bot = SimpleNamespace(
+            user_manager=UserManager(),
+            conversation_manager=ConversationManager({}),
+            inference_engine=SimpleNamespace(),
+            agent_runtime_client=None,
+            _format_tier_limit_summary=lambda: "Free: 10 requests/day",
+        )
+        handler = SlackMessageHandler(bot)
+
+        help_text = await handler._handle_help_command([], "u1", "c1", None)
+
+        assert "/llm agent" not in help_text
+        assert "Run Pi Agent" not in help_text
+
+    @pytest.mark.asyncio
+    async def test_manual_agent_command_explains_that_runtime_is_disabled(self):
+        bot = SimpleNamespace(
+            user_manager=UserManager(),
+            conversation_manager=ConversationManager({}),
+            inference_engine=SimpleNamespace(),
+            agent_runtime_client=None,
+        )
+        handler = SlackMessageHandler(bot)
+
+        response = await handler._handle_command(
+            "agent fix the tests", "u1", "c1", None, client=None
+        )
+
+        assert response == "Agent mode is currently disabled."
+
+    @pytest.mark.asyncio
     async def test_status_lists_configured_agent_provider_models(self):
         agent_runtime = SimpleNamespace(
             health_details=AsyncMock(

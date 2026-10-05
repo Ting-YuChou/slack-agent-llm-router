@@ -306,6 +306,12 @@ an allowlisted OpenAI, Anthropic, or OpenCode Go model. Redis, Kafka, ClickHouse
 web search, response cache, and the provider scheduler are disabled in
 [config/config.demo.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.demo.yaml).
 
+Agent monitoring can be enabled separately through the optional
+[observability overlay](docker-compose.agent-observability.yaml). It captures
+official Pi usage and session data through a SQLite outbox into Kafka/ClickHouse,
+and adds OTEL traces, Grafana, and owner feedback. See the
+[setup and verification guide](docs/plans/coding-agent-observability.md).
+
 1. In Slack, create an app **from a manifest** and paste
    [slack/app-manifest.demo.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/slack/app-manifest.demo.yaml).
 2. Install the app to the workspace. When updating an existing demo app,

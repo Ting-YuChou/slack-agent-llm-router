@@ -16,6 +16,7 @@ export interface GatewayClaims {
   api: AgentModelApi;
   reasoningEffort: AgentReasoningEffort;
   expiresAt: number;
+  traceparent?: string;
 }
 
 export interface ClassifierGatewayClaims {
@@ -26,6 +27,7 @@ export interface ClassifierGatewayClaims {
   api: typeof JEV_CLASSIFIER_MODEL.api;
   maxCalls: number;
   expiresAt: number;
+  traceparent?: string;
 }
 
 export function issueGatewayToken(claims: GatewayClaims, secret: string): string {
@@ -63,6 +65,7 @@ export function verifyClassifierGatewayToken(token: string, secret: string, now 
     api: JEV_CLASSIFIER_MODEL.api,
     maxCalls: claims.maxCalls,
     expiresAt: claims.expiresAt,
+    ...(typeof claims.traceparent === "string" ? {traceparent: claims.traceparent} : {}),
   };
 }
 
@@ -89,6 +92,7 @@ export function verifyGatewayToken(token: string, secret: string, now = Date.now
     api: model.api,
     reasoningEffort: claims.reasoningEffort,
     expiresAt: claims.expiresAt,
+    ...(typeof claims.traceparent === "string" ? {traceparent: claims.traceparent} : {}),
   };
 }
 
@@ -109,7 +113,9 @@ function verifySignedClaims(token: string, secret: string): Record<string, unkno
   } catch {
     return null;
   }
-  return isRecord(claims) ? claims : null;
+  if (!isRecord(claims)) return null;
+  if (claims.traceparent !== undefined && (typeof claims.traceparent !== "string" || !/^00-(?!0{32})[a-f0-9]{32}-(?!0{16})[a-f0-9]{16}-0[01]$/.test(claims.traceparent))) return null;
+  return claims;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

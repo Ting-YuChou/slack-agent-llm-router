@@ -1,4 +1,5 @@
 import asyncio
+import builtins
 import time
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -13,6 +14,7 @@ from src.admission import (
 from src.llm_router_part2_inference import (
     AnthropicProvider,
     BatchProcessor,
+    ContextCompressor,
     InferenceEngine,
     OpenAIProvider,
     ResponseCache,
@@ -1114,6 +1116,51 @@ class TestResponseCache:
 
 
 class TestInferenceEngine:
+    @pytest.mark.asyncio
+    async def test_disabled_compression_does_not_import_transformers(self, monkeypatch):
+        real_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "transformers":
+                raise AssertionError("transformers must not be imported")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", guarded_import)
+        compressor = ContextCompressor({"enabled": False})
+
+        await compressor.initialize()
+
+        assert compressor.tokenizer is None
+
+    @pytest.mark.asyncio
+    async def test_initialize_only_registers_providers_used_by_router_models(self):
+        router = MagicMock()
+        router.models = {
+            "gpt-5": SimpleNamespace(provider="openai"),
+        }
+        engine = InferenceEngine(
+            {
+                "compression": {"enabled": False},
+                "openai": {"enabled": True},
+                "anthropic": {"enabled": True},
+            },
+            router,
+        )
+        engine.cache.initialize = AsyncMock()
+
+        with (
+            patch("src.llm_router_part2_inference.OpenAIProvider") as openai_provider,
+            patch(
+                "src.llm_router_part2_inference.AnthropicProvider"
+            ) as anthropic_provider,
+        ):
+            openai_provider.return_value.initialize = AsyncMock()
+            await engine.initialize()
+
+        openai_provider.assert_called_once()
+        anthropic_provider.assert_not_called()
+        assert set(engine.providers) == {"openai"}
+
     @pytest.mark.asyncio
     async def test_initialize_skips_explicitly_disabled_providers(self):
         router = MagicMock()

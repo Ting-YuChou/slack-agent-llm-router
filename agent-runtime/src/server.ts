@@ -5,6 +5,10 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
+import { createHash } from "node:crypto";
+import { PiRunCapture } from "./pi-capture.js";
+import { AgentTelemetry, isCredentialKey } from "./telemetry.js";
+import { AgentTracing } from "./tracing.js";
 import { DockerPiProcess } from "./container-runtime.js";
 import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT, listAgentModels, resolveAgentModel } from "./agent-model.js";
 import { JevRouter, type JevMode } from "./jev-router.js";
@@ -32,6 +36,7 @@ interface ServerOptions {
   token: string;
   health: () => Record<string, unknown>;
   acceptRuns?: () => boolean;
+  feedback?: (run: RunRecord, payload: Record<string, unknown>, id: string) => Promise<boolean>;
 }
 
 export function createAgentHttpServer(options: ServerOptions) {
@@ -78,6 +83,7 @@ export function createAgentHttpServer(options: ServerOptions) {
           requiredString(body.prompt, "prompt"),
           requiredString(body.user_id, "user_id"),
           typeof body.routing_text === "string" ? body.routing_text : undefined,
+          body.task_id as string | undefined,
         );
         sendJson(response, 202, result);
         return;
@@ -116,6 +122,21 @@ export function createAgentHttpServer(options: ServerOptions) {
         sendJson(response, 202, { status: "accepted" });
         return;
       }
+      const feedbackMatch = /^\/v1\/runs\/([^/]+)\/feedback$/.exec(url.pathname);
+      if (request.method === "POST" && feedbackMatch) {
+        const run = options.orchestrator.getRun(decodeURIComponent(feedbackMatch[1]));
+        const body = asRecord(await readJson(request));
+        const user = requiredString(body.user_id, "user_id");
+        if (run.owner_user_id !== user) throw new RuntimeError("Only the run owner can submit feedback", "feedback_forbidden", 401);
+        if (!["completed", "failed", "cancelled", "rejected", "timed_out", "interrupted"].includes(run.status)) throw new RuntimeError("Run is still active", "feedback_conflict", 409);
+        const verdict = requiredString(body.verdict, "verdict");
+        const feedbackId = requiredString(body.feedback_id, "feedback_id");
+        if (!["accepted", "needs_changes"].includes(verdict) || feedbackId.length > 200) throw new RuntimeError("Invalid feedback", "invalid_request", 400);
+        if (!options.feedback) throw new RuntimeError("Feedback capture is disabled", "feedback_unavailable", 503);
+        const id = createHash("sha256").update(JSON.stringify([run.run_id, user, feedbackId, verdict])).digest("hex");
+        if (!await options.feedback(run, {user_id: user, verdict, feedback_id: feedbackId}, id)) throw new RuntimeError("Feedback capture failed", "feedback_unavailable", 503);
+        sendJson(response, 202, {status: "accepted"}); return;
+      }
       const cancelMatch = /^\/v1\/runs\/([^/]+)\/cancel$/.exec(url.pathname);
       if (request.method === "POST" && cancelMatch) {
         const body = asRecord(await readJson(request));
@@ -133,6 +154,18 @@ export function createAgentHttpServer(options: ServerOptions) {
       }
     }
   });
+}
+
+export async function settleCaptureWrite(runId: string, written: boolean, telemetry: Pick<AgentTelemetry, "releaseRun">, persistFailure: (runId: string, reason: string) => Promise<void>): Promise<void> {
+  try {
+    if (!written) await persistFailure(runId, "terminal_outbox_write_failed");
+  } finally { telemetry.releaseRun(runId); }
+}
+
+export async function recoverPendingCaptures(runs: RunRecord[], recover: (run: RunRecord) => Promise<void>): Promise<void> {
+  for (const run of runs) {
+    if (run.status === "interrupted" && run.capture_complete === undefined) await recover(run);
+  }
 }
 
 export async function createProductionServer() {
@@ -209,7 +242,36 @@ export async function createProductionServer() {
   });
   await cleanupOrphanAgentContainers();
   const stateStore = new RuntimeStateStore(path.join(runtimeRoot, "runtime-state.json"));
+  const telemetryEnabled = process.env.PI_AGENT_TELEMETRY_ENABLED === "true";
+  const telemetry = telemetryEnabled ? new AgentTelemetry({
+    file: path.join(runtimeRoot, "analytics", "outbox.sqlite"),
+    brokers: (process.env.AGENT_KAFKA_BROKERS ?? "localhost:9092").split(","),
+    secrets: Object.entries(process.env).filter(([key]) => isCredentialKey(key)).map(([,value]) => value!).filter(Boolean),
+  }) : undefined;
+  const tracing = AgentTracing.fromEnvironment();
+  const observed = new Map<string, string>();
   const orchestrator = new CodingAgentOrchestrator({
+    captureState: id => ({complete: telemetry ? telemetry.completeness(id).length === 0 : null, reasons: telemetry?.completeness(id) ?? []}),
+    observeLifecycle: (id, name, phase, failed, sessionId) => {
+      if (name === "routing" && phase === "start") { tracing?.startRun(id, sessionId ?? "unknown"); telemetry?.setTraceparent(id, tracing?.traceparent(id)); }
+      tracing?.lifecycle(id, name, phase, failed);
+      if (name === "preparation" && failed) tracing?.endRun(id, "failed");
+    },
+    observeRun: run => {
+      const summary = {...run, events: undefined, capture_complete: run.capture_complete ?? null};
+      const signature = JSON.stringify(summary);
+      if (observed.get(run.run_id) === signature) return;
+      if (!observed.has(run.run_id) && ["running", "awaiting_approval"].includes(run.status)) tracing?.startRun(run.run_id, run.session_id);
+      observed.set(run.run_id, signature);
+      tracing?.describeRun(run.run_id,run.model,run.reasoning_effort);
+      void telemetry?.record(run.run_id, run.session_id, "run", {...summary, traceparent: tracing?.traceparent(run.run_id)}).then(async written => {
+        if (["running", "awaiting_approval"].includes(run.status)) return;
+        await settleCaptureWrite(run.run_id, written, telemetry, (id, reason) => orchestrator.markCaptureIncomplete(id, reason));
+      }).catch(() => console.error(JSON.stringify({event:"agent_capture_state_persist_failed",run_id:run.run_id})));
+      if (observed.size > 2000) observed.delete(observed.keys().next().value!);
+      if (!["running", "awaiting_approval"].includes(run.status)) tracing?.log(run.run_id, "agent.run.finished", {status:run.status, capture_complete:summary.capture_complete ?? false});
+      if (!["running", "awaiting_approval"].includes(run.status)) tracing?.endRun(run.run_id, run.status);
+    },
     worktrees,
     stateStore,
     maxActiveSessions: positiveInteger(process.env.PI_AGENT_MAX_CONCURRENCY, 2),
@@ -248,17 +310,19 @@ export async function createProductionServer() {
         },
         (runId, route) => {
           const selectedModel = resolveAgentModel(route.modelRef);
-          return issueGatewayToken({
+          const token = issueGatewayToken({
             runId,
             provider: selectedModel.provider,
             model: selectedModel.id,
             api: selectedModel.api,
             reasoningEffort: route.effort,
             expiresAt: Date.now() + 16 * 60_000,
+            traceparent: tracing?.traceparent(runId),
           }, gatewaySecret);
+          telemetry?.addSecret(token, runId); return token;
         },
         onEvent,
-        mcpMode === "github_read_only" ? (runId) => issueMcpToken({
+        mcpMode === "github_read_only" ? (runId) => { const token = issueMcpToken({
           run: runId,
           session: session.id,
           slackUser: session.ownerUserId,
@@ -267,22 +331,32 @@ export async function createProductionServer() {
           tools: [...GITHUB_READ_ONLY_TOOLS],
           mode: "github_read_only",
           expiry: Date.now() + 16 * 60_000,
-        }, mcpSigningSecret) : undefined,
-        jevClassifierMode === "on" ? (runId) => issueClassifierGatewayToken({
+        }, mcpSigningSecret); telemetry?.addSecret(token, runId); return token; } : undefined,
+        jevClassifierMode === "on" ? (runId) => { const token = issueClassifierGatewayToken({
           kind: "classifier",
           runId,
           provider: "openrouter",
           model: "typesafe/jev-1.13",
           api: "typesafe-system-one",
           maxCalls: jevClassifierMaxCalls,
+          traceparent: tracing?.traceparent(runId),
           expiresAt: Date.now() + 16 * 60_000,
-        }, gatewaySecret) : undefined,
+        }, gatewaySecret); telemetry?.addSecret(token, runId); return token; } : undefined,
+        telemetry, session.id, tracing,
       );
     },
   });
+  if (telemetry) {
+    const previous = await stateStore.load();
+    await recoverPendingCaptures(previous.runs, async run => {
+      const capture = new PiRunCapture(telemetry, run.run_id, run.session_id, path.join(runtimeRoot, "sessions", run.session_id), "stopped");
+      await capture.recover();
+    });
+  }
   await orchestrator.restore();
   const runtimeHealthy = () => integrityHealthy && (mcpMode === "off" || mcpGatewayReachable);
-  return createAgentHttpServer({
+  const server = createAgentHttpServer({
+    feedback: telemetry ? (run, payload, id) => telemetry.record(run.run_id, run.session_id, "feedback", payload, id) : undefined,
     orchestrator,
     token,
     acceptRuns: runtimeHealthy,
@@ -291,6 +365,7 @@ export async function createProductionServer() {
       runtime: "pi-coding-agent",
       version: "1.0.1",
       pi_version: "1.0.1",
+      telemetry: telemetry?.health() ?? {status: "disabled"},
       mcp_mode: mcpMode,
       mcp_gateway_reachable: mcpGatewayReachable,
       mcp_servers: mcpMode === "github_read_only" ? ["github"] : [],
@@ -323,6 +398,10 @@ export async function createProductionServer() {
       ],
     }),
   });
+  server.on("close", () => {
+    void orchestrator.shutdown().finally(async () => { await telemetry?.close().catch(() => {}); await tracing?.close().catch(() => {}); });
+  });
+  return server;
 }
 
 export type JevClassifierMode = "off" | "on";
@@ -433,4 +512,5 @@ if (entrypoint === import.meta.url) {
   const port = positiveInteger(process.env.PI_AGENT_PORT, DEFAULT_AGENT_RUNTIME_PORT);
   const server = await createProductionServer();
   server.listen(port, host, () => logEvent("agent_runtime_started", { host, port }));
+  for (const signal of ["SIGTERM", "SIGINT"] as const) process.once(signal, () => server.close());
 }

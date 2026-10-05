@@ -1,3 +1,5 @@
+import { StringDecoder } from "node:string_decoder";
+
 export type PublicRunEvent =
   | { type: "turn" }
   | { type: "usage"; cost_usd: number }
@@ -11,9 +13,10 @@ export class RpcProtocolError extends Error {}
 
 export class RpcJsonlDecoder {
   private buffer = "";
+  private readonly utf8 = new StringDecoder("utf8");
 
   push(chunk: Buffer | string): Array<Record<string, unknown>> {
-    this.buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    this.buffer += typeof chunk === "string" ? chunk : this.utf8.write(chunk);
     const records: Array<Record<string, unknown>> = [];
     while (true) {
       const index = this.buffer.indexOf("\n");
@@ -110,16 +113,21 @@ export class PiRpcBridge {
   private readonly decoder = new RpcJsonlDecoder();
   private readonly writeLine: (line: string) => void;
   private readonly onEvent: (event: PublicRunEvent) => void;
+  private readonly onCommand?: (record: Record<string, unknown>) => void;
+  private readonly onRecord?: (record: Record<string, unknown>) => void;
   private readonly pending = new Map<string, { command: string; resolve: (response: Record<string, unknown>) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private sequence = 0;
 
-  constructor(options: { writeLine: (line: string) => void; onEvent: (event: PublicRunEvent) => void }) {
+  constructor(options: { writeLine: (line: string) => void; onEvent: (event: PublicRunEvent) => void; onRecord?: (record: Record<string, unknown>) => void; onCommand?: (record: Record<string, unknown>) => void }) {
     this.writeLine = options.writeLine;
     this.onEvent = options.onEvent;
+    this.onRecord = options.onRecord;
+    this.onCommand = options.onCommand;
   }
 
   feed(chunk: Buffer | string): void {
     for (const record of this.decoder.push(chunk)) {
+      try { this.onRecord?.(record); } catch { /* telemetry must not stop agent execution */ }
       if (record.type === "message_end" && isRecord(record.message)) {
         const usage = isRecord(record.message.usage) ? record.message.usage : {};
         const cost = isRecord(usage.cost) ? usage.cost : {};
@@ -146,7 +154,7 @@ export class PiRpcBridge {
     this.send({ id, type: "prompt", message });
   }
 
-  async configureAndPrompt(id: string, message: string, provider: string, model: string, effort: string): Promise<void> {
+  async configureAndPrompt(id: string, message: string, provider: string, model: string, effort: string, beforePrompt?: () => Promise<void>): Promise<void> {
     await this.command("set_model", { provider, modelId: model });
     await this.command("set_thinking_level", { level: effort });
     const state = await this.command("get_state", {});
@@ -155,7 +163,15 @@ export class PiRpcBridge {
     if (activeModel.provider !== provider || activeModel.id !== model || data.thinkingLevel !== effort) {
       throw new RpcProtocolError("Pi state mismatch after model configuration");
     }
+    await beforePrompt?.();
     this.prompt(id, message);
+  }
+
+  async snapshot(): Promise<{ state: unknown; stats: unknown; entries: unknown }> {
+    const [state, stats, entries] = await Promise.all([
+      this.command("get_state", {}), this.command("get_session_stats", {}), this.command("get_entries", {}),
+    ]);
+    return { state: state.data, stats: stats.data, entries: entries.data };
   }
 
   failPending(): void {
@@ -187,6 +203,7 @@ export class PiRpcBridge {
   }
 
   private send(record: Record<string, unknown>): void {
+    try { this.onCommand?.(record); } catch { /* monitoring must not interrupt RPC */ }
     this.writeLine(`${JSON.stringify(record)}\n`);
   }
 }

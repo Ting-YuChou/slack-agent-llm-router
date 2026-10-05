@@ -488,9 +488,16 @@ class LoggingConfig(ConfigModel):
     format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 
+class RouterClassifierConfig(ConfigModel):
+    semantic_enabled: bool = True
+
+
 class RouterConfig(ConfigModel):
     default_model: str = "mistral-7b"
     routing_strategy: str = "intelligent"
+    classifier: RouterClassifierConfig = Field(default_factory=RouterClassifierConfig)
+    tokenizer_enabled: bool = True
+    credential_gating: bool = False
     fast_lane_models: List[str] = Field(default_factory=list)
     models: Dict[str, ModelConfig] = Field(default_factory=dict)
     routing_rules: List[Dict[str, Any]] = Field(default_factory=list)
@@ -1258,6 +1265,7 @@ class ShutdownConfig(ConfigModel):
 
 class AgentRuntimeConfig(ConfigModel):
     enabled: bool = False
+    feedback_enabled: bool = False
     base_url: str = "http://127.0.0.1:3001"
     token_env: str = "AGENT_RUNTIME_TOKEN"
     connect_timeout_seconds: float = Field(2.0, gt=0)
