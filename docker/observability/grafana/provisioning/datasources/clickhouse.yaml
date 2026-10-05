@@ -1,0 +1,26 @@
+apiVersion: 1
+datasources:
+  - name: Agent ClickHouse
+    uid: agent-clickhouse
+    type: grafana-clickhouse-datasource
+    access: proxy
+    isDefault: false
+    editable: false
+    jsonData:
+      host: clickhouse
+      port: 9000
+      protocol: native
+      username: agent_grafana
+      defaultDatabase: default
+      queryTimeout: 0
+      tlsSkipVerify: false
+      traces:
+        defaultDatabase: default
+        defaultTable: otel_traces
+        otelEnabled: true
+      logs:
+        defaultDatabase: default
+        defaultTable: otel_logs
+        otelEnabled: true
+    secureJsonData:
+      password: $AGENT_GRAFANA_CH_PASSWORD

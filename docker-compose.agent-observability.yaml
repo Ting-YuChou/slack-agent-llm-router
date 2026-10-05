@@ -1,0 +1,102 @@
+# Overlay: docker compose -f docker-compose.yml -f docker-compose.agent-observability.yaml --profile agent-observability up -d
+services:
+  kafka:
+    ports: !override [127.0.0.1:9092:9092]
+    volumes:
+      - agent_kafka_data:/var/lib/kafka/data
+    environment:
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+  clickhouse:
+    ports: !override [127.0.0.1:8123:8123, 127.0.0.1:9000:9000]
+    environment:
+      AGENT_GRAFANA_CH_PASSWORD: ${AGENT_GRAFANA_CH_PASSWORD:?Set a Grafana ClickHouse read-only password}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?Set a private ClickHouse writer password}
+    healthcheck:
+      test: [CMD-SHELL, 'clickhouse-client --user "$${CLICKHOUSE_USER}" --password "$${CLICKHOUSE_PASSWORD}" --query "SELECT 1"']
+    volumes:
+      - ./docker/observability/clickhouse-users.xml:/etc/clickhouse-server/users.d/agent-grafana.xml:ro
+  api:
+    environment:
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?Set a private ClickHouse writer password}
+  workers:
+    environment:
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?Set a private ClickHouse writer password}
+  rag-workers:
+    environment:
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?Set a private ClickHouse writer password}
+  agent-topics:
+    profiles: [agent-observability]
+    image: confluentinc/cp-kafka:7.8.7
+    entrypoint: [/bin/bash, -ec]
+    command:
+      - |
+        for topic in agent.events.v1 agent.content.v1 agent.dlq.v1; do
+          kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic "$$topic" --partitions 1 --replication-factor 1 --config retention.ms=2592000000 --config retention.bytes=-1
+          kafka-configs --bootstrap-server kafka:29092 --alter --entity-type topics --entity-name "$$topic" --add-config retention.ms=2592000000,retention.bytes=-1
+        done
+    depends_on:
+      kafka: {condition: service_healthy}
+    restart: "no"
+  agent-analytics:
+    profiles: [agent-observability]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: [python, -m, src.agent_analytics]
+    environment:
+      AGENT_KAFKA_BROKERS: kafka:29092
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_USER: llm_router
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?Set a private ClickHouse writer password}
+    depends_on:
+      agent-topics: {condition: service_completed_successfully}
+      kafka: {condition: service_healthy}
+      clickhouse: {condition: service_healthy}
+    restart: unless-stopped
+  otel-collector:
+    profiles: [agent-observability]
+    image: ${AGENT_OTEL_COLLECTOR_IMAGE:-otel/opentelemetry-collector-contrib:0.127.0@sha256:e94cfd92357aa21f4101dda3c0c01f90e6f24115ba91b263c4d09fed7911ae68}
+    command: [--config=/etc/otelcol-contrib/config.yaml]
+    environment:
+      CLICKHOUSE_USER: llm_router
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?Set a private ClickHouse writer password}
+    volumes:
+      - ./docker/observability/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - agent_otel_queue:/var/lib/otelcol
+    ports:
+      - 127.0.0.1:4318:4318
+      - 127.0.0.1:13133:13133
+    networks: [default, agent-observability]
+    depends_on:
+      clickhouse: {condition: service_healthy}
+    user: "0:0"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    restart: unless-stopped
+  agent-grafana:
+    profiles: [agent-observability]
+    image: ${AGENT_GRAFANA_IMAGE:-grafana/grafana:11.6.0@sha256:62d2b9d20a19714ebfe48d1bb405086081bc602aa053e28cf6d73c7537640dfb}
+    environment:
+      GF_INSTALL_PLUGINS: grafana-clickhouse-datasource 4.9.0
+      GF_SECURITY_ADMIN_USER: ${AGENT_GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${AGENT_GRAFANA_ADMIN_PASSWORD:?Set a Grafana admin password}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      AGENT_GRAFANA_CH_PASSWORD: ${AGENT_GRAFANA_CH_PASSWORD}
+    ports: [127.0.0.1:3002:3000]
+    volumes:
+      - ./docker/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - agent_grafana_data:/var/lib/grafana
+    depends_on:
+      clickhouse: {condition: service_healthy}
+    restart: unless-stopped
+networks:
+  agent-observability:
+    name: slack-agent-observability
+    internal: true
+volumes:
+  agent_kafka_data:
+  agent_otel_queue:
+  agent_grafana_data:

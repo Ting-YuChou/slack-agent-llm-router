@@ -174,9 +174,14 @@ if [[ "${DEMO_TEST_MODE:-0}" != 1 ]]; then
     --env OPENCODE_API_KEY \
     --env OPENROUTER_API_KEY \
     --env MODEL_GATEWAY_SIGNING_SECRET \
+    --env PI_AGENT_OTEL_ENABLED \
+    --env "OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318" \
     "${gateway_image}" >/dev/null
   gateway_started=true
   docker network connect bridge "${gateway_container}"
+  if [[ "${PI_AGENT_OTEL_ENABLED:-false}" == true ]]; then
+    docker network connect "${PI_AGENT_OBSERVABILITY_NETWORK:-slack-agent-observability}" "${gateway_container}"
+  fi
   if [[ "${PI_AGENT_MCP_MODE}" == github_read_only ]]; then
     if ! docker network inspect "${mcp_egress_network}" >/dev/null 2>&1; then
       docker network create "${mcp_egress_network}" >/dev/null

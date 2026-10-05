@@ -833,6 +833,34 @@ class TestPlatformInitialization:
 
 
 class TestApiApp:
+    def test_root_endpoint_is_public_and_points_to_health(
+        self, tmp_path, patched_platform_deps
+    ):
+        config_path = _write_config(
+            tmp_path,
+            overrides={
+                "security": {
+                    "api_keys": {
+                        "enabled": True,
+                        "header_name": "X-API-Key",
+                        "env_var": "LLM_ROUTER_API_KEYS",
+                    },
+                    "cors": {"enabled": False},
+                }
+            },
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+
+        with TestClient(platform._create_fastapi_app()) as client:
+            response = client.get("/")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "service": "slack-llm-router",
+            "status": "running",
+            "health": "/health",
+        }
+
     def test_live_endpoint_is_public_and_ready_endpoint_reports_missing_services(
         self, tmp_path, patched_platform_deps
     ):
@@ -1877,3 +1905,17 @@ class TestApiApp:
 
         assert response.status_code == 200
         assert response.headers["access-control-allow-origin"] == "https://example.com"
+
+
+def test_clickhouse_writer_password_override_keeps_shared_chat_analytics_compatible(
+    monkeypatch,
+):
+    monkeypatch.setenv("CLICKHOUSE_PASSWORD", "private-writer-password")
+    config = {"clickhouse": {"password": "llm_router_pass", "host": "clickhouse"}}
+    platform = object.__new__(main.LLMRouterPlatform)
+    platform._apply_env_overrides(config)
+    assert config["clickhouse"]["password"] == "private-writer-password"
+    assert config["clickhouse"]["host"] == "clickhouse"
+    monkeypatch.delenv("CLICKHOUSE_PASSWORD")
+    platform._apply_env_overrides(config)
+    assert config["clickhouse"]["password"] == "private-writer-password"

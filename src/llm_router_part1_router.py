@@ -5,13 +5,11 @@ Implements intelligent routing logic for multi-model deployment
 
 import asyncio
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-
-import tiktoken
-from sklearn.feature_extraction.text import TfidfVectorizer
 
 from src.routing_features import build_routing_features
 from src.utils.metrics import ROUTER_METRICS
@@ -53,12 +51,11 @@ class RoutingRule:
 class QueryClassifier:
     """Advanced query classification using multiple techniques"""
 
-    def __init__(self):
+    def __init__(self, semantic_enabled: bool = True):
+        self.semantic_enabled = semantic_enabled
         self.tokenizer = None
         self.model = None
-        self.tfidf_vectorizer = TfidfVectorizer(
-            max_features=5000, stop_words="english", ngram_range=(1, 2)
-        )
+        self.tfidf_vectorizer = None
         self.patterns = self._init_patterns()
         self._is_initialized = False
 
@@ -130,11 +127,20 @@ class QueryClassifier:
 
     async def initialize(self):
         """Initialize the classifier with pre-trained models"""
+        if not self.semantic_enabled:
+            self._is_initialized = True
+            logger.info("Semantic query classification is disabled")
+            return
+
         try:
             # Load a lightweight sentence transformer for semantic analysis
             from sentence_transformers import SentenceTransformer
+            from sklearn.feature_extraction.text import TfidfVectorizer
 
             self.model = SentenceTransformer("all-MiniLM-L6-v2")
+            self.tfidf_vectorizer = TfidfVectorizer(
+                max_features=5000, stop_words="english", ngram_range=(1, 2)
+            )
             self._is_initialized = True
             logger.info("Query classifier initialized successfully")
         except Exception as e:
@@ -294,13 +300,17 @@ class QueryClassifier:
 class TokenCounter:
     """Efficient token counting for different models"""
 
-    def __init__(self):
-        self.encoders = {}
-        self._initialize_encoders()
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.encoders: Dict[str, Any] = {}
+        if enabled:
+            self._initialize_encoders()
 
     def _initialize_encoders(self):
         """Initialize tokenizer encodings for different models"""
         try:
+            import tiktoken
+
             # OpenAI models
             self.encoders["gpt-4"] = tiktoken.encoding_for_model("gpt-4")
             self.encoders["gpt-5"] = tiktoken.encoding_for_model("gpt-4")
@@ -316,10 +326,11 @@ class TokenCounter:
 
         except Exception as e:
             logger.warning(f"Failed to initialize some tokenizers: {e}")
-            self.encoders["default"] = tiktoken.get_encoding("cl100k_base")
 
     def count_tokens(self, text: str, model: str = "default") -> int:
         """Count tokens for given text and model"""
+        if not self.enabled or "default" not in self.encoders:
+            return int(len(text.split()) * 1.3)
         try:
             # Map model names to encoder keys
             encoder_key = self._get_encoder_key(model)
@@ -366,8 +377,17 @@ class ModelRouter:
         self.policy_cache = policy_cache
         self.models: Dict[str, ModelConfig] = {}
         self.routing_rules: List[RoutingRule] = []
-        self.classifier = QueryClassifier()
-        self.token_counter = TokenCounter()
+        classifier_config = dict(config.get("classifier", {}) or {})
+        self.classifier = QueryClassifier(
+            semantic_enabled=bool(
+                classifier_config.get(
+                    "semantic_enabled", config.get("semantic_enabled", True)
+                )
+            )
+        )
+        self.token_counter = TokenCounter(
+            enabled=bool(config.get("tokenizer_enabled", True))
+        )
         self.default_model = config.get("default_model", "mistral-7b")
         self.routing_strategy = config.get("routing_strategy", "intelligent")
         self.fast_lane_models: List[str] = list(config.get("fast_lane_models", []))
@@ -404,12 +424,21 @@ class ModelRouter:
         self.model_stats: Dict[str, Dict[str, float]] = {}
         self.request_cache: Dict[str, RoutingDecision] = {}
         self._initialized = False
+        self._missing_model_credentials: Dict[str, str] = {}
 
         self._load_models()
         self._load_routing_rules()
 
     async def initialize(self):
         """Initialize the router and its components"""
+        missing_default_credential = self._missing_model_credentials.get(
+            self.default_model
+        )
+        if missing_default_credential:
+            raise RuntimeError(
+                f"Required credential {missing_default_credential} is not set for "
+                f"default model {self.default_model}"
+            )
         await self.classifier.initialize()
         if self.policy_cache and hasattr(self.policy_cache, "initialize"):
             await self.policy_cache.initialize()
@@ -439,7 +468,21 @@ class ModelRouter:
             try:
                 model_payload = dict(model_config)
                 model_payload.setdefault("name", model_name)
-                self.models[model_name] = ModelConfig(**model_payload)
+                model = ModelConfig(**model_payload)
+                credential_env = model.api_key_env
+                if (
+                    self.config.get("credential_gating", False)
+                    and credential_env
+                    and not os.getenv(credential_env, "").strip()
+                ):
+                    self._missing_model_credentials[model_name] = credential_env
+                    logger.warning(
+                        "Skipping model %s because credential %s is not set",
+                        model_name,
+                        credential_env,
+                    )
+                    continue
+                self.models[model_name] = model
                 logger.debug(f"Loaded model configuration: {model_name}")
             except Exception as e:
                 logger.error(f"Failed to load model {model_name}: {e}")

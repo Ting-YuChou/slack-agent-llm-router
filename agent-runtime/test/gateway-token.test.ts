@@ -80,3 +80,11 @@ test("classifier token rejects arbitrary classifier models and invalid call budg
     assert.equal(verifyClassifierGatewayToken(token, "secret", 1_000), null);
   }
 });
+
+test("signed optional trace context survives verification and rejects invalid context", () => {
+  const claims = {runId:"trace-run",provider:"openai",model:"gpt-5.6-luna",api:"openai-responses",reasoningEffort:"max",expiresAt:Date.now()+60000,
+    traceparent:"00-11111111111111111111111111111111-2222222222222222-01"} as any;
+  const token=issueGatewayToken(claims,"secret");
+  assert.equal((verifyGatewayToken(token,"secret") as any)?.traceparent,claims.traceparent);
+  assert.equal(verifyGatewayToken(issueGatewayToken({...claims,traceparent:"bad"},"secret"),"secret"),null);
+});

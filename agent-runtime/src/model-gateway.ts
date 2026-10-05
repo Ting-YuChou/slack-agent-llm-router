@@ -1,4 +1,7 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
+import { pipeline } from "node:stream/promises";
+import { SpanStatusCode, type Span } from "@opentelemetry/api";
+import { AgentTracing } from "./tracing.js";
 import { Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 
@@ -21,6 +24,7 @@ export function createModelGateway(options: {
   providerApiKeys: ProviderApiKeys;
   fetchFn?: typeof fetch;
   classifierTimeoutMs?: number;
+  tracing?: AgentTracing;
 }) {
   const fetchFn = options.fetchFn ?? fetch;
   const classifierCalls = new Map<string, { count: number; expiresAt: number }>();
@@ -76,6 +80,9 @@ export function createModelGateway(options: {
         return;
       }
       classifierCalls.set(claims.runId, { count: budget.count + 1, expiresAt: claims.expiresAt });
+      const requestStarted = performance.now();
+      const span = options.tracing?.gateway(claims.runId, claims.traceparent, claims.provider, claims.model);
+      const disconnect = upstreamDisconnect(response, span);
       try {
         const upstream = await fetchFn(JEV_CLASSIFIER_MODEL.upstreamUrl, {
           method: "POST",
@@ -85,7 +92,7 @@ export function createModelGateway(options: {
             "x-pi-run-id": claims.runId,
           },
           body: rawBody.toString("utf8"),
-          signal: AbortSignal.timeout(options.classifierTimeoutMs ?? 5_000),
+          signal: AbortSignal.any([disconnect.signal, AbortSignal.timeout(options.classifierTimeoutMs ?? 5_000)]),
         });
         const headers: Record<string, string> = { "cache-control": "no-store" };
         for (const name of ["content-type", "request-id", "x-request-id"]) {
@@ -93,11 +100,12 @@ export function createModelGateway(options: {
           if (value) headers[name] = value;
         }
         response.writeHead(upstream.status, headers);
-        if (upstream.body) Readable.fromWeb(upstream.body as never).pipe(response);
-        else response.end();
+        await forwardUpstream(upstream, response, span, requestStarted);
       } catch {
-        sendJson(response, 502, { error: { code: "upstream_unavailable", message: "Model provider unavailable" } });
-      }
+        span?.setStatus({code: SpanStatusCode.ERROR});
+        if (!response.headersSent) sendJson(response, 502, { error: { code: "upstream_unavailable", message: "Model provider unavailable" } });
+        else response.destroy();
+      } finally { disconnect.close(); span?.end(); }
       return;
     }
     const claims = verifyGatewayToken(token, options.signingSecret);
@@ -126,11 +134,15 @@ export function createModelGateway(options: {
       });
       return;
     }
+    const requestStarted = performance.now();
+    const span = options.tracing?.gateway(claims.runId, claims.traceparent, claims.provider, claims.model);
+    const disconnect = upstreamDisconnect(response, span);
     try {
       const upstream = await fetchFn(model.upstreamUrl, {
         method: "POST",
         headers: upstreamHeaders(request, model, providerApiKey, claims.runId),
         body: rawBody.toString("utf8"),
+        signal: AbortSignal.any([disconnect.signal, AbortSignal.timeout(16 * 60_000)]),
       });
       const headers: Record<string, string> = { "cache-control": "no-store" };
       for (const name of ["content-type", "openai-request-id", "request-id", "x-request-id"]) {
@@ -138,12 +150,41 @@ export function createModelGateway(options: {
         if (value) headers[name] = value;
       }
       response.writeHead(upstream.status, headers);
-      if (upstream.body) Readable.fromWeb(upstream.body as never).pipe(response);
-      else response.end();
+      await forwardUpstream(upstream, response, span, requestStarted);
     } catch {
-      sendJson(response, 502, { error: { code: "upstream_unavailable", message: "Model provider unavailable" } });
-    }
+      span?.setStatus({code: SpanStatusCode.ERROR});
+      if (!response.headersSent) sendJson(response, 502, { error: { code: "upstream_unavailable", message: "Model provider unavailable" } });
+      else response.destroy();
+    } finally { disconnect.close(); span?.end(); }
   });
+}
+
+export function upstreamDisconnect(response: ServerResponse, span?: Span): {signal: AbortSignal; close: () => void} {
+  const controller = new AbortController();
+  const closed = () => { if (!response.writableFinished) {span?.setStatus({code:SpanStatusCode.ERROR});span?.setAttribute("http.client_disconnected",true);span?.end();controller.abort();} };
+  response.once("close",closed);
+  if(response.destroyed) closed();
+  return {signal:controller.signal,close:()=>response.off("close",closed)};
+}
+
+export function closeModelGateway(server: Server, tracing?: Pick<AgentTracing, "close">, graceMs = 1000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => server.closeAllConnections(), graceMs);
+    server.close(() => {
+      clearTimeout(timer);
+      Promise.resolve(tracing?.close()).then(resolve, reject);
+    });
+  });
+}
+
+async function forwardUpstream(upstream: Response, response: ServerResponse, span?: Span, requestStarted = performance.now()): Promise<void> {
+  span?.setAttribute("http.response.status_code",upstream.status);
+  if(upstream.status>=400) span?.setStatus({code:SpanStatusCode.ERROR});
+  for(const name of ["request-id","x-request-id","openai-request-id"]) {const id=upstream.headers.get(name); if(id)span?.setAttribute("gen_ai.response.request_id",id);}
+  if(!upstream.body){response.end();return;}
+  const stream=Readable.fromWeb(upstream.body as never); let first=true;
+  stream.on("data",()=>{if(first){first=false;span?.setAttribute("http.first_stream_data_ms", performance.now()-requestStarted);span?.addEvent("stream.first_data");}});
+  await pipeline(stream,response);
 }
 
 export function validateAgentModelRequest(body: unknown, model: AgentModelSpec, effort: AgentReasoningEffort = model.reasoningEffort): boolean {
@@ -249,5 +290,15 @@ if (entrypoint === import.meta.url) {
   if (!signingSecret || !Object.values(providerApiKeys).some(Boolean)) {
     throw new Error("MODEL_GATEWAY_SIGNING_SECRET and at least one provider API key are required");
   }
-  createModelGateway({ signingSecret, providerApiKeys }).listen(8080, "0.0.0.0");
+  const tracing = AgentTracing.fromEnvironment("pi-model-gateway");
+  const server = createModelGateway({ signingSecret, providerApiKeys, tracing });
+  server.listen(8080, "0.0.0.0");
+  let closing = false;
+  for (const signal of ["SIGTERM", "SIGINT"] as const) process.once(signal, () => {
+    if (closing) return;
+    closing = true;
+    void closeModelGateway(server, tracing).catch(() => {
+      console.error(JSON.stringify({event: "agent_otel_shutdown_failed", service: "pi-model-gateway"}));
+    });
+  });
 }

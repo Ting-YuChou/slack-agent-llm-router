@@ -13,13 +13,39 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
-import redis.asyncio as redis
-from redis.exceptions import MaxConnectionsError
-
 from src.utils.metrics import ADMISSION_METRICS
 
 
 logger = logging.getLogger(__name__)
+
+
+class _LazyRedisFactory:
+    def __call__(self, *args, **kwargs):
+        from redis.asyncio import Redis
+
+        return Redis(*args, **kwargs)
+
+    def from_url(self, *args, **kwargs):
+        from redis.asyncio import Redis
+
+        return Redis.from_url(*args, **kwargs)
+
+
+class _LazyRedisNamespace:
+    def __init__(self):
+        self.Redis = _LazyRedisFactory()
+
+
+redis = _LazyRedisNamespace()
+
+
+def _is_max_connections_error(exc: Exception) -> bool:
+    try:
+        from redis.exceptions import MaxConnectionsError
+    except ImportError:
+        return False
+    return isinstance(exc, MaxConnectionsError)
+
 
 QUEUE_PRIORITY_STRIDE = 1_000_000_000_000
 
@@ -956,7 +982,7 @@ class RedisAdmissionController:
         self._redis_available = False
         self._redis_failure_at = self._time_func()
         self._set_redis_state("unavailable")
-        if isinstance(exc, MaxConnectionsError):
+        if _is_max_connections_error(exc):
             ADMISSION_METRICS.redis_pool_exhaustion.labels(
                 operation=operation,
                 failure_mode=self.failure_mode,

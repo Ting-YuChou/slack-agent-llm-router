@@ -96,3 +96,41 @@ test("stable errors are sanitized and preserve 409/404 mapping", async () => {
   assert.equal(invalid.status, 400);
   assert.doesNotMatch(await invalid.text(), /stack|syntaxerror/i);
 });
+
+test("feedback is authenticated, owner checked, terminal only, and has stable replay identity", async () => {
+  let status = "completed"; const captures: any[] = [];
+  const server=createAgentHttpServer({token:"secret",health:()=>({}),orchestrator:{getRun:()=>({run_id:"r",session_id:"s",owner_user_id:"owner",status})} as any,
+    feedback: async (_run:any,payload:any,id:string)=>{captures.push({payload,id});return true;}} as any);
+  const base=await listen(server);
+  const submit=(user:string,token="secret")=>fetch(`${base}/v1/runs/r/feedback`,{method:"POST",headers:{authorization:`Bearer ${token}`,"content-type":"application/json"},body:JSON.stringify({user_id:user,verdict:"accepted",feedback_id:"click-1"})});
+  try {
+    assert.equal((await submit("owner","wrong")).status,401);
+    assert.equal((await submit("other")).status,401);
+    status="running"; assert.equal((await submit("owner")).status,409);
+    status="completed"; assert.equal((await submit("owner")).status,202); assert.equal((await submit("owner")).status,202);
+    assert.equal(captures.length,2); assert.equal(captures[0].id,captures[1].id);
+  } finally {await close(server);}
+});
+
+test("restart capture recovery skips previously recovered terminal runs", async () => {
+  const module: any = await import("../src/server.js");
+  assert.equal(typeof module.recoverPendingCaptures,"function");
+  const runs: any[] = [{run_id:"fresh",status:"interrupted"},{run_id:"old",status:"interrupted",capture_complete:false},{run_id:"done",status:"completed"}];
+  const recovered: string[] = [];
+  const recover = async (run:any)=>{recovered.push(run.run_id);run.capture_complete=false;};
+  await module.recoverPendingCaptures(runs,recover);
+  await module.recoverPendingCaptures(runs,recover);
+  assert.deepEqual(recovered,["fresh"]);
+});
+
+test("failed terminal writes persist failure before releasing even if persistence fails", async () => {
+  const module: any = await import("../src/server.js");
+  assert.equal(typeof module.settleCaptureWrite,"function");
+  const calls: string[] = [];
+  const telemetry = {releaseRun:(id:string)=>calls.push(`release:${id}`)};
+  await module.settleCaptureWrite("r",false,telemetry,async()=>{calls.push("persist:false");});
+  assert.deepEqual(calls,["persist:false","release:r"]);
+  calls.length=0;
+  await assert.rejects(module.settleCaptureWrite("r",false,telemetry,async()=>{throw new Error("disk full");}));
+  assert.deepEqual(calls,["release:r"]);
+});

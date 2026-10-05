@@ -233,6 +233,16 @@ class AgentRuntimeClient:
             expected_status=202,
         )
 
+    async def feedback(
+        self, run_id: str, user_id: str, verdict: str, feedback_id: str
+    ) -> None:
+        await self._request(
+            "POST",
+            f"/v1/runs/{run_id}/feedback",
+            json={"user_id": user_id, "verdict": verdict, "feedback_id": feedback_id},
+            expected_status=202,
+        )
+
     async def cancel(self, run_id: str, user_id: str) -> None:
         await self._request(
             "POST",

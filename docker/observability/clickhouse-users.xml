@@ -1,0 +1,16 @@
+<clickhouse>
+  <profiles>
+    <agent_grafana_readonly>
+      <readonly>1</readonly>
+      <max_execution_time>30</max_execution_time>
+    </agent_grafana_readonly>
+  </profiles>
+  <users>
+    <agent_grafana>
+      <password from_env="AGENT_GRAFANA_CH_PASSWORD"/>
+      <networks><ip>::/0</ip></networks>
+      <profile>agent_grafana_readonly</profile>
+      <quota>default</quota>
+    </agent_grafana>
+  </users>
+</clickhouse>

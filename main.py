@@ -48,9 +48,6 @@ from src.admission import (
 from src.agent_runtime import AgentRuntimeClient
 from src.llm_router_part1_router import ModelRouter
 from src.llm_router_part2_inference import InferenceEngine
-from src.llm_router_part3_policy import PolicyMaterializer, RoutingPolicyCache
-from src.llm_router_part3_pipeline import KafkaIngestionPipeline, KafkaProducerManager
-from src.llm_router_part4_monitor import MonitoringService
 from src.rag.service import (
     RagIdempotencyConflict,
     RagPayloadTooLarge,
@@ -86,7 +83,15 @@ DEFAULT_API_KEY_ENV_VAR = "LLM_ROUTER_API_KEYS"
 WEB_SEARCH_ENABLED_ENV_VAR = "LLM_ROUTER_WEB_SEARCH_ENABLED"
 RAG_ENABLED_ENV_VAR = "LLM_ROUTER_RAG_ENABLED"
 RAG_QUEUE_ENABLED_ENV_VAR = "LLM_ROUTER_RAG_QUEUE_ENABLED"
-PUBLIC_ENDPOINTS = {"/live", "/ready", "/health"}
+PUBLIC_ENDPOINTS = {"/", "/live", "/ready", "/health"}
+
+# Optional infrastructure is imported only when its feature is enabled. Keeping
+# these names patchable also supports the existing isolated service tests.
+KafkaIngestionPipeline = None
+KafkaProducerManager = None
+MonitoringService = None
+PolicyMaterializer = None
+RoutingPolicyCache = None
 
 
 @dataclass(frozen=True)
@@ -194,6 +199,10 @@ class LLMRouterPlatform:
 
     def _apply_env_overrides(self, raw_config: Dict[str, Any]):
         """Apply small runtime toggles that are convenient for Docker Compose."""
+        clickhouse_password = os.getenv("CLICKHOUSE_PASSWORD")
+        if clickhouse_password is not None:
+            raw_config.setdefault("clickhouse", {})["password"] = clickhouse_password
+
         web_search_enabled = _env_flag_enabled(os.getenv(WEB_SEARCH_ENABLED_ENV_VAR))
         if web_search_enabled is not None:
             tools_config = raw_config.setdefault("tools", {})
@@ -300,7 +309,12 @@ class LLMRouterPlatform:
     async def _initialize_core_services(self):
         """Initialize the router and inference services required by the API."""
         if self._event_streaming_enabled():
-            self.services["event_producer"] = KafkaProducerManager(
+            producer_class = KafkaProducerManager
+            if producer_class is None:
+                from src.llm_router_part3_pipeline import (
+                    KafkaProducerManager as producer_class,
+                )
+            self.services["event_producer"] = producer_class(
                 config=self._build_event_producer_config()
             )
             await self.services["event_producer"].initialize()
@@ -312,7 +326,12 @@ class LLMRouterPlatform:
             await self.services["admission"].initialize()
 
         if self._policy_cache_enabled():
-            self.services["policy_cache"] = RoutingPolicyCache(
+            policy_cache_class = RoutingPolicyCache
+            if policy_cache_class is None:
+                from src.llm_router_part3_policy import (
+                    RoutingPolicyCache as policy_cache_class,
+                )
+            self.services["policy_cache"] = policy_cache_class(
                 config=self._build_policy_cache_config()
             )
             await self.services["policy_cache"].initialize()
@@ -346,26 +365,46 @@ class LLMRouterPlatform:
             self.services["agent_runtime"] = AgentRuntimeClient(agent_config)
 
         if self._service_enabled("pipeline"):
-            self.services["pipeline"] = KafkaIngestionPipeline(
+            pipeline_class = KafkaIngestionPipeline
+            if pipeline_class is None:
+                from src.llm_router_part3_pipeline import (
+                    KafkaIngestionPipeline as pipeline_class,
+                )
+            self.services["pipeline"] = pipeline_class(
                 config=self._build_pipeline_config()
             )
             await self.services["pipeline"].initialize()
 
         if self._policy_cache_enabled():
             if "policy_cache" not in self.services:
-                self.services["policy_cache"] = RoutingPolicyCache(
+                policy_cache_class = RoutingPolicyCache
+                if policy_cache_class is None:
+                    from src.llm_router_part3_policy import (
+                        RoutingPolicyCache as policy_cache_class,
+                    )
+                self.services["policy_cache"] = policy_cache_class(
                     config=self._build_policy_cache_config()
                 )
                 await self.services["policy_cache"].initialize()
 
-            self.services["policy_materializer"] = PolicyMaterializer(
+            materializer_class = PolicyMaterializer
+            if materializer_class is None:
+                from src.llm_router_part3_policy import (
+                    PolicyMaterializer as materializer_class,
+                )
+            self.services["policy_materializer"] = materializer_class(
                 kafka_config=dict(self.config.get("kafka", {})),
                 policy_cache=self.services["policy_cache"],
             )
             await self.services["policy_materializer"].initialize()
 
         if self._service_enabled("monitoring"):
-            self.services["monitoring"] = MonitoringService(
+            monitoring_class = MonitoringService
+            if monitoring_class is None:
+                from src.llm_router_part4_monitor import (
+                    MonitoringService as monitoring_class,
+                )
+            self.services["monitoring"] = monitoring_class(
                 config=self.config.get("monitoring", {})
             )
             await self.services["monitoring"].initialize()
@@ -1745,6 +1784,14 @@ class LLMRouterPlatform:
                     "message": "A valid API key is required",
                 },
             )
+
+        @app.get("/")
+        async def service_index():
+            return {
+                "service": "slack-llm-router",
+                "status": "running",
+                "health": "/health",
+            }
 
         @app.get("/live")
         async def live_check():

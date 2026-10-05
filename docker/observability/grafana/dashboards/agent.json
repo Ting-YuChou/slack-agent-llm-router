@@ -1,0 +1,325 @@
+{
+  "uid": "pi-agent-observability",
+  "title": "Coding Agent Observability",
+  "schemaVersion": 40,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "run_id",
+        "type": "textbox",
+        "label": "Run ID (empty = all)",
+        "current": {
+          "text": "",
+          "value": ""
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Runs by status",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT status, count() AS runs FROM agent_runs_latest WHERE $__timeFilter(collected_at) GROUP BY status",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Official Pi tokens and costs",
+      "type": "table",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT run_id, sumOrNull(input) AS input, sumOrNull(output) AS output, sumOrNull(cache_read) AS cache_read, sumOrNull(cache_write) AS cache_write, sumOrNull(cache_write_1h) AS cache_write_1h, sumOrNull(reasoning) AS reasoning_subset, sumOrNull(total_tokens) AS total_tokens, sumOrNull(cost_total) AS cost_usd FROM agent_usage_latest WHERE $__timeFilter(collected_at) GROUP BY run_id ORDER BY cost_usd DESC",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Tools and errors",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT tool, phase, count() AS events, sum(is_error) AS errors FROM agent_tool_calls_latest WHERE $__timeFilter(collected_at) GROUP BY tool, phase",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Capture completeness",
+      "type": "table",
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT run_id, status, capture_complete FROM agent_runs_latest WHERE $__timeFilter(collected_at) ORDER BY collected_at DESC",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Human feedback",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT run_id, user_id, verdict FROM agent_feedback_current",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Existing test results",
+      "type": "table",
+      "gridPos": {
+        "x": 12,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT run_id, tool_call_id, parser, status, passed, failed FROM agent_test_results_latest WHERE $__timeFilter(collected_at) ORDER BY collected_at DESC",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Routing recommendation and actual execution",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT run_id, model, reasoning_effort, JSONExtractString(routing_json, 'source') AS routing_mode, JSONExtractString(routing_json, 'recommendedModelRef') AS recommendation, if(JSONHas(routing_json, 'probability'), JSONExtractFloat(routing_json, 'probability'), NULL) AS probability, if(JSONHas(routing_json, 'jevCostUsd'), JSONExtractFloat(routing_json, 'jevCostUsd'), NULL) AS routing_cost_usd FROM agent_runs_latest WHERE $__timeFilter(collected_at)",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Run, approval and tool latency",
+      "type": "table",
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT SpanName, count() AS spans, quantile(0.5)(Duration/1e6) AS p50_ms, quantile(0.95)(Duration/1e6) AS p95_ms FROM (SELECT TraceId, SpanId, any(SpanName) AS SpanName, any(Duration) AS Duration FROM otel_traces WHERE $__timeFilter(Timestamp) GROUP BY TraceId, SpanId) GROUP BY SpanName",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Retries and compaction",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT JSONExtractString(payload_json, 'type') AS event_type, count() AS events FROM agent_events_latest WHERE kind='rpc' AND $__timeFilter(collected_at) AND event_type IN ('auto_retry_start', 'auto_retry_end', 'auto_compaction_start', 'auto_compaction_end') GROUP BY event_type",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Traces for selected run",
+      "type": "table",
+      "gridPos": {
+        "x": 12,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT min(Timestamp) AS first_seen, TraceId, SpanId, any(ParentSpanId) AS ParentSpanId, any(SpanName) AS SpanName, any(Duration)/1e6 AS duration_ms, any(StatusCode) AS StatusCode FROM otel_traces WHERE $__timeFilter(Timestamp) AND (${run_id:sqlstring}='' OR SpanAttributes['agent.run_id']=${run_id:sqlstring}) GROUP BY TraceId, SpanId ORDER BY first_seen",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Raw dialogue and tool payload references",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT collected_at, run_id, event_id, kind, payload_json FROM agent_events_latest WHERE $__timeFilter(collected_at) AND (${run_id:sqlstring}='' OR run_id=${run_id:sqlstring}) AND kind IN ('session_entry', 'bash_output_manifest', 'capture_status') ORDER BY collected_at LIMIT 200",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Session totals and context snapshots",
+      "type": "table",
+      "gridPos": {
+        "x": 12,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT collected_at, run_id, phase, payload_json FROM agent_session_stats_latest WHERE $__timeFilter(collected_at) AND (${run_id:sqlstring}='' OR run_id=${run_id:sqlstring}) ORDER BY collected_at LIMIT 100",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "Session totals versus canonical ledger",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT * FROM agent_usage_reconciliation",
+          "format": 1
+        }
+      ]
+    }
+  ]
+}

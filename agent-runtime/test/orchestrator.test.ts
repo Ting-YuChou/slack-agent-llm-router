@@ -436,3 +436,49 @@ test("parallel first prompts in the same Slack thread create only one session", 
   releaseCreate();
   await first;
 });
+
+test("terminal capture completeness is persisted and retained on restore", async () => {
+  let state: any = {schema_version:1,sessions:[],runs:[]};
+  const store: any = {load:async()=>structuredClone(state),save:async(value:any)=>{state=structuredClone(value);},takeExpiredSessions:()=>[]};
+  const {orchestrator,process} = fixture();
+  (orchestrator as any).stateStore = store;
+  (orchestrator as any).captureState = () => ({complete:false,reasons:["final_snapshot_failed"]});
+  const first = await orchestrator.createSession({team_id:"T",channel_id:"C",thread_ts:"capture",user_id:"U",prompt:"fix"} as any);
+  process.emit({type:"settled"});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(state.runs[0].capture_complete,false);
+  state.sessions = [];
+  const restored = fixture().orchestrator;
+  (restored as any).stateStore = store;
+  (restored as any).captureState = () => ({complete:true,reasons:[]});
+  await restored.restore();
+  assert.equal((restored.getRun(first.run_id) as any).capture_complete,false);
+  assert.deepEqual((restored.getRun(first.run_id) as any).capture_reasons,["final_snapshot_failed"]);
+});
+
+test("restored newly interrupted runs retain known incomplete capture reasons", async () => {
+  const {orchestrator} = fixture();
+  const observed: any[] = [];
+  const state = {schema_version:1,sessions:[],runs:[{run_id:"r",session_id:"s",status:"interrupted",events:[]}]};
+  (orchestrator as any).stateStore = {load:async()=>state,takeExpiredSessions:()=>[],save:async()=>{}};
+  (orchestrator as any).captureState = () => ({complete:false,reasons:["container_stopped_before_final_snapshot"]});
+  (orchestrator as any).observeRun = (run:any)=>observed.push(run);
+  await orchestrator.restore();
+  assert.equal(observed[0].capture_complete,false);
+  assert.deepEqual(observed[0].capture_reasons,["container_stopped_before_final_snapshot"]);
+});
+
+test("failed terminal observability writes persist an incomplete run and stay terminal", async () => {
+  let state: any;
+  const {orchestrator,process} = fixture();
+  (orchestrator as any).stateStore = {save:async (value:any)=>{state=structuredClone(value);}};
+  (orchestrator as any).captureState = () => ({complete:true,reasons:[]});
+  const created = await orchestrator.createSession({team_id:"T",channel_id:"C",thread_ts:"failed-telemetry",user_id:"U",prompt:"fix"} as any);
+  process.emit({type:"settled"});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(state.runs[0].capture_complete,true);
+  await (orchestrator as any).markCaptureIncomplete(created.run_id,"terminal_outbox_write_failed");
+  assert.equal(state.runs[0].capture_complete,false);
+  assert.deepEqual(state.runs[0].capture_reasons,["terminal_outbox_write_failed"]);
+  assert.equal(state.runs[0].status,"completed");
+});

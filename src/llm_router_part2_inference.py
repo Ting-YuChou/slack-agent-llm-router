@@ -28,8 +28,6 @@ import hashlib
 import httpx
 import openai
 import anthropic
-import redis.asyncio as redis
-from transformers import AutoTokenizer
 
 from src.admission import AdmissionRejectedError
 from src.llm_router_part1_router import ModelRouter
@@ -47,6 +45,21 @@ from src.utils.schema import (
 from src.tools import ToolRegistry, WebSearchTool, WebSearchResult
 
 logger = logging.getLogger(__name__)
+
+
+class _LazyRedisFactory:
+    def __call__(self, *args, **kwargs):
+        from redis.asyncio import Redis
+
+        return Redis(*args, **kwargs)
+
+
+class _LazyRedisNamespace:
+    def __init__(self):
+        self.Redis = _LazyRedisFactory()
+
+
+redis = _LazyRedisNamespace()
 
 
 @dataclass
@@ -258,6 +271,7 @@ class ContextCompressor:
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
+        self.enabled = bool(config.get("enabled", True))
         self.compression_ratio = config.get("compression_ratio", 0.3)
         self.max_context_tokens = config.get("max_context_tokens", 100000)
         self.method = config.get("method", "semantic_graph")
@@ -265,8 +279,14 @@ class ContextCompressor:
 
     async def initialize(self):
         """Initialize compression components"""
+        if not self.enabled:
+            logger.info("Context compression is disabled")
+            return
+
         try:
             # Load tokenizer for token counting
+            from transformers import AutoTokenizer
+
             self.tokenizer = AutoTokenizer.from_pretrained("microsoft/DialoGPT-medium")
             logger.info("Context compressor initialized")
         except Exception as e:
@@ -274,6 +294,8 @@ class ContextCompressor:
 
     async def compress_context(self, context: str, target_length: int) -> str:
         """Compress context to target length while preserving key information"""
+        if not self.enabled:
+            return context
         if not context or len(context) < target_length:
             return context
 
@@ -2029,12 +2051,20 @@ class InferenceEngine:
 
         # Initialize providers based on configuration
         openai_config = dict(self.config.get("openai", {}) or {})
-        if "openai" in self.config and openai_config.get("enabled", True):
+        if (
+            "openai" in self.config
+            and openai_config.get("enabled", True)
+            and self._router_uses_provider("openai")
+        ):
             self.providers["openai"] = OpenAIProvider(openai_config)
             await self.providers["openai"].initialize()
 
         anthropic_config = dict(self.config.get("anthropic", {}) or {})
-        if "anthropic" in self.config and anthropic_config.get("enabled", True):
+        if (
+            "anthropic" in self.config
+            and anthropic_config.get("enabled", True)
+            and self._router_uses_provider("anthropic")
+        ):
             self.providers["anthropic"] = AnthropicProvider(anthropic_config)
             await self.providers["anthropic"].initialize()
 
@@ -2046,6 +2076,16 @@ class InferenceEngine:
         self._initialized = True
         logger.info(
             f"Inference engine initialized with {len(self.providers)} providers"
+        )
+
+    def _router_uses_provider(self, provider: str) -> bool:
+        """Return whether the router has a concrete model for a provider."""
+        models = getattr(self.router, "models", None)
+        if not isinstance(models, dict) or not models:
+            return True
+        return any(
+            str(getattr(model, "provider", "")).lower() == provider
+            for model in models.values()
         )
 
     def _vllm_configured(self, config: Dict[str, Any]) -> bool:

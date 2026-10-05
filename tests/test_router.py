@@ -1,3 +1,5 @@
+import builtins
+
 import pytest
 
 from src.llm_router_part1_router import (
@@ -17,6 +19,25 @@ from src.utils.schema import (
 
 
 class TestQueryClassifier:
+    @pytest.mark.asyncio
+    async def test_initialize_skips_sentence_transformer_when_semantic_disabled(
+        self, monkeypatch
+    ):
+        real_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "sentence_transformers":
+                raise AssertionError("sentence-transformers must not be imported")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", guarded_import)
+        classifier = QueryClassifier(semantic_enabled=False)
+
+        await classifier.initialize()
+
+        assert classifier._is_initialized is True
+        assert classifier.model is None
+
     def test_classify_code_generation_query(self):
         classifier = QueryClassifier()
         classifier._is_initialized = True
@@ -41,6 +62,21 @@ class TestQueryClassifier:
 
 
 class TestTokenCounter:
+    def test_disabled_tokenizer_uses_local_approximation_without_import(
+        self, monkeypatch
+    ):
+        real_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "tiktoken":
+                raise AssertionError("tiktoken must not be imported")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", guarded_import)
+        counter = TokenCounter(enabled=False)
+
+        assert counter.count_tokens("one two three") == 3
+
     def test_count_tokens_uses_default_encoder(self):
         counter = TokenCounter()
         token_count = counter.count_tokens("one two three", "unknown-model")
@@ -72,6 +108,102 @@ class TestRoutingRule:
 
 
 class TestModelRouter:
+    @pytest.mark.asyncio
+    async def test_nested_classifier_config_disables_semantic_model(
+        self, router_config, monkeypatch
+    ):
+        real_import = builtins.__import__
+        import_attempted = False
+
+        def guarded_import(name, *args, **kwargs):
+            nonlocal import_attempted
+            if name == "sentence_transformers":
+                import_attempted = True
+                raise AssertionError("sentence-transformers must not be imported")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", guarded_import)
+        router = ModelRouter(
+            {
+                **router_config,
+                "classifier": {"semantic_enabled": False},
+                "tokenizer_enabled": False,
+            }
+        )
+
+        await router.initialize()
+
+        assert router.classifier.model is None
+        assert import_attempted is False
+
+    @pytest.mark.asyncio
+    async def test_missing_required_default_model_credential_fails_startup(
+        self, router_config, monkeypatch
+    ):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        config = {**router_config, "credential_gating": True}
+
+        router = ModelRouter(config)
+
+        with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+            await router.initialize()
+
+    @pytest.mark.asyncio
+    async def test_optional_provider_without_credential_is_skipped(
+        self, router_config, monkeypatch
+    ):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        config = {
+            **router_config,
+            "credential_gating": True,
+            "classifier": {"semantic_enabled": False},
+            "models": {
+                "gpt-5": router_config["models"]["gpt-5"],
+                "claude-sonnet-4-6": {
+                    "provider": "anthropic",
+                    "max_tokens": 8192,
+                    "cost_per_token": 0.000015,
+                    "priority": 2,
+                    "capabilities": ["general", "reasoning", "analysis"],
+                    "api_key_env": "ANTHROPIC_API_KEY",
+                },
+            },
+        }
+
+        router = ModelRouter(config)
+        await router.initialize()
+
+        assert set(router.models) == {"gpt-5"}
+
+    @pytest.mark.asyncio
+    async def test_optional_provider_with_credential_is_loaded(
+        self, router_config, monkeypatch
+    ):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic")
+        config = {
+            **router_config,
+            "credential_gating": True,
+            "classifier": {"semantic_enabled": False},
+            "models": {
+                "gpt-5": router_config["models"]["gpt-5"],
+                "claude-sonnet-4-6": {
+                    "provider": "anthropic",
+                    "max_tokens": 8192,
+                    "cost_per_token": 0.000015,
+                    "priority": 2,
+                    "capabilities": ["general", "reasoning", "analysis"],
+                    "api_key_env": "ANTHROPIC_API_KEY",
+                },
+            },
+        }
+
+        router = ModelRouter(config)
+        await router.initialize()
+
+        assert set(router.models) == {"gpt-5", "claude-sonnet-4-6"}
+
     @pytest.mark.asyncio
     async def test_route_query_prefers_rule_based_selection(self, router_config):
         router = ModelRouter(router_config)

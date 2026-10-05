@@ -6,6 +6,9 @@ import type { AgentProcess } from "./orchestrator.js";
 import { resolveAgentModel } from "./agent-model.js";
 import type { AgentReasoningEffort } from "./agent-model.js";
 import type { RouteDecision } from "./jev-router.js";
+import type { AgentTracing } from "./tracing.js";
+import { PiRunCapture } from "./pi-capture.js";
+import type { AgentTelemetry } from "./telemetry.js";
 import type { McpRunConfig } from "./mcp-config.js";
 import { namespacedMcpToolNames } from "./mcp-config.js";
 
@@ -100,6 +103,11 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
 }
 
 export class DockerPiProcess implements AgentProcess {
+  private activeRunId?: string;
+  private readonly tracing?: AgentTracing;
+  private capture?: PiRunCapture;
+  private readonly telemetry?: AgentTelemetry;
+  private readonly sessionId: string;
   private child?: ChildProcessWithoutNullStreams;
   private bridge?: PiRpcBridge;
   private closing = false;
@@ -118,8 +126,12 @@ export class DockerPiProcess implements AgentProcess {
     onEvent: (event: PublicRunEvent) => void,
     mcpTokenForRun?: (runId: string) => string,
     classifierTokenForRun?: (runId: string) => string,
+    telemetry?: AgentTelemetry,
+    sessionId = options.name,
+    tracing?: AgentTracing,
   ) {
     this.options = options;
+    this.telemetry = telemetry; this.sessionId = sessionId; this.tracing = tracing;
     this.tokenForRun = tokenForRun;
     this.onEvent = onEvent;
     this.mcpTokenForRun = mcpTokenForRun;
@@ -130,8 +142,12 @@ export class DockerPiProcess implements AgentProcess {
   private start(runId: string, route: RouteDecision): void {
     if (this.child && this.child.exitCode === null) throw new Error("Pi container is already active");
     this.closing = false;
+    this.activeRunId = runId;
+    this.tracing?.lifecycle(runId, "container_start", "start");
     const containerName = `${this.options.name}-${runId.slice(0, 8)}`;
     this.activeContainerName = containerName;
+    const capture = this.telemetry ? new PiRunCapture(this.telemetry, runId, this.sessionId, this.options.sessionStatePath, containerName) : undefined;
+    this.capture = capture;
     const { mcp, ...baseOptions } = this.options;
     if (mcp && !this.mcpTokenForRun) throw new Error("MCP token issuer is required when MCP is enabled");
     const child = spawn("docker", buildAgentDockerArgs({
@@ -150,16 +166,18 @@ export class DockerPiProcess implements AgentProcess {
     this.child = child;
     const bridge = new PiRpcBridge({
       writeLine: (line) => child.stdin.write(line),
+      onCommand: record => capture?.onCommand(record),
+      onRecord: record => { capture?.onRecord(record); this.tracing?.rpc(runId, record); },
       onEvent: (event) => {
         if (event.type === "settled") {
           this.hasSession = true;
-          void this.stopActiveContainer().then(
-            () => this.onEvent(event),
-            () => this.onEvent({
+          void this.finalizeCapture(bridge, capture).then(() => this.bridge === bridge ? this.stopActiveContainer() : undefined).then(
+            () => { if (this.bridge === bridge) this.onEvent(event); },
+            () => { if (this.bridge === bridge) this.onEvent({
               type: "error",
               code: "container_stop_failed",
               message: "Agent container could not be confirmed stopped",
-            }),
+            }); },
           );
           return;
         }
@@ -167,6 +185,7 @@ export class DockerPiProcess implements AgentProcess {
       },
     });
     this.bridge = bridge;
+    child.once("spawn", () => this.tracing?.lifecycle(runId, "container_start", "end"));
     child.stdout.on("data", (chunk: Buffer) => {
       try {
         bridge.feed(chunk);
@@ -196,7 +215,12 @@ export class DockerPiProcess implements AgentProcess {
     const startPrompt = () => {
       this.start(runId, selected);
       const model = resolveAgentModel(selected.modelRef);
-      void this.bridge!.configureAndPrompt(runId, prompt, model.provider, model.id, selected.effort).catch(() => {
+      const bridge = this.bridge!; const capture = this.capture;
+      void bridge.configureAndPrompt(runId, prompt, model.provider, model.id, selected.effort, async () => {
+        await capture?.beforePrompt(bridge);
+        if (this.bridge !== bridge || this.closing) throw new RpcProtocolError("Pi configuration was interrupted");
+      }).catch(() => {
+        if (this.bridge !== bridge || this.closing) return;
         this.onEvent({ type: "error", code: "pi_configuration_failed", message: "Pi model configuration could not be verified" });
         void this.stopActiveContainer();
       });
@@ -214,14 +238,25 @@ export class DockerPiProcess implements AgentProcess {
     }
     startPrompt();
   }
-  decide(rpcUiId: string, approved: boolean): void { this.bridge?.respondToUi(rpcUiId, approved); }
+  decide(rpcUiId: string, approved: boolean): void { if(this.activeRunId) this.tracing?.approval(this.activeRunId,rpcUiId,approved); this.bridge?.respondToUi(rpcUiId, approved); }
   async abort(runId: string): Promise<void> {
+    const capture = this.capture;
+    capture?.cancel();
     this.bridge?.abort(`abort-${runId}`);
     await this.stopActiveContainer();
+    await capture?.recover();
   }
 
   async close(): Promise<void> {
     await this.stopActiveContainer();
+  }
+
+  private async finalizeCapture(bridge: PiRpcBridge, capture?: PiRunCapture): Promise<void> {
+    if (!capture) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try { await Promise.race([capture.finalize(bridge), new Promise<void>(resolve => {
+      timer = setTimeout(() => { capture.cancel(); this.telemetry?.markIncomplete(capture.runId, "finalization_timeout"); resolve(); }, 10_000);
+    })]); } finally { if (timer) clearTimeout(timer); }
   }
 
   private stopActiveContainer(): Promise<void> {
@@ -236,6 +271,7 @@ export class DockerPiProcess implements AgentProcess {
     const child = this.child;
     if (!child || child.exitCode !== null) return;
     this.closing = true;
+    if(this.activeRunId) this.tracing?.lifecycle(this.activeRunId, "container_stop", "start");
     const containerName = this.activeContainerName;
     if (containerName) {
       try {
@@ -282,6 +318,7 @@ export class DockerPiProcess implements AgentProcess {
         resolve();
       });
     });
+    if(this.activeRunId) this.tracing?.lifecycle(this.activeRunId, "container_stop", "end");
   }
 }
 
