@@ -38,9 +38,11 @@ class AgentObservabilityIntegrationTests(unittest.IsolatedAsyncioTestCase):
         admin = clickhouse_connect.get_client(**connection)
         admin.command(f"CREATE DATABASE {database}")
         client = clickhouse_connect.get_client(**connection, database=database)
+        reader = clickhouse_connect.get_client(**connection, database=database)
 
         def consumer_factory(*args, **kwargs):
             kwargs["group_id"] = "agent-observability-test-" + suffix
+            kwargs["auto_offset_reset"] = "latest"
             return AIOKafkaConsumer(*args, **kwargs)
 
         worker = AgentAnalyticsWorker(
@@ -50,10 +52,11 @@ class AgentObservabilityIntegrationTests(unittest.IsolatedAsyncioTestCase):
         try:
             await worker.migrate()
             task = asyncio.create_task(worker.run())
+            await asyncio.sleep(1)
             with tempfile.TemporaryDirectory() as directory:
                 # The real writer thread owns SQLite and publishes through KafkaJS.
                 program = """
-import { AgentTelemetry } from './agent-runtime/dist/src/telemetry.js';
+import { AgentTelemetry } from '__TELEMETRY_MODULE__';
 const t = new AgentTelemetry({file: process.env.TEST_OUTBOX,
   brokers: JSON.parse(process.env.TEST_BROKERS), secrets: ['integration-private-key']});
 const run = process.env.TEST_RUN;
@@ -78,7 +81,12 @@ try {
     await new Promise(resolve=>setTimeout(resolve,200));
   }
 } finally { await t.close(); }
-"""
+""".replace(
+                    "__TELEMETRY_MODULE__",
+                    (root / "agent-runtime/dist/src/telemetry.js").as_uri(),
+                )
+                runner = Path(directory) / "telemetry-integration.mjs"
+                runner.write_text(program)
                 environment = {
                     **os.environ,
                     "TEST_RUN": run_id,
@@ -88,9 +96,7 @@ try {
                 for _ in range(2):
                     process = await asyncio.create_subprocess_exec(
                         "node",
-                        "--input-type=module",
-                        "-e",
-                        program,
+                        runner,
                         cwd=root,
                         env=environment,
                         stdout=asyncio.subprocess.PIPE,
@@ -103,6 +109,8 @@ try {
                         await process.wait()
                         raise
                     self.assertEqual(process.returncode, 0, stderr.decode())
+                    if task.done():
+                        await task
 
                 async def await_projection():
                     while True:
@@ -110,14 +118,14 @@ try {
                             await task  # Surface worker failures immediately.
                             self.fail("analytics worker stopped unexpectedly")
                         result = await asyncio.to_thread(
-                            client.query,
-                            "SELECT count() FROM agent_events_latest "
+                            reader.query,
+                            "SELECT count() FROM agent_events "
                             "WHERE run_id={run:String} AND kind='integration_marker'",
                             parameters={"run": run_id},
                         )
-                        if result.result_rows[0][0] >= 2:
+                        if result.result_rows[0][0] >= 1:
                             return await asyncio.to_thread(
-                                client.query,
+                                reader.query,
                                 "SELECT count(), sum(total_tokens), any(payload_json) "
                                 "FROM agent_usage_latest WHERE run_id={run:String}",
                                 parameters={"run": run_id},
@@ -125,17 +133,22 @@ try {
                         await asyncio.sleep(0.2)
 
                 projection = await asyncio.wait_for(await_projection(), 60)
+                self.assertEqual(
+                    len(projection.result_rows[0]),
+                    3,
+                    (projection.column_names, projection.result_rows),
+                )
                 count, tokens, payload = projection.result_rows[0]
                 self.assertEqual((count, tokens), (1, 6))
                 self.assertEqual(json.loads(payload)["usage"]["futureMetric"], 17)
                 reconciliation = await asyncio.to_thread(
-                    client.query,
+                    reader.query,
                     "SELECT reconciliation FROM agent_usage_reconciliation WHERE run_id={run:String}",
                     parameters={"run": run_id},
                 )
                 self.assertEqual(reconciliation.result_rows, [("matched",)])
                 result = await asyncio.to_thread(
-                    client.query,
+                    reader.query,
                     "SELECT payload_json FROM agent_events_latest "
                     "WHERE run_id={run:String} AND kind='session_entry'",
                     parameters={"run": run_id},
@@ -146,7 +159,7 @@ try {
                 self.assertEqual(text, "中文" * 150000 + " [REDACTED]")
                 self.assertTrue(
                     await asyncio.to_thread(
-                        lambda: client.query(
+                        lambda: reader.query(
                             "SELECT count() FROM agent_content_chunks_latest WHERE run_id={run:String}",
                             parameters={"run": run_id},
                         ).result_rows[0][0]
@@ -164,6 +177,7 @@ try {
                     finally:
                         await asyncio.gather(task, return_exceptions=True)
             finally:
+                reader.close()
                 client.close()
                 try:
                     admin.command(f"DROP DATABASE IF EXISTS {database}")

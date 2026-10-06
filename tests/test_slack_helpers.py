@@ -5,6 +5,15 @@ from unittest.mock import ANY, AsyncMock
 
 import pytest
 
+
+def test_slack_socket_mode_uses_supported_aiohttp_client_import():
+    from pathlib import Path
+
+    source = Path("slack/bot_real.py").read_text()
+    assert "from slack_sdk.socket_mode.aiohttp import (" in source
+    assert "SocketModeClient as AsyncSocketModeClient" in source
+
+
 from src.memory import HashEmbeddingProvider, InMemoryMemoryStore, MemoryManager
 from slack.agent_bootstrap import AgentBootstrapContext
 from slack.bot_real import (
