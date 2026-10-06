@@ -20,6 +20,7 @@ export interface AgentEnvelope {
   topic: "agent.events.v1" | "agent.content.v1";
 }
 export const CHUNK_BYTES = 256 * 1024;
+const KAFKA_PRODUCE_BUDGET = 768 * 1024;
 function redactSignedCredentials(text: string): string {
   // Recovery runs after a restart, when the registry of previously issued tokens is gone.
   return text.replace(/eyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/g, token => {
@@ -247,11 +248,25 @@ export async function publishOutbox(store: TelemetryStore, producer: {
 }): Promise<void> {
   const records = store.pending();
   for (const topic of ["agent.content.v1", "agent.events.v1"] as const) {
-    const batch = records.filter(r => r.topic === topic);
-    if (!batch.length)
-      continue;
-    await producer.send({ topic, acks: -1, messages: batch.map(record => ({ key: record.run_id, value: JSON.stringify(record) })) });
-    store.ack(batch.map(r => r.event_id));
+    let messages: Array<{ key: string; value: string }> = [];
+    let ids: string[] = [];
+    let bytes = 0;
+    const flush = async () => {
+      if (!messages.length) return;
+      await producer.send({ topic, acks: -1, messages });
+      store.ack(ids);
+      messages = []; ids = []; bytes = 0;
+    };
+    for (const record of records.filter(r => r.topic === topic)) {
+      const value = JSON.stringify(record);
+      const size = Buffer.byteLength(value);
+      if (messages.length && bytes + size > KAFKA_PRODUCE_BUDGET)
+        await flush();
+      messages.push({ key: record.run_id, value });
+      ids.push(record.event_id);
+      bytes += size;
+    }
+    await flush();
   }
 }
 export class AgentTelemetry {

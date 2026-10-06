@@ -117,7 +117,7 @@ def schema_sql():
             else 30
         )
         statements.append(
-            f"CREATE TABLE IF NOT EXISTS {table} (\n  {columns}\n) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY {key} TTL collected_at + INTERVAL {days} DAY"
+            f"CREATE TABLE IF NOT EXISTS {table} (\n  {columns}\n) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY {key} TTL toDateTime(collected_at) + INTERVAL {days} DAY"
         )
         statements.append(
             f"CREATE VIEW IF NOT EXISTS {table}_latest AS SELECT * FROM {table} FINAL"
@@ -127,7 +127,7 @@ def schema_sql():
     )
     statements.append(
         """CREATE VIEW IF NOT EXISTS agent_usage_reconciliation AS
-SELECT r.run_id, r.capture_complete, s.start_snapshots, s.end_snapshots,
+SELECT r.run_id AS run_id, r.capture_complete, s.start_snapshots, s.end_snapshots,
   if(s.start_snapshots>0 AND s.end_snapshots>0, s.end_tokens-s.start_tokens, NULL) AS session_token_delta,
   u.ledger_tokens, u.ledger_cost,
   if(s.start_snapshots>0 AND s.end_snapshots>0, s.end_cost-s.start_cost, NULL) AS session_cost_delta,
@@ -457,19 +457,22 @@ class AgentAnalyticsWorker:
         self.producer_factory = producer_factory
         self.stop = asyncio.Event()
         self.pending_since = {}
+        self.client_lock = asyncio.Lock()
 
     async def migrate(self):
         for statement in schema_sql():
-            await asyncio.to_thread(self.client.command, statement)
+            async with self.client_lock:
+                await asyncio.to_thread(self.client.command, statement)
 
     async def resolve(self, payload):
         if not isinstance(payload, dict) or "content_ref" not in payload:
             return payload
-        result = await asyncio.to_thread(
-            self.client.query,
-            "SELECT chunk_index, chunk_count, sha256, data FROM agent_content_chunks FINAL WHERE content_id={id:String} ORDER BY chunk_index",
-            parameters={"id": payload["content_ref"]},
-        )
+        async with self.client_lock:
+            result = await asyncio.to_thread(
+                self.client.query,
+                "SELECT chunk_index, chunk_count, sha256, data FROM agent_content_chunks FINAL WHERE content_id={id:String} ORDER BY chunk_index",
+                parameters={"id": payload["content_ref"]},
+            )
         rows = result.result_rows
         if (
             not rows
@@ -528,7 +531,10 @@ class AgentAnalyticsWorker:
         }
 
     async def full_test_result(self, envelope, payload):
-        return await asyncio.to_thread(self._read_bash_test_result, envelope, payload)
+        async with self.client_lock:
+            return await asyncio.to_thread(
+                self._read_bash_test_result, envelope, payload
+            )
 
     async def consume(self, topic, producer):
         if self.consumer_factory is None:
@@ -630,12 +636,13 @@ class AgentAnalyticsWorker:
                         last_offset = message.offset
                     for table, rows in tables.items():
                         columns = list(rows[0])
-                        await asyncio.to_thread(
-                            self.client.insert,
-                            table,
-                            [[row[c] for c in columns] for row in rows],
-                            column_names=columns,
-                        )
+                        async with self.client_lock:
+                            await asyncio.to_thread(
+                                self.client.insert,
+                                table,
+                                [[row[c] for c in columns] for row in rows],
+                                column_names=columns,
+                            )
                     if last_offset is not None:
                         await consumer.commit({partition: last_offset + 1})
                     # getmany advanced the position beyond a missing chunk: explicitly seek back.

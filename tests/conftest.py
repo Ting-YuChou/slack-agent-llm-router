@@ -331,6 +331,7 @@ web = _ensure_module("slack_sdk.web")
 async_client = _ensure_module("slack_sdk.web.async_client")
 socket_mode = _ensure_module("slack_sdk.socket_mode")
 socket_mode_async = _ensure_module("slack_sdk.socket_mode.async_client")
+socket_mode_aiohttp = _ensure_module("slack_sdk.socket_mode.aiohttp")
 socket_mode_request = _ensure_module("slack_sdk.socket_mode.request")
 socket_mode_response = _ensure_module("slack_sdk.socket_mode.response")
 
@@ -359,6 +360,7 @@ class _SocketModeResponse:
 
 async_client.AsyncWebClient = _AsyncWebClient
 socket_mode_async.AsyncSocketModeClient = _AsyncSocketModeClient
+socket_mode_aiohttp.SocketModeClient = _AsyncSocketModeClient
 socket_mode_request.SocketModeRequest = _SocketModeRequest
 socket_mode_response.SocketModeResponse = _SocketModeResponse
 slack_sdk.web = web

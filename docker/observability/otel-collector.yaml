@@ -35,13 +35,9 @@ exporters:
     sending_queue:
       enabled: true
       storage: file_storage
-      sizer: items
+      sizer: requests
       queue_size: 100000
       num_consumers: 2
-      batch:
-        min_size: 1000
-        max_size: 5000
-        flush_timeout: 1s
 service:
   extensions: [file_storage, health_check]
   pipelines:

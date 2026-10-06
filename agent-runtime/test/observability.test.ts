@@ -184,6 +184,27 @@ test("Kafka ACK uncertainty retains durable events and replays the same event id
   }
 });
 
+test("Kafka publishing keeps each produce request below the broker message budget", async () => {
+  const { TelemetryStore, publishOutbox } = await telemetryModule();
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-kafka-batch-'));
+  try {
+    const store = new TelemetryStore(path.join(root, 'outbox.sqlite'));
+    for (let i = 0; i < 3; i++)
+      store.append({ event_id: `large-${i}`, run_id: 'r', topic: 'agent.content.v1', kind: 'content', payload: 'x'.repeat(350_000) });
+    const sizes: number[] = [];
+    await publishOutbox(store, { send: async (request: { messages: Array<{ value: string }> }) => {
+      sizes.push(request.messages.reduce((total: number, message: { value: string }) => total + Buffer.byteLength(message.value), 0));
+    } });
+    assert.ok(sizes.length > 1);
+    assert.ok(sizes.every(size => size <= 768 * 1024));
+    assert.equal(store.pending().length, 0);
+    store.close();
+  }
+  finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("prefixed credential keys are redacted without deleting native token metrics", async () => {
   const {redact} = await telemetryModule();
   assert.deepEqual(redact({OPENAI_API_KEY:"hidden", DATABASE_PASSWORD:"hidden", GITHUB_TOKEN:"hidden", usage:{totalTokens:9,input_tokens:3}}), {OPENAI_API_KEY:"[REDACTED]",DATABASE_PASSWORD:"[REDACTED]",GITHUB_TOKEN:"[REDACTED]",usage:{totalTokens:9,input_tokens:3}});

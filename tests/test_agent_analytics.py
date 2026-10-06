@@ -1,5 +1,6 @@
 import unittest
 import importlib
+from pathlib import Path
 
 
 class AgentAnalyticsTests(unittest.TestCase):
@@ -150,6 +151,29 @@ class AgentAnalyticsTests(unittest.TestCase):
         self.assertNotIn(
             "private source content", rows["agent_test_results"][0]["payload_json"]
         )
+
+    def test_ttl_casts_datetime64_to_clickhouse_supported_datetime(self):
+        module = self.module()
+        for statement in module.schema_sql():
+            if statement.startswith("CREATE TABLE IF NOT EXISTS"):
+                self.assertRegex(
+                    statement,
+                    r"TTL toDateTime\(collected_at\) \+ INTERVAL \d+ DAY$",
+                )
+
+    def test_persistent_otel_queue_uses_request_sizing(self):
+        config = Path("docker/observability/otel-collector.yaml").read_text()
+        self.assertIn("storage: file_storage\n      sizer: requests", config)
+        self.assertNotIn("      batch:", config)
+
+    def test_usage_reconciliation_exposes_stable_run_id_column(self):
+        module = self.module()
+        statement = next(
+            sql
+            for sql in module.schema_sql()
+            if sql.startswith("CREATE VIEW IF NOT EXISTS agent_usage_reconciliation")
+        )
+        self.assertIn("SELECT r.run_id AS run_id", statement)
 
 
 if __name__ == "__main__":

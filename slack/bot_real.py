@@ -15,7 +15,9 @@ from typing import Dict, List, Optional, Any, Set
 from dataclasses import dataclass
 
 from slack_sdk.web.async_client import AsyncWebClient
-from slack_sdk.socket_mode.async_client import AsyncSocketModeClient
+from slack_sdk.socket_mode.aiohttp import (
+    SocketModeClient as AsyncSocketModeClient,
+)
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
 import httpx
