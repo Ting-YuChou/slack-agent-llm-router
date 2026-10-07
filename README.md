@@ -7,6 +7,7 @@ Multi-model LLM router with a FastAPI API, Slack bot integration, Kafka/ClickHou
 - Routes requests across `gpt-5`, `claude-sonnet-4-6`, and optional local `vLLM` models
 - Exposes a protected API for query routing and dashboard access
 - Supports Slack bot interactions through `app_mention`, slash commands, and active reply threads
+- Runs stateful Pi 1.0.1 coding agents in isolated worktrees, with Jev model routing and trusted read-only MCP access through Codemode
 - Can enrich current-info answers with Tavily-backed `web_search` results and structured sources
 - Persists analytics and request events through Kafka and ClickHouse when the pipeline is enabled
 - Supports Redis-backed cache and Slack state for multi-process durability
@@ -295,7 +296,7 @@ the regular response-cache Redis on `6379`.
 
 ## Quick Start
 
-### Single-Model Slack Demo
+### Slack Chat and Pi Coding Agent Demo
 
 This is the smallest live demo with two execution modes in the same Slack bot:
 normal queries use the existing Python ModelRouter, while `/llm agent <task>`
@@ -321,7 +322,7 @@ and adds OTEL traces, Grafana, and owner feedback. See the
    `connections:write`. Keep the resulting `xapp-` token.
 4. Invite the bot to `#ai-testing`. If you use another channel, update
    `slack.channels` in the demo config.
-5. Install the pinned Pi runtime dependencies, build the three local images,
+5. Install the pinned Pi runtime dependencies, build the four local images,
    and fetch the pinned official GitHub MCP image once:
 
 ```bash
@@ -368,15 +369,39 @@ be enforced outside the model. Then start the demo:
 make demo-slack
 ```
 
-### Read-only GitHub MCP
+### Read-only MCP and Codemode
 
-The full demo profile enables GitHub MCP and intentionally refuses to start
-until its credentials are configured. Create a GitHub App with read access to
-**Contents**, **Issues**, and **Pull requests**, install it only on the
-repositories Pi may inspect, and set these values in `.env.demo`:
+MCP is disabled by default. Pi loads only the trusted registry compiled into
+the Agent image; repository `.pi/mcp.json` files are ignored. Enable one server
+at a time after its credentials and dependencies are ready:
 
 ```bash
-PI_AGENT_MCP_MODE=github_read_only
+PI_AGENT_MCP_MODE=read_only
+PI_AGENT_MCP_SERVERS=github
+MCP_GATEWAY_SIGNING_SECRET=replace-with-a-long-random-secret
+```
+
+The registry supports four read-only servers:
+
+| Server | Exposure | Purpose |
+| --- | --- | --- |
+| GitHub | direct + Codemode | Repository files, code search, issues, pull requests, Actions logs, and security alerts |
+| ClickHouse | Codemode | De-identified aggregate Agent latency, usage, cost, test, and trace metrics |
+| Context7 | Codemode | Version-specific public package documentation |
+| CodeGraphContext | Codemode | Lazy, run-scoped code relationship, dead-code, and complexity analysis |
+
+GitHub keeps the small, frequent tools `get_file_contents`, `search_code`,
+`issue_read`, and `pull_request_read` directly visible to the model. List
+operations, Actions and job logs, and code, Dependabot, and secret scanning
+alerts are searched and called inside Codemode so Pi can combine results before
+adding a bounded summary to its context.
+
+For GitHub, create a repository-scoped GitHub App with read access to
+**Contents**, **Issues**, **Pull requests**, **Actions**, **Code scanning
+alerts**, **Dependabot alerts**, and **Secret scanning alerts**. Install it only
+on repositories Pi may inspect, then set:
+
+```bash
 PI_AGENT_GITHUB_REPOSITORIES=owner/repository
 GITHUB_APP_ID=123456
 GITHUB_APP_INSTALLATION_ID=12345678
@@ -384,20 +409,28 @@ GITHUB_APP_PRIVATE_KEY_PATH=/absolute/path/to/github-app.private-key.pem
 ```
 
 The repository list is comma-separated. The current checkout's `origin` must
-match one entry. The private key is mounted only into the MCP gateway; it is not
-placed in a Docker environment variable or shared with Pi. The gateway mints
-short-lived installation tokens and sends them to the pinned official GitHub
-MCP server. Pi remains on its internal network and receives a separate token
-bound to the run, session, Slack user, repository, mode, server, and exact tool
-allowlist.
+match one entry. Each HTTP MCP runs behind its own gateway, credential set,
+derived signing key, and network boundary. Pi receives only a short-lived token
+bound to the server, run, session, Slack user, scope, exact tools, call budget,
+and expiry. The GitHub server also runs in read-only and lockdown mode, and the
+gateway checks the repository and exact tool allowlist again.
 
-This release exposes only `get_file_contents`, `search_code`, `issue_read`,
-`list_issues`, `pull_request_read`, and `list_pull_requests`. The official server
-runs in read-only and lockdown mode, and the local gateway rejects every other
-tool or repository. Repository `.pi/mcp.json` files are not loaded. Issue creation,
-comments, PR creation or merge, workflow dispatch, and repository settings are
-unavailable. Returning `PI_AGENT_MCP_MODE` to `off` removes MCP from new Agent
-containers.
+ClickHouse exposes only five de-identified aggregate views in the `agent_mcp`
+database. Context7 accepts package, version, and documentation questions only.
+CodeGraph creates a bounded sanitized mirror of the current worktree on first
+use, indexes it outside the worktree, and deletes its mirror, index, and child
+process with the run. All MCP results are treated as untrusted data and reduced
+before they enter the model context.
+
+Add servers gradually with a comma-separated list, for example
+`PI_AGENT_MCP_SERVERS=github,clickhouse`. The legacy `github_read_only` mode is
+still accepted for GitHub-only deployments. Returning `PI_AGENT_MCP_MODE` to
+`off` removes all MCP access from new Agent containers. Issue and pull request
+writes, workflow dispatch, artifact download, database mutation, repository
+settings, and arbitrary graph queries remain unavailable. See the
+[Codemode MCP setup and rollout guide](docs/pi-codemode-mcp.md) for server
+credentials, network boundaries, ClickHouse initialization, rollout order, and
+cleanup behavior.
 
 `make demo-slack` starts a loopback-only host orchestrator, a model-only gateway,
 and the Slack worker. It creates an internal Docker network so Agent containers
@@ -584,7 +617,9 @@ python main.py start --config config/config.yaml
 
 - [config/config.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.yaml): host-run configuration, includes optional local `vLLM`
 - [config/config.compose.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.compose.yaml): compose runtime configuration, uses service names like `redis`, `kafka`, `clickhouse`
-- [config/config.demo.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.demo.yaml): single-provider Slack demo with external infrastructure disabled
+- [config/config.demo.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.demo.yaml): Slack Chat and Pi Agent demo with the general data pipeline disabled
+- [config/demo.env.example](config/demo.env.example): Jev, Agent, MCP, and observability environment template
+- [docker-compose.agent-mcp.yaml](docker-compose.agent-mcp.yaml): optional read-only MCP gateways and ClickHouse aggregate-view initialization
 
 Important defaults in `config/config.yaml`:
 
@@ -598,11 +633,20 @@ Important defaults in `config/config.yaml`:
 
 ```text
 .
+├── agent-runtime/
+│   ├── src/
+│   ├── extensions/
+│   └── Dockerfile.*
 ├── main.py
 ├── docker-compose.yml
+├── docker-compose.agent-mcp.yaml
 ├── config/
 │   ├── config.yaml
-│   └── config.compose.yaml
+│   ├── config.compose.yaml
+│   ├── config.demo.yaml
+│   └── demo.env.example
+├── docs/
+│   └── pi-codemode-mcp.md
 ├── docker/
 │   ├── Dockerfile
 │   ├── requirements-runtime.txt

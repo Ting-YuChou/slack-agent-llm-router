@@ -68,6 +68,12 @@ export interface RunRecord {
   mcp_success?: boolean;
   mcp_error_code?: string | null;
   mcp_result_bytes?: number;
+  mcp_summary?: {
+    total_calls: number;
+    failures: number;
+    total_result_bytes: number;
+    servers: Record<string, { calls: number; failures: number; total_latency_ms: number; result_bytes: number }>;
+  };
   created_at: string;
   updated_at: string;
   tool_count: number;
@@ -484,27 +490,38 @@ export class CodingAgentOrchestrator {
     }
     if (event.type === "tool") {
       if (event.phase === "start") run.tool_count += 1;
-      const mcpTool = /^mcp__github__(.+)$/.exec(event.tool)?.[1];
-      if (mcpTool && this.mcpRepository) {
+      const mcpMatch = /^mcp__([^_]+)__(.+)$/.exec(event.tool);
+      const mcpServer = mcpMatch?.[1];
+      const mcpTool = mcpMatch?.[2];
+      if (mcpTool && mcpServer) {
         const timingKey = `${sessionId}:${event.tool_call_id}`;
         if (event.phase === "start") this.mcpToolStarts.set(timingKey, Date.now());
         const started = this.mcpToolStarts.get(timingKey);
         if (event.phase === "end") this.mcpToolStarts.delete(timingKey);
-        run.mcp_server = "github";
+        run.mcp_server = mcpServer;
         run.mcp_tool = mcpTool;
-        run.mcp_repository = this.mcpRepository;
+        if (mcpServer === "github" && this.mcpRepository) run.mcp_repository = this.mcpRepository;
         if (event.phase === "end") {
           run.mcp_latency_ms = started === undefined ? 0 : Math.max(0, Date.now() - started);
           run.mcp_success = event.is_error !== true;
           run.mcp_error_code = event.is_error === true ? "tool_error" : null;
           run.mcp_result_bytes = event.result_bytes ?? 0;
+          const summary = run.mcp_summary ??= { total_calls: 0, failures: 0, total_result_bytes: 0, servers: {} };
+          const serverSummary = summary.servers[mcpServer] ??= { calls: 0, failures: 0, total_latency_ms: 0, result_bytes: 0 };
+          summary.total_calls += 1;
+          summary.failures += event.is_error === true ? 1 : 0;
+          summary.total_result_bytes += event.result_bytes ?? 0;
+          serverSummary.calls += 1;
+          serverSummary.failures += event.is_error === true ? 1 : 0;
+          serverSummary.total_latency_ms += run.mcp_latency_ms;
+          serverSummary.result_bytes += event.result_bytes ?? 0;
         }
         run.events.push({
           type: "mcp",
           phase: event.phase,
-          server: "github",
+          server: mcpServer,
           tool: mcpTool,
-          repository: this.mcpRepository,
+          ...(mcpServer === "github" && this.mcpRepository ? { repository: this.mcpRepository } : {}),
           ...(event.phase === "end" ? { success: event.is_error !== true } : {}),
         });
       } else {

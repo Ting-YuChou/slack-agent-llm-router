@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { classifyBash, isApprovedSkillRead, validateWorkspacePath } from "../dist/src/policy.js";
+import { codemodeMcpPrompt, type McpServerId } from "../dist/src/mcp-config.js";
 
 const MAX_TURNS = Number(process.env.PI_AGENT_MAX_TURNS ?? "20");
 const MAX_TOOL_CALLS = Number(process.env.PI_AGENT_MAX_TOOL_CALLS ?? "40");
@@ -51,6 +52,14 @@ export default function policyExtension(pi: ExtensionAPI) {
         "Prefer deterministic code for exact rules, and do not use classifier output as authorization for writes, shell commands, approvals, deployment, or deletion.",
         "Check stopReason and use the returned probabilities; continue without Jev if the classifier is unavailable.",
       ].join(" ");
+    });
+  }
+  if (process.env.PI_AGENT_MCP_SERVERS_JSON) {
+    pi.on("before_agent_start", (event) => {
+      try {
+        const servers = JSON.parse(process.env.PI_AGENT_MCP_SERVERS_JSON ?? "[]") as Array<{ server?: McpServerId }>;
+        event.systemPromptOptions.sections.mcp_codemode = codemodeMcpPrompt(servers.flatMap((entry) => entry.server ? [entry.server] : []));
+      } catch { throw new Error("PI_AGENT_MCP_SERVERS_JSON must be valid JSON"); }
     });
   }
 

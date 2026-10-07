@@ -30,7 +30,8 @@ function redactSignedCredentials(text: string): string {
       const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
       const gateway = typeof claims.runId === "string" && typeof claims.expiresAt === "number";
       const mcp = typeof claims.run === "string" && typeof claims.session === "string"
-        && claims.mode === "github_read_only" && typeof claims.expiry === "number";
+        && (claims.mode === "github_read_only" || claims.mode === "read_only")
+        && typeof claims.expiry === "number";
       return gateway || mcp ? "[REDACTED]" : token;
     } catch { return token; }
   });

@@ -87,18 +87,15 @@ test("MCP is absent when off and explicitly loads only the trusted builtin path 
     ...base,
     mcp: {
       mode: "github_read_only",
-      gatewayUrl: "http://mcp-gateway:8090/mcp",
-      token: "run-bound-mcp-token",
-      tools: ["get_file_contents", "search_code"],
+      servers: [{ server: "github", gatewayUrl: "http://mcp-github:8090/mcp", token: "run-bound-mcp-token" }],
     },
   });
   const rendered = enabled.join(" ");
   assert.match(rendered, /PI_AGENT_MCP_MODE=github_read_only/);
-  assert.match(rendered, /PI_AGENT_MCP_GATEWAY_URL=http:\/\/mcp-gateway:8090\/mcp/);
-  assert.match(rendered, /PI_AGENT_MCP_TOKEN=run-bound-mcp-token/);
-  assert.match(rendered, /PI_AGENT_MCP_TOOLS_JSON=\["get_file_contents","search_code"\]/);
+  assert.match(rendered, /PI_AGENT_MCP_SERVERS_JSON=.*mcp-github.*run-bound-mcp-token/);
   assert.match(rendered, /--no-extensions.*-e builtin:mcp.*-e \/opt\/pi\/extensions\/mcp-bootstrap\.ts/);
-  assert.match(rendered, /--tools read,mcp__github__get_file_contents/);
+  assert.match(rendered, /--tools read,codemode,mcp__github__get_file_contents/);
+  assert.equal((rendered.match(/builtin:codemode/g) ?? []).length, 1);
 });
 
 test("run-time Jev exposes codemode with only a short-lived classifier gateway token", () => {

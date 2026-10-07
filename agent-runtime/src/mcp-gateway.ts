@@ -1,16 +1,16 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
 import { verifyMcpToken, type McpClaims } from "./mcp-token.js";
-import { GITHUB_READ_ONLY_TOOLS } from "./mcp-config.js";
+import type { McpServerId } from "./mcp-config.js";
 
 const DEFAULT_MAX_REQUEST_BYTES = 256_000;
 const DEFAULT_MAX_RESULT_BYTES = 1_048_576;
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 export interface McpAuditEvent {
-  server: "github";
+  server: McpServerId;
   tool: string;
-  repository: string;
+  scope: string;
   latency_ms: number;
   success: boolean;
   error_code: string | null;
@@ -18,6 +18,8 @@ export interface McpAuditEvent {
 }
 
 export interface McpGatewayOptions {
+  server: McpServerId;
+  allowedTools: readonly string[];
   signingSecret: string;
   upstreamUrl: string;
   timeoutMs?: number;
@@ -26,6 +28,8 @@ export interface McpGatewayOptions {
   onAudit?: (event: McpAuditEvent) => void;
   upstreamHeaders?: () => Promise<Record<string, string>>;
   healthCheck?: () => Promise<boolean>;
+  authorizeTool?: (tool: string, args: Record<string, unknown>, claims: McpClaims) => void;
+  transformResponse?: (method: string, tool: string, value: Record<string, any>) => void;
 }
 
 export function createMcpGatewayServer(options: McpGatewayOptions) {
@@ -33,6 +37,7 @@ export function createMcpGatewayServer(options: McpGatewayOptions) {
   const upstreamUrl = new URL(options.upstreamUrl);
   if (!/^https?:$/.test(upstreamUrl.protocol)) throw new Error("MCP upstream URL must use HTTP(S)");
   const sessionBindings = new Map<string, { identity: string; expiry: number }>();
+  const callCounts = new Map<string, number>();
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxRequestBytes = options.maxRequestBytes ?? DEFAULT_MAX_REQUEST_BYTES;
   const maxResultBytes = options.maxResultBytes ?? DEFAULT_MAX_RESULT_BYTES;
@@ -40,15 +45,15 @@ export function createMcpGatewayServer(options: McpGatewayOptions) {
   return createServer(async (request, response) => {
     if (request.method === "GET" && request.url === "/healthz") {
       const healthy = await options.healthCheck?.().catch(() => false) ?? true;
-      sendJson(response, healthy ? 200 : 503, { status: healthy ? "healthy" : "unhealthy", server: "github" });
+      sendJson(response, healthy ? 200 : 503, { status: healthy ? "healthy" : "unhealthy", server: options.server });
       return;
     }
     if (request.url !== "/mcp" || !["POST", "GET", "DELETE"].includes(request.method ?? "")) {
       sendError(response, 404, "not_found", "Endpoint not found");
       return;
     }
-    const claims = authenticate(request, options.signingSecret);
-    if (!claims || claims.tools.some((tool) => !GITHUB_READ_ONLY_TOOLS.includes(tool as typeof GITHUB_READ_ONLY_TOOLS[number]))) {
+    const claims = authenticate(request, options.signingSecret, options.server);
+    if (!claims || claims.tools.some((tool) => !options.allowedTools.includes(tool))) {
       sendError(response, 401, "unauthorized", "A valid MCP token is required");
       return;
     }
@@ -76,7 +81,12 @@ export function createMcpGatewayServer(options: McpGatewayOptions) {
       method = message.method;
       tool = method === "tools/call" && isRecord(message.params) && typeof message.params.name === "string"
         ? message.params.name : method;
-      authorizeMessage(message, claims);
+      authorizeMessage(message, claims, options.authorizeTool);
+      if (message.method === "tools/call") {
+        const used = callCounts.get(identity) ?? 0;
+        if (used >= claims.maxCalls) throw new GatewayRequestError(429, "call_budget_exceeded", "MCP call budget is exhausted");
+        callCounts.set(identity, used + 1);
+      }
 
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -94,7 +104,7 @@ export function createMcpGatewayServer(options: McpGatewayOptions) {
         clearTimeout(timer);
         const code = error instanceof Error && error.name === "AbortError" ? "upstream_timeout" : "upstream_unavailable";
         audit(options, claims, tool, started, false, code, 0);
-        sendError(response, 502, code, "GitHub MCP is unavailable");
+        sendError(response, 502, code, "MCP upstream is unavailable");
         return;
       }
       const contentLength = Number(upstream.headers.get("content-length") ?? "0");
@@ -102,7 +112,7 @@ export function createMcpGatewayServer(options: McpGatewayOptions) {
         clearTimeout(timer);
         controller.abort();
         audit(options, claims, tool, started, false, "result_too_large", contentLength);
-        sendError(response, 502, "result_too_large", "GitHub MCP result exceeded the size limit");
+        sendError(response, 502, "result_too_large", "MCP result exceeded the size limit");
         return;
       }
       let bytes: Buffer;
@@ -114,7 +124,7 @@ export function createMcpGatewayServer(options: McpGatewayOptions) {
           ? "upstream_timeout" : "upstream_unavailable";
         audit(options, claims, tool, started, false, code, tooLarge ? error.bytes : 0);
         sendError(response, 502, code, tooLarge
-          ? "GitHub MCP result exceeded the size limit" : "GitHub MCP is unavailable");
+          ? "MCP result exceeded the size limit" : "MCP upstream is unavailable");
         return;
       } finally {
         clearTimeout(timer);
@@ -122,10 +132,10 @@ export function createMcpGatewayServer(options: McpGatewayOptions) {
       const contentType = upstream.headers.get("content-type") ?? "";
       let output: Buffer;
       try {
-        output = sanitizeUpstreamResponse(bytes, contentType, message.method, new Set(claims.tools));
+        output = sanitizeUpstreamResponse(bytes, contentType, message.method, tool, new Set(claims.tools), options.transformResponse);
       } catch {
         audit(options, claims, tool, started, false, "invalid_upstream_response", bytes.length);
-        sendError(response, 502, "invalid_upstream_response", "GitHub MCP returned an invalid response");
+        sendError(response, 502, "invalid_upstream_response", "MCP upstream returned an invalid response");
         return;
       }
       const upstreamSession = upstream.headers.get("mcp-session-id");
@@ -133,7 +143,7 @@ export function createMcpGatewayServer(options: McpGatewayOptions) {
         const existing = sessionBindings.get(upstreamSession);
         if (existing && existing.identity !== identity) {
           audit(options, claims, tool, started, false, "session_collision", output.length);
-          sendError(response, 502, "session_collision", "GitHub MCP returned an invalid session");
+          sendError(response, 502, "session_collision", "MCP upstream returned an invalid session");
           return;
         }
         sessionBindings.set(upstreamSession, { identity, expiry: claims.expiry });
@@ -178,7 +188,7 @@ function parseJsonRpcRequest(raw: Buffer): JsonRpcRequest {
   return value as unknown as JsonRpcRequest;
 }
 
-function authorizeMessage(message: JsonRpcRequest, claims: McpClaims): void {
+function authorizeMessage(message: JsonRpcRequest, claims: McpClaims, authorizeTool?: McpGatewayOptions["authorizeTool"]): void {
   const allowedMethods = new Set(["initialize", "notifications/initialized", "notifications/cancelled", "ping", "tools/list", "tools/call"]);
   if (!allowedMethods.has(message.method)) throw new GatewayRequestError(403, "method_forbidden", "MCP method is not allowed");
   if (message.method !== "tools/call") return;
@@ -188,9 +198,8 @@ function authorizeMessage(message: JsonRpcRequest, claims: McpClaims): void {
   if (!claims.tools.includes(message.params.name)) {
     throw new GatewayRequestError(403, "tool_forbidden", "MCP tool is not allowed");
   }
-  if (!repositoryMatches(message.params.name, message.params.arguments, claims.repository)) {
-    throw new GatewayRequestError(403, "repository_forbidden", "Repository is not allowed");
-  }
+  try { authorizeTool?.(message.params.name, message.params.arguments, claims); }
+  catch { throw new GatewayRequestError(403, "scope_forbidden", "MCP scope is not allowed"); }
 }
 
 function repositoryMatches(tool: string, args: Record<string, unknown>, repository: string): boolean {
@@ -204,10 +213,11 @@ function repositoryMatches(tool: string, args: Record<string, unknown>, reposito
     args.owner.toLowerCase() === owner?.toLowerCase() && args.repo.toLowerCase() === repo?.toLowerCase();
 }
 
-function sanitizeUpstreamResponse(bytes: Buffer, contentType: string, method: string, tools: Set<string>): Buffer {
+function sanitizeUpstreamResponse(bytes: Buffer, contentType: string, method: string, tool: string, tools: Set<string>, transform?: McpGatewayOptions["transformResponse"]): Buffer {
   if (contentType.includes("application/json")) {
     const value = JSON.parse(bytes.toString("utf8"));
     if (!isRecord(value) || value.jsonrpc !== "2.0") throw new Error("invalid JSON-RPC response");
+    transform?.(method, tool, value);
     filterToolList(value, method, tools);
     return Buffer.from(JSON.stringify(value));
   }
@@ -216,6 +226,7 @@ function sanitizeUpstreamResponse(bytes: Buffer, contentType: string, method: st
       if (!line.startsWith("data:")) return line;
       const value = JSON.parse(line.slice(5).trim());
       if (!isRecord(value) || value.jsonrpc !== "2.0") throw new Error("invalid SSE JSON-RPC response");
+      transform?.(method, tool, value);
       filterToolList(value, method, tools);
       return `data: ${JSON.stringify(value)}`;
     });
@@ -256,17 +267,17 @@ async function proxyStreamingRequest(
     }
     response.end();
   } catch {
-    if (!response.headersSent) sendError(response, 502, "upstream_unavailable", "GitHub MCP is unavailable");
+    if (!response.headersSent) sendError(response, 502, "upstream_unavailable", "MCP upstream is unavailable");
     else response.destroy();
   } finally {
     clearTimeout(timer);
   }
 }
 
-function authenticate(request: IncomingMessage, secret: string): McpClaims | null {
+function authenticate(request: IncomingMessage, secret: string, server: McpServerId): McpClaims | null {
   const header = singleHeader(request.headers.authorization);
   if (!header?.startsWith("Bearer ")) return null;
-  return verifyMcpToken(header.slice(7), secret);
+  return verifyMcpToken(header.slice(7), secret, server);
 }
 
 function upstreamHeaders(request: IncomingMessage): Headers {
@@ -317,7 +328,7 @@ function audit(options: McpGatewayOptions, claims: McpClaims, tool: string, star
   options.onAudit?.({
     server: claims.server,
     tool,
-    repository: claims.repository,
+    scope: Object.keys(claims.scope).sort().join(","),
     latency_ms: Math.max(0, Date.now() - started),
     success,
     error_code: errorCode ?? null,

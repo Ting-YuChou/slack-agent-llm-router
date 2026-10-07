@@ -307,10 +307,18 @@ def test_demo_env_and_makefile_include_agent_setup():
     assert "MCP_GATEWAY_SIGNING_SECRET=" in env_example
     assert "PI_AGENT_JEV_MODE=on" in env_example
     assert "PI_AGENT_JEV_CLASSIFIER_MODE=on" in env_example
-    assert "PI_AGENT_MCP_MODE=github_read_only" in env_example
+    assert "PI_AGENT_MCP_MODE=off" in env_example
+    assert "PI_AGENT_MCP_SERVERS=github" in env_example
     assert "PI_AGENT_TELEMETRY_ENABLED=true" in env_example
     assert "PI_AGENT_OTEL_ENABLED=true" in env_example
-    assert "PI_AGENT_MCP_GATEWAY_URL=http://mcp-gateway:8090/mcp" in env_example
+    assert "PI_AGENT_MCP_GITHUB_GATEWAY_URL=http://mcp-github:8090/mcp" in env_example
+    assert (
+        "PI_AGENT_MCP_CLICKHOUSE_GATEWAY_URL=http://mcp-clickhouse-gateway:8090/mcp"
+        in env_example
+    )
+    assert (
+        "PI_AGENT_MCP_CONTEXT7_GATEWAY_URL=http://mcp-context7:8090/mcp" in env_example
+    )
     assert "PI_AGENT_GITHUB_REPOSITORIES=" in env_example
     assert "ANTHROPIC_API_KEY=" in env_example
     assert "OPENCODE_API_KEY=" in env_example
@@ -350,16 +358,21 @@ def test_demo_gateway_uses_the_hostname_required_by_agent_policy():
 def test_demo_mcp_gateway_has_dual_networks_and_cleanup():
     launcher = (ROOT / "scripts" / "run_slack_demo.sh").read_text(encoding="utf-8")
 
-    assert "--network-alias mcp-gateway" in launcher
+    assert "--network-alias mcp-github" in launcher
+    assert "--network-alias mcp-clickhouse-gateway" in launcher
+    assert "--network-alias mcp-context7" in launcher
     assert (
         'docker network connect "${mcp_egress_network}" "${mcp_gateway_container}"'
         in launcher
     )
     assert "GITHUB_READ_ONLY=1" in launcher
     assert "GITHUB_LOCKDOWN_MODE=1" in launcher
-    assert "GITHUB_TOOLSETS=repos,issues,pull_requests" in launcher
     assert (
-        "GITHUB_TOOLS=get_file_contents,search_code,issue_read,list_issues,pull_request_read,list_pull_requests"
+        "GITHUB_TOOLSETS=repos,issues,pull_requests,actions,code_security,dependabot,secret_protection"
+        in launcher
+    )
+    assert (
+        "GITHUB_TOOLS=get_file_contents,search_code,issue_read,pull_request_read,list_issues,list_pull_requests,actions_get,actions_list,get_job_logs"
         in launcher
     )
     assert (
@@ -369,4 +382,7 @@ def test_demo_mcp_gateway_has_dual_networks_and_cleanup():
     assert "--env GITHUB_APP_PRIVATE_KEY " not in launcher
     assert 'docker stop "${mcp_gateway_container}"' in launcher
     assert 'docker stop "${github_mcp_container}"' in launcher
+    assert 'docker stop "${clickhouse_mcp_container}"' in launcher
+    assert 'docker stop "${clickhouse_gateway_container}"' in launcher
+    assert 'docker stop "${context7_gateway_container}"' in launcher
     assert 'docker network rm "${mcp_egress_network}"' in launcher

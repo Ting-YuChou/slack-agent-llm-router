@@ -1,0 +1,118 @@
+# Read-only MCP overlay. Enable individual services through PI_AGENT_MCP_SERVERS.
+services:
+  clickhouse:
+    environment:
+      AGENT_MCP_CLICKHOUSE_PASSWORD: ${AGENT_MCP_CLICKHOUSE_PASSWORD:?Set the aggregate MCP reader password}
+    volumes:
+      - ./docker/observability/agent-mcp-users.xml:/etc/clickhouse-server/users.d/agent-mcp.xml:ro
+    networks: [default, agent-observability]
+
+  agent-mcp-clickhouse-init:
+    profiles: [agent-mcp]
+    image: clickhouse/clickhouse-server:24.8
+    entrypoint: [/bin/bash, -ec]
+    command:
+      - |
+        until [[ "$$(clickhouse-client --host clickhouse --user "$$CLICKHOUSE_USER" --password "$$CLICKHOUSE_PASSWORD" --query "SELECT count() FROM system.tables WHERE database='default' AND name IN ('agent_runs','agent_usage','agent_tool_calls','agent_test_results','otel_traces')")" == 5 ]]; do sleep 1; done
+        clickhouse-client --host clickhouse --user "$$CLICKHOUSE_USER" --password "$$CLICKHOUSE_PASSWORD" --multiquery < /init/agent-mcp-views.sql
+    environment:
+      CLICKHOUSE_USER: llm_router
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?Set the ClickHouse writer password}
+    volumes:
+      - ./docker/observability/agent-mcp-views.sql:/init/agent-mcp-views.sql:ro
+    networks: [agent-observability]
+    depends_on:
+      clickhouse: {condition: service_healthy}
+    restart: "no"
+
+  github-mcp:
+    profiles: [agent-mcp]
+    image: ${GITHUB_MCP_IMAGE:-ghcr.io/github/github-mcp-server@sha256:7aaeeec9ae4fe9a736d100c1ff0798f3c219b5009e05f5d3945fcacb13cc196b}
+    command: [http, --listen-host, 0.0.0.0, --port, "8082"]
+    environment:
+      GITHUB_READ_ONLY: "1"
+      GITHUB_LOCKDOWN_MODE: "1"
+      GITHUB_TOOLSETS: repos,issues,pull_requests,actions,code_security,dependabot,secret_protection
+      GITHUB_TOOLS: get_file_contents,search_code,issue_read,pull_request_read,list_issues,list_pull_requests,actions_get,actions_list,get_job_logs,get_code_scanning_alert,list_code_scanning_alerts,get_dependabot_alert,list_dependabot_alerts,get_secret_scanning_alert,list_secret_scanning_alerts
+    networks: [mcp-egress]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  mcp-github:
+    profiles: [agent-mcp]
+    build: {context: ./agent-runtime, dockerfile: Dockerfile.mcp-gateway}
+    environment:
+      MCP_SERVER_ID: github
+      MCP_GATEWAY_SERVER_SIGNING_SECRET: ${MCP_GATEWAY_GITHUB_SIGNING_SECRET:?Derive the GitHub MCP signing secret}
+      MCP_UPSTREAM_URL: http://github-mcp:8082/mcp
+      GITHUB_APP_ID: ${GITHUB_APP_ID:?Set the GitHub App ID}
+      GITHUB_APP_INSTALLATION_ID: ${GITHUB_APP_INSTALLATION_ID:?Set the GitHub App installation ID}
+      GITHUB_APP_PRIVATE_KEY_PATH: /run/secrets/github-app.pem
+    volumes:
+      - ${GITHUB_APP_PRIVATE_KEY_PATH:?Set the GitHub App private key path}:/run/secrets/github-app.pem:ro
+    ports: [127.0.0.1:8090:8090]
+    networks: [pi-model-only, mcp-egress]
+    depends_on: [github-mcp]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  mcp-clickhouse:
+    profiles: [agent-mcp]
+    build: {context: ./agent-runtime, dockerfile: Dockerfile.clickhouse-mcp}
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_USER: agent_mcp_reader
+      CLICKHOUSE_PASSWORD: ${AGENT_MCP_CLICKHOUSE_PASSWORD:?Set the aggregate MCP reader password}
+      CLICKHOUSE_DATABASE: agent_mcp
+      CLICKHOUSE_SECURE: "false"
+      CLICKHOUSE_MCP_AUTH_TOKEN: ${CLICKHOUSE_MCP_BEARER_TOKEN:?Set the upstream ClickHouse MCP token}
+      CLICKHOUSE_MCP_ALLOWED_HOSTS: mcp-clickhouse,mcp-clickhouse:8000
+    networks: [agent-observability]
+    depends_on:
+      agent-mcp-clickhouse-init: {condition: service_completed_successfully}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+
+  mcp-clickhouse-gateway:
+    profiles: [agent-mcp]
+    build: {context: ./agent-runtime, dockerfile: Dockerfile.mcp-gateway}
+    environment:
+      MCP_SERVER_ID: clickhouse
+      MCP_GATEWAY_SERVER_SIGNING_SECRET: ${MCP_GATEWAY_CLICKHOUSE_SIGNING_SECRET:?Derive the ClickHouse MCP signing secret}
+      MCP_UPSTREAM_URL: http://mcp-clickhouse:8000/mcp
+      CLICKHOUSE_MCP_BEARER_TOKEN: ${CLICKHOUSE_MCP_BEARER_TOKEN:?Set the upstream ClickHouse MCP token}
+    ports: [127.0.0.1:8091:8090]
+    networks: [pi-model-only, agent-observability]
+    depends_on: [mcp-clickhouse]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  mcp-context7:
+    profiles: [agent-mcp]
+    build: {context: ./agent-runtime, dockerfile: Dockerfile.mcp-gateway}
+    environment:
+      MCP_SERVER_ID: context7
+      MCP_GATEWAY_SERVER_SIGNING_SECRET: ${MCP_GATEWAY_CONTEXT7_SIGNING_SECRET:?Derive the Context7 MCP signing secret}
+      MCP_UPSTREAM_URL: https://mcp.context7.com/mcp
+      CONTEXT7_API_KEY: ${CONTEXT7_API_KEY:?Set the Context7 API key}
+    ports: [127.0.0.1:8092:8090]
+    networks: [pi-model-only, mcp-egress]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+networks:
+  pi-model-only:
+    name: pi-model-only
+    internal: true
+  mcp-egress:
+    name: pi-mcp-egress
+  agent-observability:
+    name: slack-agent-observability
+    internal: true

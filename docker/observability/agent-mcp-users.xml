@@ -1,0 +1,19 @@
+<clickhouse>
+  <profiles>
+    <agent_mcp_readonly>
+      <readonly>1</readonly>
+      <max_execution_time>5</max_execution_time>
+      <max_result_rows>1000</max_result_rows>
+      <result_overflow_mode>break</result_overflow_mode>
+      <max_memory_usage>268435456</max_memory_usage>
+    </agent_mcp_readonly>
+  </profiles>
+  <users>
+    <agent_mcp_reader>
+      <password from_env="AGENT_MCP_CLICKHOUSE_PASSWORD"/>
+      <networks><ip>::/0</ip></networks>
+      <profile>agent_mcp_readonly</profile>
+      <quota>default</quota>
+    </agent_mcp_reader>
+  </users>
+</clickhouse>

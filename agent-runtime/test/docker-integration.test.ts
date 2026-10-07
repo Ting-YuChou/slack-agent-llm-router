@@ -289,11 +289,11 @@ http.createServer((req,res)=>{let body="";req.on("data",c=>body+=c);req.on("end"
       gatewayUrl: "http://model-gateway:8080", modelRef: "openai/gpt-5.6-luna",
       extensionPaths: ["/opt/pi/extensions/model-gateway.ts"], pluginPaths: [], skillPaths: [], toolNames: ["read"],
       user: `${hostUid}:${hostGid}`,
-      mcp: { mode: "github_read_only", gatewayUrl: "http://mcp-gateway:8090/mcp", tools: ["get_file_contents"] },
+      mcp: { mode: "github_read_only", servers: [{ server: "github", gatewayUrl: "http://mcp-github:8090/mcp", token: "" }] },
     }, () => "fake-model-token", (event) => {
       events.push(event);
       if (event.type === "settled" || event.type === "error") resolveSettled();
-    }, () => "fake-mcp-token");
+    }, () => ({ github: "fake-mcp-token" }));
     piProcess.prompt("mcp-run", "Read README.md from acme/widgets with GitHub MCP.");
     await settled;
     const diagnostic = JSON.stringify({ events, model: await command("docker", ["logs", modelGateway]), mcp: await command("docker", ["logs", mcpGateway]) });

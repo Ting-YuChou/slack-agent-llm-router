@@ -27,6 +27,7 @@ demo-agent-images:
 	npm --prefix agent-runtime run lock-image -- slack-pi-agent:1.0.1
 	docker build -f agent-runtime/Dockerfile.gateway -t slack-pi-model-gateway:0.1.0 agent-runtime
 	docker build -f agent-runtime/Dockerfile.mcp-gateway -t slack-pi-mcp-gateway:0.1.0 agent-runtime
+	docker build -f agent-runtime/Dockerfile.clickhouse-mcp -t slack-pi-clickhouse-mcp:0.7.0 agent-runtime
 	docker pull ghcr.io/github/github-mcp-server@sha256:7aaeeec9ae4fe9a736d100c1ff0798f3c219b5009e05f5d3945fcacb13cc196b
 
 demo-slack:
