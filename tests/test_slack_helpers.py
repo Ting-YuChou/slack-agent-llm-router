@@ -526,6 +526,11 @@ class TestSlackMessageHandler:
         )
         assert "git cherry-pick" in response
 
+        context_response = SlackMessageHandler._format_agent_response(
+            {"answer": "docs", "mcp_server": "context7", "mcp_tool": "query_docs", "mcp_success": True}
+        )
+        assert "`context7` / `query_docs` / *succeeded*" in context_response
+
 
 class TestSlackAgentApprovals:
     @pytest.mark.asyncio

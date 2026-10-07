@@ -14,8 +14,8 @@ import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT, listAgentModels, resolveAgentMo
 import { JevRouter, type JevMode } from "./jev-router.js";
 import { repositoryFromRemote, parseGitHubRepositories } from "./github-repository.js";
 import { issueClassifierGatewayToken, issueGatewayToken } from "./gateway-token.js";
-import { GITHUB_READ_ONLY_TOOLS, parseMcpMode } from "./mcp-config.js";
-import { issueMcpToken } from "./mcp-token.js";
+import { allServerTools, enabledMcpServers, MCP_SERVERS, parseMcpMode, parseMcpServers, type McpServerId, type McpRunServer } from "./mcp-config.js";
+import { deriveMcpServerSecret, issueMcpToken } from "./mcp-token.js";
 import {
   CodingAgentOrchestrator,
   RuntimeError,
@@ -179,7 +179,12 @@ export async function createProductionServer() {
   const network = process.env.PI_AGENT_NETWORK ?? "pi-model-only";
   const gatewayUrl = process.env.PI_MODEL_GATEWAY_URL ?? "http://model-gateway:8080";
   const mcpMode = parseMcpMode(process.env.PI_AGENT_MCP_MODE);
-  const mcpGatewayUrl = process.env.PI_AGENT_MCP_GATEWAY_URL ?? "http://mcp-gateway:8090/mcp";
+  const mcpServerIds = enabledMcpServers(mcpMode, parseMcpServers(process.env.PI_AGENT_MCP_SERVERS));
+  const gatewayUrls: Partial<Record<McpServerId, string>> = {
+    github: process.env.PI_AGENT_MCP_GITHUB_GATEWAY_URL ?? process.env.PI_AGENT_MCP_GATEWAY_URL ?? "http://mcp-github:8090/mcp",
+    clickhouse: process.env.PI_AGENT_MCP_CLICKHOUSE_GATEWAY_URL ?? "http://mcp-clickhouse-gateway:8090/mcp",
+    context7: process.env.PI_AGENT_MCP_CONTEXT7_GATEWAY_URL ?? "http://mcp-context7:8090/mcp",
+  };
   const mcpSigningSecret = process.env.MCP_GATEWAY_SIGNING_SECRET ?? "";
   const configuredProviders = new Set(
     (process.env.PI_AGENT_CONFIGURED_PROVIDERS ?? "openai")
@@ -218,20 +223,27 @@ export async function createProductionServer() {
   const gitCommon = (await exec("git", ["rev-parse", "--git-common-dir"], { cwd: repoPath, encoding: "utf8" })).stdout.trim();
   const gitMetadataPath = path.resolve(repoPath, gitCommon);
   let mcpRepository: string | undefined;
-  let mcpGatewayReachable = false;
-  if (mcpMode === "github_read_only") {
-    if (!mcpSigningSecret) throw new Error("MCP_GATEWAY_SIGNING_SECRET is required when MCP is enabled");
-    const repositories = parseGitHubRepositories(process.env.PI_AGENT_GITHUB_REPOSITORIES);
-    if (repositories.length === 0) throw new Error("PI_AGENT_GITHUB_REPOSITORIES is required when MCP is enabled");
-    const remote = (await exec("git", ["remote", "get-url", "origin"], { cwd: repoPath, encoding: "utf8" })).stdout.trim();
-    const currentRepository = repositoryFromRemote(remote);
-    mcpRepository = repositories.find((repository) => repository.toLowerCase() === currentRepository?.toLowerCase());
-    if (!mcpRepository) throw new Error("The Agent repository is not in PI_AGENT_GITHUB_REPOSITORIES");
-    mcpGatewayReachable = await probeMcpGateway(mcpGatewayUrl);
+  const mcpServerReachable: Partial<Record<McpServerId, boolean>> = {};
+  if (mcpServerIds.length > 0) {
+    if (mcpServerIds.some((id) => id !== "codegraph") && !mcpSigningSecret) throw new Error("MCP_GATEWAY_SIGNING_SECRET is required when HTTP MCP is enabled");
+    if (mcpServerIds.includes("github")) {
+      const repositories = parseGitHubRepositories(process.env.PI_AGENT_GITHUB_REPOSITORIES);
+      if (repositories.length === 0) throw new Error("PI_AGENT_GITHUB_REPOSITORIES is required when GitHub MCP is enabled");
+      const remote = (await exec("git", ["remote", "get-url", "origin"], { cwd: repoPath, encoding: "utf8" })).stdout.trim();
+      const currentRepository = repositoryFromRemote(remote);
+      mcpRepository = repositories.find((repository) => repository.toLowerCase() === currentRepository?.toLowerCase());
+      if (!mcpRepository) throw new Error("The Agent repository is not in PI_AGENT_GITHUB_REPOSITORIES");
+    }
+    await Promise.all(mcpServerIds.filter((id) => id !== "codegraph").map(async (id) => {
+      mcpServerReachable[id] = await probeMcpGateway(gatewayUrls[id]!);
+    }));
+    if (mcpServerIds.includes("codegraph")) mcpServerReachable.codegraph = true;
   }
-  if (mcpMode === "github_read_only") {
+  if (mcpServerIds.length > 0) {
     const healthTimer = setInterval(() => {
-      void probeMcpGateway(mcpGatewayUrl).then((reachable) => { mcpGatewayReachable = reachable; });
+      for (const id of mcpServerIds.filter((entry) => entry !== "codegraph")) {
+        void probeMcpGateway(gatewayUrls[id]!).then((reachable) => { mcpServerReachable[id] = reachable; });
+      }
     }, positiveInteger(process.env.PI_AGENT_MCP_HEALTH_INTERVAL_MS, 5_000));
     healthTimer.unref();
   }
@@ -300,11 +312,12 @@ export async function createProductionServer() {
           continueSession: session.restored,
           safeCommands: parseSafeCommands(process.env.PI_AGENT_SAFE_COMMANDS),
           user: containerUser,
-          ...(mcpMode === "github_read_only" ? {
+          ...(mcpServerIds.length > 0 ? {
             mcp: {
-              mode: "github_read_only" as const,
-              gatewayUrl: mcpGatewayUrl,
-              tools: [...GITHUB_READ_ONLY_TOOLS],
+              mode: mcpMode as "github_read_only" | "read_only",
+              servers: mcpServerIds.map((id): McpRunServer => id === "codegraph"
+                ? { server: "codegraph", command: MCP_SERVERS.codegraph.command! }
+                : { server: id, gatewayUrl: gatewayUrls[id]!, token: "" }),
             },
           } : {}),
         },
@@ -322,16 +335,15 @@ export async function createProductionServer() {
           telemetry?.addSecret(token, runId); return token;
         },
         onEvent,
-        mcpMode === "github_read_only" ? (runId) => { const token = issueMcpToken({
-          run: runId,
-          session: session.id,
-          slackUser: session.ownerUserId,
-          repository: mcpRepository!,
-          server: "github",
-          tools: [...GITHUB_READ_ONLY_TOOLS],
-          mode: "github_read_only",
-          expiry: Date.now() + 16 * 60_000,
-        }, mcpSigningSecret); telemetry?.addSecret(token, runId); return token; } : undefined,
+        mcpServerIds.length > 0 ? (runId) => Object.fromEntries(mcpServerIds.filter((id) => id !== "codegraph").map((id) => {
+          const scope: Record<string, string> = id === "github" ? { repository: mcpRepository! } : id === "clickhouse" ? { database: "agent_mcp" } : { data: "public_docs" };
+          const token = issueMcpToken({
+            version: 2, run: runId, session: session.id, slackUser: session.ownerUserId, server: id,
+            tools: allServerTools(id), mode: "read_only", scope, maxCalls: MCP_SERVERS[id].maxCalls,
+            expiry: Date.now() + 16 * 60_000,
+          }, deriveMcpServerSecret(mcpSigningSecret, id));
+          telemetry?.addSecret(token, runId); return [id, token];
+        })) : undefined,
         jevClassifierMode === "on" ? (runId) => { const token = issueClassifierGatewayToken({
           kind: "classifier",
           runId,
@@ -354,7 +366,7 @@ export async function createProductionServer() {
     });
   }
   await orchestrator.restore();
-  const runtimeHealthy = () => integrityHealthy && (mcpMode === "off" || mcpGatewayReachable);
+  const runtimeHealthy = () => integrityHealthy;
   const server = createAgentHttpServer({
     feedback: telemetry ? (run, payload, id) => telemetry.record(run.run_id, run.session_id, "feedback", payload, id) : undefined,
     orchestrator,
@@ -367,9 +379,14 @@ export async function createProductionServer() {
       pi_version: "1.0.1",
       telemetry: telemetry?.health() ?? {status: "disabled"},
       mcp_mode: mcpMode,
-      mcp_gateway_reachable: mcpGatewayReachable,
-      mcp_servers: mcpMode === "github_read_only" ? ["github"] : [],
-      mcp_tool_count: mcpMode === "github_read_only" ? GITHUB_READ_ONLY_TOOLS.length : 0,
+      mcp_gateway_reachable: mcpServerIds.every((id) => mcpServerReachable[id] !== false),
+      mcp_servers: mcpServerIds,
+      mcp_tool_count: mcpServerIds.reduce((sum, id) => sum + allServerTools(id).length, 0),
+      mcp_server_health: Object.fromEntries(mcpServerIds.map((id) => [id, {
+        enabled: true, transport: MCP_SERVERS[id].transport, reachable: mcpServerReachable[id] ?? false,
+        tool_count: allServerTools(id).length,
+        exposure: { direct: MCP_SERVERS[id].directTools.length, codemode: MCP_SERVERS[id].codemodeTools.length },
+      }])),
       jev_classifier_mode: jevClassifierMode,
       jev_classifier_model: jevClassifierMode === "on" ? "openrouter/typesafe/jev-1.13" : null,
       jev_classifier_max_calls: jevClassifierMode === "on" ? jevClassifierMaxCalls : 0,
@@ -394,7 +411,7 @@ export async function createProductionServer() {
       errors: runtimeHealthy() ? [] : [
         ...lock.errors,
         ...skillLock.errors,
-        ...(mcpMode !== "off" && !mcpGatewayReachable ? ["MCP gateway is unreachable"] : []),
+        ...(mcpServerIds.some((id) => mcpServerReachable[id] === false) ? ["An optional MCP gateway is unreachable"] : []),
       ],
     }),
   });
@@ -416,7 +433,11 @@ async function probeMcpGateway(gatewayUrl: string): Promise<boolean> {
   try {
     const url = new URL(gatewayUrl);
     const healthUrl = new URL("/healthz", url);
-    if (url.hostname === "mcp-gateway") healthUrl.hostname = "127.0.0.1";
+    const localPorts: Record<string, string> = { "mcp-github": "8090", "mcp-clickhouse-gateway": "8091", "mcp-context7": "8092", "mcp-gateway": "8090" };
+    if (localPorts[url.hostname]) {
+      healthUrl.hostname = "127.0.0.1";
+      healthUrl.port = localPorts[url.hostname]!;
+    }
     const response = await fetch(healthUrl, { signal: AbortSignal.timeout(1_000) });
     return response.ok;
   } catch {

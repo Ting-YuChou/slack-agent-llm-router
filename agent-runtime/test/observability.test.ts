@@ -69,7 +69,7 @@ test("recovered session text redacts old signed credentials without an in-memory
   const { redact } = await telemetryModule();
   const gateway = issueGatewayToken({runId: 'old-run', provider: 'openai', model: 'gpt-5.6-luna', api: 'openai-responses', reasoningEffort: 'max', expiresAt: 1}, 'previous-secret');
   const classifier = issueClassifierGatewayToken({kind: 'classifier', runId: 'old-run', provider: 'openrouter', model: 'typesafe/jev-1.13', api: 'openrouter-jev', maxCalls: 1, expiresAt: 1} as any, 'previous-secret');
-  const mcp = issueMcpToken({run: 'old-run', session: 's', slackUser: 'u', repository: 'o/r', server: 'github', mode: 'github_read_only', tools: ['read'], expiry: 1}, 'previous-secret');
+  const mcp = issueMcpToken({version: 2, run: 'old-run', session: 's', slackUser: 'u', scope: {repository: 'o/r'}, server: 'github', mode: 'read_only', tools: ['read'], maxCalls: 1, expiry: 1}, 'previous-secret');
   for(const token of [gateway, classifier, mcp])
     assert.equal(redact('KEY=' + token, []), 'KEY=[REDACTED]');
   assert.equal(redact('ordinary.versioned.text', []), 'ordinary.versioned.text');

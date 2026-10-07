@@ -4,14 +4,16 @@ import { test } from "node:test";
 
 import { createMcpGatewayServer, type McpAuditEvent } from "../src/mcp-gateway.js";
 import { issueMcpToken, type McpClaims } from "../src/mcp-token.js";
+import { authorizeGitHubTool } from "../src/mcp-policy.js";
 
 const secret = "mcp-test-secret";
 const baseClaims: McpClaims = {
-  run: "run-1", session: "session-1", slackUser: "U1",
-  repository: "acme/widgets", server: "github",
-  tools: ["get_file_contents", "search_code"], mode: "github_read_only",
-  expiry: Date.now() + 60_000,
+  version: 2, run: "run-1", session: "session-1", slackUser: "U1",
+  scope: { repository: "acme/widgets" }, server: "github",
+  tools: ["get_file_contents", "search_code"], mode: "read_only", maxCalls: 12, expiry: Date.now() + 60_000,
 };
+
+const gatewayPolicy = { server: "github" as const, allowedTools: baseClaims.tools, authorizeTool: authorizeGitHubTool };
 
 async function listen(server: Server): Promise<string> {
   await new Promise<void>((resolve, reject) => {
@@ -51,6 +53,7 @@ test("gateway exposes health and replaces the run token with fixed GitHub upstre
   });
   const upstreamUrl = await listen(upstream);
   const gateway = createMcpGatewayServer({
+    ...gatewayPolicy,
     signingSecret: secret,
     upstreamUrl: `${upstreamUrl}/mcp`,
     upstreamHeaders: async () => ({
@@ -76,6 +79,7 @@ test("gateway exposes health and replaces the run token with fixed GitHub upstre
 
 test("gateway health fails when GitHub token or upstream readiness fails", async (t) => {
   const gateway = createMcpGatewayServer({
+    ...gatewayPolicy,
     signingSecret: secret,
     upstreamUrl: "http://127.0.0.1:1/mcp",
     healthCheck: async () => false,
@@ -97,7 +101,7 @@ test("gateway filters tools/list and audits only sanitized metadata", async (t) 
   });
   const audits: McpAuditEvent[] = [];
   const upstreamUrl = await listen(upstream);
-  const gateway = createMcpGatewayServer({ signingSecret: secret, upstreamUrl: `${upstreamUrl}/mcp`, onAudit: (event) => audits.push(event) });
+  const gateway = createMcpGatewayServer({ ...gatewayPolicy, signingSecret: secret, upstreamUrl: `${upstreamUrl}/mcp`, onAudit: (event) => audits.push(event) });
   const gatewayUrl = await listen(gateway);
   t.after(async () => { await close(gateway); await close(upstream); });
 
@@ -105,7 +109,7 @@ test("gateway filters tools/list and audits only sanitized metadata", async (t) 
   assert.equal(response.status, 200);
   assert.deepEqual((await response.json() as any).result.tools.map((tool: any) => tool.name), ["get_file_contents"]);
   assert.equal(audits.length, 1);
-  assert.deepEqual(Object.keys(audits[0]).sort(), ["error_code", "latency_ms", "repository", "result_bytes", "server", "success", "tool"].sort());
+  assert.deepEqual(Object.keys(audits[0]).sort(), ["error_code", "latency_ms", "scope", "result_bytes", "server", "success", "tool"].sort());
   assert.equal(JSON.stringify(audits).includes("Bearer"), false);
   assert.equal(JSON.stringify(audits).includes("allowed"), false);
 });
@@ -119,7 +123,7 @@ test("gateway enforces exact tool, repository, expiry and MCP session bindings",
     response.end(JSON.stringify({ jsonrpc: "2.0", id: 3, result: { content: [{ type: "text", text: "ok" }] } }));
   });
   const upstreamUrl = await listen(upstream);
-  const gateway = createMcpGatewayServer({ signingSecret: secret, upstreamUrl: `${upstreamUrl}/mcp` });
+  const gateway = createMcpGatewayServer({ ...gatewayPolicy, signingSecret: secret, upstreamUrl: `${upstreamUrl}/mcp` });
   const gatewayUrl = await listen(gateway);
   t.after(async () => { await close(gateway); await close(upstream); });
 
@@ -138,6 +142,23 @@ test("gateway enforces exact tool, repository, expiry and MCP session bindings",
   assert.equal(upstreamCalls, 1);
 });
 
+test("gateway enforces the token call budget per run", async (t) => {
+  const upstream = createServer((_request, response) => {
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [] } }));
+  });
+  const upstreamUrl = await listen(upstream);
+  const gateway = createMcpGatewayServer({ ...gatewayPolicy, signingSecret: secret, upstreamUrl: `${upstreamUrl}/mcp` });
+  const gatewayUrl = await listen(gateway);
+  t.after(async () => { await close(gateway); await close(upstream); });
+  const limited = token({ ...baseClaims, maxCalls: 1 });
+  const body = { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "get_file_contents", arguments: { owner: "acme", repo: "widgets" } } };
+  assert.equal((await post(gatewayUrl, body, limited)).status, 200);
+  const denied = await post(gatewayUrl, body, limited);
+  assert.equal(denied.status, 429);
+  assert.equal((await denied.json() as any).error.code, "call_budget_exceeded");
+});
+
 test("gateway maps upstream timeout, invalid responses and oversized results", async (t) => {
   const cases: Array<{ handler: RequestListener; expected: string; options?: Record<string, number> }> = [
     { handler: () => {}, expected: "upstream_timeout", options: { timeoutMs: 10 } },
@@ -147,7 +168,7 @@ test("gateway maps upstream timeout, invalid responses and oversized results", a
   for (const item of cases) {
     const upstream = createServer(item.handler);
     const upstreamUrl = await listen(upstream);
-    const gateway = createMcpGatewayServer({ signingSecret: secret, upstreamUrl: `${upstreamUrl}/mcp`, ...item.options });
+    const gateway = createMcpGatewayServer({ ...gatewayPolicy, signingSecret: secret, upstreamUrl: `${upstreamUrl}/mcp`, ...item.options });
     const gatewayUrl = await listen(gateway);
     const response = await post(gatewayUrl, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
     assert.equal(response.status, 502);
