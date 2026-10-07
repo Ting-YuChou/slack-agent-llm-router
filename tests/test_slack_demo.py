@@ -312,8 +312,13 @@ def test_demo_env_and_makefile_include_agent_setup():
     assert "PI_AGENT_TELEMETRY_ENABLED=true" in env_example
     assert "PI_AGENT_OTEL_ENABLED=true" in env_example
     assert "PI_AGENT_MCP_GITHUB_GATEWAY_URL=http://mcp-github:8090/mcp" in env_example
-    assert "PI_AGENT_MCP_CLICKHOUSE_GATEWAY_URL=http://mcp-clickhouse-gateway:8090/mcp" in env_example
-    assert "PI_AGENT_MCP_CONTEXT7_GATEWAY_URL=http://mcp-context7:8090/mcp" in env_example
+    assert (
+        "PI_AGENT_MCP_CLICKHOUSE_GATEWAY_URL=http://mcp-clickhouse-gateway:8090/mcp"
+        in env_example
+    )
+    assert (
+        "PI_AGENT_MCP_CONTEXT7_GATEWAY_URL=http://mcp-context7:8090/mcp" in env_example
+    )
     assert "PI_AGENT_GITHUB_REPOSITORIES=" in env_example
     assert "ANTHROPIC_API_KEY=" in env_example
     assert "OPENCODE_API_KEY=" in env_example
@@ -362,7 +367,10 @@ def test_demo_mcp_gateway_has_dual_networks_and_cleanup():
     )
     assert "GITHUB_READ_ONLY=1" in launcher
     assert "GITHUB_LOCKDOWN_MODE=1" in launcher
-    assert "GITHUB_TOOLSETS=repos,issues,pull_requests,actions,code_security,dependabot,secret_protection" in launcher
+    assert (
+        "GITHUB_TOOLSETS=repos,issues,pull_requests,actions,code_security,dependabot,secret_protection"
+        in launcher
+    )
     assert (
         "GITHUB_TOOLS=get_file_contents,search_code,issue_read,pull_request_read,list_issues,list_pull_requests,actions_get,actions_list,get_job_logs"
         in launcher
