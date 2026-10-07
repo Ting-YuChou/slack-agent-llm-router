@@ -1,4 +1,15 @@
+FROM python:3.12.12-slim-bookworm AS codegraph
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements-codegraph.lock /tmp/requirements-codegraph.lock
+RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements-codegraph.lock
+
 FROM node:22.22.0-bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git libgomp1 libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=codegraph /usr/local /usr/local
 
 WORKDIR /opt/pi
 ENV PATH="/opt/pi/node_modules/.bin:${PATH}"
@@ -14,6 +25,9 @@ COPY skills ./skills
 RUN npm run build \
     && npm prune --omit=dev --ignore-scripts \
     && npm audit --omit=dev --audit-level=high
+
+RUN printf '#!/bin/sh\nexec node /opt/pi/dist/src/codegraph-lazy-proxy.js\n' > /usr/local/bin/codegraph-lazy-proxy \
+    && chmod 0555 /usr/local/bin/codegraph-lazy-proxy
 
 RUN groupadd --gid 10001 pi && useradd --uid 10001 --gid 10001 --no-create-home pi \
     && mkdir -p /var/lib/pi-session /tmp/pi-home \
