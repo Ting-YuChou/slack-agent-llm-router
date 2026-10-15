@@ -1,3 +1,6 @@
+import { BudgetRpcClient, type BudgetAdmissionLedger } from "./budget-rpc.js";
+import { BudgetLedger } from "./budget-ledger.js";
+import { admitBudget, type ModelPrice } from "./gateway-budget.js";
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { pipeline } from "node:stream/promises";
 import { SpanStatusCode, type Span } from "@opentelemetry/api";
@@ -20,6 +23,8 @@ const MAX_BODY_BYTES = 2 * 1024 * 1024;
 export type ProviderApiKeys = Partial<Record<AgentProvider | "openrouter", string>>;
 
 export function createModelGateway(options: {
+  budgetLedger?: BudgetAdmissionLedger;
+  prices?: Record<string, ModelPrice>;
   signingSecret: string;
   providerApiKeys: ProviderApiKeys;
   fetchFn?: typeof fetch;
@@ -80,8 +85,13 @@ export function createModelGateway(options: {
         return;
       }
       classifierCalls.set(claims.runId, { count: budget.count + 1, expiresAt: claims.expiresAt });
+      let admission: Awaited<ReturnType<typeof admitBudget>>;
+      try { admission = await admitBudget(options.budgetLedger, options.prices ?? {}, claims.workflowRunId, `${claims.provider}/${claims.model}`, rawBody, claims.runId); rawBody = admission.body; }
+      catch { sendJson(response, 429, { error: { code: "workflow_budget_unavailable_or_exhausted" } }); return; }
       const requestStarted = performance.now();
-      const span = options.tracing?.gateway(claims.runId, claims.traceparent, claims.provider, claims.model);
+      const sent = await Promise.resolve(options.budgetLedger?.firstModel(claims.runId)).catch(() => undefined);
+    if (sent !== undefined) options.tracing?.firstModel(claims.runId, claims.traceparent, sent);
+    const span = options.tracing?.gateway(claims.runId, claims.traceparent, claims.provider, claims.model);
       const disconnect = upstreamDisconnect(response, span);
       try {
         const upstream = await fetchFn(JEV_CLASSIFIER_MODEL.upstreamUrl, {
@@ -100,12 +110,12 @@ export function createModelGateway(options: {
           if (value) headers[name] = value;
         }
         response.writeHead(upstream.status, headers);
-        await forwardUpstream(upstream, response, span, requestStarted);
+        await forwardUpstream(upstream, response, span, requestStarted, admission.data);
       } catch {
         span?.setStatus({code: SpanStatusCode.ERROR});
         if (!response.headersSent) sendJson(response, 502, { error: { code: "upstream_unavailable", message: "Model provider unavailable" } });
         else response.destroy();
-      } finally { disconnect.close(); span?.end(); }
+      } finally { await admission.finish(); disconnect.close(); span?.end(); }
       return;
     }
     const claims = verifyGatewayToken(token, options.signingSecret);
@@ -134,7 +144,12 @@ export function createModelGateway(options: {
       });
       return;
     }
+    let admission: Awaited<ReturnType<typeof admitBudget>>;
+    try { admission = await admitBudget(options.budgetLedger, options.prices ?? {}, claims.workflowRunId, `${claims.provider}/${claims.model}`, rawBody, claims.runId); rawBody = admission.body; }
+    catch { sendJson(response, 429, { error: { code: "workflow_budget_unavailable_or_exhausted" } }); return; }
     const requestStarted = performance.now();
+    const sent = await Promise.resolve(options.budgetLedger?.firstModel(claims.runId)).catch(() => undefined);
+    if (sent !== undefined) options.tracing?.firstModel(claims.runId, claims.traceparent, sent);
     const span = options.tracing?.gateway(claims.runId, claims.traceparent, claims.provider, claims.model);
     const disconnect = upstreamDisconnect(response, span);
     try {
@@ -150,12 +165,12 @@ export function createModelGateway(options: {
         if (value) headers[name] = value;
       }
       response.writeHead(upstream.status, headers);
-      await forwardUpstream(upstream, response, span, requestStarted);
+      await forwardUpstream(upstream, response, span, requestStarted, admission.data);
     } catch {
       span?.setStatus({code: SpanStatusCode.ERROR});
       if (!response.headersSent) sendJson(response, 502, { error: { code: "upstream_unavailable", message: "Model provider unavailable" } });
       else response.destroy();
-    } finally { disconnect.close(); span?.end(); }
+    } finally { await admission.finish(); disconnect.close(); span?.end(); }
   });
 }
 
@@ -177,13 +192,13 @@ export function closeModelGateway(server: Server, tracing?: Pick<AgentTracing, "
   });
 }
 
-async function forwardUpstream(upstream: Response, response: ServerResponse, span?: Span, requestStarted = performance.now()): Promise<void> {
+async function forwardUpstream(upstream: Response, response: ServerResponse, span?: Span, requestStarted = performance.now(), data?: (chunk: Buffer) => void): Promise<void> {
   span?.setAttribute("http.response.status_code",upstream.status);
   if(upstream.status>=400) span?.setStatus({code:SpanStatusCode.ERROR});
   for(const name of ["request-id","x-request-id","openai-request-id"]) {const id=upstream.headers.get(name); if(id)span?.setAttribute("gen_ai.response.request_id",id);}
   if(!upstream.body){response.end();return;}
   const stream=Readable.fromWeb(upstream.body as never); let first=true;
-  stream.on("data",()=>{if(first){first=false;span?.setAttribute("http.first_stream_data_ms", performance.now()-requestStarted);span?.addEvent("stream.first_data");}});
+  stream.on("data",(chunk: Buffer)=>{data?.(chunk);if(first){first=false;span?.setAttribute("http.first_stream_data_ms", performance.now()-requestStarted);span?.addEvent("stream.first_data");}});
   await pipeline(stream,response);
 }
 
@@ -291,7 +306,10 @@ if (entrypoint === import.meta.url) {
     throw new Error("MODEL_GATEWAY_SIGNING_SECRET and at least one provider API key are required");
   }
   const tracing = AgentTracing.fromEnvironment("pi-model-gateway");
-  const server = createModelGateway({ signingSecret, providerApiKeys, tracing });
+  const ledger = process.env.PI_AGENT_BUDGET_RPC_URL ? new BudgetRpcClient(process.env.PI_AGENT_BUDGET_RPC_URL,signingSecret) : process.env.PI_AGENT_BUDGET_FILE ? new BudgetLedger(process.env.PI_AGENT_BUDGET_FILE) : undefined;
+  const prices = JSON.parse(process.env.PI_AGENT_MODEL_PRICES_JSON ?? "{}");
+  const server = createModelGateway({ signingSecret, providerApiKeys, tracing, budgetLedger: ledger, prices });
+  server.on("close", () => { if (ledger instanceof BudgetLedger) ledger.close(); });
   server.listen(8080, "0.0.0.0");
   let closing = false;
   for (const signal of ["SIGTERM", "SIGINT"] as const) process.once(signal, () => {

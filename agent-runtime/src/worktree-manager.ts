@@ -37,13 +37,13 @@ export class WorktreeManager {
     this.baseRef = options.baseRef;
   }
 
-  async create(runId: string): Promise<WorktreeInfo> {
+  async create(runId: string, trustedBase?: string): Promise<WorktreeInfo> {
     await mkdir(this.worktreeRoot, { recursive: true });
     const safeId = runId.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64) || "run";
     const date = new Date().toISOString().slice(0, 10).replaceAll("-", "");
     const branch = `pi-agent/${date}-${safeId}`;
     const worktreePath = path.join(this.worktreeRoot, `${date}-${safeId}`);
-    const baselineCommit = await this.git(this.repoPath, "rev-parse", "--verify", `${this.baseRef}^{commit}`);
+    const baselineCommit = await this.git(this.repoPath, "rev-parse", "--verify", `${trustedBase ?? this.baseRef}^{commit}`);
     try {
       await this.git(this.repoPath, "worktree", "add", "-b", branch, worktreePath, baselineCommit);
     } catch (error) {
@@ -140,6 +140,7 @@ export class WorktreeManager {
   private async gitRaw(cwd: string, ...args: string[]): Promise<string> {
     const result = await exec("git", args, {
       cwd,
+      timeout: 30_000,
       maxBuffer: 4 * 1024 * 1024,
       encoding: "utf8",
       env: {

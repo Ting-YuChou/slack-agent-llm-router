@@ -52,6 +52,46 @@ BASE = {
 }
 TABLES = {
     "agent_events": {},
+    "agent_workflow_nodes": {
+        "workflow_run_id": "String",
+        "node_id": "String",
+        "execution_id": "String",
+        "role": "String",
+        "wave": "UInt32",
+        "attempt": "UInt32",
+        "state": "String",
+        "duration_ms": "UInt64",
+        "queue_ms": "UInt64",
+        "result_ref": "String",
+    },
+    "agent_workflow_revisions": {
+        "workflow_run_id": "String",
+        "revision": "UInt32",
+        "task_count": "UInt32",
+    },
+    "agent_workflow_dependencies": {
+        "workflow_run_id": "String",
+        "node_id": "String",
+        "depends_on": "String",
+    },
+    "agent_executions": {
+        "execution_id": "String",
+        "workflow_run_id": "String",
+        "role": "String",
+        "attempt": "UInt32",
+        "phase": "String",
+    },
+    "agent_verifications": {
+        "candidate_hash": "String",
+        "attempt": "UInt32",
+        "status": "String",
+    },
+    "agent_grades": {
+        "candidate_hash": "String",
+        "attempt": "UInt32",
+        "status": "String",
+    },
+    "agent_deliveries": {"candidate_hash": "String", "status": "String"},
     "agent_runs": {
         "status": "String",
         "model": "String",
@@ -113,6 +153,13 @@ def schema_sql():
                 "agent_session_stats",
                 "agent_test_results",
                 "agent_feedback",
+                "agent_executions",
+                "agent_workflow_nodes",
+                "agent_workflow_revisions",
+                "agent_workflow_dependencies",
+                "agent_verifications",
+                "agent_grades",
+                "agent_deliveries",
             }
             else 30
         )
@@ -142,6 +189,31 @@ FROM agent_runs_latest r LEFT JOIN
   FROM agent_session_stats_latest GROUP BY run_id) s ON r.run_id=s.run_id LEFT JOIN
   (SELECT run_id, count() AS ledger_rows, count(total_tokens) AS reported_tokens, count(cost_total) AS reported_costs, sum(total_tokens) AS ledger_tokens, sum(cost_total) AS ledger_cost
    FROM agent_usage_latest GROUP BY run_id) u ON r.run_id=u.run_id"""
+    )
+    statements.append(
+        """CREATE VIEW IF NOT EXISTS agent_workflow_execution_durations AS
+SELECT workflow_run_id, execution_id, any(role) AS role,
+  if(countIf(phase='end' AND JSONHas(payload_json,'duration_ms'))>0,
+    maxIf(JSONExtractUInt(payload_json,'duration_ms'),phase='end'),NULL) AS duration_ms,
+  if(countIf(phase='end' AND JSONHas(payload_json,'queue_ms'))>0,
+    maxIf(JSONExtractUInt(payload_json,'queue_ms'),phase='end'),NULL) AS queue_ms,
+  greatest(toInt64(duration_ms)-toInt64(queue_ms),0) AS active_agent_ms
+FROM agent_executions_latest GROUP BY workflow_run_id,execution_id"""
+    )
+    statements.append(
+        """CREATE VIEW IF NOT EXISTS agent_workflow_usage AS
+SELECT a.*, if(JSONHas(r.routing_json,'jevCostUsd'), JSONExtractFloat(r.routing_json,'jevCostUsd'),
+  if(JSONHas(r.routing_json,'jevLatencyMs'), NULL, 0)) AS routing_cost_usd,
+  if(a.incomplete_executions=0 AND routing_cost_usd IS NOT NULL,
+    a.known_execution_cost_usd+routing_cost_usd, NULL) AS total_cost_usd
+FROM (
+  SELECT e.workflow_run_id, count() AS executions, sum(u.ledger_tokens) AS total_tokens,
+    sum(u.ledger_cost) AS known_execution_cost_usd,
+    countIf(u.reconciliation='matched') AS matched_executions,
+    countIf(u.reconciliation!='matched') AS incomplete_executions
+  FROM (SELECT execution_id, any(workflow_run_id) AS workflow_run_id FROM agent_executions_latest GROUP BY execution_id) e
+  LEFT JOIN agent_usage_reconciliation u ON e.execution_id=u.run_id GROUP BY e.workflow_run_id
+) a LEFT JOIN agent_runs_latest r ON a.workflow_run_id=r.run_id"""
     )
     return statements
 
@@ -214,7 +286,29 @@ def project(envelope, resolved_payload=None):
     )
     rows = {"agent_events": [base.copy()]}
     kind = envelope.get("kind")
-    if kind == "content":
+    workflow_tables = {
+        "execution": "agent_executions",
+        "workflow_node": "agent_workflow_nodes",
+        "workflow_revision": "agent_workflow_revisions",
+        "workflow_dependency": "agent_workflow_dependencies",
+        "verification": "agent_verifications",
+        "grade": "agent_grades",
+        "delivery": "agent_deliveries",
+    }
+    if kind in workflow_tables:
+        table = workflow_tables[kind]
+        rows[table] = [
+            {
+                **base,
+                **{
+                    key: payload.get(
+                        key, 0 if declaration.startswith("UInt") else "unknown"
+                    )
+                    for key, declaration in TABLES[table].items()
+                },
+            }
+        ]
+    elif kind == "content":
         rows = {
             "agent_content_chunks": [
                 {

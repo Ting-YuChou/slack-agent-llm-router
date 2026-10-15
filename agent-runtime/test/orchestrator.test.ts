@@ -6,27 +6,28 @@ import { CodingAgentOrchestrator, RuntimeConflictError, RuntimeForbiddenError } 
 
 class FakeProcess {
   handler: (event: PublicRunEvent) => void = () => undefined;
-  prompts: Array<{ runId: string; prompt: string; route?: { modelRef: string; effort: string } }> = [];
+  prompts: Array<{ runId: string; prompt: string; route?: { modelRef: string; effort: string }; taskMode?: string }> = [];
   decisions: Array<{ id: string; approved: boolean }> = [];
   aborted: string[] = [];
-  prompt(runId: string, prompt: string, route?: { modelRef: string; effort: string }) { this.prompts.push({ runId, prompt, route }); }
+  prompt(runId: string, prompt: string, route?: { modelRef: string; effort: string }, taskMode?: string) { this.prompts.push({ runId, prompt, route, taskMode }); }
   decide(id: string, approved: boolean) { this.decisions.push({ id, approved }); }
   async abort(runId: string) { this.aborted.push(runId); }
   async close() {}
   emit(event: PublicRunEvent) { this.handler(event); }
 }
 
-function fixture(router?: { route(text?: string): Promise<any> }) {
+function fixture(router?: { route(text?: string): Promise<any> }, quality?: any, stateStore?: any) {
   const process = new FakeProcess();
   const calls = {
     rollback: [] as string[],
     commits: 0,
+    diff: { files: ["src/a.ts"], bytes: 10, stat: "1 file changed" },
     commitImpl: async () => "b".repeat(40),
     startedModels: [] as string[],
   };
   const worktrees = {
     create: async () => ({ path: "/managed/w1", branch: "pi-agent/20260801-run", baselineCommit: "a".repeat(40) }),
-    inspectDiff: async () => ({ files: ["src/a.ts"], bytes: 10, stat: "1 file changed" }),
+    inspectDiff: async () => calls.diff,
     commit: async () => { calls.commits += 1; return calls.commitImpl(); },
     rollback: async (_path: string, baseline: string) => { calls.rollback.push(baseline); },
     remove: async () => undefined,
@@ -41,10 +42,105 @@ function fixture(router?: { route(text?: string): Promise<any> }) {
     maxActiveSessions: 2,
     deadlineMs: 10_000,
     router,
+    quality, stateStore,
     mcpRepository: "acme/widgets",
   } as any);
   return { orchestrator, process, calls };
 }
+
+test("reproduction time cannot erase human tool-approval waiting from workflow timing", async t => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1_000_000 });
+  const { orchestrator, process } = fixture(undefined, {
+    elapsedMs: () => 1000, execution: () => {}, assertUnchanged: async () => {},
+    evaluate: async () => ({ action: "fail", candidate: { hash: "h", path: "/s" }, verification: { status: "unknown", checks: [] } }),
+  });
+  const created = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "timing", user_id: "U", prompt: "fix" });
+  t.mock.timers.tick(100);
+  process.emit({ type: "approval", approval_id: "a", title: "Run check", detail: "check" });
+  await new Promise(resolve => setImmediate(resolve));
+  t.mock.timers.tick(500);
+  const approval = orchestrator.getRun(created.run_id).events.find(event => event.type === "approval") as any;
+  await orchestrator.decide(created.run_id, approval.approval_id, "U", "approve");
+  process.emit({ type: "settled" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(orchestrator.getRun(created.run_id).timing?.human_wait_ms, 500);
+});
+
+test("quality failures repair without committing and unknown never commits", async () => {
+  let evaluations = 0;
+  const { orchestrator, process, calls } = fixture(undefined, {
+    evaluate: async () => (++evaluations === 1 ? { action: "repair", repair_prompt: "fix regression", verification: { status: "failed", checks: [] }, candidate: { hash: "a", path: "/x" } } : { action: "fail", verification: { status: "unknown", checks: [] }, candidate: { hash: "b", path: "/x" } }),
+    assertUnchanged: async () => {}, execution: () => {},
+  });
+  const r = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "quality", user_id: "U", prompt: "fix" });
+  process.emit({ type: "settled" }); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.commits, 0); assert.equal(process.prompts.length, 2);
+  assert.notEqual(process.prompts[0].runId, process.prompts[1].runId);
+  process.emit({ type: "settled" }); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.commits, 0); assert.equal(orchestrator.getRun(r.run_id).status, "failed");
+  assert.equal(calls.rollback.length, 1);
+});
+
+test('structured discovery holds the session busy and finishes before the sole writer starts', async () => {
+  let release!: (value: string) => void;
+  const { orchestrator, process, calls } = fixture(undefined, {
+    structured: { enabled: true, maxCostUsd: 5, activeTimeoutMs: 1_800_000 },
+    discover: () => new Promise<string>(resolve => { release = resolve; }), writerStarted: () => {},
+    execution: () => {}, evaluate: async () => ({ action: 'fail', candidate: { hash: 'h', path: '/s' }, verification: { status: 'unknown', checks: [] } }),
+    assertUnchanged: async () => {},
+  });
+  const run = await orchestrator.createSession({ team_id: 'T', channel_id: 'C', thread_ts: 'structured', user_id: 'U', prompt: 'fix', workflow_mode: 'structured' } as any);
+  assert.equal(process.prompts.length, 0); assert.equal(calls.commits, 0);
+  await assert.rejects(orchestrator.prompt(run.session_id, 'other', 'U'), RuntimeConflictError);
+  release('Evidence: counter reset fails'); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(process.prompts.length, 1); assert.match(process.prompts[0].prompt, /counter reset fails/);
+  process.emit({ type: 'settled' }); await new Promise(resolve => setImmediate(resolve));
+});
+
+test('structured requests fail closed without an enabled trusted profile', async () => {
+  const { orchestrator, process } = fixture();
+  await assert.rejects(orchestrator.createSession({ team_id: 'T', channel_id: 'C', thread_ts: 'no-profile', user_id: 'U', prompt: 'fix', workflow_mode: 'structured' } as any), /structured|profile/i);
+  assert.equal(process.prompts.length, 0);
+});
+
+test('cancelling discovery prevents a late writer and archives before rollback', async () => {
+  let saved = false;
+  const { orchestrator,process,calls } = fixture(undefined,{ structured: { enabled: true,maxCostUsd: 5,activeTimeoutMs: 1_800_000 }, execution: () => {},
+    discover: (input: any) => new Promise((_resolve,reject) => input.signal.addEventListener('abort',() => reject(new Error('aborted')),{ once: true })),
+    stop: async () => {}, archive: async () => { assert.equal(calls.rollback.length,0); saved = true; },
+  });
+  const run = await orchestrator.createSession({ team_id: 'T',channel_id: 'C',thread_ts: 'cancel-discovery',user_id: 'U',prompt: 'fix',workflow_mode: 'structured' } as any);
+  await orchestrator.cancel(run.run_id,'U'); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(process.prompts.length,0); assert.equal(saved,true); assert.equal(calls.rollback.length,1);
+});
+
+test('graceful shutdown interrupts read-only workflow without closing its resumable parent budget', async () => {
+  let closed = 0;
+  const { orchestrator,calls } = fixture(undefined,{ structured: { enabled: true,maxCostUsd: 5,activeTimeoutMs: 1_800_000 }, canResume: () => true,
+    discover: (input: any) => new Promise((_resolve,reject) => input.signal.addEventListener('abort',() => reject(new Error('aborted')),{ once: true })),
+    close: () => { closed++; }, stopDiscovery: async () => {},
+  });
+  const run = await orchestrator.createSession({ team_id: 'T',channel_id: 'C',thread_ts: 'shutdown-discovery',user_id: 'U',prompt: 'fix',workflow_mode: 'structured' } as any);
+  await orchestrator.shutdown();
+  assert.equal(orchestrator.getRun(run.run_id).status,'interrupted');
+  assert.equal(closed,0); assert.equal(calls.rollback.length,0);
+});
+
+test('owner can resume an interrupted read-only workflow without resetting its elapsed budget', async () => {
+  const baseline = 'a'.repeat(40);
+  const stored: any = { run_id: 'R', session_id: 'S', owner_user_id: 'U', status: 'interrupted', workflow_mode: 'structured', workflow_requirement: 'fix', workflow_prompt: 'fix', baseline_commit: baseline,
+    routing: { modelRef: 'openai/gpt-5.6-luna', effort: 'max', source: 'off' }, created_at: new Date(Date.now()-3000).toISOString(), updated_at: new Date().toISOString(), answer: '', events: [], attempts: [], estimated_cost_usd: .2 };
+  const { orchestrator, process } = fixture(undefined, { structured: { enabled: true, maxCostUsd: 5, activeTimeoutMs: 1_800_000 }, canResume: () => true, resumeElapsed: () => 2000, tasks: () => [{ wave: 1, state: 'succeeded' }], discover: async () => 'cached evidence', writerStarted: () => {}, execution: () => {}, assertUnchanged: async () => {} }, {
+    load: async () => ({ schema_version: 1, runs: [stored], sessions: [{ id: 'S', key: 'T:C:1', ownerUserId: 'U', modelRef: 'openai/gpt-5.6-luna', worktreePath: '/managed/w1', branch: 'b', baselineCommit: baseline, closed: false, lastActivity: Date.now() }] }),
+    takeExpiredSessions: () => [], save: async () => {},
+  });
+  await orchestrator.restore();
+  await assert.rejects(orchestrator.resume('R','other'),RuntimeForbiddenError);
+  await orchestrator.resume('R','U'); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(process.prompts.length,1); assert.match(process.prompts[0].prompt,/cached evidence/);
+  assert.ok(orchestrator.getRun('R').timing!.active_ms >= 2000);
+  await orchestrator.cancel('R','U');
+});
 
 test("automatic session selects Sol for a complex run and Luna for its follow-up", async () => {
   const decisions = [
@@ -491,4 +587,132 @@ test("failed terminal observability writes persist an incomplete run and stay te
   assert.equal(state.runs[0].capture_complete,false);
   assert.deepEqual(state.runs[0].capture_reasons,["terminal_outbox_write_failed"]);
   assert.equal(state.runs[0].status,"completed");
+});
+
+test("quality gate holds the session busy until candidate verification and grading finish", async () => {
+  let finish!: (result: any) => void; let unchanged = 0;
+  const { orchestrator, process, calls } = fixture(undefined, {
+    evaluate: () => new Promise(resolve => { finish = resolve; }),
+    assertUnchanged: async () => { unchanged++; }, execution: () => {},
+  });
+  const run = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "gated", user_id: "U", prompt: "fix" });
+  process.emit({ type: "settled" }); await new Promise(resolve => setImmediate(resolve));
+  await assert.rejects(orchestrator.prompt(run.session_id, "another", "U"), RuntimeConflictError);
+  assert.equal(calls.commits, 0);
+  finish({ action: "pass", candidate: { hash: "hash", path: "/snapshot" }, verification: { status: "passed", checks: [] }, grade: { status: "passed", findings: [] } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.commits, 1); assert.equal(unchanged, 1);
+  assert.equal(orchestrator.getRun(run.run_id).verification_status, "passed");
+});
+
+test("unconfirmed verifier/grader stop prevents rollback", async () => {
+  let archived = false;
+  const { orchestrator, process, calls } = fixture(undefined, {
+    evaluate: async () => { throw new Error("unused"); }, assertUnchanged: async () => {}, execution: () => {},
+    stop: async () => { throw new Error("stop failed"); }, archive: async () => { archived = true; },
+  });
+  const run = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "stop-quality", user_id: "U", prompt: "fix" });
+  await orchestrator.cancel(run.run_id, "U");
+  assert.equal(process.aborted.length, 1); assert.equal(archived, false); assert.equal(calls.rollback.length, 0);
+});
+
+test("failed candidate is archived after workers stop and before rollback", async () => {
+  const sequence: string[] = [];
+  const { orchestrator, process, calls } = fixture(undefined, {
+    evaluate: async () => ({ action: "fail", candidate: { hash: "hash", path: "/snapshot" }, verification: { status: "unknown", checks: [] } }),
+    assertUnchanged: async () => {}, execution: () => {},
+    stop: async () => { assert.equal(process.aborted.length, 1); sequence.push("stopped"); },
+    archive: async () => { assert.equal(calls.rollback.length, 0); sequence.push("archived"); },
+  });
+  const run = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "archive", user_id: "U", prompt: "fix" });
+  process.emit({ type: "settled" }); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(sequence, ["stopped", "archived"]); assert.equal(calls.rollback.length, 1);
+  assert.equal(orchestrator.getRun(run.run_id).status, "failed");
+});
+
+test("cancelling while initial state persists cannot launch a late writer", async () => {
+  let release!: () => void; let saves = 0;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const { orchestrator, process } = fixture(undefined, undefined, { save: () => ++saves === 1 ? blocked : Promise.resolve() });
+  const input = { team_id: "T", channel_id: "C", thread_ts: "persist-cancel", user_id: "U", prompt: "fix" };
+  const creating = orchestrator.createSession(input);
+  await new Promise(resolve => setImmediate(resolve));
+  const lookup = orchestrator.lookupSession(input)!;
+  await orchestrator.cancel(String(lookup.run_id), "U");
+  release(); await creating;
+  assert.equal(process.prompts.length, 0);
+});
+
+test("grader receives the task requirement instead of Slack bootstrap conversation", async () => {
+  let requirement = "";
+  const { orchestrator, process } = fixture(undefined, {
+    evaluate: async (input: any) => { requirement = input.requirement; return { action: "fail", candidate: { hash: "h", path: "/s" }, verification: { status: "unknown", checks: [] } }; },
+    assertUnchanged: async () => {}, execution: () => {},
+  });
+  await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "grader-context", user_id: "U", prompt: "Prior Slack conversation and author claims", routing_text: "Fix the failing counter test" });
+  process.emit({ type: "settled" }); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requirement, "Fix the failing counter test");
+});
+
+
+test('discussion keeps usage/budget but skips quality/commit and follow-up implement still verifies', async () => {
+  let evaluations = 0, closed = 0; const roles: string[] = [];
+  const { orchestrator, process, calls } = fixture(undefined, {
+    execution: (_id: string, _parent: string, role: string) => { roles.push(role); },
+    evaluate: async () => { evaluations++; return { action: 'pass', candidate: { hash: 'h', path: '/s' }, verification: { status: 'passed', checks: [] }, grade: { status: 'passed' } }; },
+    assertUnchanged: async () => {}, close: () => { closed++; },
+  });
+  calls.diff = { files: [], bytes: 0, stat: '' };
+  const request = { team_id: 'T', channel_id: 'C', thread_ts: 'discussion', user_id: 'U', prompt: 'explain', task_mode: 'discuss' };
+  const first = await orchestrator.createSession(request as any);
+  assert.equal(process.prompts[0].taskMode,'discuss');
+  process.emit({ type: 'answer',text: 'Project explanation' }); process.emit({ type: 'settled' });
+  await new Promise(resolve => setImmediate(resolve));
+  const run = orchestrator.getRun(first.run_id);
+  assert.equal(run.status,'completed'); assert.equal(run.answer,'Project explanation');
+  assert.equal(run.verification_status,'not_applicable'); assert.equal(run.grader_status,'not_applicable');
+  assert.equal(run.publication_status,'not_applicable'); assert.equal(run.commit,undefined);
+  assert.equal(evaluations,0); assert.equal(calls.commits,0); assert.equal(closed,1);
+  assert.deepEqual(roles,['discussion','discussion']);
+  const second = await orchestrator.createSession({ ...request, task_mode: undefined, prompt: 'implement fix' } as any);
+  assert.equal(second.session_id,first.session_id); assert.equal(process.prompts[1].taskMode,'implement');
+  process.emit({ type: 'settled' }); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(evaluations,1); assert.equal(calls.commits,1);
+});
+
+test('discussion cannot silently deliver unexpected changes even without quality configuration', async () => {
+  const { orchestrator, process, calls } = fixture();
+  const r = await orchestrator.createSession({ team_id: 'T', channel_id: 'C', thread_ts: 'drift', user_id: 'U', prompt: 'explain', task_mode: 'discuss' } as any);
+  process.emit({ type: 'settled' }); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(orchestrator.getRun(r.run_id).status,'failed'); assert.equal(calls.commits,0);
+  assert.equal(orchestrator.getRun(r.run_id).error?.code,'discussion_workspace_changed');
+  assert.equal(calls.rollback.length,1);
+});
+
+test('invalid task mode fails before dispatch and no-diff discussion needs no profile', async () => {
+  const { orchestrator, process, calls } = fixture();
+  const request = { team_id: 'T', channel_id: 'C', thread_ts: 'mode', user_id: 'U', prompt: 'explain' };
+  await assert.rejects(orchestrator.createSession({ ...request, task_mode: 'auto' } as any), /task_mode/);
+  assert.equal(process.prompts.length,0);
+  calls.diff = { files: [], bytes: 0, stat: '' };
+  const r = await orchestrator.createSession({ ...request, task_mode: 'discuss' } as any);
+  process.emit({ type: 'settled' }); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(orchestrator.getRun(r.run_id).status,'completed'); assert.equal(calls.commits,0);
+});
+
+test('structured discussion investigates then uses a read-only final responder without a quality gate', async () => {
+  let evaluations = 0;
+  const { orchestrator, process, calls } = fixture(undefined, {
+    structured: { enabled: true, maxCostUsd: 5, activeTimeoutMs: 1_800_000 },
+    discover: async () => 'Evidence from independent readers', writerStarted: () => {},
+    execution: () => {}, evaluate: async () => { evaluations++; throw new Error('not applicable'); },
+    assertUnchanged: async () => {},
+  });
+  calls.diff = { files: [], bytes: 0, stat: '' };
+  const r = await orchestrator.createSession({ team_id: 'T', channel_id: 'C', thread_ts: 'structured-discuss', user_id: 'U', prompt: 'explain', task_mode: 'discuss', workflow_mode: 'structured' } as any);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(process.prompts[0].prompt,/Evidence/); assert.equal(process.prompts[0].taskMode,'discuss');
+  process.emit({ type: 'settled' }); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(orchestrator.getRun(r.run_id).verification_status,'not_applicable');
+  assert.equal(orchestrator.getRun(r.run_id).status,'completed'); assert.equal(evaluations,0); assert.equal(calls.commits,0);
 });

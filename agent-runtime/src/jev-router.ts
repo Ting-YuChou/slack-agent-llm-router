@@ -16,16 +16,20 @@ export interface RouteDecision {
 }
 
 export class JevRouter {
-  constructor(private readonly options: { mode: JevMode; apiKey?: string; fetchFn?: typeof fetch; timeoutMs?: number }) {
+  constructor(private readonly options: { mode: JevMode; apiKey?: string; fetchFn?: typeof fetch; timeoutMs?: number; admit?: (id: string, text: string) => { settle(cost: number | null): void } }) {
     if (options.mode !== "off" && !options.apiKey) throw new Error("OPENROUTER_API_KEY is required when Jev is enabled");
   }
 
-  async route(routingText?: string): Promise<RouteDecision> {
+  async route(routingText?: string, workflowId?: string): Promise<RouteDecision> {
     const fallback: RouteDecision = { modelRef: "openai/gpt-5.6-luna", effort: "max", source: "fallback" };
     if (this.options.mode === "off") return { ...fallback, source: "off" };
     const text = routingText?.trim();
     if (!text || text.length > 4_000) return { ...fallback, reason: "missing_or_oversized_text" };
     const started = performance.now();
+    let ticket: { settle(cost: number | null): void } | undefined;
+    try {
+      if (workflowId) ticket = this.options.admit?.(workflowId, text);
+    } catch { return { ...fallback, reason: "jev_budget_admission_rejected" }; }
     try {
       const response = await (this.options.fetchFn ?? fetch)("https://openrouter.ai/api/alpha/decisions", {
         method: "POST",
@@ -49,6 +53,8 @@ export class JevRouter {
       if (!response.ok) throw new Error("jev_http_error");
       const body: unknown = await response.json();
       if (!isRecord(body) || !isRecord(body.answers) || !isRecord(body.answers.task)) throw new Error("jev_invalid_response");
+      const cost = isRecord(body.usage) && typeof body.usage.cost === "number" && Number.isFinite(body.usage.cost) && body.usage.cost >= 0 ? body.usage.cost : null;
+      ticket?.settle(cost);
       const answer = body.answers.task;
       const label = answer.choice;
       const probabilities = answer.probabilities;
@@ -68,7 +74,7 @@ export class JevRouter {
         recommendedEffort: recommended.effort,
         jevLatencyMs: Math.round(performance.now() - started),
         ...(typeof body.id === "string" ? { jevRequestId: body.id } : {}),
-        ...(isRecord(body.usage) && typeof body.usage.cost === "number" ? { jevCostUsd: body.usage.cost } : {}),
+        ...(cost !== null ? { jevCostUsd: cost } : {}),
       };
       return metadata;
     } catch (error) {

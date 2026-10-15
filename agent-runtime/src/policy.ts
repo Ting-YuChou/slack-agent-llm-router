@@ -101,6 +101,17 @@ export async function validateWorkspacePath(
   return { allowed: true, resolvedPath: resolved };
 }
 
+/** Snapshot tools run from an empty session cwd and need absolute mount paths. */
+export async function validateSnapshotRead(root: string, cwd: string, requested?: string, scopes: string[] = ['.']) {
+  const absolute = path.resolve(cwd,requested ?? '.');
+  const relative = path.relative(path.resolve(root),absolute) || '.';
+  const checked = await validateWorkspacePath(root,relative,'read');
+  if (!checked.allowed) return checked;
+  const canonicalRoot = await realpath(root);
+  if (!scopes.some(scope => { const allowed = path.resolve(canonicalRoot,scope); return checked.resolvedPath === allowed || checked.resolvedPath?.startsWith(allowed + path.sep); })) return { allowed: false,reason: 'task_scope' };
+  return checked;
+}
+
 export interface ApprovalRequest {
   id: string;
   runId: string;

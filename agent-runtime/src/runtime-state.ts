@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename } from "node:fs/promises";
 import path from "node:path";
 
 import type { RunRecord } from "./orchestrator.js";
@@ -24,6 +24,7 @@ export interface RuntimeState {
 }
 
 export class RuntimeStateStore {
+  healthy = true;
   private writeChain: Promise<void> = Promise.resolve();
   private expiredSessions: PersistedSession[] = [];
 
@@ -38,8 +39,9 @@ export class RuntimeStateStore {
       const parsed = JSON.parse(await readFile(this.filePath, "utf8"));
       if (!isState(parsed)) throw new Error("invalid state");
       state = parsed;
-    } catch {
-      return { schema_version: 1, sessions: [], runs: [] };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { schema_version: 1, sessions: [], runs: [] };
+      this.healthy = false; throw new Error("Runtime control state is unreadable or corrupt", { cause: error });
     }
     const sessionCutoff = this.now() - 24 * 60 * 60 * 1000;
     const auditCutoff = this.now() - 7 * 24 * 60 * 60 * 1000;
@@ -52,6 +54,7 @@ export class RuntimeStateStore {
     });
     for (const run of state.runs) {
       if (["starting", "running", "awaiting_approval"].includes(run.status)) {
+        if (run.workflow_mode === "structured") run.interrupted_at = run.updated_at;
         run.status = "interrupted";
         run.updated_at = new Date(this.now()).toISOString();
         run.error = { code: "runtime_restarted", message: "Agent runtime restarted during this prompt" };
@@ -71,12 +74,16 @@ export class RuntimeStateStore {
   async save(state: RuntimeState): Promise<void> {
     const snapshot = JSON.stringify(state, null, 2);
     this.writeChain = this.writeChain.then(async () => {
-      await mkdir(path.dirname(this.filePath), { recursive: true });
+      await mkdir(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
       const temporary = `${this.filePath}.tmp`;
-      await writeFile(temporary, snapshot, { encoding: "utf8", mode: 0o600 });
+      const file = await open(temporary, "w", 0o600);
+      try { await file.chmod(0o600); await file.writeFile(snapshot, "utf8"); await file.sync(); }
+      finally { await file.close(); }
       await rename(temporary, this.filePath);
+      const directory = await open(path.dirname(this.filePath), "r");
+      try { await directory.sync(); } finally { await directory.close(); }
     });
-    return this.writeChain;
+    return this.writeChain.catch(error => { this.healthy = false; throw error; });
   }
 }
 

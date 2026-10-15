@@ -119,3 +119,18 @@ test("run-time Jev exposes codemode with only a short-lived classifier gateway t
   assert.match(rendered, /--tools read,codemode/);
   assert.doesNotMatch(rendered, /OPENROUTER_API_KEY=sk-or-/);
 });
+
+
+test('discussion mode overrides writer capabilities and mounts only read-only workspace', () => {
+  const args = buildAgentDockerArgs({ taskMode: 'discuss', name: 'discuss', image: 'pi', network: 'models',
+    worktreePath: '/worktree', gitMetadataPath: '/host/.git', sessionStatePath: '/state', gatewayUrl: 'http://models', gatewayToken: 'short', modelRef: 'openai/gpt-5.6-luna',
+    extensionPaths: ['/untrusted/extension.ts'], pluginPaths: ['/writer.ts'], skillPaths: ['/skill.md'], toolNames: ['bash','write','edit','codemode'], classifierGatewayToken: 'classifier-secret',
+    mcp: { mode: 'read_only', servers: [{ server: 'github', gatewayUrl: 'http://github', token: 'mcp-secret' }] },
+  } as any);
+  assert.ok(args.includes('type=bind,src=/worktree,dst=/worktree,readonly'));
+  assert.ok(!args.some(a => a.includes('/host/.git')));
+  assert.equal(args[args.indexOf('--tools')+1],'read,grep,find,ls');
+  assert.ok(args.includes('--no-context-files'));
+  assert.ok(args.includes('/opt/pi/extensions/discussion.ts'));
+  assert.doesNotMatch(args.join(' '), /untrusted|writer.ts|skill.md|classifier-secret|mcp-secret|builtin:mcp|builtin:codemode/);
+});

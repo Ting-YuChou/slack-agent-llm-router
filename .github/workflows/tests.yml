@@ -93,3 +93,18 @@ jobs:
 
       - name: Compile source tree
         run: python -m compileall src tests slack
+
+  agent-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.0"
+          cache: npm
+          cache-dependency-path: agent-runtime/package-lock.json
+      - run: npm ci --ignore-scripts
+        working-directory: agent-runtime
+      - run: npm run typecheck && npm test
+        working-directory: agent-runtime

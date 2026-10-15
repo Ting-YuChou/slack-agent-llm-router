@@ -117,12 +117,15 @@ export class PiRpcBridge {
   private readonly onRecord?: (record: Record<string, unknown>) => void;
   private readonly pending = new Map<string, { command: string; resolve: (response: Record<string, unknown>) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private sequence = 0;
+  private ready = false;
+  private readonly onReady?: () => void;
 
-  constructor(options: { writeLine: (line: string) => void; onEvent: (event: PublicRunEvent) => void; onRecord?: (record: Record<string, unknown>) => void; onCommand?: (record: Record<string, unknown>) => void }) {
+  constructor(options: { writeLine: (line: string) => void; onEvent: (event: PublicRunEvent) => void; onRecord?: (record: Record<string, unknown>) => void; onCommand?: (record: Record<string, unknown>) => void; onReady?: () => void }) {
     this.writeLine = options.writeLine;
     this.onEvent = options.onEvent;
     this.onRecord = options.onRecord;
     this.onCommand = options.onCommand;
+    this.onReady = options.onReady;
   }
 
   feed(chunk: Buffer | string): void {
@@ -141,7 +144,10 @@ export class PiRpcBridge {
           clearTimeout(pending.timer);
           this.pending.delete(record.id);
           if (record.command !== pending.command || record.success !== true) pending.reject(new RpcProtocolError(`Pi RPC ${pending.command} failed`));
-          else pending.resolve(record);
+          else {
+            if (!this.ready) { this.ready = true; this.onReady?.(); }
+            pending.resolve(record);
+          }
           continue;
         }
       }

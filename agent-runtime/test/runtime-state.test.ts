@@ -37,3 +37,12 @@ test("audit records older than seven days and closed sessions older than 24 hour
   assert.deepEqual(loaded.sessions, []);
   assert.deepEqual(loaded.runs, []);
 });
+
+test("corrupt control state is not silently treated as a fresh runtime", async () => {
+  const { writeFile, rm } = await import("node:fs/promises");
+  const root = await mkdtemp(path.join(tmpdir(), "pi-corrupt-"));
+  try {
+    await writeFile(path.join(root, "state.json"), "{broken");
+    await assert.rejects(new RuntimeStateStore(path.join(root, "state.json")).load());
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

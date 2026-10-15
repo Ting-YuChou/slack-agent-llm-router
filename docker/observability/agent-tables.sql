@@ -15,6 +15,154 @@ CREATE TABLE IF NOT EXISTS agent_events (
 
 CREATE VIEW IF NOT EXISTS agent_events_latest AS SELECT * FROM agent_events FINAL;
 
+CREATE TABLE IF NOT EXISTS agent_workflow_nodes (
+  sequence UInt64,
+  schema_version UInt16,
+  pi_version String,
+  trace_id Nullable(String),
+  source_time Nullable(DateTime64(6, 'UTC')),
+  event_id String,
+  run_id String,
+  session_id String,
+  kind String,
+  collected_at DateTime64(6, 'UTC'),
+  version UInt64,
+  payload_json String CODEC(ZSTD(3)),
+  workflow_run_id String,
+  node_id String,
+  execution_id String,
+  role String,
+  wave UInt32,
+  attempt UInt32,
+  state String,
+  duration_ms UInt64,
+  queue_ms UInt64,
+  result_ref String
+) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
+
+CREATE VIEW IF NOT EXISTS agent_workflow_nodes_latest AS SELECT * FROM agent_workflow_nodes FINAL;
+
+CREATE TABLE IF NOT EXISTS agent_workflow_revisions (
+  sequence UInt64,
+  schema_version UInt16,
+  pi_version String,
+  trace_id Nullable(String),
+  source_time Nullable(DateTime64(6, 'UTC')),
+  event_id String,
+  run_id String,
+  session_id String,
+  kind String,
+  collected_at DateTime64(6, 'UTC'),
+  version UInt64,
+  payload_json String CODEC(ZSTD(3)),
+  workflow_run_id String,
+  revision UInt32,
+  task_count UInt32
+) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
+
+CREATE VIEW IF NOT EXISTS agent_workflow_revisions_latest AS SELECT * FROM agent_workflow_revisions FINAL;
+
+CREATE TABLE IF NOT EXISTS agent_workflow_dependencies (
+  sequence UInt64,
+  schema_version UInt16,
+  pi_version String,
+  trace_id Nullable(String),
+  source_time Nullable(DateTime64(6, 'UTC')),
+  event_id String,
+  run_id String,
+  session_id String,
+  kind String,
+  collected_at DateTime64(6, 'UTC'),
+  version UInt64,
+  payload_json String CODEC(ZSTD(3)),
+  workflow_run_id String,
+  node_id String,
+  depends_on String
+) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
+
+CREATE VIEW IF NOT EXISTS agent_workflow_dependencies_latest AS SELECT * FROM agent_workflow_dependencies FINAL;
+
+CREATE TABLE IF NOT EXISTS agent_executions (
+  sequence UInt64,
+  schema_version UInt16,
+  pi_version String,
+  trace_id Nullable(String),
+  source_time Nullable(DateTime64(6, 'UTC')),
+  event_id String,
+  run_id String,
+  session_id String,
+  kind String,
+  collected_at DateTime64(6, 'UTC'),
+  version UInt64,
+  payload_json String CODEC(ZSTD(3)),
+  execution_id String,
+  workflow_run_id String,
+  role String,
+  attempt UInt32,
+  phase String
+) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
+
+CREATE VIEW IF NOT EXISTS agent_executions_latest AS SELECT * FROM agent_executions FINAL;
+
+CREATE TABLE IF NOT EXISTS agent_verifications (
+  sequence UInt64,
+  schema_version UInt16,
+  pi_version String,
+  trace_id Nullable(String),
+  source_time Nullable(DateTime64(6, 'UTC')),
+  event_id String,
+  run_id String,
+  session_id String,
+  kind String,
+  collected_at DateTime64(6, 'UTC'),
+  version UInt64,
+  payload_json String CODEC(ZSTD(3)),
+  candidate_hash String,
+  attempt UInt32,
+  status String
+) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
+
+CREATE VIEW IF NOT EXISTS agent_verifications_latest AS SELECT * FROM agent_verifications FINAL;
+
+CREATE TABLE IF NOT EXISTS agent_grades (
+  sequence UInt64,
+  schema_version UInt16,
+  pi_version String,
+  trace_id Nullable(String),
+  source_time Nullable(DateTime64(6, 'UTC')),
+  event_id String,
+  run_id String,
+  session_id String,
+  kind String,
+  collected_at DateTime64(6, 'UTC'),
+  version UInt64,
+  payload_json String CODEC(ZSTD(3)),
+  candidate_hash String,
+  attempt UInt32,
+  status String
+) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
+
+CREATE VIEW IF NOT EXISTS agent_grades_latest AS SELECT * FROM agent_grades FINAL;
+
+CREATE TABLE IF NOT EXISTS agent_deliveries (
+  sequence UInt64,
+  schema_version UInt16,
+  pi_version String,
+  trace_id Nullable(String),
+  source_time Nullable(DateTime64(6, 'UTC')),
+  event_id String,
+  run_id String,
+  session_id String,
+  kind String,
+  collected_at DateTime64(6, 'UTC'),
+  version UInt64,
+  payload_json String CODEC(ZSTD(3)),
+  candidate_hash String,
+  status String
+) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
+
+CREATE VIEW IF NOT EXISTS agent_deliveries_latest AS SELECT * FROM agent_deliveries FINAL;
+
 CREATE TABLE IF NOT EXISTS agent_runs (
   sequence UInt64,
   schema_version UInt16,
@@ -177,7 +325,7 @@ CREATE VIEW IF NOT EXISTS agent_feedback_latest AS SELECT * FROM agent_feedback 
 CREATE VIEW IF NOT EXISTS agent_feedback_current AS SELECT run_id, user_id, argMax(verdict, version) AS verdict FROM agent_feedback_latest GROUP BY run_id, user_id;
 
 CREATE VIEW IF NOT EXISTS agent_usage_reconciliation AS
-SELECT r.run_id, r.capture_complete, s.start_snapshots, s.end_snapshots,
+SELECT r.run_id AS run_id, r.capture_complete, s.start_snapshots, s.end_snapshots,
   if(s.start_snapshots>0 AND s.end_snapshots>0, s.end_tokens-s.start_tokens, NULL) AS session_token_delta,
   u.ledger_tokens, u.ledger_cost,
   if(s.start_snapshots>0 AND s.end_snapshots>0, s.end_cost-s.start_cost, NULL) AS session_cost_delta,
@@ -192,3 +340,26 @@ FROM agent_runs_latest r LEFT JOIN
   FROM agent_session_stats_latest GROUP BY run_id) s ON r.run_id=s.run_id LEFT JOIN
   (SELECT run_id, count() AS ledger_rows, count(total_tokens) AS reported_tokens, count(cost_total) AS reported_costs, sum(total_tokens) AS ledger_tokens, sum(cost_total) AS ledger_cost
    FROM agent_usage_latest GROUP BY run_id) u ON r.run_id=u.run_id;
+
+CREATE VIEW IF NOT EXISTS agent_workflow_execution_durations AS
+SELECT workflow_run_id, execution_id, any(role) AS role,
+  if(countIf(phase='end' AND JSONHas(payload_json,'duration_ms'))>0,
+    maxIf(JSONExtractUInt(payload_json,'duration_ms'),phase='end'),NULL) AS duration_ms,
+  if(countIf(phase='end' AND JSONHas(payload_json,'queue_ms'))>0,
+    maxIf(JSONExtractUInt(payload_json,'queue_ms'),phase='end'),NULL) AS queue_ms,
+  greatest(toInt64(duration_ms)-toInt64(queue_ms),0) AS active_agent_ms
+FROM agent_executions_latest GROUP BY workflow_run_id,execution_id;
+
+CREATE VIEW IF NOT EXISTS agent_workflow_usage AS
+SELECT a.*, if(JSONHas(r.routing_json,'jevCostUsd'), JSONExtractFloat(r.routing_json,'jevCostUsd'),
+  if(JSONHas(r.routing_json,'jevLatencyMs'), NULL, 0)) AS routing_cost_usd,
+  if(a.incomplete_executions=0 AND routing_cost_usd IS NOT NULL,
+    a.known_execution_cost_usd+routing_cost_usd, NULL) AS total_cost_usd
+FROM (
+  SELECT e.workflow_run_id, count() AS executions, sum(u.ledger_tokens) AS total_tokens,
+    sum(u.ledger_cost) AS known_execution_cost_usd,
+    countIf(u.reconciliation='matched') AS matched_executions,
+    countIf(u.reconciliation!='matched') AS incomplete_executions
+  FROM (SELECT execution_id, any(workflow_run_id) AS workflow_run_id FROM agent_executions_latest GROUP BY execution_id) e
+  LEFT JOIN agent_usage_reconciliation u ON e.execution_id=u.run_id GROUP BY e.workflow_run_id
+) a LEFT JOIN agent_runs_latest r ON a.workflow_run_id=r.run_id;

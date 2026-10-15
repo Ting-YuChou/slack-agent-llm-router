@@ -2,7 +2,7 @@
   "uid": "pi-agent-observability",
   "title": "Coding Agent Observability",
   "schemaVersion": 40,
-  "version": 1,
+  "version": 2,
   "refresh": "30s",
   "time": {
     "from": "now-24h",
@@ -247,7 +247,7 @@
         {
           "refId": "A",
           "queryType": "sql",
-          "rawSql": "SELECT min(Timestamp) AS first_seen, TraceId, SpanId, any(ParentSpanId) AS ParentSpanId, any(SpanName) AS SpanName, any(Duration)/1e6 AS duration_ms, any(StatusCode) AS StatusCode FROM otel_traces WHERE $__timeFilter(Timestamp) AND (${run_id:sqlstring}='' OR SpanAttributes['agent.run_id']=${run_id:sqlstring}) GROUP BY TraceId, SpanId ORDER BY first_seen",
+          "rawSql": "SELECT min(Timestamp) AS first_seen, TraceId, SpanId, any(ParentSpanId) AS ParentSpanId, any(SpanName) AS SpanName, any(Duration)/1e6 AS duration_ms, any(StatusCode) AS StatusCode FROM otel_traces WHERE $__timeFilter(Timestamp) AND (${run_id:sqlstring}='' OR TraceId IN (SELECT TraceId FROM otel_traces WHERE SpanAttributes['agent.run_id']=${run_id:sqlstring})) GROUP BY TraceId, SpanId ORDER BY first_seen",
           "format": 1
         }
       ]
@@ -317,6 +317,197 @@
           "refId": "A",
           "queryType": "sql",
           "rawSql": "SELECT * FROM agent_usage_reconciliation",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "Workflow execution accounting",
+      "description": "Stage spans may overlap; never sum child durations to infer wall time. Cost estimates are separate from official Pi usage.",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 56,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT * FROM agent_workflow_usage",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "title": "Candidate verification and independent grades",
+      "description": "Stage spans may overlap; never sum child durations to infer wall time. Cost estimates are separate from official Pi usage.",
+      "type": "table",
+      "gridPos": {
+        "x": 12,
+        "y": 56,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT v.run_id, v.attempt, v.candidate_hash, v.status AS verification_status, g.status AS grader_status FROM agent_verifications_latest v LEFT JOIN agent_grades_latest g ON v.run_id=g.run_id AND v.attempt=g.attempt AND v.candidate_hash=g.candidate_hash WHERE $__timeFilter(v.collected_at) ORDER BY v.collected_at DESC",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "title": "Wall time, active time and human waiting",
+      "description": "Stage spans may overlap; never sum child durations to infer wall time. Cost estimates are separate from official Pi usage.",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 64,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT run_id, JSONExtractInt(payload_json,'timing','wall_ms') AS wall_ms, JSONExtractInt(payload_json,'timing','active_ms') AS active_ms, JSONExtractInt(payload_json,'timing','human_wait_ms') AS human_wait_ms FROM agent_runs_latest WHERE $__timeFilter(collected_at)",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "title": "Gateway reservations (token-based estimates)",
+      "description": "Stage spans may overlap; never sum child durations to infer wall time. Cost estimates are separate from official Pi usage.",
+      "type": "table",
+      "gridPos": {
+        "x": 12,
+        "y": 64,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT collected_at, run_id, payload_json FROM agent_events_latest WHERE kind='budget' AND $__timeFilter(collected_at) ORDER BY collected_at DESC",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "title": "Structured workflow nodes",
+      "type": "table",
+      "description": "Parallel agent intervals overlap. Investigation agent time excludes container admission queues; inspect the trace waterfall for writer, verifier and grader intervals.",
+      "gridPos": {
+        "x": 0,
+        "y": 72,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT workflow_run_id,node_id,any(role) AS role,max(wave) AS wave,max(attempt) AS attempts,argMax(state,version) AS state,argMax(duration_ms,version) AS last_attempt_ms,argMax(queue_ms,version) AS queue_ms FROM agent_workflow_nodes_latest WHERE $__timeFilter(collected_at) GROUP BY workflow_run_id,node_id ORDER BY workflow_run_id,node_id",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "title": "Workflow revisions and dependencies",
+      "type": "table",
+      "description": "Parallel agent intervals overlap. Investigation agent time excludes container admission queues; inspect the trace waterfall for writer, verifier and grader intervals.",
+      "gridPos": {
+        "x": 12,
+        "y": 72,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT collected_at,run_id,kind,payload_json FROM agent_events_latest WHERE kind IN ('workflow_revision','workflow_dependency') AND $__timeFilter(collected_at) ORDER BY collected_at DESC",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "title": "Structured workflow wall time versus agent work",
+      "type": "table",
+      "description": "Parallel agent intervals overlap. Investigation agent time excludes container admission queues; inspect the trace waterfall for writer, verifier and grader intervals.",
+      "gridPos": {
+        "x": 0,
+        "y": 80,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT run_id,JSONExtractUInt(payload_json,'timing','wall_ms') AS wall_ms,JSONExtractUInt(payload_json,'timing','active_ms') AS active_ms,JSONExtractUInt(payload_json,'timing','human_wait_ms') AS human_wait_ms,JSONExtractUInt(payload_json,'suspended_ms') AS suspended_ms,JSONExtractUInt(payload_json,'workflow_summary','agent_work_ms') AS investigation_agent_ms,JSONExtractUInt(payload_json,'workflow_summary','queue_ms') AS investigation_queue_ms FROM agent_runs_latest WHERE JSONExtractString(payload_json,'workflow_mode')='structured' AND $__timeFilter(collected_at) ORDER BY collected_at DESC",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "title": "All agent roles: cumulative work and queue time",
+      "type": "table",
+      "gridPos": {
+        "x": 12,
+        "y": 80,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT workflow_run_id,role,count() AS executions,sum(active_agent_ms) AS known_agent_work_ms,sum(queue_ms) AS known_queue_ms,countIf(isNull(active_agent_ms)) AS incomplete_executions FROM agent_workflow_execution_durations GROUP BY workflow_run_id,role ORDER BY workflow_run_id,role",
           "format": 1
         }
       ]
