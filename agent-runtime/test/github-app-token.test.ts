@@ -39,7 +39,10 @@ test("GitHub App token provider fails closed on invalid responses", async () => 
   await assert.rejects(provider.getToken(), /installation token/);
 });
 
-test("GitHub App token provider bounds a stalled token request", async () => {
+test("GitHub App token provider bounds a stalled token request", { timeout: 5_000 }, async t => {
+  // Mock fetch has no socket; keep the loop alive for AbortSignal.timeout on Node 22.
+  const keepAlive = setInterval(() => {}, 1_000);
+  t.after(() => clearInterval(keepAlive));
   const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const pem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
   const provider = new GitHubAppTokenProvider({

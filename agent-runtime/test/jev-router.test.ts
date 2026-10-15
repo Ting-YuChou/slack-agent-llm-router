@@ -49,7 +49,10 @@ test("low confidence and unavailable Jev preserve Luna max", async () => {
   assert.equal((await unavailable.route("Complex task")).modelRef, "openai/gpt-5.6-luna");
 });
 
-test("Jev timeout falls back without retrying", async () => {
+test("Jev timeout falls back without retrying", { timeout: 5_000 }, async t => {
+  // Mock fetch has no socket; keep the loop alive for AbortSignal.timeout on Node 22.
+  const keepAlive = setInterval(() => {}, 1_000);
+  t.after(() => clearInterval(keepAlive));
   let calls = 0;
   const router = new JevRouter({ mode: "on", apiKey: "key", timeoutMs: 5, fetchFn: async (_url, init) => {
     calls++;
