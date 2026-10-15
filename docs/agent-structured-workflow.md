@@ -28,6 +28,18 @@ The external profile's single-mode limits remain independent: $1 and 15 minutes 
 
 Structured requests without enabled trusted configuration fail explicitly. GitHub webhooks continue to create single-mode repairs. Existing publication approval remains mandatory for CI repair PRs.
 
+## Discussion versus implementation
+
+Task authority is independent of workflow scheduling. Session creation and follow-up prompt APIs accept `task_mode: "discuss" | "implement"`. Omission defaults to `implement` for compatibility. Each new prompt chooses its own mode; the previous prompt's mode is never inherited. Jev labels affect model routing, not permission to modify files.
+
+- `/llm agent --discuss <question>` reads and explains the project without verification or commit.
+- `/llm agent --discuss --workflow <question>` runs the structured investigations and a read-only final responder. It still skips verifier, grader and commit.
+- `/llm agent --implement <task>` retains the existing writer and configured quality gates. Omitting both flags has the same behavior.
+
+The host mounts the discussion workspace read-only, removes Git metadata mounts, and exposes only `read`, `grep`, `find` and `ls`. Discussion uses trusted model-gateway and discussion-policy extensions; writer plugins, repo context files, skills, MCP, Codemode and shell are unavailable. A separate read policy rejects protected paths, escaping symlinks and tools outside the allowlist. Existing session conversation context can continue, but it cannot restore tool privileges. Rebuild the agent image before enabling these requests.
+
+At completion the host also checks for unexpected workspace changes; any change blocks delivery. Successful discussion reports `verification_status`, `grader_status` and `publication_status` as `not_applicable`, with no commit/cherry-pick field. It retains execution usage, cost admission and traces when the trusted quality profile is configured. CI repair always requires `implement`; a discussion request to that endpoint is rejected. Starting an implementation after discussion requires a new prompt and existing write approvals.
+
 ## Execution and authority
 
 The host locks the requirement, baseline and profile checksum, and marks the parent session busy before investigation. A planner submits a validated graph through `submit_plan`. Supported investigator roles are `code_explorer`, `ci_investigator` and `test_analyst`; workers submit findings through `submit_investigation`. The host rejects cycles, unknown dependencies, escaping paths, unsupported roles and more than eight investigation tasks across both waves.

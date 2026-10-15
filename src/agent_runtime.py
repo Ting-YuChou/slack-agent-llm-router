@@ -105,6 +105,7 @@ class AgentRuntimeClient:
         *,
         model: Optional[str] = None,
         workflow_mode: Optional[str] = None,
+        task_mode: Optional[str] = None,
         routing_text: Optional[str] = None,
     ) -> Dict[str, Any]:
         payload = {
@@ -114,6 +115,8 @@ class AgentRuntimeClient:
             "user_id": user_id,
             "prompt": prompt,
         }
+        if task_mode is not None:
+            payload["task_mode"] = task_mode
         if workflow_mode is not None:
             payload["workflow_mode"] = workflow_mode
         if model:
@@ -207,8 +210,11 @@ class AgentRuntimeClient:
         *,
         routing_text: Optional[str] = None,
         workflow_mode: Optional[str] = None,
+        task_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         payload = {"prompt": prompt, "user_id": user_id}
+        if task_mode is not None:
+            payload["task_mode"] = task_mode
         if workflow_mode is not None:
             payload["workflow_mode"] = workflow_mode
         if routing_text is not None:

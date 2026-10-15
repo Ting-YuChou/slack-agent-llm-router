@@ -12,9 +12,11 @@ import type { AgentTelemetry } from "./telemetry.js";
 import type { McpRunConfig, McpServerId } from "./mcp-config.js";
 import { MCP_SERVERS, namespacedMcpToolNames } from "./mcp-config.js";
 import { StartupTiming } from "./startup-timing.js";
+import { taskMode, type TaskMode } from "./task-mode.js";
 import { agentScheduler } from "./agent-scheduler.js";
 
 export interface AgentContainerOptions {
+  taskMode?: TaskMode;
   name: string;
   image: string;
   network: string;
@@ -44,6 +46,12 @@ export interface AgentContainerOptions {
 const exec = promisify(execFile);
 
 export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
+  if (taskMode(options.taskMode) === "discuss") options = {
+    ...options, readOnlyWorkspace: true, toolNames: ["read", "grep", "find", "ls"],
+    extensionPaths: ["/opt/pi/extensions/model-gateway.ts", "/opt/pi/extensions/discussion.ts"],
+    pluginPaths: [], skillPaths: [], safeCommands: [], mcp: undefined, classifierGatewayToken: undefined,
+    graderContext: undefined, workflowContext: undefined,
+  };
   const model = resolveAgentModel(options.modelRef);
   const tools = [...options.toolNames];
   const hasCodemodeMcp = !options.directMcpOnly && (options.mcp?.servers.some((item) => MCP_SERVERS[item.server].codemodeTools.length > 0) ?? false);
@@ -159,7 +167,7 @@ export class DockerPiProcess implements AgentProcess {
     this.hasSession = options.continueSession ?? false;
   }
 
-  private start(runId: string, route: RouteDecision): void {
+  private start(runId: string, route: RouteDecision, selectedTask: TaskMode): void {
     if (this.child && this.child.exitCode === null) throw new Error("Pi container is already active");
     this.closing = false;
     this.activeRunId = runId;
@@ -170,15 +178,17 @@ export class DockerPiProcess implements AgentProcess {
     this.activeContainerName = containerName;
     const capture = this.telemetry ? new PiRunCapture(this.telemetry, runId, this.sessionId, this.options.sessionStatePath, containerName) : undefined;
     this.capture = capture;
-    const { mcp, ...baseOptions } = this.options;
+    const { mcp: configuredMcp, ...baseOptions } = this.options;
+    const mcp = selectedTask === "discuss" ? undefined : configuredMcp;
     if (mcp && !this.mcpTokenForRun) throw new Error("MCP token issuer is required when MCP is enabled");
     const child = spawn("docker", buildAgentDockerArgs({
       ...baseOptions,
+      taskMode: selectedTask,
       name: containerName,
       modelRef: route.modelRef,
       reasoningEffort: route.effort,
       gatewayToken: this.tokenForRun(runId, route),
-      ...(this.classifierTokenForRun ? { classifierGatewayToken: this.classifierTokenForRun(runId) } : {}),
+      ...(selectedTask !== "discuss" && this.classifierTokenForRun ? { classifierGatewayToken: this.classifierTokenForRun(runId) } : {}),
       ...(mcp ? { mcp: {
         ...mcp,
         servers: mcp.servers.map((item) => item.server === "codegraph" ? item : ({
@@ -249,10 +259,11 @@ export class DockerPiProcess implements AgentProcess {
     child.stderr.resume();
   }
 
-  prompt(runId: string, prompt: string, route?: RouteDecision): void {
+  prompt(runId: string, prompt: string, route?: RouteDecision, requestedTask?: TaskMode): void {
+    const selectedTask = taskMode(requestedTask ?? this.options.taskMode);
     const selected = route ?? { modelRef: this.options.modelRef, effort: resolveAgentModel(this.options.modelRef).reasoningEffort, source: "explicit" };
     const startPrompt = () => {
-      this.start(runId, selected);
+      this.start(runId, selected, selectedTask);
       const model = resolveAgentModel(selected.modelRef);
       const bridge = this.bridge!; const capture = this.capture;
       void this.readiness!.then(() => bridge.configureAndPrompt(runId, prompt, model.provider, model.id, selected.effort, async () => {

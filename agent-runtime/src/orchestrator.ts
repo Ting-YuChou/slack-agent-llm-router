@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { taskMode, type TaskMode } from "./task-mode.js";
 
 import { listAgentModels, resolveAgentModel } from "./agent-model.js";
 import type { RouteDecision } from "./jev-router.js";
@@ -12,7 +13,7 @@ import type { Candidate, GateInput, GateResult } from "./quality-gate.js";
 export interface QualityServices {
   evaluate(input: GateInput): Promise<GateResult>;
   assertUnchanged(candidate: Candidate, input: GateInput): Promise<void>;
-  execution(id: string, parent: string, role: "implementation", attempt: number, phase: "start" | "end", queueMs?: number): void | Promise<void>;
+  execution(id: string, parent: string, role: "implementation" | "discussion", attempt: number, phase: "start" | "end", queueMs?: number): void | Promise<void>;
   stop?(id: string): Promise<void>;
   open?(id: string, initialCost: number): void;
   close?(id: string): void;
@@ -69,12 +70,14 @@ export interface SessionInput {
   user_id: string;
   prompt: string;
   model?: string;
+  task_mode?: TaskMode;
   workflow_mode?: WorkflowMode;
   routing_text?: string;
   task_id?: string;
 }
 
 export interface RunRecord {
+  task_mode?: TaskMode;
   workflow_mode?: WorkflowMode;
   workflow_requirement?: string;
   workflow_prompt?: string;
@@ -134,7 +137,7 @@ export interface RunRecord {
 
 export interface AgentProcess {
   queueMs?: number;
-  prompt(runId: string, prompt: string, route: RouteDecision): void;
+  prompt(runId: string, prompt: string, route: RouteDecision, taskMode?: TaskMode): void;
   decide(rpcUiId: string, approved: boolean): void;
   abort(runId: string): Promise<void>;
   close(): Promise<void>;
@@ -266,6 +269,7 @@ export class CodingAgentOrchestrator {
     const requestedAt = new Date().toISOString();
     validateSessionInput(input);
     const mode = this.requireWorkflowMode(input.workflow_mode);
+    const task = this.requireTaskMode(input.task_mode);
     let requestedModel;
     try {
       requestedModel = resolveAgentModel(input.model);
@@ -284,7 +288,7 @@ export class CodingAgentOrchestrator {
         if (input.model && (existing.autoRouting || existing.modelRef !== requestedModel.ref)) {
           throw new RuntimeConflictError("An existing Agent session cannot switch models");
         }
-        return this.prompt(existing.id, input.prompt, input.user_id, input.routing_text, input.task_id, mode);
+        return this.prompt(existing.id, input.prompt, input.user_id, input.routing_text, input.task_id, mode, task);
       }
     }
     if (this.pendingThreadKeys.has(key)) throw new RuntimeConflictError("This Slack thread is already creating a session");
@@ -330,7 +334,7 @@ export class CodingAgentOrchestrator {
       };
       this.sessions.set(sessionId, session);
       this.threadSessions.set(key, sessionId);
-      await this.startRun(session, runId, input.prompt, route, requestedAt, input.task_id, input.routing_text, mode);
+      await this.startRun(session, runId, input.prompt, route, requestedAt, input.task_id, input.routing_text, mode, task);
       await this.persistState();
       return { session_id: sessionId, run_id: runId, status: "starting" };
     } catch (error) {
@@ -341,9 +345,10 @@ export class CodingAgentOrchestrator {
     }
   }
 
-  async prompt(sessionId: string, prompt: string, userId: string, routingText?: string, taskId?: string, requestedMode?: WorkflowMode): Promise<{ session_id: string; run_id: string; status: "starting" }> {
+  async prompt(sessionId: string, prompt: string, userId: string, routingText?: string, taskId?: string, requestedMode?: WorkflowMode, requestedTaskMode?: TaskMode): Promise<{ session_id: string; run_id: string; status: "starting" }> {
     if (this.stateStore?.healthy === false) throw new RuntimeError("Runtime control store unavailable", "control_unavailable", 503);
     const mode = this.requireWorkflowMode(requestedMode);
+    const task = this.requireTaskMode(requestedTaskMode);
     const requestedAt = new Date().toISOString();
     const session = this.requireSession(sessionId);
     if (session.ownerUserId !== userId) throw new RuntimeForbiddenError("Only the session owner can submit prompts");
@@ -363,7 +368,7 @@ export class CodingAgentOrchestrator {
       const route = await this.selectRoute(session.autoRouting, session.modelRef, routingText, runId);
       this.notifyLifecycle(runId, "routing", "end");
       if (session.autoRouting) session.modelRef = route.modelRef;
-      await this.startRun(session, runId, prompt, route, requestedAt, taskId, routingText, mode);
+      await this.startRun(session, runId, prompt, route, requestedAt, taskId, routingText, mode, task);
       await this.persistState();
       return { session_id: sessionId, run_id: runId, status: "starting" };
     } finally {
@@ -496,11 +501,12 @@ export class CodingAgentOrchestrator {
     return this.getRun(runId).events.slice(Math.max(0, after));
   }
 
-  private async startRun(session: SessionRecord, runId: string, prompt: string, route: RouteDecision, requestedAt: string, taskId?: string, requirement?: string, mode: WorkflowMode = "single"): Promise<void> {
+  private async startRun(session: SessionRecord, runId: string, prompt: string, route: RouteDecision, requestedAt: string, taskId?: string, requirement?: string, mode: WorkflowMode = "single", task: TaskMode = "implement"): Promise<void> {
     const model = resolveAgentModel(route.modelRef);
     const run: RunRecord = {
       run_id: runId,
       workflow_mode: mode,
+      task_mode: task,
       ...(mode === "structured" ? { workflow_requirement: requirement ?? prompt, workflow_prompt: prompt } : {}),
       session_id: session.id,
       status: "running",
@@ -520,6 +526,10 @@ export class CodingAgentOrchestrator {
       events: [{ type: "status", status: "starting" }],
       branch: session.branch,
     };
+    if (task === "discuss") {
+      run.phase = "discussing"; run.execution_status = "running";
+      run.verification_status = "not_applicable"; run.grader_status = "not_applicable"; run.publication_status = "not_applicable";
+    }
     this.runs.set(runId, run);
     session.activeRunId = runId;
     session.lastActivity = Date.now();
@@ -534,7 +544,7 @@ export class CodingAgentOrchestrator {
       workflow.budget.report(route.jevCostUsd ?? 0);
       this.quality.open?.(runId, route.jevCostUsd ?? 0);
       this.workflows.set(runId, workflow);
-      run.execution_status = "running"; run.publication_status = "local_only"; run.phase = "implementing"; run.verification_status = "pending"; run.grader_status = "pending"; run.attempts = [];
+      run.execution_status = "running"; run.publication_status = task === "discuss" ? "not_applicable" : "local_only"; run.phase = task === "discuss" ? "discussing" : "implementing"; run.verification_status = task === "discuss" ? "not_applicable" : "pending"; run.grader_status = task === "discuss" ? "not_applicable" : "pending"; run.attempts = [];
     }
     // Persist the busy state and exact execution identity before launching any model work.
     await this.persistState();
@@ -542,12 +552,16 @@ export class CodingAgentOrchestrator {
     if (isTerminal(run.status) || this.terminalClaims.has(runId)) return;
     if (workflow?.mode === 'structured') this.launchDiscovery(session, run, workflow, prompt.trim());
     else if (workflow) await this.startExecution(session, run, workflow, prompt.trim());
-    else session.process.prompt(runId, prompt.trim(), route);
+    else session.process.prompt(runId, prompt.trim(), route, task);
     if (!isTerminal(run.status)) this.armDeadline(session, run, this.workflows.get(runId)?.budget.remainingMs() ?? this.deadlineMs);
     } catch (error) {
       if (this.stateStore?.healthy !== false && !isTerminal(run.status) && !this.terminalClaims.has(runId)) await this.failRun(session, run, "execution_start_failed", "Execution could not start within its configured controls");
       throw error;
     }
+  }
+
+  private requireTaskMode(value: unknown): TaskMode {
+    try { return taskMode(value); } catch { throw new RuntimeError("Invalid task_mode; expected discuss or implement", "invalid_request", 400); }
   }
 
   private requireWorkflowMode(value: unknown): WorkflowMode {
@@ -564,7 +578,7 @@ export class CodingAgentOrchestrator {
       state.controller.signal.throwIfAborted();
       if (isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return;
       this.quality!.writerStarted?.(run.run_id);
-      run.phase = 'implementing'; await this.persistState();
+      run.phase = run.task_mode === 'discuss' ? 'discussing' : 'implementing'; await this.persistState();
       await this.startExecution(session, run, state, `${prompt}\n\n${evidence}`);
     }).catch(async () => {
       if (!isTerminal(run.status) && !this.terminalClaims.has(run.run_id)) await this.failRun(session, run, 'investigation_unknown', 'Required investigation could not complete; evidence retained');
@@ -596,7 +610,7 @@ export class CodingAgentOrchestrator {
     this.terminalClaims.delete(runId); this.workflows.set(runId,state); session.activeRunId = runId;
     run.suspended_ms = (run.suspended_ms ?? 0) + Math.max(0, Date.now() - Math.max(this.quality.resumeCheckpoint?.(runId) ?? 0,Date.parse(run.interrupted_at ?? run.updated_at)));
     run.status = 'running'; run.updated_at = new Date().toISOString();
-    run.execution_status = 'running'; run.verification_status = 'pending'; run.grader_status = 'pending';
+    run.execution_status = 'running'; run.verification_status = run.task_mode === 'discuss' ? 'not_applicable' : 'pending'; run.grader_status = run.task_mode === 'discuss' ? 'not_applicable' : 'pending';
     this.notifyLifecycle(runId,'resume','start',false,session.id);
     run.traceparent = this.captureTraceContext?.(runId) ?? run.traceparent;
     this.notifyLifecycle(runId,'resume','end',false,session.id);
@@ -626,8 +640,8 @@ export class CodingAgentOrchestrator {
     run.attempts!.push({ attempt: state.attempt, execution_id: state.executionId });
     await this.persistState();
     if (state.controller.signal.aborted || isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return;
-    await this.quality!.execution(state.executionId, run.run_id, "implementation", state.attempt, "start");
-    session.process.prompt(state.executionId, prompt, state.route);
+    await this.quality!.execution(state.executionId, run.run_id, run.task_mode === "discuss" ? "discussion" : "implementation", state.attempt, "start");
+    session.process.prompt(state.executionId, prompt, state.route, run.task_mode ?? "implement");
   }
 
   private handleProcessEvent(sessionId: string, event: PublicRunEvent): void {
@@ -716,7 +730,32 @@ export class CodingAgentOrchestrator {
     if (event.type === "settled") { if (this.workflows.has(run.run_id)) run.execution_status = "succeeded"; void this.completeRun(session, run); }
   }
 
+  private async completeDiscussion(session: SessionRecord, run: RunRecord): Promise<void> {
+    const workflow = this.workflows.get(run.run_id);
+    if (workflow?.checking || isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return;
+    if (workflow) workflow.checking = true;
+    try {
+      if (workflow) {
+        await this.quality!.execution(workflow.executionId, run.run_id, "discussion", workflow.attempt, "end", session.process.queueMs);
+        workflow.budget.check();
+      }
+      const diff = await this.worktrees.inspectDiff(session.worktreePath, { maxFiles: 50, maxBytes: 1024 * 1024, maxSingleFileBytes: 256 * 1024 });
+      if (isTerminal(run.status) || this.terminalClaims.has(run.run_id) || workflow?.controller.signal.aborted) return;
+      if (diff.files.length || diff.bytes) {
+        await this.failRun(session, run, "discussion_workspace_changed", "Read-only discussion produced unexpected changes; delivery blocked"); return;
+      }
+      if (!this.claimTerminal(run)) return;
+      run.changed_files = []; run.phase = "completed";
+      run.verification_status = "not_applicable"; run.grader_status = "not_applicable"; run.publication_status = "not_applicable";
+      this.updateRun(run, "completed"); this.finishActiveRun(session, run.run_id);
+      await this.persistState();
+    } catch {
+      if (!isTerminal(run.status) && !this.terminalClaims.has(run.run_id)) await this.failRun(session, run, "discussion_completion_failed", "Read-only completion checks could not finish");
+    }
+  }
+
   private async completeRun(session: SessionRecord, run: RunRecord): Promise<void> {
+    if (run.task_mode === "discuss") { await this.completeDiscussion(session, run); return; }
     const workflow = this.workflows.get(run.run_id);
     if (workflow && this.quality) {
       if (workflow.checking || this.terminalClaims.has(run.run_id) || isTerminal(run.status)) return;

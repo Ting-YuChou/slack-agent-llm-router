@@ -21,7 +21,7 @@ function fixture() {
   const orchestrator = {
     createSession: async (body: any) => { calls.push(["create", body]); return { session_id: "S1", run_id: "R1", status: "starting" }; },
     lookupSession: () => ({ session_id: "S1", owner_user_id: "U1", active: false }),
-    prompt: async (id: string, prompt: string, user: string) => { calls.push(["prompt", id, prompt, user]); return { session_id: id, run_id: "R2", status: "starting" }; },
+    prompt: async (id: string, prompt: string, user: string, ...options: unknown[]) => { calls.push(["prompt", id, prompt, user, ...options]); return { session_id: id, run_id: "R2", status: "starting" }; },
     getRun: (id: string) => { if (id === "missing") throw new RuntimeNotFoundError(); return { ...run, run_id: id }; },
     listEvents: () => run.events,
     decide: (...args: any[]) => calls.push(["decide", ...args]),
@@ -149,4 +149,32 @@ test("failed terminal writes persist failure before releasing even if persistenc
   calls.length=0;
   await assert.rejects(module.settleCaptureWrite("r",false,telemetry,async()=>{throw new Error("disk full");}));
   assert.deepEqual(calls,["release:r"]);
+});
+
+
+test('prompt task mode is validated and forwarded separately from workflow mode', async () => {
+  const { server,calls } = fixture(); const base = await listen(server);
+  const headers = { authorization: 'Bearer runtime-secret','content-type': 'application/json' };
+  try {
+    for (const mode of ['discuss','implement']) {
+      const response = await fetch(`${base}/v1/sessions/S1/prompts`,{ method: 'POST',headers,body: JSON.stringify({ user_id: 'U',prompt: 'project',task_mode: mode }) });
+      assert.equal(response.status,202); assert.equal(calls.at(-1).at(-1),mode);
+    }
+    for (const mode of ['auto',null,{}]) {
+      const before = calls.length;
+      const response = await fetch(`${base}/v1/sessions/S1/prompts`,{ method: 'POST',headers,body: JSON.stringify({ user_id: 'U',prompt: 'project',task_mode: mode }) });
+      assert.equal(response.status,400); assert.equal(calls.length,before);
+    }
+  } finally { await close(server); }
+});
+
+test('CI repair rejects discussion task mode before creating a repair', async () => {
+  let created = false;
+  const server = createAgentHttpServer({ token: 'secret',orchestrator: {} as any,health: () => ({}),
+    ci: { checkContext: () => {},create: async () => { created = true; return {}; } } as any });
+  const base = await listen(server);
+  try {
+    const response = await fetch(`${base}/v1/ci-repairs`,{ method: 'POST',headers: { authorization: 'Bearer secret','content-type': 'application/json' },body: JSON.stringify({ target: '7',user_id: 'U',task_mode: 'discuss' }) });
+    assert.equal(response.status,400); assert.equal(created,false);
+  } finally { await close(server); }
 });

@@ -29,6 +29,7 @@ import { startEvidenceRetention } from "./evidence-retention.js";
 import { ControlStore } from "./ci-control.js";
 import { BudgetLedger } from "./budget-ledger.js";
 import { createCiRuntime } from "./ci-runtime.js";
+import { taskMode } from "./task-mode.js";
 import { workflowMode } from "./structured-workflow.js";
 import type { CiRepairs } from "./ci-repair.js";
 import { loadProfile } from "./verification.js";
@@ -89,6 +90,7 @@ export function createAgentHttpServer(options: ServerOptions) {
       if (request.method === "POST" && url.pathname === "/v1/ci-repairs") {
         if (!options.ci) throw new RuntimeError("CI repair requires trusted profile, owner mapping and separate publisher credentials", "ci_setup_required", 503);
         const body = asRecord(await readJson(request));
+        if (parseTaskMode(body.task_mode) !== "implement") throw new RuntimeError("CI repair requires implement task_mode", "invalid_request", 400);
         options.ci.checkContext(body.team_id, body.channel_id, body.user_id);
         sendJson(response, 202, await options.ci.create(requiredString(body.target, "target"), requiredString(body.user_id, "user_id"), undefined, undefined, parseWorkflowMode(body.workflow_mode))); return;
       }
@@ -125,6 +127,7 @@ export function createAgentHttpServer(options: ServerOptions) {
           typeof body.routing_text === "string" ? body.routing_text : undefined,
           body.task_id as string | undefined,
           parseWorkflowMode(body.workflow_mode),
+          parseTaskMode(body.task_mode),
         );
         sendJson(response, 202, result);
         return;
@@ -681,6 +684,10 @@ if (entrypoint === import.meta.url) {
   const server = await createProductionServer();
   server.listen(port, host, () => logEvent("agent_runtime_started", { host, port }));
   for (const signal of ["SIGTERM", "SIGINT"] as const) process.once(signal, () => server.close());
+}
+
+function parseTaskMode(value: unknown) {
+  try { return taskMode(value); } catch { throw new RuntimeError("Invalid task_mode; expected discuss or implement", "invalid_request", 400); }
 }
 
 function parseWorkflowMode(value: unknown) {

@@ -6,10 +6,10 @@ import { CodingAgentOrchestrator, RuntimeConflictError, RuntimeForbiddenError } 
 
 class FakeProcess {
   handler: (event: PublicRunEvent) => void = () => undefined;
-  prompts: Array<{ runId: string; prompt: string; route?: { modelRef: string; effort: string } }> = [];
+  prompts: Array<{ runId: string; prompt: string; route?: { modelRef: string; effort: string }; taskMode?: string }> = [];
   decisions: Array<{ id: string; approved: boolean }> = [];
   aborted: string[] = [];
-  prompt(runId: string, prompt: string, route?: { modelRef: string; effort: string }) { this.prompts.push({ runId, prompt, route }); }
+  prompt(runId: string, prompt: string, route?: { modelRef: string; effort: string }, taskMode?: string) { this.prompts.push({ runId, prompt, route, taskMode }); }
   decide(id: string, approved: boolean) { this.decisions.push({ id, approved }); }
   async abort(runId: string) { this.aborted.push(runId); }
   async close() {}
@@ -21,12 +21,13 @@ function fixture(router?: { route(text?: string): Promise<any> }, quality?: any,
   const calls = {
     rollback: [] as string[],
     commits: 0,
+    diff: { files: ["src/a.ts"], bytes: 10, stat: "1 file changed" },
     commitImpl: async () => "b".repeat(40),
     startedModels: [] as string[],
   };
   const worktrees = {
     create: async () => ({ path: "/managed/w1", branch: "pi-agent/20260801-run", baselineCommit: "a".repeat(40) }),
-    inspectDiff: async () => ({ files: ["src/a.ts"], bytes: 10, stat: "1 file changed" }),
+    inspectDiff: async () => calls.diff,
     commit: async () => { calls.commits += 1; return calls.commitImpl(); },
     rollback: async (_path: string, baseline: string) => { calls.rollback.push(baseline); },
     remove: async () => undefined,
@@ -651,4 +652,67 @@ test("grader receives the task requirement instead of Slack bootstrap conversati
   await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "grader-context", user_id: "U", prompt: "Prior Slack conversation and author claims", routing_text: "Fix the failing counter test" });
   process.emit({ type: "settled" }); await new Promise(resolve => setImmediate(resolve));
   assert.equal(requirement, "Fix the failing counter test");
+});
+
+
+test('discussion keeps usage/budget but skips quality/commit and follow-up implement still verifies', async () => {
+  let evaluations = 0, closed = 0; const roles: string[] = [];
+  const { orchestrator, process, calls } = fixture(undefined, {
+    execution: (_id: string, _parent: string, role: string) => { roles.push(role); },
+    evaluate: async () => { evaluations++; return { action: 'pass', candidate: { hash: 'h', path: '/s' }, verification: { status: 'passed', checks: [] }, grade: { status: 'passed' } }; },
+    assertUnchanged: async () => {}, close: () => { closed++; },
+  });
+  calls.diff = { files: [], bytes: 0, stat: '' };
+  const request = { team_id: 'T', channel_id: 'C', thread_ts: 'discussion', user_id: 'U', prompt: 'explain', task_mode: 'discuss' };
+  const first = await orchestrator.createSession(request as any);
+  assert.equal(process.prompts[0].taskMode,'discuss');
+  process.emit({ type: 'answer',text: 'Project explanation' }); process.emit({ type: 'settled' });
+  await new Promise(resolve => setImmediate(resolve));
+  const run = orchestrator.getRun(first.run_id);
+  assert.equal(run.status,'completed'); assert.equal(run.answer,'Project explanation');
+  assert.equal(run.verification_status,'not_applicable'); assert.equal(run.grader_status,'not_applicable');
+  assert.equal(run.publication_status,'not_applicable'); assert.equal(run.commit,undefined);
+  assert.equal(evaluations,0); assert.equal(calls.commits,0); assert.equal(closed,1);
+  assert.deepEqual(roles,['discussion','discussion']);
+  const second = await orchestrator.createSession({ ...request, task_mode: undefined, prompt: 'implement fix' } as any);
+  assert.equal(second.session_id,first.session_id); assert.equal(process.prompts[1].taskMode,'implement');
+  process.emit({ type: 'settled' }); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(evaluations,1); assert.equal(calls.commits,1);
+});
+
+test('discussion cannot silently deliver unexpected changes even without quality configuration', async () => {
+  const { orchestrator, process, calls } = fixture();
+  const r = await orchestrator.createSession({ team_id: 'T', channel_id: 'C', thread_ts: 'drift', user_id: 'U', prompt: 'explain', task_mode: 'discuss' } as any);
+  process.emit({ type: 'settled' }); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(orchestrator.getRun(r.run_id).status,'failed'); assert.equal(calls.commits,0);
+  assert.equal(orchestrator.getRun(r.run_id).error?.code,'discussion_workspace_changed');
+  assert.equal(calls.rollback.length,1);
+});
+
+test('invalid task mode fails before dispatch and no-diff discussion needs no profile', async () => {
+  const { orchestrator, process, calls } = fixture();
+  const request = { team_id: 'T', channel_id: 'C', thread_ts: 'mode', user_id: 'U', prompt: 'explain' };
+  await assert.rejects(orchestrator.createSession({ ...request, task_mode: 'auto' } as any), /task_mode/);
+  assert.equal(process.prompts.length,0);
+  calls.diff = { files: [], bytes: 0, stat: '' };
+  const r = await orchestrator.createSession({ ...request, task_mode: 'discuss' } as any);
+  process.emit({ type: 'settled' }); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(orchestrator.getRun(r.run_id).status,'completed'); assert.equal(calls.commits,0);
+});
+
+test('structured discussion investigates then uses a read-only final responder without a quality gate', async () => {
+  let evaluations = 0;
+  const { orchestrator, process, calls } = fixture(undefined, {
+    structured: { enabled: true, maxCostUsd: 5, activeTimeoutMs: 1_800_000 },
+    discover: async () => 'Evidence from independent readers', writerStarted: () => {},
+    execution: () => {}, evaluate: async () => { evaluations++; throw new Error('not applicable'); },
+    assertUnchanged: async () => {},
+  });
+  calls.diff = { files: [], bytes: 0, stat: '' };
+  const r = await orchestrator.createSession({ team_id: 'T', channel_id: 'C', thread_ts: 'structured-discuss', user_id: 'U', prompt: 'explain', task_mode: 'discuss', workflow_mode: 'structured' } as any);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(process.prompts[0].prompt,/Evidence/); assert.equal(process.prompts[0].taskMode,'discuss');
+  process.emit({ type: 'settled' }); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(orchestrator.getRun(r.run_id).verification_status,'not_applicable');
+  assert.equal(orchestrator.getRun(r.run_id).status,'completed'); assert.equal(evaluations,0); assert.equal(calls.commits,0);
 });

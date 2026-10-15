@@ -1113,9 +1113,16 @@ class SlackMessageHandler:
         model = None
         include_thread_context = True
         selected_workflow = None
+        selected_task_mode = None
         task_args = list(args)
         while task_args and task_args[0].startswith("--"):
             option = task_args.pop(0)
+            if option in {"--discuss", "--implement"}:
+                requested_task_mode = option[2:]
+                if selected_task_mode and selected_task_mode != requested_task_mode:
+                    return "Conflicting task modes: choose --discuss or --implement."
+                selected_task_mode = requested_task_mode
+                continue
             if option == "--workflow":
                 selected_workflow = "structured"
                 continue
@@ -1131,7 +1138,7 @@ class SlackMessageHandler:
                 model = option.split("=", 1)[1].strip()
                 if model:
                     continue
-            return "Usage: `/llm agent [--model provider/model] [--no-thread-context] <task>`"
+            return "Usage: `/llm agent [--discuss|--implement] [--workflow] [--model provider/model] [--no-thread-context] <task>`"
         task = " ".join(task_args).strip()
         if not task:
             return "Usage: `/llm agent [--model provider/model] <task>`"
@@ -1161,6 +1168,7 @@ class SlackMessageHandler:
             model=model,
             routing_text=task,
             **({"workflow_mode": selected_workflow} if selected_workflow else {}),
+            **({"task_mode": selected_task_mode} if selected_task_mode else {}),
         )
         if bootstrap.error:
             response += (
@@ -1181,6 +1189,7 @@ class SlackMessageHandler:
         model: Optional[str] = None,
         routing_text: Optional[str] = None,
         workflow_mode: Optional[str] = None,
+        task_mode: Optional[str] = None,
     ) -> str:
         runtime = getattr(self.bot, "agent_runtime_client", None)
         if runtime is None:
@@ -1207,6 +1216,8 @@ class SlackMessageHandler:
                 task,
             )
             create_kwargs = {}
+            if task_mode is not None:
+                create_kwargs["task_mode"] = task_mode
             if workflow_mode is not None:
                 create_kwargs["workflow_mode"] = workflow_mode
             if model:
@@ -1244,7 +1255,11 @@ class SlackMessageHandler:
                     text=(
                         f"🛠️ Pi coding agent started run `{result['run_id']}`"
                         f"{f' with `{model}`' if model else ''}.\n"
-                        "Read-only exploration is automatic; edits and risky shell commands require approval here."
+                        + (
+                            "Read-only discussion: no edits, verification or commit."
+                            if task_mode == "discuss"
+                            else "Read-only exploration is automatic; edits and risky shell commands require approval here."
+                        )
                     ),
                 )
             self.bot._spawn_background_task(
@@ -1288,6 +1303,10 @@ class SlackMessageHandler:
             if result.get("mcp_repository"):
                 parts.append(f"`{result['mcp_repository']}`")
             detail_sections.append("*MCP:* " + " / ".join(parts) + f" / *{mcp_status}*")
+        if result.get("task_mode") == "discuss":
+            detail_sections.append(
+                "*Mode:* Read-only discussion; no verification or commit."
+            )
         if result.get("verification_status") or result.get("grader_status"):
             detail_sections.append(
                 f"*Verification:* {result.get('verification_status', 'pending')} / "
@@ -1321,7 +1340,7 @@ class SlackMessageHandler:
                 )
             )
         delivery = []
-        if result.get("branch"):
+        if result.get("branch") and result.get("task_mode") != "discuss":
             delivery.append(f"Branch: `{result['branch']}`")
         if result.get("commit"):
             delivery.append(f"Commit: `{result['commit']}`")
@@ -1375,6 +1394,8 @@ class SlackMessageHandler:
             lines.extend(
                 [
                     "• `/llm agent <task>` - Start a stateful Pi coding agent with the default model",
+                    "• `/llm agent --discuss <question>` - Discuss the project with read-only tools; no verification or commit",
+                    "• `/llm agent --implement <task>` - Implement changes with the configured verification gates",
                     "• `/llm agent --model anthropic/claude-sonnet-4-6 <task>` - Select an Agent model",
                     "• Use the message shortcut *Run Pi Agent* to start from an existing Slack thread",
                     "• `/llm agent --no-thread-context <task>` - Start without loading prior thread messages",

@@ -2389,3 +2389,57 @@ async def test_structured_slack_flags_select_workflow_and_resume_tracks_same_run
     assert "R" in response
     if bot.background_tasks:
         await asyncio.gather(*list(bot.background_tasks))
+
+
+@pytest.mark.asyncio
+async def test_slack_discussion_flag_is_explicit_and_not_inherited():
+    bot = SlackBot(
+        {"channels": []},
+        inference_engine=SimpleNamespace(),
+        services={"agent_runtime": SimpleNamespace()},
+    )
+    handler = SlackMessageHandler(bot)
+    handler._start_agent_prompt = AsyncMock(return_value="started")
+    for flags, expected in [
+        (["--discuss", "--workflow"], "discuss"),
+        (["--implement"], "implement"),
+        ([], None),
+    ]:
+        response = await handler._handle_agent_command(
+            [*flags, "explain", "project"],
+            "U",
+            "C",
+            SimpleNamespace(),
+            team_id="T",
+            thread_ts="1",
+        )
+        assert response == "started"
+        assert (
+            handler._start_agent_prompt.await_args.kwargs.get("task_mode") == expected
+        )
+    handler._start_agent_prompt.reset_mock()
+    response = await handler._handle_agent_command(
+        ["--discuss", "--implement", "project"],
+        "U",
+        "C",
+        SimpleNamespace(),
+        team_id="T",
+        thread_ts="1",
+    )
+    assert "conflict" in response.lower()
+    handler._start_agent_prompt.assert_not_awaited()
+
+
+def test_discussion_response_shows_no_verification_or_delivery():
+    response = SlackMessageHandler._format_agent_response(
+        {
+            "answer": "Project explanation",
+            "task_mode": "discuss",
+            "verification_status": "not_applicable",
+            "grader_status": "not_applicable",
+            "branch": "pi-agent/context-only",
+        }
+    )
+    assert "Read-only discussion" in response
+    assert "not_applicable" in response
+    assert "*Delivery:*" not in response

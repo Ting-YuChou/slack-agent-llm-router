@@ -32,11 +32,11 @@ export function createQualityServices(options: {
   const executions = new Map<string, { parent: string; role: string; attempt: number; started_at: string }>();
   const fingerprint = `${options.checksum}:${options.image}:pi-1.0.1:readonly-v1:sol-high:luna-max:github-direct4:${options.githubMcp?.gatewayUrl ?? "off"}`;
   async function execution(id: string, parent: string, role: string, attempt: number, phase: "start" | "end", cost?: number, queueMs = 0) {
-    const session = role !== 'implementation' ? id : options.session(parent);
-    const statePath = path.join(options.root, role === 'implementation' ? 'sessions' : role === 'grader' ? 'graders' : 'investigations', session);
+    const session = !['implementation','discussion'].includes(role) ? id : options.session(parent);
+    const statePath = path.join(options.root, ['implementation','discussion'].includes(role) ? 'sessions' : role === 'grader' ? 'graders' : 'investigations', session);
     options.control.put("execution", id, { id, parent, role, attempt, session, statePath, status: phase === "start" ? "running" : "completed", traceparent: tracing?.traceparent(id) });
     if (phase === "start") {
-      if (!['implementation','grader'].includes(role)) options.ledger.executionScope(id,parent,'discovery',profile.structuredWorkflow!.discoveryCostUsd);
+      if (!['implementation','discussion','grader'].includes(role)) options.ledger.executionScope(id,parent,'discovery',profile.structuredWorkflow!.discoveryCostUsd);
       options.mapping.set(id, parent);
       executions.set(id, { parent, role, attempt, started_at: new Date().toISOString() });
       tracing?.startRun(id, session, parent); telemetry?.setTraceparent(id, tracing?.traceparent(id));
@@ -48,7 +48,7 @@ export function createQualityServices(options: {
     if (phase === "end") {
       for (const reason of telemetry?.completeness(id) ?? []) telemetry?.markIncomplete(parent, `execution:${id}:${reason}`);
       // Each Pi execution reconciles its own before/after snapshots and official entries.
-      const terminalWritten = await telemetry?.record(id, session, "run", { status: "completed", model: ['grader','planner'].includes(role) ? "gpt-5.6-sol" : role === 'implementation' ? 'unknown' : 'gpt-5.6-luna', reasoning_effort: ['grader','planner'].includes(role) ? "high" : role === 'implementation' ? 'unknown' : 'max', capture_complete: telemetry ? telemetry.completeness(id).length === 0 : null, workflow_run_id: parent });
+      const terminalWritten = await telemetry?.record(id, session, "run", { status: "completed", model: ['grader','planner'].includes(role) ? "gpt-5.6-sol" : ['implementation','discussion'].includes(role) ? 'unknown' : 'gpt-5.6-luna', reasoning_effort: ['grader','planner'].includes(role) ? "high" : ['implementation','discussion'].includes(role) ? 'unknown' : 'max', capture_complete: telemetry ? telemetry.completeness(id).length === 0 : null, workflow_run_id: parent });
       if (terminalWritten === false) telemetry?.markIncomplete(parent, "execution_terminal_capture_failed");
       telemetry?.releaseRun(id);
       tracing?.endRun(id, "completed"); executions.delete(id);

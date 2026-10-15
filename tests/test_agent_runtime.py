@@ -330,3 +330,25 @@ async def test_ci_repair_accepts_initial_owner_approval_without_starting_a_write
         assert captured["body"]["user_id"] == "owner"
     finally:
         await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_discussion_mode_is_per_request_for_create_and_followup(monkeypatch):
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            202, json={"run_id": "R", "session_id": "S", "status": "starting"}
+        )
+
+    runtime = client(handler, monkeypatch)
+    try:
+        await runtime.create_session("T", "C", "1", "U", "explain", task_mode="discuss")
+        await runtime.prompt("S", "explain more", "U", task_mode="discuss")
+        await runtime.prompt("S", "fix", "U")
+    finally:
+        await runtime.close()
+    assert bodies[0]["task_mode"] == "discuss"
+    assert bodies[1]["task_mode"] == "discuss"
+    assert "task_mode" not in bodies[2]
