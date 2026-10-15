@@ -1,0 +1,139 @@
+{
+  "id": "slack-router-v1",
+  "repository": "REPLACE_OWNER/REPLACE_REPOSITORY",
+  "image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "allowedPaths": [
+    "src",
+    "slack",
+    "tests",
+    "agent-runtime/src",
+    "agent-runtime/extensions",
+    "agent-runtime/test"
+  ],
+  "baselinePaths": [
+    "tests",
+    "agent-runtime/test",
+    "pyproject.toml",
+    "mypy.ini",
+    "pytest.ini",
+    ".flake8",
+    "agent-runtime/package.json",
+    "agent-runtime/tsconfig.json",
+    "agent-runtime/tsconfig.extensions.json"
+  ],
+  "rubric": [
+    "Meets the original task requirements",
+    "No correctness or security regressions",
+    "Acceptance tests are not weakened or bypassed",
+    "Changes stay inside the allowed scope"
+  ],
+  "checks": [
+    {
+      "name": "format",
+      "argv": [
+        "python",
+        "-m",
+        "black",
+        "--check",
+        "src",
+        "tests",
+        "slack"
+      ],
+      "cwd": ".",
+      "timeoutMs": 60000,
+      "ciJob": "lint"
+    },
+    {
+      "name": "flake8",
+      "argv": [
+        "python",
+        "-m",
+        "flake8",
+        "src",
+        "tests",
+        "slack"
+      ],
+      "cwd": ".",
+      "timeoutMs": 60000,
+      "ciJob": "lint"
+    },
+    {
+      "name": "mypy",
+      "argv": [
+        "python",
+        "-m",
+        "mypy"
+      ],
+      "cwd": ".",
+      "timeoutMs": 90000,
+      "ciJob": "typecheck"
+    },
+    {
+      "name": "pytest",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "tests",
+        "-q"
+      ],
+      "cwd": ".",
+      "timeoutMs": 180000,
+      "ciJob": "pytest"
+    },
+    {
+      "name": "compile",
+      "argv": [
+        "python",
+        "-m",
+        "compileall",
+        "src",
+        "tests",
+        "slack"
+      ],
+      "cwd": ".",
+      "timeoutMs": 60000,
+      "ciJob": "pytest"
+    },
+    {
+      "name": "typecheck",
+      "argv": [
+        "npm",
+        "run",
+        "typecheck"
+      ],
+      "cwd": "agent-runtime",
+      "timeoutMs": 60000,
+      "ciJob": "agent-runtime"
+    },
+    {
+      "name": "node-tests",
+      "argv": [
+        "npm",
+        "test"
+      ],
+      "cwd": "agent-runtime",
+      "timeoutMs": 120000,
+      "ciJob": "agent-runtime"
+    }
+  ],
+  "maxRepairs": 2,
+  "maxCostUsd": 1,
+  "activeTimeoutMs": 900000,
+  "workflows": [
+    "CI"
+  ],
+  "slack": {
+    "team_id": "REPLACE_TEAM",
+    "channel_id": "REPLACE_CHANNEL",
+    "user_id": "REPLACE_OWNER"
+  },
+  "ciCheckout": "merge",
+  "structuredWorkflow": {
+    "enabled": false,
+    "concurrency": 2,
+    "maxCostUsd": 5,
+    "activeTimeoutMs": 1800000,
+    "discoveryCostUsd": 1.5
+  }
+}

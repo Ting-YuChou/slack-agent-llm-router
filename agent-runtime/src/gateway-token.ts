@@ -11,6 +11,7 @@ import {
 
 export interface GatewayClaims {
   runId: string;
+  workflowRunId?: string;
   provider: AgentProvider;
   model: string;
   api: AgentModelApi;
@@ -22,6 +23,7 @@ export interface GatewayClaims {
 export interface ClassifierGatewayClaims {
   kind: "classifier";
   runId: string;
+  workflowRunId?: string;
   provider: typeof JEV_CLASSIFIER_MODEL.provider;
   model: typeof JEV_CLASSIFIER_MODEL.id;
   api: typeof JEV_CLASSIFIER_MODEL.api;
@@ -60,6 +62,7 @@ export function verifyClassifierGatewayToken(token: string, secret: string, now 
   return {
     kind: "classifier",
     runId: claims.runId,
+    ...(typeof claims.workflowRunId === "string" ? {workflowRunId: claims.workflowRunId} : {}),
     provider: JEV_CLASSIFIER_MODEL.provider,
     model: JEV_CLASSIFIER_MODEL.id,
     api: JEV_CLASSIFIER_MODEL.api,
@@ -87,6 +90,7 @@ export function verifyGatewayToken(token: string, secret: string, now = Date.now
   if (model.api !== claims.api || !supportsAgentEffort(model, claims.reasoningEffort)) return null;
   return {
     runId: claims.runId,
+    ...(typeof claims.workflowRunId === "string" ? {workflowRunId: claims.workflowRunId} : {}),
     provider: model.provider,
     model: model.id,
     api: model.api,

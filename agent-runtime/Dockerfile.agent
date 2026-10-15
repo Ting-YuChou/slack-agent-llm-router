@@ -7,7 +7,8 @@ RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements-codegraph.l
 
 FROM node:22.22.0-bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git libgomp1 libssl3 \
+    && apt-get install -y --no-install-recommends ca-certificates git libgomp1 libssl3 ripgrep fd-find \
+    && ln -s /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=codegraph /usr/local /usr/local
 

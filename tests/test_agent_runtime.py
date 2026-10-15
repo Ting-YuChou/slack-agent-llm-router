@@ -1,4 +1,7 @@
 import json
+import subprocess
+import sys
+from pathlib import Path
 
 import httpx
 import pytest
@@ -19,6 +22,50 @@ def client(handler, monkeypatch):
         {"base_url": "http://agent.test:3001", "token_env": "AGENT_RUNTIME_TOKEN"},
         transport=httpx.MockTransport(handler),
     )
+
+
+def test_live_acceptance_driver_requires_explicit_model_usage_opt_in():
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts/validate_structured_workflow.py"
+    )
+    result = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True
+    )
+    assert result.returncode == 2
+    assert "--live-openai is required" in result.stderr
+
+
+@pytest.mark.asyncio
+async def test_structured_mode_is_explicit_for_create_prompt_ci_and_resume(monkeypatch):
+    requests = []
+
+    def handler(request):
+        requests.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(
+            202,
+            json={
+                "session_id": "S",
+                "run_id": "R",
+                "status": "awaiting_approval"
+                if request.url.path == "/v1/ci-repairs"
+                else "starting",
+            },
+        )
+
+    runtime = client(handler, monkeypatch)
+    try:
+        await runtime.create_session(
+            "T", "C", "1", "U", "fix", workflow_mode="structured"
+        )
+        await runtime.prompt("S", "fix", "U", workflow_mode="structured")
+        await runtime.repair_ci(
+            "7", "U", team_id="T", channel_id="C", workflow_mode="structured"
+        )
+        await runtime.resume("R", "U")
+    finally:
+        await runtime.close()
+    assert all(body["workflow_mode"] == "structured" for _, body in requests[:3])
+    assert requests[-1] == ("/v1/runs/R/resume", {"user_id": "U"})
 
 
 @pytest.mark.asyncio
@@ -249,3 +296,37 @@ async def test_lookup_restores_thread_session_after_slack_restart(monkeypatch):
     await runtime.close()
 
     assert session["session_id"] == "S1"
+
+
+@pytest.mark.asyncio
+async def test_ci_repair_accepts_initial_owner_approval_without_starting_a_writer(
+    monkeypatch,
+):
+    captured = {}
+
+    def handler(request):
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            202,
+            json={
+                "run_id": "ci",
+                "session_id": "ci",
+                "status": "awaiting_approval",
+                "approval_id": "approval",
+            },
+        )
+
+    runtime = client(handler, monkeypatch)
+    try:
+        result = await runtime.repair_ci(
+            "https://github.com/org/repo/pull/7",
+            "owner",
+            team_id="team",
+            channel_id="channel",
+        )
+        assert result["status"] == "awaiting_approval"
+        assert captured["path"] == "/v1/ci-repairs"
+        assert captured["body"]["user_id"] == "owner"
+    finally:
+        await runtime.close()

@@ -8,6 +8,7 @@ Multi-model LLM router with a FastAPI API, Slack bot integration, Kafka/ClickHou
 - Exposes a protected API for query routing and dashboard access
 - Supports Slack bot interactions through `app_mention`, slash commands, and active reply threads
 - Runs stateful Pi 1.0.1 coding agents in isolated worktrees, with Jev model routing and trusted read-only MCP access through Codemode
+- Supports opt-in [structured multi-agent investigation](docs/agent-structured-workflow.md) before a single verified writer, with bounded parallelism, shared budgets and read-only-stage resume
 - Can enrich current-info answers with Tavily-backed `web_search` results and structured sources
 - Persists analytics and request events through Kafka and ClickHouse when the pipeline is enabled
 - Supports Redis-backed cache and Slack state for multi-process durability
@@ -312,6 +313,11 @@ Agent monitoring can be enabled separately through the optional
 official Pi usage and session data through a SQLite outbox into Kafka/ClickHouse,
 and adds OTEL traces, Grafana, and owner feedback. See the
 [setup and verification guide](docs/plans/coding-agent-observability.md).
+
+Repository profiles can additionally enable isolated verification, a fresh Sol high
+grader, bounded repairs and owner-approved CI repair draft PRs. See the
+[verification and CI repair guide](docs/agent-verification-ci.md) for setup and
+the boundaries between local tests and live integration acceptance.
 
 1. In Slack, create an app **from a manifest** and paste
    [slack/app-manifest.demo.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/slack/app-manifest.demo.yaml).

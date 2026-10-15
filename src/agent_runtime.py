@@ -104,6 +104,7 @@ class AgentRuntimeClient:
         prompt: str,
         *,
         model: Optional[str] = None,
+        workflow_mode: Optional[str] = None,
         routing_text: Optional[str] = None,
     ) -> Dict[str, Any]:
         payload = {
@@ -113,6 +114,8 @@ class AgentRuntimeClient:
             "user_id": user_id,
             "prompt": prompt,
         }
+        if workflow_mode is not None:
+            payload["workflow_mode"] = workflow_mode
         if model:
             payload["model"] = model
         if routing_text is not None:
@@ -124,6 +127,50 @@ class AgentRuntimeClient:
             expected_status=202,
         )
         return self._validate_accepted(result)
+
+    async def ci_repairs(self) -> List[Dict[str, Any]]:
+        result = await self._request("GET", "/v1/ci-repairs")
+        if not isinstance(result, list):
+            raise AgentRuntimeInvalidResponse("Invalid CI repair list")
+        return result
+
+    async def repair_ci(
+        self,
+        target: str,
+        user_id: str,
+        *,
+        team_id: str,
+        channel_id: str,
+        workflow_mode: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        result = await self._request(
+            "POST",
+            "/v1/ci-repairs",
+            json={
+                **(
+                    {"workflow_mode": workflow_mode}
+                    if workflow_mode is not None
+                    else {}
+                ),
+                "target": target,
+                "user_id": user_id,
+                "team_id": team_id,
+                "channel_id": channel_id,
+            },
+            expected_status=202,
+        )
+        return self._validate_accepted(result, expected_status="awaiting_approval")
+
+    async def retry_publication(
+        self, run_id: str, user_id: str, *, team_id: str, channel_id: str
+    ) -> Dict[str, Any]:
+        result = await self._request(
+            "POST",
+            f"/v1/ci-repairs/{run_id}/publication",
+            json={"user_id": user_id, "team_id": team_id, "channel_id": channel_id},
+            expected_status=202,
+        )
+        return self._validate_accepted(result, expected_status="awaiting_approval")
 
     async def lookup_session(
         self, team_id: str, channel_id: str, thread_ts: str
@@ -159,8 +206,11 @@ class AgentRuntimeClient:
         user_id: str,
         *,
         routing_text: Optional[str] = None,
+        workflow_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         payload = {"prompt": prompt, "user_id": user_id}
+        if workflow_mode is not None:
+            payload["workflow_mode"] = workflow_mode
         if routing_text is not None:
             payload["routing_text"] = routing_text
         result = await self._request(
@@ -170,6 +220,21 @@ class AgentRuntimeClient:
             expected_status=202,
         )
         return self._validate_accepted(result)
+
+    async def resume(self, run_id: str, user_id: str) -> Dict[str, Any]:
+        result = await self._request(
+            "POST",
+            f"/v1/runs/{run_id}/resume",
+            json={"user_id": user_id},
+            expected_status=202,
+        )
+        return self._validate_accepted(result)
+
+    async def tasks(self, run_id: str) -> List[Dict[str, Any]]:
+        result = await self._request("GET", f"/v1/runs/{run_id}/tasks")
+        if not isinstance(result, list):
+            raise AgentRuntimeInvalidResponse("Invalid workflow tasks")
+        return result
 
     async def get_run(self, run_id: str) -> Dict[str, Any]:
         result = await self._request("GET", f"/v1/runs/{run_id}")
@@ -341,12 +406,14 @@ class AgentRuntimeClient:
         )
 
     @staticmethod
-    def _validate_accepted(result: Any) -> Dict[str, Any]:
+    def _validate_accepted(
+        result: Any, expected_status: str = "starting"
+    ) -> Dict[str, Any]:
         if (
             not isinstance(result, dict)
             or not isinstance(result.get("session_id"), str)
             or not isinstance(result.get("run_id"), str)
-            or result.get("status") != "starting"
+            or result.get("status") != expected_status
         ):
             raise AgentRuntimeInvalidResponse(
                 "Agent runtime returned an invalid acceptance response"

@@ -1,4 +1,5 @@
 import asyncio
+import os
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock
@@ -2041,6 +2042,7 @@ class TestSlackStateStores:
                 "redis": {
                     "host": "localhost",
                     "port": 6379,
+                    "url": os.environ.get("TEST_REDIS_URL"),
                     "db": 0,
                     "key_prefix": "test",
                 }
@@ -2068,6 +2070,7 @@ class TestSlackStateStores:
                 "redis": {
                     "host": "localhost",
                     "port": 6379,
+                    "url": os.environ.get("TEST_REDIS_URL"),
                     "db": 0,
                     "key_prefix": prefix,
                 }
@@ -2078,6 +2081,7 @@ class TestSlackStateStores:
                 "redis": {
                     "host": "localhost",
                     "port": 6379,
+                    "url": os.environ.get("TEST_REDIS_URL"),
                     "db": 0,
                     "key_prefix": prefix,
                 }
@@ -2113,6 +2117,7 @@ class TestSlackStateStores:
                 "redis": {
                     "host": "localhost",
                     "port": 6379,
+                    "url": os.environ.get("TEST_REDIS_URL"),
                     "db": 0,
                     "key_prefix": prefix,
                 }
@@ -2310,3 +2315,77 @@ async def test_slack_start_propagates_terminal_socket_failure_and_disconnects_on
 
     await bot._disconnect_socket_once()
     bot.socket_client.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action,method",
+    [("repair-ci", "repair_ci"), ("publish-repair", "retry_publication")],
+)
+async def test_ci_commands_preserve_the_configured_slack_identity(action, method):
+    request = AsyncMock(
+        return_value={
+            "run_id": "ci-run",
+            "session_id": "ci-session",
+            "status": "awaiting_approval",
+        }
+    )
+    runtime = SimpleNamespace(**{method: request})
+    bot = SlackBot(
+        {"channels": []},
+        inference_engine=SimpleNamespace(),
+        services={"agent_runtime": runtime},
+    )
+    bot._monitor_agent_run = AsyncMock()
+    handler = SlackMessageHandler(bot)
+    response = await handler._handle_agent_command(
+        [action, "target"],
+        "owner",
+        "channel",
+        SimpleNamespace(),
+        team_id="team",
+        thread_ts="1.0",
+    )
+    request.assert_awaited_once_with(
+        "target", "owner", team_id="team", channel_id="channel"
+    )
+    assert "ci-run" in response
+    if bot.background_tasks:
+        await asyncio.gather(*list(bot.background_tasks))
+
+
+@pytest.mark.asyncio
+async def test_structured_slack_flags_select_workflow_and_resume_tracks_same_run():
+    runtime = SimpleNamespace(
+        resume=AsyncMock(
+            return_value={"run_id": "R", "session_id": "S", "status": "starting"}
+        )
+    )
+    bot = SlackBot(
+        {"channels": []},
+        inference_engine=SimpleNamespace(),
+        services={"agent_runtime": runtime},
+    )
+    bot._monitor_agent_run = AsyncMock()
+    handler = SlackMessageHandler(bot)
+    handler._start_agent_prompt = AsyncMock(return_value="started")
+    response = await handler._handle_agent_command(
+        ["--workflow", "fix", "counter"],
+        "U",
+        "C",
+        SimpleNamespace(),
+        team_id="T",
+        thread_ts="1",
+    )
+    assert response == "started"
+    assert (
+        handler._start_agent_prompt.await_args.kwargs["workflow_mode"] == "structured"
+    )
+    assert handler._start_agent_prompt.await_args.args[0] == "fix counter"
+    response = await handler._handle_agent_command(
+        ["resume", "R"], "U", "C", SimpleNamespace(), team_id="T", thread_ts="1"
+    )
+    runtime.resume.assert_awaited_once_with("R", "U")
+    assert "R" in response
+    if bot.background_tasks:
+        await asyncio.gather(*list(bot.background_tasks))

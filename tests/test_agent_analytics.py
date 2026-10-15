@@ -10,6 +10,94 @@ class AgentAnalyticsTests(unittest.TestCase):
         except ImportError:
             self.fail("agent analytics module must exist")
 
+    def test_workflow_projections_keep_execution_identity_and_candidates(self):
+        module = self.module()
+        for kind, table, payload in [
+            (
+                "execution",
+                "agent_executions",
+                {
+                    "execution_id": "e",
+                    "workflow_run_id": "w",
+                    "role": "grader",
+                    "attempt": 2,
+                    "phase": "start",
+                },
+            ),
+            (
+                "verification",
+                "agent_verifications",
+                {"candidate_hash": "h", "attempt": 2, "status": "passed"},
+            ),
+            (
+                "grade",
+                "agent_grades",
+                {"candidate_hash": "h", "attempt": 2, "status": "passed"},
+            ),
+            (
+                "delivery",
+                "agent_deliveries",
+                {"candidate_hash": "h", "status": "published"},
+            ),
+        ]:
+            rows = module.project(
+                {
+                    "event_id": "id",
+                    "run_id": "r",
+                    "session_id": "s",
+                    "kind": kind,
+                    "payload": payload,
+                }
+            )
+            self.assertIn(table, rows)
+            self.assertEqual(rows[table][0]["event_id"], "id")
+            self.assertIn(table + "_latest", "\n".join(module.schema_sql()))
+
+    def test_structured_nodes_revisions_and_dependencies_are_queryable_metadata(self):
+        module = self.module()
+        for kind, table, payload in [
+            (
+                "workflow_node",
+                "agent_workflow_nodes",
+                {
+                    "workflow_run_id": "w",
+                    "node_id": "reader",
+                    "role": "code_explorer",
+                    "wave": 1,
+                    "attempt": 1,
+                    "state": "succeeded",
+                    "duration_ms": 42,
+                    "queue_ms": 5,
+                    "execution_id": "e",
+                    "result_ref": "artifact",
+                },
+            ),
+            (
+                "workflow_revision",
+                "agent_workflow_revisions",
+                {"workflow_run_id": "w", "revision": 2, "task_count": 3},
+            ),
+            (
+                "workflow_dependency",
+                "agent_workflow_dependencies",
+                {"workflow_run_id": "w", "node_id": "b", "depends_on": "a"},
+            ),
+        ]:
+            rows = module.project(
+                {
+                    "event_id": "event",
+                    "run_id": "w",
+                    "session_id": "s",
+                    "kind": kind,
+                    "payload": payload,
+                }
+            )
+            self.assertIn(table, rows)
+            self.assertEqual(rows[table][0]["workflow_run_id"], "w")
+            module.validate_projections(rows)
+        ddl = "\n".join(module.schema_sql())
+        self.assertIn("agent_workflow_nodes_latest", ddl)
+
     def test_ledger_only_uses_session_entries_and_preserves_missing(self):
         module = self.module()
         envelope = {

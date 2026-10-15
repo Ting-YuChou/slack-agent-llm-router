@@ -1044,11 +1044,81 @@ class SlackMessageHandler:
             except AgentRuntimeError:
                 return "Agent mode could not complete that control action."
 
+        if action == "resume" and len(args) == 2:
+            try:
+                result = await runtime.resume(args[1], user_id)
+            except AgentRuntimeError:
+                return "Workflow cannot resume. Check ownership, baseline, artifacts and whether writing already started."
+            if not thread_ts:
+                return f"Workflow `{result['run_id']}` resumed. Use `agent status` to inspect it."
+            tracked = self.bot._track_agent_run(
+                result,
+                team_id=team_id or "unknown-team",
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                owner_user_id=user_id,
+            )
+            self.bot._spawn_background_task(
+                self.bot._monitor_agent_run(tracked),
+                f"pi_agent_monitor:{result['run_id']}",
+            )
+            return f"Workflow `{result['run_id']}` resumed."
+
+        if action in {"repair-ci", "publish-repair"}:
+            ci_args = list(args)
+            ci_workflow = (
+                action == "repair-ci"
+                and len(ci_args) > 1
+                and ci_args[1] == "--workflow"
+            )
+            if ci_workflow:
+                ci_args.pop(1)
+            if len(ci_args) != 2:
+                return "Usage: `/llm agent repair-ci <PR_URL|RUN_ID>` or `/llm agent publish-repair <RUN_ID>`"
+            try:
+                request_repair = (
+                    runtime.repair_ci
+                    if action == "repair-ci"
+                    else runtime.retry_publication
+                )
+                result = await request_repair(
+                    ci_args[1],
+                    user_id,
+                    team_id=team_id or "unknown-team",
+                    channel_id=channel_id,
+                    **({"workflow_mode": "structured"} if ci_workflow else {}),
+                )
+            except AgentRuntimeError:
+                return "CI repair could not start. Check repository profile, owner mapping, failed workflow and GitHub App configuration."
+            root_ts = thread_ts
+            if not root_ts:
+                started = await client.chat_postMessage(
+                    channel=channel_id,
+                    text="Investigated CI failure; owner approval is required.",
+                )
+                root_ts = started.get("ts")
+            tracked = self.bot._track_agent_run(
+                result,
+                team_id=team_id or "unknown-team",
+                channel_id=channel_id,
+                thread_ts=root_ts,
+                owner_user_id=user_id,
+            )
+            self.bot._spawn_background_task(
+                self.bot._monitor_agent_run(tracked),
+                f"pi_agent_monitor:{result['run_id']}",
+            )
+            return f"CI repair `{result['run_id']}` is awaiting approval in the thread."
+
         model = None
         include_thread_context = True
+        selected_workflow = None
         task_args = list(args)
         while task_args and task_args[0].startswith("--"):
             option = task_args.pop(0)
+            if option == "--workflow":
+                selected_workflow = "structured"
+                continue
             if option == "--no-thread-context":
                 include_thread_context = False
                 continue
@@ -1090,6 +1160,7 @@ class SlackMessageHandler:
             thread_ts=thread_ts,
             model=model,
             routing_text=task,
+            **({"workflow_mode": selected_workflow} if selected_workflow else {}),
         )
         if bootstrap.error:
             response += (
@@ -1109,6 +1180,7 @@ class SlackMessageHandler:
         thread_ts: Optional[str],
         model: Optional[str] = None,
         routing_text: Optional[str] = None,
+        workflow_mode: Optional[str] = None,
     ) -> str:
         runtime = getattr(self.bot, "agent_runtime_client", None)
         if runtime is None:
@@ -1135,6 +1207,8 @@ class SlackMessageHandler:
                 task,
             )
             create_kwargs = {}
+            if workflow_mode is not None:
+                create_kwargs["workflow_mode"] = workflow_mode
             if model:
                 create_kwargs["model"] = model
             if routing_text:
@@ -1214,6 +1288,38 @@ class SlackMessageHandler:
             if result.get("mcp_repository"):
                 parts.append(f"`{result['mcp_repository']}`")
             detail_sections.append("*MCP:* " + " / ".join(parts) + f" / *{mcp_status}*")
+        if result.get("verification_status") or result.get("grader_status"):
+            detail_sections.append(
+                f"*Verification:* {result.get('verification_status', 'pending')} / "
+                f"*Grader:* {result.get('grader_status', 'pending')} / "
+                f"*Phase:* {result.get('phase', 'unknown')}"
+            )
+        if result.get("workflow_mode") == "structured":
+            summary = result.get("workflow_summary") or {}
+            detail_sections.append(
+                f"*Investigation:* {summary.get('completed', 0)}/{summary.get('total', 0)} nodes complete; revision {summary.get('revision', 0)}"
+            )
+        if result.get("estimated_cost_usd") is not None:
+            detail_sections.append(
+                f"*Known model cost:* ${result['estimated_cost_usd']:.4f}"
+            )
+        timing = result.get("timing") or {}
+        if timing:
+            detail_sections.append(
+                f"*Time:* wall {timing.get('wall_ms', 0) / 1000:.1f}s / "
+                f"active {timing.get('active_ms', 0) / 1000:.1f}s / "
+                f"human wait {timing.get('human_wait_ms', 0) / 1000:.1f}s / "
+                f"suspended {result.get('suspended_ms', 0) / 1000:.1f}s"
+            )
+        findings = result.get("grader_findings") or []
+        if findings:
+            detail_sections.append(
+                "*Grader findings:*\n"
+                + "\n".join(
+                    f"• `{finding['path']}:{finding['line']}` {finding['reason']}"
+                    for finding in findings[:5]
+                )
+            )
         delivery = []
         if result.get("branch"):
             delivery.append(f"Branch: `{result['branch']}`")
@@ -2086,6 +2192,10 @@ class SlackBot:
                 "slack_agent_model_cache_refresh",
             )
 
+            self._spawn_background_task(
+                self._monitor_ci_inbox(), "slack_ci_repair_inbox"
+            )
+
             # Start cleanup task
             self._spawn_background_task(
                 self._cleanup_sessions_periodically(), "slack_state_cleanup"
@@ -2100,6 +2210,36 @@ class SlackBot:
             raise
         finally:
             await self._disconnect_socket_once()
+
+    async def _monitor_ci_inbox(self):
+        while self.running:
+            runtime = self.agent_runtime_client
+            if runtime is not None:
+                try:
+                    for job in await runtime.ci_repairs():
+                        if job["run_id"] in self.agent_runs:
+                            continue
+                        message = await self.web_client.chat_postMessage(
+                            channel=job["channel_id"],
+                            client_msg_id=job["run_id"],
+                            text=f"CI repair `{job['run_id']}` requires the repository owner's review.",
+                        )
+                        tracked = self._track_agent_run(
+                            job,
+                            team_id=job["team_id"],
+                            channel_id=job["channel_id"],
+                            thread_ts=message["ts"],
+                            owner_user_id=job["owner_user_id"],
+                        )
+                        self._spawn_background_task(
+                            self._monitor_agent_run(tracked),
+                            f"pi_agent_monitor:{job['run_id']}",
+                        )
+                except AgentRuntimeError:
+                    logger.warning("CI repair inbox unavailable")
+                except Exception:
+                    logger.warning("CI repair Slack notification failed")
+            await asyncio.sleep(5)
 
     async def _handle_socket_mode_request(
         self, client: AsyncSocketModeClient, req: SocketModeRequest
@@ -3112,14 +3252,24 @@ class SlackBot:
                             {
                                 "type": "button",
                                 "action_id": "pi_agent_approve",
-                                "text": {"type": "plain_text", "text": "Approve"},
+                                "text": {
+                                    "type": "plain_text",
+                                    "text": "Publish repair Draft PR"
+                                    if approval.get("kind") == "publish"
+                                    else "Approve",
+                                },
                                 "style": "primary",
                                 "value": value,
                             },
                             {
                                 "type": "button",
                                 "action_id": "pi_agent_reject",
-                                "text": {"type": "plain_text", "text": "Reject"},
+                                "text": {
+                                    "type": "plain_text",
+                                    "text": "Keep local result"
+                                    if approval.get("kind") == "publish"
+                                    else "Reject",
+                                },
                                 "style": "danger",
                                 "value": value,
                             },

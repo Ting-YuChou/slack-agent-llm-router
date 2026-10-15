@@ -1,0 +1,19 @@
+# Build from the repository root; activate only the resulting immutable digest.
+FROM node:22.22.0-bookworm-slim AS node
+FROM python:3.12.12-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends git redis-server ca-certificates libstdc++6 libatomic1 && rm -rf /var/lib/apt/lists/*
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+COPY requirements-ci.txt /tmp/requirements-ci.txt
+RUN python -m venv /opt/verification && /opt/verification/bin/pip install --no-cache-dir -r /tmp/requirements-ci.txt
+ENV PATH="/opt/verification/bin:/opt/pi/node_modules/.bin:${PATH}"
+WORKDIR /opt/pi
+COPY agent-runtime/package.json agent-runtime/package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY agent-runtime/tsconfig.json agent-runtime/tsconfig.extensions.json ./
+COPY agent-runtime/src ./src
+COPY agent-runtime/extensions ./extensions
+RUN npm run build
+USER 10001:10001
+ENTRYPOINT []
