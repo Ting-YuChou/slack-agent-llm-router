@@ -44,10 +44,70 @@ CONTRACT_METRICS = {
     "wall_time_s_p50": ("lower", 0.5),
 }
 GRADED = ("passed", "failed")
+ERROR_MESSAGE_LIMIT = 500
+NO_ERROR_CODE = "no_error_code"
+_CREDENTIAL_NAME = (
+    r"[A-Za-z0-9_-]*(?:AUTHORIZATION|API[_-]?KEY|ACCESS[_-]?KEY|SECRET[_-]?KEY"
+    r"|PRIVATE[_-]?KEY|ACCESS[_-]?TOKEN|REFRESH[_-]?TOKEN|GATEWAY[_-]?TOKEN"
+    r"|SIGNING[_-]?SECRET|PASSWORD|PASSPHRASE|SECRET|TOKEN)"
+)
+# Mirrors agent-runtime/src/telemetry.ts redact(), plus common token shapes.
+_REDACTIONS = (
+    (
+        re.compile(
+            r"-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----[\s\S]*?"
+            r"(?:-----END (?:[A-Z0-9]+ )?PRIVATE KEY-----|$)"
+        ),
+        "[REDACTED]",
+    ),
+    (re.compile(r"Bearer\s+[A-Za-z0-9._~+/-]+", re.I), "Bearer [REDACTED]"),
+    (
+        re.compile(rf"(\b{_CREDENTIAL_NAME}[\"']?[\t ]*[:=][\t ]*)[^\r\n]+", re.I),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(
+            r"\b(?:sk-[A-Za-z0-9_-]{16,}|xox[abposr]-[A-Za-z0-9-]{8,}"
+            r"|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"
+        ),
+        "[REDACTED]",
+    ),
+    (
+        re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+"),
+        "[REDACTED]",
+    ),
+)
 
 
 class TaskError(ValueError):
     pass
+
+
+def redact_text(text, secrets=()):
+    """Mask credentials in ``text``: known ``secrets`` first, then token shapes."""
+    for secret in sorted(filter(None, secrets), key=len, reverse=True):
+        text = text.replace(secret, "[REDACTED]")
+    for pattern, replacement in _REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def _bounded(text):
+    if len(text) <= ERROR_MESSAGE_LIMIT:
+        return text
+    return text[: ERROR_MESSAGE_LIMIT - 1] + "\u2026"
+
+
+def run_error(state, secrets=()):
+    """Return the run's ``(error.code, error.message)``, redacted and bounded."""
+    error = state.get("error")
+    if not isinstance(error, dict):
+        return None, None
+    code = error.get("code") if isinstance(error.get("code"), str) else None
+    message = error.get("message")
+    if not isinstance(message, str):
+        return code, None
+    return code, _bounded(redact_text(message, secrets))
 
 
 def _files(root):
@@ -194,9 +254,14 @@ def aggregate(records):
     )
     tasks = {}
     for record in records:
-        entry = tasks.setdefault(record["task_id"], {"runs": 0, "passes": 0})
+        entry = tasks.setdefault(
+            record["task_id"], {"runs": 0, "passes": 0, "failure_codes": {}}
+        )
         entry["runs"] += 1
         entry["passes"] += 1 if record["passed"] else 0
+        if not record["passed"]:
+            code = record.get("error_code") or NO_ERROR_CODE
+            entry["failure_codes"][code] = entry["failure_codes"].get(code, 0) + 1
     for entry in tasks.values():
         entry["pass_at_1"] = entry["passes"] / entry["runs"]
     walls = [record.get("wall_time_s") for record in records]
@@ -385,6 +450,7 @@ class LiveRunner:
             )
         wall_time_s = time.monotonic() - started
         commit = state.get("commit")
+        error_code, error_message = run_error(state, secrets=[self.key])
         return {
             "run_id": created["run_id"],
             "fixture": str(root),
@@ -396,6 +462,8 @@ class LiveRunner:
             "oracle": run_oracle(task, repo, commit or baseline, self.image),
             "cost_usd": state.get("estimated_cost_usd"),
             "wall_time_s": wall_time_s,
+            "error_code": error_code,
+            "error_message": error_message,
         }
 
 
@@ -403,8 +471,13 @@ def execute(task, attempt, runner):
     try:
         outcome = runner(task, attempt)
     except Exception as error:  # a crashed run is a failed run, not a crashed eval
-        outcome = {"status": "error", "error": f"{type(error).__name__}: {error}"}
-        score = {"passed": False, "reason": "runner error: " + outcome["error"]}
+        message = _bounded(redact_text(f"{type(error).__name__}: {error}"))
+        outcome = {
+            "status": "error",
+            "error_code": "runner_error",
+            "error_message": message,
+        }
+        score = {"passed": False, "reason": "runner error: " + message}
     else:
         score = score_run(task, outcome)
     return {
@@ -421,6 +494,8 @@ def execute(task, attempt, runner):
         "cost_usd": outcome.get("cost_usd"),
         "wall_time_s": outcome.get("wall_time_s"),
         "run_id": outcome.get("run_id"),
+        "error_code": outcome.get("error_code"),
+        "error_message": outcome.get("error_message"),
     }
 
 

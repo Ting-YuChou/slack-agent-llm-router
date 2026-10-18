@@ -399,7 +399,12 @@ def test_aggregate_reports_pass_at_1_agreement_cost_and_wall_time():
     assert summary["cost_usd_p50"] == 0.2
     assert summary["wall_time_s_p50"] == 45.0
     assert summary["wall_time_s_total"] == 160.0
-    assert summary["tasks"]["t1"] == {"runs": 2, "passes": 1, "pass_at_1": 0.5}
+    assert summary["tasks"]["t1"] == {
+        "runs": 2,
+        "passes": 1,
+        "pass_at_1": 0.5,
+        "failure_codes": {"no_error_code": 1},
+    }
 
 
 def test_aggregate_excludes_runs_without_both_verdicts_from_agreement():
@@ -420,6 +425,141 @@ def test_aggregate_of_no_runs_leaves_metrics_missing():
     assert summary["runs"] == 0
     for metric in agent_eval.CONTRACT_METRICS:
         assert summary[metric] is None
+
+
+def test_aggregate_reports_a_per_task_histogram_of_failure_codes():
+    summary = agent_eval.aggregate(
+        [
+            _record(passed=False, error_code="agent_tool_limit"),
+            _record(passed=False, error_code="agent_tool_limit"),
+            _record(passed=False, error_code="quality_gate_unavailable"),
+            _record(passed=False),
+            _record(error_code="scope_violation"),
+            _record("t2"),
+        ]
+    )
+
+    assert summary["tasks"]["t1"]["failure_codes"] == {
+        "agent_tool_limit": 2,
+        "quality_gate_unavailable": 1,
+        "no_error_code": 1,
+    }
+    assert summary["tasks"]["t2"]["failure_codes"] == {}
+
+
+def test_failure_codes_leave_the_contract_metrics_unchanged():
+    records = [
+        _record(passed=False, grader="failed", oracle="failed", cost_usd=0.3),
+        _record(cost_usd=0.1, wall_time_s=10.0),
+    ]
+    coded = [dict(record, error_code="agent_tool_limit") for record in records]
+
+    plain, with_codes = agent_eval.aggregate(records), agent_eval.aggregate(coded)
+
+    for metric in agent_eval.CONTRACT_METRICS:
+        assert with_codes[metric] == plain[metric]
+    assert set(agent_eval.CONTRACT_METRICS) == {
+        "pass_at_1",
+        "grader_oracle_agreement",
+        "cost_usd_p50",
+        "wall_time_s_p50",
+    }
+
+
+# --- run error capture ---------------------------------------------------------
+
+
+def test_run_error_reads_code_and_message_from_the_final_run_state():
+    state = {
+        "status": "failed",
+        "error": {"code": "agent_tool_limit", "message": "Tool call limit reached"},
+    }
+
+    assert agent_eval.run_error(state) == (
+        "agent_tool_limit",
+        "Tool call limit reached",
+    )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"status": "completed"},
+        {"status": "failed", "error": None},
+        {"status": "failed", "error": "boom"},
+        {"status": "failed", "error": {"code": 7, "message": ["x"]}},
+    ],
+)
+def test_run_error_is_empty_without_a_well_formed_error(state):
+    assert agent_eval.run_error(state) == (None, None)
+
+
+def test_run_error_message_is_redacted_and_bounded():
+    secret = "sk-proj-" + "A1b2C3d4" * 6
+    message = (
+        f"upstream rejected {secret}; Authorization: Bearer abc.def-ghi "
+        "OPENAI_API_KEY=hunter2\n" + "x" * 5000
+    )
+
+    code, redacted = agent_eval.run_error(
+        {"error": {"code": "upstream_unavailable", "message": message}},
+        secrets=["hunter2"],
+    )
+
+    assert code == "upstream_unavailable"
+    assert len(redacted) <= agent_eval.ERROR_MESSAGE_LIMIT
+    assert secret not in redacted
+    assert "abc.def-ghi" not in redacted
+    assert "hunter2" not in redacted
+    assert "[REDACTED]" in redacted
+    assert redacted.startswith("upstream rejected")
+
+
+def test_redact_masks_known_token_shapes_without_explicit_secrets():
+    text = agent_eval.redact_text(
+        "slack xoxb-1234-5678-abcdefgh github ghp_" + "a" * 36 + " ok"
+    )
+
+    assert "xoxb-1234" not in text
+    assert "ghp_" not in text
+    assert text.endswith(" ok")
+
+
+def test_execute_records_the_run_error_code_and_message():
+    def runner(task, attempt):
+        return _outcome(
+            status="failed",
+            commit=None,
+            changed_files=[],
+            oracle="failed",
+            error_code="quality_gate_unavailable",
+            error_message="Quality gate could not run",
+        )
+
+    record = agent_eval.execute(_task("pass"), 0, runner)
+
+    assert record["passed"] is False
+    assert record["error_code"] == "quality_gate_unavailable"
+    assert record["error_message"] == "Quality gate could not run"
+
+
+def test_execute_records_no_error_for_a_clean_run():
+    record = agent_eval.execute(_task("pass"), 0, lambda task, attempt: _outcome())
+
+    assert record["error_code"] is None
+    assert record["error_message"] is None
+
+
+def test_execute_records_a_crashed_runner_as_runner_error():
+    def runner(task, attempt):
+        raise RuntimeError("docker exploded with Bearer leaked.token")
+
+    record = agent_eval.execute(_task("pass"), 0, runner)
+
+    assert record["error_code"] == "runner_error"
+    assert "docker exploded" in record["error_message"]
+    assert "leaked.token" not in record["error_message"]
+    assert "leaked.token" not in record["reason"]
 
 
 def _baseline(**metrics):
@@ -689,3 +829,59 @@ def test_run_oracle_judges_the_committed_tree_without_exposing_the_oracle(
         "src/label.cjs",
     ]
     assert agent_eval.changed_files(repo, baseline, None) == []
+
+
+def test_live_runner_takes_the_error_from_the_final_run_state(tmp_path, monkeypatch):
+    task = {
+        "id": "t1",
+        "fixture_dir": tmp_path / "fixture",
+        "task_mode": "implement",
+        "workflow_mode": "single",
+        "prompt": "fix it",
+        "profile": {"allowedPaths": ["src/"]},
+    }
+    task["fixture_dir"].mkdir()
+    (task["fixture_dir"] / "a.txt").write_text("a")
+    final = {
+        "status": "failed",
+        "verification_status": "unknown",
+        "grader_status": "unknown",
+        "estimated_cost_usd": 0.05,
+        "error": {
+            "code": "agent_tool_limit",
+            "message": "Tool limit hit using sk-live-secret-key",
+        },
+    }
+
+    class FakeTopology:
+        def __init__(self, *args):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def request(self, path, body=None):
+            return {"run_id": "run-1"}
+
+    monkeypatch.setattr(agent_eval.topology, "make_root", lambda prefix: tmp_path)
+    monkeypatch.setattr(
+        agent_eval.topology, "init_fixture_repo", lambda repo, remote: "base"
+    )
+    monkeypatch.setattr(agent_eval.topology, "Topology", FakeTopology)
+    monkeypatch.setattr(
+        agent_eval.topology,
+        "drive_run",
+        lambda booted, run_id, timeout_s: (final, set()),
+    )
+    monkeypatch.setattr(agent_eval, "run_oracle", lambda *args: "failed")
+    runner = object.__new__(agent_eval.LiveRunner)
+    runner.project, runner.timeout_s = tmp_path, 1
+    runner.key, runner.image = "sk-live-secret-key", "image-id"
+
+    outcome = runner(task, 0)
+
+    assert outcome["error_code"] == "agent_tool_limit"
+    assert outcome["error_message"] == "Tool limit hit using [REDACTED]"
