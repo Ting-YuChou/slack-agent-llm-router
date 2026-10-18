@@ -23,7 +23,7 @@ on:
         type: boolean
         default: false
       runner:
-        description: Runner label; the topology needs Docker and host.docker.internal
+        description: Runner label; needs a Docker daemon (native Linux or Docker Desktop)
         required: true
         default: ubuntu-latest
 

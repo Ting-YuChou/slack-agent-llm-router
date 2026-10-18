@@ -116,6 +116,43 @@ def collect_spans(observer):
     return spans
 
 
+HOST_ALIAS = "host.docker.internal"
+
+
+def bridge_gateway(inspect_output):
+    """IPv4 gateway of a network from `docker network inspect` JSON output."""
+    networks = json.loads(inspect_output)
+    for network in networks:
+        for config in (network.get("IPAM") or {}).get("Config") or []:
+            gateway = config.get("Gateway") or ""
+            if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", gateway):
+                return gateway
+    raise RuntimeError("docker network has no IPv4 gateway")
+
+
+def host_binding(platform, docker_os, gateway):
+    """Where the host runtime listens, and what HOST_ALIAS maps to in containers.
+
+    Docker Desktop and OrbStack forward HOST_ALIAS to the host's loopback, so the
+    runtime stays on 127.0.0.1. A native Linux daemon has no such forwarding:
+    containers reach the host through their network's bridge address, so the
+    runtime listens there and HOST_ALIAS is pinned to it with --add-host.
+    """
+    native = platform.startswith("linux") and "docker desktop" not in docker_os.lower()
+    if not native:
+        return "127.0.0.1", []
+    return gateway, ["--add-host", f"{HOST_ALIAS}:{gateway}"]
+
+
+def host_access(network):
+    """host_binding() for the current machine and the given docker network."""
+    return host_binding(
+        sys.platform,
+        docker("info", "--format", "{{.OperatingSystem}}"),
+        bridge_gateway(docker("network", "inspect", network)),
+    )
+
+
 class Topology:
     """Isolated docker networks, OTEL receiver, model gateway and host runtime."""
 
@@ -206,15 +243,16 @@ class Topology:
         )
         otel_port = docker("port", receiver, "4318/tcp").split(":")[-1]
         signing = secrets.token_hex(32)
+        listen_host, add_host = host_access(self.external)
         with socket.socket() as chosen:
-            chosen.bind(("127.0.0.1", 0))
+            chosen.bind((listen_host, 0))
             host_port = chosen.getsockname()[1]
         prices = json.dumps(MODEL_PRICES)
         gateway_env = {
             **os.environ,
             "OPENAI_API_KEY": self.key,
             "MODEL_GATEWAY_SIGNING_SECRET": signing,
-            "PI_AGENT_BUDGET_RPC_URL": f"http://host.docker.internal:{host_port}",
+            "PI_AGENT_BUDGET_RPC_URL": f"http://{HOST_ALIAS}:{host_port}",
             "PI_AGENT_MODEL_PRICES_JSON": prices,
             "PI_AGENT_OTEL_ENABLED": "true",
             "OTEL_EXPORTER_OTLP_ENDPOINT": "http://otel-receiver:4318",
@@ -233,6 +271,7 @@ class Topology:
             "--user",
             f"{os.getuid()}:{os.getgid()}",
             "--read-only",
+            *add_host,
         ]
         for variable in (
             "OPENAI_API_KEY",
@@ -251,9 +290,13 @@ class Topology:
             + json.dumps((self.project / "agent-runtime/dist/src/server.js").as_uri())
             + ");\nconst server=await createProductionServer();server.listen("
             + str(host_port)
-            + ',"127.0.0.1",()=>writeFileSync('
+            + ","
+            + json.dumps(listen_host)
+            + ",()=>writeFileSync("
             + json.dumps(str(self.api_file))
-            + ',JSON.stringify({port:server.address().port})));process.on("SIGTERM",()=>server.close());\n'
+            + ",JSON.stringify({host:"
+            + json.dumps(listen_host)
+            + ',port:server.address().port})));process.on("SIGTERM",()=>server.close());\n'
         )
         env = {
             key: value
@@ -311,8 +354,8 @@ class Topology:
                     "runtime startup failed; inspect private fixture log"
                 )
             time.sleep(0.1)
-        port = json.loads(self.api_file.read_text())["port"]
-        self.base = "http://127.0.0.1:" + str(port)
+        api = json.loads(self.api_file.read_text())
+        self.base = f"http://{api['host']}:{api['port']}"
 
     def request(self, path, body=None):
         payload = None if body is None else json.dumps(body).encode()
