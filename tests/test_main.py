@@ -271,8 +271,10 @@ class DummySlackBot:
         router=None,
         monitoring_service=None,
         analytics_service=None,
+        agent_config=None,
     ):
         self.config = config
+        self.agent_config = agent_config
         self.inference_engine = inference_engine
         resolved_services = services or {}
         self.services = resolved_services
@@ -728,6 +730,51 @@ class TestPlatformInitialization:
         assert platform.services["agent_runtime"].config["base_url"] == (
             "http://127.0.0.1:3001"
         )
+
+    @pytest.mark.asyncio
+    async def test_real_slack_bot_receives_top_level_agent_feedback_config(
+        self, tmp_path, monkeypatch, patched_platform_deps
+    ):
+        from slack.bot_real import SlackBot as RealSlackBot
+
+        class UninitializedSlackBot(RealSlackBot):
+            async def initialize(self):
+                return None
+
+        monkeypatch.setattr(main, "SlackBot", UninitializedSlackBot)
+        monkeypatch.setattr(
+            main, "AgentRuntimeClient", DummyAgentRuntimeClient, raising=False
+        )
+        config_path = _write_config(
+            tmp_path,
+            overrides={
+                "slack": {"enabled": True},
+                "agent": {"enabled": True, "feedback_enabled": True},
+            },
+        )
+        platform = main.LLMRouterPlatform(config_path=str(config_path))
+
+        await platform._initialize_services(include_api=False, include_background=True)
+
+        bot = platform.services["slack_bot"]
+        assert "agent" not in bot.config
+        assert bot.agent_config["feedback_enabled"] is True
+
+        runtime = SimpleNamespace(
+            wait_for_update=AsyncMock(
+                return_value={"run_id": "r", "status": "completed", "answer": "ok"}
+            )
+        )
+        bot.agent_runtime_client = runtime
+        bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+        await bot._monitor_agent_run(
+            {"run_id": "r", "channel_id": "c", "thread_ts": "t"}
+        )
+        blocks = bot.web_client.chat_postMessage.await_args.kwargs["blocks"]
+        assert [element["action_id"] for element in blocks[-1]["elements"]] == [
+            "pi_agent_accept_result",
+            "pi_agent_needs_changes",
+        ]
 
     @pytest.mark.asyncio
     async def test_essential_service_failure_cancels_siblings_and_returns_nonzero(

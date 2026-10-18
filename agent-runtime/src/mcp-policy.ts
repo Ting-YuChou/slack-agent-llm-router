@@ -1,3 +1,4 @@
+import { parseGitHubRepositories } from "./github-repository.js";
 import type { McpClaims } from "./mcp-token.js";
 
 const CLICKHOUSE_VIEWS = new Set([
@@ -9,8 +10,8 @@ const ACTIONS_LIST = new Set(["list_workflows", "list_workflow_runs", "list_jobs
 export function authorizeGitHubTool(tool: string, args: Record<string, unknown>, claims: McpClaims): void {
   const repository = claims.scope.repository;
   if (tool === "search_code") {
-    const qualifiers = typeof args.query === "string" ? [...args.query.matchAll(/(?:^|\s)repo:([^\s]+)/g)].map((match) => match[1]) : [];
-    if (qualifiers.length !== 1 || qualifiers[0]?.toLowerCase() !== repository?.toLowerCase()) deny("Repository is not allowed");
+    const qualifiers = typeof args.query === "string" ? searchRepositoryQualifiers(args.query) : null;
+    if (!qualifiers || qualifiers.length !== 1 || qualifiers[0]?.toLowerCase() !== repository?.toLowerCase()) deny("Repository is not allowed");
   } else {
     const [owner, repo] = repository!.split("/");
     if (String(args.owner ?? "").toLowerCase() !== owner?.toLowerCase() || String(args.repo ?? "").toLowerCase() !== repo?.toLowerCase()) {
@@ -27,6 +28,43 @@ export function authorizeGitHubTool(tool: string, args: Record<string, unknown>,
     args.tail_lines = tail;
     delete args.tail;
   }
+}
+
+/** Read-only permissions covering the allowlisted GitHub MCP toolsets; metadata is implied. */
+export const GITHUB_MCP_TOKEN_PERMISSIONS = {
+  contents: "read", issues: "read", pull_requests: "read", actions: "read",
+  security_events: "read", vulnerability_alerts: "read", secret_scanning_alerts: "read",
+} as const;
+
+/** Installation token scope for the GitHub MCP gateway: only the configured repositories, read-only. */
+export function githubMcpTokenScope(configuredRepositories: string | undefined): { repositories: string[]; permissions: Record<string, "read"> } {
+  const repositories = parseGitHubRepositories(configuredRepositories);
+  if (repositories.length === 0) throw new Error("PI_AGENT_GITHUB_REPOSITORIES is required for the GitHub MCP gateway");
+  const owners = new Set(repositories.map((repository) => repository.split("/")[0]!.toLowerCase()));
+  if (owners.size !== 1) throw new Error("GitHub MCP repositories must belong to a single installation owner");
+  return { repositories: repositories.map((repository) => repository.split("/")[1]!), permissions: { ...GITHUB_MCP_TOKEN_PERMISSIONS } };
+}
+
+const SCOPE_QUALIFIER = /(?<![A-Za-z0-9_])(repo|org|user|owner|enterprise):/gi;
+
+/**
+ * Returns the repo: qualifier values of a code search query, or null when the query could
+ * widen its scope (OR, grouping, negated repo:, org:/user:/owner:/enterprise:, ambiguous quoting).
+ */
+function searchRepositoryQualifiers(query: string): string[] | null {
+  if (query.includes("\\\"") || (query.match(/"/g)?.length ?? 0) % 2 !== 0) return null;
+  // Quoted strings are literal text in GitHub code search.
+  const tokens = query.replace(/"[^"]*"/g, " ").split(/\s+/).filter(Boolean);
+  const repositories: string[] = [];
+  for (const [index, token] of tokens.entries()) {
+    if (/[()]/.test(token) || /^(or|\|\|)$/i.test(token)) return null;
+    for (const match of token.matchAll(SCOPE_QUALIFIER)) {
+      const negated = token.startsWith("-") || /^not$/i.test(tokens[index - 1] ?? "");
+      if (match[1]!.toLowerCase() !== "repo" || negated || match.index !== 0) return null;
+      repositories.push(token.slice(match.index + match[0].length));
+    }
+  }
+  return repositories;
 }
 
 export function authorizeClickHouseTool(tool: string, args: Record<string, unknown>, _claims: McpClaims): void {

@@ -412,6 +412,7 @@ class LLMRouterPlatform:
         if self._service_enabled("slack"):
             self.services["slack_bot"] = SlackBot(
                 config=self.config.get("slack", {}),
+                agent_config=self.config.get("agent", {}),
                 inference_engine=self.services["inference"],
                 services=self.services,
                 router=self.services.get("router"),

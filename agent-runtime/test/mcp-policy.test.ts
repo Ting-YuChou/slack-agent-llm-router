@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { authorizeClickHouseTool, authorizeContext7Tool, authorizeGitHubTool, sanitizeClickHouseResponse, validateContext7Response } from "../src/mcp-policy.js";
+import { authorizeClickHouseTool, authorizeContext7Tool, authorizeGitHubTool, githubMcpTokenScope, sanitizeClickHouseResponse, validateContext7Response } from "../src/mcp-policy.js";
 import type { McpClaims } from "../src/mcp-token.js";
 
 const github = { server: "github", scope: { repository: "acme/widgets" } } as unknown as McpClaims;
@@ -9,6 +9,45 @@ test("GitHub policy enforces repository, pagination and bounded read methods", (
   assert.throws(() => authorizeGitHubTool("actions_list", { owner: "acme", repo: "widgets", method: "trigger_workflow" }, github), /method/);
   assert.throws(() => authorizeGitHubTool("list_issues", { owner: "acme", repo: "widgets", perPage: 51 }, github), /Page/);
   assert.throws(() => authorizeGitHubTool("get_file_contents", { owner: "other", repo: "widgets" }, github), /Repository/);
+});
+
+test("GitHub search_code stays pinned to the scoped repository", () => {
+  for (const query of [
+    "repo:acme/widgets password",
+    "Repo:ACME/Widgets language:typescript path:src/ token",
+    'repo:acme/widgets "foo OR (bar) org:x"',
+    "repo:acme/widgets NOT test",
+    "repo:acme/widgets myrepo:other",
+  ]) assert.doesNotThrow(() => authorizeGitHubTool("search_code", { query }, github), query);
+  for (const query of [
+    "password",
+    "repo:acme/secret password",
+    "repo:acme/widgets OR (repo:acme/secret password)",
+    "repo:acme/widgets OR repo:acme/secret",
+    "repo:acme/widgets or repo:acme/secret",
+    "(repo:acme/widgets) password",
+    "repo:acme/widgets repo:acme/secret",
+    "repo:acme/widgets -repo:acme/widgets",
+    "repo:acme/widgets NOT repo:acme/other",
+    "repo:acme/widgets org:acme password",
+    "repo:acme/widgets user:someone",
+    "repo:acme/widgets owner:acme",
+    "repo:acme/widgets enterprise:corp",
+    "repo:acme/widgets x,org:acme",
+    'repo:"acme/secret"',
+    'repo:acme/widgets "unbalanced',
+    'repo:acme/widgets "a\\" repo:acme/secret "',
+  ]) assert.throws(() => authorizeGitHubTool("search_code", { query }, github), /Repository/, query);
+  assert.throws(() => authorizeGitHubTool("search_code", { query: 42 }, github), /Repository/);
+});
+
+test("GitHub MCP installation token is scoped to configured repositories with read-only permissions", () => {
+  const scope = githubMcpTokenScope("acme/widgets,acme/gadgets");
+  assert.deepEqual(scope.repositories, ["widgets", "gadgets"]);
+  assert.ok(Object.values(scope.permissions).every((level) => level === "read"));
+  assert.equal(scope.permissions.contents, "read");
+  assert.throws(() => githubMcpTokenScope(undefined), /PI_AGENT_GITHUB_REPOSITORIES/);
+  assert.throws(() => githubMcpTokenScope("acme/widgets,other/gadgets"), /single installation owner/);
 });
 
 const clickhouse = { server: "clickhouse", scope: { database: "agent_mcp" } } as unknown as McpClaims;

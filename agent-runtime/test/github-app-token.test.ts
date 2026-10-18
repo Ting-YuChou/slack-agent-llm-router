@@ -68,3 +68,18 @@ test("publisher installation token requests only the configured repository and w
   await provider.getToken();
   assert.deepEqual(scope, { repositories: ["repo"], permissions: { contents: "write", pull_requests: "write" } });
 });
+
+test("MCP installation token requests every configured repository with read-only permissions", async () => {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  let scope: any;
+  const provider = new GitHubAppTokenProvider({
+    appId: "123", installationId: "456", privateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+    repositories: ["widgets", "gadgets"], permissions: { contents: "read", issues: "read" },
+    fetch: async (_input, init) => {
+      scope = JSON.parse(String(init?.body));
+      return Response.json({ token: "scoped", expires_at: new Date(Date.now() + 3600000).toISOString() });
+    },
+  });
+  await provider.getToken();
+  assert.deepEqual(scope, { repositories: ["widgets", "gadgets"], permissions: { contents: "read", issues: "read" } });
+});

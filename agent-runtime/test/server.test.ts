@@ -3,7 +3,7 @@ import type { Server } from "node:http";
 import { test } from "node:test";
 
 import { RuntimeConflictError, RuntimeNotFoundError } from "../src/orchestrator.js";
-import { createAgentHttpServer, parseJevClassifierMode } from "../src/server.js";
+import { authorized, createAgentHttpServer, parseJevClassifierMode } from "../src/server.js";
 
 async function listen(server: Server): Promise<string> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -177,4 +177,13 @@ test('CI repair rejects discussion task mode before creating a repair', async ()
     const response = await fetch(`${base}/v1/ci-repairs`,{ method: 'POST',headers: { authorization: 'Bearer secret','content-type': 'application/json' },body: JSON.stringify({ target: '7',user_id: 'U',task_mode: 'discuss' }) });
     assert.equal(response.status,400); assert.equal(created,false);
   } finally { await close(server); }
+});
+
+test("bearer auth compares tokens in constant time and rejects length or prefix mismatches", () => {
+  const request = (authorization?: string | string[]) => ({ headers: authorization === undefined ? {} : { authorization } }) as any;
+  assert.equal(authorized(request("Bearer runtime-secret"), "runtime-secret"), true);
+  for (const header of [undefined, "", "Bearer runtime-secreT", "Bearer runtime-secret ", "Bearer runtime", "bearer runtime-secret", "runtime-secret", ["Bearer runtime-secret"]]) {
+    assert.equal(authorized(request(header as any), "runtime-secret"), false, String(header));
+  }
+  assert.equal(authorized(request("Bearer "), ""), false);
 });

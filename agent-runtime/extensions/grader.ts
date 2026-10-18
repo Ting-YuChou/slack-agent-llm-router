@@ -5,6 +5,7 @@ import { validateGrade } from "../dist/src/quality-gate.js";
 export default function grader(pi: ExtensionAPI) {
   const config = JSON.parse(process.env.PI_AGENT_GRADER_JSON ?? "null");
   if (!config) throw new Error("Grader context required");
+  const root = process.env.PI_AGENT_WORKTREE!;
   let submitted = false;
   let calls = 0;
   pi.on("tool_call", async (event, ctx) => {
@@ -14,7 +15,9 @@ export default function grader(pi: ExtensionAPI) {
     if (submitted) return { block: true, reason: "Grade already submitted" };
     if (event.toolName !== "submit_grade") {
       const input = event.input as Record<string, unknown>;
-      if (!(await validateSnapshotRead(process.env.PI_AGENT_WORKTREE!,ctx.cwd,typeof input.path === 'string' ? input.path : undefined)).allowed) return { block: true, reason: "Only candidate snapshot is readable" };
+      // The session cwd is outside the snapshot; path-less ls/find/grep must target the snapshot root.
+      if (input.path === undefined) input.path = root;
+      if (!(await validateSnapshotRead(root,ctx.cwd,typeof input.path === 'string' ? input.path : root)).allowed) return { block: true, reason: "Only candidate snapshot is readable" };
     }
   });
   pi.registerTool({

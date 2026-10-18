@@ -1,0 +1,64 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+// Read-only roles run with cwd outside the snapshot (container-runtime mounts the session state here).
+const SESSION_CWD = '/var/lib/pi-session';
+
+async function loadExtension(name: string, env: Record<string, string>) {
+  const previous = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
+  Object.assign(process.env, env);
+  try {
+    const extension = await import(`${pathToFileURL(path.resolve(import.meta.dirname, `../../extensions/${name}.ts`)).href}?${Math.random()}`);
+    const handlers = new Map<string, (...args: any[]) => any>();
+    extension.default({ on: (event: string, handler: (...args: any[]) => any) => handlers.set(event, handler), registerTool: () => undefined });
+    const ctx = { cwd: SESSION_CWD, abort: () => undefined };
+    return (toolName: string, input: Record<string, unknown>) => handlers.get('tool_call')!({ toolName, input }, ctx);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  }
+}
+
+async function withSnapshot(run: (root: string) => Promise<void>) {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'readonly-ext-'));
+  try {
+    await mkdir(path.join(root, 'src'));
+    await writeFile(path.join(root, 'src', 'a.ts'), 'export const a = 1');
+    await writeFile(path.join(root, 'README.md'), 'readme');
+    await run(root);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test('grader path-less ls/find/grep default to the snapshot root instead of the session cwd', async () => withSnapshot(async root => {
+  const call = await loadExtension('grader', { PI_AGENT_WORKTREE: root, PI_AGENT_GRADER_JSON: JSON.stringify({ candidate_hash: 'h', rubric: [] }) });
+  for (const tool of ['ls', 'find', 'grep']) {
+    const input: Record<string, unknown> = { pattern: 'a' };
+    assert.equal(await call(tool, input), undefined, tool);
+    assert.equal(input.path, root);
+  }
+  assert.equal(await call('read', { path: path.join(root, 'src', 'a.ts') }), undefined);
+  assert.equal((await call('read', { path: '/etc/passwd' })).block, true);
+  assert.equal((await call('ls', { path: '../escape' })).block, true);
+  assert.equal((await call('bash', { command: 'ls' })).block, true);
+}));
+
+test('workflow agent path-less reads default to the task scope instead of the session cwd', async () => withSnapshot(async root => {
+  const scoped = await loadExtension('workflow-agent', { PI_AGENT_WORKTREE: root, PI_AGENT_WORKFLOW_JSON: JSON.stringify({ role: 'code_explorer', paths: ['src'] }) });
+  const input: Record<string, unknown> = { pattern: 'a' };
+  assert.equal(await scoped('grep', input), undefined);
+  assert.equal(input.path, path.join(root, 'src'));
+  assert.equal((await scoped('read', { path: path.join(root, 'README.md') })).block, true);
+
+  const whole = await loadExtension('workflow-agent', { PI_AGENT_WORKTREE: root, PI_AGENT_WORKFLOW_JSON: JSON.stringify({ role: 'planner', paths: ['.'] }) });
+  for (const tool of ['ls', 'find']) {
+    const event: Record<string, unknown> = {};
+    assert.equal(await whole(tool, event), undefined, tool);
+    assert.equal(event.path, root);
+  }
+  assert.equal((await whole('write', { path: path.join(root, 'src', 'a.ts') })).block, true);
+}));

@@ -91,10 +91,8 @@ async def test_feedback_buttons_preserve_long_result_with_valid_slack_sections()
             )
         ),
         web_client=SimpleNamespace(chat_postMessage=AsyncMock()),
-        config={
-            "agent": {"feedback_enabled": True},
-            "response_settings": {"max_response_length": 5000},
-        },
+        config={"response_settings": {"max_response_length": 5000}},
+        agent_config={"feedback_enabled": True},
         message_handler=SimpleNamespace(
             _format_agent_response=Mock(return_value=answer)
         ),

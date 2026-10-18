@@ -2,6 +2,8 @@ import { sign } from "node:crypto";
 
 interface GitHubAppTokenProviderOptions {
   repository?: string;
+  /** Repository names (without owner) within the installation; takes precedence over `repository`. */
+  repositories?: string[];
   permissions?: Record<string, "read" | "write">;
   appId: string;
   installationId: string;
@@ -43,10 +45,11 @@ export class GitHubAppTokenProvider {
     } catch (error) {
       throw new Error("GitHub App private key is invalid", { cause: error });
     }
+    const repositories = this.options.repositories ?? (this.options.repository ? [this.options.repository] : []);
     const baseUrl = (this.options.apiBaseUrl ?? "https://api.github.com").replace(/\/$/, "");
     const response = await this.fetchImpl(`${baseUrl}/app/installations/${encodeURIComponent(this.options.installationId)}/access_tokens`, {
       method: "POST",
-      ...(this.options.repository ? { body: JSON.stringify({ repositories: [this.options.repository], permissions: this.options.permissions ?? {} }) } : {}),
+      ...(repositories.length ? { body: JSON.stringify({ repositories, permissions: this.options.permissions ?? {} }) } : {}),
       signal: AbortSignal.timeout(this.options.requestTimeoutMs ?? 5_000),
       headers: {
         accept: "application/vnd.github+json",

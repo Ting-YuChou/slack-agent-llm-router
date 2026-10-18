@@ -716,3 +716,39 @@ test('structured discussion investigates then uses a read-only final responder w
   assert.equal(orchestrator.getRun(r.run_id).verification_status,'not_applicable');
   assert.equal(orchestrator.getRun(r.run_id).status,'completed'); assert.equal(evaluations,0); assert.equal(calls.commits,0);
 });
+
+test("background persistence failures mark the control store unhealthy instead of rejecting unhandled", async () => {
+  let failSaves = false;
+  const stateStore = {
+    healthy: true,
+    load: async () => ({ schema_version: 1, sessions: [], runs: [] }),
+    takeExpiredSessions: () => [],
+    save: async () => { if (failSaves) throw new Error("disk full"); },
+  };
+  const { orchestrator, process: pi } = fixture(undefined, undefined, stateStore);
+  const accepted = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "persist", user_id: "U", prompt: "inspect" });
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on("unhandledRejection", onUnhandled);
+  const originalError = console.error;
+  console.error = () => undefined;
+  try {
+    failSaves = true;
+    pi.emit({ type: "turn" });
+    pi.emit({ type: "usage", cost_usd: 0.01 } as PublicRunEvent);
+    pi.emit({ type: "tool", phase: "start", tool_call_id: "t1", tool: "read" });
+    pi.emit({ type: "answer", text: "partial" });
+    pi.emit({ type: "approval", approval_id: "a1", title: "Allow?", detail: "edit" });
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    console.error = originalError;
+  }
+  assert.deepEqual(unhandled, []);
+  assert.equal(stateStore.healthy, false);
+  assert.ok(pi.aborted.includes(accepted.run_id));
+  await assert.rejects(
+    orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "after", user_id: "U", prompt: "next" }),
+    /control store unavailable/i,
+  );
+});

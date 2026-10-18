@@ -276,6 +276,7 @@ if [[ "${DEMO_TEST_MODE:-0}" != 1 ]]; then
       --env GITHUB_APP_ID \
       --env GITHUB_APP_INSTALLATION_ID \
       --env GITHUB_APP_PRIVATE_KEY_PATH=/run/secrets/github-app.pem \
+      --env PI_AGENT_GITHUB_REPOSITORIES \
       --env MCP_SERVER_ID=github \
       --env MCP_UPSTREAM_URL=http://github-mcp:8082/mcp \
       "${mcp_gateway_image}" >/dev/null
