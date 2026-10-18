@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from slack.bot_real import RedisSlackStateStore, SlackBot
+from slack.bot_real import RedisSlackStateStore, SlackBot, SlackMessageHandler
 from src.agent_runtime import AgentRuntimeError, AgentRuntimeUnauthorized
 
 
@@ -415,3 +415,116 @@ async def test_failed_decision_is_reported_ephemerally(tmp_path, tracked_before)
     text = bot.web_client.chat_postEphemeral.await_args.kwargs["text"]
     assert "could not be recorded" in text
     bot._start_agent_monitor.assert_not_called()
+
+
+def ci_job(run_id):
+    return {
+        "run_id": run_id,
+        "session_id": f"S-{run_id}",
+        "status": "awaiting_approval",
+        "team_id": "T1",
+        "channel_id": "C1",
+        "owner_user_id": "U1",
+    }
+
+
+def inbox_bot(tmp_path, jobs, **runtime_methods):
+    runtime = SimpleNamespace(
+        ci_repairs=AsyncMock(return_value=jobs), **runtime_methods
+    )
+    bot = file_bot(tmp_path, agent_runtime=runtime)
+    bot.web_client = SimpleNamespace(
+        chat_postMessage=AsyncMock(
+            side_effect=lambda **kw: {"ts": f"ts-{kw.get('client_msg_id', 'root')}"}
+        )
+    )
+    bot._start_agent_monitor = Mock()
+    return bot
+
+
+@pytest.mark.asyncio
+async def test_ci_inbox_does_not_repost_jobs_after_restart(tmp_path):
+    first = inbox_bot(tmp_path, [ci_job("J1")])
+    await first._poll_ci_inbox_once()
+    await first._forget_agent_run(first.agent_runs["J1"])
+
+    second = inbox_bot(tmp_path, [ci_job("J1")])
+    await second._restore_state()
+    await second._poll_ci_inbox_once()
+
+    assert first.web_client.chat_postMessage.await_count == 1
+    second.web_client.chat_postMessage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ci_inbox_failure_on_one_job_does_not_block_others(tmp_path):
+    bot = inbox_bot(tmp_path, [ci_job("J1"), ci_job("J2")])
+    results = iter([RuntimeError("slack down"), {"ts": "ts-J2"}, {"ts": "ts-J1"}])
+
+    def post(**kwargs):
+        result = next(results)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    bot.web_client.chat_postMessage.side_effect = post
+
+    await bot._poll_ci_inbox_once()
+    assert set(bot.agent_runs) == {"J2"}
+
+    await bot._poll_ci_inbox_once()
+    assert set(bot.agent_runs) == {"J1", "J2"}
+    assert bot.agent_runs["J1"]["thread_ts"] == "ts-J1"
+
+
+@pytest.mark.asyncio
+async def test_repair_ci_command_claims_its_job_before_the_inbox(tmp_path):
+    accepted = {**ci_job("J1"), "status": "awaiting_approval"}
+    bot = inbox_bot(
+        tmp_path, [ci_job("J1")], repair_ci=AsyncMock(return_value=accepted)
+    )
+    handler = SlackMessageHandler(bot)
+
+    response = await handler._handle_agent_command(
+        ["repair-ci", "7"], "U1", "C1", bot.web_client, team_id="T1"
+    )
+    await bot._poll_ci_inbox_once()
+
+    assert "J1" in response
+    assert bot.web_client.chat_postMessage.await_count == 1
+    bot._start_agent_monitor.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_repair_ci_command_skips_posting_when_inbox_won_the_race(tmp_path):
+    accepted = {**ci_job("J1"), "status": "awaiting_approval"}
+    bot = inbox_bot(
+        tmp_path, [ci_job("J1")], repair_ci=AsyncMock(return_value=accepted)
+    )
+    handler = SlackMessageHandler(bot)
+
+    await bot._poll_ci_inbox_once()
+    response = await handler._handle_agent_command(
+        ["repair-ci", "7"], "U1", "C1", bot.web_client, team_id="T1"
+    )
+
+    assert "J1" in response
+    assert bot.web_client.chat_postMessage.await_count == 1
+    bot._start_agent_monitor.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_ci_job_claims_are_shared_through_redis():
+    store = RedisSlackStateStore({"redis": {"key_prefix": "p"}})
+    store.client = FakeRedis()
+    first = SlackBot({"channels": []}, SimpleNamespace())
+    first.state_store = store
+
+    assert await first._claim_ci_job("J1") is True
+    assert await first._claim_ci_job("J1") is False
+    assert store.client.sets["p:posted_ci_jobs"] == {"J1"}
+
+    second = SlackBot({"channels": []}, SimpleNamespace())
+    second.state_store = store
+    await second._restore_state()
+    assert await second._claim_ci_job("J1") is False

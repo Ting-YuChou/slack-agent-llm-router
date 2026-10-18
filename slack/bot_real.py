@@ -54,6 +54,7 @@ logger = logging.getLogger(__name__)
 
 MAX_QUERY_TOKENS = 8192
 STATE_SCHEMA_VERSION = 1
+POSTED_CI_JOBS_LIMIT = 1000
 MEMORY_SLASH_ONLY_MESSAGE = (
     "Memory commands are only available through Slack slash commands. "
     "Use `/llm remember`, `/llm memories`, or `/llm forget`."
@@ -174,6 +175,7 @@ class RedisSlackStateStore(SlackStateStore):
         self.conversations_index_key = f"{self.key_prefix}:conversations"
         self.active_threads_index_key = f"{self.key_prefix}:active_threads"
         self.agent_runs_index_key = f"{self.key_prefix}:agent_runs"
+        self.posted_ci_jobs_key = f"{self.key_prefix}:posted_ci_jobs"
         self.client = None
 
     async def initialize(self):
@@ -227,6 +229,7 @@ class RedisSlackStateStore(SlackStateStore):
                 "conversations": conversations,
                 "active_threads": active_threads,
                 "agent_runs": agent_runs,
+                "posted_ci_jobs": sorted(await self._smembers(self.posted_ci_jobs_key)),
             }
         except Exception as exc:
             logger.warning("Failed to load Slack state from Redis: %s", exc)
@@ -251,6 +254,9 @@ class RedisSlackStateStore(SlackStateStore):
 
         for run_id, run_payload in snapshot.get("agent_runs", {}).items():
             await self.persist_agent_run_state(run_id, run_payload)
+
+        for run_id in snapshot.get("posted_ci_jobs", []):
+            await self.add_posted_ci_job(run_id)
 
     async def shutdown(self):
         if self.client and hasattr(self.client, "close"):
@@ -381,6 +387,26 @@ class RedisSlackStateStore(SlackStateStore):
             await self._srem(self.agent_runs_index_key, run_id)
         except Exception as exc:
             logger.warning("Failed to delete Slack agent run from Redis: %s", exc)
+
+    async def add_posted_ci_job(self, run_id: str):
+        """Remember that a CI repair job already has a Slack thread."""
+        if not self.client:
+            return
+
+        try:
+            await self._sadd(self.posted_ci_jobs_key, run_id)
+        except Exception as exc:
+            logger.warning("Failed to persist posted CI job to Redis: %s", exc)
+
+    async def remove_posted_ci_job(self, run_id: str):
+        """Forget a CI repair job claim so it can be posted again."""
+        if not self.client:
+            return
+
+        try:
+            await self._srem(self.posted_ci_jobs_key, run_id)
+        except Exception as exc:
+            logger.warning("Failed to delete posted CI job from Redis: %s", exc)
 
     def _user_key(self, user_id: str) -> str:
         return f"{self.key_prefix}:user:{user_id}"
@@ -1160,6 +1186,10 @@ class SlackMessageHandler:
                 )
             except AgentRuntimeError:
                 return "CI repair could not start. Check repository profile, owner mapping, failed workflow and GitHub App configuration."
+            claimed = await self.bot._claim_ci_job(result["run_id"])
+            if not claimed and action == "repair-ci":
+                # The CI inbox already opened a review thread for this job.
+                return f"CI repair `{result['run_id']}` is awaiting approval in the thread."
             root_ts = thread_ts
             if not root_ts:
                 started = await client.chat_postMessage(
@@ -1173,6 +1203,7 @@ class SlackMessageHandler:
                 channel_id=channel_id,
                 thread_ts=root_ts,
                 owner_user_id=user_id,
+                mode="ci_repair",
             )
             self.bot._start_agent_monitor(tracked)
             return f"CI repair `{result['run_id']}` is awaiting approval in the thread."
@@ -2211,6 +2242,8 @@ class SlackBot:
         self.agent_runs: Dict[str, Dict[str, Any]] = {}
         self.agent_user_runs: Dict[str, Dict[str, Any]] = {}
         self.agent_monitoring: Set[str] = set()
+        # Ordered so the oldest claims are evicted first.
+        self.posted_ci_jobs: Dict[str, None] = {}
         self.agent_monitor_tasks: Dict[str, asyncio.Task] = {}
         self.agent_monitor_poll_seconds = float(
             self.agent_config.get("monitor_poll_seconds", 2)
@@ -2325,30 +2358,78 @@ class SlackBot:
 
     async def _monitor_ci_inbox(self):
         while self.running:
-            runtime = self.agent_runtime_client
-            if runtime is not None:
-                try:
-                    for job in await runtime.ci_repairs():
-                        if job["run_id"] in self.agent_runs:
-                            continue
-                        message = await self.web_client.chat_postMessage(
-                            channel=job["channel_id"],
-                            client_msg_id=job["run_id"],
-                            text=f"CI repair `{job['run_id']}` requires the repository owner's review.",
-                        )
-                        tracked = self._track_agent_run(
-                            job,
-                            team_id=job["team_id"],
-                            channel_id=job["channel_id"],
-                            thread_ts=message["ts"],
-                            owner_user_id=job["owner_user_id"],
-                        )
-                        self._start_agent_monitor(tracked)
-                except AgentRuntimeError:
-                    logger.warning("CI repair inbox unavailable")
-                except Exception:
-                    logger.warning("CI repair Slack notification failed")
+            await self._poll_ci_inbox_once()
             await asyncio.sleep(5)
+
+    async def _poll_ci_inbox_once(self):
+        runtime = self.agent_runtime_client
+        if runtime is None:
+            return
+        try:
+            jobs = await runtime.ci_repairs()
+        except AgentRuntimeError:
+            logger.warning("CI repair inbox unavailable")
+            return
+        for job in jobs:
+            try:
+                await self._post_ci_inbox_job(job)
+            except Exception:
+                logger.warning(
+                    "CI repair Slack notification failed for %s", job.get("run_id")
+                )
+
+    async def _post_ci_inbox_job(self, job: Dict[str, Any]):
+        run_id = job["run_id"]
+        if run_id in self.agent_runs:
+            await self._claim_ci_job(run_id)
+            return
+        if not await self._claim_ci_job(run_id):
+            return
+        try:
+            message = await self.web_client.chat_postMessage(
+                channel=job["channel_id"],
+                client_msg_id=run_id,
+                text=f"CI repair `{run_id}` requires the repository owner's review.",
+            )
+        except Exception:
+            await self._release_ci_job(run_id)
+            raise
+        tracked = self._track_agent_run(
+            job,
+            team_id=job["team_id"],
+            channel_id=job["channel_id"],
+            thread_ts=message["ts"],
+            owner_user_id=job["owner_user_id"],
+            mode="ci_repair",
+        )
+        self._start_agent_monitor(tracked)
+
+    async def _claim_ci_job(self, run_id: str) -> bool:
+        """Claim a CI repair job for posting; False when it was already claimed."""
+        if run_id in self.posted_ci_jobs:
+            return False
+        # Claim synchronously so the inbox and /llm agent repair-ci cannot
+        # both pass this check before either one awaits.
+        self.posted_ci_jobs[run_id] = None
+        evicted = []
+        while len(self.posted_ci_jobs) > POSTED_CI_JOBS_LIMIT:
+            oldest = next(iter(self.posted_ci_jobs))
+            self.posted_ci_jobs.pop(oldest)
+            evicted.append(oldest)
+        if self._uses_granular_redis_state():
+            await self.state_store.add_posted_ci_job(run_id)
+            for oldest in evicted:
+                await self.state_store.remove_posted_ci_job(oldest)
+        else:
+            await self._persist_state()
+        return True
+
+    async def _release_ci_job(self, run_id: str):
+        self.posted_ci_jobs.pop(run_id, None)
+        if self._uses_granular_redis_state():
+            await self.state_store.remove_posted_ci_job(run_id)
+        else:
+            await self._persist_state()
 
     async def _handle_socket_mode_request(
         self, client: AsyncSocketModeClient, req: SocketModeRequest
@@ -4531,6 +4612,9 @@ class SlackBot:
             key: self._deserialize_datetime(value)
             for key, value in snapshot.get("active_threads", {}).items()
         }
+        self.posted_ci_jobs = dict.fromkeys(
+            str(run_id) for run_id in snapshot.get("posted_ci_jobs", [])
+        )
         for record in snapshot.get("agent_runs", {}).values():
             if not isinstance(record, dict) or not all(
                 record.get(field)
@@ -4573,6 +4657,7 @@ class SlackBot:
                     for run_id, tracked in self.agent_runs.items()
                     if tracked.get("run_id") and tracked.get("session_id")
                 },
+                "posted_ci_jobs": list(self.posted_ci_jobs),
             }
             await self.state_store.save_state(snapshot)
 

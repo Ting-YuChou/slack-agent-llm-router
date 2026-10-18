@@ -2054,6 +2054,8 @@ class TestSlackStateStores:
             "rate_limits": {},
             "conversations": {},
             "active_threads": {},
+            "agent_runs": {},
+            "posted_ci_jobs": [],
         }
 
         await store.initialize()
