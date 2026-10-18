@@ -1,13 +1,19 @@
 import { StringDecoder } from "node:string_decoder";
 
+import { redact } from "./telemetry.js";
+
 export type PublicRunEvent =
   | { type: "turn" }
   | { type: "usage"; cost_usd: number }
   | { type: "tool"; phase: "start" | "end"; tool_call_id: string; tool: string; input?: Record<string, unknown>; is_error?: boolean; result_bytes?: number }
   | { type: "approval"; approval_id: string; title: string; detail: string; timeout_ms?: number }
   | { type: "answer"; text: string }
-  | { type: "settled" }
+  | { type: "settled"; outcome: RunOutcome; limit?: LimitKind; stop_reason?: string; error_message?: string }
   | { type: "error"; code: string; message: string };
+
+/** How a Pi prompt ended; only `completed` may be delivered. */
+export type RunOutcome = "completed" | "truncated" | "limit_reached" | "aborted" | "error";
+export type LimitKind = "turns" | "tool_calls";
 
 export class RpcProtocolError extends Error {}
 
@@ -87,7 +93,7 @@ export function sanitizeRpcEvent(record: Record<string, unknown>): PublicRunEven
       ...(typeof record.timeout === "number" ? { timeout_ms: record.timeout } : {}),
     };
   }
-  if (type === "agent_settled") return { type: "settled" };
+  if (type === "agent_settled") return { type: "settled", outcome: "completed" };
   if (type === "extension_error") {
     return { type: "error", code: "extension_error", message: "A trusted extension failed" };
   }
@@ -118,6 +124,9 @@ export class PiRpcBridge {
   private readonly pending = new Map<string, { command: string; resolve: (response: Record<string, unknown>) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private sequence = 0;
   private ready = false;
+  private promptId?: string;
+  private lastAssistant?: { stopReason: string; errorMessage?: string };
+  private limit?: LimitKind;
   private readonly onReady?: () => void;
 
   constructor(options: { writeLine: (line: string) => void; onEvent: (event: PublicRunEvent) => void; onRecord?: (record: Record<string, unknown>) => void; onCommand?: (record: Record<string, unknown>) => void; onReady?: () => void }) {
@@ -138,6 +147,22 @@ export class PiRpcBridge {
           this.onEvent({ type: "usage", cost_usd: cost.total });
         }
       }
+      if (record.type === "message_end" && isRecord(record.message) && record.message.role === "assistant") {
+        const message = record.message;
+        this.lastAssistant = { stopReason: safeString(message.stopReason) || "unknown", errorMessage: typeof message.errorMessage === "string" ? message.errorMessage : undefined };
+      }
+      if (record.type === "entry_appended" && isRecord(record.entry) && record.entry.type === "custom" && record.entry.customType === "pi_agent_limit") {
+        const kind = isRecord(record.entry.data) ? record.entry.data.kind : undefined;
+        if (kind === "turns" || kind === "tool_calls") this.limit = kind;
+      }
+      if (record.type === "agent_settled") {
+        this.onEvent(this.settledEvent());
+        continue;
+      }
+      if (record.type === "response" && record.command === "prompt" && record.id === this.promptId && record.success === false) {
+        this.onEvent({ type: "error", code: "prompt_rejected", message: "Pi rejected the prompt before it started" });
+        continue;
+      }
       if (record.type === "response" && typeof record.id === "string") {
         const pending = this.pending.get(record.id);
         if (pending) {
@@ -157,7 +182,20 @@ export class PiRpcBridge {
   }
 
   prompt(id: string, message: string): void {
+    this.promptId = id;
+    this.lastAssistant = undefined;
+    this.limit = undefined;
     this.send({ id, type: "prompt", message });
+  }
+
+  /** Pi emits agent_settled unconditionally; classify how the prompt actually ended. */
+  private settledEvent(): Extract<PublicRunEvent, { type: "settled" }> {
+    const last = this.lastAssistant;
+    const stop_reason = last?.stopReason ?? "no_response";
+    const error_message = last?.errorMessage ? String(redact(last.errorMessage)).slice(0, 500) : undefined;
+    if (this.limit) return { type: "settled", outcome: "limit_reached", limit: this.limit, stop_reason };
+    const outcome: RunOutcome = stop_reason === "stop" ? "completed" : stop_reason === "length" ? "truncated" : stop_reason === "aborted" ? "aborted" : "error";
+    return { type: "settled", outcome, stop_reason, ...(error_message ? { error_message } : {}) };
   }
 
   async configureAndPrompt(id: string, message: string, provider: string, model: string, effort: string, beforePrompt?: () => Promise<void>): Promise<void> {

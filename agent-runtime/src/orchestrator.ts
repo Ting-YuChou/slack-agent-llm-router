@@ -4,7 +4,7 @@ import { taskMode, type TaskMode } from "./task-mode.js";
 import { listAgentModels, resolveAgentModel } from "./agent-model.js";
 import type { RouteDecision } from "./jev-router.js";
 import { ApprovalStore } from "./policy.js";
-import type { PublicRunEvent } from "./pi-rpc.js";
+import type { PublicRunEvent, RunOutcome } from "./pi-rpc.js";
 import type { RuntimeStateStore } from "./runtime-state.js";
 import { workflowMode, type WorkflowMode, type WorkflowNode } from "./structured-workflow.js";
 import { WorkflowBudget } from "./workflow-budget.js";
@@ -90,6 +90,8 @@ export interface RunRecord {
   timing?: { wall_ms: number; active_ms: number; human_wait_ms: number };
   phase?: string;
   execution_status?: "running" | "succeeded" | "failed";
+  /** How the latest writer execution ended (Pi stop reason classification). */
+  execution_outcome?: RunOutcome;
   grader_findings?: Array<{ path: string; line: number; severity: string; reason: string }>;
   verification_status?: string;
   grader_status?: string;
@@ -727,7 +729,17 @@ export class CodingAgentOrchestrator {
       void this.failRun(session, run, event.code, event.message);
       return;
     }
-    if (event.type === "settled") { if (this.workflows.has(run.run_id)) run.execution_status = "succeeded"; void this.completeRun(session, run); }
+    if (event.type === "settled") {
+      run.execution_outcome = event.outcome;
+      if (event.outcome !== "completed") {
+        if (this.workflows.has(run.run_id)) run.execution_status = "failed";
+        const failure = settleFailure(event);
+        void this.failRun(session, run, failure.code, failure.message);
+        return;
+      }
+      if (this.workflows.has(run.run_id)) run.execution_status = "succeeded";
+      void this.completeRun(session, run);
+    }
   }
 
   private async completeDiscussion(session: SessionRecord, run: RunRecord): Promise<void> {
@@ -1000,6 +1012,18 @@ export class CodingAgentOrchestrator {
       throw error;
     }
   }
+}
+
+/** Non-completed executions are never delivered; each outcome gets its own actionable code. */
+function settleFailure(event: Extract<PublicRunEvent, { type: "settled" }>): { code: string; message: string } {
+  if (event.outcome === "limit_reached") {
+    return event.limit === "turns"
+      ? { code: "agent_turn_limit", message: "Agent stopped at its turn limit before finishing; changes were not delivered" }
+      : { code: "agent_tool_limit", message: "Agent stopped at its tool-call limit before finishing; changes were not delivered" };
+  }
+  if (event.outcome === "truncated") return { code: "agent_output_truncated", message: "Model output hit its token limit; changes were not delivered" };
+  if (event.outcome === "aborted") return { code: "agent_aborted", message: "Agent execution was aborted before finishing; changes were not delivered" };
+  return { code: "provider_error", message: event.error_message ? `Model provider error: ${event.error_message}` : "Model provider returned an error; changes were not delivered" };
 }
 
 function validateTaskId(value: unknown): void {

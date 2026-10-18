@@ -381,6 +381,7 @@ export async function createProductionServer() {
     },
   }) : undefined;
   let ciRuntime: Awaited<ReturnType<typeof createCiRuntime>> | undefined;
+  const agentLimits = parseAgentLimits(process.env);
   const orchestrator: CodingAgentOrchestrator = new CodingAgentOrchestrator({
     quality,
     captureTraceContext: id => tracing?.traceparent(id),
@@ -433,6 +434,7 @@ export async function createProductionServer() {
           toolNames: ["read", "write", "edit", "bash", "grep", "find", "ls", ...lock.plugins.flatMap((plugin) => plugin.enabled_tools)],
           continueSession: session.restored,
           safeCommands: parseSafeCommands(process.env.PI_AGENT_SAFE_COMMANDS),
+          limits: agentLimits,
           user: containerUser,
           ...(mcpServerIds.length > 0 ? {
             mcp: {
@@ -673,6 +675,16 @@ function positiveInteger(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
+export function parseAgentLimits(env: NodeJS.ProcessEnv): { maxTurns: number; maxToolCalls: number } {
+  const read = (key: string, fallback: number) => {
+    if (env[key] === undefined || env[key] === "") return fallback;
+    const value = Number(env[key]);
+    if (!Number.isInteger(value) || value < 1 || value > 1000) throw new Error(`${key} must be an integer between 1 and 1000`);
+    return value;
+  };
+  return { maxTurns: read("PI_AGENT_MAX_TURNS", 20), maxToolCalls: read("PI_AGENT_MAX_TOOL_CALLS", 40) };
+}
+
 function parseSafeCommands(value: string | undefined): string[] {
   const defaults = ["npm test", "npm run test", "npm run lint", "npm run build", "pytest", "python -m pytest"];
   if (!value) return defaults;

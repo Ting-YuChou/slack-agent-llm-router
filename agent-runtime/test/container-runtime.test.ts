@@ -134,3 +134,15 @@ test('discussion mode overrides writer capabilities and mounts only read-only wo
   assert.ok(args.includes('/opt/pi/extensions/discussion.ts'));
   assert.doesNotMatch(args.join(' '), /untrusted|writer.ts|skill.md|classifier-secret|mcp-secret|builtin:mcp|builtin:codemode/);
 });
+
+test("writer turn and tool-call limits come from host configuration", () => {
+  const base = {
+    name: "pi-session-1", image: "pi-agent@sha256:abc", network: "pi-model-only", worktreePath: "/w", gitMetadataPath: "/repo/.git",
+    sessionStatePath: "/s", gatewayUrl: "http://model-gateway:8080/v1", gatewayToken: "t", modelRef: "openai/gpt-5.6-luna",
+    extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
+  };
+  assert.match(buildAgentDockerArgs(base).join(" "), /PI_AGENT_MAX_TURNS=20 .*PI_AGENT_MAX_TOOL_CALLS=40/);
+  const rendered = buildAgentDockerArgs({ ...base, limits: { maxTurns: 3, maxToolCalls: 5 } }).join(" ");
+  assert.match(rendered, /PI_AGENT_MAX_TURNS=3 /);
+  assert.match(rendered, /PI_AGENT_MAX_TOOL_CALLS=5 /);
+});

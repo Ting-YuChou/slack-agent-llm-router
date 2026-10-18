@@ -41,6 +41,7 @@ export interface AgentContainerOptions {
   workflowContext?: { role: string; wave: number; paths: string[]; previousTasks: unknown[]; mcpTools?: string[] };
   directMcpOnly?: boolean;
   workflowKey?: string;
+  limits?: { maxTurns: number; maxToolCalls: number };
 }
 
 const exec = promisify(execFile);
@@ -74,8 +75,8 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     "--env", `HOME=/tmp/pi-home`,
     "--env", `${model.credentialEnv}=${options.gatewayToken}`,
     "--env", `PI_MODEL_GATEWAY_URL=${options.gatewayUrl}`,
-    "--env", "PI_AGENT_MAX_TURNS=20",
-    "--env", "PI_AGENT_MAX_TOOL_CALLS=40",
+    "--env", `PI_AGENT_MAX_TURNS=${options.limits?.maxTurns ?? 20}`,
+    "--env", `PI_AGENT_MAX_TOOL_CALLS=${options.limits?.maxToolCalls ?? 40}`,
     "--env", "PI_AGENT_BASH_TIMEOUT_MS=300000",
     "--env", `PI_AGENT_SAFE_COMMANDS_JSON=${JSON.stringify(options.safeCommands ?? [])}`,
     "--env", `PI_AGENT_SKILL_PATHS_JSON=${JSON.stringify(options.skillPaths)}`,

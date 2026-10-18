@@ -187,3 +187,11 @@ test("bearer auth compares tokens in constant time and rejects length or prefix 
   }
   assert.equal(authorized(request("Bearer "), ""), false);
 });
+
+test("agent limits parse positive integers and fall back to defaults", async () => {
+  const { parseAgentLimits } = await import("../src/server.js");
+  assert.deepEqual(parseAgentLimits({}), { maxTurns: 20, maxToolCalls: 40 });
+  assert.deepEqual(parseAgentLimits({ PI_AGENT_MAX_TURNS: "3", PI_AGENT_MAX_TOOL_CALLS: "7" }), { maxTurns: 3, maxToolCalls: 7 });
+  assert.throws(() => parseAgentLimits({ PI_AGENT_MAX_TURNS: "0" }), /PI_AGENT_MAX_TURNS/);
+  assert.throws(() => parseAgentLimits({ PI_AGENT_MAX_TOOL_CALLS: "lots" }), /PI_AGENT_MAX_TOOL_CALLS/);
+});

@@ -72,12 +72,17 @@ export default function policyExtension(pi: ExtensionAPI) {
 
   pi.on("turn_start", (_event, ctx) => {
     turns += 1;
-    if (turns > MAX_TURNS) ctx.abort();
+    if (turns > MAX_TURNS) {
+      // The host can only tell a harness limit from other aborts through this session entry.
+      pi.appendEntry("pi_agent_limit", { kind: "turns", limit: MAX_TURNS });
+      ctx.abort();
+    }
   });
 
   pi.on("tool_call", async (event, ctx) => {
     toolCalls += 1;
     if (toolCalls > MAX_TOOL_CALLS) {
+      pi.appendEntry("pi_agent_limit", { kind: "tool_calls", limit: MAX_TOOL_CALLS });
       ctx.abort();
       return { block: true, reason: `Tool call limit of ${MAX_TOOL_CALLS} exceeded` };
     }
