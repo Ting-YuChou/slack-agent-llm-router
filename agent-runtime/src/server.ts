@@ -293,6 +293,7 @@ export async function createProductionServer() {
   await mkdir(runtimeRoot, { recursive: true });
   await mkdir(worktreeRoot, { recursive: true });
   const actualImageDigest = process.env.PI_AGENT_IMAGE_DIGEST ?? await inspectImageDigest(image);
+  if (!await readImageFile(image, "/opt/pi/extensions/secret-env.ts")) throw new Error("Agent image must be rebuilt with the secret-env extension");
   const imageSkillLock = await readImageFile(image, "/opt/pi/skills.lock.json");
   const lock = await verifyPluginLock(lockPath, { rootDir: path.dirname(lockPath), actualImageDigest });
   const skillLock = await verifySkillLock(skillLockPath, {
@@ -433,7 +434,7 @@ export async function createProductionServer() {
           sessionStatePath,
           gatewayUrl,
           modelRef: model.ref,
-          extensionPaths: ["/opt/pi/extensions/policy.ts", "/opt/pi/extensions/model-gateway.ts"],
+          extensionPaths: ["/opt/pi/extensions/policy.ts", "/opt/pi/extensions/model-gateway.ts", "/opt/pi/extensions/secret-env.ts"],
           pluginPaths: lock.plugins.map((plugin) => plugin.container_path),
           skillPaths: skillLock.skills.map((skill) => skill.container_path),
           toolNames: ["read", "write", "edit", "bash", "grep", "find", "ls", ...lock.plugins.flatMap((plugin) => plugin.enabled_tools)],

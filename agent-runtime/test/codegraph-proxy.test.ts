@@ -41,3 +41,9 @@ test("sanitized mirror enforces total limits", async () => {
     await assert.rejects(createSanitizedMirror(root, state, { maxFileBytes: 10, maxTotalBytes: 100, maxFiles: 10 }), /limit/);
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }); }
 });
+
+test("the CodeGraph child process gets a minimal environment without run credentials", async () => {
+  const { codegraphEnv } = await import("../src/codegraph-lazy-proxy.js");
+  const env = codegraphEnv({ PATH: "/usr/bin", OPENAI_API_KEY: "t", PI_AGENT_MCP_SERVERS_JSON: "[]", GITHUB_TOKEN: "t", LANG: "C.UTF-8" }, "/state", "/mirror");
+  assert.deepEqual(env, { PATH: "/usr/bin", LANG: "C.UTF-8", HOME: "/state", CGC_ALLOWED_ROOTS: "/mirror", CGC_EMBEDDED_BUFFER_POOL_MB: "384" });
+});
