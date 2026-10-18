@@ -85,11 +85,6 @@ async def test_slack_feedback_reports_runtime_owner_rejection():
 async def test_feedback_buttons_preserve_long_result_with_valid_slack_sections():
     answer = "中文" * 2000
     bot = SimpleNamespace(
-        agent_runtime_client=SimpleNamespace(
-            wait_for_update=AsyncMock(
-                return_value={"run_id": "r", "status": "completed"}
-            )
-        ),
         web_client=SimpleNamespace(chat_postMessage=AsyncMock()),
         config={"response_settings": {"max_response_length": 5000}},
         agent_config={"feedback_enabled": True},
@@ -97,8 +92,10 @@ async def test_feedback_buttons_preserve_long_result_with_valid_slack_sections()
             _format_agent_response=Mock(return_value=answer)
         ),
     )
-    await SlackBot._monitor_agent_run(
-        bot, {"run_id": "r", "channel_id": "c", "thread_ts": "t"}
+    await SlackBot._post_agent_result(
+        bot,
+        {"run_id": "r", "channel_id": "c", "thread_ts": "t"},
+        {"run_id": "r", "status": "completed"},
     )
     blocks = bot.web_client.chat_postMessage.await_args.kwargs["blocks"]
     sections = [block["text"]["text"] for block in blocks if block["type"] == "section"]

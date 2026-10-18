@@ -1131,10 +1131,7 @@ class SlackMessageHandler:
                 thread_ts=thread_ts,
                 owner_user_id=user_id,
             )
-            self.bot._spawn_background_task(
-                self.bot._monitor_agent_run(tracked),
-                f"pi_agent_monitor:{result['run_id']}",
-            )
+            self.bot._start_agent_monitor(tracked)
             return f"Workflow `{result['run_id']}` resumed."
 
         if action in {"repair-ci", "publish-repair"}:
@@ -1177,10 +1174,7 @@ class SlackMessageHandler:
                 thread_ts=root_ts,
                 owner_user_id=user_id,
             )
-            self.bot._spawn_background_task(
-                self.bot._monitor_agent_run(tracked),
-                f"pi_agent_monitor:{result['run_id']}",
-            )
+            self.bot._start_agent_monitor(tracked)
             return f"CI repair `{result['run_id']}` is awaiting approval in the thread."
 
         model = None
@@ -1335,10 +1329,7 @@ class SlackMessageHandler:
                         )
                     ),
                 )
-            self.bot._spawn_background_task(
-                self.bot._monitor_agent_run(tracked),
-                f"pi_agent_monitor:{result['run_id']}",
-            )
+            self.bot._start_agent_monitor(tracked)
             if root_message_ts:
                 return ""
             return f"🛠️ Agent run `{result['run_id']}` started."
@@ -2219,6 +2210,11 @@ class SlackBot:
         self.agent_threads: Dict[str, Dict[str, Any]] = {}
         self.agent_runs: Dict[str, Dict[str, Any]] = {}
         self.agent_user_runs: Dict[str, Dict[str, Any]] = {}
+        self.agent_monitoring: Set[str] = set()
+        self.agent_monitor_tasks: Dict[str, asyncio.Task] = {}
+        self.agent_monitor_poll_seconds = float(
+            self.agent_config.get("monitor_poll_seconds", 2)
+        )
         self.agent_shortcut_nonces: Dict[str, AgentShortcutNonce] = {}
 
         # Running state
@@ -2310,6 +2306,7 @@ class SlackBot:
             self._spawn_background_task(
                 self._monitor_ci_inbox(), "slack_ci_repair_inbox"
             )
+            self._reconcile_agent_runs()
 
             # Start cleanup task
             self._spawn_background_task(
@@ -2346,10 +2343,7 @@ class SlackBot:
                             thread_ts=message["ts"],
                             owner_user_id=job["owner_user_id"],
                         )
-                        self._spawn_background_task(
-                            self._monitor_agent_run(tracked),
-                            f"pi_agent_monitor:{job['run_id']}",
-                        )
+                        self._start_agent_monitor(tracked)
                 except AgentRuntimeError:
                     logger.warning("CI repair inbox unavailable")
                 except Exception:
@@ -2477,9 +2471,24 @@ class SlackBot:
             return
         if not session:
             return
+        if session.get("run_id"):
+            tracked = self._track_agent_run(
+                session,
+                team_id=team_id,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                owner_user_id=session["owner_user_id"],
+            )
+            if session.get("active"):
+                self._start_agent_monitor(tracked)
+            else:
+                # Without Slack-side state we cannot tell whether the result
+                # was posted; never repost it on a later restart.
+                tracked["result_posted"] = True
+            return
         tracked = {
             "session_id": session["session_id"],
-            "run_id": session.get("run_id"),
+            "run_id": None,
             "team_id": team_id,
             "channel_id": channel_id,
             "thread_ts": thread_ts,
@@ -2487,8 +2496,6 @@ class SlackBot:
         }
         self.agent_threads[self._thread_key(channel_id, thread_ts)] = tracked
         self.agent_user_runs[session["owner_user_id"]] = tracked
-        if session.get("run_id"):
-            self.agent_runs[session["run_id"]] = tracked
         self._mark_thread_active(channel_id, thread_ts)
 
     async def _handle_mention_event(self, event: Dict[str, Any]):
@@ -3412,79 +3419,140 @@ class SlackBot:
             },
         ]
 
+    def _reconcile_agent_runs(self) -> None:
+        """Resume monitoring every restored run whose result was never posted."""
+        if self.agent_runtime_client is None:
+            return
+        for tracked in list(self.agent_runs.values()):
+            if tracked.get("run_id") and not tracked.get("result_posted"):
+                self._start_agent_monitor(tracked)
+
+    def _start_agent_monitor(self, tracked: Dict[str, Any]) -> asyncio.Task:
+        """Spawn a monitor for a run unless one is already running."""
+        run_id = tracked["run_id"]
+        task = self.agent_monitor_tasks.get(run_id)
+        if task is not None and not task.done():
+            return task
+        task = self._spawn_background_task(
+            self._monitor_agent_run(tracked), f"pi_agent_monitor:{run_id}"
+        )
+        self.agent_monitor_tasks[run_id] = task
+
+        def release(done: asyncio.Task) -> None:
+            if self.agent_monitor_tasks.get(run_id) is done:
+                self.agent_monitor_tasks.pop(run_id, None)
+
+        task.add_done_callback(release)
+        return task
+
     async def _monitor_agent_run(self, tracked: Dict[str, Any]):
+        run_id = tracked["run_id"]
+        if run_id in self.agent_monitoring:
+            return
+        self.agent_monitoring.add(run_id)
+        try:
+            await self._watch_agent_run(tracked)
+        finally:
+            self.agent_monitoring.discard(run_id)
+
+    async def _watch_agent_run(self, tracked: Dict[str, Any]):
+        """Post each new approval card and the final result exactly once."""
         runtime = self.agent_runtime_client
         if runtime is None or self.web_client is None:
             return
-        try:
-            run = await runtime.wait_for_update(tracked["run_id"])
-        except AgentRuntimeError:
-            logger.warning("Agent run monitor failed for %s", tracked["run_id"])
-            await self.web_client.chat_postMessage(
-                channel=tracked["channel_id"],
-                thread_ts=tracked["thread_ts"],
-                text="Agent status could not be retrieved; Chat mode was not used as fallback.",
-            )
-            return
-
-        if run.get("status") == "awaiting_approval":
-            approval = next(
-                (
-                    event
-                    for event in reversed(run.get("events", []))
-                    if event.get("type") == "approval"
-                ),
-                None,
-            )
-            if not approval:
+        await self._persist_agent_run(tracked)
+        while True:
+            try:
+                run = await runtime.wait_for_update(tracked["run_id"])
+            except AgentRuntimeError as exc:
+                if exc.status == 404:
+                    logger.info(
+                        "Agent run %s is gone; forgetting it", tracked["run_id"]
+                    )
+                    await self._forget_agent_run(tracked)
+                    return
+                logger.warning("Agent run monitor failed for %s", tracked["run_id"])
+                await self.web_client.chat_postMessage(
+                    channel=tracked["channel_id"],
+                    thread_ts=tracked["thread_ts"],
+                    text="Agent status could not be retrieved; Chat mode was not used as fallback.",
+                )
                 return
-            value = json.dumps(
-                {
-                    "run_id": run["run_id"],
-                    "session_id": run["session_id"],
-                    "approval_id": approval["approval_id"],
-                },
-                separators=(",", ":"),
-            )
-            await self.web_client.chat_postMessage(
-                channel=tracked["channel_id"],
-                thread_ts=tracked["thread_ts"],
-                text=f"Approval required: {approval.get('title', 'Agent action')}",
-                blocks=[
-                    *self._agent_approval_blocks(approval),
-                    {
-                        "type": "actions",
-                        "elements": [
-                            {
-                                "type": "button",
-                                "action_id": "pi_agent_approve",
-                                "text": {
-                                    "type": "plain_text",
-                                    "text": "Publish repair Draft PR"
-                                    if approval.get("kind") == "publish"
-                                    else "Approve",
-                                },
-                                "style": "primary",
-                                "value": value,
-                            },
-                            {
-                                "type": "button",
-                                "action_id": "pi_agent_reject",
-                                "text": {
-                                    "type": "plain_text",
-                                    "text": "Keep local result"
-                                    if approval.get("kind") == "publish"
-                                    else "Reject",
-                                },
-                                "style": "danger",
-                                "value": value,
-                            },
-                        ],
-                    },
-                ],
-            )
+            if run.get("status") == "awaiting_approval":
+                await self._post_agent_approval(tracked, run)
+                await asyncio.sleep(self.agent_monitor_poll_seconds)
+                continue
+            if not tracked.get("result_posted"):
+                await self._post_agent_result(tracked, run)
+                tracked["result_posted"] = True
+                await self._persist_agent_run(tracked)
             return
 
+    async def _post_agent_approval(
+        self, tracked: Dict[str, Any], run: Dict[str, Any]
+    ) -> None:
+        approval = next(
+            (
+                event
+                for event in reversed(run.get("events", []))
+                if event.get("type") == "approval"
+            ),
+            None,
+        )
+        posted = tracked.setdefault("posted_approval_ids", [])
+        if not approval or approval.get("approval_id") in posted:
+            return
+        value = json.dumps(
+            {
+                "run_id": run["run_id"],
+                "session_id": run["session_id"],
+                "approval_id": approval["approval_id"],
+            },
+            separators=(",", ":"),
+        )
+        await self.web_client.chat_postMessage(
+            channel=tracked["channel_id"],
+            thread_ts=tracked["thread_ts"],
+            text=f"Approval required: {approval.get('title', 'Agent action')}",
+            blocks=[
+                *self._agent_approval_blocks(approval),
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "action_id": "pi_agent_approve",
+                            "text": {
+                                "type": "plain_text",
+                                "text": "Publish repair Draft PR"
+                                if approval.get("kind") == "publish"
+                                else "Approve",
+                            },
+                            "style": "primary",
+                            "value": value,
+                        },
+                        {
+                            "type": "button",
+                            "action_id": "pi_agent_reject",
+                            "text": {
+                                "type": "plain_text",
+                                "text": "Keep local result"
+                                if approval.get("kind") == "publish"
+                                else "Reject",
+                            },
+                            "style": "danger",
+                            "value": value,
+                        },
+                    ],
+                },
+            ],
+        )
+        posted.append(approval["approval_id"])
+        await self._persist_agent_run(tracked)
+
+    async def _post_agent_result(
+        self, tracked: Dict[str, Any], run: Dict[str, Any]
+    ) -> None:
         max_length = int(
             self.config.get("response_settings", {}).get("max_response_length", 2000)
         )
@@ -3778,10 +3846,7 @@ class SlackBot:
                 text="This approval has expired or was already used.",
             )
             return
-        self._spawn_background_task(
-            self._monitor_agent_run(tracked),
-            f"pi_agent_monitor:{value['run_id']}",
-        )
+        self._start_agent_monitor(tracked)
 
     def _mark_thread_active(self, channel_id: Optional[str], thread_ts: Optional[str]):
         """Mark a bot thread as active for follow-up replies."""
@@ -4445,9 +4510,15 @@ class SlackBot:
             for key, value in snapshot.get("active_threads", {}).items()
         }
         for record in snapshot.get("agent_runs", {}).values():
-            required = ("run_id", "session_id", "channel_id", "thread_ts")
             if not isinstance(record, dict) or not all(
-                record.get(field) for field in (*required, "owner_user_id")
+                record.get(field)
+                for field in (
+                    "run_id",
+                    "session_id",
+                    "channel_id",
+                    "thread_ts",
+                    "owner_user_id",
+                )
             ):
                 continue
             self._register_agent_run(self._agent_run_record(record))
