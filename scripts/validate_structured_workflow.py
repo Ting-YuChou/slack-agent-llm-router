@@ -1,7 +1,7 @@
-import http.client, json, os, pathlib, re, secrets, shutil, socket, subprocess, tempfile, time, urllib.request, uuid, argparse, sqlite3
+import http.client, json, os, pathlib, re, secrets, shutil, socket, subprocess, sys, tempfile, time, urllib.request, uuid, argparse, sqlite3
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Live, budgeted structured workflow acceptance on a synthetic local repository; no Slack or GitHub publication."
     )
@@ -15,9 +15,13 @@ def main():
         action="store_true",
         help="Interrupt read-only discovery after one worker completes and resume the same run",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if not args.live_openai:
         parser.error("--live-openai is required; this command incurs model usage")
+    return args
+
+
+def run_acceptance(args):
     project = pathlib.Path(__file__).resolve().parents[1]
     root = pathlib.Path(tempfile.mkdtemp(prefix="structured-acceptance-"))
     root.chmod(0o700)
@@ -465,7 +469,22 @@ def main():
         report["trace_ids"] = sorted(set(span.get("traceId") for span in traces))
         (root / "acceptance.json").write_text(json.dumps(report, indent=2))
         print(json.dumps(report, indent=2))
+    return report
+
+
+def exit_code(report):
+    """Fail the acceptance unless the run completed and every gate passed."""
+    passed = (
+        report.get("status") == "completed"
+        and report.get("verification") == "passed"
+        and report.get("grader") == "passed"
+    )
+    return 0 if passed else 1
+
+
+def main(argv=None):
+    return exit_code(run_acceptance(parse_args(argv)))
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
