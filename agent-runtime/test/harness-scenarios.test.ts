@@ -30,7 +30,7 @@ const scenarios: Array<Scenario & { todo?: string }> = [
   { name: "S6 diff limit reports its own code", profile, todo: "A-3",
     attempts: [{ files: Object.fromEntries(Array.from({ length: 51 }, (_, i) => [`src/f${i}.js`, `${i}\n`])), records: [...piTurn("stop"), settledRecord] }],
     expect: { status: "failed", errorCode: "diff_limit_exceeded", committed: false } },
-  { name: "S7 no-profile change is labelled unverified", todo: "A-2",
+  { name: "S7 no-profile change is labelled unverified",
     attempts: [{ files: fix, records: [...piTurn("stop", "Fixed"), settledRecord] }],
     expect: { status: "completed", committed: true, verificationStatus: "unverified" } },
   { name: "S8 failed verification is repaired then committed", profile, verify: ["failed", "passed"],

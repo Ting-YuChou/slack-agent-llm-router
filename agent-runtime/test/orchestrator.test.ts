@@ -18,19 +18,20 @@ class FakeProcess {
   emit(event: PublicRunEvent) { this.handler(event); }
 }
 
-function fixture(router?: { route(text?: string): Promise<any> }, quality?: any, stateStore?: any) {
+function fixture(router?: { route(text?: string): Promise<any> }, quality?: any, stateStore?: any, extra: Record<string, unknown> = {}) {
   const process = new FakeProcess();
   const calls = {
     rollback: [] as string[],
     commits: 0,
     diff: { files: ["src/a.ts"], bytes: 10, stat: "1 file changed" },
     commitImpl: async () => "b".repeat(40),
+    commitMessages: [] as string[],
     startedModels: [] as string[],
   };
   const worktrees = {
     create: async () => ({ path: "/managed/w1", branch: "pi-agent/20260801-run", baselineCommit: "a".repeat(40) }),
     inspectDiff: async () => calls.diff,
-    commit: async () => { calls.commits += 1; return calls.commitImpl(); },
+    commit: async (_path: string, message: string) => { calls.commits += 1; calls.commitMessages.push(message); return calls.commitImpl(); },
     rollback: async (_path: string, baseline: string) => { calls.rollback.push(baseline); },
     remove: async () => undefined,
   };
@@ -46,6 +47,7 @@ function fixture(router?: { route(text?: string): Promise<any> }, quality?: any,
     router,
     quality, stateStore,
     mcpRepository: "acme/widgets",
+    ...extra,
   } as any);
   return { orchestrator, process, calls };
 }
@@ -801,4 +803,42 @@ test("a completed settle records its outcome and still commits", async () => {
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(orchestrator.getRun(accepted.run_id).execution_outcome, "completed");
   assert.equal(calls.commits, 1);
+});
+
+test("an unverified no-profile change is labelled unverified in the run and the commit trailers", async () => {
+  const { orchestrator, process, calls } = fixture();
+  const accepted = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "unverified", user_id: "U", prompt: "fix" });
+  assert.equal(orchestrator.getRun(accepted.run_id).verification_status, "unverified");
+  process.emit(SETTLED);
+  await new Promise((resolve) => setImmediate(resolve));
+  const run = orchestrator.getRun(accepted.run_id);
+  assert.equal(run.status, "completed");
+  assert.equal(run.verification_status, "unverified");
+  const message = calls.commitMessages[0];
+  assert.match(message, new RegExp(`^Pi agent: ${accepted.run_id}\n\n`));
+  assert.match(message, new RegExp(`\nPi-Run-Id: ${accepted.run_id}(\n|$)`));
+  assert.match(message, /\nPi-Model: openai\/gpt-5\.6-luna(\n|$)/);
+  assert.match(message, /\nPi-Verification: unverified(\n|$)/);
+});
+
+test("a verified change records its verification and grader verdicts as commit trailers", async () => {
+  const { orchestrator, process, calls } = fixture(undefined, {
+    execution: () => {}, assertUnchanged: async () => {}, maxCostUsd: 5,
+    evaluate: async () => ({ action: "pass", candidate: { hash: "h", path: "/s" }, verification: { status: "passed", checks: [] }, grade: { status: "passed", candidate_hash: "h", criteria: [], findings: [] } }),
+  });
+  await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "verified-trailers", user_id: "U", prompt: "fix" });
+  for (let i = 0; i < 3; i++) await new Promise((resolve) => setImmediate(resolve));
+  process.emit(SETTLED);
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+  assert.match(calls.commitMessages[0] ?? "", /\nPi-Verification: passed\nPi-Grader: passed(\n|$)/);
+});
+
+test("requireVerification rejects implement without a trusted profile but still allows discussion", async () => {
+  const { orchestrator } = fixture(undefined, undefined, undefined, { requireVerification: true });
+  await assert.rejects(
+    orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "req-1", user_id: "U", prompt: "fix" }),
+    (error: any) => error.code === "verification_profile_required" && error.statusCode === 422,
+  );
+  const discussed = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "req-2", user_id: "U", prompt: "why?", task_mode: "discuss" });
+  assert.equal(discussed.status, "starting");
 });

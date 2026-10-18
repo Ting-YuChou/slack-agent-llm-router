@@ -191,6 +191,7 @@ export class CodingAgentOrchestrator {
   private readonly workflows = new Map<string, WorkflowState>();
   private readonly quality?: QualityServices;
   private readonly captureTraceContext?: (id: string) => string | undefined;
+  private readonly requireVerification: boolean;
 
   private readonly captureState?: (runId: string) => { complete: boolean | null; reasons: string[] };
   private readonly observeRun?: (run: RunRecord) => void;
@@ -210,6 +211,8 @@ export class CodingAgentOrchestrator {
     mcpRepository?: string;
     quality?: QualityServices;
     captureTraceContext?: (id: string) => string | undefined;
+    /** Production deployments refuse implement runs that no trusted profile can verify. */
+    requireVerification?: boolean;
   }) {
     this.captureState = options.captureState;
     this.observeRun = options.observeRun; this.observeLifecycle = options.observeLifecycle;
@@ -223,6 +226,7 @@ export class CodingAgentOrchestrator {
     this.mcpRepository = options.mcpRepository;
     this.quality = options.quality;
     this.captureTraceContext = options.captureTraceContext;
+    this.requireVerification = options.requireVerification === true;
   }
 
   async restore(): Promise<void> {
@@ -528,6 +532,7 @@ export class CodingAgentOrchestrator {
       events: [{ type: "status", status: "starting" }],
       branch: session.branch,
     };
+    if (task === "implement" && !this.quality) run.verification_status = "unverified";
     if (task === "discuss") {
       run.phase = "discussing"; run.execution_status = "running";
       run.verification_status = "not_applicable"; run.grader_status = "not_applicable"; run.publication_status = "not_applicable";
@@ -563,7 +568,12 @@ export class CodingAgentOrchestrator {
   }
 
   private requireTaskMode(value: unknown): TaskMode {
-    try { return taskMode(value); } catch { throw new RuntimeError("Invalid task_mode; expected discuss or implement", "invalid_request", 400); }
+    let task: TaskMode;
+    try { task = taskMode(value); } catch { throw new RuntimeError("Invalid task_mode; expected discuss or implement", "invalid_request", 400); }
+    if (task === "implement" && this.requireVerification && !this.quality) {
+      throw new RuntimeError("Implement runs require a trusted verification profile; use discuss mode", "verification_profile_required", 422);
+    }
+    return task;
   }
 
   private requireWorkflowMode(value: unknown): WorkflowMode {
@@ -810,7 +820,7 @@ export class CodingAgentOrchestrator {
         maxSingleFileBytes: 256 * 1024,
       });
       this.notifyLifecycle(run.run_id, "commit", "start");
-      const commit = await this.worktrees.commit(session.worktreePath, `Pi agent: ${run.run_id}`);
+      const commit = await this.worktrees.commit(session.worktreePath, buildCommitMessage(run));
       this.notifyLifecycle(run.run_id, "commit", "end");
       session.baselineCommit = commit;
       run.changed_files = diff.files;
@@ -1012,6 +1022,13 @@ export class CodingAgentOrchestrator {
       throw error;
     }
   }
+}
+
+/** Trailers let reviewers trace a delivered commit back to its run and how (or whether) it was verified. */
+export function buildCommitMessage(run: RunRecord): string {
+  const trailers = [`Pi-Run-Id: ${run.run_id}`, `Pi-Model: ${run.provider}/${run.model}`, `Pi-Verification: ${run.verification_status ?? "unverified"}`];
+  if (run.grader_status) trailers.push(`Pi-Grader: ${run.grader_status}`);
+  return `Pi agent: ${run.run_id}\n\n${trailers.join("\n")}`;
 }
 
 /** Non-completed executions are never delivered; each outcome gets its own actionable code. */

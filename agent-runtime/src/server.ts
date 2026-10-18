@@ -384,6 +384,7 @@ export async function createProductionServer() {
   const agentLimits = parseAgentLimits(process.env);
   const orchestrator: CodingAgentOrchestrator = new CodingAgentOrchestrator({
     quality,
+    requireVerification: process.env.PI_AGENT_REQUIRE_VERIFICATION === "1",
     captureTraceContext: id => tracing?.traceparent(id),
     captureState: id => ({complete: telemetry ? telemetry.completeness(id).length === 0 : null, reasons: telemetry?.completeness(id) ?? []}),
     observeLifecycle: (id, name, phase, failed, sessionId) => {
