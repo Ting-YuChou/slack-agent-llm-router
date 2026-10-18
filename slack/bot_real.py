@@ -173,6 +173,7 @@ class RedisSlackStateStore(SlackStateStore):
         self.rate_limits_index_key = f"{self.key_prefix}:rate_limits"
         self.conversations_index_key = f"{self.key_prefix}:conversations"
         self.active_threads_index_key = f"{self.key_prefix}:active_threads"
+        self.agent_runs_index_key = f"{self.key_prefix}:agent_runs"
         self.client = None
 
     async def initialize(self):
@@ -215,12 +216,17 @@ class RedisSlackStateStore(SlackStateStore):
                 self.active_threads_index_key,
                 lambda item_id: self._active_thread_key(item_id),
             )
+            agent_runs = await self._load_json_map(
+                self.agent_runs_index_key,
+                lambda item_id: self._agent_run_key(item_id),
+            )
             return {
                 "schema_version": STATE_SCHEMA_VERSION,
                 "users": users,
                 "rate_limits": rate_limits,
                 "conversations": conversations,
                 "active_threads": active_threads,
+                "agent_runs": agent_runs,
             }
         except Exception as exc:
             logger.warning("Failed to load Slack state from Redis: %s", exc)
@@ -242,6 +248,9 @@ class RedisSlackStateStore(SlackStateStore):
         active_threads = snapshot.get("active_threads", {})
         for thread_key, thread_payload in active_threads.items():
             await self.persist_active_thread_state(thread_key, thread_payload)
+
+        for run_id, run_payload in snapshot.get("agent_runs", {}).items():
+            await self.persist_agent_run_state(run_id, run_payload)
 
     async def shutdown(self):
         if self.client and hasattr(self.client, "close"):
@@ -351,6 +360,28 @@ class RedisSlackStateStore(SlackStateStore):
         except Exception as exc:
             logger.warning("Failed to delete Slack active threads from Redis: %s", exc)
 
+    async def persist_agent_run_state(self, run_id: str, payload: Dict[str, Any]):
+        """Persist one tracked Pi agent run so a restart can resume monitoring."""
+        if not self.client:
+            return
+
+        try:
+            await self._set_json(self._agent_run_key(run_id), payload)
+            await self._sadd(self.agent_runs_index_key, run_id)
+        except Exception as exc:
+            logger.warning("Failed to persist Slack agent run to Redis: %s", exc)
+
+    async def delete_agent_run_state(self, run_id: str):
+        """Stop tracking one Pi agent run across restarts."""
+        if not self.client:
+            return
+
+        try:
+            await self._delete(self._agent_run_key(run_id))
+            await self._srem(self.agent_runs_index_key, run_id)
+        except Exception as exc:
+            logger.warning("Failed to delete Slack agent run from Redis: %s", exc)
+
     def _user_key(self, user_id: str) -> str:
         return f"{self.key_prefix}:user:{user_id}"
 
@@ -362,6 +393,9 @@ class RedisSlackStateStore(SlackStateStore):
 
     def _active_thread_key(self, thread_key: str) -> str:
         return f"{self.key_prefix}:active_thread:{thread_key}"
+
+    def _agent_run_key(self, run_id: str) -> str:
+        return f"{self.key_prefix}:agent_run:{run_id}"
 
     async def _load_json_map(self, index_key: str, item_key_builder) -> Dict[str, Any]:
         """Load a keyed JSON map backed by a Redis set index."""
@@ -1074,7 +1108,7 @@ class SlackMessageHandler:
                     await runtime.cancel(tracked["run_id"], user_id)
                     return f"Agent run `{tracked['run_id']}` is stopping."
                 await runtime.close_session(tracked["session_id"], user_id)
-                self.bot._forget_agent_session(tracked)
+                await self.bot._forget_agent_run(tracked)
                 return f"Agent session `{tracked['session_id']}` is closed; its branch and commits were kept."
             except AgentRuntimeConflict:
                 return "That Agent action has already completed or is no longer valid."
@@ -3239,7 +3273,9 @@ class SlackBot:
         channel_id: str,
         thread_ts: str,
         owner_user_id: str,
+        mode: Optional[str] = None,
     ) -> Dict[str, Any]:
+        previous = self.agent_runs.get(accepted["run_id"]) or {}
         tracked = {
             "session_id": accepted["session_id"],
             "run_id": accepted["run_id"],
@@ -3247,12 +3283,67 @@ class SlackBot:
             "channel_id": channel_id,
             "thread_ts": thread_ts,
             "owner_user_id": owner_user_id,
+            "mode": mode,
+            "posted_approval_ids": list(previous.get("posted_approval_ids", [])),
+            "result_posted": False,
         }
+        self._register_agent_run(tracked)
+        return tracked
+
+    def _register_agent_run(self, tracked: Dict[str, Any]) -> None:
+        channel_id = tracked["channel_id"]
+        thread_ts = tracked["thread_ts"]
+        owner_user_id = tracked["owner_user_id"]
         self.agent_threads[self._thread_key(channel_id, thread_ts)] = tracked
-        self.agent_runs[accepted["run_id"]] = tracked
+        self.agent_runs[tracked["run_id"]] = tracked
         self.agent_user_runs[owner_user_id] = tracked
         self._mark_thread_active(channel_id, thread_ts)
-        return tracked
+
+    @staticmethod
+    def _agent_run_record(tracked: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "run_id": tracked["run_id"],
+            "session_id": tracked.get("session_id"),
+            "team_id": tracked.get("team_id"),
+            "channel_id": tracked.get("channel_id"),
+            "thread_ts": tracked.get("thread_ts"),
+            "owner_user_id": tracked.get("owner_user_id"),
+            "mode": tracked.get("mode"),
+            "posted_approval_ids": list(tracked.get("posted_approval_ids", [])),
+            "result_posted": bool(tracked.get("result_posted", False)),
+        }
+
+    async def _persist_agent_run(self, tracked: Dict[str, Any]):
+        """Persist one tracked run and drop finished runs it superseded."""
+        superseded = [
+            run_id
+            for run_id, other in self.agent_runs.items()
+            if run_id != tracked["run_id"]
+            and other.get("result_posted")
+            and other.get("channel_id") == tracked["channel_id"]
+            and other.get("thread_ts") == tracked["thread_ts"]
+        ]
+        for run_id in superseded:
+            self.agent_runs.pop(run_id, None)
+
+        if self._uses_granular_redis_state():
+            await self.state_store.persist_agent_run_state(
+                tracked["run_id"], self._agent_run_record(tracked)
+            )
+            for run_id in superseded:
+                await self.state_store.delete_agent_run_state(run_id)
+            return
+
+        await self._persist_state()
+
+    async def _forget_agent_run(self, tracked: Dict[str, Any]):
+        """Stop tracking a run in memory and in the configured state backend."""
+        self._forget_agent_session(tracked)
+        if self._uses_granular_redis_state():
+            await self.state_store.delete_agent_run_state(tracked["run_id"])
+            return
+
+        await self._persist_state()
 
     def _agent_run_for(
         self,
@@ -4353,6 +4444,13 @@ class SlackBot:
             key: self._deserialize_datetime(value)
             for key, value in snapshot.get("active_threads", {}).items()
         }
+        for record in snapshot.get("agent_runs", {}).values():
+            required = ("run_id", "session_id", "channel_id", "thread_ts")
+            if not isinstance(record, dict) or not all(
+                record.get(field) for field in (*required, "owner_user_id")
+            ):
+                continue
+            self._register_agent_run(self._agent_run_record(record))
 
         expired_sessions = self.conversation_manager.cleanup_expired_sessions(
             return_keys=True
@@ -4376,6 +4474,11 @@ class SlackBot:
                 },
                 "active_threads": {
                     key: value.isoformat() for key, value in self.active_threads.items()
+                },
+                "agent_runs": {
+                    run_id: self._agent_run_record(tracked)
+                    for run_id, tracked in self.agent_runs.items()
+                    if tracked.get("run_id") and tracked.get("session_id")
                 },
             }
             await self.state_store.save_state(snapshot)
