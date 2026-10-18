@@ -1,0 +1,16 @@
+{
+  "id": "discuss-no-diff",
+  "description": "A read-only question in discuss mode. The run must complete without a commit or diff.",
+  "task_mode": "discuss",
+  "workflow_mode": "single",
+  "expect": "no_diff",
+  "prompt": "How does eviction work in src/cache.cjs, and is there an off-by-one when capacity is 1? Explain only; do not change any files.",
+  "routing_text": "Explain LRU eviction in the cache module.",
+  "profile": {
+    "rubric": ["Answers the question without modifying the repository"],
+    "allowedPaths": ["src/"],
+    "baselinePaths": ["tests/"],
+    "checks": [{"name": "unit", "argv": ["node", "--test", "tests/cache.test.cjs"], "cwd": ".", "timeoutMs": 30000}]
+  },
+  "oracle": {"argv": ["node", "--test", ".eval-oracle/cache-oracle.test.cjs"]}
+}

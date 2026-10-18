@@ -1,0 +1,20 @@
+{
+  "id": "two-bug-fix",
+  "description": "Two independent bugs in separate modules; the structured workflow should investigate both and commit a fix that keeps the original tests.",
+  "task_mode": "implement",
+  "workflow_mode": "structured",
+  "expect": "pass",
+  "prompt": "Fix two independent bugs in src/counter.cjs and src/label.cjs. increment(2) must return 3 and label(2) must return count:2. Preserve both original tests. Investigate the two modules independently before writing.",
+  "routing_text": "Fix counter increment and count label in separate modules, preserving tests.",
+  "profile": {
+    "rubric": [
+      "The increment function adds exactly one and the label uses count:",
+      "Both original regression tests remain intact",
+      "Changes stay within the two source modules"
+    ],
+    "allowedPaths": ["src/"],
+    "baselinePaths": ["tests/"],
+    "checks": [{"name": "unit", "argv": ["node", "--test", "tests/runtime.test.cjs"], "cwd": ".", "timeoutMs": 30000}]
+  },
+  "oracle": {"argv": ["node", "--test", ".eval-oracle/two-bug-oracle.test.cjs"]}
+}
