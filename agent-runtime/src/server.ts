@@ -11,6 +11,7 @@ import { PiRunCapture } from "./pi-capture.js";
 import { AgentTelemetry, isCredentialKey } from "./telemetry.js";
 import { AgentTracing } from "./tracing.js";
 import { DockerPiProcess, type WriterContext } from "./container-runtime.js";
+import { budgetIdFor, outputTokenLimitFor, parseDefaultRunBudget } from "./run-budget.js";
 import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT, listAgentModels, resolveAgentModel } from "./agent-model.js";
 import { JevRouter, type JevMode } from "./jev-router.js";
 import { repositoryFromRemote, parseGitHubRepositories } from "./github-repository.js";
@@ -364,11 +365,13 @@ export async function createProductionServer() {
   }
   const priorActive = new Map<string, number>();
   const verificationBases = new Map<string, string>();
-  const budgetLedger = trustedProfile ? new BudgetLedger(path.join(runtimeRoot, "budget", "budget.sqlite")) : undefined;
+  // Every run is metered, with or without a trusted profile (no-profile runs get a default budget).
+  const budgetLedger = new BudgetLedger(path.join(runtimeRoot, "budget", "budget.sqlite"));
+  const defaultRunBudgetUsd = parseDefaultRunBudget(process.env);
   const workflowControl = trustedProfile ? new ControlStore(path.join(runtimeRoot, "control", "state.sqlite"), () => { void orchestrator.shutdown().catch(() => {}); }) : undefined;
   const releaseCoordinator = workflowControl?.acquireCoordinator();
   const quality = trustedProfile ? createQualityServices({
-    ...trustedProfile, control: workflowControl!, session: id => orchestrator.getRun(id).session_id, repoPath, worktreeRoot, verificationBases, priorActive, ledger: budgetLedger!, mapping: executionParents, root: runtimeRoot, image: actualImageDigest, network, gatewayUrl, telemetry, tracing,
+    ...trustedProfile, control: workflowControl!, session: id => orchestrator.getRun(id).session_id, repoPath, worktreeRoot, verificationBases, priorActive, ledger: budgetLedger, mapping: executionParents, root: runtimeRoot, image: actualImageDigest, network, gatewayUrl, telemetry, tracing,
     githubMcp: mcpServerIds.includes('github') ? { gatewayUrl: gatewayUrls.github!, token: (id,owner) => {
       const token = issueMcpToken({ version: 2, run: id, session: id, slackUser: owner, server: 'github', tools: [...MCP_SERVERS.github.directTools], mode: 'read_only', scope: { repository: mcpRepository! }, maxCalls: 4, expiry: Date.now() + 5 * 60_000 },deriveMcpServerSecret(mcpSigningSecret,'github'));
       telemetry?.addSecret(token,id); return token;
@@ -376,7 +379,8 @@ export async function createProductionServer() {
     phase: (id, phase, cost) => orchestrator.qualityPhase(id, phase, cost),
     token: (id, route) => {
       const model = resolveAgentModel(route?.modelRef ?? "openai/gpt-5.6-sol");
-      const token = issueGatewayToken({ runId: id, workflowRunId: executionParents.get(id), provider: model.provider, model: model.id, api: model.api, reasoningEffort: route?.effort ?? "high", expiresAt: executionExpiry(id), traceparent: tracing?.traceparent(id) }, gatewaySecret);
+      const role = route ? "investigator" : "grader";
+      const token = issueGatewayToken({ runId: id, workflowRunId: executionParents.get(id), role, outputTokenLimit: outputTokenLimitFor(role), provider: model.provider, model: model.id, api: model.api, reasoningEffort: route?.effort ?? "high", expiresAt: executionExpiry(id), traceparent: tracing?.traceparent(id) }, gatewaySecret);
       telemetry?.addSecret(token, id); return token;
     },
   }) : undefined;
@@ -451,7 +455,9 @@ export async function createProductionServer() {
           const selectedModel = resolveAgentModel(route.modelRef);
           const token = issueGatewayToken({
             runId,
-            workflowRunId: executionParents.get(runId),
+            workflowRunId: budgetIdFor(runId, executionParents, budgetLedger, defaultRunBudgetUsd),
+            role: "writer",
+            outputTokenLimit: outputTokenLimitFor("writer"),
             provider: selectedModel.provider,
             model: selectedModel.id,
             api: selectedModel.api,
@@ -482,7 +488,7 @@ export async function createProductionServer() {
           traceparent: tracing?.traceparent(runId),
           expiresAt: executionExpiry(runId),
         }, gatewaySecret); telemetry?.addSecret(token, runId); return token; } : undefined,
-        telemetry, session.id, tracing, undefined, id => budgetLedger?.prompt(id),
+        telemetry, session.id, tracing, undefined, id => budgetLedger.prompt(id),
       );
     },
   });
@@ -569,7 +575,7 @@ export async function createProductionServer() {
     }),
   });
   server.on("close", () => {
-    void orchestrator.shutdown().finally(async () => { await ciRuntime?.close(); await stopRetention?.(); releaseCoordinator?.(); releaseHostCoordinator(); hostCoordinator.close(); workflowControl?.close(); budgetLedger?.close(); await telemetry?.close().catch(() => {}); await tracing?.close().catch(() => {}); });
+    void orchestrator.shutdown().finally(async () => { await ciRuntime?.close(); await stopRetention?.(); releaseCoordinator?.(); releaseHostCoordinator(); hostCoordinator.close(); workflowControl?.close(); budgetLedger.close(); await telemetry?.close().catch(() => {}); await tracing?.close().catch(() => {}); });
   });
   return server;
   } catch (error) { releaseHostCoordinator(); hostCoordinator.close(); throw error; }

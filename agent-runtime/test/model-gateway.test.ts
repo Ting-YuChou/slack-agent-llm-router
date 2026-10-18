@@ -340,3 +340,70 @@ test("gateway rejects hosted tools, strips unknown betas and accepts Anthropic S
     await once(gateway, "close");
   }
 });
+
+test("with a budget store, tokens without a budget identity are refused and role caps reach the provider", async () => {
+  const signingSecret = "signing-secret";
+  const bodies: any[] = [];
+  const reserved: string[] = [];
+  const gateway = createModelGateway({
+    signingSecret, providerApiKeys: { openai: "real-openai" }, prices: { "openai/gpt-5.6-luna": { input: 1, output: 1 } },
+    budgetLedger: { reserve: async (workflow: string) => { reserved.push(workflow); }, settle: async () => {}, firstModel: async () => undefined } as any,
+    fetchFn: async (_input, init) => { bodies.push(JSON.parse(String(init?.body))); return new Response("{}", { status: 200 }); },
+  });
+  gateway.listen(0, "127.0.0.1");
+  await once(gateway, "listening");
+  const port = (gateway.address() as AddressInfo).port;
+  const luna = resolveAgentModel("openai/gpt-5.6-luna");
+  const send = (claims: Record<string, unknown>) => fetch(`http://127.0.0.1:${port}${luna.gatewayPath}`, {
+    method: "POST", headers: { authorization: `Bearer ${issueGatewayToken({ runId: "r", provider: luna.provider, model: luna.id, api: luna.api, reasoningEffort: "max", expiresAt: Date.now() + 60_000, ...claims } as any, signingSecret)}`, "content-type": "application/json" },
+    body: JSON.stringify({ model: luna.id, reasoning: { effort: "max" }, input: "x", max_output_tokens: 128000 }),
+  });
+  try {
+    const unbudgeted = await send({});
+    assert.equal(unbudgeted.status, 429);
+    assert.equal((await unbudgeted.json()).error.code, "workflow_budget_unavailable_or_exhausted");
+    assert.equal(bodies.length, 0);
+    const writer = await send({ workflowRunId: "run-budget", role: "writer", outputTokenLimit: 32768 });
+    assert.equal(writer.status, 200);
+    assert.equal(bodies[0].max_output_tokens, 32768);
+    assert.deepEqual(reserved, ["run-budget"]);
+  } finally {
+    gateway.close();
+    await once(gateway, "close");
+  }
+});
+
+test("a single run token cannot open more than four concurrent provider streams", { timeout: 5_000 }, async () => {
+  const signingSecret = "signing-secret";
+  let release!: () => void;
+  const hold = new Promise<void>((resolve) => { release = resolve; });
+  const gateway = createModelGateway({
+    signingSecret, providerApiKeys: { openai: "real-openai" },
+    fetchFn: async () => { await hold; return new Response("{}", { status: 200 }); },
+  });
+  gateway.listen(0, "127.0.0.1");
+  await once(gateway, "listening");
+  const port = (gateway.address() as AddressInfo).port;
+  const luna = resolveAgentModel("openai/gpt-5.6-luna");
+  const token = issueGatewayToken({ runId: "busy", provider: luna.provider, model: luna.id, api: luna.api, reasoningEffort: "max", expiresAt: Date.now() + 60_000 }, signingSecret);
+  const send = () => fetch(`http://127.0.0.1:${port}${luna.gatewayPath}`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ model: luna.id, reasoning: { effort: "max" }, input: "x" }) });
+  try {
+    const first = Array.from({ length: 4 }, send);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const fifth = await send();
+    assert.equal(fifth.status, 429);
+    assert.equal((await fifth.json()).error.code, "too_many_streams");
+    release();
+    assert.deepEqual((await Promise.all(first)).map((r) => r.status), [200, 200, 200, 200]);
+    assert.equal((await send()).status, 200);
+  } finally {
+    gateway.close();
+    await once(gateway, "close");
+  }
+});
+
+test("the gateway process refuses to start without a budget store", async () => {
+  const { gatewayLedgerFromEnv } = await import("../src/model-gateway.js");
+  assert.throws(() => gatewayLedgerFromEnv({}, "secret"), /PI_AGENT_BUDGET_RPC_URL/);
+  assert.ok(gatewayLedgerFromEnv({ PI_AGENT_BUDGET_RPC_URL: "http://host.docker.internal:3001" }, "secret"));
+});

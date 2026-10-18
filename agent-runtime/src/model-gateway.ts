@@ -20,6 +20,8 @@ import {
 import { verifyClassifierGatewayToken, verifyGatewayToken } from "./gateway-token.js";
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
+/** Pi issues one request at a time; extra parallel streams on one token indicate a process bypassing Pi. */
+const MAX_STREAMS_PER_TOKEN = 4;
 
 export type ProviderApiKeys = Partial<Record<AgentProvider | "openrouter", string>>;
 
@@ -34,6 +36,7 @@ export function createModelGateway(options: {
 }) {
   const fetchFn = options.fetchFn ?? fetch;
   const classifierCalls = new Map<string, { count: number; expiresAt: number }>();
+  const activeStreams = new Map<string, number>();
   return createServer(async (request, response) => {
     if (request.method === "GET" && request.url === "/health") {
       sendJson(response, 200, {
@@ -86,8 +89,10 @@ export function createModelGateway(options: {
         return;
       }
       classifierCalls.set(claims.runId, { count: budget.count + 1, expiresAt: claims.expiresAt });
-      let admission: Awaited<ReturnType<typeof admitBudget>>;
-      try { admission = await admitBudget(options.budgetLedger, options.prices ?? {}, claims.workflowRunId, `${claims.provider}/${claims.model}`, rawBody, claims.runId); rawBody = admission.body; }
+      let admission: { body: Buffer; data: (chunk: Buffer) => void; finish: () => unknown };
+      // Classifier tokens are bounded by maxCalls; only workflow-bound ones are also metered.
+      if (!claims.workflowRunId) admission = { body: rawBody, data: () => {}, finish: () => {} };
+      else try { admission = await admitBudget(options.budgetLedger, options.prices ?? {}, claims.workflowRunId, `${claims.provider}/${claims.model}`, rawBody, claims.runId); rawBody = admission.body; }
       catch { sendJson(response, 429, { error: { code: "workflow_budget_unavailable_or_exhausted" } }); return; }
       const requestStarted = performance.now();
       const sent = await Promise.resolve(options.budgetLedger?.firstModel(claims.runId)).catch(() => undefined);
@@ -152,9 +157,19 @@ export function createModelGateway(options: {
       });
       return;
     }
-    let admission: Awaited<ReturnType<typeof admitBudget>>;
-    try { admission = await admitBudget(options.budgetLedger, options.prices ?? {}, claims.workflowRunId, `${claims.provider}/${claims.model}`, rawBody, claims.runId); rawBody = admission.body; }
-    catch { sendJson(response, 429, { error: { code: "workflow_budget_unavailable_or_exhausted" } }); return; }
+    const active = activeStreams.get(claims.runId) ?? 0;
+    if (active >= MAX_STREAMS_PER_TOKEN) {
+      sendJson(response, 429, { error: { code: "too_many_streams", message: "Too many concurrent model requests for this run" } });
+      return;
+    }
+    let admission: { body: Buffer; data: (chunk: Buffer) => void; finish: () => Promise<{ truncated: boolean }> | void };
+    // Tests and local tools may run without a budget store; the gateway process itself refuses to start without one.
+    if (!options.budgetLedger) admission = { body: rawBody, data: () => {}, finish: () => {} };
+    else {
+      try { admission = await admitBudget(options.budgetLedger, options.prices ?? {}, claims.workflowRunId, `${claims.provider}/${claims.model}`, rawBody, claims.runId, claims.outputTokenLimit); rawBody = admission.body; }
+      catch { sendJson(response, 429, { error: { code: "workflow_budget_unavailable_or_exhausted", message: "Model budget unavailable or exhausted" } }); return; }
+    }
+    activeStreams.set(claims.runId, active + 1);
     const requestStarted = performance.now();
     const sent = await Promise.resolve(options.budgetLedger?.firstModel(claims.runId)).catch(() => undefined);
     if (sent !== undefined) options.tracing?.firstModel(claims.runId, claims.traceparent, sent);
@@ -178,7 +193,13 @@ export function createModelGateway(options: {
       span?.setStatus({code: SpanStatusCode.ERROR});
       if (!response.headersSent) sendJson(response, 502, { error: { code: "upstream_unavailable", message: "Model provider unavailable" } });
       else response.destroy();
-    } finally { await admission.finish(); disconnect.close(); span?.end(); }
+    } finally {
+      const remaining = (activeStreams.get(claims.runId) ?? 1) - 1;
+      if (remaining > 0) activeStreams.set(claims.runId, remaining); else activeStreams.delete(claims.runId);
+      const finished = await admission.finish();
+      if (finished?.truncated) span?.setAttribute("gen_ai.response.truncated", true);
+      disconnect.close(); span?.end();
+    }
   });
 }
 
@@ -307,6 +328,13 @@ function sendJson(response: ServerResponse, status: number, payload: unknown): v
   response.end(JSON.stringify(payload));
 }
 
+/** Every agent request must be metered; a gateway without a budget store would pass requests through unbounded. */
+export function gatewayLedgerFromEnv(env: NodeJS.ProcessEnv, secret: string): BudgetAdmissionLedger {
+  if (env.PI_AGENT_BUDGET_RPC_URL) return new BudgetRpcClient(env.PI_AGENT_BUDGET_RPC_URL, secret);
+  if (env.PI_AGENT_BUDGET_FILE) return new BudgetLedger(env.PI_AGENT_BUDGET_FILE);
+  throw new Error("PI_AGENT_BUDGET_RPC_URL (or PI_AGENT_BUDGET_FILE) is required so every model request is metered");
+}
+
 const entrypoint = process.argv[1] ? pathToFileURL(process.argv[1]).href : undefined;
 if (entrypoint === import.meta.url) {
   const signingSecret = process.env.MODEL_GATEWAY_SIGNING_SECRET ?? "";
@@ -320,7 +348,7 @@ if (entrypoint === import.meta.url) {
     throw new Error("MODEL_GATEWAY_SIGNING_SECRET and at least one provider API key are required");
   }
   const tracing = AgentTracing.fromEnvironment("pi-model-gateway");
-  const ledger = process.env.PI_AGENT_BUDGET_RPC_URL ? new BudgetRpcClient(process.env.PI_AGENT_BUDGET_RPC_URL,signingSecret) : process.env.PI_AGENT_BUDGET_FILE ? new BudgetLedger(process.env.PI_AGENT_BUDGET_FILE) : undefined;
+  const ledger = gatewayLedgerFromEnv(process.env, signingSecret);
   const prices = JSON.parse(process.env.PI_AGENT_MODEL_PRICES_JSON ?? "{}");
   const server = createModelGateway({ signingSecret, providerApiKeys, tracing, budgetLedger: ledger, prices });
   server.on("close", () => { if (ledger instanceof BudgetLedger) ledger.close(); });

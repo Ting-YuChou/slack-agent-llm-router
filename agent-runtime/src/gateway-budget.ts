@@ -1,20 +1,26 @@
 import { randomUUID } from "node:crypto";
 import type { BudgetAdmissionLedger } from './budget-rpc.js';
+import { priceFor } from "./run-budget.js";
 export interface ModelPrice { input: number; output: number }
-export async function admitBudget(ledger: BudgetAdmissionLedger | undefined, prices: Record<string, ModelPrice>, workflow: string | undefined, model: string, raw: Buffer, execution?: string) {
-  if (!workflow) return { body: raw, data: (_chunk: Buffer) => {}, finish: () => {} };
-  const price = prices[model];
+/** Without a role-bound limit (classifier, legacy tokens) output stays at the historical conservative cap. */
+const DEFAULT_OUTPUT_LIMIT = 4096;
+
+export async function admitBudget(ledger: BudgetAdmissionLedger | undefined, prices: Record<string, ModelPrice>, workflow: string | undefined, model: string, raw: Buffer, execution?: string, outputLimit = DEFAULT_OUTPUT_LIMIT) {
+  if (!workflow) throw new Error("budget_required");
+  const price = priceFor(model, prices);
   if (!ledger || !price || !Number.isFinite(price.input) || price.input <= 0 || !Number.isFinite(price.output) || price.output < 0) throw new Error("workflow_budget_setup_missing");
   const body = JSON.parse(raw.toString());
-  const limit = 4096;
-  if (model.startsWith("openai/")) body.max_output_tokens = Math.min(limit, Number(body.max_output_tokens) || limit);
-  else if (!model.startsWith("openrouter/typesafe/jev")) body.max_tokens = Math.min(limit, Number(body.max_tokens) || limit);
+  let effective = outputLimit;
+  if (model.startsWith("openai/")) body.max_output_tokens = effective = Math.min(outputLimit, Number(body.max_output_tokens) || outputLimit);
+  else if (!model.startsWith("openrouter/typesafe/jev")) body.max_tokens = effective = Math.min(outputLimit, Number(body.max_tokens) || outputLimit);
   const encoded = Buffer.from(JSON.stringify(body)); const id = randomUUID();
   // UTF-8 byte count overestimates input tokens; cache discounts are intentionally ignored.
-  await ledger.reserve(workflow, id, (encoded.length * price.input + limit * price.output) / 1_000_000, execution);
-  let pending = "", input: number | undefined, output: number | undefined;
+  await ledger.reserve(workflow, id, (encoded.length * price.input + effective * price.output) / 1_000_000, execution);
+  let pending = "", input: number | undefined, output: number | undefined, truncated = false;
   const decoder = new TextDecoder();
   function usage(value: any) {
+    // OpenAI Responses: incomplete_details; Anthropic: stop_reason; chat completions: finish_reason.
+    if (value?.response?.incomplete_details?.reason === "max_output_tokens" || value?.delta?.stop_reason === "max_tokens" || value?.stop_reason === "max_tokens" || value?.choices?.[0]?.finish_reason === "length") truncated = true;
     const candidate = value?.response?.usage ?? value?.message?.usage ?? value?.usage;
     if (!candidate) return;
     const i = candidate.input_tokens ?? candidate.prompt_tokens, o = candidate.output_tokens ?? candidate.completion_tokens;
@@ -33,6 +39,7 @@ export async function admitBudget(ledger: BudgetAdmissionLedger | undefined, pri
       try { usage(JSON.parse(pending)); } catch { /* unknown usage keeps its full reservation */ }
       try { await ledger.settle(id, input === undefined || output === undefined ? null : (input * price.input + output * price.output) / 1_000_000); }
       catch { /* Unacknowledged settlement retains the original reservation. */ }
+      return { truncated };
     },
   };
 }
