@@ -193,6 +193,11 @@ export class CodingAgentOrchestrator {
   private readonly quality?: QualityServices;
   private readonly captureTraceContext?: (id: string) => string | undefined;
   private readonly requireVerification: boolean;
+  /** Text of the assistant message currently streaming, per run; replaced by the final answer. */
+  private readonly streamingAnswers = new Map<string, string>();
+  /** Terminal runs already reported to observers, keyed to the update they were reported at (resume revives runs). */
+  private readonly observedFinal = new Map<string, string>();
+  private persistTimer?: ReturnType<typeof setTimeout>;
 
   private readonly captureState?: (runId: string) => { complete: boolean | null; reasons: string[] };
   private readonly observeRun?: (run: RunRecord) => void;
@@ -642,7 +647,7 @@ export class CodingAgentOrchestrator {
   private armDeadline(session: SessionRecord, run: RunRecord, ms: number): void {
     const previous = this.deadlines.get(run.run_id); if (previous) clearTimeout(previous);
     const runId = run.run_id;
-    const deadline = setTimeout(() => void this.timeoutRun(session, run), ms);
+    const deadline = setTimeout(() => this.background(this.timeoutRun(session, run)), ms);
     deadline.unref();
     this.deadlines.set(runId, deadline);
   }
@@ -665,13 +670,13 @@ export class CodingAgentOrchestrator {
     if (event.type === "usage") {
       const state = this.workflows.get(run.run_id); state?.budget.report(event.cost_usd);
       run.estimated_cost_usd = (run.estimated_cost_usd ?? 0) + event.cost_usd;
-      this.persistInBackground();
-      if (state && state.budget.estimatedUsd > state.budget.limitUsd) void this.failRun(session, run, "workflow_budget_exhausted", "Model budget exhausted");
+      this.persistSoon();
+      if (state && state.budget.estimatedUsd > state.budget.limitUsd) this.background(this.failRun(session, run, "workflow_budget_exhausted", "Model budget exhausted"));
       return;
     }
     if (event.type === "turn") {
       run.turn_count += 1;
-      this.persistInBackground();
+      this.persistSoon();
       return;
     }
     if (event.type === "approval") {
@@ -727,17 +732,25 @@ export class CodingAgentOrchestrator {
       } else {
         run.events.push(event);
       }
-      this.persistInBackground();
+      this.persistSoon();
+      return;
+    }
+    if (event.type === "answer_delta") {
+      const text = (this.streamingAnswers.get(run.run_id) ?? "") + event.text;
+      this.streamingAnswers.set(run.run_id, text);
+      run.answer = text;
+      this.persistSoon();
       return;
     }
     if (event.type === "answer") {
+      this.streamingAnswers.delete(run.run_id);
       run.answer = event.text;
       run.events.push(event);
-      this.persistInBackground();
+      this.persistSoon();
       return;
     }
     if (event.type === "error") {
-      void this.failRun(session, run, event.code, event.message);
+      this.background(this.failRun(session, run, event.code, event.message));
       return;
     }
     if (event.type === "settled") {
@@ -745,11 +758,11 @@ export class CodingAgentOrchestrator {
       if (event.outcome !== "completed") {
         if (this.workflows.has(run.run_id)) run.execution_status = "failed";
         const failure = settleFailure(event);
-        void this.failRun(session, run, failure.code, failure.message);
+        this.background(this.failRun(session, run, failure.code, failure.message));
         return;
       }
       if (this.workflows.has(run.run_id)) run.execution_status = "succeeded";
-      void this.completeRun(session, run);
+      this.background(this.completeRun(session, run));
     }
   }
 
@@ -1000,14 +1013,32 @@ export class CodingAgentOrchestrator {
 
   /** Event handlers cannot await persistence; a failure must fail closed rather than become an unhandled rejection. */
   private persistInBackground(): void {
-    this.persistState().catch((error: unknown) => {
+    this.background(this.persistState());
+  }
+
+  /** Fire-and-forget control work: persistence failures mark the runtime unhealthy instead of crashing Node. */
+  private background(work: Promise<unknown>): void {
+    work.catch((error: unknown) => {
       if (this.stateStore) this.stateStore.healthy = false;
       console.error("Agent runtime control state could not be persisted; runtime marked unhealthy", error instanceof Error ? error.message : error);
     });
   }
 
+  /** Observational updates (tokens, tools, turns, usage) coalesce into at most one write per second. */
+  private persistSoon(): void {
+    if (this.persistTimer) return;
+    this.persistTimer = setTimeout(() => { this.persistTimer = undefined; this.persistInBackground(); }, 1_000);
+    this.persistTimer.unref?.();
+  }
+
   private async persistState(): Promise<void> {
-    for (const run of this.runs.values()) this.notifyRun(run);
+    if (this.persistTimer) { clearTimeout(this.persistTimer); this.persistTimer = undefined; }
+    for (const run of this.runs.values()) {
+      if (isTerminal(run.status) && this.observedFinal.has(run.run_id) && this.observedFinal.get(run.run_id) === run.updated_at) continue;
+      this.notifyRun(run);
+      if (isTerminal(run.status)) { this.observedFinal.set(run.run_id, run.updated_at); this.streamingAnswers.delete(run.run_id); }
+      else this.observedFinal.delete(run.run_id);
+    }
     if (!this.stateStore) return;
     try { await this.stateStore.save({
       schema_version: 1,

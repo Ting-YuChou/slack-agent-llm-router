@@ -904,3 +904,81 @@ test("a no-profile diff over the limits fails as diff_limit_exceeded and rolls b
   assert.equal(calls.commits, 0);
   assert.equal(calls.rollback.length, 1);
 });
+
+function countingStore(failing = () => false) {
+  const store = { healthy: true, saves: 0, load: async () => ({ schema_version: 1, sessions: [], runs: [] }), takeExpiredSessions: () => [],
+    save: async () => { store.saves += 1; if (failing()) { store.healthy = false; throw new Error("disk full"); } } };
+  return store;
+}
+
+test("answer deltas accumulate into the run answer without becoming events", async () => {
+  const { orchestrator, process } = fixture();
+  const accepted = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "deltas", user_id: "U", prompt: "explain" });
+  process.emit({ type: "answer_delta", text: "Hel" });
+  process.emit({ type: "answer_delta", text: "lo" });
+  assert.equal(orchestrator.getRun(accepted.run_id).answer, "Hello");
+  process.emit({ type: "answer", text: "Hello world" });
+  assert.equal(orchestrator.getRun(accepted.run_id).answer, "Hello world");
+  process.emit({ type: "answer_delta", text: "Next" });
+  assert.equal(orchestrator.getRun(accepted.run_id).answer, "Next");
+  assert.equal(orchestrator.getRun(accepted.run_id).events.filter((event: any) => event.type === "answer_delta").length, 0);
+});
+
+test("observational events are persisted with a debounce; status transitions persist immediately", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const store = countingStore();
+  const { orchestrator, process } = fixture(undefined, undefined, store);
+  await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "debounce", user_id: "U", prompt: "explain" });
+  const before = store.saves;
+  for (let i = 0; i < 100; i++) process.emit({ type: "answer_delta", text: "x" });
+  for (let i = 0; i < 10; i++) process.emit({ type: "tool", phase: "start", tool_call_id: `t${i}`, tool: "read" });
+  process.emit({ type: "turn" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(store.saves, before);
+  t.mock.timers.tick(1_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(store.saves, before + 1);
+  process.emit({ type: "approval", approval_id: "a1", title: "Allow?", detail: "edit" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(store.saves, before + 2);
+});
+
+test("finished runs are not re-observed on every later persist", async () => {
+  const observed = new Map<string, number>();
+  const { orchestrator, process } = fixture(undefined, undefined, undefined, { observeRun: (run: any) => observed.set(run.run_id, (observed.get(run.run_id) ?? 0) + 1) });
+  const first = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "obs-1", user_id: "U", prompt: "one" });
+  process.emit(SETTLED);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(orchestrator.getRun(first.run_id).status, "completed");
+  const settledCount = observed.get(first.run_id)!;
+  await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "obs-2", user_id: "U", prompt: "two" });
+  process.emit({ type: "approval", approval_id: "a1", title: "Allow?", detail: "edit" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(observed.get(first.run_id), settledCount);
+});
+
+test("persistence failures during completion, failure and timeout never become unhandled rejections", async () => {
+  let failSaves = false;
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on("unhandledRejection", onUnhandled);
+  const originalError = console.error;
+  console.error = () => undefined;
+  try {
+    for (const [thread, trigger] of [["save-complete", "settle"], ["save-fail", "error"], ["save-timeout", "timeout"]] as const) {
+      failSaves = false;
+      const store = countingStore(() => failSaves);
+      const f = fixture(undefined, undefined, store, { deadlineMs: trigger === "timeout" ? 5 : 10_000 });
+      await f.orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: thread, user_id: "U", prompt: "fix" });
+      failSaves = true;
+      if (trigger === "settle") f.process.emit(SETTLED);
+      if (trigger === "error") f.process.emit({ type: "error", code: "container_exited", message: "gone" });
+      if (trigger === "timeout") await new Promise((resolve) => setTimeout(resolve, 20));
+      for (let i = 0; i < 8; i++) await new Promise((resolve) => setImmediate(resolve));
+    }
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    console.error = originalError;
+  }
+  assert.deepEqual(unhandled, []);
+});

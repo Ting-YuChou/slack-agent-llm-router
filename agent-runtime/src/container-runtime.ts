@@ -220,7 +220,7 @@ export class DockerPiProcess implements AgentProcess {
       },
       onRecord: record => { capture?.onRecord(record); this.tracing?.rpc(runId, record); this.onRecord?.(record); },
       onEvent: (event) => {
-        if (event.type === "answer" && event.text.trim()) this.startup?.firstOutput();
+        if ((event.type === "answer" || event.type === "answer_delta") && event.text.trim()) this.startup?.firstOutput();
         if (event.type === "settled") {
           this.hasSession = true;
           void this.finalizeCapture(bridge, capture).then(() => this.bridge === bridge ? this.stopActiveContainer() : undefined).then(

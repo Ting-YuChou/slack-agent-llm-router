@@ -177,3 +177,8 @@ test("a rejected prompt command surfaces as an error instead of waiting for the 
   bridge.feed(JSON.stringify({ id: "run-1", type: "response", command: "prompt", success: false, error: "busy" }) + "\n");
   assert.deepEqual(events, [{ type: "error", code: "prompt_rejected", message: "Pi rejected the prompt before it started" }]);
 });
+
+test("streaming text deltas are distinct from the final assistant answer", () => {
+  assert.deepEqual(sanitizeRpcEvent({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Hel" } }), { type: "answer_delta", text: "Hel" });
+  assert.deepEqual(sanitizeRpcEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Hello" }] } }), { type: "answer", text: "Hello" });
+});

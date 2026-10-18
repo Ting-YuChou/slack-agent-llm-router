@@ -7,6 +7,7 @@ export type PublicRunEvent =
   | { type: "usage"; cost_usd: number }
   | { type: "tool"; phase: "start" | "end"; tool_call_id: string; tool: string; input?: Record<string, unknown>; is_error?: boolean; result_bytes?: number }
   | { type: "approval"; approval_id: string; title: string; detail: string; timeout_ms?: number }
+  | { type: "answer_delta"; text: string }
   | { type: "answer"; text: string }
   | { type: "settled"; outcome: RunOutcome; limit?: LimitKind; stop_reason?: string; error_message?: string }
   | { type: "error"; code: string; message: string };
@@ -52,7 +53,7 @@ export function sanitizeRpcEvent(record: Record<string, unknown>): PublicRunEven
     const deltaType = delta.type;
     if (typeof deltaType === "string" && deltaType.startsWith("thinking")) return null;
     if (deltaType !== "text_delta" || typeof delta.delta !== "string") return null;
-    return { type: "answer", text: delta.delta };
+    return { type: "answer_delta", text: delta.delta };
   }
   if (type === "message_end") {
     const message = isRecord(record.message) ? record.message : {};

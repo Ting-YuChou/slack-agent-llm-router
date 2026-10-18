@@ -46,3 +46,19 @@ test("corrupt control state is not silently treated as a fresh runtime", async (
     await assert.rejects(new RuntimeStateStore(path.join(root, "state.json")).load());
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test("a failed write does not poison later saves, and a successful save restores health", async () => {
+  const { mkdir, readFile, rm } = await import("node:fs/promises");
+  const root = await mkdtemp(path.join(tmpdir(), "pi-state-recover-"));
+  try {
+    const file = path.join(root, "state.json");
+    const store = new RuntimeStateStore(file);
+    await mkdir(`${file}.tmp`);
+    await assert.rejects(store.save({ schema_version: 1, sessions: [], runs: [] }));
+    assert.equal(store.healthy, false);
+    await rm(`${file}.tmp`, { recursive: true });
+    await store.save({ schema_version: 1, sessions: [], runs: [{ run_id: "after" } as any] });
+    assert.equal(store.healthy, true);
+    assert.match(await readFile(file, "utf8"), /"after"/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
