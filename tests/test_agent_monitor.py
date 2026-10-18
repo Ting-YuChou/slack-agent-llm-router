@@ -3,12 +3,12 @@
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from slack.bot_real import RedisSlackStateStore, SlackBot
-from src.agent_runtime import AgentRuntimeError
+from src.agent_runtime import AgentRuntimeError, AgentRuntimeUnauthorized
 
 
 class FakeRedis:
@@ -344,3 +344,74 @@ async def test_restored_agent_thread_without_active_run_does_not_monitor(tmp_pat
 
     assert runtime.calls == []
     assert bot._is_agent_thread("C1", "9.0")
+
+
+def approval_click(user_id="U1", action_id="pi_agent_approve"):
+    return {
+        "user": {"id": user_id},
+        "team": {"id": "T1"},
+        "channel": {"id": "C1"},
+        "container": {"channel_id": "C1", "message_ts": "5.0", "thread_ts": "1.0"},
+        "message": {"ts": "5.0", "thread_ts": "1.0"},
+        "actions": [
+            {
+                "action_id": action_id,
+                "value": '{"run_id":"R1","session_id":"S1","approval_id":"A1"}',
+            }
+        ],
+    }
+
+
+def click_bot(tmp_path, decide):
+    bot = file_bot(tmp_path, agent_runtime=SimpleNamespace(decide=decide))
+    bot.web_client = SimpleNamespace(chat_postEphemeral=AsyncMock())
+    bot._start_agent_monitor = Mock()
+    return bot
+
+
+@pytest.mark.asyncio
+async def test_approval_click_for_untracked_run_rebuilds_tracking(tmp_path):
+    bot = click_bot(tmp_path, AsyncMock())
+
+    await bot._handle_agent_interactive(approval_click())
+
+    bot.agent_runtime_client.decide.assert_awaited_once_with(
+        "R1", "A1", "U1", "approve"
+    )
+    tracked = bot.agent_runs["R1"]
+    assert {
+        key: tracked[key]
+        for key in ("session_id", "team_id", "channel_id", "thread_ts")
+    } == {"session_id": "S1", "team_id": "T1", "channel_id": "C1", "thread_ts": "1.0"}
+    assert tracked["owner_user_id"] == "U1"
+    assert tracked["posted_approval_ids"] == ["A1"]
+    bot._start_agent_monitor.assert_called_once_with(tracked)
+    bot.web_client.chat_postEphemeral.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_click_for_untracked_run_explains_ownership(tmp_path):
+    bot = click_bot(tmp_path, AsyncMock(side_effect=AgentRuntimeUnauthorized("no")))
+
+    await bot._handle_agent_interactive(approval_click(user_id="U2"))
+
+    text = bot.web_client.chat_postEphemeral.await_args.kwargs["text"]
+    assert "Only the Agent session owner" in text
+    assert "R1" not in bot.agent_runs
+    bot._start_agent_monitor.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tracked_before", [False, True])
+async def test_failed_decision_is_reported_ephemerally(tmp_path, tracked_before):
+    bot = click_bot(
+        tmp_path, AsyncMock(side_effect=AgentRuntimeError("boom", status=500))
+    )
+    if tracked_before:
+        track(bot)
+
+    await bot._handle_agent_interactive(approval_click())
+
+    text = bot.web_client.chat_postEphemeral.await_args.kwargs["text"]
+    assert "could not be recorded" in text
+    bot._start_agent_monitor.assert_not_called()

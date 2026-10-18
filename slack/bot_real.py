@@ -3814,12 +3814,12 @@ class SlackBot:
         channel_id = payload.get("channel", {}).get("id")
         try:
             value = json.loads(action.get("value", "{}"))
-            tracked = self.agent_runs.get(value["run_id"])
+            run_id = value["run_id"]
+            approval_id = value["approval_id"]
         except (KeyError, TypeError, ValueError):
-            tracked = None
-        if not tracked:
             return
-        if tracked.get("owner_user_id") != user_id:
+        tracked = self.agent_runs.get(run_id)
+        if tracked and tracked.get("owner_user_id") != user_id:
             if hasattr(self.web_client, "chat_postEphemeral"):
                 await self.web_client.chat_postEphemeral(
                     channel=channel_id,
@@ -3830,22 +3830,44 @@ class SlackBot:
         decision = "approve" if action["action_id"] == "pi_agent_approve" else "reject"
         try:
             await self.agent_runtime_client.decide(
-                value["run_id"], value["approval_id"], user_id, decision
+                run_id, approval_id, user_id, decision
             )
-        except AgentRuntimeUnauthorized:
+        except AgentRuntimeError as exc:
+            if isinstance(exc, AgentRuntimeUnauthorized):
+                text = "Only the Agent session owner can approve this action."
+            elif isinstance(exc, AgentRuntimeConflict):
+                text = "This approval has expired or was already used."
+            else:
+                logger.warning("Agent decision failed for %s", run_id)
+                text = "Agent decision could not be recorded. Please try again."
             await self.web_client.chat_postEphemeral(
-                channel=channel_id,
-                user=user_id,
-                text="Only the Agent session owner can approve this action.",
+                channel=channel_id, user=user_id, text=text
             )
             return
-        except AgentRuntimeConflict:
-            await self.web_client.chat_postEphemeral(
-                channel=channel_id,
-                user=user_id,
-                text="This approval has expired or was already used.",
+        if not tracked:
+            # The bot lost this run (e.g. restarted without state); the runtime
+            # accepted the owner's decision, so resume tracking from the card.
+            container = payload.get("container") or {}
+            message = payload.get("message") or {}
+            thread_ts = (
+                container.get("thread_ts")
+                or message.get("thread_ts")
+                or container.get("message_ts")
+                or message.get("ts")
             )
-            return
+            if not value.get("session_id") or not channel_id or not thread_ts:
+                return
+            team = payload.get("team")
+            team_id = team.get("id") if isinstance(team, dict) else None
+            tracked = self._track_agent_run(
+                value,
+                team_id=team_id or self._extract_team_id(payload) or "unknown-team",
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                owner_user_id=user_id,
+            )
+        if approval_id not in tracked.setdefault("posted_approval_ids", []):
+            tracked["posted_approval_ids"].append(approval_id)
         self._start_agent_monitor(tracked)
 
     def _mark_thread_active(self, channel_id: Optional[str], thread_ts: Optional[str]):
