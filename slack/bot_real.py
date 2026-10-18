@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 MAX_QUERY_TOKENS = 8192
 STATE_SCHEMA_VERSION = 1
 POSTED_CI_JOBS_LIMIT = 1000
+UNVERIFIED_LABEL = "⚠️ 未驗證（沒有 verification profile）"
 MEMORY_SLASH_ONLY_MESSAGE = (
     "Memory commands are only available through Slack slash commands. "
     "Use `/llm remember`, `/llm memories`, or `/llm forget`."
@@ -1403,8 +1404,11 @@ class SlackMessageHandler:
                 "*Mode:* Read-only discussion; no verification or commit."
             )
         if result.get("verification_status") or result.get("grader_status"):
+            verification = result.get("verification_status", "pending")
+            if verification == "unverified":
+                verification = UNVERIFIED_LABEL
             detail_sections.append(
-                f"*Verification:* {result.get('verification_status', 'pending')} / "
+                f"*Verification:* {verification} / "
                 f"*Grader:* {result.get('grader_status', 'pending')} / "
                 f"*Phase:* {result.get('phase', 'unknown')}"
             )

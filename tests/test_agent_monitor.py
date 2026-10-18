@@ -528,3 +528,44 @@ async def test_ci_job_claims_are_shared_through_redis():
     second.state_store = store
     await second._restore_state()
     assert await second._claim_ci_job("J1") is False
+
+
+UNVERIFIED = "⚠️ 未驗證（沒有 verification profile）"
+
+
+def test_unverified_result_is_flagged_in_the_response():
+    text = SlackMessageHandler._format_agent_response(
+        {
+            "status": "completed",
+            "answer": "Done.",
+            "verification_status": "unverified",
+            "grader_status": "skipped",
+            "commit": "abc123",
+        }
+    )
+
+    assert f"*Verification:* {UNVERIFIED}" in text
+    assert "*Verification:* unverified" not in text
+
+
+def test_unverified_flag_survives_a_long_answer():
+    text = SlackMessageHandler._format_agent_response(
+        {
+            "status": "completed",
+            "answer": "x" * 5000,
+            "verification_status": "unverified",
+        },
+        max_length=500,
+    )
+
+    assert UNVERIFIED in text
+    assert len(text) <= 500
+
+
+def test_passed_verification_is_shown_unchanged():
+    text = SlackMessageHandler._format_agent_response(
+        {"status": "completed", "verification_status": "passed"}
+    )
+
+    assert "*Verification:* passed" in text
+    assert UNVERIFIED not in text
