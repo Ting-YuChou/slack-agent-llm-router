@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import type { PublicRunEvent } from "../src/pi-rpc.js";
 import { CodingAgentOrchestrator, RuntimeConflictError, RuntimeForbiddenError } from "../src/orchestrator.js";
+import { DiffLimitError, ProtectedFileError } from "../src/worktree-manager.js";
 
 const SETTLED = { type: "settled", outcome: "completed" } as const;
 
@@ -26,11 +27,12 @@ function fixture(router?: { route(text?: string): Promise<any> }, quality?: any,
     diff: { files: ["src/a.ts"], bytes: 10, stat: "1 file changed" },
     commitImpl: async () => "b".repeat(40),
     commitMessages: [] as string[],
+    inspectError: undefined as Error | undefined,
     startedModels: [] as string[],
   };
   const worktrees = {
     create: async () => ({ path: "/managed/w1", branch: "pi-agent/20260801-run", baselineCommit: "a".repeat(40) }),
-    inspectDiff: async () => calls.diff,
+    inspectDiff: async () => { if (calls.inspectError) throw calls.inspectError; return calls.diff; },
     commit: async (_path: string, message: string) => { calls.commits += 1; calls.commitMessages.push(message); return calls.commitImpl(); },
     rollback: async (_path: string, baseline: string) => { calls.rollback.push(baseline); },
     remove: async () => undefined,
@@ -841,4 +843,64 @@ test("requireVerification rejects implement without a trusted profile but still 
   );
   const discussed = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "req-2", user_id: "U", prompt: "why?", task_mode: "discuss" });
   assert.equal(discussed.status, "starting");
+});
+
+function gatedFixture(evaluate: () => Promise<any>) {
+  return fixture(undefined, { execution: () => {}, assertUnchanged: async () => {}, maxCostUsd: 5, evaluate });
+}
+
+async function settleWorkflow(f: ReturnType<typeof fixture>, thread: string) {
+  const accepted = await f.orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: thread, user_id: "U", prompt: "fix" });
+  for (let i = 0; i < 3; i++) await new Promise((resolve) => setImmediate(resolve));
+  f.process.emit(SETTLED);
+  for (let i = 0; i < 8; i++) await new Promise((resolve) => setImmediate(resolve));
+  return f.orchestrator.getRun(accepted.run_id);
+}
+
+test("a scope violation the gate cannot repair fails as scope_violation, not quality_gate_unavailable", async () => {
+  const f = gatedFixture(async () => ({ action: "fail", failure: { code: "scope_violation", files: ["docs/x.md"] }, candidate: { hash: "", path: "/w" }, verification: { status: "failed", checks: [] } }));
+  const run = await settleWorkflow(f, "scope-fail");
+  assert.equal(run.error?.code, "scope_violation");
+  assert.match(run.error?.message ?? "", /docs\/x\.md/);
+  assert.equal(f.calls.commits, 0);
+});
+
+test("diff limit violations inside the gate report diff_limit_exceeded", async () => {
+  const f = gatedFixture(async () => { throw new Error("unreachable"); });
+  f.calls.inspectError = new DiffLimitError("Changed file limit exceeded (51/50)");
+  const run = await settleWorkflow(f, "diff-limit-gate");
+  assert.equal(run.error?.code, "diff_limit_exceeded");
+  assert.match(run.error?.message ?? "", /51\/50/);
+});
+
+test("protected file changes report protected_file_modified", async () => {
+  const f = gatedFixture(async () => { throw new Error("unreachable"); });
+  f.calls.inspectError = new ProtectedFileError("Protected file modification detected: .env");
+  const run = await settleWorkflow(f, "protected-gate");
+  assert.equal(run.error?.code, "protected_file_modified");
+});
+
+test("budget exhaustion during the gate reports workflow_budget_exhausted", async () => {
+  const f = gatedFixture(async () => { throw new Error("workflow_budget_exhausted"); });
+  const run = await settleWorkflow(f, "budget-gate");
+  assert.equal(run.error?.code, "workflow_budget_exhausted");
+});
+
+test("other gate failures stay quality_gate_unavailable but keep a bounded cause", async () => {
+  const f = gatedFixture(async () => { throw new Error("docker daemon unreachable"); });
+  const run = await settleWorkflow(f, "gate-cause");
+  assert.equal(run.error?.code, "quality_gate_unavailable");
+  assert.match(run.error?.message ?? "", /docker daemon unreachable/);
+});
+
+test("a no-profile diff over the limits fails as diff_limit_exceeded and rolls back", async () => {
+  const { orchestrator, process, calls } = fixture();
+  calls.inspectError = new DiffLimitError("Total diff limit exceeded (2000000/1048576)");
+  const accepted = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "diff-limit-plain", user_id: "U", prompt: "fix" });
+  process.emit(SETTLED);
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+  const run = orchestrator.getRun(accepted.run_id);
+  assert.equal(run.error?.code, "diff_limit_exceeded");
+  assert.equal(calls.commits, 0);
+  assert.equal(calls.rollback.length, 1);
 });

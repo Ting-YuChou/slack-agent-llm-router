@@ -126,3 +126,25 @@ test("invalid or unsupported grader claims become unknown and cannot trigger rep
   const result = await gate.evaluate({ run_id: "r", worktree: "/workspace", baseline: "a".repeat(40), requirement: "fix", attempt: 1, signal: new AbortController().signal });
   assert.equal(result.action, "fail"); assert.equal(result.grade?.status, "unknown");
 });
+
+test("quality gate turns a scope violation into a repair that lists the files, then a scope_violation failure", async () => {
+  const { QualityGate } = await import("../src/quality-gate.js");
+  const { ScopeViolationError } = await import("../src/candidate-scope.js");
+  let verified = 0;
+  const gate = new QualityGate({
+    profile: { id: "test", rubric: ["correct"], maxRepairs: 1 },
+    snapshot: async () => { throw new ScopeViolationError(["docs/notes.md"]); },
+    verify: async () => { verified++; return { status: "passed", checks: [] }; },
+    grade: async () => ({}),
+  });
+  const input = { run_id: "r", worktree: "/w", baseline: "a".repeat(40), requirement: "fix the parser", attempt: 1, signal: new AbortController().signal };
+  const first = await gate.evaluate(input);
+  assert.equal(first.action, "repair");
+  assert.deepEqual(first.failure, { code: "scope_violation", files: ["docs/notes.md"] });
+  assert.match(first.repair_prompt ?? "", /docs\/notes\.md/);
+  assert.match(first.repair_prompt ?? "", /fix the parser/);
+  const last = await gate.evaluate({ ...input, attempt: 2 });
+  assert.equal(last.action, "fail");
+  assert.equal(last.failure?.code, "scope_violation");
+  assert.equal(verified, 0);
+});

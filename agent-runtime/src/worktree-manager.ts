@@ -14,11 +14,15 @@ export interface WorktreeInfo {
   baselineCommit: string;
 }
 
+export class ProtectedFileError extends DiffLimitError {}
+
 export interface DiffLimits {
   maxFiles: number;
   maxBytes: number;
   maxSingleFileBytes: number;
 }
+
+export const DEFAULT_DIFF_LIMITS: DiffLimits = { maxFiles: 50, maxBytes: 1024 * 1024, maxSingleFileBytes: 256 * 1024 };
 
 export interface DiffSummary {
   files: string[];
@@ -61,7 +65,7 @@ export class WorktreeManager {
       .split("\0").filter(Boolean);
     const protectedFile = [...files, ...ignored].find(isProtectedChangedPath);
     if (protectedFile) {
-      throw new DiffLimitError(`Protected file modification detected: ${protectedFile}`);
+      throw new ProtectedFileError(`Protected file modification detected: ${protectedFile}`);
     }
     if (files.length > limits.maxFiles) {
       throw new DiffLimitError(`Changed file limit exceeded (${files.length}/${limits.maxFiles})`);

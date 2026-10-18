@@ -1,5 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+import path from "node:path";
+
+import { filesOutsideScope } from "../dist/src/candidate-scope.js";
+import type { WriterContext } from "../dist/src/container-runtime.js";
 import { classifyBash, isApprovedSkillRead, validateWorkspacePath } from "../dist/src/policy.js";
 import { codemodeMcpPrompt, type McpServerId } from "../dist/src/mcp-config.js";
 
@@ -23,6 +27,25 @@ function approvedSkillPaths(): string[] {
   } catch {
     return [];
   }
+}
+
+function writerContext(): WriterContext | undefined {
+  if (!process.env.PI_AGENT_WRITER_JSON) return undefined;
+  try {
+    const parsed = JSON.parse(process.env.PI_AGENT_WRITER_JSON) as WriterContext;
+    if (!Array.isArray(parsed.allowedPaths) || !parsed.allowedPaths.every((item) => typeof item === "string")) throw new Error("allowedPaths");
+    return parsed;
+  } catch { throw new Error("PI_AGENT_WRITER_JSON must describe allowedPaths, checks, rubric and diffLimits"); }
+}
+
+function scopePrompt(context: WriterContext): string {
+  const limits = context.diffLimits;
+  return [
+    `Only modify files under these paths: ${context.allowedPaths.join(", ")}. Writes elsewhere are blocked, and out-of-scope changes fail delivery.`,
+    `After you finish, trusted checks run in a separate verifier: ${context.checks.join(", ") || "(none)"}. Make them pass without weakening tests.`,
+    `An independent reviewer grades these criteria: ${context.rubric.join(", ") || "(none)"}.`,
+    `Delivery limits: at most ${limits.maxFiles} files changed, ${Math.floor(limits.maxBytes / 1024)} KiB total diff, ${Math.floor(limits.maxSingleFileBytes / 1024)} KiB per file. Prefer targeted edit calls over rewriting whole files.`,
+  ].join(" ");
 }
 
 function previewWrite(tool: string, input: Record<string, unknown>): string {
@@ -63,6 +86,13 @@ export default function policyExtension(pi: ExtensionAPI) {
     });
   }
 
+  const scope = writerContext();
+  if (scope) {
+    pi.on("before_agent_start", (event) => {
+      event.systemPromptOptions.sections.scope = scopePrompt(scope);
+    });
+  }
+
   pi.on("input", () => {
     turns = 0;
     toolCalls = 0;
@@ -97,6 +127,10 @@ export default function policyExtension(pi: ExtensionAPI) {
     }
 
     if (event.toolName === "write" || event.toolName === "edit") {
+      const target = path.posix.normalize(String((event.input as Record<string, unknown>).path ?? ""));
+      if (scope && filesOutsideScope([target], scope.allowedPaths).length) {
+        return { block: true, reason: `outside_allowed_paths: ${target}; this task may only modify ${scope.allowedPaths.join(", ")}` };
+      }
       if (event.toolName === "write" && typeof event.input.content === "string" && Buffer.byteLength(event.input.content) > 256 * 1024) {
         return { block: true, reason: "Single write exceeds 256 KiB" };
       }

@@ -146,3 +146,17 @@ test("writer turn and tool-call limits come from host configuration", () => {
   assert.match(rendered, /PI_AGENT_MAX_TURNS=3 /);
   assert.match(rendered, /PI_AGENT_MAX_TOOL_CALLS=5 /);
 });
+
+test("writer receives trusted-profile constraints; discussion mode drops them", () => {
+  const base = {
+    name: "pi-session-1", image: "pi-agent@sha256:abc", network: "pi-model-only", worktreePath: "/w", gitMetadataPath: "/repo/.git",
+    sessionStatePath: "/s", gatewayUrl: "http://model-gateway:8080/v1", gatewayToken: "t", modelRef: "openai/gpt-5.6-luna",
+    extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
+  };
+  const writerContext = { allowedPaths: ["src"], checks: ["pytest"], rubric: ["tests_cover_change"], diffLimits: { maxFiles: 50, maxBytes: 1048576, maxSingleFileBytes: 262144 } };
+  const args = buildAgentDockerArgs({ ...base, writerContext });
+  const env = args[args.findIndex((arg) => arg.startsWith("PI_AGENT_WRITER_JSON="))];
+  assert.deepEqual(JSON.parse(env.slice("PI_AGENT_WRITER_JSON=".length)), writerContext);
+  assert.doesNotMatch(buildAgentDockerArgs({ ...base, writerContext, taskMode: "discuss" }).join(" "), /PI_AGENT_WRITER_JSON/);
+  assert.doesNotMatch(buildAgentDockerArgs(base).join(" "), /PI_AGENT_WRITER_JSON/);
+});

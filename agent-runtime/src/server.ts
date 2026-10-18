@@ -10,7 +10,7 @@ import { randomUUID, createHash, timingSafeEqual } from "node:crypto";
 import { PiRunCapture } from "./pi-capture.js";
 import { AgentTelemetry, isCredentialKey } from "./telemetry.js";
 import { AgentTracing } from "./tracing.js";
-import { DockerPiProcess } from "./container-runtime.js";
+import { DockerPiProcess, type WriterContext } from "./container-runtime.js";
 import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT, listAgentModels, resolveAgentModel } from "./agent-model.js";
 import { JevRouter, type JevMode } from "./jev-router.js";
 import { repositoryFromRemote, parseGitHubRepositories } from "./github-repository.js";
@@ -32,9 +32,9 @@ import { createCiRuntime } from "./ci-runtime.js";
 import { taskMode } from "./task-mode.js";
 import { workflowMode } from "./structured-workflow.js";
 import type { CiRepairs } from "./ci-repair.js";
-import { loadProfile } from "./verification.js";
+import { loadProfile, type VerificationProfile } from "./verification.js";
 import { createQualityServices } from "./workflow-runtime.js";
-import { WorktreeManager } from "./worktree-manager.js";
+import { DEFAULT_DIFF_LIMITS, WorktreeManager } from "./worktree-manager.js";
 
 const exec = promisify(execFile);
 export const DEFAULT_AGENT_RUNTIME_PORT = 3001;
@@ -436,6 +436,7 @@ export async function createProductionServer() {
           continueSession: session.restored,
           safeCommands: parseSafeCommands(process.env.PI_AGENT_SAFE_COMMANDS),
           limits: agentLimits,
+          ...(trustedProfile ? { writerContext: writerContextFor(trustedProfile.profile) } : {}),
           user: containerUser,
           ...(mcpServerIds.length > 0 ? {
             mcp: {
@@ -676,6 +677,11 @@ function positiveInteger(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
+/** Constraints the writer sees up front and the policy extension enforces at write time. */
+export function writerContextFor(profile: VerificationProfile): WriterContext {
+  return { allowedPaths: [...profile.allowedPaths], checks: profile.checks.map((check) => check.name), rubric: [...profile.rubric], diffLimits: { ...DEFAULT_DIFF_LIMITS } };
+}
+
 export function parseAgentLimits(env: NodeJS.ProcessEnv): { maxTurns: number; maxToolCalls: number } {
   const read = (key: string, fallback: number) => {
     if (env[key] === undefined || env[key] === "") return fallback;

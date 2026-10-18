@@ -195,3 +195,9 @@ test("agent limits parse positive integers and fall back to defaults", async () 
   assert.throws(() => parseAgentLimits({ PI_AGENT_MAX_TURNS: "0" }), /PI_AGENT_MAX_TURNS/);
   assert.throws(() => parseAgentLimits({ PI_AGENT_MAX_TOOL_CALLS: "lots" }), /PI_AGENT_MAX_TOOL_CALLS/);
 });
+
+test("writer context mirrors the trusted profile's paths, check names, rubric and delivery limits", async () => {
+  const { writerContextFor } = await import("../src/server.js");
+  const context = writerContextFor({ allowedPaths: ["src", "tests"], rubric: ["correct"], checks: [{ name: "pytest", argv: ["pytest"], cwd: ".", timeoutMs: 1 }] } as any);
+  assert.deepEqual(context, { allowedPaths: ["src", "tests"], checks: ["pytest"], rubric: ["correct"], diffLimits: { maxFiles: 50, maxBytes: 1048576, maxSingleFileBytes: 262144 } });
+});

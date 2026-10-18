@@ -9,6 +9,7 @@ import type { RuntimeStateStore } from "./runtime-state.js";
 import { workflowMode, type WorkflowMode, type WorkflowNode } from "./structured-workflow.js";
 import { WorkflowBudget } from "./workflow-budget.js";
 import type { Candidate, GateInput, GateResult } from "./quality-gate.js";
+import { DEFAULT_DIFF_LIMITS, DiffLimitError, ProtectedFileError } from "./worktree-manager.js";
 
 export interface QualityServices {
   evaluate(input: GateInput): Promise<GateResult>;
@@ -761,7 +762,7 @@ export class CodingAgentOrchestrator {
         await this.quality!.execution(workflow.executionId, run.run_id, "discussion", workflow.attempt, "end", session.process.queueMs);
         workflow.budget.check();
       }
-      const diff = await this.worktrees.inspectDiff(session.worktreePath, { maxFiles: 50, maxBytes: 1024 * 1024, maxSingleFileBytes: 256 * 1024 });
+      const diff = await this.worktrees.inspectDiff(session.worktreePath, DEFAULT_DIFF_LIMITS);
       if (isTerminal(run.status) || this.terminalClaims.has(run.run_id) || workflow?.controller.signal.aborted) return;
       if (diff.files.length || diff.bytes) {
         await this.failRun(session, run, "discussion_workspace_changed", "Read-only discussion produced unexpected changes; delivery blocked"); return;
@@ -786,7 +787,7 @@ export class CodingAgentOrchestrator {
       try {
         await this.quality.execution(workflow.executionId, run.run_id, "implementation", workflow.attempt, "end", session.process.queueMs);
         workflow.budget.check();
-        await this.worktrees.inspectDiff(session.worktreePath, { maxFiles: 50, maxBytes: 1024 * 1024, maxSingleFileBytes: 256 * 1024 });
+        await this.worktrees.inspectDiff(session.worktreePath, DEFAULT_DIFF_LIMITS);
         run.phase = "verifying"; await this.persistState();
         workflow.operation = this.quality.evaluate(input);
         const result = await workflow.operation; workflow.operation = undefined;
@@ -801,24 +802,34 @@ export class CodingAgentOrchestrator {
           await this.startExecution(session, run, workflow, result.repair_prompt!); return;
         }
         if (result.action === "fail") {
+          if (result.failure?.code === "scope_violation") {
+            await this.failRun(session, run, "scope_violation", `Changes outside the allowed paths were not delivered: ${result.failure.files.slice(0, 10).join(", ")}`); return;
+          }
           await this.failRun(session, run, "verification_failed", "Candidate retained as an isolated artifact; verification/grading did not pass"); return;
         }
         await this.quality.assertUnchanged(result.candidate, input);
         workflow.controller.signal.throwIfAborted();
         run.phase = "finalizing"; await this.persistState();
-      } catch {
+      } catch (error) {
         workflow.operation = undefined;
-        if (!isTerminal(run.status) && !this.terminalClaims.has(run.run_id)) await this.failRun(session, run, "quality_gate_unavailable", "Required verification could not complete");
+        if (!isTerminal(run.status) && !this.terminalClaims.has(run.run_id)) {
+          const failure = gateFailure(error);
+          await this.failRun(session, run, failure.code, failure.message);
+        }
         return;
       }
     }
+    // Claim synchronously after settle so cancellation cannot race finalization.
     if (!this.claimTerminal(run)) return;
     try {
-      const diff = await this.worktrees.inspectDiff(session.worktreePath, {
-        maxFiles: 50,
-        maxBytes: 1024 * 1024,
-        maxSingleFileBytes: 256 * 1024,
-      });
+      let diff: Awaited<ReturnType<Worktrees["inspectDiff"]>>;
+      try { diff = await this.worktrees.inspectDiff(session.worktreePath, DEFAULT_DIFF_LIMITS); }
+      catch (error) {
+        if (!(error instanceof DiffLimitError)) throw error;
+        const failure = gateFailure(error);
+        await this.failClaimedRun(session, run, failure.code, failure.message);
+        return;
+      }
       this.notifyLifecycle(run.run_id, "commit", "start");
       const commit = await this.worktrees.commit(session.worktreePath, buildCommitMessage(run));
       this.notifyLifecycle(run.run_id, "commit", "end");
@@ -842,6 +853,10 @@ export class CodingAgentOrchestrator {
 
   private async failRun(session: SessionRecord, run: RunRecord, code: string, message: string): Promise<void> {
     if (!this.claimTerminal(run)) return;
+    await this.failClaimedRun(session, run, code, message);
+  }
+
+  private async failClaimedRun(session: SessionRecord, run: RunRecord, code: string, message: string): Promise<void> {
     if (!await this.stopBeforeRollback(session, run)) {
       await this.persistState();
       return;
@@ -1022,6 +1037,15 @@ export class CodingAgentOrchestrator {
       throw error;
     }
   }
+}
+
+/** Classify a quality-gate exception so users see what actually blocked delivery. */
+function gateFailure(error: unknown): { code: string; message: string } {
+  const detail = error instanceof Error ? error.message.slice(0, 200) : "unknown error";
+  if (error instanceof ProtectedFileError) return { code: "protected_file_modified", message: `${detail}; changes were not delivered` };
+  if (error instanceof DiffLimitError) return { code: "diff_limit_exceeded", message: `${detail}; split the change or reduce its size` };
+  if (detail === "workflow_budget_exhausted") return { code: "workflow_budget_exhausted", message: "Workflow cost or time budget was exhausted before verification finished" };
+  return { code: "quality_gate_unavailable", message: `Required verification could not complete (${detail})` };
 }
 
 /** Trailers let reviewers trace a delivered commit back to its run and how (or whether) it was verified. */

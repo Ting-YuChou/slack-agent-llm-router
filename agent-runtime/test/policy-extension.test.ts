@@ -56,3 +56,35 @@ test("turn limit records which limit was hit before aborting", () => withWorkspa
   assert.deepEqual(policy.log, ["entry:pi_agent_limit", "abort"]);
   assert.deepEqual(policy.entries[0], { customType: "pi_agent_limit", data: { kind: "turns", limit: 1 } });
 }));
+
+const writerContext = { allowedPaths: ["src"], checks: ["pytest", "tsc"], rubric: ["tests_cover_change"], diffLimits: { maxFiles: 50, maxBytes: 1048576, maxSingleFileBytes: 262144 } };
+
+test("writer is told its allowed paths, trusted checks and diff limits up front", async () => {
+  const policy = await loadPolicy({ PI_AGENT_WRITER_JSON: JSON.stringify(writerContext) });
+  const event = { systemPromptOptions: { sections: {} as Record<string, string> } };
+  await policy.fire("before_agent_start", event, {});
+  const scope = event.systemPromptOptions.sections.scope ?? "";
+  for (const expected of ["src", "pytest", "tsc", "tests_cover_change", "50 files"]) assert.match(scope, new RegExp(expected));
+});
+
+test("writes outside the allowed paths are blocked at write time with an actionable reason", () => withWorkspace(async (cwd) => {
+  const policy = await loadPolicy({ PI_AGENT_WRITER_JSON: JSON.stringify(writerContext) });
+  let confirms = 0;
+  const ctx = { cwd, abort: () => undefined, ui: { confirm: async () => { confirms++; return true; } } };
+  await policy.fire("input", {}, ctx);
+  const blocked = await policy.fire("tool_call", { toolName: "write", input: { path: "docs/notes.md", content: "x" } }, ctx) as { block: boolean; reason: string };
+  assert.equal(blocked.block, true);
+  assert.match(blocked.reason, /outside_allowed_paths: docs\/notes\.md/);
+  assert.match(blocked.reason, /src/);
+  const edit = await policy.fire("tool_call", { toolName: "edit", input: { path: "../escape/src/a.ts", edits: [] } }, ctx) as { block: boolean };
+  assert.equal(edit.block, true);
+  assert.equal(await policy.fire("tool_call", { toolName: "write", input: { path: "src/a.ts", content: "x" } }, ctx), undefined);
+  assert.equal(confirms, 1);
+}));
+
+test("without a writer context, writes are not path-scoped beyond workspace policy", () => withWorkspace(async (cwd) => {
+  const policy = await loadPolicy({});
+  const ctx = { cwd, abort: () => undefined, ui: { confirm: async () => true } };
+  await policy.fire("input", {}, ctx);
+  assert.equal(await policy.fire("tool_call", { toolName: "write", input: { path: "docs/notes.md", content: "x" } }, ctx), undefined);
+}));
