@@ -290,3 +290,53 @@ test("gateway bounds a stalled Jev classifier request", async () => {
     await once(gateway, "close");
   }
 });
+
+test("gateway rejects hosted tools, strips unknown betas and accepts Anthropic SDK query strings", async () => {
+  const signingSecret = "signing-secret";
+  const calls: Array<{ url: string; headers: Headers; body: any }> = [];
+  const gateway = createModelGateway({
+    signingSecret, providerApiKeys: { openai: "real-openai", anthropic: "real-anthropic" },
+    fetchFn: async (input, init) => {
+      calls.push({ url: String(input), headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) });
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  gateway.listen(0, "127.0.0.1");
+  await once(gateway, "listening");
+  const port = (gateway.address() as AddressInfo).port;
+  const tokenFor = (ref: string) => { const model = resolveAgentModel(ref); return issueGatewayToken({ runId: "r", provider: model.provider, model: model.id, api: model.api, reasoningEffort: model.reasoningEffort, expiresAt: Date.now() + 60_000 }, signingSecret); };
+  try {
+    const luna = resolveAgentModel("openai/gpt-5.6-luna");
+    const hosted = await fetch(`http://127.0.0.1:${port}${luna.gatewayPath}`, {
+      method: "POST", headers: { authorization: `Bearer ${tokenFor(luna.ref)}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: luna.id, reasoning: { effort: "max" }, input: "x", tools: [{ type: "mcp", server_url: "https://evil.example" }] }),
+    });
+    assert.equal(hosted.status, 400);
+    assert.deepEqual(await hosted.json(), { error: { code: "request_field_not_allowed", message: "Request field is not allowed through the gateway: tools[0].type" } });
+    assert.equal(calls.length, 0);
+
+    const sonnet = resolveAgentModel("anthropic/claude-sonnet-4-6");
+    const ok = await fetch(`http://127.0.0.1:${port}${sonnet.gatewayPath}?beta=true`, {
+      method: "POST", headers: { "x-api-key": tokenFor(sonnet.ref), "content-type": "application/json", "anthropic-beta": "mcp-client-2025-04-04,interleaved-thinking-2025-05-14" },
+      body: JSON.stringify({ model: sonnet.id, messages: [], output_config: { effort: "max" } }),
+    });
+    assert.equal(ok.status, 200);
+    assert.equal(calls[0]?.url, sonnet.upstreamUrl);
+    assert.equal(calls[0]?.headers.get("anthropic-beta"), "interleaved-thinking-2025-05-14");
+
+    const responses = await fetch(`http://127.0.0.1:${port}${luna.gatewayPath}`, {
+      method: "POST", headers: { authorization: `Bearer ${tokenFor(luna.ref)}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: luna.id, reasoning: { effort: "max" }, input: "x" }),
+    });
+    assert.equal(responses.status, 200);
+    assert.equal(calls[1]?.body.store, false);
+
+    const wrong = await fetch(`http://127.0.0.1:${port}/anthropic/v1/other?beta=true`, {
+      method: "POST", headers: { "x-api-key": tokenFor(sonnet.ref), "content-type": "application/json" }, body: "{}",
+    });
+    assert.equal(wrong.status, 403);
+  } finally {
+    gateway.close();
+    await once(gateway, "close");
+  }
+});

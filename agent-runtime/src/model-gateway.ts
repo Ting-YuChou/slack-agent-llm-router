@@ -1,6 +1,7 @@
 import { BudgetRpcClient, type BudgetAdmissionLedger } from "./budget-rpc.js";
 import { BudgetLedger } from "./budget-ledger.js";
 import { admitBudget, type ModelPrice } from "./gateway-budget.js";
+import { allowedAnthropicBeta, sanitizeAgentRequest } from "./gateway-request-policy.js";
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { pipeline } from "node:stream/promises";
 import { SpanStatusCode, type Span } from "@opentelemetry/api";
@@ -124,7 +125,8 @@ export function createModelGateway(options: {
       return;
     }
     const model = resolveAgentModel(`${claims.provider}/${claims.model}`);
-    if (request.url !== model.gatewayPath) {
+    // SDKs may append query strings (Anthropic beta client posts to /v1/messages?beta=true).
+    if (requestPath(request.url) !== model.gatewayPath) {
       sendJson(response, 403, { error: { code: "provider_path_mismatch", message: "Gateway token cannot use this provider path" } });
       return;
     }
@@ -138,6 +140,12 @@ export function createModelGateway(options: {
       rawBody = await readBody(request);
       const body = JSON.parse(rawBody.toString("utf8"));
       if (!validateAgentModelRequest(body, model, claims.reasoningEffort)) throw new Error("invalid model request");
+      const policy = sanitizeAgentRequest(model.api, body);
+      if (!policy.ok) {
+        sendJson(response, 400, { error: { code: "request_field_not_allowed", message: `Request field is not allowed through the gateway: ${policy.field}` } });
+        return;
+      }
+      rawBody = Buffer.from(JSON.stringify(policy.body));
     } catch {
       sendJson(response, 400, {
         error: { code: "invalid_request", message: "Request does not match the token-bound model configuration" },
@@ -263,13 +271,19 @@ function upstreamHeaders(
     "content-type": "application/json",
     "x-pi-run-id": runId,
   };
-  for (const name of ["accept", "anthropic-version", "anthropic-beta"]) {
+  for (const name of ["accept", "anthropic-version"]) {
     const value = request.headers[name];
     if (typeof value === "string") headers[name] = value;
   }
+  const beta = allowedAnthropicBeta(typeof request.headers["anthropic-beta"] === "string" ? request.headers["anthropic-beta"] : undefined);
+  if (beta) headers["anthropic-beta"] = beta;
   if (model.provider === "anthropic") headers["x-api-key"] = apiKey;
   else headers.authorization = `Bearer ${apiKey}`;
   return headers;
+}
+
+function requestPath(url: string | undefined): string {
+  try { return new URL(url ?? "", "http://gateway.invalid").pathname; } catch { return ""; }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
