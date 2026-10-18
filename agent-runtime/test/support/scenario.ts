@@ -122,12 +122,15 @@ export async function runScenario(scenario: Scenario): Promise<ScenarioResult> {
     await git(repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "-m", "baseline");
     const worktrees = new WorktreeManager({ repoPath: repo, worktreeRoot: path.join(root, "worktrees"), baseRef: "main" });
     let scripted!: ScriptedProcess;
+    // Runs turn terminal before their rollback finishes; wait for it before inspecting the worktree.
+    const pending = new Set<Promise<unknown>>();
+    const track = <T>(work: Promise<T>): Promise<T> => { pending.add(work); void work.finally(() => pending.delete(work)).catch(() => undefined); return work; };
     const orchestrator = new CodingAgentOrchestrator({
       worktrees: {
         create: (id: string, base?: string) => worktrees.create(id, base),
         inspectDiff: (p: string, limits: Parameters<WorktreeManager["inspectDiff"]>[1]) => worktrees.inspectDiff(p, limits),
         commit: (p: string, message: string) => withIdentity(() => worktrees.commit(p, message)),
-        rollback: (p: string, baseline: string) => worktrees.rollback(p, baseline),
+        rollback: (p: string, baseline: string) => track(worktrees.rollback(p, baseline)),
         remove: (p: string) => worktrees.remove(p),
       },
       startProcess: async (session: { worktreePath: string }, onEvent: (event: PublicRunEvent) => void) => {
@@ -139,6 +142,7 @@ export async function runScenario(scenario: Scenario): Promise<ScenarioResult> {
     });
     const created = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: scenario.name, user_id: "U", prompt: "Fix the bug in src/a.js" });
     const run = await waitForTerminal(() => orchestrator.getRun(created.run_id));
+    while (pending.size) await Promise.allSettled([...pending]);
     const session = (orchestrator as unknown as { sessions: Map<string, { worktreePath: string; baselineCommit: string }> }).sessions.get(created.session_id)!;
     const commits = Number(await git(session.worktreePath, "rev-list", "--count", "HEAD")) - 1;
     const dirty = await git(session.worktreePath, "status", "--porcelain");
