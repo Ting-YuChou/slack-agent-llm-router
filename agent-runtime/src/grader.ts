@@ -3,6 +3,8 @@ import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { DockerPiProcess, type AgentContainerOptions } from "./container-runtime.js";
 import { HarnessError } from "./error-taxonomy.js";
+import { DEFAULT_GRADER_MODEL } from "./grader-config.js";
+import type { RouteDecision } from "./jev-router.js";
 import type { PublicRunEvent } from "./pi-rpc.js";
 import type { DiffLimits } from "./worktree-manager.js";
 import { deletedPaths, verifyGradeEvidence } from "./grade-evidence.js";
@@ -14,12 +16,15 @@ export interface GraderConstraints { allowedPaths: string[]; diffLimits: DiffLim
 export interface GraderOptions {
   image: string; network: string; gatewayUrl: string; candidate: Candidate; statePath: string; executionId: string; rubric: string[];
   constraints?: GraderConstraints;
+  route?: RouteDecision;
 }
+
+const DEFAULT_GRADER_ROUTE: RouteDecision = { modelRef: DEFAULT_GRADER_MODEL, effort: "high", source: "grader" };
 export function graderDockerOptions(input: GraderOptions): Omit<AgentContainerOptions, "gatewayToken"> {
   return {
     name: `pi-grader-${input.executionId.slice(0, 8)}`, image: input.image, network: input.network,
     worktreePath: input.candidate.path, gitMetadataPath: "", sessionStatePath: input.statePath,
-    gatewayUrl: input.gatewayUrl, modelRef: "openai/gpt-5.6-sol", reasoningEffort: "high",
+    gatewayUrl: input.gatewayUrl, modelRef: (input.route ?? DEFAULT_GRADER_ROUTE).modelRef, reasoningEffort: (input.route ?? DEFAULT_GRADER_ROUTE).effort,
     extensionPaths: ["/opt/pi/extensions/model-gateway.ts", "/opt/pi/extensions/grader.ts"],
     pluginPaths: [], skillPaths: [], toolNames: ["read", "grep", "find", "ls", "submit_grade"],
     continueSession: false, readOnlyWorkspace: true, user: `${process.getuid?.()}:${process.getgid?.()}`,
@@ -57,12 +62,13 @@ export class GraderRunner {
   async stop() { await this.process?.close(); this.stopped = true; }
   constructor(private readonly options: {
     image: string; network: string; gatewayUrl: string; stateRoot: string;
-    token: (id: string) => string; telemetry?: AgentTelemetry; tracing?: AgentTracing;
+    token: (id: string, route: RouteDecision) => string; telemetry?: AgentTelemetry; tracing?: AgentTracing;
     prompt?: (id: string) => void;
     cost?: (cost: number) => Promise<void>;
     execution?: (id: string, parent: string, phase: "start" | "end", cost?: number, queueMs?: number) => void | Promise<void>;
     createProcess?: GraderProcessFactory;
     constraints?: GraderConstraints;
+    route?: RouteDecision;
     timeoutMs?: number;
   }) {}
   async grade(candidate: Candidate, verification: VerificationResult, requirement: string, rubric: string[], parent: string, signal: AbortSignal): Promise<Grade> {
@@ -91,7 +97,7 @@ export class GraderRunner {
     };
     const dockerOptions = graderDockerOptions({ ...this.options, candidate, statePath, executionId: id, rubric });
     const process = this.options.createProcess?.(dockerOptions, onEvent, onRecord)
-      ?? new DockerPiProcess(dockerOptions, () => this.options.token(id), onEvent, undefined, undefined, this.options.telemetry, id, this.options.tracing, onRecord, this.options.prompt);
+      ?? new DockerPiProcess(dockerOptions, (_run, selected) => this.options.token(id, selected), onEvent, undefined, undefined, this.options.telemetry, id, this.options.tracing, onRecord, this.options.prompt);
     this.process = process; this.stopped = false;
     const abort = () => { reject(signal.reason instanceof Error ? signal.reason : new Error("grader_aborted")); };
     signal.addEventListener("abort", abort, { once: true });
@@ -99,7 +105,7 @@ export class GraderRunner {
     const timer = setTimeout(() => reject(new HarnessError("grader_timeout", `Grader did not submit within ${Math.round(timeoutMs / 1000)}s`)), timeoutMs);
     try {
       signal.throwIfAborted();
-      process.prompt(id, graderPrompt(candidate, verification, requirement, rubric, this.options.constraints), { modelRef: "openai/gpt-5.6-sol", effort: "high", source: "grader" });
+      process.prompt(id, graderPrompt(candidate, verification, requirement, rubric, this.options.constraints), this.options.route ?? DEFAULT_GRADER_ROUTE);
       await done; signal.throwIfAborted();
       if (submitted) {
         try { await verifyGradeEvidence(submitted, candidate.path, deletedPaths(candidate.patch)); }

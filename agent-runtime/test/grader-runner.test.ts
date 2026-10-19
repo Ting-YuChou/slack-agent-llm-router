@@ -92,3 +92,16 @@ test("a submission citing evidence missing from the snapshot is rejected on the 
       (error: unknown) => error instanceof HarnessError && error.causeCode === "grader_invalid_submission" && /evidence/.test(error.message));
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test("the configured grader route reaches the container and the prompt", async () => {
+  let modelRef = ""; let promptRoute: unknown;
+  const route = { modelRef: "openai/gpt-5.6-luna", effort: "max" as const, source: "grader" };
+  const r = new GraderRunner({ image: "img", network: "net", gatewayUrl: "http://gw", stateRoot: `${process.env.TMPDIR ?? "/tmp"}/grader-runner-test`, token: () => "t", route,
+    createProcess: (options, onEvent, onRecord) => ({
+      prompt: (_id: string, _text: string, selected?: unknown) => { modelRef = options.modelRef; promptRoute = selected; setImmediate(() => { for (const step of [...submit(valid), settled]) { if (step.record) onRecord(step.record); if (step.event) onEvent(step.event); } }); },
+      close: async () => {},
+    }) });
+  await grade(r);
+  assert.equal(modelRef, "openai/gpt-5.6-luna");
+  assert.deepEqual(promptRoute, route);
+});
