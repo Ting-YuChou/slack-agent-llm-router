@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { guardedHandler } from "./http-handler.js";
 
 import { verifyMcpToken, type McpClaims } from "./mcp-token.js";
 import type { McpServerId } from "./mcp-config.js";
@@ -42,7 +43,7 @@ export function createMcpGatewayServer(options: McpGatewayOptions) {
   const maxRequestBytes = options.maxRequestBytes ?? DEFAULT_MAX_REQUEST_BYTES;
   const maxResultBytes = options.maxResultBytes ?? DEFAULT_MAX_RESULT_BYTES;
 
-  return createServer(async (request, response) => {
+  return createServer(guardedHandler("mcp-gateway", async (request, response) => {
     if (request.method === "GET" && request.url === "/healthz") {
       const healthy = await options.healthCheck?.().catch(() => false) ?? true;
       sendJson(response, healthy ? 200 : 503, { status: healthy ? "healthy" : "unhealthy", server: options.server });
@@ -161,7 +162,7 @@ export function createMcpGatewayServer(options: McpGatewayOptions) {
       audit(options, claims, tool === "unknown" ? method : tool, started, false, gatewayError.code, 0);
       sendError(response, gatewayError.status, gatewayError.code, gatewayError.message);
     }
-  });
+  }));
 }
 
 class GatewayRequestError extends Error {

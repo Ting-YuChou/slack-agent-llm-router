@@ -5,9 +5,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { createAgentHttpServer } from '../src/server.js';
 import { BudgetLedger } from '../src/budget-ledger.js';
+import * as budgetRpcModule from "../src/budget-rpc.js";
 
 test('gateway budget RPC reserves on the sole host ledger and rejects callers without its secret', async () => {
-  const m = await import('../src/budget-rpc.js' as string).catch(() => null); assert.ok(m,'budget RPC client exists');
+  const m = budgetRpcModule; assert.ok(m,'budget RPC client exists');
   const root = mkdtempSync(path.join(os.tmpdir(),'budget-rpc-')); const ledger = new BudgetLedger(path.join(root,'db'));
   let healthy = true;
   const server = createAgentHttpServer({ token: 'runtime',orchestrator: {} as any,health: () => ({}),acceptRuns: () => healthy,budgetLedger: ledger,budgetSecret: 'gateway' } as any);

@@ -129,3 +129,26 @@ test("recovery bounds directory enumeration including non-session files", async 
     assert.ok(reasons.includes("session_recovery_failed"));
   } finally {await fs.rm(root,{recursive:true,force:true});}
 });
+
+test("a failed capture write never becomes an unhandled rejection", async () => {
+  const { PiRunCapture } = await moduleUnderTest();
+  const reasons: string[] = [];
+  const telemetry = {
+    record: async () => { throw new Error("outbox full"); },
+    // Marking the run incomplete can itself fail; the write must still settle quietly.
+    markIncomplete: (_run: string, reason: string) => { reasons.push(reason); throw new Error("ledger closed"); },
+  };
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const capture = new PiRunCapture(telemetry, "run-1", "session-1", "/nonexistent/session", "container");
+    capture.onCommand({ type: "prompt" });
+    capture.onRecord({ type: "turn_start" });
+    await new Promise(resolve => setTimeout(resolve, 20));
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+  assert.deepEqual(unhandled, []);
+  assert.deepEqual(reasons, ["capture_write_failed", "capture_write_failed"]);
+});

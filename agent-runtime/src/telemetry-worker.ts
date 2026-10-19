@@ -34,7 +34,7 @@ const timer = setInterval(() => {
   if (!publishing && !closed)
     active = publish();
 }, 1000);
-parentPort?.on("message", async (message) => {
+async function handleMessage(message: { op: "append" | "close"; id: unknown; records: Parameters<TelemetryStore["appendMany"]>[0] }) {
   try {
     if (message.op === "append")
       store.appendMany(message.records);
@@ -50,4 +50,5 @@ parentPort?.on("message", async (message) => {
   catch {
     parentPort?.postMessage({ id: message.id, error: "telemetry_write_failed" });
   }
-});
+}
+parentPort?.on("message", (message) => { handleMessage(message).catch(() => undefined); });

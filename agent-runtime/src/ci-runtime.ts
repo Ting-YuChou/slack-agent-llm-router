@@ -70,7 +70,7 @@ export async function createCiRuntime(options: { priorActive: Map<string, number
   });
   ci.recover();
   let draining = false; let lastPrune = 0;
-  const timer = setInterval(async () => {
+  const drain = async () => {
     if (draining) return; draining = true;
     try {
       if (Date.now() - lastPrune > 86400000) { ci.pruneDiagnostics(); lastPrune = Date.now(); }
@@ -93,7 +93,9 @@ export async function createCiRuntime(options: { priorActive: Map<string, number
       }
     } catch { /* durable inbox remains pending; next bounded poll retries */ }
     finally { draining = false; }
-  }, 5_000); timer.unref();
+  };
+  // drain catches everything itself; the outer catch only keeps the interval from leaking a rejection.
+  const timer = setInterval(() => { drain().catch(() => undefined); }, 5_000); timer.unref();
   const webhook = process.env.PI_AGENT_CI_WEBHOOK_ENABLED === "true" ? createCiWebhook({ store, secret: process.env.GITHUB_WEBHOOK_SECRET ?? "", repository: profile.repository, workflows: profile.workflows }) : undefined;
   if (webhook) await new Promise<void>((resolve, reject) => { webhook.once("error", reject); webhook.listen(Number(process.env.PI_AGENT_CI_WEBHOOK_PORT ?? 3003), "127.0.0.1", resolve); });
   return { ci, close: async () => { clearInterval(timer); await new Promise<void>(resolve => { if (webhook) webhook.close(() => resolve()); else resolve(); }); store.close(); } };

@@ -318,7 +318,9 @@ export class DockerPiProcess implements AgentProcess {
       })).catch(() => {
         if (this.bridge !== bridge || this.closing) return;
         this.onEvent({ type: "error", code: "pi_configuration_failed", message: "Pi model configuration could not be verified" });
-        void this.stopActiveContainer();
+        this.stopActiveContainer().catch(() => {
+          if (this.bridge === bridge) this.onEvent({ type: "error", code: "container_stop_failed", message: "Agent container could not be confirmed stopped" });
+        });
       });
     };
     this.queueAbort?.abort(); const controller = new AbortController(); this.queueAbort = controller;

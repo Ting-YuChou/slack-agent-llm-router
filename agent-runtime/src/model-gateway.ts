@@ -3,6 +3,7 @@ import { BudgetLedger } from "./budget-ledger.js";
 import { admitBudget, type ModelPrice } from "./gateway-budget.js";
 import { allowedAnthropicBeta, sanitizeAgentRequest } from "./gateway-request-policy.js";
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
+import { guardedHandler } from "./http-handler.js";
 import { pipeline } from "node:stream/promises";
 import { SpanStatusCode, type Span } from "@opentelemetry/api";
 import { AgentTracing } from "./tracing.js";
@@ -37,7 +38,7 @@ export function createModelGateway(options: {
   const fetchFn = options.fetchFn ?? fetch;
   const classifierCalls = new Map<string, { count: number; expiresAt: number }>();
   const activeStreams = new Map<string, number>();
-  return createServer(async (request, response) => {
+  return createServer(guardedHandler("model-gateway", async (request, response) => {
     if (request.method === "GET" && request.url === "/health") {
       sendJson(response, 200, {
         status: "healthy",
@@ -200,7 +201,7 @@ export function createModelGateway(options: {
       if (finished?.truncated) span?.setAttribute("gen_ai.response.truncated", true);
       disconnect.close(); span?.end();
     }
-  });
+  }));
 }
 
 export function upstreamDisconnect(response: ServerResponse, span?: Span): {signal: AbortSignal; close: () => void} {

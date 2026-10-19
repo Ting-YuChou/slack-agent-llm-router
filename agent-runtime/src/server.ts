@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { guardedHandler } from "./http-handler.js";
 import path from "node:path";
 import os from "node:os";
 import { pathToFileURL } from "node:url";
@@ -61,7 +62,7 @@ interface ServerOptions {
 }
 
 export function createAgentHttpServer(options: ServerOptions) {
-  return createServer(async (request, response) => {
+  return createServer(guardedHandler("agent-runtime", async (request, response) => {
     try {
       const url = new URL(request.url ?? "/", "http://runtime.local");
       if (url.pathname.startsWith('/internal/budget/')) {
@@ -228,7 +229,7 @@ export function createAgentHttpServer(options: ServerOptions) {
         sendError(response, 502, "runtime_error", "Agent runtime request failed");
       }
     }
-  });
+  }));
 }
 
 export async function settleCaptureWrite(runId: string, written: boolean, telemetry: Pick<AgentTelemetry, "releaseRun">, persistFailure: (runId: string, reason: string) => Promise<void>): Promise<void> {
@@ -330,7 +331,7 @@ export async function createProductionServer() {
   if (mcpServerIds.length > 0) {
     const healthTimer = setInterval(() => {
       for (const id of mcpServerIds.filter((entry) => entry !== "codegraph")) {
-        void probeMcpGateway(gatewayUrls[id]!).then((reachable) => { mcpServerReachable[id] = reachable; });
+        probeMcpGateway(gatewayUrls[id]!).then((reachable) => { mcpServerReachable[id] = reachable; }, () => { mcpServerReachable[id] = false; });
       }
     }, positiveInteger(process.env.PI_AGENT_MCP_HEALTH_INTERVAL_MS, 5_000));
     healthTimer.unref();
@@ -420,7 +421,7 @@ export async function createProductionServer() {
       if (!observed.has(run.run_id) && ["running", "awaiting_approval"].includes(run.status)) tracing?.startRun(run.run_id, run.session_id);
       observed.set(run.run_id, signature);
       tracing?.describeRun(run.run_id,run.model,run.reasoning_effort);
-      void telemetry?.record(run.run_id, run.session_id, "run", {...summary, traceparent: tracing?.traceparent(run.run_id)}).then(async written => {
+      telemetry?.record(run.run_id, run.session_id, "run", {...summary, traceparent: tracing?.traceparent(run.run_id)}).then(async written => {
         if (["running", "awaiting_approval"].includes(run.status)) return;
         await settleCaptureWrite(run.run_id, written, telemetry, (id, reason) => orchestrator.markCaptureIncomplete(id, reason));
       }).catch(() => console.error(JSON.stringify({event:"agent_capture_state_persist_failed",run_id:run.run_id})));
@@ -595,7 +596,8 @@ export async function createProductionServer() {
     }),
   });
   server.on("close", () => {
-    void orchestrator.shutdown().finally(async () => { await ciRuntime?.close(); await stopRetention?.(); releaseCoordinator?.(); releaseHostCoordinator(); hostCoordinator.close(); workflowControl?.close(); budgetLedger.close(); await telemetry?.close().catch(() => {}); await tracing?.close().catch(() => {}); });
+    orchestrator.shutdown().finally(async () => { await ciRuntime?.close(); await stopRetention?.(); releaseCoordinator?.(); releaseHostCoordinator(); hostCoordinator.close(); workflowControl?.close(); budgetLedger.close(); await telemetry?.close().catch(() => {}); await tracing?.close().catch(() => {}); })
+      .catch(() => console.error(JSON.stringify({ event: "agent_runtime_shutdown_failed" })));
   });
   return server;
   } catch (error) { releaseHostCoordinator(); hostCoordinator.close(); throw error; }
