@@ -67,6 +67,8 @@ CONTRACT_METRICS = {
     "invalid_rate": ("lower_abs", 0.05),
     "cost_usd": ("lower", 0.25),
 }
+# Absolute caps a new baseline starts with, whatever the first run measured.
+DEFAULT_CEILINGS = {"invalid_rate": 0.10, "false_pass_rate": 0.2}
 
 
 class CaseError(ValueError):
@@ -449,9 +451,7 @@ def write_baseline(summary, path, records_path):
         "tolerance": {metric: spec[1] for metric, spec in CONTRACT_METRICS.items()},
     }
     # Ceilings are hand-set policy; carry them over rather than reset them.
-    ceilings = _read_baseline(path).get("ceilings")
-    if ceilings:
-        baseline["ceilings"] = ceilings
+    baseline["ceilings"] = _read_baseline(path).get("ceilings") or DEFAULT_CEILINGS
     path.write_text(json.dumps(baseline, indent=2) + "\n")
 
 

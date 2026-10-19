@@ -1,5 +1,6 @@
-import unittest
 import importlib
+import json
+import unittest
 from pathlib import Path
 
 
@@ -82,6 +83,44 @@ class AgentAnalyticsTests(unittest.TestCase):
         self.assertEqual(
             Path("docker/observability/agent-tables.sql").read_text(), expected
         )
+
+    def test_grade_feedback_agreement_joins_final_grades_with_current_feedback(self):
+        module = self.module()
+        view = next(
+            s
+            for s in module.schema_sql()
+            if s.startswith(
+                "CREATE VIEW IF NOT EXISTS agent_grade_feedback_agreement AS"
+            )
+        )
+        self.assertIn("agent_grades_latest", view)
+        self.assertIn("agent_feedback_current", view)
+        # The run's last grade is the one an owner saw; agreement maps
+        # passed->accepted, needs_changes->needs_changes, unknown->NULL.
+        self.assertIn("argMax(status, (attempt, version))", view)
+        self.assertIn("'passed', f.verdict = 'accepted'", view)
+        self.assertIn("'needs_changes', f.verdict = 'needs_changes'", view)
+        sql = module.schema_sql()
+        self.assertLess(
+            sql.index(next(s for s in sql if "agent_feedback_current AS" in s)),
+            sql.index(view),
+        )
+
+    def test_agent_dashboard_charts_grade_feedback_agreement(self):
+        dashboard = json.loads(
+            Path("docker/observability/grafana/dashboards/agent.json").read_text()
+        )
+        panels = [
+            panel
+            for panel in dashboard["panels"]
+            if any(
+                "agent_grade_feedback_agreement" in target.get("rawSql", "")
+                for target in panel.get("targets", [])
+            )
+        ]
+        self.assertEqual(len(panels), 1)
+        ids = [panel["id"] for panel in dashboard["panels"]]
+        self.assertEqual(len(ids), len(set(ids)))
 
     def test_structured_nodes_revisions_and_dependencies_are_queryable_metadata(self):
         module = self.module()

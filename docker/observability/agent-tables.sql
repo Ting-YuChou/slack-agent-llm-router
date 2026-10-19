@@ -329,6 +329,17 @@ CREATE VIEW IF NOT EXISTS agent_feedback_latest AS SELECT * FROM agent_feedback 
 
 CREATE VIEW IF NOT EXISTS agent_feedback_current AS SELECT run_id, user_id, argMax(verdict, version) AS verdict FROM agent_feedback_latest GROUP BY run_id, user_id;
 
+CREATE VIEW IF NOT EXISTS agent_grade_feedback_agreement AS
+SELECT f.run_id AS run_id, f.user_id AS user_id, g.grade_status AS grade_status,
+  g.candidate_hash AS candidate_hash, g.prompts_version AS prompts_version, f.verdict AS feedback_verdict,
+  multiIf(g.grade_status = 'passed', f.verdict = 'accepted',
+    g.grade_status = 'needs_changes', f.verdict = 'needs_changes', NULL) AS agrees
+FROM agent_feedback_current f INNER JOIN
+  (SELECT run_id, argMax(status, (attempt, version)) AS grade_status,
+    argMax(candidate_hash, (attempt, version)) AS candidate_hash,
+    argMax(prompts_version, (attempt, version)) AS prompts_version
+  FROM agent_grades_latest GROUP BY run_id) g ON f.run_id = g.run_id;
+
 CREATE VIEW IF NOT EXISTS agent_usage_reconciliation AS
 SELECT r.run_id AS run_id, r.capture_complete, s.start_snapshots, s.end_snapshots,
   if(s.start_snapshots>0 AND s.end_snapshots>0, s.end_tokens-s.start_tokens, NULL) AS session_token_delta,

@@ -338,6 +338,25 @@ def test_update_baseline_writes_metrics_and_keeps_ceilings(tmp_path):
     assert written["ceilings"] == {"invalid_rate": 0.1}
     assert written["tolerance"]["false_pass_rate"] == 0.05
 
+    # A first baseline starts with the default contract ceilings.
+    baseline.unlink()
+    code, _ = _main(
+        [
+            "--cases",
+            str(cases),
+            "--records",
+            str(out),
+            "--baseline",
+            str(baseline),
+            "--update-baseline",
+        ]
+    )
+    assert code == 0
+    assert json.loads(baseline.read_text())["ceilings"] == {
+        "invalid_rate": 0.10,
+        "false_pass_rate": 0.2,
+    }
+
 
 def test_update_baseline_refuses_undefined_metrics(tmp_path):
     cases = tmp_path / "cases"
