@@ -9,6 +9,7 @@ import { ControlStore } from "../src/ci-control.js";
 import { CiRepairs, type RepairTarget } from "../src/ci-repair.js";
 import { createCiWebhook } from "../src/ci-webhook.js";
 import { createAgentHttpServer } from "../src/server.js";
+import { waitFor } from "./support/scenario.js";
 
 async function listen(server: Server) {
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -81,7 +82,7 @@ test("HTTP CI workflow keeps publication behind a distinct single-use approval a
     assert.equal((await status()).phase, "reproducing");
     assert.equal((await decide(job.approval_id)).status, 409);
     releaseReproduction();
-    await eventually(async () => (await status()).phase === "verifying");
+    await waitFor(status, run => run.phase === "verifying", run => `workflow transition timed out; phase ${run.phase}`, 2000);
     assert.equal((await status()).approval_id, undefined);
     assert.equal(publicationRequests, 0);
     result = { status: "completed", execution_status: "succeeded", commit: "c".repeat(40), branch: "pi-agent/repair-test",
@@ -91,14 +92,14 @@ test("HTTP CI workflow keeps publication behind a distinct single-use approval a
     assert.notEqual(verified.approval_id, job.approval_id);
     assert.equal((await decide(job.approval_id)).status, 409);
     assert.equal((await decide(verified.approval_id)).status, 202);
-    await eventually(async () => (await status()).publication_status === "failed");
+    await waitFor(status, run => run.publication_status === "failed", run => `workflow transition timed out; publication_status ${run.publication_status}`, 2000);
     assert.equal((await status()).commit, "c".repeat(40));
     const retry = await post(`/v1/ci-repairs/${job.run_id}/publication`, context);
     assert.equal(retry.status, 202);
     const approval = await retry.json() as any;
     assert.notEqual(approval.approval_id, verified.approval_id);
     assert.equal((await decide(approval.approval_id)).status, 202);
-    await eventually(async () => (await status()).publication_status === "published");
+    await waitFor(status, run => run.publication_status === "published", run => `workflow transition timed out; publication_status ${run.publication_status}`, 2000);
     const published = await status();
     assert.equal(published.status, "completed");
     assert.equal(published.url, "https://github.com/org/repo/pull/8");
@@ -106,11 +107,3 @@ test("HTTP CI workflow keeps publication behind a distinct single-use approval a
     assert.equal(publicationRequests, 2);
   } finally { releaseReproduction(); await close(server); store.close(); await rm(root, { recursive: true, force: true }); }
 });
-
-async function eventually(predicate: () => Promise<boolean>) {
-  const deadline = Date.now() + 2000;
-  while (!await predicate()) {
-    assert.ok(Date.now() < deadline, "workflow transition timed out");
-    await new Promise(resolve => setTimeout(resolve, 5));
-  }
-}
