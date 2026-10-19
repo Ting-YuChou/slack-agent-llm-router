@@ -8,7 +8,7 @@ import { DiffLimitError, ProtectedFileError } from "../src/worktree-manager.js";
 import { limitsForRoute, parseAgentLimitConfig } from "../src/agent-limits.js";
 import type { RouteDecision } from "../src/jev-router.js";
 import { promptTelemetry } from "../src/prompts.js";
-import { piTurn, runScenario, settledRecord } from "./support/scenario.js";
+import { piTurn, runScenario, settledRecord, waitFor } from "./support/scenario.js";
 
 const SETTLED = { type: "settled", outcome: "completed" } as const;
 
@@ -768,7 +768,7 @@ test("background persistence failures mark the control store unhealthy instead o
     pi.emit({ type: "tool", phase: "start", tool_call_id: "t1", tool: "read" });
     pi.emit({ type: "answer", text: "partial" });
     pi.emit({ type: "approval", approval_id: "a1", title: "Allow?", detail: "edit" });
-    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+    await waitFor(() => stateStore.healthy === false && pi.aborted.includes(accepted.run_id), Boolean, () => "persistence failure never stopped the run");
   } finally {
     process.off("unhandledRejection", onUnhandled);
     console.error = originalError;
@@ -793,8 +793,7 @@ for (const [outcome, limit, code] of [
     const { orchestrator, process, calls } = fixture();
     const accepted = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: `outcome-${code}`, user_id: "U", prompt: "fix" });
     process.emit({ type: "settled", outcome, ...(limit ? { limit } : {}), ...(outcome === "error" ? { error_message: "upstream 500" } : {}) });
-    for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
-    const run = orchestrator.getRun(accepted.run_id);
+    const run = await settledRun(orchestrator, accepted.run_id, calls);
     assert.equal(run.status, "failed");
     assert.equal(run.error?.code, code);
     assert.equal(run.execution_outcome, outcome);
@@ -810,10 +809,9 @@ test("a verified workflow never sends a truncated execution to the quality gate"
     evaluate: async () => { evaluated += 1; return { action: "pass", candidate: { hash: "h", path: "/s" }, verification: { status: "passed", checks: [] } }; },
   });
   const accepted = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "wf-truncated", user_id: "U", prompt: "fix" });
-  for (let i = 0; i < 3; i++) await new Promise((resolve) => setImmediate(resolve));
+  await prompted(process);
   process.emit({ type: "settled", outcome: "truncated", stop_reason: "length" });
-  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
-  const run = orchestrator.getRun(accepted.run_id);
+  const run = await settledRun(orchestrator, accepted.run_id, calls);
   assert.equal(evaluated, 0);
   assert.equal(run.status, "failed");
   assert.equal(run.error?.code, "agent_output_truncated");
@@ -851,10 +849,10 @@ test("a verified change records its verification and grader verdicts as commit t
     execution: () => {}, assertUnchanged: async () => {}, maxCostUsd: 5,
     evaluate: async () => ({ action: "pass", candidate: { hash: "h", path: "/s" }, verification: { status: "passed", checks: [] }, grade: { status: "passed", candidate_hash: "h", criteria: [], findings: [] } }),
   });
-  await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "verified-trailers", user_id: "U", prompt: "fix" });
-  for (let i = 0; i < 3; i++) await new Promise((resolve) => setImmediate(resolve));
+  const accepted = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "verified-trailers", user_id: "U", prompt: "fix" });
+  await prompted(process);
   process.emit(SETTLED);
-  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+  await settledRun(orchestrator, accepted.run_id, calls);
   assert.match(calls.commitMessages[0] ?? "", /\nPi-Verification: passed\nPi-Grader: passed(\n|$)/);
 });
 
@@ -874,10 +872,20 @@ function gatedFixture(evaluate: () => Promise<any>) {
 
 async function settleWorkflow(f: ReturnType<typeof fixture>, thread: string) {
   const accepted = await f.orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: thread, user_id: "U", prompt: "fix" });
-  for (let i = 0; i < 3; i++) await new Promise((resolve) => setImmediate(resolve));
+  await prompted(f.process);
   f.process.emit(SETTLED);
-  for (let i = 0; i < 8; i++) await new Promise((resolve) => setImmediate(resolve));
-  return f.orchestrator.getRun(accepted.run_id);
+  return settledRun(f.orchestrator, accepted.run_id, f.calls);
+}
+
+/** Waits until the workflow has prompted the writer, so a settle reaches a running execution. */
+async function prompted(process: FakeProcess) {
+  await waitFor(() => process.prompts.length, count => count > 0, () => "the writer was never prompted");
+}
+
+/** Waits until the run is terminal and its worktree was either committed or rolled back. */
+function settledRun(orchestrator: CodingAgentOrchestrator, runId: string, calls: ReturnType<typeof fixture>["calls"]) {
+  return waitFor(() => orchestrator.getRun(runId), run => ["completed", "failed", "timed_out", "cancelled"].includes(run.status) && calls.commits + calls.rollback.length > 0,
+    run => `run never settled; status ${run.status}, commits ${calls.commits}, rollbacks ${calls.rollback.length}`);
 }
 
 test("a scope violation the gate cannot repair fails as scope_violation, not quality_gate_unavailable", async () => {
@@ -929,8 +937,7 @@ test("a no-profile diff over the limits fails as diff_limit_exceeded and rolls b
   calls.inspectError = new DiffLimitError("Total diff limit exceeded (2000000/1048576)");
   const accepted = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "diff-limit-plain", user_id: "U", prompt: "fix" });
   process.emit(SETTLED);
-  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
-  const run = orchestrator.getRun(accepted.run_id);
+  const run = await settledRun(orchestrator, accepted.run_id, calls);
   assert.equal(run.error?.code, "diff_limit_exceeded");
   assert.equal(calls.commits, 0);
   assert.equal(calls.rollback.length, 1);
@@ -1000,12 +1007,12 @@ test("persistence failures during completion, failure and timeout never become u
       failSaves = false;
       const store = countingStore(() => failSaves);
       const f = fixture(undefined, undefined, store, { deadlineMs: trigger === "timeout" ? 5 : 10_000 });
-      await f.orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: thread, user_id: "U", prompt: "fix" });
+      const accepted = await f.orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: thread, user_id: "U", prompt: "fix" });
       failSaves = true;
       if (trigger === "settle") f.process.emit(SETTLED);
       if (trigger === "error") f.process.emit({ type: "error", code: "container_exited", message: "gone" });
       if (trigger === "timeout") await new Promise((resolve) => setTimeout(resolve, 20));
-      for (let i = 0; i < 8; i++) await new Promise((resolve) => setImmediate(resolve));
+      await settledRun(f.orchestrator, accepted.run_id, f.calls);
     }
   } finally {
     process.off("unhandledRejection", onUnhandled);
