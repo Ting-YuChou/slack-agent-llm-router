@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { buildAgentDockerArgs } from "../src/container-runtime.js";
+import { buildAgentDockerArgs, buildAgentSpawnEnv } from "../src/container-runtime.js";
 
 test("agent container is non-root, resource-limited, read-only, and internal-network only", () => {
   const args = buildAgentDockerArgs({
@@ -30,8 +30,8 @@ test("agent container is non-root, resource-limited, read-only, and internal-net
     "--mode rpc", "--provider anthropic", "--model claude-sonnet-4-6", "--thinking max",
   ]) assert.match(rendered, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.doesNotMatch(rendered, /docker\.sock|OPENAI_API_KEY=[A-Za-z0-9_-]{30,}/);
-  assert.match(rendered, /ANTHROPIC_API_KEY=short-token/);
-  assert.doesNotMatch(rendered, /OPENAI_API_KEY=short-token|OPENCODE_API_KEY=short-token/);
+  assert.match(rendered, /--env ANTHROPIC_API_KEY(?: |$)/);
+  assert.doesNotMatch(rendered, /short-token/);
   assert.match(rendered, /PI_AGENT_SKILL_PATHS_JSON=\["\/opt\/pi\/skills\/test-gap\/SKILL\.md"\]/);
   assert.match(rendered, /type=bind,src=\/repo-worktrees\/w1,dst=\/repo-worktrees\/w1/);
   assert.match(rendered, /\/repo\/\.git.*\/repo\/\.git.*readonly/);
@@ -55,7 +55,7 @@ test("agent container is non-root, resource-limited, read-only, and internal-net
     user: "501:20",
   });
   assert.match(hostUserArgs.join(" "), /--user 501:20/);
-  assert.match(hostUserArgs.join(" "), /OPENCODE_API_KEY=short-token/);
+  assert.match(hostUserArgs.join(" "), /--env OPENCODE_API_KEY(?: |$)/);
   assert.match(hostUserArgs.join(" "), /--provider opencode-go --model deepseek-v4-pro --thinking max/);
 });
 
@@ -68,7 +68,7 @@ test("selected Sol run starts Pi with Sol high while retaining the internal gate
     extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
   });
   assert.match(args.join(" "), /--provider openai --model gpt-5\.6-sol --thinking high/);
-  assert.match(args.join(" "), /OPENAI_API_KEY=run-token/);
+  assert.match(args.join(" "), /--env OPENAI_API_KEY(?: |$)/);
 });
 
 test("MCP is absent when off and explicitly loads only the trusted builtin path when enabled", () => {
@@ -92,7 +92,8 @@ test("MCP is absent when off and explicitly loads only the trusted builtin path 
   });
   const rendered = enabled.join(" ");
   assert.match(rendered, /PI_AGENT_MCP_MODE=github_read_only/);
-  assert.match(rendered, /PI_AGENT_MCP_SERVERS_JSON=.*mcp-github.*run-bound-mcp-token/);
+  assert.match(rendered, /--env PI_AGENT_MCP_SERVERS_JSON(?: |$)/);
+  assert.doesNotMatch(rendered, /run-bound-mcp-token/);
   assert.match(rendered, /--no-extensions.*-e builtin:mcp.*-e \/opt\/pi\/extensions\/mcp-bootstrap\.ts/);
   assert.match(rendered, /--tools read,codemode,mcp__github__get_file_contents/);
   assert.equal((rendered.match(/builtin:codemode/g) ?? []).length, 1);
@@ -113,7 +114,8 @@ test("run-time Jev exposes codemode with only a short-lived classifier gateway t
     classifierGatewayToken: "classifier-run-token",
   });
   const rendered = enabled.join(" ");
-  assert.match(rendered, /OPENROUTER_API_KEY=classifier-run-token/);
+  assert.match(rendered, /--env OPENROUTER_API_KEY(?: |$)/);
+  assert.doesNotMatch(rendered, /classifier-run-token/);
   assert.match(rendered, /PI_AGENT_JEV_CLASSIFIER_MODE=on/);
   assert.match(rendered, /--no-extensions.*-e builtin:codemode/);
   assert.match(rendered, /--tools read,codemode/);
@@ -159,4 +161,24 @@ test("writer receives trusted-profile constraints; discussion mode drops them", 
   assert.deepEqual(JSON.parse(env.slice("PI_AGENT_WRITER_JSON=".length)), writerContext);
   assert.doesNotMatch(buildAgentDockerArgs({ ...base, writerContext, taskMode: "discuss" }).join(" "), /PI_AGENT_WRITER_JSON/);
   assert.doesNotMatch(buildAgentDockerArgs(base).join(" "), /PI_AGENT_WRITER_JSON/);
+});
+
+test("credentials travel in the docker client's environment, never on its argv", () => {
+  const options = {
+    name: "pi-session-1", image: "pi-agent@sha256:abc", network: "pi-model-only", worktreePath: "/w", gitMetadataPath: "/repo/.git",
+    sessionStatePath: "/s", gatewayUrl: "http://model-gateway:8080", gatewayToken: "gateway-secret-token", modelRef: "openai/gpt-5.6-luna",
+    classifierGatewayToken: "classifier-secret-token",
+    mcp: { mode: "read_only" as const, servers: [{ server: "github" as const, gatewayUrl: "http://mcp-github:8090/mcp", token: "mcp-secret-token" }] },
+    extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read", "bash"],
+  };
+  const rendered = buildAgentDockerArgs(options).join(" ");
+  assert.doesNotMatch(rendered, /secret-token/);
+  const env = buildAgentSpawnEnv(options, { PATH: "/usr/bin", OPENAI_API_KEY: "host-real-key" });
+  assert.equal(env.PATH, "/usr/bin");
+  assert.equal(env.OPENAI_API_KEY, "gateway-secret-token");
+  assert.equal(env.OPENROUTER_API_KEY, "classifier-secret-token");
+  assert.match(env.PI_AGENT_MCP_SERVERS_JSON ?? "", /mcp-secret-token/);
+  assert.deepEqual(Object.keys(env).sort(), ["OPENAI_API_KEY", "OPENROUTER_API_KEY", "PATH", "PI_AGENT_MCP_SERVERS_JSON"]);
+  const discuss = buildAgentSpawnEnv({ ...options, taskMode: "discuss" }, { PATH: "/usr/bin" });
+  assert.deepEqual(Object.keys(discuss).sort(), ["OPENAI_API_KEY", "PATH"]);
 });

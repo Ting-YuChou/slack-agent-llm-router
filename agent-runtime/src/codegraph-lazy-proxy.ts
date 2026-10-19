@@ -10,6 +10,12 @@ const EXCLUDED_PARTS = new Set([".git", ".codegraphcontext", "node_modules", "ve
 const SECRET_FILE = /(^|\/)(\.env(?:\..*)?|.*\.(?:pem|key|p12|pfx)|id_(?:rsa|ed25519)|credentials(?:\..*)?)$/i;
 const SOURCE_FILE = /\.(?:[cm]?[jt]sx?|py|go|rs|java|kt|kts|rb|php|cs|cpp|cc|cxx|c|h|hpp|swift|scala|sql|sh|bash|zsh|md|json|ya?ml|toml|xml|proto)$/i;
 
+/** CodeGraph indexes untrusted source; give it only what it needs, never the run's credentials. */
+export function codegraphEnv(env: NodeJS.ProcessEnv, stateRoot: string, mirror: string): NodeJS.ProcessEnv {
+  const kept = Object.fromEntries(["PATH", "LANG", "LC_ALL", "TZ"].flatMap((key) => env[key] ? [[key, env[key]]] : []));
+  return { ...kept, HOME: stateRoot, CGC_ALLOWED_ROOTS: mirror, CGC_EMBEDDED_BUFFER_POOL_MB: "384" };
+}
+
 export interface MirrorLimits { maxFiles: number; maxFileBytes: number; maxTotalBytes: number }
 const DEFAULT_LIMITS: MirrorLimits = { maxFiles: 20_000, maxFileBytes: 1_048_576, maxTotalBytes: 104_857_600 };
 
@@ -80,7 +86,7 @@ class CodeGraphProxy {
     if (this.child) return;
     const mirror = await createSanitizedMirror(this.worktree, this.stateRoot);
     this.mirror = mirror;
-    const env = { ...process.env, HOME: this.stateRoot, CGC_ALLOWED_ROOTS: mirror, CGC_EMBEDDED_BUFFER_POOL_MB: "384" };
+    const env = codegraphEnv(process.env, this.stateRoot, mirror);
     const command = process.env.CGC_COMMAND ?? "cgc";
     await exec(command, ["index", "--no-progress", mirror], { cwd: this.stateRoot, env, timeout: 180_000, maxBuffer: 1_048_576 });
     this.child = spawn(command, ["mcp", "start"], { cwd: this.stateRoot, env, stdio: ["pipe", "pipe", "pipe"] });
