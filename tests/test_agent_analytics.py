@@ -53,6 +53,36 @@ class AgentAnalyticsTests(unittest.TestCase):
             self.assertEqual(rows[table][0]["event_id"], "id")
             self.assertIn(table + "_latest", "\n".join(module.schema_sql()))
 
+    def test_runs_executions_and_grades_record_their_prompts_version(self):
+        module = self.module()
+        for kind, table in [
+            ("run", "agent_runs"),
+            ("execution", "agent_executions"),
+            ("grade", "agent_grades"),
+        ]:
+            for payload, expected in [
+                ({"prompts_version": "6da0aeafa863"}, "6da0aeafa863"),
+                ({}, "unknown"),
+            ]:
+                rows = module.project(
+                    {"event_id": "id", "run_id": "r", "kind": kind, "payload": payload}
+                )
+                self.assertEqual(rows[table][0]["prompts_version"], expected)
+                module.validate_projections(rows)
+            statement = next(
+                s
+                for s in module.schema_sql()
+                if s.startswith(f"CREATE TABLE IF NOT EXISTS {table} (")
+            )
+            self.assertIn("prompts_version String", statement)
+
+    def test_checked_in_table_ddl_is_generated_from_schema_sql(self):
+        module = self.module()
+        expected = "\n\n".join(f"{sql};" for sql in module.schema_sql()) + "\n"
+        self.assertEqual(
+            Path("docker/observability/agent-tables.sql").read_text(), expected
+        )
+
     def test_structured_nodes_revisions_and_dependencies_are_queryable_metadata(self):
         module = self.module()
         for kind, table, payload in [
@@ -239,6 +269,36 @@ class AgentAnalyticsTests(unittest.TestCase):
         self.assertNotIn(
             "private source content", rows["agent_test_results"][0]["payload_json"]
         )
+
+    def test_feedback_projects_reason_category_and_comment(self):
+        module = self.module()
+        payload = {"user_id": "u", "verdict": "needs_changes", "feedback_id": "f"}
+        detailed = module.project(
+            {
+                "kind": "feedback",
+                "payload": {
+                    **payload,
+                    "reason_category": "scope_creep",
+                    "comment": "touched [REDACTED] files",
+                },
+            }
+        )
+        module.validate_projections(detailed)
+        row = detailed["agent_feedback"][0]
+        self.assertEqual(row["reason_category"], "scope_creep")
+        self.assertEqual(row["comment"], "touched [REDACTED] files")
+        legacy = module.project({"kind": "feedback", "payload": payload})
+        module.validate_projections(legacy)
+        self.assertEqual(legacy["agent_feedback"][0]["reason_category"], "")
+        self.assertEqual(legacy["agent_feedback"][0]["comment"], "")
+        ddl = next(
+            s
+            for s in module.schema_sql()
+            if s.startswith("CREATE TABLE IF NOT EXISTS agent_feedback (")
+        )
+        self.assertIn("reason_category String", ddl)
+        self.assertIn("comment String", ddl)
+        self.assertIn(ddl, Path("docker/observability/agent-tables.sql").read_text())
 
     def test_ttl_casts_datetime64_to_clickhouse_supported_datetime(self):
         module = self.module()

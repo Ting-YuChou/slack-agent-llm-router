@@ -133,6 +133,24 @@ test("invalid or unsupported grader claims become unknown and cannot trigger rep
   assert.equal(result.action, "fail"); assert.equal(result.grade?.status, "unknown");
 });
 
+test("quality gate records verification and grade events with the prompts that produced them", async () => {
+  const { QualityGate } = await import("../src/quality-gate.js");
+  const { promptTelemetry } = await import("../src/prompts.js");
+  const recorded: Array<[string, Record<string, unknown>]> = [];
+  const gate = new QualityGate({ profile: { id: "p", rubric: ["correct"], maxRepairs: 2 },
+    snapshot: async () => ({ hash: "hash", path: "/snapshot" }),
+    verify: async () => ({ status: "passed", checks: [] }),
+    grade: async () => ({ status: "passed", candidate_hash: "hash", criteria: [{ id: "correct", passed: true, evidence: "src/a.ts:1" }], findings: [] }),
+    record: async (kind, payload) => { recorded.push([kind, payload as Record<string, unknown>]); },
+  });
+  await gate.evaluate({ run_id: "r", worktree: "/workspace", baseline: "a".repeat(40), requirement: "fix", attempt: 1, signal: new AbortController().signal });
+  const [verification, grade] = recorded;
+  assert.equal(verification?.[0], "verification");
+  assert.deepEqual({ prompts_version: verification?.[1].prompts_version, prompts: verification?.[1].prompts }, promptTelemetry("implementation"));
+  assert.equal(grade?.[0], "grade");
+  assert.deepEqual({ prompts_version: grade?.[1].prompts_version, prompts: grade?.[1].prompts }, promptTelemetry("grader"));
+});
+
 test("quality gate turns a scope violation into a repair that lists the files, then a scope_violation failure", async () => {
   const { QualityGate } = await import("../src/quality-gate.js");
   const { ScopeViolationError } = await import("../src/candidate-scope.js");

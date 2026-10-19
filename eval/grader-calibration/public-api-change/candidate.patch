@@ -1,0 +1,17 @@
+diff --git a/src/counter.cjs b/src/counter.cjs
+index d8e0c70..0ec3e99 100644
+--- a/src/counter.cjs
++++ b/src/counter.cjs
+@@ -1 +1,4 @@
+-exports.increment = n => n - 1;
++exports.increment = n => {
++  if (!Number.isInteger(n)) throw new TypeError('increment expects an integer');
++  return n + 1;
++};
+diff --git a/src/label.cjs b/src/label.cjs
+index d680ee2..8ac4151 100644
+--- a/src/label.cjs
++++ b/src/label.cjs
+@@ -1 +1 @@
+-exports.label = n => 'total:' + n;
++exports.label = n => 'count:' + n;

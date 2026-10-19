@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { renderPrompt } from "../dist/src/prompts.js";
 
 /** Must match RUN_CHECKS_TOOL / RUN_CHECKS_DIALOG in src/pi-rpc.ts; the host answers only this dialog. */
 export const RUN_CHECKS_TOOL = "run_checks";
@@ -16,12 +17,7 @@ function checksContext(): ChecksContext {
 }
 
 export function checksPrompt(context: ChecksContext): string {
-  return [
-    `Use the ${RUN_CHECKS_TOOL} tool to run the trusted verification checks on your current changes before you finish: ${context.checks.join(", ")}.`,
-    `With no arguments it runs ${context.defaultChecks.join(", ")}; pass checks to choose a subset. You have at most ${context.maxCalls} calls per task, and one call at a time.`,
-    "Results list failing files and lines; fix them and run the checks again. Run tests through this tool rather than through bash.",
-    "The same checks run again after you finish, so do not weaken or skip tests to make them pass.",
-  ].join(" ");
+  return renderPrompt("checks", { tool: RUN_CHECKS_TOOL, checks: context.checks.join(", "), default_checks: context.defaultChecks.join(", "), max_calls: context.maxCalls });
 }
 
 export default function checks(pi: ExtensionAPI) {

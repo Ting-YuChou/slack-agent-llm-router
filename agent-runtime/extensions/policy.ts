@@ -7,6 +7,7 @@ import { filesOutsideScope } from "../dist/src/candidate-scope.js";
 import type { WriterContext } from "../dist/src/container-runtime.js";
 import { classifyBash, isApprovedSkillRead, isTestConfigPath, parsePorcelainZ, validateWorkspacePath } from "../dist/src/policy.js";
 import { codemodeMcpPrompt, type McpServerId } from "../dist/src/mcp-config.js";
+import { renderPrompt } from "../dist/src/prompts.js";
 
 const MAX_TURNS = Number(process.env.PI_AGENT_MAX_TURNS ?? "20");
 const MAX_TOOL_CALLS = Number(process.env.PI_AGENT_MAX_TOOL_CALLS ?? "40");
@@ -43,12 +44,10 @@ function writerContext(): WriterContext | undefined {
 
 function scopePrompt(context: WriterContext): string {
   const limits = context.diffLimits;
-  return [
-    `Only modify files under these paths: ${context.allowedPaths.join(", ")}. Writes elsewhere are blocked, and out-of-scope changes fail delivery.`,
-    `After you finish, trusted checks run in a separate verifier: ${context.checks.join(", ") || "(none)"}. Make them pass without weakening tests.`,
-    `An independent reviewer grades these criteria: ${context.rubric.join(", ") || "(none)"}.`,
-    `Delivery limits: at most ${limits.maxFiles} files changed, ${Math.floor(limits.maxBytes / 1024)} KiB total diff, ${Math.floor(limits.maxSingleFileBytes / 1024)} KiB per file. Prefer targeted edit calls over rewriting whole files.`,
-  ].join(" ");
+  return renderPrompt("policy-scope", {
+    allowed_paths: context.allowedPaths.join(", "), checks: context.checks.join(", ") || "(none)", rubric: context.rubric.join(", ") || "(none)",
+    max_files: limits.maxFiles, max_kib: Math.floor(limits.maxBytes / 1024), max_file_kib: Math.floor(limits.maxSingleFileBytes / 1024),
+  });
 }
 
 function previewWrite(tool: string, input: Record<string, unknown>): string {
@@ -98,10 +97,9 @@ function budgetStage(used: number, max: number): BudgetStage {
 }
 
 function budgetMessage(stage: BudgetStage, used: number, max: number, unit: string): string {
-  if (stage === "final") {
-    return `[harness] Final budget warning: ${used}/${max} ${unit} used, ${Math.max(0, max - used)} left. Stop exploring now: run the tests if you have not, then summarize what changed, what passed and what is left.`;
-  }
-  return `[harness] Budget notice: ${used}/${max} ${unit} used. Start to wrap up: finish the current change, run the tests and summarize what you did and what is left.`;
+  return stage === "final"
+    ? renderPrompt("budget-final", { used, max, unit, left: Math.max(0, max - used) })
+    : renderPrompt("budget-notice", { used, max, unit });
 }
 
 export default function policyExtension(pi: ExtensionAPI) {
@@ -113,11 +111,7 @@ export default function policyExtension(pi: ExtensionAPI) {
 
   if (process.env.PI_AGENT_JEV_CLASSIFIER_MODE === "on") {
     pi.on("before_agent_start", (event) => {
-      event.systemPromptOptions.sections.jev_classifier = [
-        "For semantic classification, ranking, or yes/no probability that affects only your analysis, you may use codemode models.classify with openrouter/typesafe/jev-1.13.",
-        "Prefer deterministic code for exact rules, and do not use classifier output as authorization for writes, shell commands, approvals, deployment, or deletion.",
-        "Check stopReason and use the returned probabilities; continue without Jev if the classifier is unavailable.",
-      ].join(" ");
+      event.systemPromptOptions.sections.jev_classifier = renderPrompt("jev-classifier");
     });
   }
   if (process.env.PI_AGENT_MCP_SERVERS_JSON) {

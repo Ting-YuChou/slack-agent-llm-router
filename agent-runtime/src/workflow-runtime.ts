@@ -16,6 +16,7 @@ import { HarnessError } from "./error-taxonomy.js";
 import type { AgentTracing } from "./tracing.js";
 import { WorkflowCoordinator } from './structured-workflow.js';
 import { AgentExecutionRunner, type InvestigationProcessFactory } from './agent-execution-runner.js';
+import { promptTelemetry } from "./prompts.js";
 import { WriterChecks } from "./writer-checks.js";
 import type { RouteDecision } from './jev-router.js';
 const exec = promisify(execFile);
@@ -59,12 +60,12 @@ export function createQualityServices(options: {
     }
     const info = executions.get(id);
     if (phase === "start") options.control.put("execution", id, { id, parent, role, attempt, session, statePath, status: "running", traceparent: tracing?.traceparent(id) });
-    const written = await telemetry?.record(id, session, "execution", { execution_id: id, workflow_run_id: parent, role, attempt, phase, profile_id: profile.id, profile_checksum: options.checksum, started_at: info?.started_at, duration_ms: phase === "end" && info ? Date.now() - Date.parse(info.started_at) : 0, queue_ms: queueMs, cost_usd: cost ?? null }, `execution:${id}:${phase}`);
+    const written = await telemetry?.record(id, session, "execution", { execution_id: id, workflow_run_id: parent, role, attempt, phase, profile_id: profile.id, profile_checksum: options.checksum, started_at: info?.started_at, duration_ms: phase === "end" && info ? Date.now() - Date.parse(info.started_at) : 0, queue_ms: queueMs, cost_usd: cost ?? null, ...promptTelemetry(role) }, `execution:${id}:${phase}`);
     if (written === false) telemetry?.markIncomplete(parent, "execution_mapping_capture_failed");
     if (phase === "end") {
       for (const reason of telemetry?.completeness(id) ?? []) telemetry?.markIncomplete(parent, `execution:${id}:${reason}`);
       // Each Pi execution reconciles its own before/after snapshots and official entries.
-      const terminalWritten = await telemetry?.record(id, session, "run", { status: "completed", model: role === 'grader' ? graderModelId : role === 'planner' ? "gpt-5.6-sol" : ['implementation','discussion'].includes(role) ? 'unknown' : 'gpt-5.6-luna', reasoning_effort: role === 'grader' ? grader.route.effort : role === 'planner' ? "high" : ['implementation','discussion'].includes(role) ? 'unknown' : 'max', capture_complete: telemetry ? telemetry.completeness(id).length === 0 : null, workflow_run_id: parent });
+      const terminalWritten = await telemetry?.record(id, session, "run", { status: "completed", model: role === 'grader' ? graderModelId : role === 'planner' ? "gpt-5.6-sol" : ['implementation','discussion'].includes(role) ? 'unknown' : 'gpt-5.6-luna', reasoning_effort: role === 'grader' ? grader.route.effort : role === 'planner' ? "high" : ['implementation','discussion'].includes(role) ? 'unknown' : 'max', capture_complete: telemetry ? telemetry.completeness(id).length === 0 : null, workflow_run_id: parent, ...promptTelemetry(role) });
       if (terminalWritten === false) telemetry?.markIncomplete(parent, "execution_terminal_capture_failed");
       telemetry?.releaseRun(id);
       tracing?.endRun(id, "completed"); executions.delete(id);

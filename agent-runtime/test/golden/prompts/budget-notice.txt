@@ -1,0 +1,1 @@
+[harness] Budget notice: 30/40 tool calls used. Start to wrap up: finish the current change, run the tests and summarize what you did and what is left.

@@ -1,0 +1,24 @@
+diff --git a/src/counter.cjs b/src/counter.cjs
+index d8e0c70..d6d030a 100644
+--- a/src/counter.cjs
++++ b/src/counter.cjs
+@@ -1 +1 @@
+-exports.increment = n => n - 1;
++exports.increment = n => 1 + n;
+diff --git a/src/label.cjs b/src/label.cjs
+index d680ee2..f0b8c14 100644
+--- a/src/label.cjs
++++ b/src/label.cjs
+@@ -1 +1 @@
+-exports.label = n => 'total:' + n;
++exports.label = n => `count:${n}`;
+diff --git a/tests/runtime.test.cjs b/tests/runtime.test.cjs
+index 9e9750f..1b3ac61 100644
+--- a/tests/runtime.test.cjs
++++ b/tests/runtime.test.cjs
+@@ -2,3 +2,5 @@ const { test } = require('node:test');
+ const assert = require('node:assert/strict');
+ test('increment', () => assert.equal(require('../src/counter.cjs').increment(2), 3));
+ test('label', () => assert.equal(require('../src/label.cjs').label(2), 'count:2'));
++test('increment negative', () => assert.equal(require('../src/counter.cjs').increment(-1), 0));
++test('label zero', () => assert.equal(require('../src/label.cjs').label(0), 'count:0'));

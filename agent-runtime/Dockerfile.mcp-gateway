@@ -4,6 +4,8 @@ WORKDIR /opt/mcp-gateway
 COPY package.json package-lock.json ./
 RUN npm ci --ignore-scripts
 COPY tsconfig.json tsconfig.extensions.json ./
+COPY scripts/build-prompts.mjs ./scripts/build-prompts.mjs
+COPY prompts ./prompts
 COPY src ./src
 COPY extensions ./extensions
 COPY plugins ./plugins

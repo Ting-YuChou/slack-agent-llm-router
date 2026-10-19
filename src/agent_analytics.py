@@ -80,6 +80,7 @@ TABLES = {
         "role": "String",
         "attempt": "UInt32",
         "phase": "String",
+        "prompts_version": "String",
     },
     "agent_verifications": {
         "candidate_hash": "String",
@@ -90,6 +91,7 @@ TABLES = {
         "candidate_hash": "String",
         "attempt": "UInt32",
         "status": "String",
+        "prompts_version": "String",
     },
     "agent_deliveries": {"candidate_hash": "String", "status": "String"},
     "agent_runs": {
@@ -98,6 +100,7 @@ TABLES = {
         "reasoning_effort": "String",
         "routing_json": "String",
         "capture_complete": "Nullable(UInt8)",
+        "prompts_version": "String",
     },
     "agent_usage": {
         "pi_session_id": "String",
@@ -132,6 +135,8 @@ TABLES = {
         "user_id": "String",
         "verdict": "String",
         "feedback_id": "String",
+        "reason_category": "String",
+        "comment": "String",
     },
 }
 
@@ -431,6 +436,7 @@ def project(envelope, resolved_payload=None):
                 "model": payload.get("model", "unknown"),
                 "reasoning_effort": payload.get("reasoning_effort", "unknown"),
                 "routing_json": json.dumps(payload.get("routing", {})),
+                "prompts_version": payload.get("prompts_version", "unknown"),
                 "capture_complete": int(payload["capture_complete"])
                 if isinstance(payload.get("capture_complete"), bool)
                 else payload.get("capture_complete"),
@@ -466,7 +472,13 @@ def project(envelope, resolved_payload=None):
         ]
     elif kind == "feedback":
         rows["agent_feedback"] = [
-            {**base, **{key: payload[key] for key in TABLES["agent_feedback"]}}
+            {
+                **base,
+                **{key: payload[key] for key in ["user_id", "verdict", "feedback_id"]},
+                # Older runtimes sent only the verdict.
+                "reason_category": payload.get("reason_category", ""),
+                "comment": payload.get("comment", ""),
+            }
         ]
     return rows
 
