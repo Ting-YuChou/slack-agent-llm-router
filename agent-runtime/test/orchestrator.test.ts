@@ -77,6 +77,7 @@ test("reproduction time cannot erase human tool-approval waiting from workflow t
   process.emit(SETTLED);
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(orchestrator.getRun(created.run_id).timing?.human_wait_ms, 500);
+  assert.deepEqual(orchestrator.getRun(created.run_id).approvals, { requested: 1, approved: 1, rejected: 0, expired: 0, wait_ms: 500 });
 });
 
 test("quality failures repair without committing and unknown never commits", async () => {
@@ -351,6 +352,7 @@ test("reject and cancel abort Pi and rollback to the prompt baseline", async () 
   await orchestrator.decide(accepted.run_id, approval.approval_id, "U1", "reject");
 
   assert.equal(orchestrator.getRun(accepted.run_id).status, "rejected");
+  assert.equal(orchestrator.getRun(accepted.run_id).approvals?.rejected, 1);
   assert.deepEqual(process.decisions, [{ id: "rpc-ui-1", approved: false }]);
   assert.deepEqual(calls.rollback, ["a".repeat(40)]);
 });

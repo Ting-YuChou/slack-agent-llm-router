@@ -561,6 +561,9 @@ class LiveRunner:
             "error_cause_code": error_cause_code,
             "grader_cause": grader_cause,
             "prompts_version": state.get("prompts_version"),
+            "approvals": state.get("approvals"),
+            "writer_checks_calls": state.get("writer_checks_calls"),
+            "policy_summary": state.get("policy_summary"),
             "attempts": run_attempts(state),
         }
 
@@ -597,6 +600,9 @@ def execute(task, attempt, runner):
         "error_cause_code": outcome.get("error_cause_code"),
         "grader_cause": outcome.get("grader_cause"),
         "prompts_version": outcome.get("prompts_version"),
+        "approvals": outcome.get("approvals"),
+        "writer_checks_calls": outcome.get("writer_checks_calls"),
+        "policy_summary": outcome.get("policy_summary"),
         "attempts": outcome.get("attempts"),
     }
 

@@ -155,6 +155,8 @@ export interface RunRecord {
   turn_count: number;
   /** Counts of the container's policy decisions (allow, block, approval) for this run. */
   policy_summary?: PolicySummary;
+  /** Owner approvals this run asked for (tool writes, shell commands, delivery) and how they ended. */
+  approvals?: ApprovalCounts;
   events: Array<Record<string, unknown>>;
   changed_files?: string[];
   diff_stat?: string;
@@ -167,6 +169,8 @@ export interface RunRecord {
 }
 
 /** The run as clients (HTTP, Slack, telemetry) see it: host artifact paths become a flag. */
+export interface ApprovalCounts { requested: number; approved: number; rejected: number; expired: number; wait_ms: number }
+
 export function publicRun<T extends Partial<RunRecord>>(run: T): Omit<T, "patch_artifact"> & { patch_retained?: true } {
   const { patch_artifact, ...rest } = run;
   return patch_artifact ? { ...rest, patch_retained: true } : rest;
@@ -244,6 +248,8 @@ export class CodingAgentOrchestrator {
   private readonly deliveries = new Map<string, { approvalId: string; digest: string }>();
   /** Text of the assistant message currently streaming, per run; replaced by the final answer. */
   private readonly streamingAnswers = new Map<string, string>();
+  /** When each open approval was shown, for the run's approval wait time. */
+  private readonly approvalOpened = new Map<string, number>();
   /** Terminal runs already reported to observers, keyed to the update they were reported at (resume revives runs). */
   private readonly observedFinal = new Map<string, string>();
   private persistTimer?: ReturnType<typeof setTimeout>;
@@ -514,6 +520,7 @@ export class CodingAgentOrchestrator {
     if (result.code === "wrong_run" || result.code === "expired" || result.code === "already_used") {
       throw new RuntimeConflictError(`Approval is ${result.code.replace("_", " ")}`);
     }
+    this.countApproval(run, approvalId, decision === "approve" ? "approved" : "rejected");
     if (this.deliveries.get(runId)?.approvalId === approvalId) {
       await this.decideDelivery(session, run, approvalId, decision);
       return;
@@ -772,6 +779,7 @@ export class CodingAgentOrchestrator {
         userId: run.owner_user_id,
         action: `${event.title}\n${event.detail}`,
       });
+      this.countApproval(run, approval.id, "requested");
       this.updateRun(run, "awaiting_approval");
       run.events.push({ ...event, approval_id: approval.id, expires_at: new Date(approval.expiresAt).toISOString() });
       this.persistInBackground();
@@ -1013,6 +1021,7 @@ export class CodingAgentOrchestrator {
     }
     const ttlMs = this.deliveryApproval!.ttlMs;
     const approval = this.approvals.create({ runId: run.run_id, toolCallId: "delivery", userId: run.owner_user_id, action: `Deliver ${diff.files.length} changed files` }, ttlMs);
+    this.countApproval(run, approval.id, "requested");
     this.deliveries.set(run.run_id, { approvalId: approval.id, digest });
     this.workflows.get(run.run_id)?.budget.pause();
     const previous = this.deadlines.get(run.run_id);
@@ -1073,9 +1082,19 @@ export class CodingAgentOrchestrator {
     await this.finalizeClaimedRun(session, run);
   }
 
+  private countApproval(run: RunRecord, approvalId: string, outcome: "requested" | "approved" | "rejected" | "expired"): void {
+    const counts = run.approvals ??= { requested: 0, approved: 0, rejected: 0, expired: 0, wait_ms: 0 };
+    counts[outcome] += 1;
+    if (outcome === "requested") { this.approvalOpened.set(approvalId, Date.now()); return; }
+    const opened = this.approvalOpened.get(approvalId);
+    this.approvalOpened.delete(approvalId);
+    if (opened !== undefined) counts.wait_ms += Math.max(0, Date.now() - opened);
+  }
+
   private async expireDelivery(session: SessionRecord, run: RunRecord, approvalId: string): Promise<void> {
     if (this.deliveries.get(run.run_id)?.approvalId !== approvalId || !this.claimTerminal(run)) return;
     this.deliveries.delete(run.run_id);
+    this.countApproval(run, approvalId, "expired");
     await this.failClaimedRun(session, run, { code: "delivery_expired", message: "Nobody delivered the changes before the approval expired; the patch was kept" });
   }
 

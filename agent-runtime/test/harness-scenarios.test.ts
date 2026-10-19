@@ -228,6 +228,10 @@ for (const scenario of deliveryScenarios) {
     assert.match(String(delivery.delivery_digest), /^sha256:[0-9a-f]{64}$/);
     assert.match(String(delivery.excerpt), /\+export const a = 2;/);
     assert.match(String(delivery.stat), /src\/a\.js/);
+    const { wait_ms: waited, ...counts } = run.approvals ?? {};
+    assert.ok(typeof waited === "number" && waited >= 0);
+    const outcome = { approve: "approved", reject: "rejected", expire: "expired" }[scenario.delivery];
+    assert.deepEqual(counts, { requested: 1, approved: 0, rejected: 0, expired: 0, [outcome]: 1 });
     if (scenario.delivery === "approve") {
       assert.equal(commits, 1);
       assert.equal(patches.length, 0);

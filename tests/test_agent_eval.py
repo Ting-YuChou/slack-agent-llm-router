@@ -563,6 +563,32 @@ def test_execute_records_the_prompts_version_the_run_was_built_with():
     assert unknown["prompts_version"] is None
 
 
+def test_execute_records_approvals_checks_and_policy_from_the_run():
+    approvals = {
+        "requested": 1,
+        "approved": 1,
+        "rejected": 0,
+        "expired": 0,
+        "wait_ms": 900,
+    }
+    policy = {"allow": 3, "block": 1, "approval": 1, "approved": 1, "by_reason": {}}
+    record = agent_eval.execute(
+        _task("pass"),
+        0,
+        lambda task, attempt: _outcome(
+            approvals=approvals, writer_checks_calls=2, policy_summary=policy
+        ),
+    )
+
+    assert record["approvals"] == approvals
+    assert record["writer_checks_calls"] == 2
+    assert record["policy_summary"] == policy
+    bare = agent_eval.execute(_task("pass"), 0, lambda task, attempt: _outcome())
+    assert bare["approvals"] is None
+    assert bare["writer_checks_calls"] is None
+    assert bare["policy_summary"] is None
+
+
 def test_execute_records_a_crashed_runner_as_runner_error():
     def runner(task, attempt):
         raise RuntimeError("docker exploded with Bearer leaked.token")
