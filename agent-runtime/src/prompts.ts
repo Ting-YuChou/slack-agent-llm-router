@@ -24,3 +24,14 @@ function prompt(id: PromptId): { body: string; vars: readonly string[]; hash: st
   if (!Object.hasOwn(PROMPTS, id)) throw new Error(`Unknown prompt: ${String(id)}`);
   return PROMPTS[id];
 }
+
+const WRITER_PROMPTS: readonly PromptId[] = ["policy-scope", "checks", "jev-classifier", "budget-notice", "budget-final", "repair", "scope-repair", "ci-repair", "investigation-results"];
+const ROLE_PROMPTS: Readonly<Record<string, readonly PromptId[]>> = {
+  implementation: WRITER_PROMPTS, discussion: ["discussion"], grader: ["grader", "grader-scope"], planner: ["planner"],
+  code_explorer: ["investigator"], ci_investigator: ["investigator"], test_analyst: ["investigator"],
+};
+
+/** Telemetry fields naming the prompt set and the prompts an execution role is driven by. */
+export function promptTelemetry(role: string): { prompts_version: string; prompts: string[] } {
+  return { prompts_version: PROMPTS_VERSION, prompts: (Object.hasOwn(ROLE_PROMPTS, role) ? ROLE_PROMPTS[role]! : []).map(promptRef) };
+}

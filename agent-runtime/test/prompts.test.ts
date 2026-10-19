@@ -4,7 +4,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 
-import { PROMPT_IDS, PROMPTS_VERSION, promptRef, renderPrompt, type PromptVars } from "../src/prompts.js";
+import { PROMPT_IDS, PROMPTS_VERSION, promptRef, promptTelemetry, renderPrompt, type PromptVars } from "../src/prompts.js";
 
 const root = path.resolve(import.meta.dirname, "../..");
 const goldenDir = path.join(root, "test/golden/prompts");
@@ -59,4 +59,15 @@ test("the generator rejects malformed placeholders", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "prompts-"));
   writeFileSync(path.join(dir, "bad.md"), "Hello {{ name }}\n");
   assert.throws(() => generatePromptsModule(dir), /bad.*placeholder/);
+});
+
+test("telemetry names the prompt version and the prompts each role runs with", () => {
+  const refs = (...ids: Parameters<typeof promptRef>[0][]) => ({ prompts_version: PROMPTS_VERSION, prompts: ids.map(promptRef) });
+  assert.deepEqual(promptTelemetry("grader"), refs("grader", "grader-scope"));
+  assert.deepEqual(promptTelemetry("planner"), refs("planner"));
+  for (const role of ["code_explorer", "ci_investigator", "test_analyst"]) assert.deepEqual(promptTelemetry(role), refs("investigator"));
+  assert.deepEqual(promptTelemetry("discussion"), refs("discussion"));
+  const writer = promptTelemetry("implementation").prompts;
+  for (const id of ["policy-scope", "checks", "repair", "scope-repair", "budget-notice", "budget-final"] as const) assert.ok(writer.includes(promptRef(id)), id);
+  assert.deepEqual(promptTelemetry("no-such-role"), { prompts_version: PROMPTS_VERSION, prompts: [] });
 });

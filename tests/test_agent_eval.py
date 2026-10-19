@@ -551,6 +551,18 @@ def test_execute_records_no_error_for_a_clean_run():
     assert record["error_message"] is None
 
 
+def test_execute_records_the_prompts_version_the_run_was_built_with():
+    record = agent_eval.execute(
+        _task("pass"),
+        0,
+        lambda task, attempt: _outcome(prompts_version="6da0aeafa863"),
+    )
+
+    assert record["prompts_version"] == "6da0aeafa863"
+    unknown = agent_eval.execute(_task("pass"), 0, lambda task, attempt: _outcome())
+    assert unknown["prompts_version"] is None
+
+
 def test_execute_records_a_crashed_runner_as_runner_error():
     def runner(task, attempt):
         raise RuntimeError("docker exploded with Bearer leaked.token")
@@ -851,6 +863,7 @@ def test_live_runner_takes_the_error_from_the_final_run_state(tmp_path, monkeypa
         "verification_status": "unknown",
         "grader_status": "unknown",
         "estimated_cost_usd": 0.05,
+        "prompts_version": "6da0aeafa863",
         "error": {
             "code": "agent_tool_limit",
             "message": "Tool limit hit using sk-live-secret-key",
@@ -902,6 +915,7 @@ def test_live_runner_takes_the_error_from_the_final_run_state(tmp_path, monkeypa
     assert outcome["error_message"] == "Tool limit hit using [REDACTED]"
     assert outcome["error_cause_code"] == "tool_budget"
     assert outcome["grader_cause"] == "grader_timeout"
+    assert outcome["prompts_version"] == "6da0aeafa863"
     assert outcome["attempts"] == [
         {"verification": "failed", "grader": "not_run"},
         {"verification": None, "grader": None},

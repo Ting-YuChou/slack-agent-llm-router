@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { ScopeViolationError } from "./candidate-scope.js";
 import { formatCheckFeedback, type CheckFailure } from "./check-report.js";
 import { HarnessError, type CauseCode } from "./error-taxonomy.js";
-import { renderPrompt } from "./prompts.js";
+import { promptTelemetry, renderPrompt } from "./prompts.js";
 
 export type CheckStatus = "passed" | "failed" | "unknown";
 export interface VerificationCheck {
@@ -111,11 +111,11 @@ export class QualityGate {
     }
     const verification = await this.options.verify(candidate, input);
     input.signal.throwIfAborted();
-    await this.options.record?.("verification", { candidate_hash: candidate.hash, source_hash: candidate.sourceHash ?? candidate.hash, tested_baseline: candidate.testedBaseline ?? input.baseline, ...verification }, input);
+    await this.options.record?.("verification", { candidate_hash: candidate.hash, source_hash: candidate.sourceHash ?? candidate.hash, tested_baseline: candidate.testedBaseline ?? input.baseline, ...verification, ...promptTelemetry("implementation") }, input);
     let grade: Grade | undefined;
     if (verification.status === "passed") {
       grade = await this.gradeWithRetry(candidate, verification, input);
-      await this.options.record?.("grade", grade, input);
+      await this.options.record?.("grade", { ...grade, ...promptTelemetry("grader") }, input);
     }
     input.signal.throwIfAborted();
     if (verification.status === "passed" && grade?.status === "passed") return { action: "pass", candidate, verification, grade };
