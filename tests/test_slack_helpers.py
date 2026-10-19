@@ -2443,3 +2443,143 @@ def test_discussion_response_shows_no_verification_or_delivery():
     assert "Read-only discussion" in response
     assert "not_applicable" in response
     assert "*Delivery:*" not in response
+
+
+def _section_texts(blocks):
+    return [block["text"]["text"] for block in blocks if block["type"] == "section"]
+
+
+@pytest.mark.parametrize("detail_length", [0, 120, 2_950, 3_000, 4_096])
+def test_agent_approval_blocks_stay_within_slack_section_limit(detail_length):
+    detail = "x" * detail_length
+    blocks = SlackBot._agent_approval_blocks(
+        {
+            "title": "Approve write to src/app.py",
+            "detail": detail,
+            "expires_at": "2026-10-18T12:05:00.000Z",
+        }
+    )
+    sections = _section_texts(blocks)
+    assert all(len(text) <= 3000 for text in sections)
+    assert sections[0] == "*Approve write to src/app.py*"
+    detail_text = sections[1]
+    if detail_length + 6 > 3000:
+        shown = detail_text.split("```")[1]
+        assert (
+            f"_Truncated: showing {len(shown)}/{detail_length} chars._" in detail_text
+        )
+    else:
+        assert "Truncated" not in detail_text
+        if detail_length:
+            assert detail_text == f"```{detail}```"
+    footer = blocks[-1]["elements"][0]["text"]
+    expected_ts = int(datetime.fromisoformat("2026-10-18T12:05:00+00:00").timestamp())
+    assert f"<!date^{expected_ts}^{{time}}|2026-10-18T12:05:00.000Z>" in footer
+    assert "5 minutes" not in footer
+
+
+def test_agent_approval_blocks_neutralize_fences_and_missing_expiry():
+    blocks = SlackBot._agent_approval_blocks(
+        {"title": "Run command", "detail": "echo ```break``` out"}
+    )
+    detail_text = _section_texts(blocks)[1]
+    assert detail_text.count("```") == 2
+    assert "expires soon" in blocks[-1]["elements"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_monitor_posts_oversized_approval_card_with_valid_blocks():
+    runtime = SimpleNamespace(
+        wait_for_update=AsyncMock(
+            return_value={
+                "run_id": "r",
+                "session_id": "s",
+                "status": "awaiting_approval",
+                "events": [
+                    {
+                        "type": "approval",
+                        "approval_id": "a",
+                        "title": "Approve shell command",
+                        "detail": "rm -rf build && " * 300,
+                        "expires_at": "2026-10-18T12:05:00Z",
+                    }
+                ],
+            }
+        )
+    )
+    bot = SlackBot(
+        {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+    )
+    bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+
+    await bot._monitor_agent_run({"run_id": "r", "channel_id": "c", "thread_ts": "t"})
+
+    blocks = bot.web_client.chat_postMessage.await_args.kwargs["blocks"]
+    assert all(len(text) <= 3000 for text in _section_texts(blocks))
+    assert "Truncated: showing" in _section_texts(blocks)[1]
+    assert blocks[-1]["type"] == "actions"
+
+
+@pytest.mark.parametrize(
+    "status,error,expected",
+    [
+        ("completed", None, "*completed*"),
+        (
+            "failed",
+            {"code": "commit_failed", "message": "Changes remain"},
+            "*failed* — commit_failed: Changes remain",
+        ),
+        (
+            "timed_out",
+            {"code": "run_timeout", "message": "Agent prompt exceeded its deadline"},
+            "*timed_out* — run_timeout",
+        ),
+        ("timed_out", None, "*timed_out* — the run exceeded its deadline"),
+        ("cancelled", None, "*cancelled*"),
+        ("rejected", None, "*rejected*"),
+        ("interrupted", None, "*interrupted*"),
+    ],
+)
+def test_agent_response_leads_with_terminal_status(status, error, expected):
+    result = {"run_id": "r1", "status": status, "answer": ""}
+    if error:
+        result["error"] = error
+    response = SlackMessageHandler._format_agent_response(result, max_length=2000)
+    first_line = response.splitlines()[0]
+    assert response.strip()
+    assert "`r1`" in first_line
+    assert expected in first_line
+
+
+def test_agent_response_status_line_survives_truncation():
+    response = SlackMessageHandler._format_agent_response(
+        {
+            "run_id": "r1",
+            "status": "failed",
+            "error": {"code": "container_start_failed", "message": "boom"},
+            "answer": "a" * 5000,
+            "changed_files": ["src/a.py"],
+        },
+        max_length=400,
+    )
+    assert len(response) <= 400
+    assert response.startswith(
+        "⚠️ Agent run `r1` *failed* — container_start_failed: boom"
+    )
+    assert "src/a.py" in response
+
+
+def test_agent_response_is_never_empty_and_tolerates_partial_findings():
+    assert SlackMessageHandler._format_agent_response({"answer": ""}).strip()
+    response = SlackMessageHandler._format_agent_response(
+        {
+            "answer": "done",
+            "grader_findings": [
+                {"path": "src/a.py", "reason": "missing test"},
+                {"line": 3},
+                "not-a-finding",
+            ],
+        }
+    )
+    assert "• `src/a.py` missing test" in response
+    assert "• `unknown:3`" in response

@@ -652,13 +652,13 @@ export class CodingAgentOrchestrator {
     if (event.type === "usage") {
       const state = this.workflows.get(run.run_id); state?.budget.report(event.cost_usd);
       run.estimated_cost_usd = (run.estimated_cost_usd ?? 0) + event.cost_usd;
-      void this.persistState();
+      this.persistInBackground();
       if (state && state.budget.estimatedUsd > state.budget.limitUsd) void this.failRun(session, run, "workflow_budget_exhausted", "Model budget exhausted");
       return;
     }
     if (event.type === "turn") {
       run.turn_count += 1;
-      void this.persistState();
+      this.persistInBackground();
       return;
     }
     if (event.type === "approval") {
@@ -672,7 +672,7 @@ export class CodingAgentOrchestrator {
       });
       this.updateRun(run, "awaiting_approval");
       run.events.push({ ...event, approval_id: approval.id, expires_at: new Date(approval.expiresAt).toISOString() });
-      void this.persistState();
+      this.persistInBackground();
       return;
     }
     if (event.type === "tool") {
@@ -714,13 +714,13 @@ export class CodingAgentOrchestrator {
       } else {
         run.events.push(event);
       }
-      void this.persistState();
+      this.persistInBackground();
       return;
     }
     if (event.type === "answer") {
       run.answer = event.text;
       run.events.push(event);
-      void this.persistState();
+      this.persistInBackground();
       return;
     }
     if (event.type === "error") {
@@ -959,6 +959,14 @@ export class CodingAgentOrchestrator {
         run.capture_reasons = capture?.reasons ?? [];
       }
       this.observeRun?.(structuredClone(run)); } catch { /* monitoring cannot fail agent runs */ }
+  }
+
+  /** Event handlers cannot await persistence; a failure must fail closed rather than become an unhandled rejection. */
+  private persistInBackground(): void {
+    this.persistState().catch((error: unknown) => {
+      if (this.stateStore) this.stateStore.healthy = false;
+      console.error("Agent runtime control state could not be persisted; runtime marked unhealthy", error instanceof Error ? error.message : error);
+    });
   }
 
   private async persistState(): Promise<void> {

@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { GitHubAppTokenProvider } from "./github-app-token.js";
 import { allServerTools, MCP_SERVERS, type McpServerId } from "./mcp-config.js";
 import { createMcpGatewayServer } from "./mcp-gateway.js";
-import { authorizeClickHouseTool, authorizeContext7Tool, authorizeGitHubTool, sanitizeClickHouseResponse, validateContext7Response } from "./mcp-policy.js";
+import { authorizeClickHouseTool, authorizeContext7Tool, authorizeGitHubTool, githubMcpTokenScope, sanitizeClickHouseResponse, validateContext7Response } from "./mcp-policy.js";
 
 const serverId = parseServer(process.env.MCP_SERVER_ID);
 const signingSecret = process.env.MCP_GATEWAY_SERVER_SIGNING_SECRET ?? "";
@@ -13,6 +13,7 @@ const port = positiveInteger(process.env.MCP_GATEWAY_PORT, 8090);
 const githubToken = serverId === "github" ? new GitHubAppTokenProvider({
   appId: process.env.GITHUB_APP_ID ?? "", installationId: process.env.GITHUB_APP_INSTALLATION_ID ?? "",
   privateKey: readPrivateKey(process.env.GITHUB_APP_PRIVATE_KEY_PATH),
+  ...githubMcpTokenScope(process.env.PI_AGENT_GITHUB_REPOSITORIES),
 }) : undefined;
 
 const upstreamHeaders = async (): Promise<Record<string, string>> => {

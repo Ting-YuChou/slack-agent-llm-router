@@ -59,6 +59,45 @@ MEMORY_SLASH_ONLY_MESSAGE = (
     "Use `/llm remember`, `/llm memories`, or `/llm forget`."
 )
 SLACK_BUSY_MESSAGE = "The LLM Router is busy right now. Please retry in a moment."
+SLACK_SECTION_TEXT_LIMIT = 3000
+AGENT_TERMINAL_STATUSES = {
+    "completed",
+    "rejected",
+    "cancelled",
+    "failed",
+    "timed_out",
+    "interrupted",
+}
+
+
+def _format_agent_status_line(result: Dict[str, Any]) -> str:
+    """Lead every terminal agent result with an explicit outcome."""
+    status = str(result.get("status") or "")
+    if status not in AGENT_TERMINAL_STATUSES:
+        return ""
+    run_id = result.get("run_id")
+    label = f"Agent run `{run_id}`" if run_id else "Agent run"
+    if status == "completed":
+        return f"✅ {label} *completed*"
+    error = result.get("error") if isinstance(result.get("error"), dict) else {}
+    code = str(error.get("code") or "").strip()
+    message = str(error.get("message") or "").strip()
+    reason = ": ".join(part for part in (code, message) if part)
+    if not reason:
+        reason = {
+            "rejected": "the requested action was rejected or the approval expired",
+            "cancelled": "the run was cancelled",
+            "timed_out": "the run exceeded its deadline",
+            "interrupted": "the runtime stopped before the run finished",
+        }.get(status, "no error detail was reported")
+    return f"⚠️ {label} *{status}* — {reason}"
+
+
+def _format_grader_finding(finding: Dict[str, Any]) -> str:
+    location = str(finding.get("path") or "unknown")
+    if finding.get("line") is not None:
+        location = f"{location}:{finding.get('line')}"
+    return f"• `{location}` {finding.get('reason') or ''}".rstrip()
 
 
 @dataclass(frozen=True)
@@ -1330,14 +1369,15 @@ class SlackMessageHandler:
                 f"human wait {timing.get('human_wait_ms', 0) / 1000:.1f}s / "
                 f"suspended {result.get('suspended_ms', 0) / 1000:.1f}s"
             )
-        findings = result.get("grader_findings") or []
+        findings = [
+            finding
+            for finding in result.get("grader_findings") or []
+            if isinstance(finding, dict)
+        ]
         if findings:
             detail_sections.append(
                 "*Grader findings:*\n"
-                + "\n".join(
-                    f"• `{finding['path']}:{finding['line']}` {finding['reason']}"
-                    for finding in findings[:5]
-                )
+                + "\n".join(_format_grader_finding(finding) for finding in findings[:5])
             )
         delivery = []
         if result.get("branch") and result.get("task_mode") != "discuss":
@@ -1350,6 +1390,21 @@ class SlackMessageHandler:
             detail_sections.append("*Delivery:*\n" + "\n".join(delivery))
 
         details = "\n\n".join(detail_sections)
+        status_line = _format_agent_status_line(result)
+        if not answer and not details and not status_line:
+            answer = "_The agent finished without producing an answer._"
+        if status_line:
+            if max_length is not None:
+                status_line = status_line[: max(1, max_length)]
+                max_length = max(0, max_length - len(status_line) - 2)
+            body = SlackMessageHandler._fit_agent_response(answer, details, max_length)
+            return "\n\n".join(section for section in (status_line, body) if section)
+        return SlackMessageHandler._fit_agent_response(answer, details, max_length)
+
+    @staticmethod
+    def _fit_agent_response(
+        answer: str, details: str, max_length: Optional[int]
+    ) -> str:
         response = "\n\n".join(section for section in (answer, details) if section)
         if max_length is None or len(response) <= max_length:
             return response
@@ -2061,8 +2116,13 @@ class SlackBot:
         monitoring_service=None,
         analytics_service=None,
         services: Optional[Dict[str, Any]] = None,
+        agent_config: Optional[Dict[str, Any]] = None,
     ):
         self.config = config
+        # Agent settings live in the top-level `agent` section, not under `slack`.
+        self.agent_config = dict(
+            agent_config if agent_config is not None else config.get("agent") or {}
+        )
         self.inference_engine = inference_engine
         resolved_services = services or {}
         self.services = resolved_services
@@ -3217,6 +3277,50 @@ class SlackBot:
         if self.agent_user_runs.get(tracked.get("owner_user_id")) is tracked:
             self.agent_user_runs.pop(tracked.get("owner_user_id"), None)
 
+    @staticmethod
+    def _agent_approval_blocks(approval: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Build approval card blocks that each stay within Slack's section limit."""
+        title = str(approval.get("title") or "Approval required")[:200]
+        # Keep embedded fences from closing the code block early.
+        detail = str(approval.get("detail") or "").replace("```", "`\u200b``")
+        fence = "```"
+        text = f"{fence}{detail}{fence}" if detail else "_No detail provided._"
+        if len(text) > SLACK_SECTION_TEXT_LIMIT:
+            marker_reserve = len(
+                f"\n_Truncated: showing {len(detail)}/{len(detail)} chars._"
+            )
+            shown = SLACK_SECTION_TEXT_LIMIT - 2 * len(fence) - marker_reserve
+            text = (
+                f"{fence}{detail[:shown]}{fence}\n"
+                f"_Truncated: showing {shown}/{len(detail)} chars._"
+            )
+
+        expiry = "This request expires soon."
+        expires_at = approval.get("expires_at")
+        if isinstance(expires_at, str) and expires_at:
+            try:
+                parsed = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                expiry = (
+                    f"This request expires at <!date^{int(parsed.timestamp())}"
+                    f"^{{time}}|{expires_at}>."
+                )
+            except ValueError:
+                pass
+
+        return [
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*"}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"Only the session owner can decide. {expiry}",
+                    }
+                ],
+            },
+        ]
+
     async def _monitor_agent_run(self, tracked: Dict[str, Any]):
         runtime = self.agent_runtime_client
         if runtime is None or self.web_client is None:
@@ -3256,17 +3360,7 @@ class SlackBot:
                 thread_ts=tracked["thread_ts"],
                 text=f"Approval required: {approval.get('title', 'Agent action')}",
                 blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": (
-                                f"*{approval.get('title', 'Approval required')}*\n"
-                                f"```{str(approval.get('detail', ''))[:3000]}```\n"
-                                "Only the session owner can decide. This request expires in 5 minutes."
-                            ),
-                        },
-                    },
+                    *self._agent_approval_blocks(approval),
                     {
                         "type": "actions",
                         "elements": [
@@ -3307,7 +3401,7 @@ class SlackBot:
             run, max_length=max_length
         )
         extra = {}
-        if run.get("status") == "completed" and self.config.get("agent", {}).get(
+        if run.get("status") == "completed" and self.agent_config.get(
             "feedback_enabled", False
         ):
             extra["blocks"] = [

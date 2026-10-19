@@ -6,7 +6,7 @@ import os from "node:os";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID, createHash, timingSafeEqual } from "node:crypto";
 import { PiRunCapture } from "./pi-capture.js";
 import { AgentTelemetry, isCredentialKey } from "./telemetry.js";
 import { AgentTracing } from "./tracing.js";
@@ -625,8 +625,13 @@ async function cleanupOrphanAgentContainers(): Promise<void> {
   }
 }
 
-function authorized(request: IncomingMessage, token: string): boolean {
-  return Boolean(token) && request.headers.authorization === `Bearer ${token}`;
+export function authorized(request: Pick<IncomingMessage, "headers">, token: string): boolean {
+  const header = request.headers.authorization;
+  if (!token || typeof header !== "string") return false;
+  const expected = Buffer.from(`Bearer ${token}`, "utf8");
+  const actual = Buffer.from(header, "utf8");
+  // timingSafeEqual requires equal lengths; the length itself is not secret.
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 async function readJson(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];

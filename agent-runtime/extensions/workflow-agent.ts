@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import path from 'node:path';
 import { Type } from 'typebox';
 import { validateSnapshotRead } from '../dist/src/policy.js';
 import { validateInvestigation, validatePlan } from '../dist/src/structured-workflow.js';
@@ -15,7 +16,10 @@ export default function workflowAgent(pi: ExtensionAPI) {
     if (config.mcpTools?.includes(event.toolName)) return;
     if (event.toolName !== tool) {
       const input = event.input as Record<string, unknown>;
-      if (!(await validateSnapshotRead(root,ctx.cwd,typeof input.path === 'string' ? input.path : undefined,config.paths)).allowed) return { block: true, reason: 'Read is outside the task snapshot scope' };
+      // The session cwd is outside the snapshot; path-less ls/find/grep default to the task scope.
+      const defaultPath = config.paths.length === 1 ? path.resolve(root, String(config.paths[0])) : root;
+      if (input.path === undefined) input.path = defaultPath;
+      if (!(await validateSnapshotRead(root,ctx.cwd,typeof input.path === 'string' ? input.path : defaultPath,config.paths)).allowed) return { block: true, reason: 'Read is outside the task snapshot scope' };
     }
   });
   const task = Type.Object({ id: Type.String(), role: Type.Union([Type.Literal('code_explorer'),Type.Literal('ci_investigator'),Type.Literal('test_analyst')]), purpose: Type.String(), paths: Type.Array(Type.String()), dependencies: Type.Array(Type.String()), expected_output: Type.String() });

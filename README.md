@@ -415,7 +415,9 @@ GITHUB_APP_PRIVATE_KEY_PATH=/absolute/path/to/github-app.private-key.pem
 ```
 
 The repository list is comma-separated. The current checkout's `origin` must
-match one entry. Each HTTP MCP runs behind its own gateway, credential set,
+match one entry. The GitHub gateway also receives this list and mints
+installation tokens limited to those repositories (which must share one owner)
+and to the read permissions above. Each HTTP MCP runs behind its own gateway, credential set,
 derived signing key, and network boundary. Pi receives only a short-lived token
 bound to the server, run, session, Slack user, scope, exact tools, call budget,
 and expiry. The GitHub server also runs in read-only and lockdown mode, and the

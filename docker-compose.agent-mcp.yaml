@@ -49,6 +49,7 @@ services:
       GITHUB_APP_ID: ${GITHUB_APP_ID:?Set the GitHub App ID}
       GITHUB_APP_INSTALLATION_ID: ${GITHUB_APP_INSTALLATION_ID:?Set the GitHub App installation ID}
       GITHUB_APP_PRIVATE_KEY_PATH: /run/secrets/github-app.pem
+      PI_AGENT_GITHUB_REPOSITORIES: ${PI_AGENT_GITHUB_REPOSITORIES:?Set the GitHub repository allowlist}
     volumes:
       - ${GITHUB_APP_PRIVATE_KEY_PATH:?Set the GitHub App private key path}:/run/secrets/github-app.pem:ro
     ports: [127.0.0.1:8090:8090]

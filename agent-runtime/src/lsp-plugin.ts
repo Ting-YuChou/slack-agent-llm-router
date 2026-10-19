@@ -9,6 +9,8 @@ import { LspClient, languageServerForPath, resolveWorkspaceFile } from "./lsp-cl
 
 const MAX_DOCUMENT_BYTES = 256 * 1024;
 const MAX_RESULT_CHARS = 60_000;
+const DIAGNOSTICS_TIMEOUT_MS = 3_000;
+const INITIAL_DIAGNOSTICS_TIMEOUT_MS = 15_000;
 const ACTIONS = ["diagnostics", "definition", "references", "hover", "document_symbols", "workspace_symbols"] as const;
 
 export class DocumentVersionTracker {
@@ -68,8 +70,11 @@ export default function lspPlugin(pi: ExtensionAPI) {
         const uri = pathToFileURL(absolutePath).href;
         const version = versions.next(key, uri);
 
-        let diagnostics: Promise<unknown> | undefined;
-        if (params.action === "diagnostics") diagnostics = waitForDiagnostics(client, uri);
+        let diagnostics: Promise<DiagnosticsOutcome> | undefined;
+        // Freshly started servers (tsserver, pyright) routinely need longer than 3s for the first report.
+        if (params.action === "diagnostics") {
+          diagnostics = waitForDiagnostics(client, uri, version === 1 ? INITIAL_DIAGNOSTICS_TIMEOUT_MS : DIAGNOSTICS_TIMEOUT_MS);
+        }
         if (version === 1) {
           client.notify("textDocument/didOpen", {
             textDocument: { uri, languageId: spec.languageId, version, text },
@@ -87,9 +92,18 @@ export default function lspPlugin(pi: ExtensionAPI) {
         };
         let result: unknown;
         switch (params.action) {
-          case "diagnostics":
-            result = await diagnostics;
+          case "diagnostics": {
+            const outcome = await diagnostics!;
+            if (outcome.status === "timeout") {
+              return {
+                content: [{ type: "text", text: `LSP diagnostics timed out after ${outcome.timeoutMs / 1000}s; no diagnostics were received, so this is NOT evidence that the file has no errors. Retry or run the project's checks.` }],
+                details: { action: params.action, path: params.path, language: spec.languageId, status: "timeout", diagnostics: null },
+                isError: true,
+              };
+            }
+            result = outcome.diagnostics;
             break;
+          }
           case "definition":
             result = await client.request("textDocument/definition", { textDocument: { uri }, position });
             break;
@@ -132,7 +146,16 @@ export default function lspPlugin(pi: ExtensionAPI) {
   });
 }
 
-function waitForDiagnostics(client: LspClient, uri: string): Promise<unknown> {
+export type DiagnosticsOutcome =
+  | { status: "received"; diagnostics: unknown }
+  | { status: "timeout"; timeoutMs: number };
+
+/** Waits for publishDiagnostics; a timeout is reported explicitly, never as an empty (clean) list. */
+export function waitForDiagnostics(
+  client: Pick<LspClient, "onNotification">,
+  uri: string,
+  timeoutMs = DIAGNOSTICS_TIMEOUT_MS,
+): Promise<DiagnosticsOutcome> {
   return new Promise((resolve) => {
     let settled = false;
     const dispose = client.onNotification("textDocument/publishDiagnostics", (value) => {
@@ -140,14 +163,14 @@ function waitForDiagnostics(client: LspClient, uri: string): Promise<unknown> {
       settled = true;
       clearTimeout(timeout);
       dispose();
-      resolve(value.diagnostics ?? []);
+      resolve({ status: "received", diagnostics: value.diagnostics ?? [] });
     });
     const timeout = setTimeout(() => {
       if (settled) return;
       settled = true;
       dispose();
-      resolve([]);
-    }, 3_000);
+      resolve({ status: "timeout", timeoutMs });
+    }, timeoutMs);
     timeout.unref();
   });
 }
