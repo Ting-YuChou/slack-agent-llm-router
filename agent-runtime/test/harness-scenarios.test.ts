@@ -9,6 +9,10 @@ import { awaitUi, piTurn, runScenario, settledRecord, type Scenario } from "./su
 
 const fix = { "src/a.js": "export const a = 2;\n" };
 const profile = { allowedPaths: ["src"], maxRepairs: 1 };
+const weakened = { status: "failed" as const, checks: [
+  { name: "baseline:oracle", status: "failed" as const, exit_code: 1 },
+  { name: "candidate:oracle", status: "passed" as const, exit_code: 0 },
+] };
 const limitEntry = { type: "entry_appended", entry: { type: "custom", customType: "pi_agent_limit", data: { kind: "tool_calls", limit: 40 } } };
 
 /** Harness acceptance contract. A `todo` names the Phase 1 slice that makes the scenario pass. */
@@ -45,6 +49,15 @@ const scenarios: Array<Scenario & { todo?: string }> = [
     expect: { status: "completed", committed: true, verificationStatus: "passed" } },
   { name: "S9 unknown grade never commits", profile, grade: ["unknown"],
     attempts: [{ files: fix, records: [...piTurn("stop"), settledRecord] }],
+    expect: { status: "failed", errorCode: "verification_failed", committed: false } },
+  // Offline mirror of the weakened-test variant in full-loop-docker.test.ts: the candidate's own test run passes,
+  // but the baseline run restores the trusted test and fails, so neither attempt may commit.
+  { name: "S20 a weakened trusted test fails both attempts and never commits", profile: { allowedPaths: ["src", "test"], maxRepairs: 1 },
+    verify: [weakened, weakened],
+    attempts: [
+      { files: { "test/a.test.js": "process.exit(0);\n" }, records: [...piTurn("stop"), settledRecord] },
+      { files: { "test/a.test.js": "process.exit(0);\n" }, records: [...piTurn("stop"), settledRecord] },
+    ],
     expect: { status: "failed", errorCode: "verification_failed", committed: false } },
   { name: "S19 docker unavailable during verification names its cause", profile,
     verify: [new HarnessError("docker_unavailable", "Docker is unavailable for verification")],
