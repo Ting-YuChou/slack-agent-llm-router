@@ -56,3 +56,33 @@ for (const scenario of scenarios) {
     for (const text of expect.repairPromptIncludes ?? []) assert.match(prompts[1] ?? "", new RegExp(text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   });
 }
+
+test("harness: full verification results reach the repair prompt", async () => {
+  const failed = { status: "failed" as const, checks: [{ name: "candidate:pytest", status: "failed" as const, exit_code: 1, failed: 3 }] };
+  const { run, prompts } = await runScenario({ name: "H0 verify result", profile, verify: [failed, "passed"],
+    attempts: [
+      { files: { "src/a.js": "broken\n" }, records: [...piTurn("stop"), settledRecord] },
+      { files: fix, records: [...piTurn("stop"), settledRecord] },
+    ],
+    expect: { status: "completed", committed: true } });
+  assert.equal(run.status, "completed");
+  assert.match(prompts[1] ?? "", /candidate:pytest/);
+});
+
+test("harness: grader steps are consumed per grader call and may throw", async () => {
+  const { run, gradeCalls } = await runScenario({ name: "H0 grader error", profile, grade: [new Error("grader_timeout")],
+    attempts: [{ files: fix, records: [...piTurn("stop"), settledRecord] }],
+    expect: { status: "failed", committed: false } });
+  assert.equal(run.status, "failed");
+  assert.equal(gradeCalls, 1);
+});
+
+test("harness: quality overrides replace scripted services", async () => {
+  let archived = 0;
+  const { run } = await runScenario({ name: "H0 quality override", profile, verify: ["failed", "failed"],
+    quality: { archive: async () => { archived += 1; } },
+    attempts: [{ files: { "src/a.js": "broken\n" }, records: [...piTurn("stop"), settledRecord] }, { files: { "src/a.js": "broken\n" }, records: [...piTurn("stop"), settledRecord] }],
+    expect: { status: "failed", committed: false } });
+  assert.equal(run.status, "failed");
+  assert.ok(archived >= 1, "failed runs archive through the overridden service");
+});
