@@ -18,6 +18,7 @@ def test_slack_socket_mode_uses_supported_aiohttp_client_import():
 from src.memory import HashEmbeddingProvider, InMemoryMemoryStore, MemoryManager
 from slack.agent_bootstrap import AgentBootstrapContext
 from slack.bot_real import (
+    AGENT_ERROR_HINTS,
     ConversationContext,
     ConversationManager,
     FileSlackStateStore,
@@ -26,6 +27,7 @@ from slack.bot_real import (
     SlackMessageHandler,
     SlackWorkItem,
     UserManager,
+    _format_agent_status_line,
 )
 from src.utils.schema import (
     Attachment,
@@ -2699,3 +2701,69 @@ def test_delivery_expired_status_line_suggests_the_next_step():
     assert "*failed* — delivery_expired" in lines[0]
     assert lines[1].startswith("Next step: ")
     assert "approve it in time" in lines[1]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"code": "scope_violation"},
+        {"code": "diff_limit_exceeded"},
+        {"code": "agent_tool_limit"},
+        {"code": "agent_turn_limit"},
+        {"code": "verification_failed", "cause_code": "grader_timeout"},
+        {"code": "verification_failed", "cause_code": "insufficient_evidence"},
+        {"code": "quality_gate_unavailable", "cause_code": "docker_unavailable"},
+        {"code": "delivery_expired"},
+        {"code": "delivery_rejected"},
+        {"code": "archive_failed"},
+    ],
+)
+def test_agent_status_line_appends_next_step_for_known_codes(error):
+    key = error.get("cause_code") or error["code"]
+    line = _format_agent_status_line(
+        {"run_id": "r1", "status": "failed", "error": {**error, "message": "m"}}
+    )
+    assert line.startswith(f"⚠️ Agent run `r1` *failed* — {error['code']}: m")
+    assert line.endswith(f"\nNext step: {AGENT_ERROR_HINTS[key]}")
+
+
+def test_agent_status_line_prefers_cause_code_hint_over_code_hint():
+    line = _format_agent_status_line(
+        {
+            "status": "failed",
+            "error": {"code": "agent_tool_limit", "cause_code": "docker_unavailable"},
+        }
+    )
+    assert AGENT_ERROR_HINTS["docker_unavailable"] in line
+    assert AGENT_ERROR_HINTS["agent_tool_limit"] not in line
+
+
+def test_agent_status_line_keeps_generic_text_for_unknown_codes():
+    line = _format_agent_status_line(
+        {
+            "run_id": "r1",
+            "status": "failed",
+            "error": {
+                "code": "something_new",
+                "cause_code": "also_new",
+                "message": "x",
+            },
+        }
+    )
+    assert line == "⚠️ Agent run `r1` *failed* — something_new: x"
+    assert (
+        _format_agent_status_line({"status": "cancelled"})
+        == "⚠️ Agent run *cancelled* — the run was cancelled"
+    )
+
+
+def test_agent_status_line_mentions_a_retained_patch_without_a_path():
+    line = _format_agent_status_line(
+        {
+            "status": "failed",
+            "error": {"code": "agent_aborted"},
+            "patch_retained": True,
+        }
+    )
+    assert line.endswith("\nThe undelivered patch was kept on the runtime host.")
+    assert "/" not in line.split("\n", 1)[1]

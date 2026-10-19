@@ -1,12 +1,13 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
 import { assertCandidateScope } from "../../src/candidate-scope.js";
-import { CodingAgentOrchestrator, type QualityServices, type RunRecord } from "../../src/orchestrator.js";
+import { CodingAgentOrchestrator, type PatchArchiver, type QualityServices, type RunRecord } from "../../src/orchestrator.js";
+import { archivePatch, undeliveredPatchPath } from "../../src/patch-archive.js";
 import { PiRpcBridge, type PublicRunEvent } from "../../src/pi-rpc.js";
 import { QualityGate, type CheckStatus, type Grade, type VerificationResult } from "../../src/quality-gate.js";
 import { WorktreeManager } from "../../src/worktree-manager.js";
@@ -27,15 +28,18 @@ export interface Scenario {
   /** Omit for the no-profile path. */
   profile?: { allowedPaths: string[]; maxRepairs: number };
   attempts: ScriptedAttempt[];
-  /** Per attempt: a status for a single scripted check, or the full verification result. */
-  verify?: Array<CheckStatus | VerificationResult>;
+  /** Per attempt: a status for a single scripted check, the full verification result, or an error the verifier throws. */
+  verify?: Array<CheckStatus | VerificationResult | Error>;
   /** Per grader call, not per attempt, so retries consume their own entries. */
   grade?: ScriptedGrade[];
   /** Overrides merged over the scenario's quality services. */
   quality?: Partial<QualityServices>;
+  /** Replaces the real patch archiver (which writes under the scenario root's artifacts/). */
+  archivePatch?: PatchArchiver;
   expect: {
     status: RunRecord["status"];
     errorCode?: string;
+    causeCode?: string;
     committed: boolean;
     verificationStatus?: string;
     repairPromptIncludes?: string[];
@@ -100,7 +104,8 @@ async function changedFiles(worktree: string, baseline: string): Promise<string[
   return [...tracked, ...untracked];
 }
 
-function scriptedVerification(step: CheckStatus | VerificationResult | undefined): VerificationResult {
+function scriptedVerification(step: CheckStatus | VerificationResult | Error | undefined): VerificationResult {
+  if (step instanceof Error) throw step;
   if (step && typeof step === "object") return step;
   const status = step ?? "passed";
   return { status, checks: [{ name: "scripted", status, exit_code: status === "passed" ? 0 : 1 }] };
@@ -136,7 +141,10 @@ function qualityFor(scenario: Scenario, counters: { gradeCalls: number }): Quali
   };
 }
 
-export interface ScenarioResult { run: RunRecord; prompts: string[]; responses: ScriptedProcess["responses"]; gradeCalls: number; commits: number; dirty: string }
+/** An undelivered patch archived during the scenario, read back before the scenario root is removed. */
+export interface ArchivedPatchFile { path: string; content: string; mode: number }
+
+export interface ScenarioResult { run: RunRecord; prompts: string[]; responses: ScriptedProcess["responses"]; gradeCalls: number; commits: number; dirty: string; patches: ArchivedPatchFile[] }
 
 /** Runs a scenario through the real orchestrator, worktree manager, Pi RPC bridge and quality gate. */
 export async function runScenario(scenario: Scenario): Promise<ScenarioResult> {
@@ -151,6 +159,12 @@ export async function runScenario(scenario: Scenario): Promise<ScenarioResult> {
     const worktrees = new WorktreeManager({ repoPath: repo, worktreeRoot: path.join(root, "worktrees"), baseRef: "main" });
     let scripted!: ScriptedProcess;
     const counters = { gradeCalls: 0 };
+    const archived: string[] = [];
+    const archiver: PatchArchiver = scenario.archivePatch ?? (async input => {
+      const result = await archivePatch({ worktree: input.worktree, baseline: input.baseline, file: undeliveredPatchPath(root, input.run_id) });
+      if (result) archived.push(result.path);
+      return result?.path;
+    });
     // Runs turn terminal before their rollback finishes; wait for it before inspecting the worktree.
     const pending = new Set<Promise<unknown>>();
     const track = <T>(work: Promise<T>): Promise<T> => { pending.add(work); void work.finally(() => pending.delete(work)).catch(() => undefined); return work; };
@@ -168,6 +182,7 @@ export async function runScenario(scenario: Scenario): Promise<ScenarioResult> {
       },
       deadlineMs: 30_000,
       quality: qualityFor(scenario, counters),
+      archivePatch: archiver,
     });
     const created = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: scenario.name, user_id: "U", prompt: "Fix the bug in src/a.js" });
     const run = await waitForTerminal(() => orchestrator.getRun(created.run_id));
@@ -176,7 +191,8 @@ export async function runScenario(scenario: Scenario): Promise<ScenarioResult> {
     const commits = Number(await git(session.worktreePath, "rev-list", "--count", "HEAD")) - 1;
     const dirty = await git(session.worktreePath, "status", "--porcelain");
     await orchestrator.shutdown();
-    return { run: structuredClone(run), prompts: scripted.prompts, responses: scripted.responses, gradeCalls: counters.gradeCalls, commits, dirty };
+    const patches = await Promise.all(archived.map(async file => ({ path: file, content: await readFile(file, "utf8"), mode: (await stat(file)).mode & 0o777 })));
+    return { run: structuredClone(run), prompts: scripted.prompts, responses: scripted.responses, gradeCalls: counters.gradeCalls, commits, dirty, patches };
   } finally {
     await rm(root, { recursive: true, force: true });
   }

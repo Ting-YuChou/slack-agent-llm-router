@@ -74,12 +74,40 @@ AGENT_TERMINAL_STATUSES = {
 }
 # Next step shown after a failed run's reason, keyed by error code or cause_code.
 AGENT_ERROR_HINTS = {
+    "scope_violation": (
+        "Ask for the change again within the profile's allowed paths, "
+        "or widen allowedPaths if those files belong in scope."
+    ),
+    "diff_limit_exceeded": (
+        "Split the request into smaller changes, each within the diff limits."
+    ),
+    "agent_tool_limit": (
+        "Narrow the request or split it so the agent needs fewer tool calls."
+    ),
+    "agent_turn_limit": (
+        "Narrow the request or split it so the agent can finish in fewer turns."
+    ),
+    "grader_timeout": (
+        "The grader timed out; retry the run, and report it if it keeps happening."
+    ),
+    "insufficient_evidence": (
+        "The grader could not confirm the change; add tests or point to how "
+        "the behaviour can be checked, then retry."
+    ),
+    "docker_unavailable": (
+        "Docker is unavailable on the runtime host; ask an operator to start it, "
+        "then retry."
+    ),
     "delivery_expired": (
         "The delivery approval expired; rerun the request and approve it in time."
     ),
     "delivery_rejected": (
         "Delivery was rejected; rerun with updated instructions if you still "
         "want the change."
+    ),
+    "archive_failed": (
+        "The change could not be archived, so it stays in the isolated worktree; "
+        "ask an operator to recover it before retrying."
     ),
 }
 
@@ -109,6 +137,8 @@ def _format_agent_status_line(result: Dict[str, Any]) -> str:
     hint = AGENT_ERROR_HINTS.get(cause) or AGENT_ERROR_HINTS.get(code)
     if hint:
         line = f"{line}\nNext step: {hint}"
+    if result.get("patch_retained") is True:
+        line = f"{line}\nThe undelivered patch was kept on the runtime host."
     return line
 
 
