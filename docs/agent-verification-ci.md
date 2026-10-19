@@ -72,6 +72,17 @@ Gateway dollar figures derived from token counts/rates are estimates; official P
 
 Startup timing distinguishes Docker CLI spawn, inspected container running, verified RPC response, configuration, first accepted model request and first nonempty output. CI approval/reproduction/publication and verification/grading have separate spans. The dashboard shows wall time, active time and human waiting; overlapping spans must not be added together.
 
+### Feedback to eval-task drafts
+
+`scripts/export_agent_feedback.py` turns telemetry into eval-task drafts: runs the owner marked `needs_changes`, runs where the grader and the owner disagree, and CI-repair runs that failed. It joins `agent_runs`, the latest owner feedback, grade and verification, and the run's first user message from ClickHouse (same `CLICKHOUSE_*` variables as `export_agent_content.py`), or reads the same joined rows from a JSON array with `--input`:
+
+```sh
+CLICKHOUSE_PASSWORD=... python scripts/export_agent_feedback.py --days 30 drafts.jsonl
+python scripts/export_agent_feedback.py --input rows.json -   # offline, to stdout
+```
+
+Each JSONL line has `draft_id` (sha256 of the run id), `reason`, `reason_category`, `comment`, `prompt`, `changed_files`, `grader_status`, `verification_status`, `prompts_version` and `created_at`. User, Slack channel/thread and run ids are never written, and comment, prompt and paths pass through the eval redaction patterns. Review each draft by hand before turning it into `eval/tasks/<id>/` with a fixture and oracle.
+
 ## Validation and operating limits
 
 Local suites cover timing boundaries, candidate hashes, fresh grader settings, bounded repairs, no commit on unknown results, owner approvals, durable inbox replay, budget reservations and recovery after PR creation times out. Node tests are included in GitHub CI. Tests that explicitly require Docker or Kafka remain opt-in.
