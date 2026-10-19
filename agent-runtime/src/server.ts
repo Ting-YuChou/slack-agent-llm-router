@@ -11,6 +11,9 @@ import { PiRunCapture } from "./pi-capture.js";
 import { AgentTelemetry, isCredentialKey } from "./telemetry.js";
 import { AgentTracing } from "./tracing.js";
 import { DockerPiProcess, type ChecksContext, type WriterContext } from "./container-runtime.js";
+import { parseAgentLimitConfig } from "./agent-limits.js";
+
+export { parseAgentLimits } from "./agent-limits.js";
 import { budgetIdFor, outputTokenLimitFor, parseDefaultRunBudget } from "./run-budget.js";
 import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT, listAgentModels, resolveAgentModel } from "./agent-model.js";
 import { JevRouter, type JevMode } from "./jev-router.js";
@@ -20,9 +23,11 @@ import { allServerTools, enabledMcpServers, MCP_SERVERS, parseMcpMode, parseMcpS
 import { deriveMcpServerSecret, issueMcpToken } from "./mcp-token.js";
 import {
   CodingAgentOrchestrator,
+  publicRun,
   RuntimeError,
   type RunRecord,
 } from "./orchestrator.js";
+import { archivePatch, undeliveredPatchPath } from "./patch-archive.js";
 import { verifyPluginLock } from "./plugin-lock.js";
 import { RuntimeStateStore } from "./runtime-state.js";
 import { verifySkillLock } from "./skill-lock.js";
@@ -36,6 +41,7 @@ import type { CiRepairs } from "./ci-repair.js";
 import { loadProfile, type VerificationProfile } from "./verification.js";
 import { createQualityServices } from "./workflow-runtime.js";
 import { DEFAULT_DIFF_LIMITS, WorktreeManager } from "./worktree-manager.js";
+import { parseGraderConfig } from "./grader-config.js";
 
 const exec = promisify(execFile);
 export const DEFAULT_AGENT_RUNTIME_PORT = 3001;
@@ -155,7 +161,7 @@ export function createAgentHttpServer(options: ServerOptions) {
       const runMatch = /^\/v1\/runs\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && runMatch) {
         const id = decodeURIComponent(runMatch[1]);
-        sendJson(response, 200, options.ci?.has(id) ? await options.ci.get(id) : options.orchestrator.getRun(id));
+        sendJson(response, 200, options.ci?.has(id) ? await options.ci.get(id) : publicRun(options.orchestrator.getRun(id)));
         return;
       }
       const eventsMatch = /^\/v1\/runs\/([^/]+)\/events$/.exec(url.pathname);
@@ -359,7 +365,7 @@ export async function createProductionServer() {
     if (repositoryFromRemote(remote)?.toLowerCase() !== trustedProfile.profile.repository.toLowerCase()) throw new Error("Verification profile repository does not match the checkout origin");
   }
   if (trustedProfile?.profile.structuredWorkflow?.enabled && !configuredModels.some(model => model.ref === "openai/gpt-5.6-luna")) throw new Error("Structured workflow requires configured Luna worker provider");
-  if (trustedProfile && !configuredModels.some(model => model.ref === "openai/gpt-5.6-sol")) throw new Error("Quality workflow requires configured Sol grader provider");
+  const grader = trustedProfile ? parseGraderConfig(process.env, configuredModels) : undefined;
   const executionParents = new Map<string, string>();
   function executionExpiry(id: string) {
     const parent = executionParents.get(id);
@@ -380,18 +386,22 @@ export async function createProductionServer() {
       telemetry?.addSecret(token,id); return token;
     } } : undefined,
     phase: (id, phase, cost) => orchestrator.qualityPhase(id, phase, cost),
-    token: (id, route) => {
-      const model = resolveAgentModel(route?.modelRef ?? "openai/gpt-5.6-sol");
-      const role = route ? "investigator" : "grader";
-      const token = issueGatewayToken({ runId: id, workflowRunId: executionParents.get(id), role, outputTokenLimit: outputTokenLimitFor(role), provider: model.provider, model: model.id, api: model.api, reasoningEffort: route?.effort ?? "high", expiresAt: executionExpiry(id), traceparent: tracing?.traceparent(id) }, gatewaySecret);
+    grader,
+    token: (id, route, role) => {
+      const model = resolveAgentModel(route.modelRef);
+      const token = issueGatewayToken({ runId: id, workflowRunId: executionParents.get(id), role, outputTokenLimit: outputTokenLimitFor(role), provider: model.provider, model: model.id, api: model.api, reasoningEffort: route.effort, expiresAt: executionExpiry(id), traceparent: tracing?.traceparent(id) }, gatewaySecret);
       telemetry?.addSecret(token, id); return token;
     },
   }) : undefined;
   let ciRuntime: Awaited<ReturnType<typeof createCiRuntime>> | undefined;
-  const agentLimits = parseAgentLimits(process.env);
+  const agentLimits = parseAgentLimitConfig(process.env);
   const orchestrator: CodingAgentOrchestrator = new CodingAgentOrchestrator({
     quality,
     requireVerification: process.env.PI_AGENT_REQUIRE_VERIFICATION === "1",
+    archivePatch: async input => (await archivePatch({
+      worktree: input.worktree, baseline: input.baseline, file: undeliveredPatchPath(runtimeRoot, input.run_id),
+      secrets: Object.entries(process.env).filter(([key]) => isCredentialKey(key)).map(([, value]) => value!).filter(Boolean),
+    }))?.path,
     captureTraceContext: id => tracing?.traceparent(id),
     captureState: id => ({complete: telemetry ? telemetry.completeness(id).length === 0 : null, reasons: telemetry?.completeness(id) ?? []}),
     observeLifecycle: (id, name, phase, failed, sessionId) => {
@@ -401,7 +411,7 @@ export async function createProductionServer() {
       if (name === "preparation" && failed) tracing?.endRun(id, "failed");
     },
     observeRun: run => {
-      const summary = {...run, workflow_prompt: undefined, workflow_requirement: undefined, events: undefined, capture_complete: run.capture_complete ?? null};
+      const summary = {...publicRun(run), workflow_prompt: undefined, workflow_requirement: undefined, events: undefined, capture_complete: run.capture_complete ?? null};
       const signature = JSON.stringify(summary);
       if (observed.get(run.run_id) === signature) return;
       if (!observed.has(run.run_id) && ["running", "awaiting_approval"].includes(run.status)) tracing?.startRun(run.run_id, run.session_id);
@@ -441,7 +451,8 @@ export async function createProductionServer() {
           skillPaths: skillLock.skills.map((skill) => skill.container_path),
           continueSession: session.restored,
           safeCommands: parseSafeCommands(process.env.PI_AGENT_SAFE_COMMANDS),
-          limits: agentLimits,
+          limits: agentLimits.base,
+          routeLimits: agentLimits,
           ...(trustedProfile ? { writerContext: writerContextFor(trustedProfile.profile) } : {}),
           user: containerUser,
           ...(mcpServerIds.length > 0 ? {
@@ -517,7 +528,8 @@ export async function createProductionServer() {
   }
   workflowControl?.interruptWorkflowNodes();
   await orchestrator.restore();
-  const stopRetention = trustedProfile ? startEvidenceRetention(runtimeRoot, () => workflowControl?.pruneWorkflowContent(Date.now() - 30 * 86400000)) : undefined;
+  // Undelivered patches land under artifacts/ with or without a profile, so retention always runs.
+  const stopRetention = startEvidenceRetention(runtimeRoot, workflowControl ? () => workflowControl.pruneWorkflowContent(Date.now() - 30 * 86400000) : undefined);
   if (process.env.PI_AGENT_CI_REPAIR_ENABLED === "true" && !trustedProfile) throw new Error("CI repair requires PI_AGENT_VERIFICATION_PROFILE");
   ciRuntime = process.env.PI_AGENT_CI_REPAIR_ENABLED === "true" ? await createCiRuntime({ profile: trustedProfile!.profile, root: runtimeRoot, repoPath, worktreeRoot, orchestrator, telemetry, tracing, verificationBases, priorActive }) : undefined;
   const runtimeHealthy = () => integrityHealthy && stateStore.healthy && (workflowControl?.healthy ?? true) && (ciRuntime?.ci.healthy ?? true);
@@ -699,16 +711,6 @@ export function writerTools(profile: VerificationProfile | undefined, extensionP
 /** Constraints the writer sees up front and the policy extension enforces at write time. */
 export function writerContextFor(profile: VerificationProfile): WriterContext {
   return { allowedPaths: [...profile.allowedPaths], checks: profile.checks.map((check) => check.name), rubric: [...profile.rubric], diffLimits: { ...DEFAULT_DIFF_LIMITS } };
-}
-
-export function parseAgentLimits(env: NodeJS.ProcessEnv): { maxTurns: number; maxToolCalls: number } {
-  const read = (key: string, fallback: number) => {
-    if (env[key] === undefined || env[key] === "") return fallback;
-    const value = Number(env[key]);
-    if (!Number.isInteger(value) || value < 1 || value > 1000) throw new Error(`${key} must be an integer between 1 and 1000`);
-    return value;
-  };
-  return { maxTurns: read("PI_AGENT_MAX_TURNS", 20), maxToolCalls: read("PI_AGENT_MAX_TOOL_CALLS", 40) };
 }
 
 function parseSafeCommands(value: string | undefined): string[] {

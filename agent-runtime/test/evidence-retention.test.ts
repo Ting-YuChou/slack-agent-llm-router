@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, utimes, access, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, utimes, access, rm, writeFile, chmod } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { pruneEvidence } from '../src/evidence-retention.js';
@@ -29,4 +29,21 @@ test('retention preserves an old session directory when its context was recently
     await access(path.join(session, 'session.jsonl'));
     await assert.rejects(access(expired));
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('retention prunes expired read-only undelivered patches', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'patch-evidence-'));
+  try {
+    const expired = path.join(root, 'artifacts', 'old-run');
+    const recent = path.join(root, 'artifacts', 'new-run');
+    for (const directory of [expired, recent]) {
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      await writeFile(path.join(directory, 'undelivered-2026.patch'), 'diff --git a/x b/x\n', { mode: 0o400 });
+    }
+    await utimes(path.join(expired, 'undelivered-2026.patch'), new Date(0), new Date(0));
+    await utimes(expired, new Date(0), new Date(0));
+    await pruneEvidence(root, [], Date.now() - 30 * 86400000);
+    await assert.rejects(access(expired));
+    await access(path.join(recent, 'undelivered-2026.patch'));
+  } finally { await chmod(root, 0o700).catch(() => {}); await rm(root, { recursive: true, force: true }); }
 });

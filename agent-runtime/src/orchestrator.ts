@@ -3,6 +3,7 @@ import { taskMode, type TaskMode } from "./task-mode.js";
 
 import { listAgentModels, resolveAgentModel } from "./agent-model.js";
 import type { RouteDecision } from "./jev-router.js";
+import type { AgentLimits } from "./agent-limits.js";
 import { ApprovalStore } from "./policy.js";
 import type { PublicRunEvent, RunOutcome, UiResponse } from "./pi-rpc.js";
 import type { RuntimeStateStore } from "./runtime-state.js";
@@ -109,6 +110,8 @@ export interface RunRecord {
   grader_findings?: Array<{ path: string; line: number; severity: string; reason: string }>;
   verification_status?: string;
   grader_status?: string;
+  /** Why the last grade was a harness-made unknown, when it was. */
+  grader_cause?: { code: string; message: string };
   publication_status?: string;
   attempts?: Array<{ attempt: number; execution_id: string; candidate_hash?: string; verification_status?: string; grader_status?: string; artifact?: string }>;
   run_id: string;
@@ -124,6 +127,7 @@ export interface RunRecord {
   model?: string;
   reasoning_effort?: string;
   routing?: RouteDecision;
+  limits?: AgentLimits;
   estimated_cost_usd?: number;
   mcp_server?: string;
   mcp_tool?: string;
@@ -149,11 +153,24 @@ export interface RunRecord {
   commit?: string;
   cherry_pick?: string;
   error?: RunFailure;
+  /** Host path of the archived patch of an undelivered run; never leaves the host (see publicRun). */
+  patch_artifact?: string;
 }
+
+/** The run as clients (HTTP, Slack, telemetry) see it: host artifact paths become a flag. */
+export function publicRun<T extends Partial<RunRecord>>(run: T): Omit<T, "patch_artifact"> & { patch_retained?: true } {
+  const { patch_artifact, ...rest } = run;
+  return patch_artifact ? { ...rest, patch_retained: true } : rest;
+}
+
+/** Archives the worktree's change before rollback; resolves to the archive path, or undefined when nothing changed. */
+export type PatchArchiver = (input: { run_id: string; worktree: string; baseline: string }) => Promise<string | undefined>;
 
 export interface AgentProcess {
   queueMs?: number;
   prompt(runId: string, prompt: string, route: RouteDecision, taskMode?: TaskMode): void;
+  /** Limits the process applies for this route, recorded on the run as `limits`. */
+  limitsFor?(route: RouteDecision): AgentLimits | undefined;
   decide(rpcUiId: string, approved: boolean): void;
   /** Answers an extension UI dialog other than an approval (run_checks). */
   respondUi(rpcUiId: string, response: UiResponse): void;
@@ -208,6 +225,7 @@ export class CodingAgentOrchestrator {
   private readonly quality?: QualityServices;
   private readonly captureTraceContext?: (id: string) => string | undefined;
   private readonly requireVerification: boolean;
+  private readonly archivePatch?: PatchArchiver;
   /** Text of the assistant message currently streaming, per run; replaced by the final answer. */
   private readonly streamingAnswers = new Map<string, string>();
   /** Terminal runs already reported to observers, keyed to the update they were reported at (resume revives runs). */
@@ -234,6 +252,8 @@ export class CodingAgentOrchestrator {
     captureTraceContext?: (id: string) => string | undefined;
     /** Production deployments refuse implement runs that no trusted profile can verify. */
     requireVerification?: boolean;
+    /** Keeps the patch of every run that is rolled back instead of delivered, profile or not. */
+    archivePatch?: PatchArchiver;
   }) {
     this.captureState = options.captureState;
     this.observeRun = options.observeRun; this.observeLifecycle = options.observeLifecycle;
@@ -248,6 +268,7 @@ export class CodingAgentOrchestrator {
     this.quality = options.quality;
     this.captureTraceContext = options.captureTraceContext;
     this.requireVerification = options.requireVerification === true;
+    this.archivePatch = options.archivePatch;
   }
 
   async restore(): Promise<void> {
@@ -276,6 +297,7 @@ export class CodingAgentOrchestrator {
       if (latestRun?.status === "interrupted" && !(latestRun.workflow_mode === "structured" && this.quality?.canResume?.(latestRun.run_id))) {
         if (latestRun.attempts?.length && !this.quality) throw new Error("Interrupted verified workflow requires its trusted profile before recovery");
         await this.quality?.archive?.({ run_id: latestRun.run_id, worktree: saved.worktreePath, baseline: saved.baselineCommit, requirement: "Interrupted workflow", attempt: 0, signal: new AbortController().signal });
+        await this.retainPatch(latestRun, saved.worktreePath, saved.baselineCommit);
         await this.worktrees.rollback(saved.worktreePath, saved.baselineCommit);
       }
       let session!: SessionRecord;
@@ -553,6 +575,8 @@ export class CodingAgentOrchestrator {
       events: [{ type: "status", status: "starting" }],
       branch: session.branch,
     };
+    const limits = session.process.limitsFor?.(route);
+    if (limits) run.limits = limits;
     if (task === "implement" && !this.quality) run.verification_status = "unverified";
     if (task === "discuss") {
       run.phase = "discussing"; run.execution_status = "running";
@@ -867,7 +891,9 @@ export class CodingAgentOrchestrator {
           if (result.failure?.code === "scope_violation") {
             await this.failRun(session, run, { code: "scope_violation", message: `Changes outside the allowed paths were not delivered: ${result.failure.files.slice(0, 10).join(", ")}` }); return;
           }
-          await this.failRun(session, run, { code: "verification_failed", message: "Candidate retained as an isolated artifact; verification/grading did not pass" }); return;
+          if (result.grade?.cause) run.grader_cause = result.grade.cause;
+          const cause = result.failure?.code === "verification_failed" ? result.failure.cause_code : undefined;
+          await this.failRun(session, run, { code: "verification_failed", message: "Candidate retained as an isolated artifact; verification/grading did not pass", ...(cause ? { cause_code: cause } : {}) }); return;
         }
         await this.quality.assertUnchanged(result.candidate, input);
         workflow.controller.signal.throwIfAborted();
@@ -952,26 +978,44 @@ export class CodingAgentOrchestrator {
     }
   }
 
+  /** Stops every writer and keeps the undelivered change; false means the worktree must not be rolled back. */
   private async stopBeforeRollback(session: SessionRecord, run: RunRecord): Promise<boolean> {
+    const workflow = this.workflows.get(run.run_id);
     try {
-      const workflow = this.workflows.get(run.run_id);
       workflow?.controller.abort();
       if (workflow?.discovery) await workflow.discovery.catch(() => {});
       if (workflow?.operation) await workflow.operation.catch(() => {});
       if (workflow?.checksOperation) await workflow.checksOperation.catch(() => {});
       await session.process.abort(workflow?.executionId ?? run.run_id);
       await this.quality?.stop?.(run.run_id);
-      if (this.quality?.archive) await this.quality.archive({ run_id: run.run_id, worktree: session.worktreePath, baseline: session.baselineCommit, requirement: workflow?.requirement ?? "", attempt: workflow?.attempt ?? 0, signal: new AbortController().signal });
-      return true;
     } catch {
-      run.error = {
+      return this.refuseRollback(session, run, {
         code: "container_stop_failed",
         message: "Changes remain isolated because the Agent container could not be confirmed stopped",
-      };
-      this.updateRun(run, "failed");
-      this.finishActiveRun(session, run.run_id);
-      return false;
+      });
     }
+    try {
+      if (this.quality?.archive) await this.quality.archive({ run_id: run.run_id, worktree: session.worktreePath, baseline: session.baselineCommit, requirement: workflow?.requirement ?? "", attempt: workflow?.attempt ?? 0, signal: new AbortController().signal });
+      await this.retainPatch(run, session.worktreePath, session.baselineCommit);
+    } catch {
+      return this.refuseRollback(session, run, {
+        code: "archive_failed",
+        message: "Changes remain in the isolated worktree because their patch could not be archived",
+      });
+    }
+    return true;
+  }
+
+  private async retainPatch(run: RunRecord, worktree: string, baseline: string): Promise<void> {
+    const archived = await this.archivePatch?.({ run_id: run.run_id, worktree, baseline });
+    if (archived) run.patch_artifact = archived;
+  }
+
+  private refuseRollback(session: SessionRecord, run: RunRecord, failure: RunFailure): false {
+    run.error = failure;
+    this.updateRun(run, "failed");
+    this.finishActiveRun(session, run.run_id);
+    return false;
   }
 
   private finishActiveRun(session: SessionRecord, runId: string): void {

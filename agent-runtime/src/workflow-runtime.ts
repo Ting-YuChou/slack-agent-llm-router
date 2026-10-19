@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { writeFile, unlink, access } from "node:fs/promises";
-import { WorktreeManager } from "./worktree-manager.js";
+import { DEFAULT_DIFF_LIMITS, WorktreeManager } from "./worktree-manager.js";
 import { promisify } from "node:util";
 import path from "node:path";
 import type { ControlStore } from "./ci-control.js";
@@ -9,6 +9,7 @@ import { QualityGate, type GateInput } from "./quality-gate.js";
 import { assertCandidateScope } from "./candidate-scope.js";
 import { CandidateStore, DockerVerifier, type VerificationProfile } from "./verification.js";
 import { GraderRunner } from "./grader.js";
+import { DEFAULT_GRADER_MODEL, type GraderConfig } from "./grader-config.js";
 import type { QualityServices } from "./orchestrator.js";
 import { redact, type AgentTelemetry } from "./telemetry.js";
 import type { AgentTracing } from "./tracing.js";
@@ -22,17 +23,22 @@ export function createQualityServices(options: {
   control: ControlStore; session: (id: string) => string;
   priorActive: Map<string, number>; repoPath: string; worktreeRoot: string; verificationBases: Map<string, string>;
   profile: VerificationProfile; checksum: string; root: string; image: string; network: string; gatewayUrl: string;
-  token: (id: string, route?: RouteDecision) => string; ledger: BudgetLedger; mapping: Map<string, string>; telemetry?: AgentTelemetry; tracing?: AgentTracing;
+  token: (id: string, route: RouteDecision, role: "grader" | "investigator") => string; ledger: BudgetLedger; mapping: Map<string, string>; telemetry?: AgentTelemetry; tracing?: AgentTracing;
   phase: (run: string, phase: string, cost?: number) => Promise<void>;
   githubMcp?: { gatewayUrl: string; token(id: string, owner: string): string };
+  grader?: GraderConfig;
 }): QualityServices {
   const { profile, telemetry, tracing } = options;
+  const grader = options.grader ?? { route: { modelRef: DEFAULT_GRADER_MODEL, effort: "high" as const, source: "grader" }, timeoutMs: 120_000 };
+  // Keep the historical fingerprint for the default grader so in-flight workflows still resume after upgrade.
+  const graderTag = grader.route.modelRef === DEFAULT_GRADER_MODEL && grader.route.effort === "high" ? "sol-high" : `grader=${grader.route.modelRef}@${grader.route.effort}`;
+  const graderModelId = grader.route.modelRef.split("/").slice(1).join("/");
   const store = new CandidateStore(path.join(options.root, "artifacts"));
   const graders = new Map<string, GraderRunner>();
   const verifiers = new Map<string, DockerVerifier>();
   const artifacts = new Map<string, string>();
   const executions = new Map<string, { parent: string; role: string; attempt: number; started_at: string }>();
-  const fingerprint = `${options.checksum}:${options.image}:pi-1.0.1:readonly-v1:sol-high:luna-max:github-direct4:${options.githubMcp?.gatewayUrl ?? "off"}`;
+  const fingerprint = `${options.checksum}:${options.image}:pi-1.0.1:readonly-v1:${graderTag}:luna-max:github-direct4:${options.githubMcp?.gatewayUrl ?? "off"}`;
   async function execution(id: string, parent: string, role: string, attempt: number, phase: "start" | "end", cost?: number, queueMs = 0) {
     const session = !['implementation','discussion'].includes(role) ? id : options.session(parent);
     const statePath = path.join(options.root, ['implementation','discussion'].includes(role) ? 'sessions' : role === 'grader' ? 'graders' : 'investigations', session);
@@ -50,14 +56,14 @@ export function createQualityServices(options: {
     if (phase === "end") {
       for (const reason of telemetry?.completeness(id) ?? []) telemetry?.markIncomplete(parent, `execution:${id}:${reason}`);
       // Each Pi execution reconciles its own before/after snapshots and official entries.
-      const terminalWritten = await telemetry?.record(id, session, "run", { status: "completed", model: ['grader','planner'].includes(role) ? "gpt-5.6-sol" : ['implementation','discussion'].includes(role) ? 'unknown' : 'gpt-5.6-luna', reasoning_effort: ['grader','planner'].includes(role) ? "high" : ['implementation','discussion'].includes(role) ? 'unknown' : 'max', capture_complete: telemetry ? telemetry.completeness(id).length === 0 : null, workflow_run_id: parent });
+      const terminalWritten = await telemetry?.record(id, session, "run", { status: "completed", model: role === 'grader' ? graderModelId : role === 'planner' ? "gpt-5.6-sol" : ['implementation','discussion'].includes(role) ? 'unknown' : 'gpt-5.6-luna', reasoning_effort: role === 'grader' ? grader.route.effort : role === 'planner' ? "high" : ['implementation','discussion'].includes(role) ? 'unknown' : 'max', capture_complete: telemetry ? telemetry.completeness(id).length === 0 : null, workflow_run_id: parent });
       if (terminalWritten === false) telemetry?.markIncomplete(parent, "execution_terminal_capture_failed");
       telemetry?.releaseRun(id);
       tracing?.endRun(id, "completed"); executions.delete(id);
     }
   }
   const runner = new AgentExecutionRunner({ ...options, stateRoot: path.join(options.root,'investigations'), execution,
-    token: (id,route) => options.token(id,route), prompt: id => options.ledger.prompt(id),
+    token: (id,route) => options.token(id,route,"investigator"), prompt: id => options.ledger.prompt(id),
     cost: (id,cost) => options.phase(id,'investigating',cost),
   });
   const coordinator = new WorkflowCoordinator({ store: options.control, concurrency: profile.structuredWorkflow?.concurrency ?? 2,
@@ -104,14 +110,16 @@ export function createQualityServices(options: {
       finally { await verifier.stop(); verifiers.delete(input.run_id); tracing?.lifecycle(input.run_id, "verification", "end"); }
     },
     grade: async (candidate, verification, input) => {
-      const grader = new GraderRunner({ ...options, prompt: id => options.ledger.prompt(id), stateRoot: path.join(options.root, "graders"),
+      const runner = new GraderRunner({ ...options, prompt: id => options.ledger.prompt(id), stateRoot: path.join(options.root, "graders"),
+        token: (id, route) => options.token(id, route, "grader"), route: grader.route, timeoutMs: grader.timeoutMs,
+        constraints: { allowedPaths: profile.allowedPaths, diffLimits: DEFAULT_DIFF_LIMITS },
         execution: (id, parent, phase, cost, queueMs) => execution(id, parent, "grader", input.attempt, phase, cost, queueMs),
         cost: cost => options.phase(input.run_id, "grading", cost),
       });
-      graders.set(input.run_id, grader);
+      graders.set(input.run_id, runner);
       await options.phase(input.run_id, "grading"); tracing?.lifecycle(input.run_id, "grading", "start");
-      try { return await grader.grade(candidate, verification, input.requirement, profile.rubric, input.run_id, input.signal); }
-      finally { if (grader.stopped) graders.delete(input.run_id); tracing?.lifecycle(input.run_id, "grading", "end"); }
+      try { return await runner.grade(candidate, verification, input.requirement, profile.rubric, input.run_id, input.signal); }
+      finally { if (runner.stopped) graders.delete(input.run_id); tracing?.lifecycle(input.run_id, "grading", "end"); }
     },
     record: async (kind, payload, input) => {
       const location = artifacts.get(`${input.run_id}:${input.attempt}`);

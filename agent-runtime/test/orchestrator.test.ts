@@ -5,6 +5,9 @@ import type { PublicRunEvent } from "../src/pi-rpc.js";
 import { CodingAgentOrchestrator, RuntimeConflictError, RuntimeForbiddenError } from "../src/orchestrator.js";
 import { HarnessError } from "../src/error-taxonomy.js";
 import { DiffLimitError, ProtectedFileError } from "../src/worktree-manager.js";
+import { limitsForRoute, parseAgentLimitConfig } from "../src/agent-limits.js";
+import type { RouteDecision } from "../src/jev-router.js";
+import { piTurn, runScenario, settledRecord } from "./support/scenario.js";
 
 const SETTLED = { type: "settled", outcome: "completed" } as const;
 
@@ -167,6 +170,14 @@ test("automatic session selects Sol for a complex run and Luna for its follow-up
   const second = await (orchestrator as any).prompt(first.session_id, "inspect result", "U", "inspect result");
   assert.equal(orchestrator.getRun(second.run_id).model, "gpt-5.6-luna");
   assert.equal(process.prompts[1].route?.effort, "low");
+});
+
+test("a run records the turn and tool-call limits its route was started with", async () => {
+  const { orchestrator, process } = fixture({ route: async () => ({ modelRef: "openai/gpt-5.6-sol", effort: "high", source: "jev", label: "complex" }) });
+  const config = parseAgentLimitConfig({});
+  (process as any).limitsFor = (route: RouteDecision) => limitsForRoute(route, config);
+  const created = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "route-limits", user_id: "U", prompt: "refactor", routing_text: "refactor everything" } as any);
+  assert.deepEqual(orchestrator.getRun(created.run_id).limits, { maxTurns: 30, maxToolCalls: 60 });
 });
 
 test("explicit Sol session ignores Jev and keeps Sol max on follow-up", async () => {
@@ -992,4 +1003,74 @@ test("persistence failures during completion, failure and timeout never become u
     console.error = originalError;
   }
   assert.deepEqual(unhandled, []);
+});
+
+test("a failed no-profile run archives its patch before rollback", async () => {
+  const order: string[] = [];
+  const { orchestrator, process, calls } = fixture(undefined, undefined, undefined, {
+    archivePatch: async (input: { run_id: string; worktree: string; baseline: string }) => {
+      order.push(`archive:${calls.rollback.length}`);
+      assert.equal(input.worktree, "/managed/w1"); assert.equal(input.baseline, "a".repeat(40));
+      return `/runtime/artifacts/${input.run_id}/undelivered.patch`;
+    },
+  });
+  const accepted = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "no-profile-archive", user_id: "U", prompt: "edit" });
+  process.emit({ type: "settled", outcome: "aborted" });
+  await new Promise(resolve => setImmediate(resolve));
+  const run = orchestrator.getRun(accepted.run_id);
+  assert.equal(run.status, "failed");
+  assert.equal(run.error?.code, "agent_aborted");
+  assert.deepEqual(order, ["archive:0"]);
+  assert.equal(calls.rollback.length, 1);
+  assert.equal(run.patch_artifact, `/runtime/artifacts/${accepted.run_id}/undelivered.patch`);
+});
+
+test("cancelled runs archive their patch too, and an empty diff records none", async () => {
+  const { orchestrator, calls } = fixture(undefined, undefined, undefined, { archivePatch: async () => undefined });
+  const accepted = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "cancel-archive", user_id: "U", prompt: "edit" });
+  await orchestrator.cancel(accepted.run_id, "U");
+  const run = orchestrator.getRun(accepted.run_id);
+  assert.equal(run.status, "cancelled");
+  assert.equal(run.patch_artifact, undefined);
+  assert.equal(calls.rollback.length, 1);
+});
+
+test("an archive failure keeps the worktree and is not reported as a container stop failure", async () => {
+  const { orchestrator, process, calls } = fixture(undefined, undefined, undefined, {
+    archivePatch: async () => { throw new Error("disk full"); },
+  });
+  const accepted = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "archive-failure", user_id: "U", prompt: "edit" });
+  process.emit({ type: "settled", outcome: "aborted" });
+  await new Promise(resolve => setImmediate(resolve));
+  const run = orchestrator.getRun(accepted.run_id);
+  assert.equal(run.status, "failed");
+  assert.equal(run.error?.code, "archive_failed");
+  assert.deepEqual(calls.rollback, []);
+  assert.equal(process.aborted.length, 1, "the writer was still stopped");
+});
+
+test("a quality archive failure is archive_failed, not container_stop_failed", async () => {
+  const { orchestrator, calls } = fixture(undefined, {
+    evaluate: async () => { throw new Error("unused"); }, assertUnchanged: async () => {}, execution: () => {},
+    stop: async () => {}, archive: async () => { throw new Error("snapshot failed"); },
+  });
+  const accepted = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "quality-archive-failure", user_id: "U", prompt: "fix" });
+  await orchestrator.cancel(accepted.run_id, "U");
+  const run = orchestrator.getRun(accepted.run_id);
+  assert.equal(run.error?.code, "archive_failed");
+  assert.deepEqual(calls.rollback, []);
+});
+
+test("a 3 MiB diff over the limit is archived in full and rolled back", async () => {
+  const big = Array.from({ length: 3 * 1024 }, (_, i) => `line ${i} ${"x".repeat(1100)}`).join("\n") + "\n";
+  const { run, patches, dirty, commits } = await runScenario({ name: "3 MiB diff limit",
+    attempts: [{ files: { "src/big.txt": big }, records: [...piTurn("stop"), settledRecord] }],
+    expect: { status: "failed", errorCode: "diff_limit_exceeded", committed: false } });
+  assert.equal(run.error?.code, "diff_limit_exceeded");
+  assert.equal(commits, 0);
+  assert.equal(dirty, "");
+  assert.equal(patches.length, 1);
+  assert.ok(patches[0].content.length > 3 * 1024 * 1024, "the whole diff is kept below the archive cap");
+  assert.doesNotMatch(patches[0].content, /patch truncated/);
+  assert.match(patches[0].content, /line 3071 x/);
 });
