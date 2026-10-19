@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import { PiRpcBridge, RpcJsonlDecoder, type PublicRunEvent } from "../src/pi-rpc.js";
+import { fakeGatewayScript, scriptedTurns, waitForContainerHealthz } from "./support/fake-provider.js";
 
 const enabled = process.env.PI_AGENT_DOCKER_INTEGRATION === "1";
 
@@ -110,37 +111,18 @@ test("real Pi writer completes a run_checks round trip through the dialog channe
   const worktrees = new WorktreeManager({ repoPath: repo, worktreeRoot, baseRef: "HEAD" });
   const isolated = await worktrees.create(`checks-${suffix}`);
   const marker = "lint-report-marker-7f3a";
-  const fakeGateway = String.raw`
-const http = require("node:http"); let call = 0;
-const usage = {input_tokens:1,output_tokens:1,total_tokens:2,input_tokens_details:{cached_tokens:0}};
-function send(res, events) { res.writeHead(200,{"content-type":"text/event-stream"}); for(const e of events) res.write("data: "+JSON.stringify(e)+"\n\n"); res.end("data: [DONE]\n\n"); }
-http.createServer((req,res)=>{ let body=""; req.on("data",c=>body+=c); req.on("end",()=>{
-  call++;
-  if(call===1){
-    if(!body.includes("run_checks")){ res.writeHead(400); res.end("run_checks tool was not offered"); return; }
-    const item={type:"function_call",id:"fc_1",call_id:"call_1",name:"run_checks",arguments:'{"checks":["lint"]}',status:"completed"}; send(res,[
-    {type:"response.created",response:{id:"resp_1"}},
-    {type:"response.output_item.added",output_index:0,item},
-    {type:"response.function_call_arguments.done",output_index:0,arguments:item.arguments},
-    {type:"response.output_item.done",output_index:0,item},
-    {type:"response.completed",response:{id:"resp_1",status:"completed",output:[item],usage}}]); return; }
-  if(!body.includes("${marker}")){ res.writeHead(400); res.end("check report did not reach the model"); return; }
-  const text="Checks report received.";
-  const item={type:"message",id:"msg_1",role:"assistant",status:"completed",content:[{type:"output_text",text,annotations:[]}],phase:"final_answer"}; send(res,[
-    {type:"response.created",response:{id:"resp_2"}},
-    {type:"response.output_item.added",output_index:0,item},
-    {type:"response.output_text.delta",output_index:0,content_index:0,delta:text},
-    {type:"response.output_item.done",output_index:0,item},
-    {type:"response.completed",response:{id:"resp_2",status:"completed",output:[item],usage}}]);
-});}).listen(8080,"0.0.0.0");`;
+  const gatewayScript = fakeGatewayScript(scriptedTurns([
+    { kind: "function_call", name: "run_checks", arguments: { checks: ["lint"] }, expect: { includes: ["run_checks"] } },
+    { kind: "text", text: "Checks report received.", expect: { includes: [marker] } },
+  ]));
   let piProcess: InstanceType<typeof DockerPiProcess> | undefined;
   try {
     // The released agent image plus this branch's run_checks extension.
     await command("docker", ["build", "-q", "-t", image, "-f", "-", fileURLToPath(new URL("../../extensions", import.meta.url))], undefined,
       "FROM slack-pi-agent:1.0.1\nCOPY --chown=10001:10001 checks.ts /opt/pi/extensions/checks.ts\n");
     await command("docker", ["network", "create", "--internal", network]);
-    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", "node:22.22.0-bookworm-slim", "node", "-e", fakeGateway]);
-    await new Promise(resolve => setTimeout(resolve, 500));
+    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", "node:22.22.0-bookworm-slim", "node", "-e", gatewayScript]);
+    await waitForContainerHealthz(gateway);
     const events: PublicRunEvent[] = [];
     let resolveSettled!: () => void;
     const settled = new Promise<void>(resolve => { resolveSettled = resolve; });
