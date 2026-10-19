@@ -338,11 +338,11 @@ export class ApprovalStore {
     this.now = options.now ?? Date.now;
   }
 
-  create(input: Omit<ApprovalRequest, "id" | "expiresAt" | "used">): ApprovalRequest {
+  create(input: Omit<ApprovalRequest, "id" | "expiresAt" | "used">, ttlMs = this.ttlMs): ApprovalRequest {
     const approval: ApprovalRequest = {
       ...input,
       id: randomUUID(),
-      expiresAt: this.now() + this.ttlMs,
+      expiresAt: this.now() + ttlMs,
       used: false,
     };
     this.approvals.set(approval.id, approval);

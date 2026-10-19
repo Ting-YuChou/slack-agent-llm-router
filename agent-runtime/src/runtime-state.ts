@@ -15,6 +15,8 @@ export interface PersistedSession {
   closed: boolean;
   lastActivity: number;
   activeRunId?: string;
+  /** Set for CI-repair sessions, which gate delivery through their own publish approval. */
+  skipDelivery?: boolean;
 }
 
 export interface RuntimeState {

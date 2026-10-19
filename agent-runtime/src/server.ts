@@ -11,6 +11,7 @@ import { PiRunCapture } from "./pi-capture.js";
 import { AgentTelemetry, isCredentialKey } from "./telemetry.js";
 import { AgentTracing } from "./tracing.js";
 import { DockerPiProcess, type WriterContext } from "./container-runtime.js";
+import { approvalSettings } from "./approval-mode.js";
 import { parseAgentLimitConfig } from "./agent-limits.js";
 
 export { parseAgentLimits } from "./agent-limits.js";
@@ -393,6 +394,8 @@ export async function createProductionServer() {
   }) : undefined;
   let ciRuntime: Awaited<ReturnType<typeof createCiRuntime>> | undefined;
   const agentLimits = parseAgentLimitConfig(process.env);
+  const approval = approvalSettings(process.env);
+  const credentialValues = () => Object.entries(process.env).filter(([key]) => isCredentialKey(key)).map(([, value]) => value!).filter(Boolean);
   const orchestrator: CodingAgentOrchestrator = new CodingAgentOrchestrator({
     quality,
     requireVerification: process.env.PI_AGENT_REQUIRE_VERIFICATION === "1",
@@ -427,6 +430,7 @@ export async function createProductionServer() {
     stateStore,
     maxActiveSessions: positiveInteger(process.env.PI_AGENT_MAX_CONCURRENCY, 2),
     deadlineMs: positiveInteger(process.env.PI_AGENT_DEADLINE_MS, 15 * 60_000),
+    ...(approval.deliveryApproval ? { deliveryApproval: { ttlMs: approval.deliveryTtlMs, secrets: credentialValues } } : {}),
     availableModelRefs: configuredModels.map((model) => model.ref),
     router,
     mcpRepository,
@@ -453,6 +457,8 @@ export async function createProductionServer() {
           limits: agentLimits.base,
           routeLimits: agentLimits,
           ...(trustedProfile ? { writerContext: writerContextFor(trustedProfile.profile) } : {}),
+          // Runs that skip delivery approval keep per-write prompts, so no run loses both gates.
+          writeApproval: session.skipDelivery ? "per_prompt" : approval.writeApproval,
           user: containerUser,
           ...(mcpServerIds.length > 0 ? {
             mcp: {

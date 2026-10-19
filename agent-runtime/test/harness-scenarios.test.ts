@@ -3,6 +3,8 @@ import { test } from "node:test";
 
 import { HarnessError } from "../src/error-taxonomy.js";
 import { publicRun } from "../src/orchestrator.js";
+import { writeFile } from "node:fs/promises";
+import path from "node:path";
 import { piTurn, runScenario, settledRecord, type Scenario } from "./support/scenario.js";
 
 const fix = { "src/a.js": "export const a = 2;\n" };
@@ -133,3 +135,54 @@ for (const scenario of graderScenarios) {
     }
   });
 }
+
+const deliveryScenarios: Array<{ name: string; delivery: "approve" | "reject" | "expire"; status: string; errorCode?: string }> = [
+  { name: "S15 an approved delivery commits the exact diff on the card", delivery: "approve", status: "completed" },
+  { name: "S16 a discarded delivery rolls back and keeps the patch", delivery: "reject", status: "failed", errorCode: "delivery_rejected" },
+  { name: "S17 an unanswered delivery expires, rolls back and keeps the patch", delivery: "expire", status: "failed", errorCode: "delivery_expired" },
+];
+for (const scenario of deliveryScenarios) {
+  test(scenario.name, async () => {
+    const { run, commits, dirty, patches, deliveryCard } = await runScenario({ name: scenario.name, profile, deliveryApproval: true, delivery: scenario.delivery,
+      attempts: [{ files: fix, records: [...piTurn("stop", "Fixed"), settledRecord] }],
+      expect: { status: scenario.status as "completed" | "failed", committed: scenario.delivery === "approve" } });
+    assert.equal(run.status, scenario.status, JSON.stringify(run.error));
+    assert.equal(run.error?.code, scenario.errorCode);
+    const delivery = deliveryCard?.delivery as Record<string, unknown>;
+    assert.deepEqual(delivery.files, ["src/a.js"]);
+    assert.equal(delivery.verification_status, "passed");
+    assert.equal(delivery.grader_status, "passed");
+    assert.match(String(delivery.delivery_digest), /^sha256:[0-9a-f]{64}$/);
+    assert.match(String(delivery.excerpt), /\+export const a = 2;/);
+    assert.match(String(delivery.stat), /src\/a\.js/);
+    if (scenario.delivery === "approve") {
+      assert.equal(commits, 1);
+      assert.equal(patches.length, 0);
+    } else {
+      assert.equal(commits, 0);
+      assert.equal(dirty, "");
+      assert.equal(patches.length, 1);
+      assert.match(patches[0].content, /\+export const a = 2;/);
+    }
+  });
+}
+
+test("delivery: a worktree changed after the card fails as delivery_candidate_changed", async () => {
+  const { run, commits, dirty, patches } = await runScenario({ name: "delivery changed", profile, deliveryApproval: true, delivery: "approve",
+    beforeDelivery: worktree => writeFile(path.join(worktree, "src", "a.js"), "export const a = 3;\n"),
+    attempts: [{ files: fix, records: [...piTurn("stop"), settledRecord] }],
+    expect: { status: "failed", committed: false } });
+  assert.equal(run.error?.code, "delivery_candidate_changed");
+  assert.equal(commits, 0);
+  assert.equal(dirty, "");
+  assert.match(patches[0]?.content ?? "", /\+export const a = 3;/);
+});
+
+test("delivery: an empty diff completes without a delivery card", async () => {
+  const { run, deliveryCard, commits } = await runScenario({ name: "delivery empty", deliveryApproval: true, delivery: "approve",
+    attempts: [{ files: {}, records: [...piTurn("stop", "Nothing to change"), settledRecord] }],
+    expect: { status: "completed", committed: false } });
+  assert.equal(run.status, "completed");
+  assert.equal(deliveryCard, undefined);
+  assert.equal(commits, 0);
+});
