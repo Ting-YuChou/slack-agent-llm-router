@@ -327,6 +327,30 @@ CREATE TABLE IF NOT EXISTS agent_feedback (
 
 CREATE VIEW IF NOT EXISTS agent_feedback_latest AS SELECT * FROM agent_feedback FINAL;
 
+CREATE TABLE IF NOT EXISTS agent_policy_decisions (
+  sequence UInt64,
+  schema_version UInt16,
+  pi_version String,
+  trace_id Nullable(String),
+  source_time Nullable(DateTime64(6, 'UTC')),
+  event_id String,
+  run_id String,
+  session_id String,
+  kind String,
+  collected_at DateTime64(6, 'UTC'),
+  version UInt64,
+  payload_json String CODEC(ZSTD(3)),
+  tool String,
+  decision String,
+  reason String,
+  approved Nullable(UInt8),
+  argv0 String,
+  cmd_hash String,
+  latency_ms Nullable(UInt64)
+) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 30 DAY;
+
+CREATE VIEW IF NOT EXISTS agent_policy_decisions_latest AS SELECT * FROM agent_policy_decisions FINAL;
+
 CREATE VIEW IF NOT EXISTS agent_feedback_current AS SELECT run_id, user_id, argMax(verdict, version) AS verdict FROM agent_feedback_latest GROUP BY run_id, user_id;
 
 CREATE VIEW IF NOT EXISTS agent_usage_reconciliation AS

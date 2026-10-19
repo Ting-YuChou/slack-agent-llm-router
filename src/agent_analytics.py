@@ -138,6 +138,16 @@ TABLES = {
         "reason_category": "String",
         "comment": "String",
     },
+    # One row per policy decision in the writer's container; commands only as basename and hash.
+    "agent_policy_decisions": {
+        "tool": "String",
+        "decision": "String",
+        "reason": "String",
+        "approved": "Nullable(UInt8)",
+        "argv0": "String",
+        "cmd_hash": "String",
+        "latency_ms": "Nullable(UInt64)",
+    },
 }
 
 
@@ -468,6 +478,18 @@ def project(envelope, resolved_payload=None):
                         ).hexdigest(),
                     }
                 ),
+            }
+        ]
+    elif kind == "policy_decision":
+        approved = payload.get("approved")
+        rows["agent_policy_decisions"] = [
+            {
+                **base,
+                **{key: payload[key] for key in ["tool", "decision", "reason"]},
+                "approved": None if approved is None else int(bool(approved)),
+                "argv0": payload.get("argv0", ""),
+                "cmd_hash": payload.get("cmd_hash", ""),
+                "latency_ms": payload.get("latency_ms"),
             }
         ]
     elif kind == "feedback":

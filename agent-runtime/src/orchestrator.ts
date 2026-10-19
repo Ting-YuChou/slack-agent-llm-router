@@ -12,6 +12,7 @@ import { WorkflowBudget } from "./workflow-budget.js";
 import type { Candidate, GateInput, GateResult } from "./quality-gate.js";
 import { classifyGateError, type RunFailure } from "./error-taxonomy.js";
 import { promptTelemetry } from "./prompts.js";
+import { summarizePolicy, type PolicyDecision, type PolicySummary } from "./policy-decision.js";
 import { redact } from "./telemetry.js";
 import { DEFAULT_DIFF_LIMITS, DiffLimitError } from "./worktree-manager.js";
 import { rejected, type WriterChecksRequest, type WriterChecksResponse } from "./writer-checks.js";
@@ -152,6 +153,8 @@ export interface RunRecord {
   updated_at: string;
   tool_count: number;
   turn_count: number;
+  /** Counts of the container's policy decisions (allow, block, approval) for this run. */
+  policy_summary?: PolicySummary;
   events: Array<Record<string, unknown>>;
   changed_files?: string[];
   diff_stat?: string;
@@ -247,11 +250,13 @@ export class CodingAgentOrchestrator {
 
   private readonly captureState?: (runId: string) => { complete: boolean | null; reasons: string[] };
   private readonly observeRun?: (run: RunRecord) => void;
+  private readonly observePolicy?: (runId: string, sessionId: string, decision: PolicyDecision) => void;
   private readonly observeLifecycle?: (runId: string, name: string, phase: "start" | "end", failed?: boolean, sessionId?: string) => void;
 
   constructor(options: {
     captureState?: CodingAgentOrchestrator["captureState"];
     observeRun?: (run: RunRecord) => void;
+    observePolicy?: CodingAgentOrchestrator["observePolicy"];
     observeLifecycle?: CodingAgentOrchestrator["observeLifecycle"];
     worktrees: Worktrees;
     startProcess: CodingAgentOrchestrator["startProcess"];
@@ -271,7 +276,7 @@ export class CodingAgentOrchestrator {
     deliveryApproval?: DeliveryApprovalOptions;
   }) {
     this.captureState = options.captureState;
-    this.observeRun = options.observeRun; this.observeLifecycle = options.observeLifecycle;
+    this.observeRun = options.observeRun; this.observePolicy = options.observePolicy; this.observeLifecycle = options.observeLifecycle;
     this.worktrees = options.worktrees;
     this.startProcess = options.startProcess;
     this.maxActiveSessions = options.maxActiveSessions ?? 2;
@@ -747,6 +752,14 @@ export class CodingAgentOrchestrator {
     }
     if (event.type === "turn") {
       run.turn_count += 1;
+      this.persistSoon();
+      return;
+    }
+    if (event.type === "policy_decision") {
+      // Counted, not stored: one run can make hundreds of decisions.
+      const { type: _type, ...decision } = event;
+      run.policy_summary = summarizePolicy(run.policy_summary, decision);
+      try { this.observePolicy?.(run.run_id, run.session_id, decision); } catch { /* monitoring cannot fail agent runs */ }
       this.persistSoon();
       return;
     }

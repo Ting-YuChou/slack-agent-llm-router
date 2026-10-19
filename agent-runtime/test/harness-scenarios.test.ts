@@ -149,6 +149,22 @@ for (const scenario of graderScenarios) {
   });
 }
 
+test("S21 policy decisions are counted on the run, not stored as events", async () => {
+  const decision = (data: Record<string, unknown>) => ({ type: "entry_appended", entry: { type: "custom", customType: "pi_agent_policy", data } });
+  const { run } = await runScenario({ name: "S21 policy summary",
+    attempts: [{ files: fix, records: [
+      decision({ tool: "bash", decision: "block", reason: "network_command", argv0: "curl" }),
+      decision({ tool: "bash", decision: "block", reason: "secret_env_read", argv0: "env" }),
+      decision({ tool: "write", decision: "approval", reason: "write_approval", approved: true }),
+      decision({ tool: "bash", decision: "forged", reason: "x" }),
+      ...piTurn("stop", "Fixed"), settledRecord,
+    ] }],
+    expect: { status: "completed", committed: true } });
+  assert.equal(run.status, "completed");
+  assert.deepEqual(run.policy_summary, { allow: 0, block: 2, approval: 1, approved: 1, by_reason: { network_command: 1, secret_env_read: 1, write_approval: 1 } });
+  assert.ok(!run.events.some(event => event.type === "policy_decision"), "decisions must not grow run.events");
+});
+
 test("S10 repair prompt carries parsed failures in an untrusted block, never host paths", async () => {
   const failed = { status: "failed" as const, checks: [
     { name: "candidate:flake8", status: "failed" as const, exit_code: 1, artifact: "/var/lib/pi-agent/artifacts/run/candidate-flake8.log",
