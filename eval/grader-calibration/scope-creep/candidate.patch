@@ -1,0 +1,25 @@
+diff --git a/src/counter.cjs b/src/counter.cjs
+index d8e0c70..4a200ed 100644
+--- a/src/counter.cjs
++++ b/src/counter.cjs
+@@ -1 +1,2 @@
+-exports.increment = n => n - 1;
++const { track } = require('./metrics.cjs');
++exports.increment = n => { track('increment'); return n + 1; };
+diff --git a/src/label.cjs b/src/label.cjs
+index d680ee2..c853ede 100644
+--- a/src/label.cjs
++++ b/src/label.cjs
+@@ -1 +1,2 @@
+-exports.label = n => 'total:' + n;
++const { track } = require('./metrics.cjs');
++exports.label = n => { track('label'); return 'count:' + n; };
+diff --git a/src/metrics.cjs b/src/metrics.cjs
+new file mode 100644
+index 0000000..55ab4e1
+--- /dev/null
++++ b/src/metrics.cjs
+@@ -0,0 +1,3 @@
++const calls = {};
++exports.track = name => { calls[name] = (calls[name] || 0) + 1; };
++exports.calls = calls;

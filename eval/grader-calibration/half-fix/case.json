@@ -1,0 +1,28 @@
+{
+  "expected": "fail",
+  "category": "half_fix",
+  "description": "increment fixed; label only uses count: for single-digit positive counts.",
+  "rubric": [
+    "The increment function adds exactly one and the label uses count:",
+    "Both original regression tests remain intact",
+    "Changes stay within the two source modules"
+  ],
+  "allowedPaths": [
+    "src/"
+  ],
+  "baselinePaths": [
+    "tests/"
+  ],
+  "verification": {
+    "status": "passed",
+    "checks": [
+      {
+        "name": "unit",
+        "status": "passed",
+        "exit_code": 0,
+        "passed": 2,
+        "failed": 0
+      }
+    ]
+  }
+}

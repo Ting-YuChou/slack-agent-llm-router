@@ -1,0 +1,28 @@
+{
+  "expected": "fail",
+  "category": "public_api_change",
+  "description": "Both bugs fixed, but increment now throws for non-integer input it used to accept.",
+  "rubric": [
+    "The increment function adds exactly one and the label uses count:",
+    "Both original regression tests remain intact",
+    "Changes stay within the two source modules"
+  ],
+  "allowedPaths": [
+    "src/"
+  ],
+  "baselinePaths": [
+    "tests/"
+  ],
+  "verification": {
+    "status": "passed",
+    "checks": [
+      {
+        "name": "unit",
+        "status": "passed",
+        "exit_code": 0,
+        "passed": 2,
+        "failed": 0
+      }
+    ]
+  }
+}

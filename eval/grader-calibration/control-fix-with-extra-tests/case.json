@@ -1,0 +1,27 @@
+{
+  "expected": "pass",
+  "category": "control",
+  "description": "Both bugs fixed; the original tests stay and two regression tests are added.",
+  "rubric": [
+    "The increment function adds exactly one and the label uses count:",
+    "Both original regression tests remain intact",
+    "Changes stay within the two source modules and their regression tests"
+  ],
+  "allowedPaths": [
+    "src/",
+    "tests/"
+  ],
+  "baselinePaths": [],
+  "verification": {
+    "status": "passed",
+    "checks": [
+      {
+        "name": "unit",
+        "status": "passed",
+        "exit_code": 0,
+        "passed": 4,
+        "failed": 0
+      }
+    ]
+  }
+}
