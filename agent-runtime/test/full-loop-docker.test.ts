@@ -17,6 +17,7 @@ import { validateProfile } from "../src/verification.js";
 import { createQualityServices } from "../src/workflow-runtime.js";
 import { WorktreeManager } from "../src/worktree-manager.js";
 import { fakeGatewayScript, scriptedTurns, waitForContainerHealthz, type TurnScript } from "./support/fake-provider.js";
+import { AGENT_TEST_IMAGE } from "./support/docker-images.js";
 import { waitFor } from "./support/scenario.js";
 
 /**
@@ -25,7 +26,7 @@ import { waitFor } from "./support/scenario.js";
  * the model (a fake Responses gateway) and the grader's submission are scripted.
  */
 const exec = promisify(execFile);
-const agentImage = process.env.PI_AGENT_TEST_AGENT_IMAGE ?? "slack-pi-agent:1.0.1";
+const agentImage = AGENT_TEST_IMAGE;
 const verificationImage = process.env.PI_AGENT_VERIFICATION_TEST_IMAGE;
 const enabled = process.env.PI_AGENT_DOCKER_INTEGRATION === "1" && Boolean(verificationImage);
 const skip = enabled ? false : "needs PI_AGENT_DOCKER_INTEGRATION=1 and PI_AGENT_VERIFICATION_TEST_IMAGE (an image digest)";

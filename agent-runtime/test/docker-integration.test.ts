@@ -10,6 +10,7 @@ import { DockerPiProcess } from "../src/container-runtime.js";
 import type { PublicRunEvent } from "../src/pi-rpc.js";
 import { WorktreeManager } from "../src/worktree-manager.js";
 import { fakeGatewayScript, scriptedTurns, waitForContainerHealthz } from "./support/fake-provider.js";
+import { AGENT_TEST_IMAGE } from "./support/docker-images.js";
 
 const exec = promisify(execFile);
 const enabled = process.env.PI_AGENT_DOCKER_INTEGRATION === "1";
@@ -57,7 +58,7 @@ test("real Pi preserves its session while switching from Luna max to Sol high", 
     piProcess = new DockerPiProcess(
       {
         name: `pi-integration-${suffix}`,
-        image: "slack-pi-agent:1.0.1",
+        image: AGENT_TEST_IMAGE,
         network,
         worktreePath: isolated.path,
         gitMetadataPath: path.join(repo, ".git"),
@@ -146,7 +147,7 @@ test("Pi 1.0.1 resumes a session persisted by Pi 0.83", { skip: !enabled, timeou
     piProcess = new DockerPiProcess(
       {
         name: `pi-legacy-${suffix}`,
-        image: "slack-pi-agent:1.0.1",
+        image: AGENT_TEST_IMAGE,
         network,
         worktreePath: isolated.path,
         gitMetadataPath: path.join(repo, ".git"),
@@ -237,7 +238,7 @@ http.createServer((req,res)=>{let body="";req.on("data",c=>body+=c);req.on("end"
     let resolveSettled!: () => void;
     const settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
     piProcess = new DockerPiProcess({
-      name: `pi-mcp-${suffix}`, image: "slack-pi-agent:1.0.1", network,
+      name: `pi-mcp-${suffix}`, image: AGENT_TEST_IMAGE, network,
       worktreePath: isolated.path, gitMetadataPath: path.join(repo, ".git"), sessionStatePath,
       gatewayUrl: "http://model-gateway:8080", modelRef: "openai/gpt-5.6-luna",
       extensionPaths: ["/opt/pi/extensions/model-gateway.ts"], pluginPaths: [], skillPaths: [], toolNames: ["read"],
@@ -297,7 +298,7 @@ test("real Pi requests pass the gateway allowlist and bash children cannot read 
     let settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
     piProcess = new DockerPiProcess(
       {
-        name: `pi-allowlist-${suffix}`, image: "slack-pi-agent:1.0.1", network, worktreePath: isolated.path,
+        name: `pi-allowlist-${suffix}`, image: AGENT_TEST_IMAGE, network, worktreePath: isolated.path,
         gitMetadataPath: path.join(repo, ".git"), sessionStatePath, gatewayUrl: "http://model-gateway:8080",
         modelRef: "openai/gpt-5.6-luna",
         extensionPaths: ["/opt/pi/extensions/policy.ts", "/opt/pi/extensions/model-gateway.ts", "/opt/pi/extensions/secret-env.ts"],
