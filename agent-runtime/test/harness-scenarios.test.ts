@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { piTurn, runScenario, settledRecord, type Scenario } from "./support/scenario.js";
+import { awaitUi, piTurn, runScenario, settledRecord, type Scenario } from "./support/scenario.js";
 
 const fix = { "src/a.js": "export const a = 2;\n" };
 const profile = { allowedPaths: ["src"], maxRepairs: 1 };
@@ -105,4 +105,28 @@ test("S10 repair prompt carries parsed failures in an untrusted block, never hos
   assert.ok(boundary, "diagnostics sit inside a random-boundary block");
   assert.ok(repair.trimEnd().endsWith(`${boundary}>>>`));
   assert.ok(!repair.includes("/var/lib/pi-agent"), "host artifact paths never reach the writer");
+});
+
+test("S18 the writer runs checks mid-attempt through the run_checks dialog", async () => {
+  const checksRequest = (id: string, toolCallId: string) => ({ type: "extension_ui_request", id, method: "input", title: "pi-agent/run_checks", placeholder: JSON.stringify({ tool_call_id: toolCallId, checks: ["lint"] }) });
+  const report = { status: "failed" as const, checks: [{ name: "lint", status: "failed" as const }], report: "src/a.js:1:1 E1 bad" };
+  const requested: string[][] = [];
+  const { run, responses } = await runScenario({ name: "S18 run_checks", profile,
+    quality: {
+      runChecks: async request => { requested.push(request.checks ?? []); return report; },
+      writerChecks: { maxCalls: 4, checks: ["lint"], defaultChecks: ["lint"], estimateMs: () => 1000, reserveMs: 1000 },
+    },
+    attempts: [{ files: fix, records: [
+      { type: "tool_execution_start", toolCallId: "tc1", toolName: "run_checks", args: { checks: ["lint"] } },
+      checksRequest("ui-1", "tc1"), awaitUi,
+      { type: "tool_execution_end", toolCallId: "tc1", toolName: "run_checks", result: {}, isError: false },
+      checksRequest("ui-forged", "tc1"),
+      ...piTurn("stop", "Fixed"), settledRecord,
+    ] }],
+    expect: { status: "completed", committed: true } });
+  assert.equal(run.status, "completed", JSON.stringify(run.error));
+  assert.deepEqual(requested, [["lint"]], "a forged request after the tool call ended never reaches the host");
+  assert.deepEqual(responses.map(item => item.id), ["ui-1"]);
+  assert.deepEqual(JSON.parse((responses[0].response as { value: string }).value), report);
+  assert.equal(run.writer_checks_calls, 1);
 });

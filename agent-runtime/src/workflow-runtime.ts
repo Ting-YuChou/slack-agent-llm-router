@@ -141,7 +141,7 @@ export function createQualityServices(options: {
     stopDiscovery: id => runner.stop(id),
     stop: async id => { options.ledger.stop(id); await runner.stop(id); await writerChecks.stop(id); await verifiers.get(id)?.stop(); await graders.get(id)?.stop(); },
     runChecks: request => writerChecks.run(request),
-    get writerChecks() { return { maxCalls: profile.writerChecks?.maxCalls ?? 4, checks: writerChecks.checkNames }; },
+    get writerChecks() { return { maxCalls: profile.writerChecks?.maxCalls ?? 4, checks: writerChecks.checkNames, defaultChecks: writerChecks.defaultChecks, estimateMs: (names: string[]) => writerChecks.estimateMs(names), reserveMs: writerChecks.reserveMs }; },
     open: (id, cost) => options.ledger.open(id, profile.maxCostUsd, cost),
     close: id => { void telemetry?.record(id, id, "budget", options.ledger.summary(id)); options.ledger.stop(id); options.verificationBases.delete(id); for (const [execution, parent] of options.mapping) if (parent === id) options.mapping.delete(execution); },
     elapsedMs: id => options.priorActive.get(id) ?? 0,

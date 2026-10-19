@@ -15,6 +15,8 @@ class FakeProcess {
   aborted: string[] = [];
   prompt(runId: string, prompt: string, route?: { modelRef: string; effort: string }, taskMode?: string) { this.prompts.push({ runId, prompt, route, taskMode }); }
   decide(id: string, approved: boolean) { this.decisions.push({ id, approved }); }
+  responses: Array<{ id: string; response: unknown }> = [];
+  respondUi(id: string, response: unknown) { this.responses.push({ id, response }); }
   async abort(runId: string) { this.aborted.push(runId); }
   async close() {}
   emit(event: PublicRunEvent) { this.handler(event); }

@@ -4,6 +4,9 @@ import type { Candidate, CheckStatus, VerificationResult } from "./quality-gate.
 import type { VerificationCheckSpec, VerificationProfile } from "./verification.js";
 
 export const MAX_WRITER_CHECKS_BYTES = 16 * 1024;
+const CHECK_OVERHEAD_MS = 15_000;
+const MODE_OVERHEAD_MS = 30_000;
+const GRADER_RESERVE_MS = 150_000;
 
 export interface WriterChecksRequest { run_id: string; worktree: string; baseline: string; checks?: string[]; signal: AbortSignal }
 /** What the writer's run_checks tool receives. Never contains host paths; at most 16 KiB as JSON. */
@@ -47,9 +50,16 @@ export class WriterChecks {
   }) {}
 
   get checkNames(): string[] { return this.options.profile.checks.map(check => check.name); }
+  get defaultChecks(): string[] { return this.options.profile.writerChecks?.defaultChecks ?? this.checkNames; }
+  /** Worst case for one candidate-mode run of these checks, including per-check set-up. */
+  estimateMs(names: string[]): number {
+    return this.options.profile.checks.filter(check => names.includes(check.name)).reduce((total, check) => total + check.timeoutMs + CHECK_OVERHEAD_MS, MODE_OVERHEAD_MS);
+  }
+  /** Kept back for the final verification (all checks; modes run in parallel) and the grader. */
+  get reserveMs(): number { return this.estimateMs(this.checkNames) + GRADER_RESERVE_MS; }
 
   async run(request: WriterChecksRequest): Promise<WriterChecksResponse> {
-    const names = [...new Set(request.checks?.length ? request.checks : this.options.profile.writerChecks?.defaultChecks ?? this.checkNames)];
+    const names = [...new Set(request.checks?.length ? request.checks : this.defaultChecks)];
     const unknown = names.filter(name => !this.checkNames.includes(name));
     if (unknown.length) return rejected("unknown_check", `Unknown checks: ${unknown.slice(0, 10).map(name => JSON.stringify(name.slice(0, 80))).join(", ")}. Available: ${this.checkNames.join(", ")}`);
     if (this.active.has(request.run_id)) return rejected("busy", "A run_checks call is already running for this task");

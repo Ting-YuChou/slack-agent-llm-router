@@ -1,7 +1,7 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { promisify } from "node:util";
 
-import { PiRpcBridge, RpcProtocolError, type PublicRunEvent } from "./pi-rpc.js";
+import { PiRpcBridge, RpcProtocolError, type PublicRunEvent, type UiResponse } from "./pi-rpc.js";
 import type { AgentProcess } from "./orchestrator.js";
 import { resolveAgentModel } from "./agent-model.js";
 import type { AgentReasoningEffort } from "./agent-model.js";
@@ -313,6 +313,7 @@ export class DockerPiProcess implements AgentProcess {
     })().catch(() => { if (!controller.signal.aborted) this.onEvent({ type: "error", code: "container_admission_failed", message: "Agent could not acquire/start an execution slot" }); });
   }
   decide(rpcUiId: string, approved: boolean): void { if(this.activeRunId) this.tracing?.approval(this.activeRunId,rpcUiId,approved); this.bridge?.respondToUi(rpcUiId, approved); }
+  respondUi(rpcUiId: string, response: UiResponse): void { this.bridge?.respondUi(rpcUiId, response); }
   async abort(runId: string): Promise<void> {
     const capture = this.capture;
     capture?.cancel();
