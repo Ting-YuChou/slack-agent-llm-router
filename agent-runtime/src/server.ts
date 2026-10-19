@@ -20,9 +20,11 @@ import { allServerTools, enabledMcpServers, MCP_SERVERS, parseMcpMode, parseMcpS
 import { deriveMcpServerSecret, issueMcpToken } from "./mcp-token.js";
 import {
   CodingAgentOrchestrator,
+  publicRun,
   RuntimeError,
   type RunRecord,
 } from "./orchestrator.js";
+import { archivePatch, undeliveredPatchPath } from "./patch-archive.js";
 import { verifyPluginLock } from "./plugin-lock.js";
 import { RuntimeStateStore } from "./runtime-state.js";
 import { verifySkillLock } from "./skill-lock.js";
@@ -155,7 +157,7 @@ export function createAgentHttpServer(options: ServerOptions) {
       const runMatch = /^\/v1\/runs\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && runMatch) {
         const id = decodeURIComponent(runMatch[1]);
-        sendJson(response, 200, options.ci?.has(id) ? await options.ci.get(id) : options.orchestrator.getRun(id));
+        sendJson(response, 200, options.ci?.has(id) ? await options.ci.get(id) : publicRun(options.orchestrator.getRun(id)));
         return;
       }
       const eventsMatch = /^\/v1\/runs\/([^/]+)\/events$/.exec(url.pathname);
@@ -390,6 +392,10 @@ export async function createProductionServer() {
   const orchestrator: CodingAgentOrchestrator = new CodingAgentOrchestrator({
     quality,
     requireVerification: process.env.PI_AGENT_REQUIRE_VERIFICATION === "1",
+    archivePatch: async input => (await archivePatch({
+      worktree: input.worktree, baseline: input.baseline, file: undeliveredPatchPath(runtimeRoot, input.run_id),
+      secrets: Object.entries(process.env).filter(([key]) => isCredentialKey(key)).map(([, value]) => value!).filter(Boolean),
+    }))?.path,
     captureTraceContext: id => tracing?.traceparent(id),
     captureState: id => ({complete: telemetry ? telemetry.completeness(id).length === 0 : null, reasons: telemetry?.completeness(id) ?? []}),
     observeLifecycle: (id, name, phase, failed, sessionId) => {
@@ -399,7 +405,7 @@ export async function createProductionServer() {
       if (name === "preparation" && failed) tracing?.endRun(id, "failed");
     },
     observeRun: run => {
-      const summary = {...run, workflow_prompt: undefined, workflow_requirement: undefined, events: undefined, capture_complete: run.capture_complete ?? null};
+      const summary = {...publicRun(run), workflow_prompt: undefined, workflow_requirement: undefined, events: undefined, capture_complete: run.capture_complete ?? null};
       const signature = JSON.stringify(summary);
       if (observed.get(run.run_id) === signature) return;
       if (!observed.has(run.run_id) && ["running", "awaiting_approval"].includes(run.status)) tracing?.startRun(run.run_id, run.session_id);
@@ -516,7 +522,8 @@ export async function createProductionServer() {
   }
   workflowControl?.interruptWorkflowNodes();
   await orchestrator.restore();
-  const stopRetention = trustedProfile ? startEvidenceRetention(runtimeRoot, () => workflowControl?.pruneWorkflowContent(Date.now() - 30 * 86400000)) : undefined;
+  // Undelivered patches land under artifacts/ with or without a profile, so retention always runs.
+  const stopRetention = startEvidenceRetention(runtimeRoot, workflowControl ? () => workflowControl.pruneWorkflowContent(Date.now() - 30 * 86400000) : undefined);
   if (process.env.PI_AGENT_CI_REPAIR_ENABLED === "true" && !trustedProfile) throw new Error("CI repair requires PI_AGENT_VERIFICATION_PROFILE");
   ciRuntime = process.env.PI_AGENT_CI_REPAIR_ENABLED === "true" ? await createCiRuntime({ profile: trustedProfile!.profile, root: runtimeRoot, repoPath, worktreeRoot, orchestrator, telemetry, tracing, verificationBases, priorActive }) : undefined;
   const runtimeHealthy = () => integrityHealthy && stateStore.healthy && (workflowControl?.healthy ?? true) && (ciRuntime?.ci.healthy ?? true);
