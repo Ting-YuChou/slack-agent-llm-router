@@ -178,3 +178,88 @@ test("an unset or unknown write approval mode keeps per-write prompts", () => wi
     assert.equal(prompts.length, 1, JSON.stringify(env));
   }
 }));
+
+type Block = { type: string; text?: string };
+const budgetText = (result: unknown) => ((result as { content?: Block[] } | undefined)?.content ?? []).filter((block) => block.text?.startsWith("[harness]")).map((block) => block.text!);
+
+/** Runs one tool call and returns the harness notices appended to its result. */
+async function callTool(policy: Awaited<ReturnType<typeof loadPolicy>>, ctx: unknown, content: Block[] = [{ type: "text", text: "ok" }]) {
+  await policy.fire("tool_call", { toolName: "ls", input: { path: "." } }, ctx);
+  return policy.fire("tool_result", { type: "tool_result", toolCallId: "t", toolName: "ls", input: {}, content, isError: false }, ctx);
+}
+
+test("tool results warn once at 75% of the tool-call budget and finally with two calls left", () => withWorkspace(async (cwd) => {
+  const policy = await loadPolicy({ PI_AGENT_MAX_TOOL_CALLS: "40", PI_AGENT_MAX_TURNS: "100" });
+  const ctx = { cwd, abort: () => undefined, ui: { confirm: async () => true } };
+  await policy.fire("input", {}, ctx);
+  const notices: Array<[number, string[]]> = [];
+  for (let call = 1; call <= 40; call++) {
+    const text = budgetText(await callTool(policy, ctx));
+    if (text.length) notices.push([call, text]);
+  }
+  assert.deepEqual(notices.map(([call]) => call), [30, 38]);
+  assert.equal(notices[0][1].length, 1);
+  assert.match(notices[0][1][0], /^\[harness\] Budget notice: 30\/40 tool calls used/);
+  assert.match(notices[0][1][0], /wrap up/i);
+  assert.match(notices[0][1][0], /test/);
+  assert.match(notices[0][1][0], /summar/i);
+  assert.match(notices[1][1][0], /^\[harness\] Final budget warning: 38\/40 tool calls used, 2 left/);
+}));
+
+test("turn budget warnings ride on tool results at 75% and with two turns left", () => withWorkspace(async (cwd) => {
+  const policy = await loadPolicy({ PI_AGENT_MAX_TURNS: "12", PI_AGENT_MAX_TOOL_CALLS: "1000" });
+  const ctx = { cwd, abort: () => undefined, ui: { confirm: async () => true } };
+  await policy.fire("input", {}, ctx);
+  const notices: Array<[number, string[]]> = [];
+  for (let turn = 1; turn <= 12; turn++) {
+    await policy.fire("turn_start", {}, ctx);
+    for (let call = 0; call < 2; call++) {
+      const text = budgetText(await callTool(policy, ctx));
+      if (text.length) notices.push([turn, text]);
+    }
+  }
+  assert.deepEqual(notices.map(([turn]) => turn), [9, 10]);
+  assert.match(notices[0][1][0], /^\[harness\] Budget notice: 9\/12 turns used/);
+  assert.match(notices[1][1][0], /^\[harness\] Final budget warning: 10\/12 turns used, 2 left/);
+}));
+
+test("a small budget skips straight to the final warning instead of warning twice", () => withWorkspace(async (cwd) => {
+  const policy = await loadPolicy({ PI_AGENT_MAX_TOOL_CALLS: "4", PI_AGENT_MAX_TURNS: "100" });
+  const ctx = { cwd, abort: () => undefined, ui: { confirm: async () => true } };
+  await policy.fire("input", {}, ctx);
+  const notices: string[][] = [];
+  for (let call = 1; call <= 4; call++) notices.push(budgetText(await callTool(policy, ctx)));
+  assert.deepEqual(notices.map((text) => text.length), [0, 1, 0, 0]);
+  assert.match(notices[1][0], /Final budget warning: 2\/4 tool calls used, 2 left/);
+}));
+
+test("budget notices keep content other handlers added and nested results get none", () => withWorkspace(async (cwd) => {
+  const policy = await loadPolicy({ PI_AGENT_MAX_TOOL_CALLS: "4", PI_AGENT_MAX_TURNS: "100" });
+  const ctx = { cwd, abort: () => undefined, ui: { confirm: async () => true } };
+  await policy.fire("input", {}, ctx);
+  await callTool(policy, ctx);
+  await policy.fire("tool_call", { toolName: "ls", input: { path: "." } }, ctx);
+  const nested = await policy.fire("tool_result", { type: "tool_result", toolCallId: "c/1", parentToolCallId: "c", toolName: "ls", input: {}, content: [{ type: "text", text: "ok" }], isError: false }, ctx);
+  assert.equal(nested, undefined);
+  const content = [{ type: "text", text: "tool output" }, { type: "text", text: "[checks] added by another handler" }];
+  const structuredContent = { files: ["a"] };
+  const result = await policy.fire("tool_result", { type: "tool_result", toolCallId: "t3", toolName: "ls", input: {}, content, structuredContent, isError: false }, ctx) as { content: Block[]; structuredContent: unknown };
+  assert.deepEqual(result.content.slice(0, 2), content);
+  assert.equal(result.content.length, 3);
+  assert.match(result.content[2].text!, /Final budget warning: 2\/4 tool calls used/);
+  assert.deepEqual(result.structuredContent, structuredContent);
+  assert.equal(content.length, 2, "the event's own content array is not mutated");
+}));
+
+test("a new input resets the budget notices", () => withWorkspace(async (cwd) => {
+  const policy = await loadPolicy({ PI_AGENT_MAX_TOOL_CALLS: "8", PI_AGENT_MAX_TURNS: "100" });
+  const ctx = { cwd, abort: () => undefined, ui: { confirm: async () => true } };
+  const run = async () => {
+    await policy.fire("input", {}, ctx);
+    const calls: number[] = [];
+    for (let call = 1; call <= 8; call++) if (budgetText(await callTool(policy, ctx)).length) calls.push(call);
+    return calls;
+  };
+  assert.deepEqual(await run(), [6]);
+  assert.deepEqual(await run(), [6]);
+}));

@@ -11,6 +11,9 @@ import { PiRunCapture } from "./pi-capture.js";
 import { AgentTelemetry, isCredentialKey } from "./telemetry.js";
 import { AgentTracing } from "./tracing.js";
 import { DockerPiProcess, type WriterContext } from "./container-runtime.js";
+import { parseAgentLimitConfig } from "./agent-limits.js";
+
+export { parseAgentLimits } from "./agent-limits.js";
 import { budgetIdFor, outputTokenLimitFor, parseDefaultRunBudget } from "./run-budget.js";
 import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT, listAgentModels, resolveAgentModel } from "./agent-model.js";
 import { JevRouter, type JevMode } from "./jev-router.js";
@@ -36,6 +39,7 @@ import type { CiRepairs } from "./ci-repair.js";
 import { loadProfile, type VerificationProfile } from "./verification.js";
 import { createQualityServices } from "./workflow-runtime.js";
 import { DEFAULT_DIFF_LIMITS, WorktreeManager } from "./worktree-manager.js";
+import { parseGraderConfig } from "./grader-config.js";
 
 const exec = promisify(execFile);
 export const DEFAULT_AGENT_RUNTIME_PORT = 3001;
@@ -357,7 +361,7 @@ export async function createProductionServer() {
     if (repositoryFromRemote(remote)?.toLowerCase() !== trustedProfile.profile.repository.toLowerCase()) throw new Error("Verification profile repository does not match the checkout origin");
   }
   if (trustedProfile?.profile.structuredWorkflow?.enabled && !configuredModels.some(model => model.ref === "openai/gpt-5.6-luna")) throw new Error("Structured workflow requires configured Luna worker provider");
-  if (trustedProfile && !configuredModels.some(model => model.ref === "openai/gpt-5.6-sol")) throw new Error("Quality workflow requires configured Sol grader provider");
+  const grader = trustedProfile ? parseGraderConfig(process.env, configuredModels) : undefined;
   const executionParents = new Map<string, string>();
   function executionExpiry(id: string) {
     const parent = executionParents.get(id);
@@ -378,15 +382,15 @@ export async function createProductionServer() {
       telemetry?.addSecret(token,id); return token;
     } } : undefined,
     phase: (id, phase, cost) => orchestrator.qualityPhase(id, phase, cost),
-    token: (id, route) => {
-      const model = resolveAgentModel(route?.modelRef ?? "openai/gpt-5.6-sol");
-      const role = route ? "investigator" : "grader";
-      const token = issueGatewayToken({ runId: id, workflowRunId: executionParents.get(id), role, outputTokenLimit: outputTokenLimitFor(role), provider: model.provider, model: model.id, api: model.api, reasoningEffort: route?.effort ?? "high", expiresAt: executionExpiry(id), traceparent: tracing?.traceparent(id) }, gatewaySecret);
+    grader,
+    token: (id, route, role) => {
+      const model = resolveAgentModel(route.modelRef);
+      const token = issueGatewayToken({ runId: id, workflowRunId: executionParents.get(id), role, outputTokenLimit: outputTokenLimitFor(role), provider: model.provider, model: model.id, api: model.api, reasoningEffort: route.effort, expiresAt: executionExpiry(id), traceparent: tracing?.traceparent(id) }, gatewaySecret);
       telemetry?.addSecret(token, id); return token;
     },
   }) : undefined;
   let ciRuntime: Awaited<ReturnType<typeof createCiRuntime>> | undefined;
-  const agentLimits = parseAgentLimits(process.env);
+  const agentLimits = parseAgentLimitConfig(process.env);
   const orchestrator: CodingAgentOrchestrator = new CodingAgentOrchestrator({
     quality,
     requireVerification: process.env.PI_AGENT_REQUIRE_VERIFICATION === "1",
@@ -440,7 +444,8 @@ export async function createProductionServer() {
           toolNames: ["read", "write", "edit", "bash", "grep", "find", "ls", ...lock.plugins.flatMap((plugin) => plugin.enabled_tools)],
           continueSession: session.restored,
           safeCommands: parseSafeCommands(process.env.PI_AGENT_SAFE_COMMANDS),
-          limits: agentLimits,
+          limits: agentLimits.base,
+          routeLimits: agentLimits,
           ...(trustedProfile ? { writerContext: writerContextFor(trustedProfile.profile) } : {}),
           user: containerUser,
           ...(mcpServerIds.length > 0 ? {
@@ -687,16 +692,6 @@ function positiveInteger(value: string | undefined, fallback: number): number {
 /** Constraints the writer sees up front and the policy extension enforces at write time. */
 export function writerContextFor(profile: VerificationProfile): WriterContext {
   return { allowedPaths: [...profile.allowedPaths], checks: profile.checks.map((check) => check.name), rubric: [...profile.rubric], diffLimits: { ...DEFAULT_DIFF_LIMITS } };
-}
-
-export function parseAgentLimits(env: NodeJS.ProcessEnv): { maxTurns: number; maxToolCalls: number } {
-  const read = (key: string, fallback: number) => {
-    if (env[key] === undefined || env[key] === "") return fallback;
-    const value = Number(env[key]);
-    if (!Number.isInteger(value) || value < 1 || value > 1000) throw new Error(`${key} must be an integer between 1 and 1000`);
-    return value;
-  };
-  return { maxTurns: read("PI_AGENT_MAX_TURNS", 20), maxToolCalls: read("PI_AGENT_MAX_TOOL_CALLS", 40) };
 }
 
 function parseSafeCommands(value: string | undefined): string[] {
