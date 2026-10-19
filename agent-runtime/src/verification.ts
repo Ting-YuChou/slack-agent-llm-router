@@ -64,7 +64,8 @@ export async function loadProfile(file: string, repo: string, worktreeRoot: stri
   const resolved = await realpath(file);
   for (const root of [repo, worktreeRoot]) {
     const relative = path.relative(await realpath(root).catch(() => path.resolve(root)), resolved);
-    if (!relative.startsWith("..") && !path.isAbsolute(relative)) throw new Error("Verification profile must live outside the repository/worktrees");
+    // "..profile.json" is inside the root; only a leading ".." segment leaves it.
+    if (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) throw new Error("Verification profile must live outside the repository/worktrees");
   }
   const data = await readFile(resolved);
   return { profile: validateProfile(JSON.parse(data.toString())), checksum: createHash("sha256").update(data).digest("hex") };

@@ -514,11 +514,34 @@
     },
     {
       "id": 22,
-      "title": "Harness: how writer executions ended",
+      "title": "Grader verdicts versus owner feedback",
       "type": "table",
       "gridPos": {
         "x": 0,
         "y": 88,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "format": 1,
+          "rawSql": "SELECT prompts_version,count() AS feedback,countIf(agrees=1) AS agree,countIf(agrees=0) AS disagree,countIf(isNull(agrees)) AS no_grader_verdict,if(countIf(isNotNull(agrees))>0,countIf(agrees=1)/countIf(isNotNull(agrees)),NULL) AS agreement_rate,countIf(grade_status='passed' AND feedback_verdict='needs_changes') AS grader_passed_owner_rejected,countIf(grade_status='needs_changes' AND feedback_verdict='accepted') AS grader_failed_owner_accepted FROM agent_grade_feedback_agreement GROUP BY prompts_version ORDER BY prompts_version"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "title": "Harness: how writer executions ended",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 96,
         "w": 12,
         "h": 8
       },
@@ -536,12 +559,12 @@
       ]
     },
     {
-      "id": 23,
+      "id": 24,
       "title": "Harness: turn and tool-call limit utilization",
       "type": "table",
       "gridPos": {
         "x": 12,
-        "y": 88,
+        "y": 96,
         "w": 12,
         "h": 8
       },
@@ -559,12 +582,12 @@
       ]
     },
     {
-      "id": 24,
+      "id": 25,
       "title": "Harness: first-attempt pass and repair success",
       "type": "table",
       "gridPos": {
         "x": 0,
-        "y": 96,
+        "y": 104,
         "w": 12,
         "h": 8
       },

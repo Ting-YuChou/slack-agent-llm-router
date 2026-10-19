@@ -88,8 +88,12 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-ci.txt
 
-      - name: Run pytest
-        run: python -m pytest tests -q
+      - name: Run pytest with agent coverage report
+        run: python -m pytest tests -q --cov=src.agent_runtime --cov=src.agent_analytics --cov-report=term-missing
+
+      # Floor is 2 points below the measured coverage of src/agent_*; raise it as coverage grows.
+      - name: Enforce agent coverage threshold
+        run: python -m coverage report --fail-under=77
 
       - name: Compile source tree
         run: python -m compileall src tests slack
@@ -108,4 +112,8 @@ jobs:
         working-directory: agent-runtime
       # lint needs the compiled dist/ that extensions import, so it runs after the build in npm test.
       - run: npm run typecheck && npm test && npm run lint
+        working-directory: agent-runtime
+      # Reports line/branch/function coverage and fails below the floors set in package.json.
+      - name: Coverage report and threshold
+        run: npm run test:coverage
         working-directory: agent-runtime

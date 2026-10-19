@@ -175,6 +175,7 @@ class Topology:
         self.api_file = root / "api.json"
         self.entry = root / "host.mjs"
         self.token = secrets.token_hex(32)
+        self.signing = None
         self.base = None
         self.env = None
 
@@ -242,7 +243,7 @@ class Topology:
             "network", "connect", "--alias", "otel-receiver", self.internal, receiver
         )
         otel_port = docker("port", receiver, "4318/tcp").split(":")[-1]
-        signing = secrets.token_hex(32)
+        signing = self.signing = secrets.token_hex(32)
         listen_host, add_host = host_access(self.external)
         with socket.socket() as chosen:
             chosen.bind((listen_host, 0))
@@ -356,6 +357,23 @@ class Topology:
             time.sleep(0.1)
         api = json.loads(self.api_file.read_text())
         self.base = f"http://{api['host']}:{api['port']}"
+
+    def grader_gateway(self):
+        """Test-only: what an out-of-process grader needs to reach this gateway.
+
+        The grader container joins the internal network and mints its own
+        tokens with the signing secret; the gateway meters it against a budget
+        opened in the runtime's ledger.
+        """
+        if self.signing is None:
+            raise RuntimeError("topology is not started")
+        return {
+            "gateway_url": "http://model-gateway:8080",
+            "network": self.internal,
+            "image": AGENT_IMAGE,
+            "budget_ledger": str(self.root / "state/budget/budget.sqlite"),
+            "signing_secret": self.signing,
+        }
 
     def request(self, path, body=None):
         payload = None if body is None else json.dumps(body).encode()

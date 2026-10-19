@@ -1,0 +1,108 @@
+name: Grader calibration
+
+# Live grader calibration over eval/grader-calibration. It spends real model
+# budget, so it only runs on manual dispatch. The scripted, offline run of the
+# same pipeline is agent-runtime/test/grader-calibration-cli.test.ts and runs
+# in the regular CI agent-runtime job.
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Grader model ref (must be in the gateway's price table)
+        required: true
+        default: openai/gpt-5.6-sol
+      repeats:
+        description: Grades per case (self-consistency needs at least 2)
+        required: true
+        default: "3"
+      max_cost_usd:
+        description: Stop grading once this much model spend is reached
+        required: true
+        default: "2"
+      update_baseline:
+        description: Write the metrics to eval/grader-baseline.json instead of comparing
+        type: boolean
+        default: false
+      runner:
+        description: Runner label; needs a Docker daemon (native Linux or Docker Desktop)
+        required: true
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+concurrency:
+  group: grader-calibration
+  cancel-in-progress: false
+
+jobs:
+  calibrate:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.0"
+          cache: npm
+          cache-dependency-path: agent-runtime/package-lock.json
+
+      - name: Build agent runtime
+        working-directory: agent-runtime
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build fixture images
+        run: |
+          docker build -t slack-pi-agent:structured-test -f agent-runtime/Dockerfile.agent agent-runtime
+          docker build -t slack-pi-model-gateway:structured-test -f agent-runtime/Dockerfile.gateway agent-runtime
+          docker build -t slack-pi-verification:structured-test -f agent-runtime/Dockerfile.verification .
+
+      - name: Write calibration credential
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          test -n "$OPENAI_API_KEY" || { echo "OPENAI_API_KEY secret is not set" >&2; exit 1; }
+          umask 077
+          printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY" > .env.demo
+
+      # Without a baseline the contract fails closed; the first run sets one with
+      # update_baseline (download it from the artifact and commit it). From then
+      # on every run is held to it and to its ceilings: invalid_rate <= 0.10 and
+      # false_pass_rate <= 0.2.
+      - name: Run calibration
+        env:
+          MODEL: ${{ inputs.model }}
+          REPEATS: ${{ inputs.repeats }}
+          MAX_COST_USD: ${{ inputs.max_cost_usd }}
+          UPDATE_BASELINE: ${{ inputs.update_baseline }}
+        run: |
+          set -o pipefail
+          args=(--live-openai --grader-model "$MODEL" --repeats "$REPEATS" --max-cost-usd "$MAX_COST_USD" --out eval/results/grader-calibration.jsonl)
+          if [ "$UPDATE_BASELINE" = "true" ]; then args+=(--update-baseline); fi
+          python scripts/grader_calibration.py "${args[@]}" | tee eval/results/grader-calibration-summary.json
+
+      - name: Remove calibration credential
+        if: always()
+        run: rm -f .env.demo
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grader-calibration-results
+          path: |
+            eval/results/grader-calibration.jsonl
+            eval/results/grader-calibration-summary.json
+            eval/grader-baseline.json
+          if-no-files-found: warn
