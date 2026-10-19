@@ -1,0 +1,68 @@
+"""Guards against CI drifting away from the agent harness it is meant to cover."""
+
+import json
+from pathlib import Path
+
+import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+DOCKER_SUITES = (
+    "docker-integration",
+    "run-checks-rpc",
+    "verification-docker",
+    "full-loop-docker",
+)
+DOCKERFILES = (
+    "agent-runtime/Dockerfile.agent",
+    "agent-runtime/Dockerfile.gateway",
+    "agent-runtime/Dockerfile.verification",
+)
+
+
+def _workflow(name):
+    return yaml.safe_load((ROOT / ".github/workflows" / name).read_text())
+
+
+def _run_text(job):
+    return "\n".join(
+        step.get("run", "") + json.dumps(step.get("with", {})) for step in job["steps"]
+    )
+
+
+def test_docker_job_builds_every_harness_image_and_runs_every_opt_in_suite():
+    workflow = _workflow("agent-docker.yml")
+    job = workflow["jobs"]["agent-runtime-docker"]
+    text = _run_text(job) + json.dumps(job.get("env", {}))
+    for dockerfile in DOCKERFILES:
+        assert dockerfile in text, f"{dockerfile} is not built"
+    for suite in DOCKER_SUITES:
+        assert f"dist/test/{suite}.test.js" in text, f"{suite} does not run"
+    env = job["env"]
+    assert env["PI_AGENT_DOCKER_INTEGRATION"] == "1"
+    assert "PI_AGENT_TEST_AGENT_IMAGE" in env
+    # The verification suites need a digest; the job resolves it after building.
+    assert "PI_AGENT_VERIFICATION_TEST_IMAGE" in text
+
+
+def test_docker_job_runs_on_harness_changes():
+    # PyYAML parses the bare `on` key as True.
+    triggers = _workflow("agent-docker.yml")[True]
+    for event in ("pull_request", "push"):
+        paths = triggers[event]["paths"]
+        for path in (
+            "agent-runtime/**",
+            "config/verification/**",
+            ".github/workflows/agent-docker.yml",
+        ):
+            assert path in paths, f"{event} ignores {path}"
+    assert triggers["push"]["branches"] == ["main"]
+
+
+def test_example_profile_ci_jobs_exist():
+    jobs = _workflow("tests.yml")["jobs"]
+    profile = json.loads(
+        (ROOT / "config/verification/slack-router.example.json").read_text()
+    )
+    named = {check["ciJob"] for check in profile["checks"] if "ciJob" in check}
+    assert named, "the example profile maps checks to CI jobs"
+    assert named <= set(jobs), f"unknown CI jobs: {sorted(named - set(jobs))}"
