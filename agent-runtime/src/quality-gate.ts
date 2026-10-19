@@ -1,4 +1,5 @@
 import { ScopeViolationError } from "./candidate-scope.js";
+import { HarnessError, type CauseCode } from "./error-taxonomy.js";
 
 export type CheckStatus = "passed" | "failed" | "unknown";
 export interface VerificationCheck { name: string; status: CheckStatus; exit_code: number | null; duration_ms?: number; passed?: number | null; failed?: number | null; artifact?: string }
@@ -8,6 +9,8 @@ export interface Grade {
   candidate_hash: string;
   criteria: Array<{ id: string; passed: boolean; evidence?: string }>;
   findings: Array<{ path: string; line: number; severity: "error" | "warning"; reason: string }>;
+  /** Set on a harness-made unknown: why no valid verdict exists. Never part of a grader's own submission. */
+  cause?: { code: CauseCode; message: string };
 }
 export interface Candidate { sourceHash?: string; testedBaseline?: string; hash: string; path: string; patch?: string; artifact?: string }
 export interface GateInput { run_id: string; worktree: string; baseline: string; requirement: string; attempt: number; signal: AbortSignal }
@@ -28,6 +31,24 @@ export function validateGrade(value: unknown, hash: string, rubric: string[]): G
   if (g.status === "passed" && (g.criteria.some(c => !c.passed || !c.evidence?.trim()) || g.findings.some(f => f.severity === "error"))) throw new Error("Inconsistent grader verdict");
   return g;
 }
+/** A harness-made unknown verdict: no criterion passes, and `cause` says why the grader gave none. */
+export function syntheticUnknown(rubric: string[], hash: string, cause: NonNullable<Grade["cause"]>): Grade {
+  return { status: "unknown", candidate_hash: hash, criteria: rubric.map(id => ({ id, passed: false })), findings: [], cause };
+}
+
+function graderCause(error: unknown): NonNullable<Grade["cause"]> {
+  if (error instanceof HarnessError) return { code: error.causeCode, message: error.message.slice(0, 300) };
+  const detail = error instanceof Error ? error.message.slice(0, 200) : "unknown error";
+  // validateGrade throws plain errors for malformed verdicts; anything else broke the grader itself.
+  return /^(Invalid grader|Missing grader|Inconsistent grader)/.test(detail)
+    ? { code: "grader_invalid_submission", message: `Grader result was rejected: ${detail}` }
+    : { code: "grader_execution_failed", message: `Grader failed: ${detail}` };
+}
+
+function isBudgetExhausted(error: unknown): boolean {
+  return error instanceof Error && error.message === "workflow_budget_exhausted";
+}
+
 export class QualityGate {
   constructor(private readonly options: QualityGateOptions) {}
   /** Out-of-scope edits are a writer mistake, not missing infrastructure: give it the file list to revert. */
@@ -55,7 +76,10 @@ export class QualityGate {
     let grade: Grade | undefined;
     if (verification.status === "passed") {
       try { grade = validateGrade(await this.options.grade(candidate, verification, input), candidate.hash, this.options.profile.rubric); }
-      catch { grade = { status: "unknown", candidate_hash: candidate.hash, criteria: this.options.profile.rubric.map(id => ({ id, passed: false })), findings: [] }; }
+      catch (error) {
+        if (input.signal.aborted || isBudgetExhausted(error)) throw error;
+        grade = syntheticUnknown(this.options.profile.rubric, candidate.hash, graderCause(error));
+      }
       await this.options.record?.("grade", grade, input);
     }
     input.signal.throwIfAborted();

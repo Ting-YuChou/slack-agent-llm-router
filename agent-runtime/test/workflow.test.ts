@@ -148,3 +148,41 @@ test("quality gate turns a scope violation into a repair that lists the files, t
   assert.equal(last.failure?.code, "scope_violation");
   assert.equal(verified, 0);
 });
+
+test("quality gate keeps why the grader produced no verdict", async () => {
+  const { QualityGate } = await import("../src/quality-gate.js");
+  const { HarnessError } = await import("../src/error-taxonomy.js");
+  const recorded: any[] = [];
+  const gate = new QualityGate({ profile: { id: "p", rubric: ["correct"], maxRepairs: 2 },
+    snapshot: async () => ({ hash: "hash", path: "/snapshot" }),
+    verify: async () => ({ status: "passed", checks: [] }),
+    grade: async () => { throw new HarnessError("grader_timeout", "Grader did not finish within 120s"); },
+    record: async (kind, payload) => { recorded.push({ kind, payload }); },
+  });
+  const result = await gate.evaluate({ run_id: "r", worktree: "/w", baseline: "a".repeat(40), requirement: "fix", attempt: 1, signal: new AbortController().signal });
+  assert.equal(result.grade?.status, "unknown");
+  assert.equal(result.grade?.cause?.code, "grader_timeout");
+  assert.equal(recorded.find(r => r.kind === "grade")?.payload.cause.code, "grader_timeout");
+});
+
+test("quality gate reports an invalid grader result as grader_invalid_submission", async () => {
+  const { QualityGate } = await import("../src/quality-gate.js");
+  const gate = new QualityGate({ profile: { id: "p", rubric: ["correct"], maxRepairs: 2 },
+    snapshot: async () => ({ hash: "hash", path: "/snapshot" }),
+    verify: async () => ({ status: "passed", checks: [] }),
+    grade: async () => ({ status: "passed", candidate_hash: "other", criteria: [], findings: [] }),
+  });
+  const result = await gate.evaluate({ run_id: "r", worktree: "/w", baseline: "a".repeat(40), requirement: "fix", attempt: 1, signal: new AbortController().signal });
+  assert.equal(result.grade?.cause?.code, "grader_invalid_submission");
+});
+
+test("quality gate propagates aborts and budget exhaustion instead of grading unknown", async () => {
+  const { QualityGate } = await import("../src/quality-gate.js");
+  const controller = new AbortController();
+  const make = (grade: () => Promise<unknown>) => new QualityGate({ profile: { id: "p", rubric: ["correct"], maxRepairs: 2 },
+    snapshot: async () => ({ hash: "hash", path: "/snapshot" }),
+    verify: async () => ({ status: "passed", checks: [] }), grade });
+  const input = { run_id: "r", worktree: "/w", baseline: "a".repeat(40), requirement: "fix", attempt: 1, signal: controller.signal };
+  await assert.rejects(make(async () => { throw new Error("workflow_budget_exhausted"); }).evaluate(input), /workflow_budget_exhausted/);
+  await assert.rejects(make(async () => { controller.abort(); throw new Error("grader_aborted"); }).evaluate(input));
+});
