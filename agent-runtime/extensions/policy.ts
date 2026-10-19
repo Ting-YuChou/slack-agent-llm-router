@@ -1,10 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+import { execFile } from "node:child_process";
 import path from "node:path";
 
 import { filesOutsideScope } from "../dist/src/candidate-scope.js";
 import type { WriterContext } from "../dist/src/container-runtime.js";
-import { classifyBash, isApprovedSkillRead, validateWorkspacePath } from "../dist/src/policy.js";
+import { classifyBash, isApprovedSkillRead, isTestConfigPath, parsePorcelainZ, validateWorkspacePath } from "../dist/src/policy.js";
 import { codemodeMcpPrompt, type McpServerId } from "../dist/src/mcp-config.js";
 
 const MAX_TURNS = Number(process.env.PI_AGENT_MAX_TURNS ?? "20");
@@ -63,10 +64,34 @@ function previewWrite(tool: string, input: Record<string, unknown>): string {
   return `${filePath}\n\n${summary.slice(0, 3_500)}`;
 }
 
+/** Changed files in the worktree; undefined when git cannot say, which callers treat as tainted. */
+function changedFiles(cwd: string): Promise<string[] | undefined> {
+  return new Promise((resolve) => {
+    execFile(
+      "git",
+      ["status", "--porcelain", "-z", "--untracked-files=all"],
+      // The git metadata is mounted read-only, so status must not try to refresh the index.
+      { cwd, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" }, maxBuffer: 8 * 1024 * 1024, timeout: 15_000 },
+      (error, stdout) => resolve(error ? undefined : parsePorcelainZ(stdout)),
+    );
+  });
+}
+
+/** Names the reason a configured command needs approval because test configuration may have changed. */
+async function testConfigTaint(cwd: string, writtenPaths: Set<string>): Promise<string | undefined> {
+  const written = [...writtenPaths].find(isTestConfigPath);
+  if (written) return `test configuration changed: ${written}`;
+  const changed = await changedFiles(cwd);
+  if (!changed) return "could not list changed files";
+  const tainted = changed.find(isTestConfigPath);
+  return tainted ? `test configuration changed: ${tainted}` : undefined;
+}
+
 export default function policyExtension(pi: ExtensionAPI) {
   let turns = 0;
   let toolCalls = 0;
   let writeApproved = false;
+  const writtenPaths = new Set<string>();
 
   if (process.env.PI_AGENT_JEV_CLASSIFIER_MODE === "on") {
     pi.on("before_agent_start", (event) => {
@@ -143,6 +168,7 @@ export default function policyExtension(pi: ExtensionAPI) {
         if (!approved) return { block: true, reason: "Workspace modification rejected or expired" };
         writeApproved = true;
       }
+      writtenPaths.add(target);
       return undefined;
     }
 
@@ -155,10 +181,11 @@ export default function policyExtension(pi: ExtensionAPI) {
       const decision = classifyBash(command, safeCommands());
       if (decision.decision === "block") return { block: true, reason: `Command permanently blocked: ${decision.reason}` };
       if (decision.decision === "allow") return undefined;
-      if (decision.decision === "allow_after_write_approval" && writeApproved) return undefined;
+      const taint = decision.decision === "allow_after_write_approval" ? await testConfigTaint(ctx.cwd, writtenPaths) : undefined;
+      if (decision.decision === "allow_after_write_approval" && writeApproved && !taint) return undefined;
       const approved = await ctx.ui.confirm(
         "Allow shell command?",
-        command.slice(0, 4_000),
+        `${taint ? `Needs approval because ${taint}.\n\n` : ""}${command.slice(0, 4_000)}`,
         { timeout: APPROVAL_TIMEOUT_MS },
       );
       if (!approved) return { block: true, reason: "Shell command rejected or expired" };

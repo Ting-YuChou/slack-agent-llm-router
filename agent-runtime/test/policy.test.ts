@@ -8,6 +8,8 @@ import {
   ApprovalStore,
   classifyBash,
   isApprovedSkillRead,
+  isTestConfigPath,
+  parsePorcelainZ,
   validateWorkspacePath,
 } from "../src/policy.js";
 
@@ -209,4 +211,24 @@ test("shell commands are classified segment by segment and the strictest segment
       assert.equal(classifyBash(command, safe).decision, expected, command);
     }
   }
+});
+
+test("test configuration files are recognised at any depth", () => {
+  for (const file of [
+    "package.json", "web/package.json", "conftest.py", "tests/unit/conftest.py", "pytest.ini", "pyproject.toml",
+    "setup.cfg", "tsconfig.json", "tsconfig.build.json", "packages/a/tsconfig.test.json", "Makefile", ".npmrc", "site-packages/evil.pth",
+  ]) {
+    assert.equal(isTestConfigPath(file), true, file);
+  }
+  for (const file of ["src/package.ts", "tests/test_conftest.py", "makefile.md", "README.md", "tsconfig.ts"]) {
+    assert.equal(isTestConfigPath(file), false, file);
+  }
+});
+
+test("porcelain -z output yields every changed path, including rename sources", () => {
+  assert.deepEqual(
+    parsePorcelainZ(" M src/a.ts\0?? tests/conftest.py\0R  new name.py\0old.py\0D  gone.txt\0"),
+    ["src/a.ts", "tests/conftest.py", "new name.py", "old.py", "gone.txt"],
+  );
+  assert.deepEqual(parsePorcelainZ(""), []);
 });

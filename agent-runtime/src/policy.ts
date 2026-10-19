@@ -240,6 +240,29 @@ const PROTECTED_BASENAMES = [
   /\.(?:pem|key|p12|pfx)$/i,
 ];
 
+const TEST_CONFIG_BASENAMES = /^(?:package\.json|conftest\.py|pytest\.ini|pyproject\.toml|setup\.cfg|Makefile|\.npmrc|tsconfig.*\.json|.*\.pth)$/;
+
+/** Files that change what a configured test command executes, at any depth. */
+export function isTestConfigPath(filePath: string): boolean {
+  return TEST_CONFIG_BASENAMES.test(path.posix.basename(filePath.replaceAll("\\", "/")));
+}
+
+/** Parses `git status --porcelain -z`; a rename or copy entry is followed by its source path. */
+export function parsePorcelainZ(output: string): string[] {
+  const fields = output.split("\0").filter(Boolean);
+  const paths: string[] = [];
+  for (let index = 0; index < fields.length; index += 1) {
+    const field = fields[index]!;
+    paths.push(field.slice(3));
+    if (field[0] === "R" || field[0] === "C") {
+      const source = fields[index + 1];
+      if (source !== undefined) paths.push(source);
+      index += 1;
+    }
+  }
+  return paths;
+}
+
 export async function validateWorkspacePath(
   workspaceRoot: string,
   requestedPath: string,
