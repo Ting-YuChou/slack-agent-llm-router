@@ -8,21 +8,31 @@ import { promisify } from "node:util";
 import { assertCandidateScope } from "../../src/candidate-scope.js";
 import { CodingAgentOrchestrator, type QualityServices, type RunRecord } from "../../src/orchestrator.js";
 import { PiRpcBridge, type PublicRunEvent } from "../../src/pi-rpc.js";
-import { QualityGate, type CheckStatus, type Grade } from "../../src/quality-gate.js";
+import { QualityGate, type CheckStatus, type Grade, type VerificationResult } from "../../src/quality-gate.js";
 import { WorktreeManager } from "../../src/worktree-manager.js";
 
 const exec = promisify(execFile);
 
+/** Playback pauses at this record until the host answers the process through `respondUi`. */
+export const awaitUi = { awaitUi: true } as const;
+
 /** One writer execution: files it leaves in the worktree (null deletes) and the raw Pi RPC records it emits. */
 export interface ScriptedAttempt { files: Record<string, string | null>; records: Array<Record<string, unknown>> }
+
+/** A grader step: a verdict, an error the grader throws, or a function building the raw submission for grader call `call` (1-based). */
+export type ScriptedGrade = Grade["status"] | Error | ((call: number, candidateHash: string) => unknown);
 
 export interface Scenario {
   name: string;
   /** Omit for the no-profile path. */
   profile?: { allowedPaths: string[]; maxRepairs: number };
   attempts: ScriptedAttempt[];
-  verify?: CheckStatus[];
-  grade?: Grade["status"][];
+  /** Per attempt: a status for a single scripted check, or the full verification result. */
+  verify?: Array<CheckStatus | VerificationResult>;
+  /** Per grader call, not per attempt, so retries consume their own entries. */
+  grade?: ScriptedGrade[];
+  /** Overrides merged over the scenario's quality services. */
+  quality?: Partial<QualityServices>;
   expect: {
     status: RunRecord["status"];
     errorCode?: string;
@@ -44,7 +54,9 @@ export const settledRecord = { type: "agent_settled" };
 
 class ScriptedProcess {
   prompts: string[] = [];
+  responses: Array<{ id: string; response: unknown }> = [];
   private attempt = 0;
+  private resumeUi?: () => void;
   private readonly bridge: PiRpcBridge;
   constructor(private readonly worktree: string, private readonly scenario: Scenario, onEvent: (event: PublicRunEvent) => void) {
     this.bridge = new PiRpcBridge({ writeLine: () => undefined, onEvent });
@@ -57,6 +69,12 @@ class ScriptedProcess {
     setImmediate(() => void this.play(script));
   }
   decide(): void { /* scenarios do not request approvals */ }
+  respondUi(id: string, response: unknown): void {
+    this.responses.push({ id, response });
+    const resume = this.resumeUi;
+    this.resumeUi = undefined;
+    resume?.();
+  }
   async abort(): Promise<void> {}
   async close(): Promise<void> {}
   private async play(script: ScriptedAttempt): Promise<void> {
@@ -65,7 +83,10 @@ class ScriptedProcess {
       if (content === null) await rm(target, { force: true });
       else { await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, content); }
     }
-    for (const record of script.records) this.bridge.feed(`${JSON.stringify(record)}\n`);
+    for (const record of script.records) {
+      if (record === awaitUi) { await new Promise<void>(resolve => { this.resumeUi = resolve; }); continue; }
+      this.bridge.feed(`${JSON.stringify(record)}\n`);
+    }
   }
 }
 
@@ -79,7 +100,13 @@ async function changedFiles(worktree: string, baseline: string): Promise<string[
   return [...tracked, ...untracked];
 }
 
-function qualityFor(scenario: Scenario): QualityServices | undefined {
+function scriptedVerification(step: CheckStatus | VerificationResult | undefined): VerificationResult {
+  if (step && typeof step === "object") return step;
+  const status = step ?? "passed";
+  return { status, checks: [{ name: "scripted", status, exit_code: status === "passed" ? 0 : 1 }] };
+}
+
+function qualityFor(scenario: Scenario, counters: { gradeCalls: number }): QualityServices | undefined {
   const profile = scenario.profile;
   if (!profile) return undefined;
   const rubric = ["meets_request"];
@@ -90,13 +117,13 @@ function qualityFor(scenario: Scenario): QualityServices | undefined {
       const patch = (await exec("git", ["diff", "--binary", input.baseline], { cwd: input.worktree })).stdout;
       return { hash: createHash("sha256").update(patch).digest("hex"), path: input.worktree, patch };
     },
-    verify: async (_candidate, input) => {
-      const status = scenario.verify?.[input.attempt - 1] ?? "passed";
-      return { status, checks: [{ name: "scripted", status, exit_code: status === "passed" ? 0 : 1 }] };
-    },
-    grade: async (candidate, _verification, input) => {
-      const status = scenario.grade?.[input.attempt - 1] ?? "passed";
-      return { status, candidate_hash: candidate.hash, criteria: rubric.map(id => ({ id, passed: status === "passed", evidence: "scripted" })), findings: [] };
+    verify: async (_candidate, input) => scriptedVerification(scenario.verify?.[input.attempt - 1]),
+    grade: async candidate => {
+      const call = ++counters.gradeCalls;
+      const step = scenario.grade?.[call - 1] ?? "passed";
+      if (step instanceof Error) throw step;
+      if (typeof step === "function") return step(call, candidate.hash);
+      return { status: step, candidate_hash: candidate.hash, criteria: rubric.map(id => ({ id, passed: step === "passed", evidence: "scripted" })), findings: [] };
     },
   });
   return {
@@ -105,10 +132,11 @@ function qualityFor(scenario: Scenario): QualityServices | undefined {
     execution: () => undefined,
     maxCostUsd: 10,
     activeTimeoutMs: 60_000,
+    ...scenario.quality,
   };
 }
 
-export interface ScenarioResult { run: RunRecord; prompts: string[]; commits: number; dirty: string }
+export interface ScenarioResult { run: RunRecord; prompts: string[]; responses: ScriptedProcess["responses"]; gradeCalls: number; commits: number; dirty: string }
 
 /** Runs a scenario through the real orchestrator, worktree manager, Pi RPC bridge and quality gate. */
 export async function runScenario(scenario: Scenario): Promise<ScenarioResult> {
@@ -122,6 +150,7 @@ export async function runScenario(scenario: Scenario): Promise<ScenarioResult> {
     await git(repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "-m", "baseline");
     const worktrees = new WorktreeManager({ repoPath: repo, worktreeRoot: path.join(root, "worktrees"), baseRef: "main" });
     let scripted!: ScriptedProcess;
+    const counters = { gradeCalls: 0 };
     // Runs turn terminal before their rollback finishes; wait for it before inspecting the worktree.
     const pending = new Set<Promise<unknown>>();
     const track = <T>(work: Promise<T>): Promise<T> => { pending.add(work); void work.finally(() => pending.delete(work)).catch(() => undefined); return work; };
@@ -138,7 +167,7 @@ export async function runScenario(scenario: Scenario): Promise<ScenarioResult> {
         return scripted;
       },
       deadlineMs: 30_000,
-      quality: qualityFor(scenario),
+      quality: qualityFor(scenario, counters),
     });
     const created = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: scenario.name, user_id: "U", prompt: "Fix the bug in src/a.js" });
     const run = await waitForTerminal(() => orchestrator.getRun(created.run_id));
@@ -147,7 +176,7 @@ export async function runScenario(scenario: Scenario): Promise<ScenarioResult> {
     const commits = Number(await git(session.worktreePath, "rev-list", "--count", "HEAD")) - 1;
     const dirty = await git(session.worktreePath, "status", "--porcelain");
     await orchestrator.shutdown();
-    return { run: structuredClone(run), prompts: scripted.prompts, commits, dirty };
+    return { run: structuredClone(run), prompts: scripted.prompts, responses: scripted.responses, gradeCalls: counters.gradeCalls, commits, dirty };
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -169,12 +198,17 @@ function restore(key: string, value: string | undefined): void {
 
 const TERMINAL = new Set(["completed", "rejected", "cancelled", "failed", "timed_out", "interrupted"]);
 
-async function waitForTerminal(read: () => RunRecord, timeoutMs = 10_000): Promise<RunRecord> {
+/** Polls `read` until `done` accepts its value. */
+export async function waitFor<T>(read: () => T, done: (value: T) => boolean, describe: (value: T) => string, timeoutMs = 10_000): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const run = read();
-    if (TERMINAL.has(run.status)) return run;
+    const value = read();
+    if (done(value)) return value;
     await new Promise(resolve => setTimeout(resolve, 5));
   }
-  throw new Error(`run did not reach a terminal status; last status ${read().status}`);
+  throw new Error(describe(read()));
+}
+
+function waitForTerminal(read: () => RunRecord): Promise<RunRecord> {
+  return waitFor(read, run => TERMINAL.has(run.status), run => `run did not reach a terminal status; last status ${run.status}`);
 }
