@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { validateSnapshotRead } from "../dist/src/policy.js";
 import { Type } from "typebox";
 import { validateGrade } from "../dist/src/quality-gate.js";
+import { verifyGradeEvidence } from "../dist/src/grade-evidence.js";
 export default function grader(pi: ExtensionAPI) {
   const config = JSON.parse(process.env.PI_AGENT_GRADER_JSON ?? "null");
   if (!config) throw new Error("Grader context required");
@@ -21,7 +22,7 @@ export default function grader(pi: ExtensionAPI) {
     }
   });
   pi.registerTool({
-    name: "submit_grade", label: "Submit grade", description: "Submit the final independent verdict bound to this candidate. Evaluate every rubric criterion.",
+    name: "submit_grade", label: "Submit grade", description: "Submit the final independent verdict bound to this candidate. Evaluate every rubric criterion. Cite evidence as path or path:line inside the snapshot.",
     parameters: Type.Object({
       status: Type.Union([Type.Literal("passed"), Type.Literal("needs_changes"), Type.Literal("unknown")]),
       candidate_hash: Type.String(),
@@ -29,7 +30,10 @@ export default function grader(pi: ExtensionAPI) {
       findings: Type.Array(Type.Object({ path: Type.String(), line: Type.Integer(), severity: Type.Union([Type.Literal("error"), Type.Literal("warning")]), reason: Type.String() })),
     }),
     async execute(_id, input) {
-      const result = validateGrade(input, config.candidate_hash, config.rubric); submitted = true;
+      const result = validateGrade(input, config.candidate_hash, config.rubric);
+      // Reject invented locations now, so the grader can correct them within this session.
+      await verifyGradeEvidence(result, root, Array.isArray(config.deleted_paths) ? config.deleted_paths : []);
+      submitted = true;
       return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
     },
   });

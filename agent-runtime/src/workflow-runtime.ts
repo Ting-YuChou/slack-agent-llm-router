@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { writeFile, unlink, access } from "node:fs/promises";
-import { WorktreeManager } from "./worktree-manager.js";
+import { DEFAULT_DIFF_LIMITS, WorktreeManager } from "./worktree-manager.js";
 import { promisify } from "node:util";
 import path from "node:path";
 import type { ControlStore } from "./ci-control.js";
@@ -97,6 +97,7 @@ export function createQualityServices(options: {
     },
     grade: async (candidate, verification, input) => {
       const grader = new GraderRunner({ ...options, prompt: id => options.ledger.prompt(id), stateRoot: path.join(options.root, "graders"),
+        constraints: { allowedPaths: profile.allowedPaths, diffLimits: DEFAULT_DIFF_LIMITS },
         execution: (id, parent, phase, cost, queueMs) => execution(id, parent, "grader", input.attempt, phase, cost, queueMs),
         cost: cost => options.phase(input.run_id, "grading", cost),
       });

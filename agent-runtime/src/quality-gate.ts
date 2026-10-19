@@ -24,6 +24,10 @@ export interface QualityGateOptions {
   grade(candidate: Candidate, verification: VerificationResult, input: GateInput): Promise<unknown>;
   record?(kind: string, payload: unknown, input: GateInput): Promise<void>;
 }
+/** Verification as models may see it: host artifact paths stay on the host. */
+export function publicVerification(verification: VerificationResult): VerificationResult {
+  return { status: verification.status, checks: verification.checks.map(({ artifact: _artifact, ...check }) => check) };
+}
 export function validateGrade(value: unknown, hash: string, rubric: string[]): Grade {
   const g = value as Grade;
   if (!g || !["passed", "needs_changes", "unknown"].includes(g.status) || g.candidate_hash !== hash || !Array.isArray(g.criteria) || !Array.isArray(g.findings) || g.findings.length > 50 || g.criteria.length !== rubric.length) throw new Error("Invalid grader result");

@@ -62,3 +62,23 @@ test('workflow agent path-less reads default to the task scope instead of the se
   }
   assert.equal((await whole('write', { path: path.join(root, 'src', 'a.ts') })).block, true);
 }));
+
+test('grader submit_grade rejects evidence the snapshot does not contain', async () => withSnapshot(async root => {
+  const tools = new Map<string, any>();
+  const previous = { w: process.env.PI_AGENT_WORKTREE, g: process.env.PI_AGENT_GRADER_JSON };
+  process.env.PI_AGENT_WORKTREE = root;
+  process.env.PI_AGENT_GRADER_JSON = JSON.stringify({ candidate_hash: 'h', rubric: ['correct'] });
+  try {
+    const extension = await import(`${pathToFileURL(path.resolve(import.meta.dirname, '../../extensions/grader.ts')).href}?${Math.random()}`);
+    extension.default({ on: () => undefined, registerTool: (tool: any) => tools.set(tool.name, tool) });
+  } finally {
+    if (previous.w === undefined) delete process.env.PI_AGENT_WORKTREE; else process.env.PI_AGENT_WORKTREE = previous.w;
+    if (previous.g === undefined) delete process.env.PI_AGENT_GRADER_JSON; else process.env.PI_AGENT_GRADER_JSON = previous.g;
+  }
+  const submit = tools.get('submit_grade');
+  const fabricated = { status: 'passed', candidate_hash: 'h', criteria: [{ id: 'correct', passed: true, evidence: 'src/a.ts:99 is correct' }], findings: [] };
+  await assert.rejects(submit.execute('t1', fabricated), /src\/a\.ts:99/);
+  const grounded = { ...fabricated, criteria: [{ id: 'correct', passed: true, evidence: 'src/a.ts:1 exports a' }] };
+  const result = await submit.execute('t2', grounded);
+  assert.equal(result.details.status, 'passed');
+}));
