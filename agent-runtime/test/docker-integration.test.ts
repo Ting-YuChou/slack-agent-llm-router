@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { DockerPiProcess } from "../src/container-runtime.js";
 import type { PublicRunEvent } from "../src/pi-rpc.js";
 import { WorktreeManager } from "../src/worktree-manager.js";
+import { fakeGatewayScript, scriptedTurns, waitForContainerHealthz } from "./support/fake-provider.js";
 
 const exec = promisify(execFile);
 const enabled = process.env.PI_AGENT_DOCKER_INTEGRATION === "1";
@@ -36,44 +37,20 @@ test("real Pi preserves its session while switching from Luna max to Sol high", 
   assert.notEqual(hostGid, undefined);
   assert.notEqual(hostUid, 0, "integration test must run as a non-root host user");
 
-  const fakeGatewayScript = String.raw`
-const http = require("node:http"); let call = 0;
-const usage = {input_tokens:1,output_tokens:1,total_tokens:2,input_tokens_details:{cached_tokens:0}};
-function send(res, events) { res.writeHead(200,{"content-type":"text/event-stream"}); for(const e of events) res.write("data: "+JSON.stringify(e)+"\n\n"); res.end("data: [DONE]\n\n"); }
-http.createServer((req,res)=>{ let body=""; req.on("data",c=>body+=c); req.on("end",()=>{
-  const request = JSON.parse(body);
-  const expected = call < 2
-    ? {model:"gpt-5.6-luna",effort:"max"}
-    : {model:"gpt-5.6-sol",effort:"high"};
-  if(request.model!==expected.model || request.reasoning?.effort!==expected.effort){
-    res.writeHead(400); res.end("unexpected model or reasoning effort"); return;
-  }
-  if(call >= 2 && !body.includes("written by pi")){ res.writeHead(400); res.end("session history was not restored"); return; }
-  call++;
-  if(call===1){
-    if(!body.includes("Close one concrete coverage gap")){ res.writeHead(400); res.end("skill was not expanded"); return; }
-    const item={type:"function_call",id:"fc_1",call_id:"call_1",name:"write",arguments:'{"path":"agent.txt","content":"written by pi\\n"}',status:"completed"}; send(res,[
-    {type:"response.created",response:{id:"resp_1"}},
-    {type:"response.output_item.added",output_index:0,item},
-    {type:"response.function_call_arguments.done",output_index:0,arguments:item.arguments},
-    {type:"response.output_item.done",output_index:0,item},
-    {type:"response.completed",response:{id:"resp_1",status:"completed",output:[item],usage}}
-  ]); return; }
-  const text=call===2 ? "Implemented the requested file." : "agent.txt contains written by pi.";
-  const item={type:"message",id:"msg_1",role:"assistant",status:"completed",content:[{type:"output_text",text,annotations:[]}],phase:"final_answer"}; send(res,[
-    {type:"response.created",response:{id:"resp_2"}},
-    {type:"response.output_item.added",output_index:0,item},
-    {type:"response.output_text.delta",output_index:0,content_index:0,delta:text},
-    {type:"response.output_item.done",output_index:0,item},
-    {type:"response.completed",response:{id:"resp_2",status:"completed",output:[item],usage}}
-  ]);
-});}).listen(8080,"0.0.0.0");`;
+  const gatewayScript = fakeGatewayScript(scriptedTurns([
+    {
+      kind: "function_call", name: "write", arguments: { path: "agent.txt", content: "written by pi\n" },
+      expect: { model: "gpt-5.6-luna", effort: "max", includes: ["Close one concrete coverage gap"] },
+    },
+    { kind: "text", text: "Implemented the requested file.", expect: { model: "gpt-5.6-luna", effort: "max" } },
+    { kind: "text", text: "agent.txt contains written by pi.", expect: { model: "gpt-5.6-sol", effort: "high", includes: ["written by pi"] } },
+  ]));
 
   let piProcess: DockerPiProcess | undefined;
   try {
     await command("docker", ["network", "create", "--internal", network]);
-    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", "node:22.22.0-bookworm-slim", "node", "-e", fakeGatewayScript]);
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", "node:22.22.0-bookworm-slim", "node", "-e", gatewayScript]);
+    await waitForContainerHealthz(gateway);
     const events: PublicRunEvent[] = [];
     let resolveSettled!: () => void;
     let settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
@@ -154,29 +131,15 @@ test("Pi 1.0.1 resumes a session persisted by Pi 0.83", { skip: !enabled, timeou
   assert.notEqual(hostGid, undefined);
   assert.notEqual(hostUid, 0, "integration test must run as a non-root host user");
 
-  const fakeGatewayScript = String.raw`
-const http = require("node:http");
-const usage = {input_tokens:1,output_tokens:1,total_tokens:2,input_tokens_details:{cached_tokens:0}};
-http.createServer((req,res)=>{ let body=""; req.on("data",c=>body+=c); req.on("end",()=>{
-  if(!body.includes("legacy-session-marker-083")){ res.writeHead(400); res.end("legacy session history was not restored"); return; }
-  const text="Restored legacy-session-marker-083.";
-  const item={type:"message",id:"msg_restored",role:"assistant",status:"completed",content:[{type:"output_text",text,annotations:[]}],phase:"final_answer"};
-  res.writeHead(200,{"content-type":"text/event-stream"});
-  for(const event of [
-    {type:"response.created",response:{id:"resp_restored"}},
-    {type:"response.output_item.added",output_index:0,item},
-    {type:"response.output_text.delta",output_index:0,content_index:0,delta:text},
-    {type:"response.output_item.done",output_index:0,item},
-    {type:"response.completed",response:{id:"resp_restored",status:"completed",output:[item],usage}}
-  ]) res.write("data: "+JSON.stringify(event)+"\n\n");
-  res.end("data: [DONE]\n\n");
-});}).listen(8080,"0.0.0.0");`;
+  const gatewayScript = fakeGatewayScript(scriptedTurns([
+    { kind: "text", text: "Restored legacy-session-marker-083.", expect: { includes: ["legacy-session-marker-083"] } },
+  ]));
 
   let piProcess: DockerPiProcess | undefined;
   try {
     await command("docker", ["network", "create", "--internal", network]);
-    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", "node:22.22.0-bookworm-slim", "node", "-e", fakeGatewayScript]);
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", "node:22.22.0-bookworm-slim", "node", "-e", gatewayScript]);
+    await waitForContainerHealthz(gateway);
     const events: PublicRunEvent[] = [];
     let resolveSettled!: () => void;
     const settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
@@ -243,6 +206,7 @@ test("Pi builtin MCP uses only the trusted GitHub registration and ignores proje
 const fakeMcpScript = String.raw`
 const http=require("node:http");
 http.createServer((req,res)=>{let body="";req.on("data",c=>body+=c);req.on("end",()=>{
+  if(req.url==="/healthz"){res.writeHead(200);res.end("ok");return;}
   if(req.method==="GET"){res.writeHead(405);res.end();return;}
   if(req.method==="DELETE"){res.writeHead(200);res.end();return;}
   const msg=JSON.parse(body||"{}");
@@ -254,32 +218,21 @@ http.createServer((req,res)=>{let body="";req.on("data",c=>body+=c);req.on("end"
   else {res.writeHead(400);res.end("unexpected MCP request");return;}
   res.writeHead(200,{"content-type":"application/json","mcp-session-id":"fake-session"});res.end(JSON.stringify({jsonrpc:"2.0",id:msg.id,result}));
 });}).listen(8090,"0.0.0.0");`;
-  const fakeModelScript = String.raw`
-const http=require("node:http");let call=0;const usage={input_tokens:1,output_tokens:1,total_tokens:2,input_tokens_details:{cached_tokens:0}};
-function send(res,events){res.writeHead(200,{"content-type":"text/event-stream"});for(const e of events)res.write("data: "+JSON.stringify(e)+"\n\n");res.end("data: [DONE]\n\n");}
-http.createServer((req,res)=>{let body="";req.on("data",c=>body+=c);req.on("end",()=>{
-  if(body.includes("mcp__evil__")){res.writeHead(400);res.end("project MCP was loaded");return;}
-  call++;
-  if(call===1){
-    if(!body.includes("mcp__github__get_file_contents")){res.writeHead(400);res.end("trusted MCP tool missing");return;}
-    const item={type:"function_call",id:"fc_mcp",call_id:"call_mcp",name:"mcp__github__get_file_contents",arguments:'{"owner":"acme","repo":"widgets","path":"README.md"}',status:"completed"};send(res,[
-      {type:"response.created",response:{id:"resp_mcp_1"}},{type:"response.output_item.added",output_index:0,item},
-      {type:"response.function_call_arguments.done",output_index:0,arguments:item.arguments},{type:"response.output_item.done",output_index:0,item},
-      {type:"response.completed",response:{id:"resp_mcp_1",status:"completed",output:[item],usage}}]);return;
-  }
-  if(!body.includes("trusted-mcp-marker")){res.writeHead(400);res.end("MCP result missing");return;}
-  const text="Read trusted-mcp-marker through GitHub MCP.";const item={type:"message",id:"msg_mcp",role:"assistant",status:"completed",content:[{type:"output_text",text,annotations:[]}],phase:"final_answer"};send(res,[
-    {type:"response.created",response:{id:"resp_mcp_2"}},{type:"response.output_item.added",output_index:0,item},
-    {type:"response.output_text.delta",output_index:0,content_index:0,delta:text},{type:"response.output_item.done",output_index:0,item},
-    {type:"response.completed",response:{id:"resp_mcp_2",status:"completed",output:[item],usage}}]);
-});}).listen(8080,"0.0.0.0");`;
+  const fakeModelScript = fakeGatewayScript(scriptedTurns([
+    {
+      kind: "function_call", name: "mcp__github__get_file_contents", arguments: { owner: "acme", repo: "widgets", path: "README.md" },
+      expect: { includes: ["mcp__github__get_file_contents"], excludes: ["mcp__evil__"] },
+    },
+    { kind: "text", text: "Read trusted-mcp-marker through GitHub MCP.", expect: { includes: ["trusted-mcp-marker"], excludes: ["mcp__evil__"] } },
+  ]));
 
   let piProcess: DockerPiProcess | undefined;
   try {
     await command("docker", ["network", "create", "--internal", network]);
     await command("docker", ["run", "--detach", "--rm", "--name", modelGateway, "--network", network, "--network-alias", "model-gateway", "node:22.22.0-bookworm-slim", "node", "-e", fakeModelScript]);
     await command("docker", ["run", "--detach", "--rm", "--name", mcpGateway, "--network", network, "--network-alias", "mcp-gateway", "node:22.22.0-bookworm-slim", "node", "-e", fakeMcpScript]);
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await waitForContainerHealthz(modelGateway);
+    await waitForContainerHealthz(mcpGateway, 8090);
     const events: PublicRunEvent[] = [];
     let resolveSettled!: () => void;
     const settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
@@ -328,39 +281,17 @@ test("real Pi requests pass the gateway allowlist and bash children cannot read 
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
   const probe = `node -e "process.stdout.write('TOKEN='+(process.env.OPENAI_API_KEY||'none')+';MCP='+(process.env.PI_AGENT_MCP_SERVERS_JSON?'set':'none'))"`;
-  const fakeGatewayScript = String.raw`
-const http = require("node:http"); const fs = require("node:fs"); let call = 0;
-const usage = {input_tokens:1,output_tokens:1,total_tokens:2,input_tokens_details:{cached_tokens:0}};
-function sse(res, events) { res.writeHead(200,{"content-type":"text/event-stream"}); for(const e of events) res.write("data: "+JSON.stringify(e)+"\n\n"); res.end("data: [DONE]\n\n"); }
-function anthropic(res, events) { res.writeHead(200,{"content-type":"text/event-stream"}); for(const e of events) res.write("event: "+e.type+"\ndata: "+JSON.stringify(e)+"\n\n"); res.end(); }
-http.createServer((req,res)=>{ let body=""; req.on("data",c=>body+=c); req.on("end",()=>{
-  fs.appendFileSync("/record/requests.jsonl", JSON.stringify({url:req.url, headers:req.headers, body:JSON.parse(body)})+"\n");
-  call++;
-  if (req.url.startsWith("/anthropic/")) {
-    anthropic(res,[
-      {type:"message_start",message:{id:"msg_a",type:"message",role:"assistant",content:[],model:"claude-sonnet-4-6",stop_reason:null,usage:{input_tokens:1,output_tokens:1}}},
-      {type:"content_block_start",index:0,content_block:{type:"text",text:""}},
-      {type:"content_block_delta",index:0,delta:{type:"text_delta",text:"anthropic-ok"}},
-      {type:"content_block_stop",index:0},
-      {type:"message_delta",delta:{stop_reason:"end_turn"},usage:{output_tokens:1}},
-      {type:"message_stop"},
-    ]); return;
-  }
-  if (call===1) {
-    const item={type:"function_call",id:"fc_1",call_id:"call_1",name:"bash",arguments:JSON.stringify({command:${JSON.stringify(probe)}}),status:"completed"};
-    sse(res,[{type:"response.created",response:{id:"resp_1"}},{type:"response.output_item.added",output_index:0,item},{type:"response.function_call_arguments.done",output_index:0,arguments:item.arguments},{type:"response.output_item.done",output_index:0,item},{type:"response.completed",response:{id:"resp_1",status:"completed",output:[item],usage}}]);
-    return;
-  }
-  const text="probe done";
-  const item={type:"message",id:"msg_1",role:"assistant",status:"completed",content:[{type:"output_text",text,annotations:[]}],phase:"final_answer"};
-  sse(res,[{type:"response.created",response:{id:"resp_2"}},{type:"response.output_item.added",output_index:0,item},{type:"response.output_text.delta",output_index:0,content_index:0,delta:text},{type:"response.output_item.done",output_index:0,item},{type:"response.completed",response:{id:"resp_2",status:"completed",output:[item],usage}}]);
-});}).listen(8080,"0.0.0.0");`;
+  const gatewayScript = fakeGatewayScript(scriptedTurns([
+    { kind: "function_call", name: "bash", arguments: { command: probe } },
+    { kind: "text", text: "probe done" },
+    { kind: "anthropic_text", text: "anthropic-ok" },
+  ]), { recordPath: "/record/requests.jsonl" });
 
   let piProcess: DockerPiProcess | undefined;
   try {
     await command("docker", ["network", "create", "--internal", network]);
-    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", "--mount", `type=bind,src=${recordDir},dst=/record`, "node:22.22.0-bookworm-slim", "node", "-e", fakeGatewayScript]);
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", "--mount", `type=bind,src=${recordDir},dst=/record`, "node:22.22.0-bookworm-slim", "node", "-e", gatewayScript]);
+    await waitForContainerHealthz(gateway);
     const events: PublicRunEvent[] = [];
     let resolveSettled!: () => void;
     let settled = new Promise<void>((resolve) => { resolveSettled = resolve; });

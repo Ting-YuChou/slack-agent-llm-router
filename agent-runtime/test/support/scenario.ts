@@ -233,15 +233,15 @@ function restore(key: string, value: string | undefined): void {
 
 const TERMINAL = new Set(["completed", "rejected", "cancelled", "failed", "timed_out", "interrupted"]);
 
-/** Polls `read` until `done` accepts its value. */
-export async function waitFor<T>(read: () => T, done: (value: T) => boolean, describe: (value: T) => string, timeoutMs = 10_000): Promise<T> {
+/** Polls `read` (sync or async) until `done` accepts its value. */
+export async function waitFor<T>(read: () => T | Promise<T>, done: (value: T) => boolean, describe: (value: T) => string, timeoutMs = 10_000): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const value = read();
+    const value = await read();
     if (done(value)) return value;
     await new Promise(resolve => setTimeout(resolve, 5));
   }
-  throw new Error(describe(read()));
+  throw new Error(describe(await read()));
 }
 
 function waitForTerminal(read: () => RunRecord): Promise<RunRecord> {
