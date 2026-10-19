@@ -35,10 +35,16 @@ export class AgentTracing {
       this.logs = new LoggerProvider({ resource: resourceFromAttributes({ "service.name": serviceName }), processors: [new BatchLogRecordProcessor({ exporter: new OTLPLogExporter() })] });
     this.tracer = this.provider.getTracer("pi-agent-observability", "1.0.0");
   }
-  startRun(runId: string, sessionId: string): void {
+  startRun(runId: string, sessionId: string, parentRunId?: string, persistedParent?: string): void {
     if (this.runs.has(runId))
       return;
-    this.runs.set(runId, { root: this.tracer.startSpan("agent.run", { attributes: { "agent.run_id": runId, "agent.session_id": sessionId } }, ROOT_CONTEXT), children: new Map() });
+    const parent = parentRunId ? this.runs.get(parentRunId)?.root : undefined;
+    let context = parent ? trace.setSpan(ROOT_CONTEXT,parent) : ROOT_CONTEXT;
+    if (!parent && validTraceparent(persistedParent)) {
+      const [,traceId,spanId,flags] = persistedParent.split('-');
+      context = trace.setSpanContext(context,{ traceId,spanId,traceFlags: parseInt(flags,16),isRemote: true });
+    }
+    this.runs.set(runId, { root: this.tracer.startSpan("agent.run", { attributes: { "agent.run_id": runId, "agent.session_id": sessionId, ...(parentRunId ? { "agent.workflow_run_id": parentRunId } : {}) } }, context), children: new Map() });
   }
   describeRun(runId: string, model?: string, effort?: string): void {
     const root = this.runs.get(runId)?.root;
@@ -136,6 +142,12 @@ export class AgentTracing {
     span?.setAttribute("approval.approved", approved);
     span?.end();
     children?.delete(`approval:${id}`);
+  }
+  firstModel(runId: string, parent: string | undefined, sent: number): void {
+    if (!validTraceparent(parent)) return;
+    const [, traceId, spanId, flags] = parent.split("-");
+    const context = trace.setSpanContext(ROOT_CONTEXT, { traceId, spanId, traceFlags: parseInt(flags,16), isRemote: true });
+    this.tracer.startSpan("agent.prompt_to_first_model_request", { startTime: new Date(sent), attributes: { "agent.run_id": runId } }, context).end();
   }
   gateway(runId: string, parent: string | undefined, provider: string, model: string): Span {
     let context = ROOT_CONTEXT;

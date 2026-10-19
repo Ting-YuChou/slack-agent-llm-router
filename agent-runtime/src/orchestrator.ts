@@ -1,10 +1,38 @@
 import { randomUUID } from "node:crypto";
+import { taskMode, type TaskMode } from "./task-mode.js";
 
 import { listAgentModels, resolveAgentModel } from "./agent-model.js";
 import type { RouteDecision } from "./jev-router.js";
 import { ApprovalStore } from "./policy.js";
 import type { PublicRunEvent } from "./pi-rpc.js";
 import type { RuntimeStateStore } from "./runtime-state.js";
+import { workflowMode, type WorkflowMode, type WorkflowNode } from "./structured-workflow.js";
+import { WorkflowBudget } from "./workflow-budget.js";
+import type { Candidate, GateInput, GateResult } from "./quality-gate.js";
+
+export interface QualityServices {
+  evaluate(input: GateInput): Promise<GateResult>;
+  assertUnchanged(candidate: Candidate, input: GateInput): Promise<void>;
+  execution(id: string, parent: string, role: "implementation" | "discussion", attempt: number, phase: "start" | "end", queueMs?: number): void | Promise<void>;
+  stop?(id: string): Promise<void>;
+  open?(id: string, initialCost: number): void;
+  close?(id: string): void;
+  archive?(input: GateInput): Promise<void>;
+  elapsedMs?(id: string): number;
+  activeTimeoutMs?: number;
+  maxCostUsd?: number;
+  structured?: { enabled: boolean; maxCostUsd: number; activeTimeoutMs: number };
+  prepare?(id: string, mode: WorkflowMode): void;
+  discover?(input: GateInput & { owner: string; initial_active_ms: number }): Promise<string>;
+  writerStarted?(id: string): void;
+  canResume?(id: string): boolean;
+  resumeElapsed?(id: string): number;
+  resumeCheckpoint?(id: string): number;
+  stopDiscovery?(id: string): Promise<void>;
+  validateResume?(input: GateInput): Promise<void>;
+  tasks?(id: string): WorkflowNode[];
+}
+interface WorkflowState { mode: WorkflowMode; discovery?: Promise<string>; priorActiveMs: number; initialActiveMs: number; requirement: string; route: RouteDecision; attempt: number; executionId: string; budget: WorkflowBudget; controller: AbortController; checking: boolean; operation?: Promise<GateResult> }
 
 export type RunStatus =
   | "starting"
@@ -42,11 +70,31 @@ export interface SessionInput {
   user_id: string;
   prompt: string;
   model?: string;
+  task_mode?: TaskMode;
+  workflow_mode?: WorkflowMode;
   routing_text?: string;
   task_id?: string;
 }
 
 export interface RunRecord {
+  task_mode?: TaskMode;
+  workflow_mode?: WorkflowMode;
+  workflow_requirement?: string;
+  workflow_prompt?: string;
+  traceparent?: string;
+  interrupted_at?: string;
+  suspended_ms?: number;
+  prior_active_ms?: number;
+  workflow_summary?: { revision: number; total: number; completed: number; agent_work_ms: number; queue_ms: number };
+  budget?: ReturnType<WorkflowBudget["snapshot"]>;
+  timing?: { wall_ms: number; active_ms: number; human_wait_ms: number };
+  phase?: string;
+  execution_status?: "running" | "succeeded" | "failed";
+  grader_findings?: Array<{ path: string; line: number; severity: string; reason: string }>;
+  verification_status?: string;
+  grader_status?: string;
+  publication_status?: string;
+  attempts?: Array<{ attempt: number; execution_id: string; candidate_hash?: string; verification_status?: string; grader_status?: string; artifact?: string }>;
   run_id: string;
   session_id: string;
   status: RunStatus;
@@ -88,14 +136,15 @@ export interface RunRecord {
 }
 
 export interface AgentProcess {
-  prompt(runId: string, prompt: string, route: RouteDecision): void;
+  queueMs?: number;
+  prompt(runId: string, prompt: string, route: RouteDecision, taskMode?: TaskMode): void;
   decide(rpcUiId: string, approved: boolean): void;
   abort(runId: string): Promise<void>;
   close(): Promise<void>;
 }
 
 interface Worktrees {
-  create(runId: string): Promise<{ path: string; branch: string; baselineCommit: string }>;
+  create(runId: string, trustedBase?: string): Promise<{ path: string; branch: string; baselineCommit: string }>;
   inspectDiff(path: string, limits: { maxFiles: number; maxBytes: number; maxSingleFileBytes: number }): Promise<{ files: string[]; bytes: number; stat: string }>;
   commit(path: string, message: string): Promise<string>;
   rollback(path: string, baseline: string): Promise<void>;
@@ -124,7 +173,7 @@ export class CodingAgentOrchestrator {
   private readonly deadlineMs: number;
   private readonly availableModelRefs: Set<string>;
   private readonly stateStore?: RuntimeStateStore;
-  private readonly router?: { route(text?: string): Promise<RouteDecision> };
+  private readonly router?: { route(text?: string, runId?: string): Promise<RouteDecision> };
   private readonly mcpRepository?: string;
   private readonly approvals = new ApprovalStore();
   private readonly sessions = new Map<string, SessionRecord>();
@@ -137,6 +186,9 @@ export class CodingAgentOrchestrator {
   private readonly closingSessionIds = new Set<string>();
   private readonly mcpToolStarts = new Map<string, number>();
   private startingSessions = 0;
+  private readonly workflows = new Map<string, WorkflowState>();
+  private readonly quality?: QualityServices;
+  private readonly captureTraceContext?: (id: string) => string | undefined;
 
   private readonly captureState?: (runId: string) => { complete: boolean | null; reasons: string[] };
   private readonly observeRun?: (run: RunRecord) => void;
@@ -152,8 +204,10 @@ export class CodingAgentOrchestrator {
     deadlineMs?: number;
     stateStore?: RuntimeStateStore;
     availableModelRefs?: string[];
-    router?: { route(text?: string): Promise<RouteDecision> };
+    router?: { route(text?: string, runId?: string): Promise<RouteDecision> };
     mcpRepository?: string;
+    quality?: QualityServices;
+    captureTraceContext?: (id: string) => string | undefined;
   }) {
     this.captureState = options.captureState;
     this.observeRun = options.observeRun; this.observeLifecycle = options.observeLifecycle;
@@ -165,13 +219,18 @@ export class CodingAgentOrchestrator {
     this.stateStore = options.stateStore;
     this.router = options.router;
     this.mcpRepository = options.mcpRepository;
+    this.quality = options.quality;
+    this.captureTraceContext = options.captureTraceContext;
   }
 
   async restore(): Promise<void> {
     if (!this.stateStore) return;
     const state = await this.stateStore.load();
     for (const expired of this.stateStore.takeExpiredSessions()) {
-      try { await this.worktrees.remove(expired.worktreePath); } catch { /* branch and audit metadata remain */ }
+      try {
+        await this.quality?.archive?.({ run_id: `expired-${expired.id}`, worktree: expired.worktreePath, baseline: expired.baselineCommit, requirement: "Expired session", attempt: 0, signal: new AbortController().signal });
+        await this.worktrees.remove(expired.worktreePath);
+      } catch { /* Preserve isolated changes when evidence cannot be archived. */ }
     }
     for (const run of state.runs) {
       if (!["running", "awaiting_approval"].includes(run.status) && run.capture_complete === undefined) {
@@ -187,7 +246,9 @@ export class CodingAgentOrchestrator {
         .filter((run) => run.session_id === saved.id)
         .sort((left, right) => Date.parse(left.updated_at) - Date.parse(right.updated_at))
         .at(-1);
-      if (latestRun?.status === "interrupted") {
+      if (latestRun?.status === "interrupted" && !(latestRun.workflow_mode === "structured" && this.quality?.canResume?.(latestRun.run_id))) {
+        if (latestRun.attempts?.length && !this.quality) throw new Error("Interrupted verified workflow requires its trusted profile before recovery");
+        await this.quality?.archive?.({ run_id: latestRun.run_id, worktree: saved.worktreePath, baseline: saved.baselineCommit, requirement: "Interrupted workflow", attempt: 0, signal: new AbortController().signal });
         await this.worktrees.rollback(saved.worktreePath, saved.baselineCommit);
       }
       let session!: SessionRecord;
@@ -203,9 +264,12 @@ export class CodingAgentOrchestrator {
     await this.persistState();
   }
 
-  async createSession(input: SessionInput): Promise<{ session_id: string; run_id: string; status: "starting" }> {
+  async createSession(input: SessionInput, trustedBase?: string, trustedRunId?: string): Promise<{ session_id: string; run_id: string; status: "starting" }> {
+    if (this.stateStore?.healthy === false) throw new RuntimeError("Runtime control store unavailable", "control_unavailable", 503);
     const requestedAt = new Date().toISOString();
     validateSessionInput(input);
+    const mode = this.requireWorkflowMode(input.workflow_mode);
+    const task = this.requireTaskMode(input.task_mode);
     let requestedModel;
     try {
       requestedModel = resolveAgentModel(input.model);
@@ -224,7 +288,7 @@ export class CodingAgentOrchestrator {
         if (input.model && (existing.autoRouting || existing.modelRef !== requestedModel.ref)) {
           throw new RuntimeConflictError("An existing Agent session cannot switch models");
         }
-        return this.prompt(existing.id, input.prompt, input.user_id, input.routing_text, input.task_id);
+        return this.prompt(existing.id, input.prompt, input.user_id, input.routing_text, input.task_id, mode, task);
       }
     }
     if (this.pendingThreadKeys.has(key)) throw new RuntimeConflictError("This Slack thread is already creating a session");
@@ -232,16 +296,17 @@ export class CodingAgentOrchestrator {
     if (activeSessions + this.startingSessions >= this.maxActiveSessions) throw new RuntimeBusyError();
 
     const sessionId = randomUUID();
-    const runId = randomUUID();
+    const runId = trustedRunId ?? randomUUID();
     this.pendingThreadKeys.add(key);
     this.startingSessions += 1;
     try {
+      this.quality?.prepare?.(runId, mode);
       const autoRouting = !input.model;
       this.notifyLifecycle(runId, "routing", "start", false, sessionId);
-      const route = await this.selectRoute(autoRouting, requestedModel.ref, input.routing_text);
+      const route = await this.selectRoute(autoRouting, requestedModel.ref, input.routing_text, runId);
       this.notifyLifecycle(runId, "routing", "end");
       this.notifyLifecycle(runId, "worktree_create", "start");
-      const worktree = await this.worktrees.create(runId);
+      const worktree = await this.worktrees.create(runId, trustedBase);
       this.notifyLifecycle(runId, "worktree_create", "end");
       let session!: SessionRecord;
       let process: AgentProcess;
@@ -269,7 +334,7 @@ export class CodingAgentOrchestrator {
       };
       this.sessions.set(sessionId, session);
       this.threadSessions.set(key, sessionId);
-      this.startRun(session, runId, input.prompt, route, requestedAt, input.task_id);
+      await this.startRun(session, runId, input.prompt, route, requestedAt, input.task_id, input.routing_text, mode, task);
       await this.persistState();
       return { session_id: sessionId, run_id: runId, status: "starting" };
     } catch (error) {
@@ -280,7 +345,10 @@ export class CodingAgentOrchestrator {
     }
   }
 
-  async prompt(sessionId: string, prompt: string, userId: string, routingText?: string, taskId?: string): Promise<{ session_id: string; run_id: string; status: "starting" }> {
+  async prompt(sessionId: string, prompt: string, userId: string, routingText?: string, taskId?: string, requestedMode?: WorkflowMode, requestedTaskMode?: TaskMode): Promise<{ session_id: string; run_id: string; status: "starting" }> {
+    if (this.stateStore?.healthy === false) throw new RuntimeError("Runtime control store unavailable", "control_unavailable", 503);
+    const mode = this.requireWorkflowMode(requestedMode);
+    const task = this.requireTaskMode(requestedTaskMode);
     const requestedAt = new Date().toISOString();
     const session = this.requireSession(sessionId);
     if (session.ownerUserId !== userId) throw new RuntimeForbiddenError("Only the session owner can submit prompts");
@@ -294,12 +362,13 @@ export class CodingAgentOrchestrator {
     validateTaskId(taskId);
     this.pendingSessionIds.add(sessionId);
     const runId = randomUUID();
+    this.quality?.prepare?.(runId, mode);
     try {
       this.notifyLifecycle(runId, "routing", "start", false, sessionId);
-      const route = await this.selectRoute(session.autoRouting, session.modelRef, routingText);
+      const route = await this.selectRoute(session.autoRouting, session.modelRef, routingText, runId);
       this.notifyLifecycle(runId, "routing", "end");
       if (session.autoRouting) session.modelRef = route.modelRef;
-      this.startRun(session, runId, prompt, route, requestedAt, taskId);
+      await this.startRun(session, runId, prompt, route, requestedAt, taskId, routingText, mode, task);
       await this.persistState();
       return { session_id: sessionId, run_id: runId, status: "starting" };
     } finally {
@@ -307,11 +376,11 @@ export class CodingAgentOrchestrator {
     }
   }
 
-  private async selectRoute(autoRouting: boolean, modelRef: string, routingText?: string): Promise<RouteDecision> {
+  private async selectRoute(autoRouting: boolean, modelRef: string, routingText?: string, runId?: string): Promise<RouteDecision> {
     if (!autoRouting) return { modelRef, effort: "max", source: "explicit" };
     let decision: RouteDecision;
     try {
-      decision = this.router ? await this.router.route(routingText)
+      decision = this.router ? await this.router.route(routingText, runId)
         : { modelRef: "openai/gpt-5.6-luna", effort: "max", source: "off" };
     } catch {
       return { modelRef: "openai/gpt-5.6-luna", effort: "max", source: "fallback", reason: "jev_unavailable" };
@@ -373,6 +442,9 @@ export class CodingAgentOrchestrator {
     }
     session.process.decide(result.approval!.toolCallId, decision === "approve");
     if (decision === "approve") {
+      const workflow = this.workflows.get(runId);
+      workflow?.budget.resume();
+      if (workflow) this.armDeadline(session, run, workflow.budget.remainingMs());
       this.updateRun(run, "running");
       run.events.push({ type: "approval_decision", decision: "approved", approval_id: approvalId });
     } else {
@@ -429,10 +501,13 @@ export class CodingAgentOrchestrator {
     return this.getRun(runId).events.slice(Math.max(0, after));
   }
 
-  private startRun(session: SessionRecord, runId: string, prompt: string, route: RouteDecision, requestedAt: string, taskId?: string): void {
+  private async startRun(session: SessionRecord, runId: string, prompt: string, route: RouteDecision, requestedAt: string, taskId?: string, requirement?: string, mode: WorkflowMode = "single", task: TaskMode = "implement"): Promise<void> {
     const model = resolveAgentModel(route.modelRef);
     const run: RunRecord = {
       run_id: runId,
+      workflow_mode: mode,
+      task_mode: task,
+      ...(mode === "structured" ? { workflow_requirement: requirement ?? prompt, workflow_prompt: prompt } : {}),
       session_id: session.id,
       status: "running",
       answer: "",
@@ -451,14 +526,122 @@ export class CodingAgentOrchestrator {
       events: [{ type: "status", status: "starting" }],
       branch: session.branch,
     };
+    if (task === "discuss") {
+      run.phase = "discussing"; run.execution_status = "running";
+      run.verification_status = "not_applicable"; run.grader_status = "not_applicable"; run.publication_status = "not_applicable";
+    }
     this.runs.set(runId, run);
     session.activeRunId = runId;
     session.lastActivity = Date.now();
     this.notifyRun(run);
-    session.process.prompt(runId, prompt.trim(), route);
-    const deadline = setTimeout(() => void this.timeoutRun(session, run), this.deadlineMs);
+    try {
+    if (this.quality) {
+      const priorActiveMs = this.quality.elapsedMs?.(runId) ?? 0;
+      if (mode === 'structured') run.prior_active_ms = priorActiveMs;
+      const initialActiveMs = priorActiveMs + Math.max(0, Date.now() - Date.parse(requestedAt));
+      const limits = mode === "structured" ? this.quality.structured! : this.quality;
+      const workflow: WorkflowState = { mode, priorActiveMs, initialActiveMs, requirement: requirement ?? prompt, route, attempt: 1, executionId: randomUUID(), budget: new WorkflowBudget(limits.maxCostUsd, (limits.activeTimeoutMs ?? this.deadlineMs) - initialActiveMs), controller: new AbortController(), checking: false };
+      workflow.budget.report(route.jevCostUsd ?? 0);
+      this.quality.open?.(runId, route.jevCostUsd ?? 0);
+      this.workflows.set(runId, workflow);
+      run.execution_status = "running"; run.publication_status = task === "discuss" ? "not_applicable" : "local_only"; run.phase = task === "discuss" ? "discussing" : "implementing"; run.verification_status = task === "discuss" ? "not_applicable" : "pending"; run.grader_status = task === "discuss" ? "not_applicable" : "pending"; run.attempts = [];
+    }
+    // Persist the busy state and exact execution identity before launching any model work.
+    await this.persistState();
+    const workflow = this.workflows.get(runId);
+    if (isTerminal(run.status) || this.terminalClaims.has(runId)) return;
+    if (workflow?.mode === 'structured') this.launchDiscovery(session, run, workflow, prompt.trim());
+    else if (workflow) await this.startExecution(session, run, workflow, prompt.trim());
+    else session.process.prompt(runId, prompt.trim(), route, task);
+    if (!isTerminal(run.status)) this.armDeadline(session, run, this.workflows.get(runId)?.budget.remainingMs() ?? this.deadlineMs);
+    } catch (error) {
+      if (this.stateStore?.healthy !== false && !isTerminal(run.status) && !this.terminalClaims.has(runId)) await this.failRun(session, run, "execution_start_failed", "Execution could not start within its configured controls");
+      throw error;
+    }
+  }
+
+  private requireTaskMode(value: unknown): TaskMode {
+    try { return taskMode(value); } catch { throw new RuntimeError("Invalid task_mode; expected discuss or implement", "invalid_request", 400); }
+  }
+
+  private requireWorkflowMode(value: unknown): WorkflowMode {
+    let mode: WorkflowMode;
+    try { mode = workflowMode(value); } catch { throw new RuntimeError('Invalid workflow_mode', 'invalid_request', 400); }
+    if (mode === 'structured' && (!this.quality?.structured?.enabled || !this.quality.discover)) throw new RuntimeError('Structured workflow requires an enabled trusted profile', 'workflow_setup_required', 503);
+    return mode;
+  }
+
+  private launchDiscovery(session: SessionRecord, run: RunRecord, state: WorkflowState, prompt: string) {
+    run.phase = 'planning';
+    state.discovery = this.quality!.discover!({ run_id: run.run_id, owner: run.owner_user_id, worktree: session.worktreePath, baseline: session.baselineCommit, requirement: state.requirement, attempt: 0, signal: state.controller.signal, initial_active_ms: state.initialActiveMs });
+    void state.discovery.then(async evidence => {
+      state.controller.signal.throwIfAborted();
+      if (isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return;
+      this.quality!.writerStarted?.(run.run_id);
+      run.phase = run.task_mode === 'discuss' ? 'discussing' : 'implementing'; await this.persistState();
+      await this.startExecution(session, run, state, `${prompt}\n\n${evidence}`);
+    }).catch(async () => {
+      if (!isTerminal(run.status) && !this.terminalClaims.has(run.run_id)) await this.failRun(session, run, 'investigation_unknown', 'Required investigation could not complete; evidence retained');
+    });
+  }
+
+  tasks(runId: string): WorkflowNode[] { this.getRun(runId); return this.quality?.tasks?.(runId) ?? []; }
+
+  async resume(runId: string, user: string) {
+    const run = this.runs.get(runId); if (!run) throw new RuntimeNotFoundError();
+    if (run.owner_user_id !== user) throw new RuntimeForbiddenError();
+    this.requireWorkflowMode(run.workflow_mode);
+    if (run.workflow_mode !== 'structured' || run.status !== 'interrupted' || !this.quality?.canResume?.(runId)) throw new RuntimeConflictError('Only interrupted read-only workflow stages can resume');
+    const session = this.requireSession(run.session_id);
+    if (session.activeRunId || this.pendingSessionIds.has(session.id) || this.closingSessionIds.has(session.id)) throw new RuntimeConflictError();
+    if (session.baselineCommit !== run.baseline_commit) throw new RuntimeConflictError('Baseline changed; start a new task');
+    this.pendingSessionIds.add(session.id);
+    try { await this.quality.validateResume?.({ run_id: runId, worktree: session.worktreePath, baseline: session.baselineCommit, requirement: run.workflow_requirement ?? '', attempt: 0, signal: new AbortController().signal }); }
+    catch { throw new RuntimeConflictError('Workflow identity or artifacts changed; start a new task'); }
+    finally { this.pendingSessionIds.delete(session.id); }
+    const limits = this.quality.structured!;
+    const consumed = Math.max(this.quality.resumeElapsed?.(runId) ?? 0,(run.timing?.active_ms ?? 0) + (run.prior_active_ms ?? 0));
+    if (consumed >= limits.activeTimeoutMs) throw new RuntimeConflictError('Workflow time budget exhausted');
+    const state: WorkflowState = { mode: 'structured', priorActiveMs: run.prior_active_ms ?? 0, initialActiveMs: consumed, requirement: '', route: run.routing!, attempt: 1, executionId: randomUUID(), budget: new WorkflowBudget(limits.maxCostUsd, limits.activeTimeoutMs - consumed), controller: new AbortController(), checking: false };
+    state.budget.report(run.estimated_cost_usd ?? 0);
+    const saved = this.quality.tasks?.(runId); if (!saved?.length) throw new RuntimeConflictError('Workflow artifacts missing');
+    state.requirement = run.workflow_requirement ?? '';
+    if (!state.requirement) throw new RuntimeConflictError('Workflow requirement missing');
+    this.terminalClaims.delete(runId); this.workflows.set(runId,state); session.activeRunId = runId;
+    run.suspended_ms = (run.suspended_ms ?? 0) + Math.max(0, Date.now() - Math.max(this.quality.resumeCheckpoint?.(runId) ?? 0,Date.parse(run.interrupted_at ?? run.updated_at)));
+    run.status = 'running'; run.updated_at = new Date().toISOString();
+    run.execution_status = 'running'; run.verification_status = run.task_mode === 'discuss' ? 'not_applicable' : 'pending'; run.grader_status = run.task_mode === 'discuss' ? 'not_applicable' : 'pending';
+    this.notifyLifecycle(runId,'resume','start',false,session.id);
+    run.traceparent = this.captureTraceContext?.(runId) ?? run.traceparent;
+    this.notifyLifecycle(runId,'resume','end',false,session.id);
+    await this.persistState(); this.launchDiscovery(session,run,state,run.workflow_prompt ?? state.requirement);
+    this.armDeadline(session,run,state.budget.remainingMs());
+    return { run_id: runId, session_id: session.id, status: 'starting' as const };
+  }
+
+  async qualityPhase(runId: string, phase: string, cost = 0): Promise<void> {
+    const run = this.runs.get(runId); const workflow = this.workflows.get(runId);
+    if (!run || !workflow || isTerminal(run.status)) return;
+    workflow.budget.report(cost); run.estimated_cost_usd = (run.estimated_cost_usd ?? 0) + cost;
+    run.phase = phase; await this.persistState(); workflow.budget.check();
+  }
+
+  private armDeadline(session: SessionRecord, run: RunRecord, ms: number): void {
+    const previous = this.deadlines.get(run.run_id); if (previous) clearTimeout(previous);
+    const runId = run.run_id;
+    const deadline = setTimeout(() => void this.timeoutRun(session, run), ms);
     deadline.unref();
     this.deadlines.set(runId, deadline);
+  }
+
+  private async startExecution(session: SessionRecord, run: RunRecord, state: WorkflowState, prompt: string) {
+    state.budget.check();
+    run.execution_status = "running"; run.answer = "";
+    run.attempts!.push({ attempt: state.attempt, execution_id: state.executionId });
+    await this.persistState();
+    if (state.controller.signal.aborted || isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return;
+    await this.quality!.execution(state.executionId, run.run_id, run.task_mode === "discuss" ? "discussion" : "implementation", state.attempt, "start");
+    session.process.prompt(state.executionId, prompt, state.route, run.task_mode ?? "implement");
   }
 
   private handleProcessEvent(sessionId: string, event: PublicRunEvent): void {
@@ -467,8 +650,10 @@ export class CodingAgentOrchestrator {
     const run = this.runs.get(session.activeRunId);
     if (!run || isTerminal(run.status)) return;
     if (event.type === "usage") {
+      const state = this.workflows.get(run.run_id); state?.budget.report(event.cost_usd);
       run.estimated_cost_usd = (run.estimated_cost_usd ?? 0) + event.cost_usd;
       void this.persistState();
+      if (state && state.budget.estimatedUsd > state.budget.limitUsd) void this.failRun(session, run, "workflow_budget_exhausted", "Model budget exhausted");
       return;
     }
     if (event.type === "turn") {
@@ -477,6 +662,8 @@ export class CodingAgentOrchestrator {
       return;
     }
     if (event.type === "approval") {
+      const state = this.workflows.get(run.run_id);
+      if (state) { state.budget.pause(); const timer = this.deadlines.get(run.run_id); if (timer) clearTimeout(timer); this.armDeadline(session, run, 300_000); }
       const approval = this.approvals.create({
         runId: run.run_id,
         toolCallId: event.approval_id,
@@ -540,10 +727,69 @@ export class CodingAgentOrchestrator {
       void this.failRun(session, run, event.code, event.message);
       return;
     }
-    if (event.type === "settled") void this.completeRun(session, run);
+    if (event.type === "settled") { if (this.workflows.has(run.run_id)) run.execution_status = "succeeded"; void this.completeRun(session, run); }
+  }
+
+  private async completeDiscussion(session: SessionRecord, run: RunRecord): Promise<void> {
+    const workflow = this.workflows.get(run.run_id);
+    if (workflow?.checking || isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return;
+    if (workflow) workflow.checking = true;
+    try {
+      if (workflow) {
+        await this.quality!.execution(workflow.executionId, run.run_id, "discussion", workflow.attempt, "end", session.process.queueMs);
+        workflow.budget.check();
+      }
+      const diff = await this.worktrees.inspectDiff(session.worktreePath, { maxFiles: 50, maxBytes: 1024 * 1024, maxSingleFileBytes: 256 * 1024 });
+      if (isTerminal(run.status) || this.terminalClaims.has(run.run_id) || workflow?.controller.signal.aborted) return;
+      if (diff.files.length || diff.bytes) {
+        await this.failRun(session, run, "discussion_workspace_changed", "Read-only discussion produced unexpected changes; delivery blocked"); return;
+      }
+      if (!this.claimTerminal(run)) return;
+      run.changed_files = []; run.phase = "completed";
+      run.verification_status = "not_applicable"; run.grader_status = "not_applicable"; run.publication_status = "not_applicable";
+      this.updateRun(run, "completed"); this.finishActiveRun(session, run.run_id);
+      await this.persistState();
+    } catch {
+      if (!isTerminal(run.status) && !this.terminalClaims.has(run.run_id)) await this.failRun(session, run, "discussion_completion_failed", "Read-only completion checks could not finish");
+    }
   }
 
   private async completeRun(session: SessionRecord, run: RunRecord): Promise<void> {
+    if (run.task_mode === "discuss") { await this.completeDiscussion(session, run); return; }
+    const workflow = this.workflows.get(run.run_id);
+    if (workflow && this.quality) {
+      if (workflow.checking || this.terminalClaims.has(run.run_id) || isTerminal(run.status)) return;
+      workflow.checking = true;
+      const input: GateInput = { run_id: run.run_id, worktree: session.worktreePath, baseline: session.baselineCommit, requirement: workflow.requirement, attempt: workflow.attempt, signal: workflow.controller.signal };
+      try {
+        await this.quality.execution(workflow.executionId, run.run_id, "implementation", workflow.attempt, "end", session.process.queueMs);
+        workflow.budget.check();
+        await this.worktrees.inspectDiff(session.worktreePath, { maxFiles: 50, maxBytes: 1024 * 1024, maxSingleFileBytes: 256 * 1024 });
+        run.phase = "verifying"; await this.persistState();
+        workflow.operation = this.quality.evaluate(input);
+        const result = await workflow.operation; workflow.operation = undefined;
+        if (workflow.controller.signal.aborted || isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return;
+        workflow.budget.check();
+        run.grader_findings = result.grade?.findings;
+        run.verification_status = result.verification.status; run.grader_status = result.grade?.status ?? "pending";
+        Object.assign(run.attempts!.at(-1)!, { candidate_hash: result.candidate.hash, verification_status: run.verification_status, grader_status: run.grader_status, artifact: result.candidate.artifact });
+        if (result.action === "repair") {
+          workflow.attempt++; workflow.executionId = randomUUID(); workflow.checking = false;
+          run.phase = "repairing"; await this.persistState();
+          await this.startExecution(session, run, workflow, result.repair_prompt!); return;
+        }
+        if (result.action === "fail") {
+          await this.failRun(session, run, "verification_failed", "Candidate retained as an isolated artifact; verification/grading did not pass"); return;
+        }
+        await this.quality.assertUnchanged(result.candidate, input);
+        workflow.controller.signal.throwIfAborted();
+        run.phase = "finalizing"; await this.persistState();
+      } catch {
+        workflow.operation = undefined;
+        if (!isTerminal(run.status) && !this.terminalClaims.has(run.run_id)) await this.failRun(session, run, "quality_gate_unavailable", "Required verification could not complete");
+        return;
+      }
+    }
     if (!this.claimTerminal(run)) return;
     try {
       const diff = await this.worktrees.inspectDiff(session.worktreePath, {
@@ -561,6 +807,7 @@ export class CodingAgentOrchestrator {
       run.cherry_pick = `git cherry-pick ${commit}`;
       run.events.push({ type: "diff", files: diff.files, stat: diff.stat, bytes: diff.bytes });
       this.updateRun(run, "completed");
+      if (workflow) { run.execution_status = "succeeded"; run.phase = "completed"; }
       this.finishActiveRun(session, run.run_id);
     } catch {
       this.notifyLifecycle(run.run_id, "commit", "end", true);
@@ -610,7 +857,13 @@ export class CodingAgentOrchestrator {
 
   private async stopBeforeRollback(session: SessionRecord, run: RunRecord): Promise<boolean> {
     try {
-      await session.process.abort(run.run_id);
+      const workflow = this.workflows.get(run.run_id);
+      workflow?.controller.abort();
+      if (workflow?.discovery) await workflow.discovery.catch(() => {});
+      if (workflow?.operation) await workflow.operation.catch(() => {});
+      await session.process.abort(workflow?.executionId ?? run.run_id);
+      await this.quality?.stop?.(run.run_id);
+      if (this.quality?.archive) await this.quality.archive({ run_id: run.run_id, worktree: session.worktreePath, baseline: session.baselineCommit, requirement: workflow?.requirement ?? "", attempt: workflow?.attempt ?? 0, signal: new AbortController().signal });
       return true;
     } catch {
       run.error = {
@@ -627,6 +880,8 @@ export class CodingAgentOrchestrator {
     const timer = this.deadlines.get(runId);
     if (timer) clearTimeout(timer);
     this.deadlines.delete(runId);
+    if (this.workflows.has(runId)) this.quality?.close?.(runId);
+    this.workflows.delete(runId);
     for (const key of this.mcpToolStarts.keys()) {
       if (key.startsWith(`${session.id}:`)) this.mcpToolStarts.delete(key);
     }
@@ -645,6 +900,12 @@ export class CodingAgentOrchestrator {
 
   private updateRun(run: RunRecord, status: RunStatus): void {
     run.status = status;
+    if (run.execution_status && isTerminal(status)) {
+      if (run.execution_status === "running") run.execution_status = status === "completed" ? "succeeded" : "failed";
+      if (status !== "completed") run.phase = status;
+      if (run.verification_status === "pending") run.verification_status = "unknown";
+      if (run.grader_status === "pending") run.grader_status = "unknown";
+    }
     run.updated_at = new Date().toISOString();
     run.events.push({ type: "status", status });
   }
@@ -657,7 +918,18 @@ export class CodingAgentOrchestrator {
 
   async shutdown(): Promise<void> {
     for (const session of this.sessions.values()) {
-      if (session.activeRunId) { try { await this.cancel(session.activeRunId, session.ownerUserId); } catch { /* retain worktree if stop fails */ } }
+      const run = session.activeRunId ? this.runs.get(session.activeRunId) : undefined;
+      const state = run ? this.workflows.get(run.run_id) : undefined;
+      if (run?.workflow_mode === 'structured' && state && this.quality?.canResume?.(run.run_id) && this.claimTerminal(run)) {
+        try {
+          state.controller.abort(); await state.discovery?.catch(() => {}); await this.quality.stopDiscovery?.(run.run_id);
+          this.updateRun(run,'interrupted'); run.interrupted_at = new Date().toISOString();
+          await this.persistState();
+          const timer = this.deadlines.get(run.run_id); if (timer) clearTimeout(timer);
+          this.deadlines.delete(run.run_id); this.workflows.delete(run.run_id); session.activeRunId = undefined;
+          await this.persistState();
+        } catch { run.error = { code: 'shutdown_stop_unconfirmed',message: 'Read-only workers could not be confirmed stopped; evidence retained' }; this.updateRun(run,'failed'); await this.persistState(); }
+      } else if (session.activeRunId) { try { await this.cancel(session.activeRunId, session.ownerUserId); } catch { /* retain worktree if stop fails */ } }
       try { await session.process.close(); } catch { /* stop failure already audited */ }
     }
   }
@@ -668,6 +940,19 @@ export class CodingAgentOrchestrator {
 
   private notifyRun(run: RunRecord): void {
     try {
+      run.traceparent ??= this.captureTraceContext?.(run.run_id);
+      if (run.workflow_mode === 'structured') {
+        const nodes = this.quality?.tasks?.(run.run_id) ?? [];
+        run.workflow_summary = { revision: Math.max(0,...nodes.map(node => node.wave)), total: nodes.length, completed: nodes.filter(node => node.state === 'succeeded').length, agent_work_ms: nodes.reduce((sum,node) => sum + (node.agent_work_ms ?? node.duration_ms ?? 0),0), queue_ms: nodes.reduce((sum,node) => sum + (node.queue_ms ?? 0),0) };
+      }
+      const workflow = this.workflows.get(run.run_id);
+      if (workflow) {
+        run.budget = workflow.budget.snapshot();
+        const wall = Date.now() - Date.parse(run.created_at);
+        // Reproduction consumes the shared budget but predates this execution's wall clock.
+        const active = workflow.budget.activeMs() + workflow.initialActiveMs - workflow.priorActiveMs;
+        run.timing = { wall_ms: wall, active_ms: active, human_wait_ms: Math.max(0, wall - active - (run.suspended_ms ?? 0)) };
+      }
       if (!["running", "awaiting_approval"].includes(run.status) && run.capture_complete === undefined) {
         const capture = this.captureState?.(run.run_id);
         run.capture_complete = capture?.complete ?? null;
@@ -679,7 +964,7 @@ export class CodingAgentOrchestrator {
   private async persistState(): Promise<void> {
     for (const run of this.runs.values()) this.notifyRun(run);
     if (!this.stateStore) return;
-    await this.stateStore.save({
+    try { await this.stateStore.save({
       schema_version: 1,
       sessions: [...this.sessions.values()].map((session) => ({
         id: session.id,
@@ -696,6 +981,16 @@ export class CodingAgentOrchestrator {
       })),
       runs: [...this.runs.values()].map((run) => structuredClone(run)),
     });
+    } catch (error) {
+      // Retain isolated changes and stop all work if execution state cannot be durable.
+      for (const workflow of this.workflows.values()) workflow.controller.abort();
+      await Promise.allSettled([...this.sessions.values()].filter(session => session.activeRunId).map(async session => {
+        const runId = session.activeRunId!;
+        await session.process.abort(this.workflows.get(runId)?.executionId ?? runId);
+        await this.quality?.stop?.(runId);
+      }));
+      throw error;
+    }
   }
 }
 

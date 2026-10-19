@@ -201,13 +201,18 @@ if [[ "${DEMO_TEST_MODE:-0}" != 1 ]]; then
     docker network create --internal "${agent_network}" >/dev/null
     network_created=true
   fi
+  budget_root="${PI_AGENT_STATE_ROOT:-${repo_root}/.pi-agent-runtime}/budget"
+  mkdir -p "${budget_root}"
+  chmod 700 "${budget_root}"
   docker run --detach --rm \
     --name "${gateway_container}" \
     --label slack-pi-model-gateway=true \
     --network "${agent_network}" \
     --network-alias model-gateway \
     --read-only \
-    --user 10002:10002 \
+    --user "$(id -u):$(id -g)" \
+    --env "PI_AGENT_BUDGET_RPC_URL=http://host.docker.internal:${PI_AGENT_PORT:-3001}" \
+    --env PI_AGENT_MODEL_PRICES_JSON \
     --cap-drop ALL \
     --security-opt no-new-privileges \
     --cpus 1 \
@@ -318,8 +323,10 @@ if [[ "${DEMO_TEST_MODE:-0}" != 1 ]]; then
   fi
 fi
 
+runtime_github_env=(-u GITHUB_APP_ID -u GITHUB_APP_INSTALLATION_ID -u GITHUB_APP_PRIVATE_KEY_PATH)
+if [[ "${PI_AGENT_CI_REPAIR_ENABLED:-false}" == true ]]; then runtime_github_env=(); fi
 env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u OPENCODE_API_KEY \
-  -u GITHUB_APP_ID -u GITHUB_APP_INSTALLATION_ID -u GITHUB_APP_PRIVATE_KEY_PATH \
+  "${runtime_github_env[@]}" \
   -u CONTEXT7_API_KEY -u AGENT_MCP_CLICKHOUSE_PASSWORD -u CLICKHOUSE_MCP_BEARER_TOKEN \
   node "${agent_runtime_dir}/dist/src/server.js" &
 agent_pid=$!
@@ -340,6 +347,7 @@ if [[ "${agent_ready}" != true ]]; then
 fi
 
 env -u ANTHROPIC_API_KEY -u OPENCODE_API_KEY -u OPENROUTER_API_KEY \
+  -u GITHUB_PUBLISHER_APP_ID -u GITHUB_PUBLISHER_APP_INSTALLATION_ID -u GITHUB_PUBLISHER_APP_PRIVATE_KEY_PATH \
   -u MCP_GATEWAY_SIGNING_SECRET -u GITHUB_APP_ID -u GITHUB_APP_INSTALLATION_ID \
   -u GITHUB_APP_PRIVATE_KEY_PATH -u PI_AGENT_GITHUB_REPOSITORIES \
   -u CONTEXT7_API_KEY -u AGENT_MCP_CLICKHOUSE_PASSWORD -u CLICKHOUSE_MCP_BEARER_TOKEN \

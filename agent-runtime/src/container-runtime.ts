@@ -11,8 +11,12 @@ import { PiRunCapture } from "./pi-capture.js";
 import type { AgentTelemetry } from "./telemetry.js";
 import type { McpRunConfig, McpServerId } from "./mcp-config.js";
 import { MCP_SERVERS, namespacedMcpToolNames } from "./mcp-config.js";
+import { StartupTiming } from "./startup-timing.js";
+import { taskMode, type TaskMode } from "./task-mode.js";
+import { agentScheduler } from "./agent-scheduler.js";
 
 export interface AgentContainerOptions {
+  taskMode?: TaskMode;
   name: string;
   image: string;
   network: string;
@@ -32,14 +36,25 @@ export interface AgentContainerOptions {
   safeCommands?: string[];
   user?: string;
   mcp?: McpRunConfig;
+  readOnlyWorkspace?: boolean;
+  graderContext?: { candidate_hash: string; rubric: string[] };
+  workflowContext?: { role: string; wave: number; paths: string[]; previousTasks: unknown[]; mcpTools?: string[] };
+  directMcpOnly?: boolean;
+  workflowKey?: string;
 }
 
 const exec = promisify(execFile);
 
 export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
+  if (taskMode(options.taskMode) === "discuss") options = {
+    ...options, readOnlyWorkspace: true, toolNames: ["read", "grep", "find", "ls"],
+    extensionPaths: ["/opt/pi/extensions/model-gateway.ts", "/opt/pi/extensions/discussion.ts"],
+    pluginPaths: [], skillPaths: [], safeCommands: [], mcp: undefined, classifierGatewayToken: undefined,
+    graderContext: undefined, workflowContext: undefined,
+  };
   const model = resolveAgentModel(options.modelRef);
   const tools = [...options.toolNames];
-  const hasCodemodeMcp = options.mcp?.servers.some((item) => MCP_SERVERS[item.server].codemodeTools.length > 0) ?? false;
+  const hasCodemodeMcp = !options.directMcpOnly && (options.mcp?.servers.some((item) => MCP_SERVERS[item.server].codemodeTools.length > 0) ?? false);
   if ((options.classifierGatewayToken || hasCodemodeMcp) && !tools.includes("codemode")) tools.push("codemode");
   const directMcpTools = options.mcp?.servers.flatMap((item) =>
     namespacedMcpToolNames(item.server, MCP_SERVERS[item.server].directTools)) ?? [];
@@ -65,11 +80,10 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     "--env", `PI_AGENT_SAFE_COMMANDS_JSON=${JSON.stringify(options.safeCommands ?? [])}`,
     "--env", `PI_AGENT_SKILL_PATHS_JSON=${JSON.stringify(options.skillPaths)}`,
     "--env", `PI_AGENT_WORKTREE=${options.worktreePath}`,
-    "--mount", `type=bind,src=${options.worktreePath},dst=${options.worktreePath}`,
-    "--mount", `type=bind,src=${options.worktreePath}/.git,dst=${options.worktreePath}/.git,readonly`,
-    "--mount", `type=bind,src=${options.gitMetadataPath},dst=${options.gitMetadataPath},readonly`,
+    "--mount", `type=bind,src=${options.worktreePath},dst=${options.worktreePath}${options.readOnlyWorkspace ? ",readonly" : ""}`,
+    ...(!options.readOnlyWorkspace ? ["--mount", `type=bind,src=${options.worktreePath}/.git,dst=${options.worktreePath}/.git,readonly`, "--mount", `type=bind,src=${options.gitMetadataPath},dst=${options.gitMetadataPath},readonly`] : []),
     "--mount", `type=bind,src=${options.sessionStatePath},dst=/var/lib/pi-session`,
-    "--workdir", options.worktreePath,
+    "--workdir", options.readOnlyWorkspace ? "/var/lib/pi-session" : options.worktreePath,
     options.image,
     "pi",
     "--mode", "rpc",
@@ -84,7 +98,10 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     "--no-themes",
     "--tools", [...tools, ...directMcpTools].join(","),
   ];
+  if (options.readOnlyWorkspace) args.push("--no-context-files");
   if (options.continueSession) args.push("--continue");
+  if (options.graderContext) args.splice(args.indexOf("--mount"), 0, "--env", `PI_AGENT_GRADER_JSON=${JSON.stringify(options.graderContext)}`);
+  if (options.workflowContext) args.splice(args.indexOf("--mount"), 0, "--env", `PI_AGENT_WORKFLOW_JSON=${JSON.stringify(options.workflowContext)}`);
   if (options.classifierGatewayToken) {
     args.splice(args.indexOf("--mount"), 0,
       "--env", `OPENROUTER_API_KEY=${options.classifierGatewayToken}`,
@@ -105,6 +122,7 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
 }
 
 export class DockerPiProcess implements AgentProcess {
+  queueMs = 0;
   private activeRunId?: string;
   private readonly tracing?: AgentTracing;
   private capture?: PiRunCapture;
@@ -116,6 +134,12 @@ export class DockerPiProcess implements AgentProcess {
   private hasSession = false;
   private activeContainerName?: string;
   private stopping?: Promise<void>;
+  private readiness?: Promise<void>;
+  private startup?: StartupTiming;
+  private startupAbort?: AbortController;
+  private queueAbort?: AbortController;
+  private queuedStart?: Promise<void>;
+  private releasePermit?: () => void;
   private readonly options: Omit<AgentContainerOptions, "gatewayToken" | "classifierGatewayToken" | "mcp"> & { mcp?: Omit<McpRunConfig, "token"> };
   private readonly tokenForRun: (runId: string, route: RouteDecision) => string;
   private readonly onEvent: (event: PublicRunEvent) => void;
@@ -131,6 +155,8 @@ export class DockerPiProcess implements AgentProcess {
     telemetry?: AgentTelemetry,
     sessionId = options.name,
     tracing?: AgentTracing,
+    private readonly onRecord?: (record: Record<string, unknown>) => void,
+    private readonly onPrompt?: (runId: string) => void,
   ) {
     this.options = options;
     this.telemetry = telemetry; this.sessionId = sessionId; this.tracing = tracing;
@@ -141,24 +167,28 @@ export class DockerPiProcess implements AgentProcess {
     this.hasSession = options.continueSession ?? false;
   }
 
-  private start(runId: string, route: RouteDecision): void {
+  private start(runId: string, route: RouteDecision, selectedTask: TaskMode): void {
     if (this.child && this.child.exitCode === null) throw new Error("Pi container is already active");
     this.closing = false;
     this.activeRunId = runId;
-    this.tracing?.lifecycle(runId, "container_start", "start");
+    this.startup = new StartupTiming((name, phase, failed) => this.tracing?.lifecycle(runId, name, phase, failed));
+    this.startup.start();
+    this.startupAbort = new AbortController();
     const containerName = `${this.options.name}-${runId.slice(0, 8)}`;
     this.activeContainerName = containerName;
     const capture = this.telemetry ? new PiRunCapture(this.telemetry, runId, this.sessionId, this.options.sessionStatePath, containerName) : undefined;
     this.capture = capture;
-    const { mcp, ...baseOptions } = this.options;
+    const { mcp: configuredMcp, ...baseOptions } = this.options;
+    const mcp = selectedTask === "discuss" ? undefined : configuredMcp;
     if (mcp && !this.mcpTokenForRun) throw new Error("MCP token issuer is required when MCP is enabled");
     const child = spawn("docker", buildAgentDockerArgs({
       ...baseOptions,
+      taskMode: selectedTask,
       name: containerName,
       modelRef: route.modelRef,
       reasoningEffort: route.effort,
       gatewayToken: this.tokenForRun(runId, route),
-      ...(this.classifierTokenForRun ? { classifierGatewayToken: this.classifierTokenForRun(runId) } : {}),
+      ...(selectedTask !== "discuss" && this.classifierTokenForRun ? { classifierGatewayToken: this.classifierTokenForRun(runId) } : {}),
       ...(mcp ? { mcp: {
         ...mcp,
         servers: mcp.servers.map((item) => item.server === "codegraph" ? item : ({
@@ -172,10 +202,19 @@ export class DockerPiProcess implements AgentProcess {
     });
     this.child = child;
     const bridge = new PiRpcBridge({
+      onReady: () => this.startup?.rpcReady(),
       writeLine: (line) => child.stdin.write(line),
-      onCommand: record => capture?.onCommand(record),
-      onRecord: record => { capture?.onRecord(record); this.tracing?.rpc(runId, record); },
+      onCommand: record => {
+        capture?.onCommand(record);
+        if (record.type === "prompt") {
+          this.startup?.configured(); this.startup?.promptSent();
+          this.onPrompt?.(runId);
+          this.tracing?.log(runId, "agent.prompt_sent");
+        }
+      },
+      onRecord: record => { capture?.onRecord(record); this.tracing?.rpc(runId, record); this.onRecord?.(record); },
       onEvent: (event) => {
+        if (event.type === "answer" && event.text.trim()) this.startup?.firstOutput();
         if (event.type === "settled") {
           this.hasSession = true;
           void this.finalizeCapture(bridge, capture).then(() => this.bridge === bridge ? this.stopActiveContainer() : undefined).then(
@@ -192,7 +231,10 @@ export class DockerPiProcess implements AgentProcess {
       },
     });
     this.bridge = bridge;
-    child.once("spawn", () => this.tracing?.lifecycle(runId, "container_start", "end"));
+    child.once("spawn", () => this.startup?.cliSpawned());
+    this.readiness = this.waitForContainer(containerName, this.startupAbort.signal).then(() => this.startup?.containerRunning());
+    // The prompt path observes this rejection; attach immediately to avoid a startup race.
+    void this.readiness.catch(() => this.startup?.fail());
     child.stdout.on("data", (chunk: Buffer) => {
       try {
         bridge.feed(chunk);
@@ -217,45 +259,60 @@ export class DockerPiProcess implements AgentProcess {
     child.stderr.resume();
   }
 
-  prompt(runId: string, prompt: string, route?: RouteDecision): void {
+  prompt(runId: string, prompt: string, route?: RouteDecision, requestedTask?: TaskMode): void {
+    const selectedTask = taskMode(requestedTask ?? this.options.taskMode);
     const selected = route ?? { modelRef: this.options.modelRef, effort: resolveAgentModel(this.options.modelRef).reasoningEffort, source: "explicit" };
     const startPrompt = () => {
-      this.start(runId, selected);
+      this.start(runId, selected, selectedTask);
       const model = resolveAgentModel(selected.modelRef);
       const bridge = this.bridge!; const capture = this.capture;
-      void bridge.configureAndPrompt(runId, prompt, model.provider, model.id, selected.effort, async () => {
+      void this.readiness!.then(() => bridge.configureAndPrompt(runId, prompt, model.provider, model.id, selected.effort, async () => {
         await capture?.beforePrompt(bridge);
         if (this.bridge !== bridge || this.closing) throw new RpcProtocolError("Pi configuration was interrupted");
-      }).catch(() => {
+      })).catch(() => {
         if (this.bridge !== bridge || this.closing) return;
         this.onEvent({ type: "error", code: "pi_configuration_failed", message: "Pi model configuration could not be verified" });
         void this.stopActiveContainer();
       });
     };
-    if (this.child && this.child.exitCode === null) {
-      const previous = this.child;
-      previous.once("exit", () => {
-        startPrompt();
-      });
-      if (!this.closing) {
-        this.closing = true;
-        previous.kill("SIGTERM");
-      }
-      return;
-    }
-    startPrompt();
+    this.queueAbort?.abort(); const controller = new AbortController(); this.queueAbort = controller;
+    this.queuedStart = (async () => {
+      await this.stopActiveContainer(); controller.signal.throwIfAborted();
+      const queuedAt = Date.now();
+      this.tracing?.lifecycle(runId, "queue", "start");
+      const release = await agentScheduler.acquire(this.options.workflowKey ?? this.sessionId, controller.signal);
+      if (controller.signal.aborted) { release(); return; }
+      this.queueMs = Date.now() - queuedAt;
+      this.releasePermit = release; this.tracing?.lifecycle(runId, "queue", "end"); startPrompt();
+    })().catch(() => { if (!controller.signal.aborted) this.onEvent({ type: "error", code: "container_admission_failed", message: "Agent could not acquire/start an execution slot" }); });
   }
   decide(rpcUiId: string, approved: boolean): void { if(this.activeRunId) this.tracing?.approval(this.activeRunId,rpcUiId,approved); this.bridge?.respondToUi(rpcUiId, approved); }
   async abort(runId: string): Promise<void> {
     const capture = this.capture;
     capture?.cancel();
     this.bridge?.abort(`abort-${runId}`);
-    await this.stopActiveContainer();
+    await this.close();
     await capture?.recover();
   }
 
   async close(): Promise<void> {
+    this.queueAbort?.abort();
+    await this.queuedStart;
     await this.stopActiveContainer();
+  }
+
+  private async waitForContainer(name: string, signal: AbortSignal): Promise<void> {
+    const until = Date.now() + 15_000;
+    while (Date.now() < until) {
+      signal.throwIfAborted();
+      try {
+        const result = await exec("docker", ["inspect", "--format={{.State.Running}}", name], { timeout: 1000, signal, env: { PATH: process.env.PATH } });
+        if (result.stdout.trim() === "true") return;
+      } catch { signal.throwIfAborted(); }
+      if (this.child?.exitCode !== null) throw new Error("Container exited before readiness");
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    throw new Error("Container readiness timed out");
   }
 
   private async finalizeCapture(bridge: PiRpcBridge, capture?: PiRunCapture): Promise<void> {
@@ -268,13 +325,14 @@ export class DockerPiProcess implements AgentProcess {
 
   private stopActiveContainer(): Promise<void> {
     if (this.stopping) return this.stopping;
-    this.stopping = this.stopActiveContainerOnce().finally(() => {
+    this.stopping = this.stopActiveContainerOnce().then(() => { this.releasePermit?.(); this.releasePermit = undefined; }).finally(() => {
       this.stopping = undefined;
     });
     return this.stopping;
   }
 
   private async stopActiveContainerOnce(): Promise<void> {
+    this.startupAbort?.abort();
     const child = this.child;
     if (!child || child.exitCode !== null) return;
     this.closing = true;

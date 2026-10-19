@@ -10,7 +10,7 @@
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc -p tsconfig.json && tsc -p tsconfig.extensions.json",
     "lock-image": "node scripts/lock-image.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.extensions.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.extensions.json",
     "test": "npm run build && node --test 'dist/test/**/*.test.js'",
     "start": "node dist/src/server.js"
   },

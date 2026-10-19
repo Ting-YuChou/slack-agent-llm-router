@@ -1,0 +1,168 @@
+{
+  "external_publication": false,
+  "approvals": "simulated fixture owner",
+  "models": "live OpenAI",
+  "status": "completed",
+  "run_id": "b36a0e02-514c-4519-aa1d-b35e69d2f9e2",
+  "resume": {
+    "reused_completed_workers": [
+      "code-investigation"
+    ],
+    "same_run_id": true,
+    "known_cost_before_resume": 0.032205080000000004
+  },
+  "phase": "completed",
+  "verification": "passed",
+  "grader": "passed",
+  "nodes": [
+    {
+      "id": "planner-1",
+      "role": "planner",
+      "state": "succeeded",
+      "attempt": 2
+    },
+    {
+      "id": "code-investigation",
+      "role": "code_explorer",
+      "state": "succeeded",
+      "attempt": 1
+    },
+    {
+      "id": "test-investigation",
+      "role": "test_analyst",
+      "state": "succeeded",
+      "attempt": 2
+    },
+    {
+      "id": "planner-2",
+      "role": "planner",
+      "state": "succeeded",
+      "attempt": 1
+    }
+  ],
+  "cost_usd": 0.11998477,
+  "timing": {
+    "wall_ms": 119738,
+    "active_ms": 118240,
+    "human_wait_ms": 546,
+    "suspended_ms": 952
+  },
+  "commit": "e79f5feed9ac178a89d5174cd6936a662e7c0c28",
+  "approval_count": 2,
+  "exported_spans": 188,
+  "span_names": [
+    "agent.approval_wait",
+    "agent.commit",
+    "agent.container_start",
+    "agent.container_stop",
+    "agent.docker_cli_spawn",
+    "agent.grading",
+    "agent.pi_configuration",
+    "agent.pi_rpc_ready",
+    "agent.prompt_to_first_model_request",
+    "agent.prompt_to_first_output",
+    "agent.queue",
+    "agent.resume",
+    "agent.routing",
+    "agent.run",
+    "agent.tool",
+    "agent.turn",
+    "agent.verification",
+    "agent.worktree_create",
+    "gen_ai.request"
+  ],
+  "trace_ids": [
+    "33e5c9748776d38c5d9221abe5bd47de"
+  ],
+  "cost_note": "Reported runtime cost, not a fully reconciled provider invoice. Unknown reservations remain reserved.",
+  "scope": {
+    "live_model_api": true,
+    "real_docker": true,
+    "real_kafka_clickhouse": true,
+    "real_slack_owner_approval": false,
+    "real_ci_failure_and_draft_pr": false,
+    "grafana_live_ui": false,
+    "collector_backend": false,
+    "second_wave_new_tasks": "covered by unit test; live planner required no additional tasks"
+  },
+  "analytics_pipeline": {
+    "source_events": 5144,
+    "status": "passed",
+    "events_in_clickhouse": 5144,
+    "canonical_usage_rows": 27,
+    "usage_after_replay": 27,
+    "roles": [
+      [
+        "code_explorer"
+      ],
+      [
+        "grader"
+      ],
+      [
+        "implementation"
+      ],
+      [
+        "planner"
+      ],
+      [
+        "test_analyst"
+      ]
+    ],
+    "node_states": [
+      [
+        "code-investigation",
+        "succeeded",
+        1
+      ],
+      [
+        "planner-1",
+        "succeeded",
+        2
+      ],
+      [
+        "planner-2",
+        "succeeded",
+        1
+      ],
+      [
+        "test-investigation",
+        "succeeded",
+        2
+      ]
+    ],
+    "accounting": {
+      "workflow_run_id": "b36a0e02-514c-4519-aa1d-b35e69d2f9e2",
+      "executions": 8,
+      "total_tokens": 91773,
+      "known_execution_cost_usd": 0.117469,
+      "matched_executions": 6,
+      "incomplete_executions": 2,
+      "routing_cost_usd": 0.0,
+      "total_cost_usd": null
+    }
+  },
+  "local_verification": {
+    "node": {
+      "passed": 209,
+      "skipped": 4,
+      "failed": 0
+    },
+    "docker_verifier": {
+      "passed": 1,
+      "failed": 0
+    },
+    "python_selected_agent_slack_tests": {
+      "passed": 125,
+      "failed": 0
+    },
+    "checks": [
+      "TypeScript build",
+      "configured mypy",
+      "scoped black and flake8",
+      "shell syntax",
+      "git diff --check"
+    ],
+    "temporary_containers": "removed",
+    "docker_vm": "restored to stopped state"
+  }
+}

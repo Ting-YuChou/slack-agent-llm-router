@@ -21,12 +21,14 @@ function fixture() {
   const orchestrator = {
     createSession: async (body: any) => { calls.push(["create", body]); return { session_id: "S1", run_id: "R1", status: "starting" }; },
     lookupSession: () => ({ session_id: "S1", owner_user_id: "U1", active: false }),
-    prompt: async (id: string, prompt: string, user: string) => { calls.push(["prompt", id, prompt, user]); return { session_id: id, run_id: "R2", status: "starting" }; },
+    prompt: async (id: string, prompt: string, user: string, ...options: unknown[]) => { calls.push(["prompt", id, prompt, user, ...options]); return { session_id: id, run_id: "R2", status: "starting" }; },
     getRun: (id: string) => { if (id === "missing") throw new RuntimeNotFoundError(); return { ...run, run_id: id }; },
     listEvents: () => run.events,
     decide: (...args: any[]) => calls.push(["decide", ...args]),
     cancel: async (...args: any[]) => calls.push(["cancel", ...args]),
     closeSession: async (...args: any[]) => calls.push(["close", ...args]),
+    tasks: (id: string) => [{ id: 'inspect',workflow: id,state: 'succeeded' }],
+    resume: async (id: string, user: string) => { calls.push(['resume',id,user]); return { run_id: id,session_id: 'S1',status: 'starting' }; },
   };
   const server = createAgentHttpServer({
     orchestrator: orchestrator as any,
@@ -42,6 +44,20 @@ test("run-time Jev classifier mode is explicit and defaults off", () => {
   assert.equal(parseJevClassifierMode("off"), "off");
   assert.equal(parseJevClassifierMode("on"), "on");
   assert.throws(() => parseJevClassifierMode("shadow"), /off or on/i);
+});
+
+test('workflow task and resume routes use the existing auth contract and validate prompt modes', async () => {
+  const { server,calls } = fixture(); const base = await listen(server);
+  const headers = { authorization: 'Bearer runtime-secret','content-type': 'application/json' };
+  try {
+    assert.equal((await fetch(`${base}/v1/runs/R1/tasks`)).status,401);
+    const tasks = await fetch(`${base}/v1/runs/R1/tasks`,{ headers });
+    assert.deepEqual(await tasks.json(),[{ id: 'inspect',workflow: 'R1',state: 'succeeded' }]);
+    const resumed = await fetch(`${base}/v1/runs/R1/resume`,{ method: 'POST',headers,body: JSON.stringify({ user_id: 'owner' }) });
+    assert.equal(resumed.status,202); assert.deepEqual(calls.at(-1),['resume','R1','owner']);
+    const invalid = await fetch(`${base}/v1/sessions/S1/prompts`,{ method: 'POST',headers,body: JSON.stringify({ user_id: 'owner',prompt: 'fix',workflow_mode: 'execute-js' }) });
+    assert.equal(invalid.status,400);
+  } finally { await close(server); }
 });
 
 test("health is public while every session/run endpoint requires bearer auth", async () => {
@@ -133,4 +149,32 @@ test("failed terminal writes persist failure before releasing even if persistenc
   calls.length=0;
   await assert.rejects(module.settleCaptureWrite("r",false,telemetry,async()=>{throw new Error("disk full");}));
   assert.deepEqual(calls,["release:r"]);
+});
+
+
+test('prompt task mode is validated and forwarded separately from workflow mode', async () => {
+  const { server,calls } = fixture(); const base = await listen(server);
+  const headers = { authorization: 'Bearer runtime-secret','content-type': 'application/json' };
+  try {
+    for (const mode of ['discuss','implement']) {
+      const response = await fetch(`${base}/v1/sessions/S1/prompts`,{ method: 'POST',headers,body: JSON.stringify({ user_id: 'U',prompt: 'project',task_mode: mode }) });
+      assert.equal(response.status,202); assert.equal(calls.at(-1).at(-1),mode);
+    }
+    for (const mode of ['auto',null,{}]) {
+      const before = calls.length;
+      const response = await fetch(`${base}/v1/sessions/S1/prompts`,{ method: 'POST',headers,body: JSON.stringify({ user_id: 'U',prompt: 'project',task_mode: mode }) });
+      assert.equal(response.status,400); assert.equal(calls.length,before);
+    }
+  } finally { await close(server); }
+});
+
+test('CI repair rejects discussion task mode before creating a repair', async () => {
+  let created = false;
+  const server = createAgentHttpServer({ token: 'secret',orchestrator: {} as any,health: () => ({}),
+    ci: { checkContext: () => {},create: async () => { created = true; return {}; } } as any });
+  const base = await listen(server);
+  try {
+    const response = await fetch(`${base}/v1/ci-repairs`,{ method: 'POST',headers: { authorization: 'Bearer secret','content-type': 'application/json' },body: JSON.stringify({ target: '7',user_id: 'U',task_mode: 'discuss' }) });
+    assert.equal(response.status,400); assert.equal(created,false);
+  } finally { await close(server); }
 });

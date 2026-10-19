@@ -2,10 +2,11 @@ import { execFile } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
+import os from "node:os";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
-import { createHash } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { PiRunCapture } from "./pi-capture.js";
 import { AgentTelemetry, isCredentialKey } from "./telemetry.js";
 import { AgentTracing } from "./tracing.js";
@@ -24,6 +25,15 @@ import {
 import { verifyPluginLock } from "./plugin-lock.js";
 import { RuntimeStateStore } from "./runtime-state.js";
 import { verifySkillLock } from "./skill-lock.js";
+import { startEvidenceRetention } from "./evidence-retention.js";
+import { ControlStore } from "./ci-control.js";
+import { BudgetLedger } from "./budget-ledger.js";
+import { createCiRuntime } from "./ci-runtime.js";
+import { taskMode } from "./task-mode.js";
+import { workflowMode } from "./structured-workflow.js";
+import type { CiRepairs } from "./ci-repair.js";
+import { loadProfile } from "./verification.js";
+import { createQualityServices } from "./workflow-runtime.js";
 import { WorktreeManager } from "./worktree-manager.js";
 
 const exec = promisify(execFile);
@@ -32,7 +42,10 @@ const DEFAULT_AGENT_RUNTIME_HOST = "127.0.0.1";
 const MAX_REQUEST_BYTES = 64_000;
 
 interface ServerOptions {
+  budgetLedger?: BudgetLedger;
+  budgetSecret?: string;
   orchestrator: CodingAgentOrchestrator;
+  ci?: CiRepairs;
   token: string;
   health: () => Record<string, unknown>;
   acceptRuns?: () => boolean;
@@ -43,6 +56,21 @@ export function createAgentHttpServer(options: ServerOptions) {
   return createServer(async (request, response) => {
     try {
       const url = new URL(request.url ?? "/", "http://runtime.local");
+      if (url.pathname.startsWith('/internal/budget/')) {
+        if (!options.budgetSecret || !authorized(request,options.budgetSecret)) { sendError(response,401,'unauthorized','Gateway budget authentication required'); return; }
+        if (request.method !== 'POST' || !options.budgetLedger) { sendError(response,503,'budget_unavailable','Host budget store unavailable'); return; }
+        const body = asRecord(await readJson(request)); const ledger = options.budgetLedger;
+        if (url.pathname === '/internal/budget/reserve' && options.acceptRuns && !options.acceptRuns()) { sendError(response,503,'runtime_unhealthy','New budget reservations are unavailable'); return; }
+        const id = (value: unknown) => { const result = requiredString(value,'budget identity'); if (result.length > 240) throw new RuntimeError('Invalid budget identity','invalid_request',400); return result; };
+        try {
+          if (url.pathname === '/internal/budget/reserve') ledger.reserve(id(body.workflow),id(body.id),Number(body.amount),body.execution === undefined ? undefined : id(body.execution));
+          else if (url.pathname === '/internal/budget/settle') ledger.settle(id(body.id),body.amount === null ? null : Number(body.amount));
+          else if (url.pathname === '/internal/budget/first-model') { sendJson(response,200,{ result: ledger.firstModel(id(body.execution)) }); return; }
+          else { sendError(response,404,'not_found','Unknown budget operation'); return; }
+          sendJson(response,200,{});
+        } catch { sendError(response,429,'budget_unavailable_or_exhausted','Budget admission refused'); }
+        return;
+      }
       if (request.method === "GET" && url.pathname === "/health") {
         sendJson(response, 200, options.health());
         return;
@@ -51,11 +79,25 @@ export function createAgentHttpServer(options: ServerOptions) {
         sendError(response, 401, "unauthorized", "A valid Agent runtime token is required");
         return;
       }
-      if (options.acceptRuns && !options.acceptRuns() && request.method === "POST") {
-        sendError(response, 502, "runtime_unhealthy", "Agent runtime integrity checks failed");
+      if (options.acceptRuns && !options.acceptRuns() && request.method === "POST" && !/\/(?:cancel|close)$/.test(url.pathname)) {
+        sendError(response, 502, "runtime_unhealthy", "Agent runtime integrity or control state is unavailable");
         return;
       }
 
+      if (request.method === "GET" && url.pathname === "/v1/ci-repairs") {
+        sendJson(response, 200, options.ci ? await options.ci.notifications() : []); return;
+      }
+      if (request.method === "POST" && url.pathname === "/v1/ci-repairs") {
+        if (!options.ci) throw new RuntimeError("CI repair requires trusted profile, owner mapping and separate publisher credentials", "ci_setup_required", 503);
+        const body = asRecord(await readJson(request));
+        if (parseTaskMode(body.task_mode) !== "implement") throw new RuntimeError("CI repair requires implement task_mode", "invalid_request", 400);
+        options.ci.checkContext(body.team_id, body.channel_id, body.user_id);
+        sendJson(response, 202, await options.ci.create(requiredString(body.target, "target"), requiredString(body.user_id, "user_id"), undefined, undefined, parseWorkflowMode(body.workflow_mode))); return;
+      }
+      const retryMatch = /^\/v1\/ci-repairs\/([^/]+)\/publication$/.exec(url.pathname);
+      if (request.method === "POST" && retryMatch && options.ci) {
+        const body = asRecord(await readJson(request)); options.ci.checkContext(body.team_id, body.channel_id, body.user_id); sendJson(response, 202, options.ci.retryPublication(decodeURIComponent(retryMatch[1]), requiredString(body.user_id, "user_id"))); return;
+      }
       if (request.method === "GET" && url.pathname === "/v1/sessions/lookup") {
         const session = options.orchestrator.lookupSession({
           team_id: requiredString(url.searchParams.get("team_id"), "team_id"),
@@ -84,6 +126,8 @@ export function createAgentHttpServer(options: ServerOptions) {
           requiredString(body.user_id, "user_id"),
           typeof body.routing_text === "string" ? body.routing_text : undefined,
           body.task_id as string | undefined,
+          parseWorkflowMode(body.workflow_mode),
+          parseTaskMode(body.task_mode),
         );
         sendJson(response, 202, result);
         return;
@@ -95,14 +139,30 @@ export function createAgentHttpServer(options: ServerOptions) {
         sendJson(response, 202, { status: "closed" });
         return;
       }
+      const tasksMatch = /^\/v1\/runs\/([^/]+)\/tasks$/.exec(url.pathname);
+      if (request.method === 'GET' && tasksMatch) {
+        const id = decodeURIComponent(tasksMatch[1]);
+        const child = options.ci?.has(id) ? options.ci.executionId(id) : id;
+        sendJson(response,200,child ? options.orchestrator.tasks(child) : []); return;
+      }
+      const resumeMatch = /^\/v1\/runs\/([^/]+)\/resume$/.exec(url.pathname);
+      if (request.method === 'POST' && resumeMatch) {
+        const body = asRecord(await readJson(request)), id = decodeURIComponent(resumeMatch[1]);
+        const user = requiredString(body.user_id,'user_id');
+        sendJson(response,202,options.ci?.has(id) ? await options.ci.resume(id,user) : await options.orchestrator.resume(id,user)); return;
+      }
       const runMatch = /^\/v1\/runs\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && runMatch) {
-        sendJson(response, 200, options.orchestrator.getRun(decodeURIComponent(runMatch[1])));
+        const id = decodeURIComponent(runMatch[1]);
+        sendJson(response, 200, options.ci?.has(id) ? await options.ci.get(id) : options.orchestrator.getRun(id));
         return;
       }
       const eventsMatch = /^\/v1\/runs\/([^/]+)\/events$/.exec(url.pathname);
       if (request.method === "GET" && eventsMatch) {
         const runId = decodeURIComponent(eventsMatch[1]);
+        if (options.ci?.has(runId)) {
+          const job = await options.ci.get(runId); sendSse(response, job.events ?? [], 0); return;
+        }
         options.orchestrator.getRun(runId);
         const after = Math.max(0, Number(url.searchParams.get("after") ?? "0") || 0);
         sendSse(response, options.orchestrator.listEvents(runId, after), after);
@@ -113,6 +173,11 @@ export function createAgentHttpServer(options: ServerOptions) {
         const body = asRecord(await readJson(request));
         const decision = requiredString(body.decision, "decision");
         if (decision !== "approve" && decision !== "reject") throw new RuntimeError("decision must be approve or reject", "invalid_request", 400);
+        const id = decodeURIComponent(decisionMatch[1]);
+        if (options.ci?.has(id)) {
+          await options.ci.decide(id, requiredString(body.approval_id, "approval_id"), requiredString(body.user_id, "user_id"), decision, true);
+          sendJson(response, 202, { status: "accepted" }); return;
+        }
         await options.orchestrator.decide(
           decodeURIComponent(decisionMatch[1]),
           requiredString(body.approval_id, "approval_id"),
@@ -140,7 +205,9 @@ export function createAgentHttpServer(options: ServerOptions) {
       const cancelMatch = /^\/v1\/runs\/([^/]+)\/cancel$/.exec(url.pathname);
       if (request.method === "POST" && cancelMatch) {
         const body = asRecord(await readJson(request));
-        await options.orchestrator.cancel(decodeURIComponent(cancelMatch[1]), requiredString(body.user_id, "user_id"));
+        const id = decodeURIComponent(cancelMatch[1]);
+        if (options.ci?.has(id)) await options.ci.cancel(id, requiredString(body.user_id, "user_id"));
+        else await options.orchestrator.cancel(id, requiredString(body.user_id, "user_id"));
         sendJson(response, 202, { status: "cancelling" });
         return;
       }
@@ -172,6 +239,9 @@ export async function createProductionServer() {
   const token = process.env.AGENT_RUNTIME_TOKEN ?? "";
   const gatewaySecret = process.env.MODEL_GATEWAY_SIGNING_SECRET ?? "";
   if (!token || !gatewaySecret) throw new Error("AGENT_RUNTIME_TOKEN and MODEL_GATEWAY_SIGNING_SECRET are required");
+  const hostCoordinator = new ControlStore(path.join(os.tmpdir(), `slack-pi-${process.getuid?.() ?? 'user'}-coordinator.sqlite`));
+  const releaseHostCoordinator = hostCoordinator.acquireCoordinator();
+  try {
   const repoPath = path.resolve(process.env.PI_AGENT_REPO_PATH ?? process.cwd());
   const runtimeRoot = path.resolve(process.env.PI_AGENT_STATE_ROOT ?? path.join(repoPath, ".pi-agent-runtime"));
   const worktreeRoot = path.resolve(process.env.PI_AGENT_WORKTREE_ROOT ?? path.join(repoPath, ".pi-agent-worktrees"));
@@ -200,7 +270,16 @@ export async function createProductionServer() {
     throw new Error("OPENROUTER_API_KEY is required when run-time Jev classification is enabled");
   }
   const jevClassifierMaxCalls = positiveInteger(process.env.PI_AGENT_JEV_CLASSIFIER_MAX_CALLS, 8);
-  const router = new JevRouter({ mode: jevMode as JevMode, apiKey: process.env.OPENROUTER_API_KEY });
+  const router = new JevRouter({ mode: jevMode as JevMode, apiKey: process.env.OPENROUTER_API_KEY,
+    admit: (id, text) => {
+      if (!budgetLedger || !trustedProfile) return { settle: () => {} };
+      const price = JSON.parse(process.env.PI_AGENT_MODEL_PRICES_JSON ?? "{}")["openrouter/typesafe/jev-1.13"];
+      if (!price || !Number.isFinite(price.input) || price.input <= 0 || !Number.isFinite(price.output) || price.output < 0) throw new Error("Jev budget prices missing");
+      budgetLedger.open(id, trustedProfile.profile.maxCostUsd);
+      const reservation = randomUUID(); budgetLedger.reserve(id, reservation, ((Buffer.byteLength(text) + 4096) * price.input + 4096 * price.output) / 1_000_000);
+      return { settle: cost => budgetLedger.settle(reservation, cost) };
+    },
+  });
   if (configuredModels.length === 0) throw new Error("At least one Agent model provider must be configured");
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
@@ -262,15 +341,58 @@ export async function createProductionServer() {
   }) : undefined;
   const tracing = AgentTracing.fromEnvironment();
   const observed = new Map<string, string>();
-  const orchestrator = new CodingAgentOrchestrator({
+  const profilePath = process.env.PI_AGENT_VERIFICATION_PROFILE;
+  const trustedProfile = profilePath ? await loadProfile(profilePath, repoPath, worktreeRoot) : undefined;
+  if (trustedProfile) {
+    if (await inspectImageDigest(trustedProfile.profile.image) === "missing") throw new Error("Pinned verification image is missing; build Dockerfile.verification and configure its digest");
+    if (!await readImageFile(trustedProfile.profile.image, "/opt/pi/dist/src/verification-entry.js")) throw new Error("Verification image is missing the trusted runner");
+    if (trustedProfile.profile.structuredWorkflow?.enabled && !await readImageFile(image, "/opt/pi/extensions/workflow-agent.ts")) throw new Error("Agent image must be rebuilt with workflow-agent extension");
+    if (!await readImageFile(image, "/opt/pi/extensions/grader.ts")) throw new Error("Agent image must be rebuilt with the isolated grader extension");
+    const prices = JSON.parse(process.env.PI_AGENT_MODEL_PRICES_JSON ?? "{}");
+    const refs = [...configuredModels.map(model => model.ref), ...((jevMode !== "off" || jevClassifierMode === "on") ? ["openrouter/typesafe/jev-1.13"] : [])];
+    if (refs.some(ref => !prices[ref] || !Number.isFinite(prices[ref].input) || prices[ref].input <= 0 || !Number.isFinite(prices[ref].output) || prices[ref].output < 0)) throw new Error("PI_AGENT_MODEL_PRICES_JSON must provide conservative prices for all enabled coding/grader/Jev models");
+    const remote = (await exec("git", ["remote", "get-url", "origin"], { cwd: repoPath, encoding: "utf8" })).stdout.trim();
+    if (repositoryFromRemote(remote)?.toLowerCase() !== trustedProfile.profile.repository.toLowerCase()) throw new Error("Verification profile repository does not match the checkout origin");
+  }
+  if (trustedProfile?.profile.structuredWorkflow?.enabled && !configuredModels.some(model => model.ref === "openai/gpt-5.6-luna")) throw new Error("Structured workflow requires configured Luna worker provider");
+  if (trustedProfile && !configuredModels.some(model => model.ref === "openai/gpt-5.6-sol")) throw new Error("Quality workflow requires configured Sol grader provider");
+  const executionParents = new Map<string, string>();
+  function executionExpiry(id: string) {
+    const parent = executionParents.get(id);
+    const structured = parent && orchestrator.getRun(parent).workflow_mode === 'structured';
+    return Date.now() + (structured ? 31 : 16) * 60_000;
+  }
+  const priorActive = new Map<string, number>();
+  const verificationBases = new Map<string, string>();
+  const budgetLedger = trustedProfile ? new BudgetLedger(path.join(runtimeRoot, "budget", "budget.sqlite")) : undefined;
+  const workflowControl = trustedProfile ? new ControlStore(path.join(runtimeRoot, "control", "state.sqlite"), () => { void orchestrator.shutdown().catch(() => {}); }) : undefined;
+  const releaseCoordinator = workflowControl?.acquireCoordinator();
+  const quality = trustedProfile ? createQualityServices({
+    ...trustedProfile, control: workflowControl!, session: id => orchestrator.getRun(id).session_id, repoPath, worktreeRoot, verificationBases, priorActive, ledger: budgetLedger!, mapping: executionParents, root: runtimeRoot, image: actualImageDigest, network, gatewayUrl, telemetry, tracing,
+    githubMcp: mcpServerIds.includes('github') ? { gatewayUrl: gatewayUrls.github!, token: (id,owner) => {
+      const token = issueMcpToken({ version: 2, run: id, session: id, slackUser: owner, server: 'github', tools: [...MCP_SERVERS.github.directTools], mode: 'read_only', scope: { repository: mcpRepository! }, maxCalls: 4, expiry: Date.now() + 5 * 60_000 },deriveMcpServerSecret(mcpSigningSecret,'github'));
+      telemetry?.addSecret(token,id); return token;
+    } } : undefined,
+    phase: (id, phase, cost) => orchestrator.qualityPhase(id, phase, cost),
+    token: (id, route) => {
+      const model = resolveAgentModel(route?.modelRef ?? "openai/gpt-5.6-sol");
+      const token = issueGatewayToken({ runId: id, workflowRunId: executionParents.get(id), provider: model.provider, model: model.id, api: model.api, reasoningEffort: route?.effort ?? "high", expiresAt: executionExpiry(id), traceparent: tracing?.traceparent(id) }, gatewaySecret);
+      telemetry?.addSecret(token, id); return token;
+    },
+  }) : undefined;
+  let ciRuntime: Awaited<ReturnType<typeof createCiRuntime>> | undefined;
+  const orchestrator: CodingAgentOrchestrator = new CodingAgentOrchestrator({
+    quality,
+    captureTraceContext: id => tracing?.traceparent(id),
     captureState: id => ({complete: telemetry ? telemetry.completeness(id).length === 0 : null, reasons: telemetry?.completeness(id) ?? []}),
     observeLifecycle: (id, name, phase, failed, sessionId) => {
+      if (name === 'resume' && phase === 'start') { tracing?.startRun(id,sessionId ?? 'unknown',undefined,orchestrator.getRun(id).traceparent); telemetry?.setTraceparent(id,tracing?.traceparent(id)); }
       if (name === "routing" && phase === "start") { tracing?.startRun(id, sessionId ?? "unknown"); telemetry?.setTraceparent(id, tracing?.traceparent(id)); }
       tracing?.lifecycle(id, name, phase, failed);
       if (name === "preparation" && failed) tracing?.endRun(id, "failed");
     },
     observeRun: run => {
-      const summary = {...run, events: undefined, capture_complete: run.capture_complete ?? null};
+      const summary = {...run, workflow_prompt: undefined, workflow_requirement: undefined, events: undefined, capture_complete: run.capture_complete ?? null};
       const signature = JSON.stringify(summary);
       if (observed.get(run.run_id) === signature) return;
       if (!observed.has(run.run_id) && ["running", "awaiting_approval"].includes(run.status)) tracing?.startRun(run.run_id, run.session_id);
@@ -282,7 +404,7 @@ export async function createProductionServer() {
       }).catch(() => console.error(JSON.stringify({event:"agent_capture_state_persist_failed",run_id:run.run_id})));
       if (observed.size > 2000) observed.delete(observed.keys().next().value!);
       if (!["running", "awaiting_approval"].includes(run.status)) tracing?.log(run.run_id, "agent.run.finished", {status:run.status, capture_complete:summary.capture_complete ?? false});
-      if (!["running", "awaiting_approval"].includes(run.status)) tracing?.endRun(run.run_id, run.status);
+      if (!["running", "awaiting_approval"].includes(run.status) && !ciRuntime?.ci.has(run.run_id)) tracing?.endRun(run.run_id, run.status);
     },
     worktrees,
     stateStore,
@@ -298,7 +420,7 @@ export async function createProductionServer() {
       return new DockerPiProcess(
         {
           name: `pi-session-${session.id.slice(0, 8)}`,
-          image,
+          image: actualImageDigest,
           network,
           worktreePath: session.worktreePath,
           gitMetadataPath,
@@ -325,11 +447,12 @@ export async function createProductionServer() {
           const selectedModel = resolveAgentModel(route.modelRef);
           const token = issueGatewayToken({
             runId,
+            workflowRunId: executionParents.get(runId),
             provider: selectedModel.provider,
             model: selectedModel.id,
             api: selectedModel.api,
             reasoningEffort: route.effort,
-            expiresAt: Date.now() + 16 * 60_000,
+            expiresAt: executionExpiry(runId),
             traceparent: tracing?.traceparent(runId),
           }, gatewaySecret);
           telemetry?.addSecret(token, runId); return token;
@@ -340,34 +463,55 @@ export async function createProductionServer() {
           const token = issueMcpToken({
             version: 2, run: runId, session: session.id, slackUser: session.ownerUserId, server: id,
             tools: allServerTools(id), mode: "read_only", scope, maxCalls: MCP_SERVERS[id].maxCalls,
-            expiry: Date.now() + 16 * 60_000,
+            expiry: executionExpiry(runId),
           }, deriveMcpServerSecret(mcpSigningSecret, id));
           telemetry?.addSecret(token, runId); return [id, token];
         })) : undefined,
         jevClassifierMode === "on" ? (runId) => { const token = issueClassifierGatewayToken({
           kind: "classifier",
           runId,
+          workflowRunId: executionParents.get(runId),
           provider: "openrouter",
           model: "typesafe/jev-1.13",
           api: "typesafe-system-one",
           maxCalls: jevClassifierMaxCalls,
           traceparent: tracing?.traceparent(runId),
-          expiresAt: Date.now() + 16 * 60_000,
+          expiresAt: executionExpiry(runId),
         }, gatewaySecret); telemetry?.addSecret(token, runId); return token; } : undefined,
-        telemetry, session.id, tracing,
+        telemetry, session.id, tracing, undefined, id => budgetLedger?.prompt(id),
       );
     },
   });
+  if (workflowControl) {
+    for (const execution of workflowControl.all<{ id: string; parent: string; session: string; statePath: string; status: string; traceparent?: string }>("execution")) {
+      if (execution.status !== "running") continue;
+      if (telemetry) {
+        telemetry.setTraceparent(execution.id, execution.traceparent);
+        await new PiRunCapture(telemetry, execution.id, execution.session, execution.statePath, "stopped").recover();
+        telemetry.markIncomplete(execution.parent, "execution_interrupted_before_terminal_snapshot");
+        await telemetry.record(execution.id, execution.session, "run", { status: "interrupted", capture_complete: false });
+        telemetry.releaseRun(execution.id);
+      }
+      workflowControl.put("execution", execution.id, { ...execution, status: "interrupted" });
+    }
+  }
   if (telemetry) {
     const previous = await stateStore.load();
     await recoverPendingCaptures(previous.runs, async run => {
+      if (run.attempts?.length) return;
       const capture = new PiRunCapture(telemetry, run.run_id, run.session_id, path.join(runtimeRoot, "sessions", run.session_id), "stopped");
       await capture.recover();
     });
   }
+  workflowControl?.interruptWorkflowNodes();
   await orchestrator.restore();
-  const runtimeHealthy = () => integrityHealthy;
+  const stopRetention = trustedProfile ? startEvidenceRetention(runtimeRoot, () => workflowControl?.pruneWorkflowContent(Date.now() - 30 * 86400000)) : undefined;
+  if (process.env.PI_AGENT_CI_REPAIR_ENABLED === "true" && !trustedProfile) throw new Error("CI repair requires PI_AGENT_VERIFICATION_PROFILE");
+  ciRuntime = process.env.PI_AGENT_CI_REPAIR_ENABLED === "true" ? await createCiRuntime({ profile: trustedProfile!.profile, root: runtimeRoot, repoPath, worktreeRoot, orchestrator, telemetry, tracing, verificationBases, priorActive }) : undefined;
+  const runtimeHealthy = () => integrityHealthy && stateStore.healthy && (workflowControl?.healthy ?? true) && (ciRuntime?.ci.healthy ?? true);
   const server = createAgentHttpServer({
+    budgetLedger, budgetSecret: gatewaySecret,
+    ci: ciRuntime?.ci,
     feedback: telemetry ? (run, payload, id) => telemetry.record(run.run_id, run.session_id, "feedback", payload, id) : undefined,
     orchestrator,
     token,
@@ -375,8 +519,12 @@ export async function createProductionServer() {
     health: () => ({
       status: runtimeHealthy() ? "healthy" : "unhealthy",
       runtime: "pi-coding-agent",
+      control_store: stateStore.healthy ? "healthy" : "failed",
       version: "1.0.1",
       pi_version: "1.0.1",
+      structured_workflow: trustedProfile?.profile.structuredWorkflow ?? { enabled: false },
+      agent_container_limit: 4,
+      verification_profile: trustedProfile ? { id: trustedProfile.profile.id, checksum: trustedProfile.checksum } : null,
       telemetry: telemetry?.health() ?? {status: "disabled"},
       mcp_mode: mcpMode,
       mcp_gateway_reachable: mcpServerIds.every((id) => mcpServerReachable[id] !== false),
@@ -411,14 +559,16 @@ export async function createProductionServer() {
       errors: runtimeHealthy() ? [] : [
         ...lock.errors,
         ...skillLock.errors,
+        ...(!stateStore.healthy ? ["Runtime control store is unavailable"] : []),
         ...(mcpServerIds.some((id) => mcpServerReachable[id] === false) ? ["An optional MCP gateway is unreachable"] : []),
       ],
     }),
   });
   server.on("close", () => {
-    void orchestrator.shutdown().finally(async () => { await telemetry?.close().catch(() => {}); await tracing?.close().catch(() => {}); });
+    void orchestrator.shutdown().finally(async () => { await ciRuntime?.close(); await stopRetention?.(); releaseCoordinator?.(); releaseHostCoordinator(); hostCoordinator.close(); workflowControl?.close(); budgetLedger?.close(); await telemetry?.close().catch(() => {}); await tracing?.close().catch(() => {}); });
   });
   return server;
+  } catch (error) { releaseHostCoordinator(); hostCoordinator.close(); throw error; }
 }
 
 export type JevClassifierMode = "off" | "on";
@@ -471,7 +621,7 @@ async function cleanupOrphanAgentContainers(): Promise<void> {
       await exec("docker", ["stop", "--time", "5", containerId], { encoding: "utf8" });
     }
   } catch {
-    // Health/integrity checks will reject runs if Docker is unavailable.
+    throw new Error("Cannot confirm all orphan writers/verifiers/graders stopped; refusing rollback/startup");
   }
 }
 
@@ -534,4 +684,12 @@ if (entrypoint === import.meta.url) {
   const server = await createProductionServer();
   server.listen(port, host, () => logEvent("agent_runtime_started", { host, port }));
   for (const signal of ["SIGTERM", "SIGINT"] as const) process.once(signal, () => server.close());
+}
+
+function parseTaskMode(value: unknown) {
+  try { return taskMode(value); } catch { throw new RuntimeError("Invalid task_mode; expected discuss or implement", "invalid_request", 400); }
+}
+
+function parseWorkflowMode(value: unknown) {
+  try { return workflowMode(value); } catch { throw new RuntimeError('Invalid workflow_mode','invalid_request',400); }
 }

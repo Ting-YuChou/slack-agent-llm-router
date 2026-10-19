@@ -2,6 +2,17 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 async function tracingModule(): Promise<any> { const name = "../src/tracing.js"; const m = await import(name).catch(() => null); assert.ok(m, "OTEL tracing module exists"); return m; }
+test('resumed workflows retain the persisted trace identity across runtime instances', async () => {
+  const { AgentTracing } = await tracingModule();
+  const first = new AgentTracing([new SimpleSpanProcessor(new InMemorySpanExporter())]);
+  const next = new AgentTracing([new SimpleSpanProcessor(new InMemorySpanExporter())]);
+  try {
+    first.startRun('r','s'); const parent = first.traceparent('r'); first.endRun('r','interrupted');
+    next.startRun('r','s',undefined,parent);
+    assert.equal(next.traceparent('r').split('-')[1],parent.split('-')[1]);
+    next.endRun('r','completed');
+  } finally { await first.close(); await next.close(); }
+});
 test("tools pair by call id, gateway parent is signed run context, unfinished tools are marked", async () => {
   const { AgentTracing } = await tracingModule();
   const exporter = new InMemorySpanExporter();

@@ -1,6 +1,8 @@
 import { sign } from "node:crypto";
 
 interface GitHubAppTokenProviderOptions {
+  repository?: string;
+  permissions?: Record<string, "read" | "write">;
   appId: string;
   installationId: string;
   privateKey: string;
@@ -44,9 +46,11 @@ export class GitHubAppTokenProvider {
     const baseUrl = (this.options.apiBaseUrl ?? "https://api.github.com").replace(/\/$/, "");
     const response = await this.fetchImpl(`${baseUrl}/app/installations/${encodeURIComponent(this.options.installationId)}/access_tokens`, {
       method: "POST",
+      ...(this.options.repository ? { body: JSON.stringify({ repositories: [this.options.repository], permissions: this.options.permissions ?? {} }) } : {}),
       signal: AbortSignal.timeout(this.options.requestTimeoutMs ?? 5_000),
       headers: {
         accept: "application/vnd.github+json",
+        "content-type": "application/json",
         authorization: `Bearer ${unsigned}.${signature}`,
         "x-github-api-version": "2022-11-28",
       },
