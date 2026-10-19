@@ -9,6 +9,7 @@ import { redact } from "./telemetry.js";
 import { parseRunnerRecords, MAX_LOG_BYTES, type RunnerSpec } from "./verification-runner.js";
 import { excerpt, MAX_REPORT_BYTES, parseDiagnostics, parseJUnit, type CheckFailure } from "./check-report.js";
 import { dockerUnavailable, HarnessError } from "./error-taxonomy.js";
+import type { FixerSpec } from "./fixers.js";
 import type { Candidate, CheckStatus, VerificationCheck, VerificationResult } from "./quality-gate.js";
 const exec = promisify(execFile);
 /** One trusted check. `{report}` in argv becomes the check's report path under /out. */
@@ -24,6 +25,8 @@ export interface VerificationProfile {
   isolation?: "per_mode" | "per_check";
   /** The writer's own run_checks calls: which checks run by default and how many calls a run gets. */
   writerChecks?: { defaultChecks: string[]; maxCalls: number };
+  /** Deterministic formatters run on the candidate before verification; they may only touch files the diff changed. */
+  fixers?: FixerSpec[];
 }
 export const REPORT_TOKEN = "{report}";
 /** File-safe check name used for /out/<check>.report and /out/<check>.log. */
@@ -43,6 +46,7 @@ export function validateProfile(raw: unknown): VerificationProfile {
     if (!w || typeof w !== "object" || (w.maxCalls !== undefined && (!Number.isInteger(w.maxCalls) || w.maxCalls < 1 || w.maxCalls > 10)) || (w.defaultChecks !== undefined && (!Array.isArray(w.defaultChecks) || !w.defaultChecks.length || w.defaultChecks.some(name => !p.checks.some(c => c.name === name))))) throw new Error("Invalid writer checks");
   }
   if (p.isolation !== undefined && !["per_mode", "per_check"].includes(p.isolation)) throw new Error("Invalid verification isolation");
+  if (p.fixers !== undefined && (!Array.isArray(p.fixers) || p.fixers.length > 5 || p.fixers.some(f => !f || typeof f.name !== "string" || !/^[\w.-]{1,64}$/.test(f.name) || !Array.isArray(f.argv) || !f.argv.length || f.argv.some(x => typeof x !== "string" || x.includes("\0") || x.includes(REPORT_TOKEN)) || typeof f.cwd !== "string" || !safeRelative(f.cwd) || !Number.isInteger(f.timeoutMs) || f.timeoutMs <= 0 || f.timeoutMs > 300_000) || new Set(p.fixers.map(f => f.name)).size !== p.fixers.length)) throw new Error("Invalid fixers");
   if (p.checks.some(c => c.kind !== undefined && !["static", "test"].includes(c.kind))) throw new Error("Invalid check kind");
   if (p.checks.some(c => (c.report !== undefined && (!c.report || c.report.format !== "junit")) || (c.report === undefined && c.argv.some(x => x.includes(REPORT_TOKEN))))) throw new Error("Invalid check report");
   if (p.baselinePaths !== undefined && (!Array.isArray(p.baselinePaths) || p.baselinePaths.some(x => typeof x !== "string" || !safeRelative(x)))) throw new Error("Invalid baseline paths");

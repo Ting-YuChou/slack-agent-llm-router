@@ -110,3 +110,31 @@ test("discovery runs planner and investigator through an injected execution proc
   assert.deepEqual(roles, ["planner", "code_explorer", "planner"]);
   assert.match(brief, /a is exported here/);
 });
+
+test("profile fixers run before the snapshot and their files reach the candidate", async () => {
+  const { root, repo, baseline } = fixture();
+  const fixed = { ...profile, fixers: [{ name: "fmt", argv: ["fmt"], cwd: ".", timeoutMs: 1000 }] };
+  const { readFile, writeFile } = await import("node:fs/promises");
+  const snapshots: string[] = [];
+  const { services: quality } = services(root, repo, {
+    profile: fixed,
+    createFixerRunner: () => async (_fixer, workspace) => {
+      await writeFile(path.join(workspace, "src", "a.js"), "export const a = 2; // formatted\n");
+      return { exit: 0, timedOut: false };
+    },
+    createVerifier: () => ({ verify: async candidate => { snapshots.push(await readFile(path.join(candidate.path, "src", "a.js"), "utf8")); return { status: "passed", checks: [] }; }, stop: async () => {} }),
+    createGraderProcess: (_options, onEvent, onRecord) => ({
+      prompt: (_id, prompt) => {
+        const hash = /"candidate_hash":"([^"]+)"/.exec(prompt)?.[1];
+        play([...submit("submit_grade", { status: "passed", candidate_hash: hash, criteria: [{ id: "correct", passed: true, evidence: "src/a.js:1 exports 2" }], findings: [] }), settled], onEvent, onRecord);
+      },
+      close: async () => {},
+    }),
+  });
+  quality.prepare?.("run-fix", "single");
+  const result = await quality.evaluate({ run_id: "run-fix", worktree: repo, baseline, requirement: "make a 2", attempt: 1, signal: new AbortController().signal });
+  assert.equal(result.action, "pass");
+  assert.deepEqual(result.candidate.fixes, [{ name: "fmt", files: ["src/a.js"] }]);
+  assert.deepEqual(snapshots, ["export const a = 2; // formatted\n"], "the verifier sees the fixed file");
+  assert.equal(await readFile(path.join(repo, "src", "a.js"), "utf8"), "export const a = 2; // formatted\n");
+});

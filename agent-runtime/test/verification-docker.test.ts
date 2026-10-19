@@ -84,3 +84,16 @@ test('real Docker per-mode runner gives every check a fresh workspace, HOME, Red
     } finally { await verifier.stop(); }
   } finally { await rm(root,{ recursive: true,force: true }); }
 });
+
+test('real Docker fixer runs black in the verification image on the scratch workspace only', { skip: !process.env.PI_AGENT_VERIFICATION_TEST_IMAGE }, async () => {
+  const { dockerFixerRunner } = await import('../src/fixers.js');
+  const workspace = await mkdtemp(path.join(os.tmpdir(),'docker-fixer-'));
+  try {
+    await mkdir(path.join(workspace,'src')); await writeFile(path.join(workspace,'src/a.py'),'x=1\n');
+    const run = dockerFixerRunner(process.env.PI_AGENT_VERIFICATION_TEST_IMAGE!);
+    const result = await run({ name: 'black',argv: ['python','-m','black','--quiet','src'],cwd: '.',timeoutMs: 60_000 },workspace,new AbortController().signal);
+    assert.deepEqual(result,{ exit: 0,timedOut: false });
+    const { readFile } = await import('node:fs/promises');
+    assert.equal(await readFile(path.join(workspace,'src/a.py'),'utf8'),'x = 1\n');
+  } finally { await rm(workspace,{ recursive: true,force: true }); }
+});

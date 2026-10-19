@@ -6,6 +6,8 @@ export interface HarnessMetrics {
   turn_util: number | null; tool_util: number | null;
   attempts: number; first_attempt_pass: boolean | null; repair_success: boolean | null;
   writer_checks_calls: number; approvals: number; policy_blocks: number;
+  /** Files the profile's fixers rewrote, summed over attempts. */
+  fixed_files: number;
   cost_usd: number | null; wall_s: number; active_s: number | null; human_wait_s: number | null;
   time_to_first_edit_s: number | null;
 }
@@ -30,6 +32,7 @@ export function computeHarnessMetrics(run: RunRecord, now = Date.now()): Harness
     writer_checks_calls: run.writer_checks_calls ?? 0,
     approvals: run.approvals?.requested ?? 0,
     policy_blocks: run.policy_summary?.block ?? 0,
+    fixed_files: attempts.reduce((sum, attempt) => sum + (attempt.fixes ?? []).reduce((files, fix) => files + fix.files.length, 0), 0),
     cost_usd: run.estimated_cost_usd ?? null,
     wall_s: seconds(run.timing?.wall_ms ?? Math.max(0, (Date.parse(run.updated_at) || now) - created)),
     active_s: run.timing ? seconds(run.timing.active_ms) : null,

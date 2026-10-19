@@ -154,5 +154,21 @@
     "maxCostUsd": 5,
     "activeTimeoutMs": 1800000,
     "discoveryCostUsd": 1.5
-  }
+  },
+  "fixers": [
+    {
+      "name": "black",
+      "argv": [
+        "python",
+        "-m",
+        "black",
+        "--quiet",
+        "src",
+        "tests",
+        "slack"
+      ],
+      "cwd": ".",
+      "timeoutMs": 60000
+    }
+  ]
 }

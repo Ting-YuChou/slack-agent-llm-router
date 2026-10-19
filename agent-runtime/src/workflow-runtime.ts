@@ -18,6 +18,8 @@ import { WorkflowCoordinator } from './structured-workflow.js';
 import { AgentExecutionRunner, type InvestigationProcessFactory } from './agent-execution-runner.js';
 import { promptTelemetry } from "./prompts.js";
 import { WriterChecks } from "./writer-checks.js";
+import { applyFixers, dockerFixerRunner, type RunFixer } from "./fixers.js";
+import type { Candidate } from "./quality-gate.js";
 import type { RouteDecision } from './jev-router.js';
 const exec = promisify(execFile);
 /** What the gate and run_checks need from a verifier; DockerVerifier in production. */
@@ -35,6 +37,7 @@ export function createQualityServices(options: {
   createVerifier?: (profile: VerificationProfile) => QualityVerifier;
   createGraderProcess?: GraderProcessFactory;
   createExecutionProcess?: InvestigationProcessFactory;
+  createFixerRunner?: (image: string) => RunFixer;
 }): QualityServices {
   const { profile, telemetry, tracing } = options;
   const grader = options.grader ?? { route: { modelRef: DEFAULT_GRADER_MODEL, effort: "high" as const, source: "grader" }, timeoutMs: 120_000 };
@@ -43,6 +46,7 @@ export function createQualityServices(options: {
   const graderModelId = grader.route.modelRef.split("/").slice(1).join("/");
   const store = new CandidateStore(path.join(options.root, "artifacts"));
   const createVerifier = options.createVerifier ?? ((selected: VerificationProfile) => new DockerVerifier(selected));
+  const fixerRunner = (options.createFixerRunner ?? dockerFixerRunner)(profile.image);
   const graders = new Map<string, GraderRunner>();
   const verifiers = new Map<string, QualityVerifier>();
   const artifacts = new Map<string, string>();
@@ -98,9 +102,13 @@ export function createQualityServices(options: {
     profile,
     snapshot: async input => {
       await assertScope(input.worktree, input.baseline);
+      // Fixers edit the worktree itself, so the snapshot, assertUnchanged and the delivery digest all see the fixed diff.
+      const fixed = profile.fixers?.length ? await applyFixers({ fixers: profile.fixers, worktree: input.worktree, baseline: input.baseline,
+        scratch: path.join(options.root, "fixers"), run: fixerRunner, signal: input.signal }) : undefined;
+      const withFixes = (candidate: Candidate): Candidate => fixed ? { ...candidate, fixes: fixed.fixes, ...(fixed.cause ? { fixer_cause: fixed.cause } : {}) } : candidate;
       const source = await store.create(input.worktree, input.baseline, input.run_id);
       const tested = options.verificationBases.get(input.run_id);
-      if (!tested || tested === input.baseline) { artifacts.set(`${input.run_id}:${input.attempt}`, path.dirname(source.path)); return source; }
+      if (!tested || tested === input.baseline) { artifacts.set(`${input.run_id}:${input.attempt}`, path.dirname(source.path)); return withFixes(source); }
       const worktrees = new WorktreeManager({ repoPath: options.repoPath, worktreeRoot: options.worktreeRoot, baseRef: tested });
       const tree = await worktrees.create(`verify-${input.run_id}-${input.attempt}`, tested);
       const patchFile = path.join(path.dirname(source.path), "merge-input.patch");
@@ -109,7 +117,7 @@ export function createQualityServices(options: {
         if (source.patch) await exec("git", ["apply", "--binary", "--", patchFile], { cwd: tree.path });
         const merged = await store.create(tree.path, tested, input.run_id);
         artifacts.set(`${input.run_id}:${input.attempt}`, path.dirname(merged.path));
-        return { ...merged, patch: source.patch, sourceHash: source.hash, testedBaseline: tested };
+        return withFixes({ ...merged, patch: source.patch, sourceHash: source.hash, testedBaseline: tested });
       } finally { await unlink(patchFile).catch(() => {}); await worktrees.remove(tree.path); }
     },
     verify: async (candidate, input) => {
