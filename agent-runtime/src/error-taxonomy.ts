@@ -21,6 +21,27 @@ export class HarnessError extends Error {
   }
 }
 
+/** True when Docker itself is missing (ENOENT) or its daemon cannot be reached. */
+export function dockerUnavailable(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const { code, stderr, message } = error as { code?: unknown; stderr?: unknown; message?: unknown };
+  return code === "ENOENT" || /Cannot connect to the Docker daemon/i.test(`${stderr ?? ""}\n${message ?? ""}`);
+}
+
+/** Causes recognised on errors that predate HarnessError, keyed by their message. */
+const MESSAGE_CAUSES: Record<string, CauseCode> = {
+  "Candidate snapshot too large": "snapshot_too_large",
+  candidate_changed_after_verification: "candidate_changed",
+  candidate_artifact_missing: "candidate_artifact_missing",
+  verification_stop_unconfirmed: "verification_stop_unconfirmed",
+};
+
+function causeOf(error: unknown): CauseCode | undefined {
+  if (error instanceof HarnessError) return error.causeCode;
+  if (dockerUnavailable(error)) return "docker_unavailable";
+  return error instanceof Error ? MESSAGE_CAUSES[error.message] : undefined;
+}
+
 export interface RunFailure { code: string; message: string; cause_code?: CauseCode }
 
 /** Maps an exception escaping the quality gate to the run's public error. */
@@ -30,6 +51,7 @@ export function classifyGateError(error: unknown): RunFailure {
   if (error instanceof DiffLimitError) return { code: "diff_limit_exceeded", message: `${detail}; split the change or reduce its size` };
   if (detail === "workflow_budget_exhausted") return { code: "workflow_budget_exhausted", message: "Workflow cost or time budget was exhausted before verification finished" };
   const failure: RunFailure = { code: "quality_gate_unavailable", message: `Required verification could not complete (${detail})` };
-  if (error instanceof HarnessError) failure.cause_code = error.causeCode;
+  const cause = causeOf(error);
+  if (cause) failure.cause_code = cause;
   return failure;
 }
