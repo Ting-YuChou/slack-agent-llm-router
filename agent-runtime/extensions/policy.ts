@@ -8,6 +8,7 @@ import type { WriterContext } from "../dist/src/container-runtime.js";
 import { classifyBash, isApprovedSkillRead, isTestConfigPath, parsePorcelainZ, validateWorkspacePath } from "../dist/src/policy.js";
 import { codemodeMcpPrompt, type McpServerId } from "../dist/src/mcp-config.js";
 import { renderPrompt } from "../dist/src/prompts.js";
+import { POLICY_ENTRY, policyDecisionEntry, type PolicyVerdict } from "../dist/src/policy-decision.js";
 
 const MAX_TURNS = Number(process.env.PI_AGENT_MAX_TURNS ?? "20");
 const MAX_TOOL_CALLS = Number(process.env.PI_AGENT_MAX_TOOL_CALLS ?? "40");
@@ -138,6 +139,9 @@ export default function policyExtension(pi: ExtensionAPI) {
   const budgetSent: Record<"turns" | "toolCalls" | "usd", BudgetStage> = { turns: "none", toolCalls: "none", usd: "none" };
   /** The turn whose one budget_status dialog was already asked; the host would cancel a second. */
   let usdAskedTurn = -1;
+  // The host counts these to tune the classifier; commands go out only as a basename and a hash.
+  const decide = (tool: string, decision: PolicyVerdict, reason: string, extra: { approved?: boolean; command?: string; startedAt?: number } = {}) =>
+    pi.appendEntry(POLICY_ENTRY, policyDecisionEntry({ tool, decision, reason, approved: extra.approved, command: extra.command, latencyMs: extra.startedAt === undefined ? undefined : Date.now() - extra.startedAt }));
 
   if (process.env.PI_AGENT_JEV_CLASSIFIER_MODE === "on") {
     pi.on("before_agent_start", (event) => {
@@ -190,26 +194,30 @@ export default function policyExtension(pi: ExtensionAPI) {
       if (event.toolName === "read" && isApprovedSkillRead(requestedPath, approvedSkillPaths())) return undefined;
       const operation = event.toolName === "write" || event.toolName === "edit" ? "write" : "read";
       const checked = await validateWorkspacePath(ctx.cwd, requestedPath, operation);
-      if (!checked.allowed) return { block: true, reason: `Path blocked by policy: ${checked.reason}` };
+      if (!checked.allowed) { decide(event.toolName, "block", checked.reason ?? "path_blocked"); return { block: true, reason: `Path blocked by policy: ${checked.reason}` }; }
     }
 
     if (event.toolName === "write" || event.toolName === "edit") {
       const target = path.posix.normalize(String((event.input as Record<string, unknown>).path ?? ""));
       if (scope && filesOutsideScope([target], scope.allowedPaths).length) {
+        decide(event.toolName, "block", "outside_allowed_paths");
         return { block: true, reason: `outside_allowed_paths: ${target}; this task may only modify ${scope.allowedPaths.join(", ")}` };
       }
       if (event.toolName === "write" && typeof event.input.content === "string" && Buffer.byteLength(event.input.content) > 256 * 1024) {
+        decide(event.toolName, "block", "write_too_large");
         return { block: true, reason: "Single write exceeds 256 KiB" };
       }
       if (!writeApproved && WRITE_APPROVAL === "per_prompt") {
+        const startedAt = Date.now();
         const approved = await ctx.ui.confirm(
           `Allow workspace ${event.toolName}?`,
           previewWrite(event.toolName, event.input),
           { timeout: APPROVAL_TIMEOUT_MS },
         );
+        decide(event.toolName, "approval", "write_approval", { approved, startedAt });
         if (!approved) return { block: true, reason: "Workspace modification rejected or expired" };
         writeApproved = true;
-      }
+      } else decide(event.toolName, "allow", WRITE_APPROVAL === "none" ? "write_approval_off" : "write_approved_for_prompt");
       writtenPaths.add(target);
       return undefined;
     }
@@ -221,15 +229,17 @@ export default function policyExtension(pi: ExtensionAPI) {
         300_000,
       );
       const decision = classifyBash(command, safeCommands());
-      if (decision.decision === "block") return { block: true, reason: `Command permanently blocked: ${decision.reason}` };
-      if (decision.decision === "allow") return undefined;
+      if (decision.decision === "block") { decide("bash", "block", decision.reason, { command }); return { block: true, reason: `Command permanently blocked: ${decision.reason}` }; }
+      if (decision.decision === "allow") { decide("bash", "allow", decision.reason, { command }); return undefined; }
       const taint = decision.decision === "allow_after_write_approval" ? await testConfigTaint(ctx.cwd, writtenPaths) : undefined;
-      if (decision.decision === "allow_after_write_approval" && (writeApproved || WRITE_APPROVAL === "none") && !taint) return undefined;
+      if (decision.decision === "allow_after_write_approval" && (writeApproved || WRITE_APPROVAL === "none") && !taint) { decide("bash", "allow", decision.reason, { command }); return undefined; }
+      const startedAt = Date.now();
       const approved = await ctx.ui.confirm(
         "Allow shell command?",
         `${taint ? `Needs approval because ${taint}.\n\n` : ""}${command.slice(0, 4_000)}`,
         { timeout: APPROVAL_TIMEOUT_MS },
       );
+      decide("bash", "approval", taint ? "test_config_changed" : decision.reason, { approved, command, startedAt });
       if (!approved) return { block: true, reason: "Shell command rejected or expired" };
     }
     return undefined;

@@ -76,6 +76,8 @@ for (const scenario of scenarios) {
     if (!expect.committed) assert.equal(dirty, "", "failed runs must leave the worktree rolled back");
     if (!expect.committed) assert.equal(patches.length, 1, "undelivered runs keep their patch");
     if (expect.verificationStatus) assert.equal(run.verification_status, expect.verificationStatus);
+    assert.ok(run.harness_metrics, "terminal runs carry harness metrics");
+    assert.equal(run.harness_metrics.attempts, run.attempts?.length ?? 0);
     for (const text of expect.repairPromptIncludes ?? []) assert.match(prompts[1] ?? "", new RegExp(text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   });
 }
@@ -149,6 +151,22 @@ for (const scenario of graderScenarios) {
   });
 }
 
+test("S21 policy decisions are counted on the run, not stored as events", async () => {
+  const decision = (data: Record<string, unknown>) => ({ type: "entry_appended", entry: { type: "custom", customType: "pi_agent_policy", data } });
+  const { run } = await runScenario({ name: "S21 policy summary",
+    attempts: [{ files: fix, records: [
+      decision({ tool: "bash", decision: "block", reason: "network_command", argv0: "curl" }),
+      decision({ tool: "bash", decision: "block", reason: "secret_env_read", argv0: "env" }),
+      decision({ tool: "write", decision: "approval", reason: "write_approval", approved: true }),
+      decision({ tool: "bash", decision: "forged", reason: "x" }),
+      ...piTurn("stop", "Fixed"), settledRecord,
+    ] }],
+    expect: { status: "completed", committed: true } });
+  assert.equal(run.status, "completed");
+  assert.deepEqual(run.policy_summary, { allow: 0, block: 2, approval: 1, approved: 1, by_reason: { network_command: 1, secret_env_read: 1, write_approval: 1 } });
+  assert.ok(!run.events.some(event => event.type === "policy_decision"), "decisions must not grow run.events");
+});
+
 test("S10 repair prompt carries parsed failures in an untrusted block, never host paths", async () => {
   const failed = { status: "failed" as const, checks: [
     { name: "candidate:flake8", status: "failed" as const, exit_code: 1, artifact: "/var/lib/pi-agent/artifacts/run/candidate-flake8.log",
@@ -212,6 +230,10 @@ for (const scenario of deliveryScenarios) {
     assert.match(String(delivery.delivery_digest), /^sha256:[0-9a-f]{64}$/);
     assert.match(String(delivery.excerpt), /\+export const a = 2;/);
     assert.match(String(delivery.stat), /src\/a\.js/);
+    const { wait_ms: waited, ...counts } = run.approvals ?? {};
+    assert.ok(typeof waited === "number" && waited >= 0);
+    const outcome = { approve: "approved", reject: "rejected", expire: "expired" }[scenario.delivery];
+    assert.deepEqual(counts, { requested: 1, approved: 0, rejected: 0, expired: 0, [outcome]: 1 });
     if (scenario.delivery === "approve") {
       assert.equal(commits, 1);
       assert.equal(patches.length, 0);

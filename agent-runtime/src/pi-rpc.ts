@@ -1,5 +1,6 @@
 import { StringDecoder } from "node:string_decoder";
 
+import { parsePolicyDecision, POLICY_ENTRY, type PolicyDecision } from "./policy-decision.js";
 import { redact } from "./telemetry.js";
 
 export type PublicRunEvent =
@@ -12,7 +13,8 @@ export type PublicRunEvent =
   | { type: "answer_delta"; text: string }
   | { type: "answer"; text: string }
   | { type: "settled"; outcome: RunOutcome; limit?: LimitKind; stop_reason?: string; error_message?: string }
-  | { type: "error"; code: string; message: string };
+  | { type: "error"; code: string; message: string }
+  | ({ type: "policy_decision" } & PolicyDecision);
 
 /** How a Pi prompt ended; only `completed` may be delivered. */
 export type RunOutcome = "completed" | "truncated" | "limit_reached" | "aborted" | "error";
@@ -170,6 +172,10 @@ export class PiRpcBridge {
       if (record.type === "entry_appended" && isRecord(record.entry) && record.entry.type === "custom" && record.entry.customType === "pi_agent_limit") {
         const kind = isRecord(record.entry.data) ? record.entry.data.kind : undefined;
         if (kind === "turns" || kind === "tool_calls") this.limit = kind;
+      }
+      if (record.type === "entry_appended" && isRecord(record.entry) && record.entry.type === "custom" && record.entry.customType === POLICY_ENTRY) {
+        const decision = parsePolicyDecision(record.entry.data);
+        if (decision) this.onEvent({ type: "policy_decision", ...decision });
       }
       if (record.type === "agent_settled") {
         this.onEvent(this.settledEvent());

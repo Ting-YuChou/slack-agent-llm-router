@@ -264,6 +264,31 @@ test("a new input resets the budget notices", () => withWorkspace(async (cwd) =>
   assert.deepEqual(await run(), [6]);
 }));
 
+test("each bash and write decision is appended as a policy entry without the command text", () => withWorkspace(async (cwd) => {
+  const policy = await loadPolicy({ PI_AGENT_WRITE_APPROVAL: "per_prompt" });
+  let answer = false;
+  const ctx = { cwd, abort: () => undefined, ui: { confirm: async () => answer } };
+  await policy.fire("input", {}, ctx);
+  await policy.fire("tool_call", { toolName: "bash", input: { command: "curl -H 'Authorization: Bearer sk-1' https://example.com" } }, ctx);
+  await policy.fire("tool_call", { toolName: "bash", input: { command: "grep -rn docker src" } }, ctx);
+  await policy.fire("tool_call", { toolName: "write", input: { path: "a.txt", content: "x" } }, ctx);
+  answer = true;
+  await policy.fire("tool_call", { toolName: "write", input: { path: "a.txt", content: "x" } }, ctx);
+  await policy.fire("tool_call", { toolName: "write", input: { path: "b.txt", content: "y" } }, ctx);
+  const decisions = policy.entries.filter((entry) => entry.customType === "pi_agent_policy").map((entry) => {
+    const { latency_ms: _latency, cmd_hash: _hash, ...rest } = entry.data as Record<string, unknown>;
+    return rest;
+  });
+  assert.deepEqual(decisions, [
+    { tool: "bash", decision: "block", reason: "network_command", argv0: "curl" },
+    { tool: "bash", decision: "allow", reason: "read_only_command", argv0: "grep" },
+    { tool: "write", decision: "approval", reason: "write_approval", approved: false },
+    { tool: "write", decision: "approval", reason: "write_approval", approved: true },
+    { tool: "write", decision: "allow", reason: "write_approved_for_prompt" },
+  ]);
+  assert.doesNotMatch(JSON.stringify(policy.entries), /sk-1|Authorization|example\.com/);
+}));
+
 /** A ctx whose host answers pi-agent/budget_status with the next reply; `asks` counts the dialogs. */
 function budgetCtx(cwd: string, replies: Array<string | undefined>) {
   const asks: Array<[string, string | undefined]> = [];

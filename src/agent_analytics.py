@@ -138,6 +138,16 @@ TABLES = {
         "reason_category": "String",
         "comment": "String",
     },
+    # One row per policy decision in the writer's container; commands only as basename and hash.
+    "agent_policy_decisions": {
+        "tool": "String",
+        "decision": "String",
+        "reason": "String",
+        "approved": "Nullable(UInt8)",
+        "argv0": "String",
+        "cmd_hash": "String",
+        "latency_ms": "Nullable(UInt64)",
+    },
 }
 
 
@@ -208,6 +218,26 @@ FROM agent_runs_latest r LEFT JOIN
   FROM agent_session_stats_latest GROUP BY run_id) s ON r.run_id=s.run_id LEFT JOIN
   (SELECT run_id, count() AS ledger_rows, count(total_tokens) AS reported_tokens, count(cost_total) AS reported_costs, sum(total_tokens) AS ledger_tokens, sum(cost_total) AS ledger_cost
    FROM agent_usage_latest GROUP BY run_id) u ON r.run_id=u.run_id"""
+    )
+    # Runs carry harness_metrics once terminal (agent-runtime/src/harness-metrics.ts).
+    statements.append(
+        """CREATE VIEW IF NOT EXISTS agent_harness_metrics AS
+SELECT run_id, status, model, collected_at,
+  JSONExtractString(payload_json,'harness_metrics','outcome') AS outcome,
+  JSONExtract(payload_json,'harness_metrics','turn_util','Nullable(Float64)') AS turn_util,
+  JSONExtract(payload_json,'harness_metrics','tool_util','Nullable(Float64)') AS tool_util,
+  JSONExtractUInt(payload_json,'harness_metrics','attempts') AS attempts,
+  JSONExtract(payload_json,'harness_metrics','first_attempt_pass','Nullable(Bool)') AS first_attempt_pass,
+  JSONExtract(payload_json,'harness_metrics','repair_success','Nullable(Bool)') AS repair_success,
+  JSONExtractUInt(payload_json,'harness_metrics','writer_checks_calls') AS writer_checks_calls,
+  JSONExtractUInt(payload_json,'harness_metrics','approvals') AS approvals,
+  JSONExtractUInt(payload_json,'harness_metrics','policy_blocks') AS policy_blocks,
+  JSONExtract(payload_json,'harness_metrics','cost_usd','Nullable(Float64)') AS cost_usd,
+  JSONExtractFloat(payload_json,'harness_metrics','wall_s') AS wall_s,
+  JSONExtract(payload_json,'harness_metrics','active_s','Nullable(Float64)') AS active_s,
+  JSONExtract(payload_json,'harness_metrics','human_wait_s','Nullable(Float64)') AS human_wait_s,
+  JSONExtract(payload_json,'harness_metrics','time_to_first_edit_s','Nullable(Float64)') AS time_to_first_edit_s
+FROM agent_runs_latest WHERE JSONHas(payload_json,'harness_metrics')"""
     )
     statements.append(
         """CREATE VIEW IF NOT EXISTS agent_workflow_execution_durations AS
@@ -482,6 +512,18 @@ def project(envelope, resolved_payload=None):
                         ).hexdigest(),
                     }
                 ),
+            }
+        ]
+    elif kind == "policy_decision":
+        approved = payload.get("approved")
+        rows["agent_policy_decisions"] = [
+            {
+                **base,
+                **{key: payload[key] for key in ["tool", "decision", "reason"]},
+                "approved": None if approved is None else int(bool(approved)),
+                "argv0": payload.get("argv0", ""),
+                "cmd_hash": payload.get("cmd_hash", ""),
+                "latency_ms": payload.get("latency_ms"),
             }
         ]
     elif kind == "feedback":

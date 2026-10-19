@@ -327,6 +327,30 @@ CREATE TABLE IF NOT EXISTS agent_feedback (
 
 CREATE VIEW IF NOT EXISTS agent_feedback_latest AS SELECT * FROM agent_feedback FINAL;
 
+CREATE TABLE IF NOT EXISTS agent_policy_decisions (
+  sequence UInt64,
+  schema_version UInt16,
+  pi_version String,
+  trace_id Nullable(String),
+  source_time Nullable(DateTime64(6, 'UTC')),
+  event_id String,
+  run_id String,
+  session_id String,
+  kind String,
+  collected_at DateTime64(6, 'UTC'),
+  version UInt64,
+  payload_json String CODEC(ZSTD(3)),
+  tool String,
+  decision String,
+  reason String,
+  approved Nullable(UInt8),
+  argv0 String,
+  cmd_hash String,
+  latency_ms Nullable(UInt64)
+) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 30 DAY;
+
+CREATE VIEW IF NOT EXISTS agent_policy_decisions_latest AS SELECT * FROM agent_policy_decisions FINAL;
+
 CREATE VIEW IF NOT EXISTS agent_feedback_current AS SELECT run_id, user_id, argMax(verdict, version) AS verdict FROM agent_feedback_latest GROUP BY run_id, user_id;
 
 CREATE VIEW IF NOT EXISTS agent_grade_feedback_agreement AS
@@ -356,6 +380,24 @@ FROM agent_runs_latest r LEFT JOIN
   FROM agent_session_stats_latest GROUP BY run_id) s ON r.run_id=s.run_id LEFT JOIN
   (SELECT run_id, count() AS ledger_rows, count(total_tokens) AS reported_tokens, count(cost_total) AS reported_costs, sum(total_tokens) AS ledger_tokens, sum(cost_total) AS ledger_cost
    FROM agent_usage_latest GROUP BY run_id) u ON r.run_id=u.run_id;
+
+CREATE VIEW IF NOT EXISTS agent_harness_metrics AS
+SELECT run_id, status, model, collected_at,
+  JSONExtractString(payload_json,'harness_metrics','outcome') AS outcome,
+  JSONExtract(payload_json,'harness_metrics','turn_util','Nullable(Float64)') AS turn_util,
+  JSONExtract(payload_json,'harness_metrics','tool_util','Nullable(Float64)') AS tool_util,
+  JSONExtractUInt(payload_json,'harness_metrics','attempts') AS attempts,
+  JSONExtract(payload_json,'harness_metrics','first_attempt_pass','Nullable(Bool)') AS first_attempt_pass,
+  JSONExtract(payload_json,'harness_metrics','repair_success','Nullable(Bool)') AS repair_success,
+  JSONExtractUInt(payload_json,'harness_metrics','writer_checks_calls') AS writer_checks_calls,
+  JSONExtractUInt(payload_json,'harness_metrics','approvals') AS approvals,
+  JSONExtractUInt(payload_json,'harness_metrics','policy_blocks') AS policy_blocks,
+  JSONExtract(payload_json,'harness_metrics','cost_usd','Nullable(Float64)') AS cost_usd,
+  JSONExtractFloat(payload_json,'harness_metrics','wall_s') AS wall_s,
+  JSONExtract(payload_json,'harness_metrics','active_s','Nullable(Float64)') AS active_s,
+  JSONExtract(payload_json,'harness_metrics','human_wait_s','Nullable(Float64)') AS human_wait_s,
+  JSONExtract(payload_json,'harness_metrics','time_to_first_edit_s','Nullable(Float64)') AS time_to_first_edit_s
+FROM agent_runs_latest WHERE JSONHas(payload_json,'harness_metrics');
 
 CREATE VIEW IF NOT EXISTS agent_workflow_execution_durations AS
 SELECT workflow_run_id, execution_id, any(role) AS role,
