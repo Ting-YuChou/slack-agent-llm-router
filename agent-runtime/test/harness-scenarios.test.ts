@@ -76,6 +76,8 @@ for (const scenario of scenarios) {
     if (!expect.committed) assert.equal(dirty, "", "failed runs must leave the worktree rolled back");
     if (!expect.committed) assert.equal(patches.length, 1, "undelivered runs keep their patch");
     if (expect.verificationStatus) assert.equal(run.verification_status, expect.verificationStatus);
+    assert.ok(run.harness_metrics, "terminal runs carry harness metrics");
+    assert.equal(run.harness_metrics.attempts, run.attempts?.length ?? 0);
     for (const text of expect.repairPromptIncludes ?? []) assert.match(prompts[1] ?? "", new RegExp(text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   });
 }

@@ -1,3 +1,4 @@
+import json
 import unittest
 import importlib
 from pathlib import Path
@@ -269,6 +270,39 @@ class AgentAnalyticsTests(unittest.TestCase):
         self.assertNotIn(
             "private source content", rows["agent_test_results"][0]["payload_json"]
         )
+
+    def test_harness_metrics_view_reads_run_payloads_and_feeds_dashboard(self):
+        module = self.module()
+        view = next(
+            s
+            for s in module.schema_sql()
+            if s.startswith("CREATE VIEW IF NOT EXISTS agent_harness_metrics AS")
+        )
+        self.assertIn("FROM agent_runs_latest", view)
+        for column in (
+            "outcome",
+            "turn_util",
+            "tool_util",
+            "first_attempt_pass",
+            "repair_success",
+            "writer_checks_calls",
+            "policy_blocks",
+            "time_to_first_edit_s",
+        ):
+            self.assertIn(f"AS {column}", view)
+        dashboard = json.loads(
+            Path("docker/observability/grafana/dashboards/agent.json").read_text()
+        )
+        queries = [
+            target["rawSql"]
+            for panel in dashboard["panels"]
+            for target in panel.get("targets", [])
+        ]
+        self.assertGreaterEqual(
+            sum("agent_harness_metrics" in query for query in queries), 3
+        )
+        ids = [panel["id"] for panel in dashboard["panels"]]
+        self.assertEqual(len(ids), len(set(ids)))
 
     def test_policy_decisions_project_without_command_text(self):
         module = self.module()

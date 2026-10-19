@@ -12,6 +12,7 @@ import { WorkflowBudget } from "./workflow-budget.js";
 import type { Candidate, GateInput, GateResult } from "./quality-gate.js";
 import { classifyGateError, type RunFailure } from "./error-taxonomy.js";
 import { promptTelemetry } from "./prompts.js";
+import { computeHarnessMetrics, type HarnessMetrics } from "./harness-metrics.js";
 import { summarizePolicy, type PolicyDecision, type PolicySummary } from "./policy-decision.js";
 import { redact } from "./telemetry.js";
 import { DEFAULT_DIFF_LIMITS, DiffLimitError } from "./worktree-manager.js";
@@ -157,6 +158,10 @@ export interface RunRecord {
   policy_summary?: PolicySummary;
   /** Owner approvals this run asked for (tool writes, shell commands, delivery) and how they ended. */
   approvals?: ApprovalCounts;
+  /** When the writer first started a write or edit tool call, for time-to-first-edit. */
+  first_edit_at?: string;
+  /** Computed once the run is terminal; see harness-metrics.ts. */
+  harness_metrics?: HarnessMetrics;
   events: Array<Record<string, unknown>>;
   changed_files?: string[];
   diff_stat?: string;
@@ -791,6 +796,7 @@ export class CodingAgentOrchestrator {
     }
     if (event.type === "tool") {
       if (event.phase === "start") run.tool_count += 1;
+      if (event.phase === "start" && (event.tool === "write" || event.tool === "edit")) run.first_edit_at ??= new Date().toISOString();
       const mcpMatch = /^mcp__([^_]+)__(.+)$/.exec(event.tool);
       const mcpServer = mcpMatch?.[1];
       const mcpTool = mcpMatch?.[2];
@@ -1211,6 +1217,8 @@ export class CodingAgentOrchestrator {
     }
     run.updated_at = new Date().toISOString();
     run.events.push({ type: "status", status });
+    // Recomputed in notifyRun once the final timing is known.
+    if (isTerminal(status)) run.harness_metrics = computeHarnessMetrics(run);
   }
 
   private requireSession(sessionId: string): SessionRecord {
@@ -1261,6 +1269,7 @@ export class CodingAgentOrchestrator {
         run.capture_complete = capture?.complete ?? null;
         run.capture_reasons = capture?.reasons ?? [];
       }
+      if (isTerminal(run.status)) run.harness_metrics = computeHarnessMetrics(run);
       this.observeRun?.(structuredClone(run)); } catch { /* monitoring cannot fail agent runs */ }
   }
 
