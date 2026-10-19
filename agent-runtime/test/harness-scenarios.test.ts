@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { HarnessError } from "../src/error-taxonomy.js";
 import { piTurn, runScenario, settledRecord, type Scenario } from "./support/scenario.js";
 
 const fix = { "src/a.js": "export const a = 2;\n" };
@@ -70,11 +71,11 @@ test("harness: full verification results reach the repair prompt", async () => {
 });
 
 test("harness: grader steps are consumed per grader call and may throw", async () => {
-  const { run, gradeCalls } = await runScenario({ name: "H0 grader error", profile, grade: [new Error("grader_timeout")],
+  const { run, gradeCalls } = await runScenario({ name: "H0 grader error", profile, grade: [new Error("grader broke"), new Error("grader broke again")],
     attempts: [{ files: fix, records: [...piTurn("stop"), settledRecord] }],
     expect: { status: "failed", committed: false } });
   assert.equal(run.status, "failed");
-  assert.equal(gradeCalls, 1);
+  assert.equal(gradeCalls, 2);
 });
 
 test("harness: quality overrides replace scripted services", async () => {
@@ -86,3 +87,25 @@ test("harness: quality overrides replace scripted services", async () => {
   assert.equal(run.status, "failed");
   assert.ok(archived >= 1, "failed runs archive through the overridden service");
 });
+
+const unknownSubmission = (_call: number, hash: string) => ({ status: "unknown", candidate_hash: hash, criteria: [{ id: "meets_request", passed: false }], findings: [] });
+const graderScenarios: Array<{ name: string; grade: NonNullable<Scenario["grade"]>; status: string; gradeCalls: number; cause?: string }> = [
+  { name: "S11 a grader timeout is retried and the change commits", grade: [new HarnessError("grader_timeout", "slow"), "passed"], status: "completed", gradeCalls: 2 },
+  { name: "S12 two grader timeouts fail with grader_timeout", grade: [new HarnessError("grader_timeout", "slow"), new HarnessError("grader_timeout", "slow")], status: "failed", gradeCalls: 2, cause: "grader_timeout" },
+  { name: "S13 a grader that submits unknown fails once as insufficient_evidence", grade: [unknownSubmission], status: "failed", gradeCalls: 1, cause: "insufficient_evidence" },
+];
+for (const scenario of graderScenarios) {
+  test(scenario.name, async () => {
+    const { run, commits, gradeCalls } = await runScenario({ name: scenario.name, profile, grade: scenario.grade,
+      attempts: [{ files: fix, records: [...piTurn("stop"), settledRecord] }],
+      expect: { status: scenario.status as "completed" | "failed", committed: scenario.status === "completed" } });
+    assert.equal(run.status, scenario.status, JSON.stringify(run.error));
+    assert.equal(gradeCalls, scenario.gradeCalls);
+    assert.equal(commits, scenario.status === "completed" ? 1 : 0);
+    if (scenario.cause) {
+      assert.equal(run.error?.code, "verification_failed");
+      assert.equal(run.error?.cause_code, scenario.cause);
+      assert.equal(run.grader_cause?.code, scenario.cause);
+    }
+  });
+}

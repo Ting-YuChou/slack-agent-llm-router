@@ -186,3 +186,44 @@ test("quality gate propagates aborts and budget exhaustion instead of grading un
   await assert.rejects(make(async () => { throw new Error("workflow_budget_exhausted"); }).evaluate(input), /workflow_budget_exhausted/);
   await assert.rejects(make(async () => { controller.abort(); throw new Error("grader_aborted"); }).evaluate(input));
 });
+
+function retryGate(grade: (call: number) => Promise<unknown>) {
+  return import("../src/quality-gate.js").then(({ QualityGate }) => {
+    let calls = 0;
+    const gate = new QualityGate({ profile: { id: "p", rubric: ["correct"], maxRepairs: 2 },
+      snapshot: async () => ({ hash: "hash", path: "/snapshot" }),
+      verify: async () => ({ status: "passed", checks: [] }),
+      grade: async () => grade(++calls),
+    });
+    return { gate, calls: () => calls };
+  });
+}
+const gateInput = () => ({ run_id: "r", worktree: "/w", baseline: "a".repeat(40), requirement: "fix", attempt: 1, signal: new AbortController().signal });
+const passedGrade = { status: "passed", candidate_hash: "hash", criteria: [{ id: "correct", passed: true, evidence: "ok" }], findings: [] };
+
+test("quality gate retries a grader infrastructure error once", async () => {
+  const { HarnessError } = await import("../src/error-taxonomy.js");
+  const { gate, calls } = await retryGate(async call => { if (call === 1) throw new HarnessError("grader_timeout", "slow"); return passedGrade; });
+  const result = await gate.evaluate(gateInput());
+  assert.equal(result.action, "pass");
+  assert.equal(calls(), 2);
+  assert.equal(result.grade?.grader_attempts, 2);
+});
+
+test("quality gate fails with the grader cause after a second infrastructure error", async () => {
+  const { HarnessError } = await import("../src/error-taxonomy.js");
+  const { gate, calls } = await retryGate(async () => { throw new HarnessError("grader_timeout", "slow"); });
+  const result = await gate.evaluate(gateInput());
+  assert.equal(result.action, "fail");
+  assert.equal(calls(), 2);
+  assert.deepEqual(result.failure, { code: "verification_failed", cause_code: "grader_timeout" });
+});
+
+test("a grader that submits unknown is not retried and fails as insufficient_evidence", async () => {
+  const { gate, calls } = await retryGate(async () => ({ status: "unknown", candidate_hash: "hash", criteria: [{ id: "correct", passed: false }], findings: [] }));
+  const result = await gate.evaluate(gateInput());
+  assert.equal(result.action, "fail");
+  assert.equal(calls(), 1);
+  assert.equal(result.grade?.cause?.code, "insufficient_evidence");
+  assert.deepEqual(result.failure, { code: "verification_failed", cause_code: "insufficient_evidence" });
+});
