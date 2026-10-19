@@ -875,6 +875,18 @@ class KafkaProducerManager:
         else:
             return json.dumps(message).encode("utf-8")
 
+    @staticmethod
+    async def _wait_for_cancelled_dispatcher(dispatcher: asyncio.Task) -> None:
+        """Wait until a cancelled dispatcher has accounted for its in-flight batch.
+
+        The dispatcher's cancellation path is already bounded: it gives unfinished
+        deliveries ``shutdown_cancel_timeout_seconds`` and then records each one as
+        delivered, ``shutdown_timeout`` or ``shutdown_abandoned`` before re-raising.
+        A second timer of the same length here would race that one (it starts a
+        loop turn earlier), letting shutdown return before the batch is counted.
+        """
+        await asyncio.wait({dispatcher})
+
     async def shutdown(self):
         """Shutdown producer"""
         self._accepting = False
@@ -888,20 +900,12 @@ class KafkaProducerManager:
                     )
                 except asyncio.TimeoutError:
                     dispatcher.cancel()
-                    done, _ = await asyncio.wait(
-                        {dispatcher}, timeout=self.shutdown_cancel_timeout_seconds
-                    )
-                    if dispatcher not in done:
-                        dispatcher.add_done_callback(self._consume_task_result)
+                    await self._wait_for_cancelled_dispatcher(dispatcher)
                     self._drop_queued_messages("shutdown_timeout")
                 else:
                     if not dispatcher.done():
                         dispatcher.cancel()
-                    done, _ = await asyncio.wait(
-                        {dispatcher}, timeout=self.shutdown_cancel_timeout_seconds
-                    )
-                    if dispatcher not in done:
-                        dispatcher.add_done_callback(self._consume_task_result)
+                    await self._wait_for_cancelled_dispatcher(dispatcher)
                 finally:
                     self._dispatcher_task = None
         finally:

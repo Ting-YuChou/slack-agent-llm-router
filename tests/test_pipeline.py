@@ -387,10 +387,12 @@ class TestKafkaProducerManager:
         request = QueryRequest(query="hung", user_id="u1", user_tier=UserTier.FREE)
         assert await manager.produce_request_raw(request) is True
         await asyncio.wait_for(delivery_started.wait(), 0.05)
+        dispatcher = manager._dispatcher_task
 
         await asyncio.wait_for(manager.shutdown(), 0.1)
 
         try:
+            assert dispatcher.done()
             manager.producer.stop.assert_awaited_once()
             assert delivered._value.get() == delivered_before
             assert abandoned._value.get() == abandoned_before + 1
