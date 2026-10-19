@@ -33,6 +33,36 @@ async def test_feedback_client_uses_authenticated_endpoint(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_feedback_client_sends_optional_reason_and_comment(monkeypatch):
+    monkeypatch.setenv("AGENT_RUNTIME_TOKEN", "runtime-secret")
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(202, json={"status": "accepted"})
+
+    runtime = AgentRuntimeClient({}, transport=httpx.MockTransport(handler))
+    try:
+        await runtime.feedback(
+            "run1",
+            "user1",
+            "needs_changes",
+            "click1",
+            reason_category="incomplete",
+            comment="also update the docs",
+        )
+    finally:
+        await runtime.close()
+    assert json.loads(requests[0].content) == {
+        "user_id": "user1",
+        "verdict": "needs_changes",
+        "feedback_id": "click1",
+        "reason_category": "incomplete",
+        "comment": "also update the docs",
+    }
+
+
+@pytest.mark.asyncio
 async def test_slack_feedback_does_not_depend_on_active_run_cache_or_call_approval():
     runtime = SimpleNamespace(feedback=AsyncMock(), decide=AsyncMock())
     bot = SimpleNamespace(

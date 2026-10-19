@@ -317,12 +317,23 @@ class AgentRuntimeClient:
         )
 
     async def feedback(
-        self, run_id: str, user_id: str, verdict: str, feedback_id: str
+        self,
+        run_id: str,
+        user_id: str,
+        verdict: str,
+        feedback_id: str,
+        reason_category: Optional[str] = None,
+        comment: Optional[str] = None,
     ) -> None:
+        body = {"user_id": user_id, "verdict": verdict, "feedback_id": feedback_id}
+        if reason_category is not None:
+            body["reason_category"] = reason_category
+        if comment is not None:
+            body["comment"] = comment
         await self._request(
             "POST",
             f"/v1/runs/{run_id}/feedback",
-            json={"user_id": user_id, "verdict": verdict, "feedback_id": feedback_id},
+            json=body,
             expected_status=202,
         )
 

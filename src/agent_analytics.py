@@ -132,6 +132,8 @@ TABLES = {
         "user_id": "String",
         "verdict": "String",
         "feedback_id": "String",
+        "reason_category": "String",
+        "comment": "String",
     },
 }
 
@@ -466,7 +468,13 @@ def project(envelope, resolved_payload=None):
         ]
     elif kind == "feedback":
         rows["agent_feedback"] = [
-            {**base, **{key: payload[key] for key in TABLES["agent_feedback"]}}
+            {
+                **base,
+                **{key: payload[key] for key in ["user_id", "verdict", "feedback_id"]},
+                # Older runtimes sent only the verdict.
+                "reason_category": payload.get("reason_category", ""),
+                "comment": payload.get("comment", ""),
+            }
         ]
     return rows
 
