@@ -4,6 +4,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ControlStore } from '../src/ci-control.js';
+import * as structuredWorkflowModule from "../src/structured-workflow.js";
+import * as agentSchedulerModule from "../src/agent-scheduler.js";
 
 const task = (id: string, dependencies: string[] = []) => ({ id, role: 'code_explorer', purpose: 'Find counter implementation', paths: ['src/'], dependencies, expected_output: 'Located code and evidence' });
 test('trusted profile enables separate structured limits without changing single mode', async () => {
@@ -16,7 +18,7 @@ test('trusted profile enables separate structured limits without changing single
 });
 
 test('structured plans reject cycles, privilege escalation, escaping paths and too many tasks', async () => {
-  const m = await import('../src/structured-workflow.js' as string).catch(() => null);
+  const m = structuredWorkflowModule;
   assert.ok(m, 'structured workflow implementation exists');
   assert.equal(m.validatePlan({ tasks: [task('a')] }, []).tasks.length, 1);
   assert.throws(() => m.validatePlan({ tasks: [] }, [], true));
@@ -53,7 +55,7 @@ test('planner tool schema advertises the actual allowed roles instead of making 
 });
 
 test('coordinator persists two waves, enforces dependencies and reuses completed results on resume', async () => {
-  const m = await import('../src/structured-workflow.js' as string).catch(() => null);
+  const m = structuredWorkflowModule;
   assert.ok(m, 'structured workflow implementation exists');
   const root = mkdtempSync(path.join(os.tmpdir(), 'structured-')); const store = new ControlStore(path.join(root, 'db'));
   const input = { run_id: 'r', owner: 'owner', requirement: 'fix counter', baseline: 'a'.repeat(40), snapshot: { hash: 'h', path: root }, fingerprint: 'profile-tools-models' };
@@ -80,7 +82,7 @@ test('coordinator persists two waves, enforces dependencies and reuses completed
 });
 
 test('resource scheduler limits active containers and removes cancelled queued work', async () => {
-  const m = await import('../src/agent-scheduler.js' as string).catch(() => null);
+  const m = agentSchedulerModule;
   assert.ok(m, 'scheduler implementation exists');
   const scheduler = new m.AgentScheduler(1);
   const release = await scheduler.acquire('a', new AbortController().signal);

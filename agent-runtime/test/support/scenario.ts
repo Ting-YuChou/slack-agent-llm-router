@@ -75,7 +75,8 @@ class ScriptedProcess {
     const script = this.scenario.attempts[this.attempt++];
     if (!script) throw new Error(`scenario ${this.scenario.name} has no attempt ${this.attempt}`);
     this.bridge.prompt(runId, prompt);
-    setImmediate(() => void this.play(script));
+    // A broken script must fail the scenario, not escape as an unhandled rejection.
+    setImmediate(() => { this.play(script).catch((error: unknown) => this.bridge.feed(`${JSON.stringify({ type: "extension_error", error: String(error) })}\n`)); });
   }
   decide(): void { /* scenarios do not request approvals */ }
   respondUi(id: string, response: unknown): void {

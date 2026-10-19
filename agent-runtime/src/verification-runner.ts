@@ -140,8 +140,8 @@ export function execute(check: RunnerCheck, options: { cwd: string; env: Record<
       if (settled) return; settled = true; clearTimeout(timer); killGroup();
       // Leftover processes may hold the pipes open; the reaper kills them, so do not wait long.
       const close = setTimeout(() => { child.stdout.destroy(); child.stderr.destroy(); }, 1000);
-      Promise.all(closed)
-        .then(() => { clearTimeout(close); log.end(() => resolve({ ...result, logTruncated })); });
+      const done = () => { clearTimeout(close); log.end(() => resolve({ ...result, logTruncated })); };
+      Promise.all(closed).then(done, done);
     };
     child.once("error", () => finish({ exit: null, timedOut: false, logTruncated, cause: "check_spawn_failed" }));
     child.once("exit", code => finish(timedOut ? { exit: null, timedOut: true, logTruncated, cause: "check_timeout" } : { exit: code ?? null, timedOut: false, logTruncated, ...(code === null ? { cause: "check_killed" } : {}) }));

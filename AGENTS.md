@@ -31,6 +31,7 @@ python -m mypy
 npm --prefix agent-runtime ci
 npm --prefix agent-runtime run typecheck
 npm --prefix agent-runtime test                   # builds, then runs dist/test/**/*.test.js
+npm --prefix agent-runtime run lint               # after a build: no-floating-promises and friends
 ```
 
 Docker-backed agent-runtime tests are opt-in: `PI_AGENT_DOCKER_INTEGRATION=1 npm --prefix agent-runtime test`.

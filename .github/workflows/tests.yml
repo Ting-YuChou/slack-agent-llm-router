@@ -106,5 +106,6 @@ jobs:
           cache-dependency-path: agent-runtime/package-lock.json
       - run: npm ci --ignore-scripts
         working-directory: agent-runtime
-      - run: npm run typecheck && npm test
+      # lint needs the compiled dist/ that extensions import, so it runs after the build in npm test.
+      - run: npm run typecheck && npm test && npm run lint
         working-directory: agent-runtime

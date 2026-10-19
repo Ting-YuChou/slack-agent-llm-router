@@ -138,9 +138,9 @@ async function main(): Promise<void> {
       }).catch((error) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: safeId(line), error: { code: -32000, message: error instanceof Error ? error.message : "CodeGraph failed" } }) + "\n"));
     }
   });
-  for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => { void proxy.close().finally(() => process.exit(0)); });
+  for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => { proxy.close().then(() => process.exit(0), () => process.exit(0)); });
   process.on("exit", () => proxy.terminate());
 }
 function safeId(line: string): unknown { try { return JSON.parse(line).id ?? null; } catch { return null; } }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) void main();
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) main().catch(() => { process.stderr.write("codegraph proxy failed to start\n"); process.exit(1); });

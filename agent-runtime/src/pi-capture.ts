@@ -62,16 +62,21 @@ export class PiRunCapture {
   private stopped = false;
   private get cursorPath(): string { return path.join(`${this.sessionPath}.capture`, `${this.runId}.json`); }
   constructor(private readonly telemetry: AgentTelemetry, readonly runId: string, readonly sessionId: string, private readonly sessionPath: string, private readonly container: string) { }
+  /** Never rejects: a failed write marks the capture incomplete, and even that failing is swallowed. */
   private save(kind: string, payload: unknown, stableId?: string): Promise<void> {
-    const write = this.telemetry.record(this.runId, this.sessionId, kind, payload, stableId).then(() => { }).catch(() => { this.telemetry.markIncomplete(this.runId, "capture_write_failed"); });
+    const write = this.telemetry.record(this.runId, this.sessionId, kind, payload, stableId).then(() => { }, () => {
+      try { this.telemetry.markIncomplete(this.runId, "capture_write_failed"); } catch { /* the ledger is gone; nothing left to mark */ }
+    });
     this.writes.add(write);
-    void write.finally(() => this.writes.delete(write));
+    write.then(() => this.writes.delete(write), () => this.writes.delete(write));
     return write;
   }
-  onCommand(value: Record<string, unknown>): void { if (this.stopped) return; void this.save("rpc_command", value); }
+  /** Fire-and-forget for synchronous RPC callbacks; drain() still awaits the write. */
+  private enqueue(kind: string, payload: unknown): void { this.save(kind, payload).catch(() => undefined); }
+  onCommand(value: Record<string, unknown>): void { if (this.stopped) return; this.enqueue("rpc_command", value); }
   onRecord(value: Record<string, unknown>): void {
     if (this.stopped) return;
-    void this.save("rpc", value);
+    this.enqueue("rpc", value);
     if (value.type === "tool_execution_start" && typeof value.toolCallId === "string" && typeof record(value.args).command === "string")
       this.commands.set(value.toolCallId, record(value.args).command);
     const walk = (v: unknown, depth = 0): void => {

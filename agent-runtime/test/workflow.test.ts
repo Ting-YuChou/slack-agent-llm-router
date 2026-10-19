@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import * as workflowBudgetModule from "../src/workflow-budget.js";
+import * as verificationModule from "../src/verification.js";
+import * as startupTimingModule from "../src/startup-timing.js";
+import * as qualityGateModule from "../src/quality-gate.js";
+import * as graderModule from "../src/grader.js";
 test('verification counts preserve Node TAP and pytest results without inventing counts for typecheck', async () => {
   const module: any = await import('../src/verification.js');
   assert.equal(typeof module.parseVerificationCounts,'function');
@@ -9,7 +14,7 @@ test('verification counts preserve Node TAP and pytest results without inventing
 });
 
 test("startup readiness does not finish when only the Docker CLI spawned", async () => {
-  const module = await import("../src/startup-timing.js" as string).catch(() => null);
+  const module = startupTimingModule;
   assert.ok(module, "startup timing implementation exists");
   const events: any[] = [];
   const timing = new module.StartupTiming((...args: any[]) => events.push(args));
@@ -21,7 +26,7 @@ test("startup readiness does not finish when only the Docker CLI spawned", async
 });
 
 test("quality gate never grades failed tests, bounds repairs and binds the candidate", async () => {
-  const module = await import("../src/quality-gate.js" as string).catch(() => null);
+  const module = qualityGateModule;
   assert.ok(module, "quality gate implementation exists");
   let grades = 0;
   const gate = new module.QualityGate({
@@ -37,7 +42,7 @@ test("quality gate never grades failed tests, bounds repairs and binds the candi
 });
 
 test("grader cannot approve a different candidate or omit a required criterion", async () => {
-  const module = await import("../src/quality-gate.js" as string).catch(() => null);
+  const module = qualityGateModule;
   assert.ok(module, "quality gate implementation exists");
   assert.throws(() => module.validateGrade({ status: "passed", candidate_hash: "other", criteria: [], findings: [] }, "candidate", ["correct"]));
   assert.throws(() => module.validateGrade({ status: "passed", candidate_hash: "candidate", criteria: [], findings: [] }, "candidate", ["correct"]));
@@ -45,7 +50,7 @@ test("grader cannot approve a different candidate or omit a required criterion",
 });
 
 test("budget retains unknown usage reservations and pauses only human waiting", async () => {
-  const module = await import("../src/workflow-budget.js" as string).catch(() => null);
+  const module = workflowBudgetModule;
   assert.ok(module, "workflow budget implementation exists");
   let now = 0;
   const budget = new module.WorkflowBudget(1, 100, () => now);
@@ -70,7 +75,7 @@ test("RPC readiness requires a successful matching response, not arbitrary stdou
 });
 
 test("verification profiles reject shell strings, floating images and workspace-loaded profiles", async () => {
-  const m = await import("../src/verification.js" as string).catch(() => null);
+  const m = verificationModule;
   assert.ok(m, "verification implementation exists");
   const profile = { id: "p", repository: "o/r", image: "repo@sha256:" + "a".repeat(64), rubric: ["correct"], checks: [{ name: "unit", argv: ["python", "-m", "pytest"], cwd: ".", timeoutMs: 1000 }], allowedPaths: ["src/", "tests/"] };
   assert.equal(m.validateProfile(profile).checks.length, 1);
@@ -80,7 +85,7 @@ test("verification profiles reject shell strings, floating images and workspace-
 });
 
 test("candidate snapshot includes untracked code and changes its identity on modification", async () => {
-  const m = await import("../src/verification.js" as string).catch(() => null);
+  const m = verificationModule;
   assert.ok(m, "verification implementation exists");
   const { mkdtemp, writeFile, readFile, rm } = await import("node:fs/promises");
   const { tmpdir } = await import("node:os"); const { execFileSync } = await import("node:child_process");
@@ -97,12 +102,13 @@ test("candidate snapshot includes untracked code and changes its identity on mod
     assert.equal(await readFile(a.path + "/new.txt", "utf8"), "candidate");
     await writeFile(root + "/new.txt", "changed");
     const b = await store.create(root, baseline, "r"); assert.notEqual(a.hash, b.hash);
+    assert.ok(a.artifact);
     assert.match(await readFile(a.artifact, "utf8"), /candidate/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("grader Docker invocation has read-only source, fresh context and no mutation tools", async () => {
-  const m = await import("../src/grader.js" as string).catch(() => null);
+  const m = graderModule;
   assert.ok(m, "grader implementation exists");
   const args = m.graderDockerOptions({ image: "agent", network: "pi-model-only", gatewayUrl: "http://model-gateway:8080", candidate: { hash: "h", path: "/snapshot" }, statePath: "/state/new", executionId: "e", rubric: ["correct"] });
   assert.equal(args.continueSession, false);
