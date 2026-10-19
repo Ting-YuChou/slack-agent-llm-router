@@ -768,6 +768,12 @@ export class CodingAgentOrchestrator {
       this.background(this.answerChecks(session, run, event));
       return;
     }
+    if (event.type === "budget_request") {
+      // Only dollar figures cross the dialog; runs without a workflow budget have none to give.
+      const budget = this.workflows.get(run.run_id)?.budget;
+      session.process.respondUi(event.request_id, { value: JSON.stringify(budget ? { used_usd: budget.estimatedUsd, limit_usd: budget.limitUsd } : { unavailable: true }) });
+      return;
+    }
     if (event.type === "tool") {
       if (event.phase === "start") run.tool_count += 1;
       const mcpMatch = /^mcp__([^_]+)__(.+)$/.exec(event.tool);

@@ -12,6 +12,9 @@ import { renderPrompt } from "../dist/src/prompts.js";
 const MAX_TURNS = Number(process.env.PI_AGENT_MAX_TURNS ?? "20");
 const MAX_TOOL_CALLS = Number(process.env.PI_AGENT_MAX_TOOL_CALLS ?? "40");
 const APPROVAL_TIMEOUT_MS = 300_000;
+/** Must match BUDGET_STATUS_DIALOG in src/pi-rpc.ts; the host answers it at most once per turn. */
+const BUDGET_STATUS_DIALOG = "pi-agent/budget_status";
+const BUDGET_STATUS_TIMEOUT_MS = 5_000;
 // Anything but an explicit "none" keeps per-write prompts, so a typo never silently drops approval.
 const WRITE_APPROVAL = process.env.PI_AGENT_WRITE_APPROVAL === "none" ? "none" : "per_prompt";
 
@@ -102,12 +105,39 @@ function budgetMessage(stage: BudgetStage, used: number, max: number, unit: stri
     : renderPrompt("budget-notice", { used, max, unit });
 }
 
+/** Dollar stage: a notice at 75% of the run's model budget, a final warning at 90%. */
+function usdStage(used: number, limit: number): BudgetStage {
+  if (used >= 0.9 * limit) return "final";
+  return used >= 0.75 * limit ? "notice" : "none";
+}
+
+function usdMessage(stage: BudgetStage, used: number, limit: number): string {
+  const usd = (value: number) => `$${value.toFixed(2)}`;
+  const unit = "of the model budget";
+  return stage === "final"
+    ? renderPrompt("budget-final", { used: usd(used), max: usd(limit), unit, left: usd(Math.max(0, limit - used)) })
+    : renderPrompt("budget-notice", { used: usd(used), max: usd(limit), unit });
+}
+
+/** The host's reply to budget_status; anything but finite dollar figures means unavailable. */
+function parseBudgetStatus(value: string | undefined): { used: number; limit: number } | undefined {
+  if (value === undefined) return undefined;
+  try {
+    const parsed = JSON.parse(value) as { used_usd?: unknown; limit_usd?: unknown };
+    const { used_usd: used, limit_usd: limit } = parsed;
+    if (typeof used !== "number" || typeof limit !== "number" || !Number.isFinite(used) || !Number.isFinite(limit) || used < 0 || limit <= 0) return undefined;
+    return { used, limit };
+  } catch { return undefined; }
+}
+
 export default function policyExtension(pi: ExtensionAPI) {
   let turns = 0;
   let toolCalls = 0;
   let writeApproved = false;
   const writtenPaths = new Set<string>();
-  const budgetSent: Record<"turns" | "toolCalls", BudgetStage> = { turns: "none", toolCalls: "none" };
+  const budgetSent: Record<"turns" | "toolCalls" | "usd", BudgetStage> = { turns: "none", toolCalls: "none", usd: "none" };
+  /** The turn whose one budget_status dialog was already asked; the host would cancel a second. */
+  let usdAskedTurn = -1;
 
   if (process.env.PI_AGENT_JEV_CLASSIFIER_MODE === "on") {
     pi.on("before_agent_start", (event) => {
@@ -208,11 +238,13 @@ export default function policyExtension(pi: ExtensionAPI) {
   pi.on("input", () => {
     budgetSent.turns = "none";
     budgetSent.toolCalls = "none";
+    budgetSent.usd = "none";
+    usdAskedTurn = -1;
     return undefined;
   });
 
   // Limits abort without warning, so tell the agent while it can still verify and summarize its work.
-  pi.on("tool_result", (event) => {
+  pi.on("tool_result", async (event, ctx) => {
     // Nested results go back to the calling script, not to the model.
     if (event.parentToolCallId) return undefined;
     const notices: string[] = [];
@@ -221,6 +253,15 @@ export default function policyExtension(pi: ExtensionAPI) {
       if (stage === "none" || stage === budgetSent[key] || budgetSent[key] === "final") continue;
       budgetSent[key] = stage;
       notices.push(budgetMessage(stage, used, max, unit));
+    }
+    if (budgetSent.usd !== "final" && usdAskedTurn !== turns && typeof ctx.ui?.input === "function") {
+      usdAskedTurn = turns;
+      const status = parseBudgetStatus(await ctx.ui.input(BUDGET_STATUS_DIALOG, "", { timeout: BUDGET_STATUS_TIMEOUT_MS }));
+      const stage = status ? usdStage(status.used, status.limit) : "none";
+      if (status && stage !== "none" && stage !== budgetSent.usd) {
+        budgetSent.usd = stage;
+        notices.push(usdMessage(stage, status.used, status.limit));
+      }
     }
     if (!notices.length) return undefined;
     return {
