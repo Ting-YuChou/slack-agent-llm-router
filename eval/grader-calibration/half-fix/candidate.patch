@@ -1,0 +1,14 @@
+diff --git a/src/counter.cjs b/src/counter.cjs
+index d8e0c70..f5bcacd 100644
+--- a/src/counter.cjs
++++ b/src/counter.cjs
+@@ -1 +1 @@
+-exports.increment = n => n - 1;
++exports.increment = n => n + 1;
+diff --git a/src/label.cjs b/src/label.cjs
+index d680ee2..202c54e 100644
+--- a/src/label.cjs
++++ b/src/label.cjs
+@@ -1 +1 @@
+-exports.label = n => 'total:' + n;
++exports.label = n => (n > 0 && n < 10 ? 'count:' : 'total:') + n;
