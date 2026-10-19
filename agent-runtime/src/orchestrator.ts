@@ -3,6 +3,7 @@ import { taskMode, type TaskMode } from "./task-mode.js";
 
 import { listAgentModels, resolveAgentModel } from "./agent-model.js";
 import type { RouteDecision } from "./jev-router.js";
+import type { AgentLimits } from "./agent-limits.js";
 import { ApprovalStore } from "./policy.js";
 import type { PublicRunEvent, RunOutcome } from "./pi-rpc.js";
 import type { RuntimeStateStore } from "./runtime-state.js";
@@ -111,6 +112,7 @@ export interface RunRecord {
   model?: string;
   reasoning_effort?: string;
   routing?: RouteDecision;
+  limits?: AgentLimits;
   estimated_cost_usd?: number;
   mcp_server?: string;
   mcp_tool?: string;
@@ -141,6 +143,8 @@ export interface RunRecord {
 export interface AgentProcess {
   queueMs?: number;
   prompt(runId: string, prompt: string, route: RouteDecision, taskMode?: TaskMode): void;
+  /** Limits the process applies for this route, recorded on the run as `limits`. */
+  limitsFor?(route: RouteDecision): AgentLimits | undefined;
   decide(rpcUiId: string, approved: boolean): void;
   abort(runId: string): Promise<void>;
   close(): Promise<void>;
@@ -538,6 +542,8 @@ export class CodingAgentOrchestrator {
       events: [{ type: "status", status: "starting" }],
       branch: session.branch,
     };
+    const limits = session.process.limitsFor?.(route);
+    if (limits) run.limits = limits;
     if (task === "implement" && !this.quality) run.verification_status = "unverified";
     if (task === "discuss") {
       run.phase = "discussing"; run.execution_status = "running";
