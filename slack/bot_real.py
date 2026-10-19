@@ -62,6 +62,8 @@ MEMORY_SLASH_ONLY_MESSAGE = (
 )
 SLACK_BUSY_MESSAGE = "The LLM Router is busy right now. Please retry in a moment."
 SLACK_SECTION_TEXT_LIMIT = 3000
+AGENT_DELIVERY_CARD_LIMIT = 3000
+AGENT_DELIVERY_MAX_FILES = 15
 AGENT_TERMINAL_STATUSES = {
     "completed",
     "rejected",
@@ -69,6 +71,16 @@ AGENT_TERMINAL_STATUSES = {
     "failed",
     "timed_out",
     "interrupted",
+}
+# Next step shown after a failed run's reason, keyed by error code or cause_code.
+AGENT_ERROR_HINTS = {
+    "delivery_expired": (
+        "The delivery approval expired; rerun the request and approve it in time."
+    ),
+    "delivery_rejected": (
+        "Delivery was rejected; rerun with updated instructions if you still "
+        "want the change."
+    ),
 }
 
 
@@ -92,7 +104,12 @@ def _format_agent_status_line(result: Dict[str, Any]) -> str:
             "timed_out": "the run exceeded its deadline",
             "interrupted": "the runtime stopped before the run finished",
         }.get(status, "no error detail was reported")
-    return f"⚠️ {label} *{status}* — {reason}"
+    line = f"⚠️ {label} *{status}* — {reason}"
+    cause = str(error.get("cause_code") or "").strip()
+    hint = AGENT_ERROR_HINTS.get(cause) or AGENT_ERROR_HINTS.get(code)
+    if hint:
+        line = f"{line}\nNext step: {hint}"
+    return line
 
 
 def _format_grader_finding(finding: Dict[str, Any]) -> str:
@@ -3504,6 +3521,67 @@ class SlackBot:
             },
         ]
 
+    @staticmethod
+    def _agent_delivery_blocks(approval: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Build the Deliver/Discard card; all of its text stays within 3000 chars."""
+        delivery = approval.get("delivery")
+        delivery = delivery if isinstance(delivery, dict) else {}
+        files = [str(item) for item in delivery.get("files") or []]
+        shown_files = files[:AGENT_DELIVERY_MAX_FILES]
+        file_lines = [f"• `{name[:200]}`" for name in shown_files]
+        if len(files) > len(shown_files):
+            file_lines.append(f"_…and {len(files) - len(shown_files)} more._")
+        title = f"*Deliver {len(files)} changed file{'s' if len(files) != 1 else ''}?*"
+        files_text = "\n".join(file_lines) or "_No file list provided._"
+        checks = (
+            f"Verification: *{delivery.get('verification_status') or 'unknown'}*"
+            f" · Grader: *{delivery.get('grader_status') or 'unknown'}*"
+        )
+
+        expiry = "This request expires soon."
+        expires_at = approval.get("expires_at")
+        if isinstance(expires_at, str) and expires_at:
+            try:
+                parsed = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                expiry = (
+                    f"Expires at <!date^{int(parsed.timestamp())}"
+                    f"^{{date_short_pretty}} {{time}}|{expires_at}>; "
+                    "unanswered changes are discarded."
+                )
+            except ValueError:
+                pass
+        footer = f"Only the session owner can deliver. {expiry}"
+
+        fence = "```"
+        # Spend whatever the fixed parts leave on the stat and the diff excerpt.
+        budget = AGENT_DELIVERY_CARD_LIMIT - sum(
+            len(part) for part in (title, files_text, checks, footer)
+        )
+        extras = []
+        for raw in (delivery.get("stat"), delivery.get("excerpt")):
+            text = str(raw or "").replace(fence, "`\u200b``")
+            if not text or budget <= 2 * len(fence) + 20:
+                continue
+            room = budget - 2 * len(fence)
+            if len(text) > room:
+                text = text[: room - 2] + "\n…"
+            extras.append(f"{fence}{text}{fence}")
+            budget -= len(extras[-1])
+
+        return [
+            {"type": "section", "text": {"type": "mrkdwn", "text": title}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": files_text}},
+            *(
+                {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+                for text in extras
+            ),
+            {"type": "section", "text": {"type": "mrkdwn", "text": checks}},
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": footer}],
+            },
+        ]
+
     def _reconcile_agent_runs(self) -> None:
         """Resume monitoring every restored run whose result was never posted."""
         if self.agent_runtime_client is None:
@@ -3595,36 +3673,40 @@ class SlackBot:
             },
             separators=(",", ":"),
         )
+        kind = approval.get("kind")
+        labels = {
+            "publish": ("Publish repair Draft PR", "Keep local result"),
+            "delivery": ("Deliver", "Discard"),
+        }.get(str(kind), ("Approve", "Reject"))
+        card = (
+            self._agent_delivery_blocks(approval)
+            if kind == "delivery"
+            else self._agent_approval_blocks(approval)
+        )
         await self.web_client.chat_postMessage(
             channel=tracked["channel_id"],
             thread_ts=tracked["thread_ts"],
-            text=f"Approval required: {approval.get('title', 'Agent action')}",
+            text=(
+                "Ready to deliver: review the changes"
+                if kind == "delivery"
+                else f"Approval required: {approval.get('title', 'Agent action')}"
+            ),
             blocks=[
-                *self._agent_approval_blocks(approval),
+                *card,
                 {
                     "type": "actions",
                     "elements": [
                         {
                             "type": "button",
                             "action_id": "pi_agent_approve",
-                            "text": {
-                                "type": "plain_text",
-                                "text": "Publish repair Draft PR"
-                                if approval.get("kind") == "publish"
-                                else "Approve",
-                            },
+                            "text": {"type": "plain_text", "text": labels[0]},
                             "style": "primary",
                             "value": value,
                         },
                         {
                             "type": "button",
                             "action_id": "pi_agent_reject",
-                            "text": {
-                                "type": "plain_text",
-                                "text": "Keep local result"
-                                if approval.get("kind") == "publish"
-                                else "Reject",
-                            },
+                            "text": {"type": "plain_text", "text": labels[1]},
                             "style": "danger",
                             "value": value,
                         },

@@ -2589,3 +2589,113 @@ def test_agent_response_is_never_empty_and_tolerates_partial_findings():
     )
     assert "• `src/a.py` missing test" in response
     assert "• `unknown:3`" in response
+
+
+def _delivery_approval(files=3, excerpt="+print('hi')\n", stat=" src/a.py | 2 +-"):
+    return {
+        "type": "approval",
+        "kind": "delivery",
+        "approval_id": "a",
+        "title": "Deliver changes",
+        "expires_at": "2026-10-18T12:30:00.000Z",
+        "delivery": {
+            "files": [f"src/file_{index}.py" for index in range(files)],
+            "stat": stat,
+            "verification_status": "passed",
+            "grader_status": "approved",
+            "excerpt": excerpt,
+            "delivery_digest": "sha256:abc",
+        },
+    }
+
+
+def _block_texts(blocks):
+    texts = _section_texts(blocks)
+    for block in blocks:
+        if block["type"] == "context":
+            texts.extend(element["text"] for element in block["elements"])
+    return texts
+
+
+def test_delivery_card_lists_files_stat_and_check_results():
+    blocks = SlackBot._agent_delivery_blocks(_delivery_approval())
+    text = "\n".join(_block_texts(blocks))
+    assert "*Deliver 3 changed files?*" in text
+    for index in range(3):
+        assert f"`src/file_{index}.py`" in text
+    assert "src/a.py | 2 +-" in text
+    assert "print('hi')" in text
+    assert "Verification: *passed*" in text
+    assert "Grader: *approved*" in text
+    assert "<!date^" in text
+
+
+@pytest.mark.parametrize(
+    "files,excerpt_length", [(1, 0), (40, 0), (5, 5_000), (60, 9_000)]
+)
+def test_delivery_card_text_stays_within_3000_chars(files, excerpt_length):
+    approval = _delivery_approval(
+        files=files, excerpt="```" + "x" * excerpt_length, stat="s" * 2_000
+    )
+    texts = _block_texts(SlackBot._agent_delivery_blocks(approval))
+    assert sum(len(text) for text in texts) <= 3000
+    assert all(text.count("```") % 2 == 0 for text in texts)
+    if files > 15:
+        assert f"…and {files - 15} more." in "\n".join(texts)
+
+
+@pytest.mark.asyncio
+async def test_monitor_posts_delivery_card_with_deliver_and_discard_buttons():
+    runtime = SimpleNamespace(
+        wait_for_update=AsyncMock(
+            side_effect=[
+                {
+                    "run_id": "r",
+                    "session_id": "s",
+                    "status": "awaiting_approval",
+                    "phase": "awaiting_delivery",
+                    "events": [_delivery_approval()],
+                },
+                {"run_id": "r", "session_id": "s", "status": "completed"},
+            ]
+        )
+    )
+    bot = SlackBot(
+        {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+    )
+    bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+    bot.agent_monitor_poll_seconds = 0
+
+    await bot._monitor_agent_run({"run_id": "r", "channel_id": "c", "thread_ts": "t"})
+
+    kwargs = bot.web_client.chat_postMessage.await_args_list[0].kwargs
+    actions = kwargs["blocks"][-1]
+    assert actions["type"] == "actions"
+    assert [element["text"]["text"] for element in actions["elements"]] == [
+        "Deliver",
+        "Discard",
+    ]
+    assert [element["action_id"] for element in actions["elements"]] == [
+        "pi_agent_approve",
+        "pi_agent_reject",
+    ]
+    assert "*Deliver 3 changed files?*" in _section_texts(kwargs["blocks"])[0]
+
+
+def test_delivery_expired_status_line_suggests_the_next_step():
+    response = SlackMessageHandler._format_agent_response(
+        {
+            "run_id": "r1",
+            "status": "failed",
+            "error": {
+                "code": "delivery_expired",
+                "message": "Delivery approval expired",
+            },
+            "answer": "",
+        },
+        max_length=2000,
+    )
+    lines = response.splitlines()
+    assert "*failed* — delivery_expired" in lines[0]
+    assert lines[1].startswith("Next step: ")
+    assert "approve it in time" in lines[1]
