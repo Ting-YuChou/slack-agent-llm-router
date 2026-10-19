@@ -45,6 +45,8 @@ CONTRACT_METRICS = {
     "cost_usd_p50": ("lower", 0.25),
     "wall_time_s_p50": ("lower", 0.5),
     "grader_unknown_rate": ("lower_abs", 0.1),
+    # 12 runs make this noisy, hence the wide absolute tolerance.
+    "first_attempt_pass_rate": ("higher", 0.15),
 }
 # The runtime grader emits passed | needs_changes | unknown; needs_changes (and
 # a legacy failed) is a fail verdict. The hidden oracle emits passed | failed.
@@ -279,10 +281,11 @@ def _gates_passed(attempt):
 
 
 def _attempt_metrics(records):
-    """Informational first-attempt and repair rates; omitted without the data."""
+    """First-attempt pass rate (contract) and repair success rate (informational)."""
     histories = [record["attempts"] for record in records if record.get("attempts")]
     if not histories:
-        return {}
+        # A contract metric: present but unknown, so the contract fails closed.
+        return {"first_attempt_pass_rate": None}
     metrics = {
         "first_attempt_pass_rate": sum(
             1 for attempts in histories if _gates_passed(attempts[0])
@@ -299,6 +302,21 @@ def _attempt_metrics(records):
             1 for attempts in repaired if _gates_passed(attempts[-1])
         ) / len(repaired)
     return metrics
+
+
+def _harness_medians(records):
+    """Informational medians of the runtime's harness signals; omitted without data."""
+    sources = {
+        "tool_util_p50": lambda r: (r.get("harness_metrics") or {}).get("tool_util"),
+        "approvals_p50": lambda r: (r.get("approvals") or {}).get("requested"),
+        "policy_blocks_p50": lambda r: (r.get("policy_summary") or {}).get("block"),
+    }
+    medians = {}
+    for metric, read in sources.items():
+        value = _median(read(record) for record in records)
+        if value is not None:
+            medians[metric] = value
+    return medians
 
 
 def aggregate(records):
@@ -348,6 +366,7 @@ def aggregate(records):
             grader_unknown / len(grader_due) if grader_due else None
         ),
         **_attempt_metrics(records),
+        **_harness_medians(records),
         "tasks": tasks,
     }
 
@@ -564,6 +583,7 @@ class LiveRunner:
             "approvals": state.get("approvals"),
             "writer_checks_calls": state.get("writer_checks_calls"),
             "policy_summary": state.get("policy_summary"),
+            "harness_metrics": state.get("harness_metrics"),
             "attempts": run_attempts(state),
         }
 
@@ -603,6 +623,7 @@ def execute(task, attempt, runner):
         "approvals": outcome.get("approvals"),
         "writer_checks_calls": outcome.get("writer_checks_calls"),
         "policy_summary": outcome.get("policy_summary"),
+        "harness_metrics": outcome.get("harness_metrics"),
         "attempts": outcome.get("attempts"),
     }
 

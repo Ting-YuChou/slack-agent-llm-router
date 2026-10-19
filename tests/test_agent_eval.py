@@ -464,6 +464,7 @@ def test_failure_codes_leave_the_contract_metrics_unchanged():
         "cost_usd_p50",
         "wall_time_s_p50",
         "grader_unknown_rate",
+        "first_attempt_pass_rate",
     }
 
 
@@ -608,6 +609,7 @@ def _baseline(**metrics):
         "cost_usd_p50": 0.4,
         "wall_time_s_p50": 300.0,
         "grader_unknown_rate": 0.2,
+        "first_attempt_pass_rate": 0.75,
     }
     values.update(metrics)
     return {"metrics": values}
@@ -637,6 +639,7 @@ def test_evaluate_contract_accepts_a_run_within_tolerance():
         {"cost_usd_p50": 0.8},
         {"wall_time_s_p50": 900.0},
         {"grader_unknown_rate": 0.35},
+        {"first_attempt_pass_rate": 0.55},
     ],
 )
 def test_evaluate_contract_flags_regressions_beyond_tolerance(metrics):
@@ -666,6 +669,45 @@ def test_evaluate_contract_fails_closed_when_baseline_metric_is_missing():
 
     assert any("grader_oracle_agreement" in failure for failure in failures)
     assert agent_eval.evaluate_contract(_summary(), {})
+
+
+def test_first_attempt_pass_rate_is_a_contract_metric_with_room_for_noise():
+    assert (
+        agent_eval.evaluate_contract(
+            _summary(first_attempt_pass_rate=0.62), _baseline()
+        )
+        == []
+    )
+    baseline = _baseline()
+    del baseline["metrics"]["first_attempt_pass_rate"]
+    assert agent_eval.evaluate_contract(_summary(), baseline) == [
+        "first_attempt_pass_rate: missing from baseline"
+    ]
+
+
+def test_aggregate_reports_harness_signals_as_informational_medians():
+    def record(tool_util, approvals, blocks):
+        return {
+            **_record(passed=True),
+            "harness_metrics": {"tool_util": tool_util},
+            "approvals": {"requested": approvals},
+            "policy_summary": {"block": blocks},
+        }
+
+    summary = agent_eval.aggregate(
+        [record(0.25, 1, 0), record(0.5, 1, 2), record(0.75, 3, 1)]
+    )
+
+    assert summary["tool_util_p50"] == 0.5
+    assert summary["approvals_p50"] == 1
+    assert summary["policy_blocks_p50"] == 1
+    assert not set(agent_eval.CONTRACT_METRICS) & {
+        "tool_util_p50",
+        "approvals_p50",
+        "policy_blocks_p50",
+    }
+    bare = agent_eval.aggregate([_record(passed=True)])
+    assert "tool_util_p50" not in bare
 
 
 def test_evaluate_contract_honours_baseline_tolerance_override():
@@ -705,7 +747,11 @@ def _stub_runner(outcome=None, cost=0.1):
 
     def runner(task, attempt):
         calls.append((task["id"], attempt))
-        result = _outcome(cost_usd=cost, wall_time_s=1.0)
+        result = _outcome(
+            cost_usd=cost,
+            wall_time_s=1.0,
+            attempts=[{"attempt": 1, "verification": "passed", "grader": "passed"}],
+        )
         result.update(outcome or {})
         return result
 
@@ -720,6 +766,7 @@ def _write_baseline(tmp_path, **metrics):
         cost_usd_p50=0.1,
         wall_time_s_p50=1.0,
         grader_unknown_rate=0.0,
+        first_attempt_pass_rate=1.0,
     )
     baseline["metrics"].update(metrics)
     (tmp_path / "baseline.json").write_text(json.dumps(baseline))
@@ -956,6 +1003,13 @@ LIVE_RESULTS = (
 )
 
 
+# Phase 2 records carry per-attempt gates, so they can set every contract metric.
+ATTEMPT_RESULTS = (
+    agent_eval.PROJECT
+    / "eval/results/openai_gpt-5.6-luna__a4f39169832a__035297f99f3f.json"
+)
+
+
 def _live_records():
     return json.loads(LIVE_RESULTS.read_text())["records"]
 
@@ -1101,7 +1155,7 @@ def test_execute_records_grader_and_error_causes():
 def test_informational_attempt_metrics_are_skipped_without_attempt_data():
     summary = agent_eval.aggregate(_live_records())
 
-    assert "first_attempt_pass_rate" not in summary
+    assert summary["first_attempt_pass_rate"] is None
     assert "repair_success_rate" not in summary
 
 
@@ -1120,7 +1174,7 @@ def test_informational_attempt_metrics_from_per_attempt_gates():
 
     assert summary["first_attempt_pass_rate"] == 0.25
     assert summary["repair_success_rate"] == 0.5
-    assert "first_attempt_pass_rate" not in agent_eval.CONTRACT_METRICS
+    assert "first_attempt_pass_rate" in agent_eval.CONTRACT_METRICS
     assert "repair_success_rate" not in agent_eval.CONTRACT_METRICS
 
 
@@ -1132,9 +1186,9 @@ def test_repair_success_rate_is_skipped_without_a_repair():
     assert "repair_success_rate" not in summary
 
 
-def _recompute_copy(tmp_path):
+def _recompute_copy(tmp_path, source=ATTEMPT_RESULTS):
     results = tmp_path / "results.json"
-    shutil.copy(LIVE_RESULTS, results)
+    shutil.copy(source, results)
     return results
 
 
@@ -1160,17 +1214,33 @@ def test_recompute_summary_updates_baseline_without_a_live_run(tmp_path, monkeyp
 
     assert code == 0
     baseline = json.loads(baseline_path.read_text())
-    assert baseline["key"] == "openai_gpt-5.6-luna__158a4739d12c__035297f99f3f"
+    assert baseline["key"] == "openai_gpt-5.6-luna__a4f39169832a__035297f99f3f"
     assert baseline["repeats"] == 3
-    assert baseline["metrics"]["grader_unknown_rate"] == pytest.approx(5 / 9)
-    assert baseline["metrics"]["pass_at_1"] == pytest.approx(10 / 12)
-    assert baseline["tolerance"]["grader_unknown_rate"] == 0.1
+    assert baseline["metrics"]["grader_unknown_rate"] == 0.0
+    assert baseline["metrics"]["pass_at_1"] == 1.0
+    assert baseline["metrics"]["first_attempt_pass_rate"] == 0.75
+    assert baseline["tolerance"]["first_attempt_pass_rate"] == 0.15
     assert baseline["ceilings"] == {"grader_unknown_rate": 0.9}
     result = json.loads(results.read_text())
-    assert result["summary"]["grader_unknown_rate"] == pytest.approx(5 / 9)
-    assert result["summary"]["spent_usd"] == pytest.approx(0.63831603)
-    assert result["records"] == _live_records()
-    assert result["created_at"] == "2026-10-18T11:05:06+00:00"
+    assert result["summary"]["spent_usd"] == pytest.approx(0.65906288)
+    assert result["records"] == json.loads(ATTEMPT_RESULTS.read_text())["records"]
+    assert result["created_at"] == "2026-10-19T11:46:06+00:00"
+
+
+def test_recompute_summary_will_not_baseline_records_without_attempts(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(agent_eval, "LiveRunner", _no_live_runner)
+    results = _recompute_copy(tmp_path, LIVE_RESULTS)
+    baseline_path = tmp_path / "baseline.json"
+    args = ["--recompute-summary", str(results), "--baseline", str(baseline_path)]
+
+    assert agent_eval.main(args + ["--update-baseline"]) == 1
+    assert not baseline_path.exists()
+    result = json.loads(results.read_text())
+    assert result["contract_failures"] == [
+        "first_attempt_pass_rate: missing from eval summary"
+    ]
 
 
 def test_recompute_summary_compares_against_the_baseline(tmp_path, monkeypatch):
@@ -1182,14 +1252,12 @@ def test_recompute_summary_compares_against_the_baseline(tmp_path, monkeypatch):
 
     assert agent_eval.main(args) == 0
     baseline = json.loads(baseline_path.read_text())
-    baseline["ceilings"] = {"grader_unknown_rate": 0.1}
+    baseline["ceilings"] = {"cost_usd_p50": 0.01}
     baseline_path.write_text(json.dumps(baseline))
 
     assert agent_eval.main(args) == 1
     result = json.loads(results.read_text())
-    assert result["contract_failures"] == [
-        "grader_unknown_rate: 0.556 exceeds ceiling 0.1"
-    ]
+    assert result["contract_failures"] == ["cost_usd_p50: 0.044 exceeds ceiling 0.01"]
 
 
 def test_recompute_summary_rejects_an_unreadable_results_file(tmp_path):
