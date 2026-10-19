@@ -111,6 +111,19 @@ test('structured discovery holds the session busy and finishes before the sole w
   process.emit(SETTLED); await new Promise(resolve => setImmediate(resolve));
 });
 
+test('a failed discovery reports why it failed', async () => {
+  const { HarnessError } = await import('../src/error-taxonomy.js');
+  const { orchestrator } = fixture(undefined, {
+    structured: { enabled: true, maxCostUsd: 5, activeTimeoutMs: 1_800_000 },
+    discover: async () => { throw new Error('investigation_attempts_exhausted', { cause: new HarnessError('investigation_timeout', 'investigation_timeout') }); },
+    writerStarted: () => {}, execution: () => {}, assertUnchanged: async () => {},
+    evaluate: async () => ({ action: 'fail', candidate: { hash: 'h', path: '/s' }, verification: { status: 'unknown', checks: [] } }),
+  });
+  const run = await orchestrator.createSession({ team_id: 'T', channel_id: 'C', thread_ts: 'discovery-cause', user_id: 'U', prompt: 'fix', workflow_mode: 'structured' } as any);
+  for (let i = 0; i < 20 && orchestrator.getRun(run.run_id).status !== 'failed'; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(orchestrator.getRun(run.run_id).error, { code: 'investigation_unknown', message: 'Required investigation could not complete; evidence retained', cause_code: 'investigation_timeout' });
+});
+
 test('structured requests fail closed without an enabled trusted profile', async () => {
   const { orchestrator, process } = fixture();
   await assert.rejects(orchestrator.createSession({ team_id: 'T', channel_id: 'C', thread_ts: 'no-profile', user_id: 'U', prompt: 'fix', workflow_mode: 'structured' } as any), /structured|profile/i);

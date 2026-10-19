@@ -10,7 +10,7 @@ import type { RuntimeStateStore } from "./runtime-state.js";
 import { workflowMode, type WorkflowMode, type WorkflowNode } from "./structured-workflow.js";
 import { WorkflowBudget } from "./workflow-budget.js";
 import type { Candidate, GateInput, GateResult } from "./quality-gate.js";
-import { classifyGateError, type RunFailure } from "./error-taxonomy.js";
+import { classifyGateError, failureCause, type RunFailure } from "./error-taxonomy.js";
 import { promptTelemetry } from "./prompts.js";
 import type { FixResult } from "./fixers.js";
 import { computeHarnessMetrics, type HarnessMetrics } from "./harness-metrics.js";
@@ -687,8 +687,9 @@ export class CodingAgentOrchestrator {
       this.quality!.writerStarted?.(run.run_id);
       run.phase = run.task_mode === 'discuss' ? 'discussing' : 'implementing'; await this.persistState();
       await this.startExecution(session, run, state, `${prompt}\n\n${evidence}`);
-    }).catch(async () => {
-      if (!isTerminal(run.status) && !this.terminalClaims.has(run.run_id)) await this.failRun(session, run, { code: 'investigation_unknown', message: 'Required investigation could not complete; evidence retained' });
+    }).catch(async (error: unknown) => {
+      const cause = failureCause(error);
+      if (!isTerminal(run.status) && !this.terminalClaims.has(run.run_id)) await this.failRun(session, run, { code: 'investigation_unknown', message: 'Required investigation could not complete; evidence retained', ...(cause ? { cause_code: cause } : {}) });
     });
   }
 
