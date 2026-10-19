@@ -50,6 +50,25 @@ export interface WriterContext { allowedPaths: string[]; checks: string[]; rubri
 
 const exec = promisify(execFile);
 
+/** Discussion runs get neither MCP nor the classifier; mirror buildAgentDockerArgs so secrets match the argv names. */
+function effectiveSecrets(options: AgentContainerOptions): Record<string, string> {
+  const discuss = taskMode(options.taskMode) === "discuss";
+  const model = resolveAgentModel(options.modelRef);
+  return {
+    [model.credentialEnv]: options.gatewayToken,
+    ...(!discuss && options.classifierGatewayToken ? { OPENROUTER_API_KEY: options.classifierGatewayToken } : {}),
+    ...(!discuss && options.mcp ? { PI_AGENT_MCP_SERVERS_JSON: JSON.stringify(options.mcp.servers) } : {}),
+  };
+}
+
+/**
+ * Credentials reach the container as `--env NAME` resolved from the docker client's own environment,
+ * so they never appear on the host process list or in shell history.
+ */
+export function buildAgentSpawnEnv(options: AgentContainerOptions, host: NodeJS.ProcessEnv): Record<string, string> {
+  return { ...(host.PATH ? { PATH: host.PATH } : {}), ...effectiveSecrets(options) };
+}
+
 export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
   if (taskMode(options.taskMode) === "discuss") options = {
     ...options, readOnlyWorkspace: true, toolNames: ["read", "grep", "find", "ls"],
@@ -77,7 +96,7 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     "--pids-limit", "256",
     "--tmpfs", "/tmp:rw,noexec,nosuid,size=536870912",
     "--env", `HOME=/tmp/pi-home`,
-    "--env", `${model.credentialEnv}=${options.gatewayToken}`,
+    "--env", model.credentialEnv,
     "--env", `PI_MODEL_GATEWAY_URL=${options.gatewayUrl}`,
     "--env", `PI_AGENT_MAX_TURNS=${options.limits?.maxTurns ?? 20}`,
     "--env", `PI_AGENT_MAX_TOOL_CALLS=${options.limits?.maxToolCalls ?? 40}`,
@@ -110,14 +129,14 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
   if (options.writerContext) args.splice(args.indexOf("--mount"), 0, "--env", `PI_AGENT_WRITER_JSON=${JSON.stringify(options.writerContext)}`);
   if (options.classifierGatewayToken) {
     args.splice(args.indexOf("--mount"), 0,
-      "--env", `OPENROUTER_API_KEY=${options.classifierGatewayToken}`,
+      "--env", "OPENROUTER_API_KEY",
       "--env", "PI_AGENT_JEV_CLASSIFIER_MODE=on",
     );
   }
   if (options.mcp) {
     args.splice(args.indexOf("--mount"), 0,
       "--env", `PI_AGENT_MCP_MODE=${options.mcp.mode}`,
-      "--env", `PI_AGENT_MCP_SERVERS_JSON=${JSON.stringify(options.mcp.servers)}`,
+      "--env", "PI_AGENT_MCP_SERVERS_JSON",
     );
     args.push("-e", "builtin:mcp", "-e", "/opt/pi/extensions/mcp-bootstrap.ts");
   }
@@ -187,7 +206,7 @@ export class DockerPiProcess implements AgentProcess {
     const { mcp: configuredMcp, ...baseOptions } = this.options;
     const mcp = selectedTask === "discuss" ? undefined : configuredMcp;
     if (mcp && !this.mcpTokenForRun) throw new Error("MCP token issuer is required when MCP is enabled");
-    const child = spawn("docker", buildAgentDockerArgs({
+    const containerOptions: AgentContainerOptions = {
       ...baseOptions,
       taskMode: selectedTask,
       name: containerName,
@@ -202,9 +221,10 @@ export class DockerPiProcess implements AgentProcess {
         })),
       } } : {}),
       continueSession: this.hasSession,
-    }), {
+    };
+    const child = spawn("docker", buildAgentDockerArgs(containerOptions), {
       stdio: ["pipe", "pipe", "pipe"],
-      env: { PATH: process.env.PATH },
+      env: buildAgentSpawnEnv(containerOptions, process.env),
     });
     this.child = child;
     const bridge = new PiRpcBridge({

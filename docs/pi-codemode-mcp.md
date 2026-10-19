@@ -32,6 +32,7 @@ MCP_GATEWAY_SIGNING_SECRET=... node agent-runtime/scripts/derive-mcp-secret.mjs 
 - GitHub App, Context7, ClickHouse database, and upstream bearer credentials stay in their gateway or upstream container.
 - The Agent receives only run-bound tokens. Token claims bind the server, run, session, Slack user, scope, exact tools, call budget, and expiry.
 - Codemode results are treated as untrusted data and reduced to an 8 KiB summary.
+- Run-bound tokens reach the container as `docker run --env NAME` from the docker client's environment, so they are not on the host process list. Inside the container, the `secret-env` extension replaces `bash` with a copy whose child processes do not inherit credential variables, and the bash policy blocks `env`/`printenv`/`/proc/*/environ` and `$…KEY`/`$…TOKEN` reads. This is defense in depth only: Pi is PID 1 and agent code runs as the same user, so `/proc/1/environ` remains readable. The real boundary is the model gateway: a request-field allowlist (no provider-hosted tools, `store:false`), per-run budgets that fail closed, per-role output caps, and at most four concurrent streams per token.
 
 ## ClickHouse
 

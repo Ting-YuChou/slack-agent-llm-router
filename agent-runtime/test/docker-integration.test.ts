@@ -289,7 +289,7 @@ http.createServer((req,res)=>{let body="";req.on("data",c=>body+=c);req.on("end"
       gatewayUrl: "http://model-gateway:8080", modelRef: "openai/gpt-5.6-luna",
       extensionPaths: ["/opt/pi/extensions/model-gateway.ts"], pluginPaths: [], skillPaths: [], toolNames: ["read"],
       user: `${hostUid}:${hostGid}`,
-      mcp: { mode: "github_read_only", servers: [{ server: "github", gatewayUrl: "http://mcp-github:8090/mcp", token: "" }] },
+      mcp: { mode: "github_read_only", servers: [{ server: "github", gatewayUrl: "http://mcp-gateway:8090/mcp", token: "" }] },
     }, () => "fake-model-token", (event) => {
       events.push(event);
       if (event.type === "settled" || event.type === "error") resolveSettled();
@@ -304,6 +304,108 @@ http.createServer((req,res)=>{let body="";req.on("data",c=>body+=c);req.on("end"
     await piProcess?.close();
     await command("docker", ["stop", modelGateway]).catch(() => "");
     await command("docker", ["stop", mcpGateway]).catch(() => "");
+    await command("docker", ["network", "rm", network]).catch(() => "");
+    await worktrees.remove(isolated.path).catch(() => undefined);
+  }
+});
+
+test("real Pi requests pass the gateway allowlist and bash children cannot read the run token", { skip: !enabled, timeout: 120_000 }, async () => {
+  const { allowedAnthropicBeta, sanitizeAgentRequest } = await import("../src/gateway-request-policy.js");
+  const suffix = Math.random().toString(16).slice(2, 10);
+  const network = `pi-allowlist-${suffix}`;
+  const gateway = `model-gateway-${suffix}`;
+  const repo = await mkdtemp(path.join(tmpdir(), "pi-allowlist-repo-"));
+  const worktreeRoot = await mkdtemp(path.join(tmpdir(), "pi-allowlist-worktrees-"));
+  const sessionStatePath = await mkdtemp(path.join(tmpdir(), "pi-allowlist-state-"));
+  const recordDir = await mkdtemp(path.join(tmpdir(), "pi-allowlist-record-"));
+  await command("chmod", ["777", recordDir]);
+  await command("git", ["init", "-b", "main"], repo);
+  await writeFile(path.join(repo, "README.md"), "base\n");
+  await command("git", ["add", "README.md"], repo);
+  await command("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base"], repo);
+  const worktrees = new WorktreeManager({ repoPath: repo, worktreeRoot, baseRef: "HEAD" });
+  const isolated = await worktrees.create(`allowlist-${suffix}`);
+  const hostUid = process.getuid?.();
+  const hostGid = process.getgid?.();
+  const probe = `node -e "process.stdout.write('TOKEN='+(process.env.OPENAI_API_KEY||'none')+';MCP='+(process.env.PI_AGENT_MCP_SERVERS_JSON?'set':'none'))"`;
+  const fakeGatewayScript = String.raw`
+const http = require("node:http"); const fs = require("node:fs"); let call = 0;
+const usage = {input_tokens:1,output_tokens:1,total_tokens:2,input_tokens_details:{cached_tokens:0}};
+function sse(res, events) { res.writeHead(200,{"content-type":"text/event-stream"}); for(const e of events) res.write("data: "+JSON.stringify(e)+"\n\n"); res.end("data: [DONE]\n\n"); }
+function anthropic(res, events) { res.writeHead(200,{"content-type":"text/event-stream"}); for(const e of events) res.write("event: "+e.type+"\ndata: "+JSON.stringify(e)+"\n\n"); res.end(); }
+http.createServer((req,res)=>{ let body=""; req.on("data",c=>body+=c); req.on("end",()=>{
+  fs.appendFileSync("/record/requests.jsonl", JSON.stringify({url:req.url, headers:req.headers, body:JSON.parse(body)})+"\n");
+  call++;
+  if (req.url.startsWith("/anthropic/")) {
+    anthropic(res,[
+      {type:"message_start",message:{id:"msg_a",type:"message",role:"assistant",content:[],model:"claude-sonnet-4-6",stop_reason:null,usage:{input_tokens:1,output_tokens:1}}},
+      {type:"content_block_start",index:0,content_block:{type:"text",text:""}},
+      {type:"content_block_delta",index:0,delta:{type:"text_delta",text:"anthropic-ok"}},
+      {type:"content_block_stop",index:0},
+      {type:"message_delta",delta:{stop_reason:"end_turn"},usage:{output_tokens:1}},
+      {type:"message_stop"},
+    ]); return;
+  }
+  if (call===1) {
+    const item={type:"function_call",id:"fc_1",call_id:"call_1",name:"bash",arguments:JSON.stringify({command:${JSON.stringify(probe)}}),status:"completed"};
+    sse(res,[{type:"response.created",response:{id:"resp_1"}},{type:"response.output_item.added",output_index:0,item},{type:"response.function_call_arguments.done",output_index:0,arguments:item.arguments},{type:"response.output_item.done",output_index:0,item},{type:"response.completed",response:{id:"resp_1",status:"completed",output:[item],usage}}]);
+    return;
+  }
+  const text="probe done";
+  const item={type:"message",id:"msg_1",role:"assistant",status:"completed",content:[{type:"output_text",text,annotations:[]}],phase:"final_answer"};
+  sse(res,[{type:"response.created",response:{id:"resp_2"}},{type:"response.output_item.added",output_index:0,item},{type:"response.output_text.delta",output_index:0,content_index:0,delta:text},{type:"response.output_item.done",output_index:0,item},{type:"response.completed",response:{id:"resp_2",status:"completed",output:[item],usage}}]);
+});}).listen(8080,"0.0.0.0");`;
+
+  let piProcess: DockerPiProcess | undefined;
+  try {
+    await command("docker", ["network", "create", "--internal", network]);
+    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", "--mount", `type=bind,src=${recordDir},dst=/record`, "node:22.22.0-bookworm-slim", "node", "-e", fakeGatewayScript]);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const events: PublicRunEvent[] = [];
+    let resolveSettled!: () => void;
+    let settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
+    piProcess = new DockerPiProcess(
+      {
+        name: `pi-allowlist-${suffix}`, image: "slack-pi-agent:1.0.1", network, worktreePath: isolated.path,
+        gitMetadataPath: path.join(repo, ".git"), sessionStatePath, gatewayUrl: "http://model-gateway:8080",
+        modelRef: "openai/gpt-5.6-luna",
+        extensionPaths: ["/opt/pi/extensions/policy.ts", "/opt/pi/extensions/model-gateway.ts", "/opt/pi/extensions/secret-env.ts"],
+        pluginPaths: [], skillPaths: [], toolNames: ["read", "write", "edit", "bash", "grep", "find", "ls"],
+        user: `${hostUid}:${hostGid}`,
+      },
+      () => "fake-run-token-value",
+      (event) => {
+        events.push(event);
+        if (event.type === "approval") piProcess!.decide(event.approval_id, true);
+        if (event.type === "settled" || event.type === "error") resolveSettled();
+      },
+    );
+    piProcess.prompt("run-1", "Run the environment probe.");
+    await settled;
+    assert.ok(!events.some((event) => event.type === "error"), JSON.stringify(events));
+
+    settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
+    piProcess.prompt("run-2", "Say hello.", { modelRef: "anthropic/claude-sonnet-4-6", effort: "max", source: "jev" });
+    await settled;
+    assert.ok(events.some((event) => event.type === "answer" && event.text.includes("anthropic-ok")), JSON.stringify(events));
+
+    const requests = (await readFile(path.join(recordDir, "requests.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const openai = requests.filter((request) => request.url === "/openai/v1/responses");
+    const claude = requests.filter((request) => new URL(request.url, "http://x").pathname === "/anthropic/v1/messages");
+    assert.ok(openai.length >= 2, JSON.stringify(requests.map((request) => request.url)));
+    assert.ok(claude.length >= 1, JSON.stringify(requests.map((request) => request.url)));
+    for (const request of openai) assert.deepEqual(sanitizeAgentRequest("openai-responses", request.body).ok, true, JSON.stringify(sanitizeAgentRequest("openai-responses", request.body)));
+    for (const request of claude) {
+      assert.deepEqual(sanitizeAgentRequest("anthropic-messages", request.body).ok, true, JSON.stringify(sanitizeAgentRequest("anthropic-messages", request.body)));
+      const beta = request.headers["anthropic-beta"];
+      if (beta) assert.equal(allowedAnthropicBeta(beta), beta.split(",").map((item: string) => item.trim()).join(","));
+    }
+    const toolOutput = JSON.stringify(openai[1].body.input);
+    assert.match(toolOutput, /TOKEN=none;MCP=none/);
+    assert.doesNotMatch(toolOutput, /fake-run-token-value/);
+  } finally {
+    await piProcess?.close();
+    await command("docker", ["stop", gateway]).catch(() => "");
     await command("docker", ["network", "rm", network]).catch(() => "");
     await worktrees.remove(isolated.path).catch(() => undefined);
   }
