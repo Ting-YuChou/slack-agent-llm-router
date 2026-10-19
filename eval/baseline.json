@@ -1,0 +1,11 @@
+{
+  "key": null,
+  "note": "No live baseline yet. Run `python scripts/agent_eval.py --live-openai --repeats 3 --update-baseline` and commit the result. Until then every comparison fails closed.",
+  "metrics": {},
+  "tolerance": {
+    "pass_at_1": 0.1,
+    "grader_oracle_agreement": 0.1,
+    "cost_usd_p50": 0.25,
+    "wall_time_s_p50": 0.5
+  }
+}
