@@ -1,19 +1,22 @@
 {
-  "key": "openai_gpt-5.6-luna__158a4739d12c__035297f99f3f",
-  "updated_at": "2026-10-19T10:05:48+00:00",
+  "key": "openai_gpt-5.6-luna__a4f39169832a__035297f99f3f",
+  "updated_at": "2026-10-19T11:46:34+00:00",
   "repeats": 3,
   "metrics": {
-    "pass_at_1": 0.8333333333333334,
+    "pass_at_1": 1.0,
     "grader_oracle_agreement": 1.0,
-    "cost_usd_p50": 0.04806369,
-    "wall_time_s_p50": 66.66045852098614,
-    "grader_unknown_rate": 0.5555555555555556
+    "cost_usd_p50": 0.043603499999999996,
+    "wall_time_s_p50": 41.29281454154989,
+    "grader_unknown_rate": 0.0
   },
   "tolerance": {
     "pass_at_1": 0.1,
     "grader_oracle_agreement": 0.1,
     "cost_usd_p50": 0.25,
     "wall_time_s_p50": 0.5,
+    "grader_unknown_rate": 0.1
+  },
+  "ceilings": {
     "grader_unknown_rate": 0.1
   }
 }
