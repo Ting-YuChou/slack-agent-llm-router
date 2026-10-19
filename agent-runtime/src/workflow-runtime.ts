@@ -8,17 +8,19 @@ import { BudgetLedger } from "./budget-ledger.js";
 import { QualityGate, type GateInput } from "./quality-gate.js";
 import { assertCandidateScope } from "./candidate-scope.js";
 import { CandidateStore, DockerVerifier, type VerificationProfile } from "./verification.js";
-import { GraderRunner } from "./grader.js";
+import { GraderRunner, type GraderProcessFactory } from "./grader.js";
 import { DEFAULT_GRADER_MODEL, type GraderConfig } from "./grader-config.js";
 import type { QualityServices } from "./orchestrator.js";
 import { redact, type AgentTelemetry } from "./telemetry.js";
 import { HarnessError } from "./error-taxonomy.js";
 import type { AgentTracing } from "./tracing.js";
 import { WorkflowCoordinator } from './structured-workflow.js';
-import { AgentExecutionRunner } from './agent-execution-runner.js';
+import { AgentExecutionRunner, type InvestigationProcessFactory } from './agent-execution-runner.js';
 import { WriterChecks } from "./writer-checks.js";
 import type { RouteDecision } from './jev-router.js';
 const exec = promisify(execFile);
+/** What the gate and run_checks need from a verifier; DockerVerifier in production. */
+export type QualityVerifier = Pick<DockerVerifier, "verify" | "stop">;
 
 export function createQualityServices(options: {
   control: ControlStore; session: (id: string) => string;
@@ -28,6 +30,10 @@ export function createQualityServices(options: {
   phase: (run: string, phase: string, cost?: number) => Promise<void>;
   githubMcp?: { gatewayUrl: string; token(id: string, owner: string): string };
   grader?: GraderConfig;
+  /** Test seams; production leaves them unset and runs Docker. */
+  createVerifier?: (profile: VerificationProfile) => QualityVerifier;
+  createGraderProcess?: GraderProcessFactory;
+  createExecutionProcess?: InvestigationProcessFactory;
 }): QualityServices {
   const { profile, telemetry, tracing } = options;
   const grader = options.grader ?? { route: { modelRef: DEFAULT_GRADER_MODEL, effort: "high" as const, source: "grader" }, timeoutMs: 120_000 };
@@ -35,8 +41,9 @@ export function createQualityServices(options: {
   const graderTag = grader.route.modelRef === DEFAULT_GRADER_MODEL && grader.route.effort === "high" ? "sol-high" : `grader=${grader.route.modelRef}@${grader.route.effort}`;
   const graderModelId = grader.route.modelRef.split("/").slice(1).join("/");
   const store = new CandidateStore(path.join(options.root, "artifacts"));
+  const createVerifier = options.createVerifier ?? ((selected: VerificationProfile) => new DockerVerifier(selected));
   const graders = new Map<string, GraderRunner>();
-  const verifiers = new Map<string, DockerVerifier>();
+  const verifiers = new Map<string, QualityVerifier>();
   const artifacts = new Map<string, string>();
   const executions = new Map<string, { parent: string; role: string; attempt: number; started_at: string }>();
   const fingerprint = `${options.checksum}:${options.image}:pi-1.0.1:readonly-v1:${graderTag}:luna-max:github-direct4:${options.githubMcp?.gatewayUrl ?? "off"}`;
@@ -65,7 +72,7 @@ export function createQualityServices(options: {
   }
   const runner = new AgentExecutionRunner({ ...options, stateRoot: path.join(options.root,'investigations'), execution,
     token: (id,route) => options.token(id,route,"investigator"), prompt: id => options.ledger.prompt(id),
-    cost: (id,cost) => options.phase(id,'investigating',cost),
+    cost: (id,cost) => options.phase(id,'investigating',cost), createProcess: options.createExecutionProcess,
   });
   const coordinator = new WorkflowCoordinator({ store: options.control, concurrency: profile.structuredWorkflow?.concurrency ?? 2,
     execute: request => runner.run(request),
@@ -84,7 +91,7 @@ export function createQualityServices(options: {
   };
   const writerChecks = new WriterChecks({ profile,
     snapshot: async request => { await assertScope(request.worktree, request.baseline); return store.create(request.worktree, request.baseline, request.run_id, { baselineTree: false }); },
-    verifier: () => new DockerVerifier(profile),
+    verifier: () => createVerifier(profile),
   });
   const gate = new QualityGate({
     profile,
@@ -106,7 +113,7 @@ export function createQualityServices(options: {
     },
     verify: async (candidate, input) => {
       await options.phase(input.run_id, "verifying"); tracing?.lifecycle(input.run_id, "verification", "start");
-      const verifier = new DockerVerifier(profile); verifiers.set(input.run_id, verifier);
+      const verifier = createVerifier(profile); verifiers.set(input.run_id, verifier);
       try { return await verifier.verify(candidate, input.signal); }
       finally { await verifier.stop(); verifiers.delete(input.run_id); tracing?.lifecycle(input.run_id, "verification", "end"); }
     },
@@ -115,7 +122,7 @@ export function createQualityServices(options: {
         token: (id, route) => options.token(id, route, "grader"), route: grader.route, timeoutMs: grader.timeoutMs,
         constraints: { allowedPaths: profile.allowedPaths, diffLimits: DEFAULT_DIFF_LIMITS },
         execution: (id, parent, phase, cost, queueMs) => execution(id, parent, "grader", input.attempt, phase, cost, queueMs),
-        cost: cost => options.phase(input.run_id, "grading", cost),
+        cost: cost => options.phase(input.run_id, "grading", cost), createProcess: options.createGraderProcess,
       });
       graders.set(input.run_id, runner);
       await options.phase(input.run_id, "grading"); tracing?.lifecycle(input.run_id, "grading", "start");
