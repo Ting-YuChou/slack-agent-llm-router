@@ -36,6 +36,11 @@ export interface Scenario {
   quality?: Partial<QualityServices>;
   /** Replaces the real patch archiver (which writes under the scenario root's artifacts/). */
   archivePatch?: PatchArchiver;
+  /** Turns on delivery approval; `delivery` is how the owner answers the card (`expire` lets its short TTL run out). */
+  deliveryApproval?: boolean;
+  delivery?: "approve" | "reject" | "expire";
+  /** Runs against the worktree while the delivery card is pending, before the owner answers. */
+  beforeDelivery?: (worktree: string) => Promise<void>;
   expect: {
     status: RunRecord["status"];
     errorCode?: string;
@@ -144,7 +149,7 @@ function qualityFor(scenario: Scenario, counters: { gradeCalls: number }): Quali
 /** An undelivered patch archived during the scenario, read back before the scenario root is removed. */
 export interface ArchivedPatchFile { path: string; content: string; mode: number }
 
-export interface ScenarioResult { run: RunRecord; prompts: string[]; responses: ScriptedProcess["responses"]; gradeCalls: number; commits: number; dirty: string; patches: ArchivedPatchFile[] }
+export interface ScenarioResult { run: RunRecord; prompts: string[]; responses: ScriptedProcess["responses"]; gradeCalls: number; commits: number; dirty: string; patches: ArchivedPatchFile[]; deliveryCard?: Record<string, unknown> }
 
 /** Runs a scenario through the real orchestrator, worktree manager, Pi RPC bridge and quality gate. */
 export async function runScenario(scenario: Scenario): Promise<ScenarioResult> {
@@ -172,6 +177,7 @@ export async function runScenario(scenario: Scenario): Promise<ScenarioResult> {
       worktrees: {
         create: (id: string, base?: string) => worktrees.create(id, base),
         inspectDiff: (p: string, limits: Parameters<WorktreeManager["inspectDiff"]>[1]) => worktrees.inspectDiff(p, limits),
+        patch: (p: string) => worktrees.patch(p),
         commit: (p: string, message: string) => withIdentity(() => worktrees.commit(p, message)),
         rollback: (p: string, baseline: string) => track(worktrees.rollback(p, baseline)),
         remove: (p: string) => worktrees.remove(p),
@@ -183,8 +189,21 @@ export async function runScenario(scenario: Scenario): Promise<ScenarioResult> {
       deadlineMs: 30_000,
       quality: qualityFor(scenario, counters),
       archivePatch: archiver,
+      ...(scenario.deliveryApproval ? { deliveryApproval: { ttlMs: scenario.delivery === "expire" ? 50 : 30_000 } } : {}),
     });
     const created = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: scenario.name, user_id: "U", prompt: "Fix the bug in src/a.js" });
+    let deliveryCard: Record<string, unknown> | undefined;
+    if (scenario.deliveryApproval) {
+      const waiting = await waitFor(() => orchestrator.getRun(created.run_id), run => TERMINAL.has(run.status) || run.phase === "awaiting_delivery", run => `run never reached delivery; last status ${run.status}`);
+      deliveryCard = [...waiting.events].reverse().find(event => event.type === "approval" && event.kind === "delivery");
+      if (deliveryCard) {
+        const worktree = (orchestrator as unknown as { sessions: Map<string, { worktreePath: string }> }).sessions.get(created.session_id)!.worktreePath;
+        await scenario.beforeDelivery?.(worktree);
+        if (scenario.delivery === "approve" || scenario.delivery === "reject") {
+          await orchestrator.decide(created.run_id, String(deliveryCard.approval_id), "U", scenario.delivery);
+        }
+      }
+    }
     const run = await waitForTerminal(() => orchestrator.getRun(created.run_id));
     while (pending.size) await Promise.allSettled([...pending]);
     const session = (orchestrator as unknown as { sessions: Map<string, { worktreePath: string; baselineCommit: string }> }).sessions.get(created.session_id)!;
@@ -192,7 +211,7 @@ export async function runScenario(scenario: Scenario): Promise<ScenarioResult> {
     const dirty = await git(session.worktreePath, "status", "--porcelain");
     await orchestrator.shutdown();
     const patches = await Promise.all(archived.map(async file => ({ path: file, content: await readFile(file, "utf8"), mode: (await stat(file)).mode & 0o777 })));
-    return { run: structuredClone(run), prompts: scripted.prompts, responses: scripted.responses, gradeCalls: counters.gradeCalls, commits, dirty, patches };
+    return { run: structuredClone(run), prompts: scripted.prompts, responses: scripted.responses, gradeCalls: counters.gradeCalls, commits, dirty, patches, ...(deliveryCard ? { deliveryCard } : {}) };
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { taskMode, type TaskMode } from "./task-mode.js";
 
 import { listAgentModels, resolveAgentModel } from "./agent-model.js";
@@ -11,6 +11,7 @@ import { workflowMode, type WorkflowMode, type WorkflowNode } from "./structured
 import { WorkflowBudget } from "./workflow-budget.js";
 import type { Candidate, GateInput, GateResult } from "./quality-gate.js";
 import { classifyGateError, type RunFailure } from "./error-taxonomy.js";
+import { redact } from "./telemetry.js";
 import { DEFAULT_DIFF_LIMITS, DiffLimitError } from "./worktree-manager.js";
 import { rejected, type WriterChecksRequest, type WriterChecksResponse } from "./writer-checks.js";
 
@@ -179,6 +180,8 @@ export interface AgentProcess {
 }
 
 interface Worktrees {
+  /** Full patch against HEAD; delivery approval binds its digest when available. */
+  patch?(path: string): Promise<string>;
   create(runId: string, trustedBase?: string): Promise<{ path: string; branch: string; baselineCommit: string }>;
   inspectDiff(path: string, limits: { maxFiles: number; maxBytes: number; maxSingleFileBytes: number }): Promise<{ files: string[]; bytes: number; stat: string }>;
   commit(path: string, message: string): Promise<string>;
@@ -196,6 +199,8 @@ interface SessionRecord {
   branch: string;
   baselineCommit: string;
   process: AgentProcess;
+  /** Trusted callers (CI repair) gate delivery themselves. */
+  skipDelivery?: boolean;
   activeRunId?: string;
   closed: boolean;
   lastActivity: number;
@@ -203,7 +208,7 @@ interface SessionRecord {
 
 export class CodingAgentOrchestrator {
   private readonly worktrees: Worktrees;
-  private readonly startProcess: (session: { id: string; ownerUserId: string; worktreePath: string; modelRef: string; restored?: boolean }, onEvent: (event: PublicRunEvent) => void) => Promise<AgentProcess>;
+  private readonly startProcess: (session: { id: string; ownerUserId: string; worktreePath: string; modelRef: string; restored?: boolean; skipDelivery?: boolean }, onEvent: (event: PublicRunEvent) => void) => Promise<AgentProcess>;
   private readonly maxActiveSessions: number;
   private readonly deadlineMs: number;
   private readonly availableModelRefs: Set<string>;
@@ -226,6 +231,9 @@ export class CodingAgentOrchestrator {
   private readonly captureTraceContext?: (id: string) => string | undefined;
   private readonly requireVerification: boolean;
   private readonly archivePatch?: PatchArchiver;
+  private readonly deliveryApproval?: DeliveryApprovalOptions;
+  /** Runs waiting for the owner to approve their diff, with the approval and the digest it binds. */
+  private readonly deliveries = new Map<string, { approvalId: string; digest: string }>();
   /** Text of the assistant message currently streaming, per run; replaced by the final answer. */
   private readonly streamingAnswers = new Map<string, string>();
   /** Terminal runs already reported to observers, keyed to the update they were reported at (resume revives runs). */
@@ -254,6 +262,8 @@ export class CodingAgentOrchestrator {
     requireVerification?: boolean;
     /** Keeps the patch of every run that is rolled back instead of delivered, profile or not. */
     archivePatch?: PatchArchiver;
+    /** Off by default: the owner approves the final diff before it is committed. */
+    deliveryApproval?: DeliveryApprovalOptions;
   }) {
     this.captureState = options.captureState;
     this.observeRun = options.observeRun; this.observeLifecycle = options.observeLifecycle;
@@ -269,6 +279,8 @@ export class CodingAgentOrchestrator {
     this.captureTraceContext = options.captureTraceContext;
     this.requireVerification = options.requireVerification === true;
     this.archivePatch = options.archivePatch;
+    this.deliveryApproval = options.deliveryApproval;
+    if (this.deliveryApproval && !this.worktrees.patch) throw new Error("Delivery approval needs worktrees.patch to bind the approved diff");
   }
 
   async restore(): Promise<void> {
@@ -299,11 +311,15 @@ export class CodingAgentOrchestrator {
         await this.quality?.archive?.({ run_id: latestRun.run_id, worktree: saved.worktreePath, baseline: saved.baselineCommit, requirement: "Interrupted workflow", attempt: 0, signal: new AbortController().signal });
         await this.retainPatch(latestRun, saved.worktreePath, saved.baselineCommit);
         await this.worktrees.rollback(saved.worktreePath, saved.baselineCommit);
+        if (latestRun.phase === "awaiting_delivery") {
+          latestRun.error = { code: "delivery_interrupted", message: "The runtime restarted before the changes were delivered; the patch was kept" };
+          this.updateRun(latestRun, "failed");
+        }
       }
       let session!: SessionRecord;
       const modelRef = saved.modelRef ?? resolveAgentModel().ref;
       const process = await this.startProcess(
-        { id: saved.id, ownerUserId: saved.ownerUserId, worktreePath: saved.worktreePath, modelRef, restored: true },
+        { id: saved.id, ownerUserId: saved.ownerUserId, worktreePath: saved.worktreePath, modelRef, restored: true, ...(saved.skipDelivery ? { skipDelivery: true } : {}) },
         (event) => this.handleProcessEvent(session.id, event),
       );
       session = { ...saved, modelRef, autoRouting: saved.autoRouting === true, process };
@@ -313,7 +329,7 @@ export class CodingAgentOrchestrator {
     await this.persistState();
   }
 
-  async createSession(input: SessionInput, trustedBase?: string, trustedRunId?: string): Promise<{ session_id: string; run_id: string; status: "starting" }> {
+  async createSession(input: SessionInput, trustedBase?: string, trustedRunId?: string, trusted: { delivery?: "skip" } = {}): Promise<{ session_id: string; run_id: string; status: "starting" }> {
     if (this.stateStore?.healthy === false) throw new RuntimeError("Runtime control store unavailable", "control_unavailable", 503);
     const requestedAt = new Date().toISOString();
     validateSessionInput(input);
@@ -341,7 +357,8 @@ export class CodingAgentOrchestrator {
       }
     }
     if (this.pendingThreadKeys.has(key)) throw new RuntimeConflictError("This Slack thread is already creating a session");
-    const activeSessions = [...this.sessions.values()].filter((session) => !session.closed && session.activeRunId).length;
+    // A run waiting for its owner to deliver holds no container work, so it does not use a slot.
+    const activeSessions = [...this.sessions.values()].filter((session) => !session.closed && session.activeRunId && !this.deliveries.has(session.activeRunId)).length;
     if (activeSessions + this.startingSessions >= this.maxActiveSessions) throw new RuntimeBusyError();
 
     const sessionId = randomUUID();
@@ -361,7 +378,7 @@ export class CodingAgentOrchestrator {
       let process: AgentProcess;
       try {
         process = await this.startProcess(
-          { id: sessionId, ownerUserId: input.user_id, worktreePath: worktree.path, modelRef: route.modelRef },
+          { id: sessionId, ownerUserId: input.user_id, worktreePath: worktree.path, modelRef: route.modelRef, ...(trusted.delivery === "skip" ? { skipDelivery: true } : {}) },
           (event) => this.handleProcessEvent(session.id, event),
         );
       } catch (error) {
@@ -378,6 +395,7 @@ export class CodingAgentOrchestrator {
         branch: worktree.branch,
         baselineCommit: worktree.baselineCommit,
         process,
+        ...(trusted.delivery === "skip" ? { skipDelivery: true } : {}),
         closed: false,
         lastActivity: Date.now(),
       };
@@ -486,6 +504,10 @@ export class CodingAgentOrchestrator {
     if (result.code === "wrong_run" || result.code === "expired" || result.code === "already_used") {
       throw new RuntimeConflictError(`Approval is ${result.code.replace("_", " ")}`);
     }
+    if (this.deliveries.get(runId)?.approvalId === approvalId) {
+      await this.decideDelivery(session, run, approvalId, decision);
+      return;
+    }
     if (decision === "reject" && !this.claimTerminal(run)) {
       throw new RuntimeConflictError("Run is already finalizing");
     }
@@ -516,6 +538,10 @@ export class CodingAgentOrchestrator {
     if (isTerminal(run.status)) throw new RuntimeConflictError("Run is already terminal");
     const session = this.requireSession(run.session_id);
     if (!this.claimTerminal(run)) throw new RuntimeConflictError("Run is already finalizing");
+    if (this.deliveries.delete(runId)) {
+      await this.failClaimedRun(session, run, { code: "delivery_rejected", message: "The owner cancelled the run before delivery; the patch was kept" });
+      return;
+    }
     if (!await this.stopBeforeRollback(session, run)) {
       await this.persistState();
       return;
@@ -906,8 +932,18 @@ export class CodingAgentOrchestrator {
         return;
       }
     }
+    if (this.deliveryApproval && !session.skipDelivery) {
+      await this.requestDelivery(session, run);
+      return;
+    }
     // Claim synchronously after settle so cancellation cannot race finalization.
     if (!this.claimTerminal(run)) return;
+    await this.finalizeClaimedRun(session, run);
+  }
+
+  /** Commits the worktree for a run whose terminal claim the caller already holds. */
+  private async finalizeClaimedRun(session: SessionRecord, run: RunRecord): Promise<void> {
+    const workflow = this.workflows.get(run.run_id);
     try {
       let diff: Awaited<ReturnType<Worktrees["inspectDiff"]>>;
       try { diff = await this.worktrees.inspectDiff(session.worktreePath, DEFAULT_DIFF_LIMITS); }
@@ -935,6 +971,93 @@ export class CodingAgentOrchestrator {
       this.finishActiveRun(session, run.run_id);
     }
     await this.persistState();
+  }
+
+  /** Pauses a settled run until its owner approves the exact diff; an empty diff completes directly. */
+  private async requestDelivery(session: SessionRecord, run: RunRecord): Promise<void> {
+    if (isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return;
+    let diff: Awaited<ReturnType<Worktrees["inspectDiff"]>>;
+    let digest: string;
+    let patch: string;
+    try {
+      diff = await this.worktrees.inspectDiff(session.worktreePath, DEFAULT_DIFF_LIMITS);
+      ({ digest, patch } = await this.deliveryCandidate(session, diff));
+    } catch (error) {
+      if (!isTerminal(run.status) && !this.terminalClaims.has(run.run_id)) await this.failRun(session, run, classifyGateError(error));
+      return;
+    }
+    if (isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return;
+    if (!diff.files.length && !diff.bytes) {
+      if (!this.claimTerminal(run)) return;
+      await this.finalizeClaimedRun(session, run);
+      return;
+    }
+    const ttlMs = this.deliveryApproval!.ttlMs;
+    const approval = this.approvals.create({ runId: run.run_id, toolCallId: "delivery", userId: run.owner_user_id, action: `Deliver ${diff.files.length} changed files` }, ttlMs);
+    this.deliveries.set(run.run_id, { approvalId: approval.id, digest });
+    this.workflows.get(run.run_id)?.budget.pause();
+    const previous = this.deadlines.get(run.run_id);
+    if (previous) clearTimeout(previous);
+    const expiry = setTimeout(() => this.background(this.expireDelivery(session, run, approval.id)), ttlMs);
+    expiry.unref();
+    this.deadlines.set(run.run_id, expiry);
+    run.phase = "awaiting_delivery";
+    run.changed_files = diff.files;
+    run.diff_stat = diff.stat;
+    this.updateRun(run, "awaiting_approval");
+    run.events.push({
+      type: "approval",
+      kind: "delivery",
+      approval_id: approval.id,
+      title: `Deliver ${diff.files.length} changed file${diff.files.length === 1 ? "" : "s"}?`,
+      detail: diff.stat,
+      expires_at: new Date(approval.expiresAt).toISOString(),
+      delivery: {
+        files: diff.files,
+        stat: diff.stat,
+        verification_status: run.verification_status ?? "unverified",
+        grader_status: run.grader_status ?? "not_run",
+        excerpt: truncateUtf8(String(redact(patch, this.deliveryApproval!.secrets?.() ?? [])), DELIVERY_EXCERPT_BYTES),
+        delivery_digest: digest,
+      },
+    });
+    await this.persistState();
+  }
+
+  private async deliveryCandidate(session: SessionRecord, diff: Awaited<ReturnType<Worktrees["inspectDiff"]>>): Promise<{ digest: string; patch: string }> {
+    const patch = await this.worktrees.patch!(session.worktreePath);
+    const digest = createHash("sha256").update(JSON.stringify(diff.files)).update("\0").update(patch).digest("hex");
+    return { digest: `sha256:${digest}`, patch };
+  }
+
+  private async decideDelivery(session: SessionRecord, run: RunRecord, approvalId: string, decision: "approve" | "reject"): Promise<void> {
+    const pending = this.deliveries.get(run.run_id)!;
+    if (!this.claimTerminal(run)) throw new RuntimeConflictError("Run is already finalizing");
+    this.deliveries.delete(run.run_id);
+    run.events.push({ type: "approval_decision", decision: decision === "approve" ? "approved" : "rejected", approval_id: approvalId });
+    if (decision === "reject") {
+      await this.failClaimedRun(session, run, { code: "delivery_rejected", message: "The owner discarded the changes; the patch was kept" });
+      return;
+    }
+    let current: string;
+    try {
+      current = (await this.deliveryCandidate(session, await this.worktrees.inspectDiff(session.worktreePath, DEFAULT_DIFF_LIMITS))).digest;
+    } catch (error) {
+      await this.failClaimedRun(session, run, classifyGateError(error));
+      return;
+    }
+    if (current !== pending.digest) {
+      await this.failClaimedRun(session, run, { code: "delivery_candidate_changed", message: "The worktree changed after the delivery card was posted; nothing was committed" });
+      return;
+    }
+    run.phase = "finalizing";
+    await this.finalizeClaimedRun(session, run);
+  }
+
+  private async expireDelivery(session: SessionRecord, run: RunRecord, approvalId: string): Promise<void> {
+    if (this.deliveries.get(run.run_id)?.approvalId !== approvalId || !this.claimTerminal(run)) return;
+    this.deliveries.delete(run.run_id);
+    await this.failClaimedRun(session, run, { code: "delivery_expired", message: "Nobody delivered the changes before the approval expired; the patch was kept" });
   }
 
   private async failRun(session: SessionRecord, run: RunRecord, failure: RunFailure): Promise<void> {
@@ -1071,7 +1194,7 @@ export class CodingAgentOrchestrator {
           this.deadlines.delete(run.run_id); this.workflows.delete(run.run_id); session.activeRunId = undefined;
           await this.persistState();
         } catch { run.error = { code: 'shutdown_stop_unconfirmed',message: 'Read-only workers could not be confirmed stopped; evidence retained' }; this.updateRun(run,'failed'); await this.persistState(); }
-      } else if (session.activeRunId) { try { await this.cancel(session.activeRunId, session.ownerUserId); } catch { /* retain worktree if stop fails */ } }
+      } else if (session.activeRunId && !this.deliveries.has(session.activeRunId)) { try { await this.cancel(session.activeRunId, session.ownerUserId); } catch { /* retain worktree if stop fails */ } }
       try { await session.process.close(); } catch { /* stop failure already audited */ }
     }
   }
@@ -1144,6 +1267,7 @@ export class CodingAgentOrchestrator {
         branch: session.branch,
         baselineCommit: session.baselineCommit,
         activeRunId: session.activeRunId,
+        ...(session.skipDelivery ? { skipDelivery: true } : {}),
         closed: session.closed,
         lastActivity: session.lastActivity,
       })),
@@ -1199,4 +1323,22 @@ function validateSessionInput(input: SessionInput): void {
 
 function isTerminal(status: RunStatus): boolean {
   return ["completed", "rejected", "cancelled", "failed", "timed_out", "interrupted"].includes(status);
+}
+
+export interface DeliveryApprovalOptions {
+  /** How long the owner has to deliver before the changes are discarded (patch kept). */
+  ttlMs: number;
+  /** Extra secret values to mask in the diff excerpt shown on the delivery card. */
+  secrets?: () => string[];
+}
+
+const DELIVERY_EXCERPT_BYTES = 1_800;
+
+function truncateUtf8(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text) <= maxBytes) return text;
+  const marker = "\n… (truncated)";
+  let cut = Buffer.from(text).subarray(0, maxBytes - Buffer.byteLength(marker)).toString("utf8");
+  // A split multi-byte character decodes to U+FFFD; drop it.
+  cut = cut.replace(/\uFFFD$/, "");
+  return `${cut}${marker}`;
 }
