@@ -36,6 +36,7 @@ import type { CiRepairs } from "./ci-repair.js";
 import { loadProfile, type VerificationProfile } from "./verification.js";
 import { createQualityServices } from "./workflow-runtime.js";
 import { DEFAULT_DIFF_LIMITS, WorktreeManager } from "./worktree-manager.js";
+import { parseGraderConfig } from "./grader-config.js";
 
 const exec = promisify(execFile);
 export const DEFAULT_AGENT_RUNTIME_PORT = 3001;
@@ -357,7 +358,7 @@ export async function createProductionServer() {
     if (repositoryFromRemote(remote)?.toLowerCase() !== trustedProfile.profile.repository.toLowerCase()) throw new Error("Verification profile repository does not match the checkout origin");
   }
   if (trustedProfile?.profile.structuredWorkflow?.enabled && !configuredModels.some(model => model.ref === "openai/gpt-5.6-luna")) throw new Error("Structured workflow requires configured Luna worker provider");
-  if (trustedProfile && !configuredModels.some(model => model.ref === "openai/gpt-5.6-sol")) throw new Error("Quality workflow requires configured Sol grader provider");
+  const grader = trustedProfile ? parseGraderConfig(process.env, configuredModels) : undefined;
   const executionParents = new Map<string, string>();
   function executionExpiry(id: string) {
     const parent = executionParents.get(id);
@@ -378,10 +379,10 @@ export async function createProductionServer() {
       telemetry?.addSecret(token,id); return token;
     } } : undefined,
     phase: (id, phase, cost) => orchestrator.qualityPhase(id, phase, cost),
-    token: (id, route) => {
-      const model = resolveAgentModel(route?.modelRef ?? "openai/gpt-5.6-sol");
-      const role = route ? "investigator" : "grader";
-      const token = issueGatewayToken({ runId: id, workflowRunId: executionParents.get(id), role, outputTokenLimit: outputTokenLimitFor(role), provider: model.provider, model: model.id, api: model.api, reasoningEffort: route?.effort ?? "high", expiresAt: executionExpiry(id), traceparent: tracing?.traceparent(id) }, gatewaySecret);
+    grader,
+    token: (id, route, role) => {
+      const model = resolveAgentModel(route.modelRef);
+      const token = issueGatewayToken({ runId: id, workflowRunId: executionParents.get(id), role, outputTokenLimit: outputTokenLimitFor(role), provider: model.provider, model: model.id, api: model.api, reasoningEffort: route.effort, expiresAt: executionExpiry(id), traceparent: tracing?.traceparent(id) }, gatewaySecret);
       telemetry?.addSecret(token, id); return token;
     },
   }) : undefined;

@@ -14,6 +14,7 @@ import { MCP_SERVERS, namespacedMcpToolNames } from "./mcp-config.js";
 import { StartupTiming } from "./startup-timing.js";
 import { taskMode, type TaskMode } from "./task-mode.js";
 import { agentScheduler } from "./agent-scheduler.js";
+import type { DiffLimits } from "./worktree-manager.js";
 
 export interface AgentContainerOptions {
   taskMode?: TaskMode;
@@ -37,7 +38,7 @@ export interface AgentContainerOptions {
   user?: string;
   mcp?: McpRunConfig;
   readOnlyWorkspace?: boolean;
-  graderContext?: { candidate_hash: string; rubric: string[] };
+  graderContext?: { candidate_hash: string; rubric: string[]; allowed_paths?: string[]; diff_limits?: DiffLimits; deleted_paths?: string[] };
   workflowContext?: { role: string; wave: number; paths: string[]; previousTasks: unknown[]; mcpTools?: string[] };
   directMcpOnly?: boolean;
   workflowKey?: string;

@@ -97,6 +97,8 @@ export interface RunRecord {
   grader_findings?: Array<{ path: string; line: number; severity: string; reason: string }>;
   verification_status?: string;
   grader_status?: string;
+  /** Why the last grade was a harness-made unknown, when it was. */
+  grader_cause?: { code: string; message: string };
   publication_status?: string;
   attempts?: Array<{ attempt: number; execution_id: string; candidate_hash?: string; verification_status?: string; grader_status?: string; artifact?: string }>;
   run_id: string;
@@ -818,7 +820,9 @@ export class CodingAgentOrchestrator {
           if (result.failure?.code === "scope_violation") {
             await this.failRun(session, run, { code: "scope_violation", message: `Changes outside the allowed paths were not delivered: ${result.failure.files.slice(0, 10).join(", ")}` }); return;
           }
-          await this.failRun(session, run, { code: "verification_failed", message: "Candidate retained as an isolated artifact; verification/grading did not pass" }); return;
+          if (result.grade?.cause) run.grader_cause = result.grade.cause;
+          const cause = result.failure?.code === "verification_failed" ? result.failure.cause_code : undefined;
+          await this.failRun(session, run, { code: "verification_failed", message: "Candidate retained as an isolated artifact; verification/grading did not pass", ...(cause ? { cause_code: cause } : {}) }); return;
         }
         await this.quality.assertUnchanged(result.candidate, input);
         workflow.controller.signal.throwIfAborted();
