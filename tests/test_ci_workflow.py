@@ -66,3 +66,27 @@ def test_example_profile_ci_jobs_exist():
     named = {check["ciJob"] for check in profile["checks"] if "ciJob" in check}
     assert named, "the example profile maps checks to CI jobs"
     assert named <= set(jobs), f"unknown CI jobs: {sorted(named - set(jobs))}"
+
+
+def test_grader_calibration_is_a_manual_budgeted_live_run():
+    workflow = _workflow("grader-calibration.yml")
+    # PyYAML reads the bare `on` key as True.
+    triggers = workflow[True]
+    assert list(triggers) == ["workflow_dispatch"]
+    inputs = triggers["workflow_dispatch"]["inputs"]
+    assert inputs["repeats"]["default"] == "3"
+    assert inputs["max_cost_usd"]["default"] == "2"
+    assert {"model", "update_baseline"} <= set(inputs)
+    assert workflow["permissions"] == {"contents": "read"}
+    job = workflow["jobs"]["calibrate"]
+    text = _run_text(job)
+    for dockerfile in DOCKERFILES:
+        assert dockerfile in text
+    assert "secrets.OPENAI_API_KEY" in json.dumps(job)
+    assert "scripts/grader_calibration.py" in text
+    for flag in ("--live-openai", "--max-cost-usd", "--update-baseline"):
+        assert flag in text
+    assert "set -o pipefail" in text
+    upload = next(s for s in job["steps"] if "upload-artifact" in s.get("uses", ""))
+    assert upload["if"] == "always()"
+    assert "eval/grader-baseline.json" in upload["with"]["path"]

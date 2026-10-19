@@ -11,21 +11,37 @@ closed when the baseline or any metric is missing.
 
     python scripts/grader_calibration.py            # check every case loads
     python scripts/grader_calibration.py --records grades.jsonl
+    python scripts/grader_calibration.py --live-openai --repeats 3 --max-cost-usd 2
+
+The records come from ``agent-runtime/src/grader-calibration-cli.ts``: one
+``grade`` line per (case, repeat) and a closing ``run`` line that says whether
+the run is complete. ``--live-openai`` boots the validator topology, runs the
+CLI against its model gateway (spending real model budget) and scores it.
 """
 
 import argparse
 import collections
+import datetime
 import json
 import math
+import os
 import pathlib
 import shutil
 import subprocess
 import sys
 import tempfile
 
+try:
+    from scripts import validate_structured_workflow as topology
+except ImportError:  # executed as ``python scripts/grader_calibration.py``
+    import validate_structured_workflow as topology
+
 PROJECT = pathlib.Path(__file__).resolve().parents[1]
 CASES_DIR = PROJECT / "eval/grader-calibration"
 BASELINE = PROJECT / "eval/grader-baseline.json"
+RESULTS = PROJECT / "eval/results/grader-calibration.jsonl"
+CLI = PROJECT / "agent-runtime/dist/src/grader-calibration-cli.js"
+DEFAULT_GRADER_MODEL = "openai/gpt-5.6-sol"
 EXPECTATIONS = ("pass", "fail")
 # Controls are the only cases a correct grader passes.
 CATEGORIES = {
@@ -51,6 +67,8 @@ CONTRACT_METRICS = {
     "invalid_rate": ("lower_abs", 0.05),
     "cost_usd": ("lower", 0.25),
 }
+# Absolute caps a new baseline starts with, whatever the first run measured.
+DEFAULT_CEILINGS = {"invalid_rate": 0.10, "false_pass_rate": 0.2}
 
 
 class CaseError(ValueError):
@@ -299,33 +317,212 @@ def evaluate_contract(summary, baseline):
     return failures
 
 
-def _read_records(path):
+def read_run(path):
+    """Split the CLI's JSONL into grade records and its closing ``run`` line.
+
+    Lines without a ``type`` are grade records too, so hand-written record
+    files keep working; ``run`` is None when the output was cut short.
+    """
+    records, run = [], None
     with open(path) as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+        for line in handle:
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if isinstance(value, dict) and value.get("type") == "run":
+                run = value
+            else:
+                records.append(value)
+    return records, run
 
 
-def main(argv=None):
+def run_failures(run, records):
+    """A calibration counts only when the CLI finished every (case, repeat)."""
+    if run is None:
+        return ["calibration incomplete: no run summary line"]
+    if run.get("complete") is not True:
+        reason = run.get("reason") or "not complete"
+        return [
+            f"calibration incomplete: {reason} "
+            f"({run.get('records')} of {run.get('expected_records')} records)"
+        ]
+    if run.get("records") != len(records):
+        return [
+            f"calibration incomplete: {len(records)} grade lines "
+            f"but the run reports {run.get('records')}"
+        ]
+    return []
+
+
+def cli_command(
+    cases, out, repeats, max_cost_usd, grader_model, gateway, base_env=None
+):
+    """argv and environment for a live CLI run against ``gateway``.
+
+    The signing secret travels in the environment, never argv; provider keys
+    stay with the gateway, so the CLI environment drops them.
+    """
+    env = {
+        key: value
+        for key, value in (os.environ if base_env is None else base_env).items()
+        if not any(part in key for part in ("API_KEY", "MODEL_GATEWAY", "PI_AGENT_"))
+    }
+    env["MODEL_GATEWAY_SIGNING_SECRET"] = gateway["signing_secret"]
+    argv = [
+        "node",
+        str(CLI),
+        "--cases",
+        str(cases),
+        "--out",
+        str(out),
+        "--repeats",
+        str(repeats),
+        "--max-cost-usd",
+        str(max_cost_usd),
+        "--grader-model",
+        grader_model,
+        "--gateway-url",
+        gateway["gateway_url"],
+        "--network",
+        gateway["network"],
+        "--image",
+        gateway["image"],
+        "--budget-ledger",
+        gateway["budget_ledger"],
+    ]
+    return argv, env
+
+
+def _live_profile(case, image):
+    return {
+        "id": "grader-calibration",
+        "repository": "fixture/grader-calibration",
+        "image": image,
+        "rubric": case["rubric"],
+        "allowedPaths": case["allowedPaths"],
+        "baselinePaths": case["baselinePaths"],
+        "checks": [
+            {
+                "name": "unit",
+                "argv": ["node", "--test", "tests/runtime.test.cjs"],
+                "cwd": ".",
+                "timeoutMs": 30000,
+            }
+        ],
+    }
+
+
+def run_live(args, cases):
+    """Boot the validator topology and grade every case through its gateway."""
+    key = topology.read_openai_key()
+    image = topology.verification_image_id()
+    root = topology.make_root("grader-calibration-")
+    # The runtime needs a repository and profile to boot; the grader never sees them.
+    repo = root / "repo"
+    shutil.copytree(cases[0]["base"], repo)
+    topology.init_fixture_repo(repo, remote="https://github.com/fixture/grader.git")
+    profile = root / "profile.json"
+    profile.write_text(json.dumps(_live_profile(cases[0], image)))
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    with topology.Topology(PROJECT, root, repo, key, profile) as booted:
+        argv, env = cli_command(
+            args.cases,
+            args.out,
+            args.repeats,
+            args.max_cost_usd,
+            args.grader_model,
+            booted.grader_gateway(),
+        )
+        _run_cli(argv, env)
+    return args.out
+
+
+def _run_cli(argv, env):
+    subprocess.run(argv, env=env, check=True)
+
+
+def write_baseline(summary, path, records_path):
+    baseline = {
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(
+            timespec="seconds"
+        ),
+        "records": str(records_path.name),
+        "metrics": {metric: summary[metric] for metric in CONTRACT_METRICS},
+        "tolerance": {metric: spec[1] for metric, spec in CONTRACT_METRICS.items()},
+    }
+    # Ceilings are hand-set policy; carry them over rather than reset them.
+    baseline["ceilings"] = _read_baseline(path).get("ceilings") or DEFAULT_CEILINGS
+    path.write_text(json.dumps(baseline, indent=2) + "\n")
+
+
+def _read_baseline(path):
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--cases", type=pathlib.Path, default=CASES_DIR)
     parser.add_argument("--records", type=pathlib.Path, help="grade records (JSONL)")
     parser.add_argument("--baseline", type=pathlib.Path, default=BASELINE)
+    parser.add_argument(
+        "--update-baseline",
+        action="store_true",
+        help="write the metrics to --baseline instead of comparing",
+    )
+    parser.add_argument(
+        "--live-openai",
+        action="store_true",
+        help="grade every case through the live model gateway (spends model budget)",
+    )
+    parser.add_argument("--repeats", type=int, help="live: grades per case (3)")
+    parser.add_argument("--max-cost-usd", type=float, help="live: stop once spent (2)")
+    parser.add_argument("--grader-model", default=DEFAULT_GRADER_MODEL)
+    parser.add_argument("--out", type=pathlib.Path, default=RESULTS)
     args = parser.parse_args(argv)
+    if not args.live_openai:
+        if args.repeats is not None or args.max_cost_usd is not None:
+            parser.error("--repeats/--max-cost-usd grade live: pass --live-openai")
+        return args
+    if args.records is not None:
+        parser.error("--live-openai writes its own records; drop --records")
+    args.repeats = 3 if args.repeats is None else args.repeats
+    args.max_cost_usd = 2.0 if args.max_cost_usd is None else args.max_cost_usd
+    if args.repeats < 1:
+        parser.error("--repeats must be at least 1")
+    if not args.max_cost_usd > 0:
+        parser.error("--max-cost-usd must be positive")
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
     try:
         cases = load_cases(args.cases)
     except CaseError as error:
         print(f"invalid calibration case: {error}", file=sys.stderr)
         return 1
+    if args.live_openai:
+        args.records = run_live(args, cases)
     if args.records is None:
         print(f"{len(cases)} calibration cases load")
         return 0
-    summary = aggregate(
-        _read_records(args.records), {case["id"]: case["expected"] for case in cases}
-    )
-    try:
-        baseline = json.loads(args.baseline.read_text())
-    except (OSError, ValueError):
-        baseline = None
-    failures = evaluate_contract(summary, baseline)
+    records, run = read_run(args.records)
+    failures = run_failures(run, records)
+    summary = aggregate(records, {case["id"]: case["expected"] for case in cases})
+    if args.update_baseline:
+        failures += [
+            f"{metric}: missing from calibration summary"
+            for metric in CONTRACT_METRICS
+            if _number(summary.get(metric)) is None
+        ]
+        if not failures:
+            write_baseline(summary, args.baseline, args.records)
+    else:
+        failures += evaluate_contract(summary, _read_baseline(args.baseline) or None)
     print(json.dumps({"summary": summary, "failures": failures}, indent=2))
     return 1 if failures else 0
 
