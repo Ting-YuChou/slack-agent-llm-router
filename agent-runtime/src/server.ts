@@ -454,7 +454,7 @@ export async function createProductionServer() {
           pluginPaths: lock.plugins.map((plugin) => plugin.container_path),
           skillPaths: skillLock.skills.map((skill) => skill.container_path),
           continueSession: session.restored,
-          safeCommands: parseSafeCommands(process.env.PI_AGENT_SAFE_COMMANDS),
+          safeCommands: parseSafeCommands(process.env.PI_AGENT_SAFE_COMMANDS, { profiled: Boolean(trustedProfile) }),
           limits: agentLimits.base,
           routeLimits: agentLimits,
           ...(trustedProfile ? { writerContext: writerContextFor(trustedProfile.profile) } : {}),
@@ -719,9 +719,12 @@ export function writerContextFor(profile: VerificationProfile): WriterContext {
   return { allowedPaths: [...profile.allowedPaths], checks: profile.checks.map((check) => check.name), rubric: [...profile.rubric], diffLimits: { ...DEFAULT_DIFF_LIMITS } };
 }
 
-function parseSafeCommands(value: string | undefined): string[] {
+const TEST_RUNNERS = new Set(["npm test", "npm run test", "pytest", "python -m pytest"]);
+
+/** With a trusted profile the writer tests through run_checks (no network, no token, baseline config), not bash. */
+export function parseSafeCommands(value: string | undefined, options: { profiled: boolean } = { profiled: false }): string[] {
   const defaults = ["npm test", "npm run test", "npm run lint", "npm run build", "pytest", "python -m pytest"];
-  if (!value) return defaults;
+  if (!value) return options.profiled ? defaults.filter(command => !TEST_RUNNERS.has(command)) : defaults;
   return value.split("||").map((command) => command.trim()).filter(Boolean);
 }
 function logEvent(event: string, fields: Record<string, unknown>): void {
