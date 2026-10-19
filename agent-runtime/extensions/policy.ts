@@ -11,6 +11,8 @@ import { codemodeMcpPrompt, type McpServerId } from "../dist/src/mcp-config.js";
 const MAX_TURNS = Number(process.env.PI_AGENT_MAX_TURNS ?? "20");
 const MAX_TOOL_CALLS = Number(process.env.PI_AGENT_MAX_TOOL_CALLS ?? "40");
 const APPROVAL_TIMEOUT_MS = 300_000;
+// Anything but an explicit "none" keeps per-write prompts, so a typo never silently drops approval.
+const WRITE_APPROVAL = process.env.PI_AGENT_WRITE_APPROVAL === "none" ? "none" : "per_prompt";
 
 function safeCommands(): string[] {
   try {
@@ -159,7 +161,7 @@ export default function policyExtension(pi: ExtensionAPI) {
       if (event.toolName === "write" && typeof event.input.content === "string" && Buffer.byteLength(event.input.content) > 256 * 1024) {
         return { block: true, reason: "Single write exceeds 256 KiB" };
       }
-      if (!writeApproved) {
+      if (!writeApproved && WRITE_APPROVAL === "per_prompt") {
         const approved = await ctx.ui.confirm(
           `Allow workspace ${event.toolName}?`,
           previewWrite(event.toolName, event.input),
@@ -182,7 +184,7 @@ export default function policyExtension(pi: ExtensionAPI) {
       if (decision.decision === "block") return { block: true, reason: `Command permanently blocked: ${decision.reason}` };
       if (decision.decision === "allow") return undefined;
       const taint = decision.decision === "allow_after_write_approval" ? await testConfigTaint(ctx.cwd, writtenPaths) : undefined;
-      if (decision.decision === "allow_after_write_approval" && writeApproved && !taint) return undefined;
+      if (decision.decision === "allow_after_write_approval" && (writeApproved || WRITE_APPROVAL === "none") && !taint) return undefined;
       const approved = await ctx.ui.confirm(
         "Allow shell command?",
         `${taint ? `Needs approval because ${taint}.\n\n` : ""}${command.slice(0, 4_000)}`,

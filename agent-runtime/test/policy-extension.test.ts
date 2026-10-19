@@ -148,3 +148,33 @@ test("configured commands need approval when git cannot list changed files", () 
   assert.equal(prompts.length, 2);
   assert.match(prompts[1]!, /could not list changed files/);
 })));
+
+test("write approval mode none skips write prompts but keeps scope, protection and size limits", () => withRepo((cwd) => withSafeCommands(["pytest"], async () => {
+  const policy = await loadPolicy({ PI_AGENT_WRITE_APPROVAL: "none", PI_AGENT_WRITER_JSON: JSON.stringify(writerContext) });
+  const { prompts, ctx } = confirmingCtx(cwd);
+  await policy.fire("input", {}, ctx);
+  assert.equal(await policy.fire("tool_call", { toolName: "write", input: { path: "src/a.py", content: "x" } }, ctx), undefined);
+  assert.equal(await policy.fire("tool_call", { toolName: "edit", input: { path: "src/a.py", edits: [] } }, ctx), undefined);
+  assert.equal(await policy.fire("tool_call", { toolName: "bash", input: { command: "pytest -q" } }, ctx), undefined);
+  assert.deepEqual(prompts, []);
+  for (const input of [
+    { path: "docs/a.md", content: "x" },
+    { path: "src/.env", content: "x" },
+    { path: "src/big.txt", content: "x".repeat(256 * 1024 + 1) },
+  ]) {
+    const blocked = await policy.fire("tool_call", { toolName: "write", input }, ctx) as { block?: boolean } | undefined;
+    assert.equal(blocked?.block, true, input.path);
+  }
+  assert.equal(await policy.fire("tool_call", { toolName: "bash", input: { command: "python script.py" } }, ctx), undefined);
+  assert.equal(prompts.length, 1, "unlisted shell commands still prompt");
+})));
+
+test("an unset or unknown write approval mode keeps per-write prompts", () => withWorkspace(async (cwd) => {
+  for (const env of [{}, { PI_AGENT_WRITE_APPROVAL: "nope" }] as Array<Record<string, string>>) {
+    const policy = await loadPolicy(env);
+    const { prompts, ctx } = confirmingCtx(cwd);
+    await policy.fire("input", {}, ctx);
+    await policy.fire("tool_call", { toolName: "write", input: { path: "a.txt", content: "x" } }, ctx);
+    assert.equal(prompts.length, 1, JSON.stringify(env));
+  }
+}));
