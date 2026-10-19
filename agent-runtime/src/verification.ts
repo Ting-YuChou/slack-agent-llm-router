@@ -5,6 +5,7 @@ import { mkdir, readFile, writeFile, lstat, copyFile, realpath } from "node:fs/p
 import path from "node:path";
 import { validateWorkspacePath } from "./policy.js";
 import { redact } from "./telemetry.js";
+import { excerpt, parseDiagnostics } from "./check-report.js";
 import type { Candidate, VerificationResult } from "./quality-gate.js";
 const exec = promisify(execFile);
 export interface VerificationProfile {
@@ -102,17 +103,19 @@ export class DockerVerifier {
       const container = "pi-verify-" + randomUUID();
       const args = ["run", "--rm", "--name", container, "--label", "slack-pi-agent-session=true", "--network", "none", "--read-only", "--user", `${process.getuid?.()}:${process.getgid?.()}`, "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--cpus", "2", "--memory", "2g", "--pids-limit", "256", "--tmpfs", "/tmp:rw,nosuid,size=536870912", "--tmpfs", "/workspace:rw,nosuid,size=1073741824,mode=1777", "--mount", `type=bind,src=${candidate.path},dst=/candidate,readonly`, "--mount", `type=bind,src=${path.join(path.dirname(candidate.path), "baseline")},dst=/baseline,readonly`, this.profile.image, "node", "/opt/pi/dist/src/verification-entry.js", JSON.stringify({ ...check, mode, baselinePaths: this.profile.baselinePaths })];
       this.active.add(container);
-      let output = ""; let exit: number | null = null;
+      let output = ""; let exit: number | null = null; let timedOut = false;
       const stop = () => { void exec("docker", ["kill", container], { timeout: 5000 }).catch(() => {}); };
       signal.addEventListener("abort", stop, { once: true });
       try {
         const result = await exec("docker", args, { timeout: check.timeoutMs, signal, maxBuffer: 4 * 1024 * 1024, env: { PATH: process.env.PATH } }); output = result.stdout + result.stderr; exit = 0;
-      } catch (error: any) { output = String(error.stdout ?? "") + String(error.stderr ?? ""); exit = typeof error.code === "number" && ![125, 126, 127].includes(error.code) && !error.killed ? error.code : null; }
+      } catch (error: any) { output = String(error.stdout ?? "") + String(error.stderr ?? ""); exit = typeof error.code === "number" && ![125, 126, 127].includes(error.code) && !error.killed ? error.code : null; timedOut = error.killed === true && !signal.aborted; }
       finally { signal.removeEventListener("abort", stop); await this.remove(container); }
       signal.throwIfAborted();
       const artifact = path.join(path.dirname(candidate.path), `${mode}-${check.name.replace(/[^\w-]/g, "_")}.log`);
       await writeFile(artifact, String(redact(output)), { mode: 0o600 });
-      checks.push({ name: `${mode}:${check.name}`, status: exit === 0 ? "passed" : exit === null ? "unknown" : "failed", exit_code: exit, duration_ms: performance.now() - started, ...parseVerificationCounts(output), artifact });
+      checks.push({ name: `${mode}:${check.name}`, status: exit === 0 ? "passed" : exit === null ? "unknown" : "failed", exit_code: exit, duration_ms: performance.now() - started, ...parseVerificationCounts(output), artifact,
+        ...(exit === 0 ? {} : { failures: parseDiagnostics(output, check.cwd), excerpt: excerpt(output) }),
+        ...(timedOut ? { timed_out: true, cause: "check_timeout" } : exit === null ? { cause: "check_runner_failed" } : {}) });
       if (exit === null) return { status: "unknown", checks };
     }
     return { status: checks.every(c => c.status === "passed") ? "passed" : "failed", checks };

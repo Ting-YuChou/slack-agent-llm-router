@@ -86,3 +86,23 @@ test("harness: quality overrides replace scripted services", async () => {
   assert.equal(run.status, "failed");
   assert.ok(archived >= 1, "failed runs archive through the overridden service");
 });
+
+test("S10 repair prompt carries parsed failures in an untrusted block, never host paths", async () => {
+  const failed = { status: "failed" as const, checks: [
+    { name: "candidate:flake8", status: "failed" as const, exit_code: 1, artifact: "/var/lib/pi-agent/artifacts/run/candidate-flake8.log",
+      failures: [{ file: "src/a.js", line: 1, column: 7, code: "E999", message: "unexpected token" }], excerpt: "src/a.js:1:7: E999 unexpected token" },
+  ] };
+  const { run, prompts } = await runScenario({ name: "S10 structured repair", profile, verify: [failed, "passed"],
+    attempts: [
+      { files: { "src/a.js": "broken\n" }, records: [...piTurn("stop"), settledRecord] },
+      { files: fix, records: [...piTurn("stop"), settledRecord] },
+    ],
+    expect: { status: "completed", committed: true } });
+  assert.equal(run.status, "completed");
+  const repair = prompts[1] ?? "";
+  assert.match(repair, /src\/a\.js:1:7 E999 unexpected token/);
+  const boundary = /<<<(UNTRUSTED-[a-f0-9]+)\n/.exec(repair)?.[1];
+  assert.ok(boundary, "diagnostics sit inside a random-boundary block");
+  assert.ok(repair.trimEnd().endsWith(`${boundary}>>>`));
+  assert.ok(!repair.includes("/var/lib/pi-agent"), "host artifact paths never reach the writer");
+});
