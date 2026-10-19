@@ -6,7 +6,7 @@ import { test } from "node:test";
 
 import { DockerVerifier, VerifierScheduler, validateProfile, verifyConcurrency, type ContainerResult, type RunContainer } from "../src/verification.js";
 
-const base = { id: "p", repository: "o/r", image: `sha256:${"0".repeat(64)}`, rubric: ["ok"], allowedPaths: ["src"] };
+const base = { id: "p", repository: "o/r", image: `sha256:${"0".repeat(64)}`, rubric: ["ok"], allowedPaths: ["src"], isolation: "per_check" as const };
 const spec = (name: string, kind?: "static" | "test") => ({ name, argv: ["run", name], cwd: ".", timeoutMs: 1000, ...(kind ? { kind } : {}) });
 
 async function withCandidate<T>(work: (candidate: { hash: string; path: string }) => Promise<T>): Promise<T> {

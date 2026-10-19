@@ -6,6 +6,7 @@ import { constants } from "node:fs";
 import path from "node:path";
 import { validateWorkspacePath } from "./policy.js";
 import { redact } from "./telemetry.js";
+import { parseRunnerRecords, MAX_LOG_BYTES, type RunnerSpec } from "./verification-runner.js";
 import { excerpt, MAX_REPORT_BYTES, parseDiagnostics, parseJUnit, type CheckFailure } from "./check-report.js";
 import type { Candidate, CheckStatus, VerificationCheck, VerificationResult } from "./quality-gate.js";
 const exec = promisify(execFile);
@@ -18,6 +19,8 @@ export interface VerificationProfile {
   ciCheckout?: "head" | "merge";
   slack?: { team_id: string; channel_id: string; user_id: string }; workflows?: string[];
   structuredWorkflow?: { enabled: boolean; concurrency: number; maxCostUsd: number; activeTimeoutMs: number; discoveryCostUsd: number };
+  /** per_mode (default): one container per mode, each check isolated inside it; per_check: one container per check. */
+  isolation?: "per_mode" | "per_check";
 }
 export const REPORT_TOKEN = "{report}";
 /** File-safe check name used for /out/<check>.report and /out/<check>.log. */
@@ -32,6 +35,7 @@ export function validateProfile(raw: unknown): VerificationProfile {
   if (!Array.isArray(p.rubric) || !p.rubric.length || p.rubric.some(x => typeof x !== "string" || x.length > 2000) || new Set(p.rubric).size !== p.rubric.length) throw new Error("Invalid rubric");
   if (!Array.isArray(p.allowedPaths) || p.allowedPaths.some(x => typeof x !== "string" || !safeRelative(x))) throw new Error("Invalid allowed paths");
   if (!Array.isArray(p.checks) || !p.checks.length || p.checks.some(c => !c || !Array.isArray(c.argv) || !c.argv.length || c.argv.some(x => typeof x !== "string" || x.includes("\0")) || !safeRelative(c.cwd) || !Number.isInteger(c.timeoutMs) || c.timeoutMs <= 0 || typeof c.name !== "string")) throw new Error("Invalid verification command");
+  if (p.isolation !== undefined && !["per_mode", "per_check"].includes(p.isolation)) throw new Error("Invalid verification isolation");
   if (p.checks.some(c => c.kind !== undefined && !["static", "test"].includes(c.kind))) throw new Error("Invalid check kind");
   if (p.checks.some(c => (c.report !== undefined && (!c.report || c.report.format !== "junit")) || (c.report === undefined && c.argv.some(x => x.includes(REPORT_TOKEN))))) throw new Error("Invalid check report");
   if (p.baselinePaths !== undefined && (!Array.isArray(p.baselinePaths) || p.baselinePaths.some(x => typeof x !== "string" || !safeRelative(x)))) throw new Error("Invalid baseline paths");
@@ -47,7 +51,7 @@ export function validateProfile(raw: unknown): VerificationProfile {
     if (!Number.isInteger(config.concurrency) || config.concurrency < 1 || config.concurrency > 4 || !Number.isFinite(config.maxCostUsd) || config.maxCostUsd <= 0 || config.maxCostUsd > 5 || !Number.isInteger(config.activeTimeoutMs) || config.activeTimeoutMs <= 0 || config.activeTimeoutMs > 1_800_000 || !Number.isFinite(config.discoveryCostUsd) || config.discoveryCostUsd <= 0 || config.discoveryCostUsd >= config.maxCostUsd) throw new Error('Invalid structured workflow limits');
     p.structuredWorkflow = config;
   }
-  return { ...p, baselinePaths: p.baselinePaths ?? ["tests/", "agent-runtime/test/"], maxRepairs: Math.min(2, Math.max(0, p.maxRepairs ?? 2)), maxCostUsd: p.maxCostUsd ?? 1, activeTimeoutMs: p.activeTimeoutMs ?? 900_000 };
+  return { ...p, isolation: p.isolation ?? "per_mode", baselinePaths: p.baselinePaths ?? ["tests/", "agent-runtime/test/"], maxRepairs: Math.min(2, Math.max(0, p.maxRepairs ?? 2)), maxCostUsd: p.maxCostUsd ?? 1, activeTimeoutMs: p.activeTimeoutMs ?? 900_000 };
 }
 export async function loadProfile(file: string, repo: string, worktreeRoot: string) {
   const resolved = await realpath(file);
@@ -99,7 +103,7 @@ export class CandidateStore {
   }
 }
 /** What one verifier container produced. `exit` is null when the runner itself failed or was killed. */
-export interface ContainerResult { output: string; exit: number | null; timedOut: boolean }
+export interface ContainerResult { output: string; exit: number | null; timedOut: boolean; stdout?: string }
 export type RunContainer = (run: { name: string; args: string[]; timeoutMs: number; signal: AbortSignal }) => Promise<ContainerResult>;
 
 export const runDockerContainer: RunContainer = async ({ name, args, timeoutMs, signal }) => {
@@ -107,10 +111,10 @@ export const runDockerContainer: RunContainer = async ({ name, args, timeoutMs, 
   signal.addEventListener("abort", stop, { once: true });
   try {
     const result = await exec("docker", args, { timeout: timeoutMs, signal, maxBuffer: 4 * 1024 * 1024, env: { PATH: process.env.PATH } });
-    return { output: result.stdout + result.stderr, exit: 0, timedOut: false };
+    return { output: result.stdout + result.stderr, stdout: result.stdout, exit: 0, timedOut: false };
   } catch (error: any) {
     const output = String(error.stdout ?? "") + String(error.stderr ?? "");
-    return { output, exit: typeof error.code === "number" && ![125, 126, 127].includes(error.code) && !error.killed ? error.code : null, timedOut: error.killed === true && !signal.aborted };
+    return { output, stdout: String(error.stdout ?? ""), exit: typeof error.code === "number" && ![125, 126, 127].includes(error.code) && !error.killed ? error.code : null, timedOut: error.killed === true && !signal.aborted };
   } finally { signal.removeEventListener("abort", stop); }
 };
 
@@ -179,6 +183,7 @@ export class DockerVerifier {
   }
   private async runMode(candidate: Candidate, mode: Mode, checks: VerificationCheckSpec[], signal: AbortSignal): Promise<VerificationCheck[]> {
     const out = path.join(path.dirname(candidate.path), "out", mode); await mkdir(out, { recursive: true, mode: 0o700 });
+    if (this.profile.isolation !== "per_check") return this.scheduler.run(() => this.runModeContainer(candidate, mode, checks, out, signal), signal);
     const results: VerificationCheck[] = [];
     for (const check of checks) {
       signal.throwIfAborted();
@@ -186,6 +191,36 @@ export class DockerVerifier {
       results.push(result);
       if (result.status === "unknown") break;
     }
+    return results;
+  }
+  /** One container runs the whole mode; each check gets a fresh workspace, HOME, Redis and its own timeout inside it. */
+  private async runModeContainer(candidate: Candidate, mode: Mode, checks: VerificationCheckSpec[], out: string, signal: AbortSignal): Promise<VerificationCheck[]> {
+    const container = "pi-verify-" + randomUUID();
+    const spec: RunnerSpec = { runner: "mode", mode, baselinePaths: this.profile.baselinePaths, checks: checks.map(check => ({ name: check.name, file: checkFileName(check.name), argv: checkArgv(check), cwd: check.cwd, timeoutMs: check.timeoutMs })) };
+    const args = ["run", "--rm", "--name", container, ...this.isolationArgs(candidate, out), this.profile.image, "node", "/opt/pi/dist/src/verification-entry.js", JSON.stringify(spec)];
+    // Each check's own timeout plus workspace copy and Redis start-up.
+    const timeoutMs = checks.reduce((total, check) => total + check.timeoutMs + 15_000, 30_000);
+    this.active.add(container);
+    let result: ContainerResult;
+    try { result = await this.runContainer({ name: container, args, timeoutMs, signal }); }
+    finally { await this.remove(container); }
+    signal.throwIfAborted();
+    const { records, violation } = parseRunnerRecords(result.stdout ?? "", checks.map(check => check.name));
+    const results: VerificationCheck[] = [];
+    for (const record of records) {
+      const check = checks[record.seq - 1];
+      const output = (await readLog(out, check.name)) ?? "";
+      const artifact = path.join(path.dirname(candidate.path), `${mode}-${checkFileName(check.name)}.log`);
+      await writeFile(artifact, String(redact(output)), { mode: 0o600 });
+      const exit = record.exit !== null && [125, 126, 127].includes(record.exit) ? null : record.exit;
+      results.push({ name: `${mode}:${check.name}`, status: exit === 0 ? "passed" : exit === null ? "unknown" : "failed", exit_code: exit, duration_ms: record.duration_ms, ...parseVerificationCounts(output), artifact,
+        ...(exit === 0 ? {} : { failures: await checkFailures(check, output, out), excerpt: excerpt(output) }),
+        ...(record.timed_out ? { timed_out: true, cause: "check_timeout" } : exit === null ? { cause: record.cause ?? "check_runner_failed" } : {}) });
+    }
+    const unknown = (check: VerificationCheckSpec, cause: string, timedOut = false): VerificationCheck => ({ name: `${mode}:${check.name}`, status: "unknown", exit_code: null, cause, ...(timedOut ? { timed_out: true } : {}) });
+    // A forged or duplicated record means the latest accepted one cannot be trusted either.
+    if (violation) results.splice(Math.max(0, results.length - 1), 1, unknown(checks[Math.max(0, results.length - 1)], violation));
+    else if (results.length < checks.length && results.at(-1)?.status !== "unknown") results.push(unknown(checks[results.length], result.timedOut ? "mode_timeout" : "runner_incomplete", result.timedOut));
     return results;
   }
   private async runCheck(candidate: Candidate, mode: Mode, check: VerificationCheckSpec, out: string, signal: AbortSignal): Promise<VerificationCheck> {
@@ -215,17 +250,20 @@ export function parseVerificationCounts(output: string) {
   return { passed: passed ? Number(passed[1]) : null, failed: failed ? Number(failed[1]) : null };
 }
 
-/** A report the check wrote to /out; only a regular file within the size limit is read. */
-export async function readReport(out: string, name: string): Promise<Buffer | undefined> {
+/** A file the check wrote to /out; only a regular file within `max` bytes is read, never through a symlink. */
+async function readOut(file: string, max: number): Promise<Buffer | undefined> {
   let handle;
-  try { handle = await open(path.join(out, `${checkFileName(name)}.report`), constants.O_RDONLY | constants.O_NOFOLLOW); }
+  try { handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW); }
   catch { return undefined; }
   try {
     const stat = await handle.stat();
-    if (!stat.isFile() || stat.size > MAX_REPORT_BYTES) return undefined;
+    if (!stat.isFile() || stat.size > max) return undefined;
     return await handle.readFile();
   } finally { await handle.close(); }
 }
+export const readReport = (out: string, name: string) => readOut(path.join(out, `${checkFileName(name)}.report`), MAX_REPORT_BYTES);
+/** The runner caps logs at 8 MiB plus its truncation marker. */
+export const readLog = async (out: string, name: string) => (await readOut(path.join(out, `${checkFileName(name)}.log`), MAX_LOG_BYTES + 64))?.toString();
 
 /** JUnit failures when the check has a parseable report, otherwise diagnostics parsed from its log. */
 async function checkFailures(check: VerificationCheckSpec, output: string, out: string): Promise<CheckFailure[]> {
