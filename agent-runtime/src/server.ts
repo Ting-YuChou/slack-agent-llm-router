@@ -11,6 +11,9 @@ import { PiRunCapture } from "./pi-capture.js";
 import { AgentTelemetry, isCredentialKey } from "./telemetry.js";
 import { AgentTracing } from "./tracing.js";
 import { DockerPiProcess, type WriterContext } from "./container-runtime.js";
+import { parseAgentLimitConfig } from "./agent-limits.js";
+
+export { parseAgentLimits } from "./agent-limits.js";
 import { budgetIdFor, outputTokenLimitFor, parseDefaultRunBudget } from "./run-budget.js";
 import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT, listAgentModels, resolveAgentModel } from "./agent-model.js";
 import { JevRouter, type JevMode } from "./jev-router.js";
@@ -387,7 +390,7 @@ export async function createProductionServer() {
     },
   }) : undefined;
   let ciRuntime: Awaited<ReturnType<typeof createCiRuntime>> | undefined;
-  const agentLimits = parseAgentLimits(process.env);
+  const agentLimits = parseAgentLimitConfig(process.env);
   const orchestrator: CodingAgentOrchestrator = new CodingAgentOrchestrator({
     quality,
     requireVerification: process.env.PI_AGENT_REQUIRE_VERIFICATION === "1",
@@ -441,7 +444,8 @@ export async function createProductionServer() {
           toolNames: ["read", "write", "edit", "bash", "grep", "find", "ls", ...lock.plugins.flatMap((plugin) => plugin.enabled_tools)],
           continueSession: session.restored,
           safeCommands: parseSafeCommands(process.env.PI_AGENT_SAFE_COMMANDS),
-          limits: agentLimits,
+          limits: agentLimits.base,
+          routeLimits: agentLimits,
           ...(trustedProfile ? { writerContext: writerContextFor(trustedProfile.profile) } : {}),
           user: containerUser,
           ...(mcpServerIds.length > 0 ? {
@@ -688,16 +692,6 @@ function positiveInteger(value: string | undefined, fallback: number): number {
 /** Constraints the writer sees up front and the policy extension enforces at write time. */
 export function writerContextFor(profile: VerificationProfile): WriterContext {
   return { allowedPaths: [...profile.allowedPaths], checks: profile.checks.map((check) => check.name), rubric: [...profile.rubric], diffLimits: { ...DEFAULT_DIFF_LIMITS } };
-}
-
-export function parseAgentLimits(env: NodeJS.ProcessEnv): { maxTurns: number; maxToolCalls: number } {
-  const read = (key: string, fallback: number) => {
-    if (env[key] === undefined || env[key] === "") return fallback;
-    const value = Number(env[key]);
-    if (!Number.isInteger(value) || value < 1 || value > 1000) throw new Error(`${key} must be an integer between 1 and 1000`);
-    return value;
-  };
-  return { maxTurns: read("PI_AGENT_MAX_TURNS", 20), maxToolCalls: read("PI_AGENT_MAX_TOOL_CALLS", 40) };
 }
 
 function parseSafeCommands(value: string | undefined): string[] {

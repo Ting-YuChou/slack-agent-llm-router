@@ -6,6 +6,7 @@ import type { AgentProcess } from "./orchestrator.js";
 import { resolveAgentModel } from "./agent-model.js";
 import type { AgentReasoningEffort } from "./agent-model.js";
 import type { RouteDecision } from "./jev-router.js";
+import { limitsForRoute, type AgentLimitConfig, type AgentLimits } from "./agent-limits.js";
 import type { AgentTracing } from "./tracing.js";
 import { PiRunCapture } from "./pi-capture.js";
 import type { AgentTelemetry } from "./telemetry.js";
@@ -42,7 +43,9 @@ export interface AgentContainerOptions {
   workflowContext?: { role: string; wave: number; paths: string[]; previousTasks: unknown[]; mcpTools?: string[] };
   directMcpOnly?: boolean;
   workflowKey?: string;
-  limits?: { maxTurns: number; maxToolCalls: number };
+  limits?: AgentLimits;
+  /** Per-route ceilings; when set, each run's route selects `limits` (see limitsForRoute). */
+  routeLimits?: AgentLimitConfig;
   /** Trusted-profile constraints the writer is told about and checked against at write time. */
   writerContext?: WriterContext;
 }
@@ -193,6 +196,11 @@ export class DockerPiProcess implements AgentProcess {
     this.hasSession = options.continueSession ?? false;
   }
 
+  /** The turn and tool-call limits a run on this route is started with. */
+  limitsFor(route: RouteDecision): AgentLimits | undefined {
+    return this.options.routeLimits ? limitsForRoute(route, this.options.routeLimits) : this.options.limits;
+  }
+
   private start(runId: string, route: RouteDecision, selectedTask: TaskMode): void {
     if (this.child && this.child.exitCode === null) throw new Error("Pi container is already active");
     this.closing = false;
@@ -213,6 +221,7 @@ export class DockerPiProcess implements AgentProcess {
       name: containerName,
       modelRef: route.modelRef,
       reasoningEffort: route.effort,
+      limits: this.limitsFor(route),
       gatewayToken: this.tokenForRun(runId, route),
       ...(selectedTask !== "discuss" && this.classifierTokenForRun ? { classifierGatewayToken: this.classifierTokenForRun(runId) } : {}),
       ...(mcp ? { mcp: {
