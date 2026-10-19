@@ -10,6 +10,7 @@ from src.agent_runtime import (
     AgentRuntimeBusy,
     AgentRuntimeClient,
     AgentRuntimeConflict,
+    AgentRuntimeError,
     AgentRuntimeTimeout,
     AgentRuntimeUnauthorized,
     AgentRuntimeUnavailable,
@@ -352,3 +353,126 @@ async def test_discussion_mode_is_per_request_for_create_and_followup(monkeypatc
     assert bodies[0]["task_mode"] == "discuss"
     assert bodies[1]["task_mode"] == "discuss"
     assert "task_mode" not in bodies[2]
+
+
+def _run_payload(status):
+    return {"run_id": "R", "session_id": "S", "status": status}
+
+
+def _fake_clock(runtime, monkeypatch):
+    """Replace sleep and the monotonic clock so backoff runs instantly."""
+    import src.agent_runtime as agent_runtime_module
+
+    now = {"t": 0.0}
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        now["t"] += seconds
+
+    monkeypatch.setattr(agent_runtime_module.asyncio, "sleep", fake_sleep)
+    runtime._monotonic = lambda: now["t"]
+    return sleeps
+
+
+@pytest.mark.asyncio
+async def test_wait_for_update_retries_transient_5xx_until_terminal(monkeypatch):
+    responses = iter(
+        [
+            httpx.Response(503, json={"error": {"code": "unavailable"}}),
+            httpx.Response(503, json={"error": {"code": "unavailable"}}),
+            httpx.Response(200, json=_run_payload("completed")),
+        ]
+    )
+    runtime = client(lambda request: next(responses), monkeypatch)
+    sleeps = _fake_clock(runtime, monkeypatch)
+    try:
+        run = await runtime.wait_for_update("R")
+    finally:
+        await runtime.close()
+    assert run["status"] == "completed"
+    assert sleeps == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_update_retries_request_timeouts(monkeypatch):
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ReadTimeout("slow", request=request)
+        return httpx.Response(200, json=_run_payload("awaiting_approval"))
+
+    runtime = client(handler, monkeypatch)
+    _fake_clock(runtime, monkeypatch)
+    try:
+        run = await runtime.wait_for_update("R")
+    finally:
+        await runtime.close()
+    assert run["status"] == "awaiting_approval"
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 404])
+async def test_wait_for_update_does_not_retry_auth_or_missing_run(monkeypatch, status):
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(status, json={"error": {"code": "not_found"}})
+
+    runtime = client(handler, monkeypatch)
+    sleeps = _fake_clock(runtime, monkeypatch)
+    try:
+        with pytest.raises(AgentRuntimeError) as raised:
+            await runtime.wait_for_update("R")
+    finally:
+        await runtime.close()
+    assert calls["n"] == 1
+    assert sleeps == []
+    assert raised.value.status == status
+
+
+@pytest.mark.asyncio
+async def test_wait_for_update_backoff_is_capped_and_gives_up_after_deadline(
+    monkeypatch,
+):
+    runtime = client(
+        lambda request: httpx.Response(
+            502, json={"error": {"code": "bad_gateway", "message": "down"}}
+        ),
+        monkeypatch,
+    )
+    sleeps = _fake_clock(runtime, monkeypatch)
+    try:
+        with pytest.raises(AgentRuntimeError) as raised:
+            await runtime.wait_for_update("R", max_error_seconds=120)
+    finally:
+        await runtime.close()
+    assert sleeps[:6] == [1, 2, 4, 8, 16, 30]
+    assert max(sleeps) == 30
+    assert sum(sleeps) <= 120
+    assert raised.value.status == 502
+    assert raised.value.code == "bad_gateway"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_update_resets_backoff_after_a_successful_poll(monkeypatch):
+    responses = iter(
+        [
+            httpx.Response(503),
+            httpx.Response(503),
+            httpx.Response(200, json=_run_payload("running")),
+            httpx.Response(503),
+            httpx.Response(200, json=_run_payload("completed")),
+        ]
+    )
+    runtime = client(lambda request: next(responses), monkeypatch)
+    sleeps = _fake_clock(runtime, monkeypatch)
+    try:
+        await runtime.wait_for_update("R", poll_seconds=0.5)
+    finally:
+        await runtime.close()
+    assert sleeps == [1, 2, 0.5, 1]

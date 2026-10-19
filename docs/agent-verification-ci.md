@@ -44,6 +44,8 @@ GITHUB_PUBLISHER_APP_PRIVATE_KEY_PATH=/absolute/private/path/publisher.pem
 PI_AGENT_MODEL_PRICES_JSON={"openai/gpt-5.6-luna":{"input":<USD_per_million>,"output":<USD_per_million>},"openai/gpt-5.6-sol":{"input":<USD_per_million>,"output":<USD_per_million>},"openrouter/typesafe/jev-1.13":{"input":<USD_per_million>,"output":<USD_per_million>}}
 ```
 
+Without `PI_AGENT_VERIFICATION_PROFILE`, implement runs are committed with `verification_status: "unverified"` and a `Pi-Verification: unverified` commit trailer, and Slack labels them as unverified. Production deployments should set `PI_AGENT_REQUIRE_VERIFICATION=1`, which rejects implement runs with `verification_profile_required` (HTTP 422) unless a trusted profile is configured; discuss mode stays available.
+
 Replace every placeholder; the prices example is deliberately not valid JSON until actual rates are supplied. Rates should conservatively cover cache-write premiums when applicable. Zero output price is accepted. No live price is hard-coded.
 
 Keep the existing read-only `GITHUB_APP_*` configuration and provider/Slack/Kafka/OTEL settings. Create a **different** publisher App, installed only on the allowed repository, with Contents and Pull requests write permissions. Do not grant those permissions to the MCP App. The runtime requires configured OpenAI Sol for grading.

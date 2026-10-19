@@ -54,6 +54,8 @@ logger = logging.getLogger(__name__)
 
 MAX_QUERY_TOKENS = 8192
 STATE_SCHEMA_VERSION = 1
+POSTED_CI_JOBS_LIMIT = 1000
+UNVERIFIED_LABEL = "⚠️ 未驗證（沒有 verification profile）"
 MEMORY_SLASH_ONLY_MESSAGE = (
     "Memory commands are only available through Slack slash commands. "
     "Use `/llm remember`, `/llm memories`, or `/llm forget`."
@@ -173,6 +175,8 @@ class RedisSlackStateStore(SlackStateStore):
         self.rate_limits_index_key = f"{self.key_prefix}:rate_limits"
         self.conversations_index_key = f"{self.key_prefix}:conversations"
         self.active_threads_index_key = f"{self.key_prefix}:active_threads"
+        self.agent_runs_index_key = f"{self.key_prefix}:agent_runs"
+        self.posted_ci_jobs_key = f"{self.key_prefix}:posted_ci_jobs"
         self.client = None
 
     async def initialize(self):
@@ -215,12 +219,18 @@ class RedisSlackStateStore(SlackStateStore):
                 self.active_threads_index_key,
                 lambda item_id: self._active_thread_key(item_id),
             )
+            agent_runs = await self._load_json_map(
+                self.agent_runs_index_key,
+                lambda item_id: self._agent_run_key(item_id),
+            )
             return {
                 "schema_version": STATE_SCHEMA_VERSION,
                 "users": users,
                 "rate_limits": rate_limits,
                 "conversations": conversations,
                 "active_threads": active_threads,
+                "agent_runs": agent_runs,
+                "posted_ci_jobs": sorted(await self._smembers(self.posted_ci_jobs_key)),
             }
         except Exception as exc:
             logger.warning("Failed to load Slack state from Redis: %s", exc)
@@ -242,6 +252,12 @@ class RedisSlackStateStore(SlackStateStore):
         active_threads = snapshot.get("active_threads", {})
         for thread_key, thread_payload in active_threads.items():
             await self.persist_active_thread_state(thread_key, thread_payload)
+
+        for run_id, run_payload in snapshot.get("agent_runs", {}).items():
+            await self.persist_agent_run_state(run_id, run_payload)
+
+        for run_id in snapshot.get("posted_ci_jobs", []):
+            await self.add_posted_ci_job(run_id)
 
     async def shutdown(self):
         if self.client and hasattr(self.client, "close"):
@@ -351,6 +367,48 @@ class RedisSlackStateStore(SlackStateStore):
         except Exception as exc:
             logger.warning("Failed to delete Slack active threads from Redis: %s", exc)
 
+    async def persist_agent_run_state(self, run_id: str, payload: Dict[str, Any]):
+        """Persist one tracked Pi agent run so a restart can resume monitoring."""
+        if not self.client:
+            return
+
+        try:
+            await self._set_json(self._agent_run_key(run_id), payload)
+            await self._sadd(self.agent_runs_index_key, run_id)
+        except Exception as exc:
+            logger.warning("Failed to persist Slack agent run to Redis: %s", exc)
+
+    async def delete_agent_run_state(self, run_id: str):
+        """Stop tracking one Pi agent run across restarts."""
+        if not self.client:
+            return
+
+        try:
+            await self._delete(self._agent_run_key(run_id))
+            await self._srem(self.agent_runs_index_key, run_id)
+        except Exception as exc:
+            logger.warning("Failed to delete Slack agent run from Redis: %s", exc)
+
+    async def add_posted_ci_job(self, run_id: str):
+        """Remember that a CI repair job already has a Slack thread."""
+        if not self.client:
+            return
+
+        try:
+            await self._sadd(self.posted_ci_jobs_key, run_id)
+        except Exception as exc:
+            logger.warning("Failed to persist posted CI job to Redis: %s", exc)
+
+    async def remove_posted_ci_job(self, run_id: str):
+        """Forget a CI repair job claim so it can be posted again."""
+        if not self.client:
+            return
+
+        try:
+            await self._srem(self.posted_ci_jobs_key, run_id)
+        except Exception as exc:
+            logger.warning("Failed to delete posted CI job from Redis: %s", exc)
+
     def _user_key(self, user_id: str) -> str:
         return f"{self.key_prefix}:user:{user_id}"
 
@@ -362,6 +420,9 @@ class RedisSlackStateStore(SlackStateStore):
 
     def _active_thread_key(self, thread_key: str) -> str:
         return f"{self.key_prefix}:active_thread:{thread_key}"
+
+    def _agent_run_key(self, run_id: str) -> str:
+        return f"{self.key_prefix}:agent_run:{run_id}"
 
     async def _load_json_map(self, index_key: str, item_key_builder) -> Dict[str, Any]:
         """Load a keyed JSON map backed by a Redis set index."""
@@ -1074,7 +1135,7 @@ class SlackMessageHandler:
                     await runtime.cancel(tracked["run_id"], user_id)
                     return f"Agent run `{tracked['run_id']}` is stopping."
                 await runtime.close_session(tracked["session_id"], user_id)
-                self.bot._forget_agent_session(tracked)
+                await self.bot._forget_agent_run(tracked)
                 return f"Agent session `{tracked['session_id']}` is closed; its branch and commits were kept."
             except AgentRuntimeConflict:
                 return "That Agent action has already completed or is no longer valid."
@@ -1097,10 +1158,7 @@ class SlackMessageHandler:
                 thread_ts=thread_ts,
                 owner_user_id=user_id,
             )
-            self.bot._spawn_background_task(
-                self.bot._monitor_agent_run(tracked),
-                f"pi_agent_monitor:{result['run_id']}",
-            )
+            self.bot._start_agent_monitor(tracked)
             return f"Workflow `{result['run_id']}` resumed."
 
         if action in {"repair-ci", "publish-repair"}:
@@ -1129,6 +1187,10 @@ class SlackMessageHandler:
                 )
             except AgentRuntimeError:
                 return "CI repair could not start. Check repository profile, owner mapping, failed workflow and GitHub App configuration."
+            claimed = await self.bot._claim_ci_job(result["run_id"])
+            if not claimed and action == "repair-ci":
+                # The CI inbox already opened a review thread for this job.
+                return f"CI repair `{result['run_id']}` is awaiting approval in the thread."
             root_ts = thread_ts
             if not root_ts:
                 started = await client.chat_postMessage(
@@ -1142,11 +1204,9 @@ class SlackMessageHandler:
                 channel_id=channel_id,
                 thread_ts=root_ts,
                 owner_user_id=user_id,
+                mode="ci_repair",
             )
-            self.bot._spawn_background_task(
-                self.bot._monitor_agent_run(tracked),
-                f"pi_agent_monitor:{result['run_id']}",
-            )
+            self.bot._start_agent_monitor(tracked)
             return f"CI repair `{result['run_id']}` is awaiting approval in the thread."
 
         model = None
@@ -1301,10 +1361,7 @@ class SlackMessageHandler:
                         )
                     ),
                 )
-            self.bot._spawn_background_task(
-                self.bot._monitor_agent_run(tracked),
-                f"pi_agent_monitor:{result['run_id']}",
-            )
+            self.bot._start_agent_monitor(tracked)
             if root_message_ts:
                 return ""
             return f"🛠️ Agent run `{result['run_id']}` started."
@@ -1347,8 +1404,11 @@ class SlackMessageHandler:
                 "*Mode:* Read-only discussion; no verification or commit."
             )
         if result.get("verification_status") or result.get("grader_status"):
+            verification = result.get("verification_status", "pending")
+            if verification == "unverified":
+                verification = UNVERIFIED_LABEL
             detail_sections.append(
-                f"*Verification:* {result.get('verification_status', 'pending')} / "
+                f"*Verification:* {verification} / "
                 f"*Grader:* {result.get('grader_status', 'pending')} / "
                 f"*Phase:* {result.get('phase', 'unknown')}"
             )
@@ -2185,6 +2245,13 @@ class SlackBot:
         self.agent_threads: Dict[str, Dict[str, Any]] = {}
         self.agent_runs: Dict[str, Dict[str, Any]] = {}
         self.agent_user_runs: Dict[str, Dict[str, Any]] = {}
+        self.agent_monitoring: Set[str] = set()
+        # Ordered so the oldest claims are evicted first.
+        self.posted_ci_jobs: Dict[str, None] = {}
+        self.agent_monitor_tasks: Dict[str, asyncio.Task] = {}
+        self.agent_monitor_poll_seconds = float(
+            self.agent_config.get("monitor_poll_seconds", 2)
+        )
         self.agent_shortcut_nonces: Dict[str, AgentShortcutNonce] = {}
 
         # Running state
@@ -2276,6 +2343,7 @@ class SlackBot:
             self._spawn_background_task(
                 self._monitor_ci_inbox(), "slack_ci_repair_inbox"
             )
+            self._reconcile_agent_runs()
 
             # Start cleanup task
             self._spawn_background_task(
@@ -2294,33 +2362,78 @@ class SlackBot:
 
     async def _monitor_ci_inbox(self):
         while self.running:
-            runtime = self.agent_runtime_client
-            if runtime is not None:
-                try:
-                    for job in await runtime.ci_repairs():
-                        if job["run_id"] in self.agent_runs:
-                            continue
-                        message = await self.web_client.chat_postMessage(
-                            channel=job["channel_id"],
-                            client_msg_id=job["run_id"],
-                            text=f"CI repair `{job['run_id']}` requires the repository owner's review.",
-                        )
-                        tracked = self._track_agent_run(
-                            job,
-                            team_id=job["team_id"],
-                            channel_id=job["channel_id"],
-                            thread_ts=message["ts"],
-                            owner_user_id=job["owner_user_id"],
-                        )
-                        self._spawn_background_task(
-                            self._monitor_agent_run(tracked),
-                            f"pi_agent_monitor:{job['run_id']}",
-                        )
-                except AgentRuntimeError:
-                    logger.warning("CI repair inbox unavailable")
-                except Exception:
-                    logger.warning("CI repair Slack notification failed")
+            await self._poll_ci_inbox_once()
             await asyncio.sleep(5)
+
+    async def _poll_ci_inbox_once(self):
+        runtime = self.agent_runtime_client
+        if runtime is None:
+            return
+        try:
+            jobs = await runtime.ci_repairs()
+        except AgentRuntimeError:
+            logger.warning("CI repair inbox unavailable")
+            return
+        for job in jobs:
+            try:
+                await self._post_ci_inbox_job(job)
+            except Exception:
+                logger.warning(
+                    "CI repair Slack notification failed for %s", job.get("run_id")
+                )
+
+    async def _post_ci_inbox_job(self, job: Dict[str, Any]):
+        run_id = job["run_id"]
+        if run_id in self.agent_runs:
+            await self._claim_ci_job(run_id)
+            return
+        if not await self._claim_ci_job(run_id):
+            return
+        try:
+            message = await self.web_client.chat_postMessage(
+                channel=job["channel_id"],
+                client_msg_id=run_id,
+                text=f"CI repair `{run_id}` requires the repository owner's review.",
+            )
+        except Exception:
+            await self._release_ci_job(run_id)
+            raise
+        tracked = self._track_agent_run(
+            job,
+            team_id=job["team_id"],
+            channel_id=job["channel_id"],
+            thread_ts=message["ts"],
+            owner_user_id=job["owner_user_id"],
+            mode="ci_repair",
+        )
+        self._start_agent_monitor(tracked)
+
+    async def _claim_ci_job(self, run_id: str) -> bool:
+        """Claim a CI repair job for posting; False when it was already claimed."""
+        if run_id in self.posted_ci_jobs:
+            return False
+        # Claim synchronously so the inbox and /llm agent repair-ci cannot
+        # both pass this check before either one awaits.
+        self.posted_ci_jobs[run_id] = None
+        evicted = []
+        while len(self.posted_ci_jobs) > POSTED_CI_JOBS_LIMIT:
+            oldest = next(iter(self.posted_ci_jobs))
+            self.posted_ci_jobs.pop(oldest)
+            evicted.append(oldest)
+        if self._uses_granular_redis_state():
+            await self.state_store.add_posted_ci_job(run_id)
+            for oldest in evicted:
+                await self.state_store.remove_posted_ci_job(oldest)
+        else:
+            await self._persist_state()
+        return True
+
+    async def _release_ci_job(self, run_id: str):
+        self.posted_ci_jobs.pop(run_id, None)
+        if self._uses_granular_redis_state():
+            await self.state_store.remove_posted_ci_job(run_id)
+        else:
+            await self._persist_state()
 
     async def _handle_socket_mode_request(
         self, client: AsyncSocketModeClient, req: SocketModeRequest
@@ -2443,9 +2556,24 @@ class SlackBot:
             return
         if not session:
             return
+        if session.get("run_id"):
+            tracked = self._track_agent_run(
+                session,
+                team_id=team_id,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                owner_user_id=session["owner_user_id"],
+            )
+            if session.get("active"):
+                self._start_agent_monitor(tracked)
+            else:
+                # Without Slack-side state we cannot tell whether the result
+                # was posted; never repost it on a later restart.
+                tracked["result_posted"] = True
+            return
         tracked = {
             "session_id": session["session_id"],
-            "run_id": session.get("run_id"),
+            "run_id": None,
             "team_id": team_id,
             "channel_id": channel_id,
             "thread_ts": thread_ts,
@@ -2453,8 +2581,6 @@ class SlackBot:
         }
         self.agent_threads[self._thread_key(channel_id, thread_ts)] = tracked
         self.agent_user_runs[session["owner_user_id"]] = tracked
-        if session.get("run_id"):
-            self.agent_runs[session["run_id"]] = tracked
         self._mark_thread_active(channel_id, thread_ts)
 
     async def _handle_mention_event(self, event: Dict[str, Any]):
@@ -3239,7 +3365,9 @@ class SlackBot:
         channel_id: str,
         thread_ts: str,
         owner_user_id: str,
+        mode: Optional[str] = None,
     ) -> Dict[str, Any]:
+        previous = self.agent_runs.get(accepted["run_id"]) or {}
         tracked = {
             "session_id": accepted["session_id"],
             "run_id": accepted["run_id"],
@@ -3247,12 +3375,67 @@ class SlackBot:
             "channel_id": channel_id,
             "thread_ts": thread_ts,
             "owner_user_id": owner_user_id,
+            "mode": mode,
+            "posted_approval_ids": list(previous.get("posted_approval_ids", [])),
+            "result_posted": False,
         }
+        self._register_agent_run(tracked)
+        return tracked
+
+    def _register_agent_run(self, tracked: Dict[str, Any]) -> None:
+        channel_id = tracked["channel_id"]
+        thread_ts = tracked["thread_ts"]
+        owner_user_id = tracked["owner_user_id"]
         self.agent_threads[self._thread_key(channel_id, thread_ts)] = tracked
-        self.agent_runs[accepted["run_id"]] = tracked
+        self.agent_runs[tracked["run_id"]] = tracked
         self.agent_user_runs[owner_user_id] = tracked
         self._mark_thread_active(channel_id, thread_ts)
-        return tracked
+
+    @staticmethod
+    def _agent_run_record(tracked: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "run_id": tracked["run_id"],
+            "session_id": tracked.get("session_id"),
+            "team_id": tracked.get("team_id"),
+            "channel_id": tracked.get("channel_id"),
+            "thread_ts": tracked.get("thread_ts"),
+            "owner_user_id": tracked.get("owner_user_id"),
+            "mode": tracked.get("mode"),
+            "posted_approval_ids": list(tracked.get("posted_approval_ids", [])),
+            "result_posted": bool(tracked.get("result_posted", False)),
+        }
+
+    async def _persist_agent_run(self, tracked: Dict[str, Any]):
+        """Persist one tracked run and drop finished runs it superseded."""
+        superseded = [
+            run_id
+            for run_id, other in self.agent_runs.items()
+            if run_id != tracked["run_id"]
+            and other.get("result_posted")
+            and other.get("channel_id") == tracked["channel_id"]
+            and other.get("thread_ts") == tracked["thread_ts"]
+        ]
+        for run_id in superseded:
+            self.agent_runs.pop(run_id, None)
+
+        if self._uses_granular_redis_state():
+            await self.state_store.persist_agent_run_state(
+                tracked["run_id"], self._agent_run_record(tracked)
+            )
+            for run_id in superseded:
+                await self.state_store.delete_agent_run_state(run_id)
+            return
+
+        await self._persist_state()
+
+    async def _forget_agent_run(self, tracked: Dict[str, Any]):
+        """Stop tracking a run in memory and in the configured state backend."""
+        self._forget_agent_session(tracked)
+        if self._uses_granular_redis_state():
+            await self.state_store.delete_agent_run_state(tracked["run_id"])
+            return
+
+        await self._persist_state()
 
     def _agent_run_for(
         self,
@@ -3321,79 +3504,140 @@ class SlackBot:
             },
         ]
 
+    def _reconcile_agent_runs(self) -> None:
+        """Resume monitoring every restored run whose result was never posted."""
+        if self.agent_runtime_client is None:
+            return
+        for tracked in list(self.agent_runs.values()):
+            if tracked.get("run_id") and not tracked.get("result_posted"):
+                self._start_agent_monitor(tracked)
+
+    def _start_agent_monitor(self, tracked: Dict[str, Any]) -> asyncio.Task:
+        """Spawn a monitor for a run unless one is already running."""
+        run_id = tracked["run_id"]
+        task = self.agent_monitor_tasks.get(run_id)
+        if task is not None and not task.done():
+            return task
+        task = self._spawn_background_task(
+            self._monitor_agent_run(tracked), f"pi_agent_monitor:{run_id}"
+        )
+        self.agent_monitor_tasks[run_id] = task
+
+        def release(done: asyncio.Task) -> None:
+            if self.agent_monitor_tasks.get(run_id) is done:
+                self.agent_monitor_tasks.pop(run_id, None)
+
+        task.add_done_callback(release)
+        return task
+
     async def _monitor_agent_run(self, tracked: Dict[str, Any]):
+        run_id = tracked["run_id"]
+        if run_id in self.agent_monitoring:
+            return
+        self.agent_monitoring.add(run_id)
+        try:
+            await self._watch_agent_run(tracked)
+        finally:
+            self.agent_monitoring.discard(run_id)
+
+    async def _watch_agent_run(self, tracked: Dict[str, Any]):
+        """Post each new approval card and the final result exactly once."""
         runtime = self.agent_runtime_client
         if runtime is None or self.web_client is None:
             return
-        try:
-            run = await runtime.wait_for_update(tracked["run_id"])
-        except AgentRuntimeError:
-            logger.warning("Agent run monitor failed for %s", tracked["run_id"])
-            await self.web_client.chat_postMessage(
-                channel=tracked["channel_id"],
-                thread_ts=tracked["thread_ts"],
-                text="Agent status could not be retrieved; Chat mode was not used as fallback.",
-            )
-            return
-
-        if run.get("status") == "awaiting_approval":
-            approval = next(
-                (
-                    event
-                    for event in reversed(run.get("events", []))
-                    if event.get("type") == "approval"
-                ),
-                None,
-            )
-            if not approval:
+        await self._persist_agent_run(tracked)
+        while True:
+            try:
+                run = await runtime.wait_for_update(tracked["run_id"])
+            except AgentRuntimeError as exc:
+                if exc.status == 404:
+                    logger.info(
+                        "Agent run %s is gone; forgetting it", tracked["run_id"]
+                    )
+                    await self._forget_agent_run(tracked)
+                    return
+                logger.warning("Agent run monitor failed for %s", tracked["run_id"])
+                await self.web_client.chat_postMessage(
+                    channel=tracked["channel_id"],
+                    thread_ts=tracked["thread_ts"],
+                    text="Agent status could not be retrieved; Chat mode was not used as fallback.",
+                )
                 return
-            value = json.dumps(
-                {
-                    "run_id": run["run_id"],
-                    "session_id": run["session_id"],
-                    "approval_id": approval["approval_id"],
-                },
-                separators=(",", ":"),
-            )
-            await self.web_client.chat_postMessage(
-                channel=tracked["channel_id"],
-                thread_ts=tracked["thread_ts"],
-                text=f"Approval required: {approval.get('title', 'Agent action')}",
-                blocks=[
-                    *self._agent_approval_blocks(approval),
-                    {
-                        "type": "actions",
-                        "elements": [
-                            {
-                                "type": "button",
-                                "action_id": "pi_agent_approve",
-                                "text": {
-                                    "type": "plain_text",
-                                    "text": "Publish repair Draft PR"
-                                    if approval.get("kind") == "publish"
-                                    else "Approve",
-                                },
-                                "style": "primary",
-                                "value": value,
-                            },
-                            {
-                                "type": "button",
-                                "action_id": "pi_agent_reject",
-                                "text": {
-                                    "type": "plain_text",
-                                    "text": "Keep local result"
-                                    if approval.get("kind") == "publish"
-                                    else "Reject",
-                                },
-                                "style": "danger",
-                                "value": value,
-                            },
-                        ],
-                    },
-                ],
-            )
+            if run.get("status") == "awaiting_approval":
+                await self._post_agent_approval(tracked, run)
+                await asyncio.sleep(self.agent_monitor_poll_seconds)
+                continue
+            if not tracked.get("result_posted"):
+                await self._post_agent_result(tracked, run)
+                tracked["result_posted"] = True
+                await self._persist_agent_run(tracked)
             return
 
+    async def _post_agent_approval(
+        self, tracked: Dict[str, Any], run: Dict[str, Any]
+    ) -> None:
+        approval = next(
+            (
+                event
+                for event in reversed(run.get("events", []))
+                if event.get("type") == "approval"
+            ),
+            None,
+        )
+        posted = tracked.setdefault("posted_approval_ids", [])
+        if not approval or approval.get("approval_id") in posted:
+            return
+        value = json.dumps(
+            {
+                "run_id": run["run_id"],
+                "session_id": run["session_id"],
+                "approval_id": approval["approval_id"],
+            },
+            separators=(",", ":"),
+        )
+        await self.web_client.chat_postMessage(
+            channel=tracked["channel_id"],
+            thread_ts=tracked["thread_ts"],
+            text=f"Approval required: {approval.get('title', 'Agent action')}",
+            blocks=[
+                *self._agent_approval_blocks(approval),
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "action_id": "pi_agent_approve",
+                            "text": {
+                                "type": "plain_text",
+                                "text": "Publish repair Draft PR"
+                                if approval.get("kind") == "publish"
+                                else "Approve",
+                            },
+                            "style": "primary",
+                            "value": value,
+                        },
+                        {
+                            "type": "button",
+                            "action_id": "pi_agent_reject",
+                            "text": {
+                                "type": "plain_text",
+                                "text": "Keep local result"
+                                if approval.get("kind") == "publish"
+                                else "Reject",
+                            },
+                            "style": "danger",
+                            "value": value,
+                        },
+                    ],
+                },
+            ],
+        )
+        posted.append(approval["approval_id"])
+        await self._persist_agent_run(tracked)
+
+    async def _post_agent_result(
+        self, tracked: Dict[str, Any], run: Dict[str, Any]
+    ) -> None:
         max_length = int(
             self.config.get("response_settings", {}).get("max_response_length", 2000)
         )
@@ -3655,12 +3899,12 @@ class SlackBot:
         channel_id = payload.get("channel", {}).get("id")
         try:
             value = json.loads(action.get("value", "{}"))
-            tracked = self.agent_runs.get(value["run_id"])
+            run_id = value["run_id"]
+            approval_id = value["approval_id"]
         except (KeyError, TypeError, ValueError):
-            tracked = None
-        if not tracked:
             return
-        if tracked.get("owner_user_id") != user_id:
+        tracked = self.agent_runs.get(run_id)
+        if tracked and tracked.get("owner_user_id") != user_id:
             if hasattr(self.web_client, "chat_postEphemeral"):
                 await self.web_client.chat_postEphemeral(
                     channel=channel_id,
@@ -3671,26 +3915,45 @@ class SlackBot:
         decision = "approve" if action["action_id"] == "pi_agent_approve" else "reject"
         try:
             await self.agent_runtime_client.decide(
-                value["run_id"], value["approval_id"], user_id, decision
+                run_id, approval_id, user_id, decision
             )
-        except AgentRuntimeUnauthorized:
+        except AgentRuntimeError as exc:
+            if isinstance(exc, AgentRuntimeUnauthorized):
+                text = "Only the Agent session owner can approve this action."
+            elif isinstance(exc, AgentRuntimeConflict):
+                text = "This approval has expired or was already used."
+            else:
+                logger.warning("Agent decision failed for %s", run_id)
+                text = "Agent decision could not be recorded. Please try again."
             await self.web_client.chat_postEphemeral(
-                channel=channel_id,
-                user=user_id,
-                text="Only the Agent session owner can approve this action.",
+                channel=channel_id, user=user_id, text=text
             )
             return
-        except AgentRuntimeConflict:
-            await self.web_client.chat_postEphemeral(
-                channel=channel_id,
-                user=user_id,
-                text="This approval has expired or was already used.",
+        if not tracked:
+            # The bot lost this run (e.g. restarted without state); the runtime
+            # accepted the owner's decision, so resume tracking from the card.
+            container = payload.get("container") or {}
+            message = payload.get("message") or {}
+            thread_ts = (
+                container.get("thread_ts")
+                or message.get("thread_ts")
+                or container.get("message_ts")
+                or message.get("ts")
             )
-            return
-        self._spawn_background_task(
-            self._monitor_agent_run(tracked),
-            f"pi_agent_monitor:{value['run_id']}",
-        )
+            if not value.get("session_id") or not channel_id or not thread_ts:
+                return
+            team = payload.get("team")
+            team_id = team.get("id") if isinstance(team, dict) else None
+            tracked = self._track_agent_run(
+                value,
+                team_id=team_id or self._extract_team_id(payload) or "unknown-team",
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                owner_user_id=user_id,
+            )
+        if approval_id not in tracked.setdefault("posted_approval_ids", []):
+            tracked["posted_approval_ids"].append(approval_id)
+        self._start_agent_monitor(tracked)
 
     def _mark_thread_active(self, channel_id: Optional[str], thread_ts: Optional[str]):
         """Mark a bot thread as active for follow-up replies."""
@@ -4353,6 +4616,22 @@ class SlackBot:
             key: self._deserialize_datetime(value)
             for key, value in snapshot.get("active_threads", {}).items()
         }
+        self.posted_ci_jobs = dict.fromkeys(
+            str(run_id) for run_id in snapshot.get("posted_ci_jobs", [])
+        )
+        for record in snapshot.get("agent_runs", {}).values():
+            if not isinstance(record, dict) or not all(
+                record.get(field)
+                for field in (
+                    "run_id",
+                    "session_id",
+                    "channel_id",
+                    "thread_ts",
+                    "owner_user_id",
+                )
+            ):
+                continue
+            self._register_agent_run(self._agent_run_record(record))
 
         expired_sessions = self.conversation_manager.cleanup_expired_sessions(
             return_keys=True
@@ -4377,6 +4656,12 @@ class SlackBot:
                 "active_threads": {
                     key: value.isoformat() for key, value in self.active_threads.items()
                 },
+                "agent_runs": {
+                    run_id: self._agent_run_record(tracked)
+                    for run_id, tracked in self.agent_runs.items()
+                    if tracked.get("run_id") and tracked.get("session_id")
+                },
+                "posted_ci_jobs": list(self.posted_ci_jobs),
             }
             await self.state_store.save_state(snapshot)
 

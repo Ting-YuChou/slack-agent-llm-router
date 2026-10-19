@@ -4,11 +4,12 @@ import { taskMode, type TaskMode } from "./task-mode.js";
 import { listAgentModels, resolveAgentModel } from "./agent-model.js";
 import type { RouteDecision } from "./jev-router.js";
 import { ApprovalStore } from "./policy.js";
-import type { PublicRunEvent } from "./pi-rpc.js";
+import type { PublicRunEvent, RunOutcome } from "./pi-rpc.js";
 import type { RuntimeStateStore } from "./runtime-state.js";
 import { workflowMode, type WorkflowMode, type WorkflowNode } from "./structured-workflow.js";
 import { WorkflowBudget } from "./workflow-budget.js";
 import type { Candidate, GateInput, GateResult } from "./quality-gate.js";
+import { DEFAULT_DIFF_LIMITS, DiffLimitError, ProtectedFileError } from "./worktree-manager.js";
 
 export interface QualityServices {
   evaluate(input: GateInput): Promise<GateResult>;
@@ -90,6 +91,8 @@ export interface RunRecord {
   timing?: { wall_ms: number; active_ms: number; human_wait_ms: number };
   phase?: string;
   execution_status?: "running" | "succeeded" | "failed";
+  /** How the latest writer execution ended (Pi stop reason classification). */
+  execution_outcome?: RunOutcome;
   grader_findings?: Array<{ path: string; line: number; severity: string; reason: string }>;
   verification_status?: string;
   grader_status?: string;
@@ -189,6 +192,12 @@ export class CodingAgentOrchestrator {
   private readonly workflows = new Map<string, WorkflowState>();
   private readonly quality?: QualityServices;
   private readonly captureTraceContext?: (id: string) => string | undefined;
+  private readonly requireVerification: boolean;
+  /** Text of the assistant message currently streaming, per run; replaced by the final answer. */
+  private readonly streamingAnswers = new Map<string, string>();
+  /** Terminal runs already reported to observers, keyed to the update they were reported at (resume revives runs). */
+  private readonly observedFinal = new Map<string, string>();
+  private persistTimer?: ReturnType<typeof setTimeout>;
 
   private readonly captureState?: (runId: string) => { complete: boolean | null; reasons: string[] };
   private readonly observeRun?: (run: RunRecord) => void;
@@ -208,6 +217,8 @@ export class CodingAgentOrchestrator {
     mcpRepository?: string;
     quality?: QualityServices;
     captureTraceContext?: (id: string) => string | undefined;
+    /** Production deployments refuse implement runs that no trusted profile can verify. */
+    requireVerification?: boolean;
   }) {
     this.captureState = options.captureState;
     this.observeRun = options.observeRun; this.observeLifecycle = options.observeLifecycle;
@@ -221,6 +232,7 @@ export class CodingAgentOrchestrator {
     this.mcpRepository = options.mcpRepository;
     this.quality = options.quality;
     this.captureTraceContext = options.captureTraceContext;
+    this.requireVerification = options.requireVerification === true;
   }
 
   async restore(): Promise<void> {
@@ -526,6 +538,7 @@ export class CodingAgentOrchestrator {
       events: [{ type: "status", status: "starting" }],
       branch: session.branch,
     };
+    if (task === "implement" && !this.quality) run.verification_status = "unverified";
     if (task === "discuss") {
       run.phase = "discussing"; run.execution_status = "running";
       run.verification_status = "not_applicable"; run.grader_status = "not_applicable"; run.publication_status = "not_applicable";
@@ -561,7 +574,12 @@ export class CodingAgentOrchestrator {
   }
 
   private requireTaskMode(value: unknown): TaskMode {
-    try { return taskMode(value); } catch { throw new RuntimeError("Invalid task_mode; expected discuss or implement", "invalid_request", 400); }
+    let task: TaskMode;
+    try { task = taskMode(value); } catch { throw new RuntimeError("Invalid task_mode; expected discuss or implement", "invalid_request", 400); }
+    if (task === "implement" && this.requireVerification && !this.quality) {
+      throw new RuntimeError("Implement runs require a trusted verification profile; use discuss mode", "verification_profile_required", 422);
+    }
+    return task;
   }
 
   private requireWorkflowMode(value: unknown): WorkflowMode {
@@ -629,7 +647,7 @@ export class CodingAgentOrchestrator {
   private armDeadline(session: SessionRecord, run: RunRecord, ms: number): void {
     const previous = this.deadlines.get(run.run_id); if (previous) clearTimeout(previous);
     const runId = run.run_id;
-    const deadline = setTimeout(() => void this.timeoutRun(session, run), ms);
+    const deadline = setTimeout(() => this.background(this.timeoutRun(session, run)), ms);
     deadline.unref();
     this.deadlines.set(runId, deadline);
   }
@@ -652,13 +670,13 @@ export class CodingAgentOrchestrator {
     if (event.type === "usage") {
       const state = this.workflows.get(run.run_id); state?.budget.report(event.cost_usd);
       run.estimated_cost_usd = (run.estimated_cost_usd ?? 0) + event.cost_usd;
-      this.persistInBackground();
-      if (state && state.budget.estimatedUsd > state.budget.limitUsd) void this.failRun(session, run, "workflow_budget_exhausted", "Model budget exhausted");
+      this.persistSoon();
+      if (state && state.budget.estimatedUsd > state.budget.limitUsd) this.background(this.failRun(session, run, "workflow_budget_exhausted", "Model budget exhausted"));
       return;
     }
     if (event.type === "turn") {
       run.turn_count += 1;
-      this.persistInBackground();
+      this.persistSoon();
       return;
     }
     if (event.type === "approval") {
@@ -714,20 +732,38 @@ export class CodingAgentOrchestrator {
       } else {
         run.events.push(event);
       }
-      this.persistInBackground();
+      this.persistSoon();
+      return;
+    }
+    if (event.type === "answer_delta") {
+      const text = (this.streamingAnswers.get(run.run_id) ?? "") + event.text;
+      this.streamingAnswers.set(run.run_id, text);
+      run.answer = text;
+      this.persistSoon();
       return;
     }
     if (event.type === "answer") {
+      this.streamingAnswers.delete(run.run_id);
       run.answer = event.text;
       run.events.push(event);
-      this.persistInBackground();
+      this.persistSoon();
       return;
     }
     if (event.type === "error") {
-      void this.failRun(session, run, event.code, event.message);
+      this.background(this.failRun(session, run, event.code, event.message));
       return;
     }
-    if (event.type === "settled") { if (this.workflows.has(run.run_id)) run.execution_status = "succeeded"; void this.completeRun(session, run); }
+    if (event.type === "settled") {
+      run.execution_outcome = event.outcome;
+      if (event.outcome !== "completed") {
+        if (this.workflows.has(run.run_id)) run.execution_status = "failed";
+        const failure = settleFailure(event);
+        this.background(this.failRun(session, run, failure.code, failure.message));
+        return;
+      }
+      if (this.workflows.has(run.run_id)) run.execution_status = "succeeded";
+      this.background(this.completeRun(session, run));
+    }
   }
 
   private async completeDiscussion(session: SessionRecord, run: RunRecord): Promise<void> {
@@ -739,7 +775,7 @@ export class CodingAgentOrchestrator {
         await this.quality!.execution(workflow.executionId, run.run_id, "discussion", workflow.attempt, "end", session.process.queueMs);
         workflow.budget.check();
       }
-      const diff = await this.worktrees.inspectDiff(session.worktreePath, { maxFiles: 50, maxBytes: 1024 * 1024, maxSingleFileBytes: 256 * 1024 });
+      const diff = await this.worktrees.inspectDiff(session.worktreePath, DEFAULT_DIFF_LIMITS);
       if (isTerminal(run.status) || this.terminalClaims.has(run.run_id) || workflow?.controller.signal.aborted) return;
       if (diff.files.length || diff.bytes) {
         await this.failRun(session, run, "discussion_workspace_changed", "Read-only discussion produced unexpected changes; delivery blocked"); return;
@@ -764,7 +800,7 @@ export class CodingAgentOrchestrator {
       try {
         await this.quality.execution(workflow.executionId, run.run_id, "implementation", workflow.attempt, "end", session.process.queueMs);
         workflow.budget.check();
-        await this.worktrees.inspectDiff(session.worktreePath, { maxFiles: 50, maxBytes: 1024 * 1024, maxSingleFileBytes: 256 * 1024 });
+        await this.worktrees.inspectDiff(session.worktreePath, DEFAULT_DIFF_LIMITS);
         run.phase = "verifying"; await this.persistState();
         workflow.operation = this.quality.evaluate(input);
         const result = await workflow.operation; workflow.operation = undefined;
@@ -779,26 +815,36 @@ export class CodingAgentOrchestrator {
           await this.startExecution(session, run, workflow, result.repair_prompt!); return;
         }
         if (result.action === "fail") {
+          if (result.failure?.code === "scope_violation") {
+            await this.failRun(session, run, "scope_violation", `Changes outside the allowed paths were not delivered: ${result.failure.files.slice(0, 10).join(", ")}`); return;
+          }
           await this.failRun(session, run, "verification_failed", "Candidate retained as an isolated artifact; verification/grading did not pass"); return;
         }
         await this.quality.assertUnchanged(result.candidate, input);
         workflow.controller.signal.throwIfAborted();
         run.phase = "finalizing"; await this.persistState();
-      } catch {
+      } catch (error) {
         workflow.operation = undefined;
-        if (!isTerminal(run.status) && !this.terminalClaims.has(run.run_id)) await this.failRun(session, run, "quality_gate_unavailable", "Required verification could not complete");
+        if (!isTerminal(run.status) && !this.terminalClaims.has(run.run_id)) {
+          const failure = gateFailure(error);
+          await this.failRun(session, run, failure.code, failure.message);
+        }
         return;
       }
     }
+    // Claim synchronously after settle so cancellation cannot race finalization.
     if (!this.claimTerminal(run)) return;
     try {
-      const diff = await this.worktrees.inspectDiff(session.worktreePath, {
-        maxFiles: 50,
-        maxBytes: 1024 * 1024,
-        maxSingleFileBytes: 256 * 1024,
-      });
+      let diff: Awaited<ReturnType<Worktrees["inspectDiff"]>>;
+      try { diff = await this.worktrees.inspectDiff(session.worktreePath, DEFAULT_DIFF_LIMITS); }
+      catch (error) {
+        if (!(error instanceof DiffLimitError)) throw error;
+        const failure = gateFailure(error);
+        await this.failClaimedRun(session, run, failure.code, failure.message);
+        return;
+      }
       this.notifyLifecycle(run.run_id, "commit", "start");
-      const commit = await this.worktrees.commit(session.worktreePath, `Pi agent: ${run.run_id}`);
+      const commit = await this.worktrees.commit(session.worktreePath, buildCommitMessage(run));
       this.notifyLifecycle(run.run_id, "commit", "end");
       session.baselineCommit = commit;
       run.changed_files = diff.files;
@@ -820,6 +866,10 @@ export class CodingAgentOrchestrator {
 
   private async failRun(session: SessionRecord, run: RunRecord, code: string, message: string): Promise<void> {
     if (!this.claimTerminal(run)) return;
+    await this.failClaimedRun(session, run, code, message);
+  }
+
+  private async failClaimedRun(session: SessionRecord, run: RunRecord, code: string, message: string): Promise<void> {
     if (!await this.stopBeforeRollback(session, run)) {
       await this.persistState();
       return;
@@ -963,14 +1013,32 @@ export class CodingAgentOrchestrator {
 
   /** Event handlers cannot await persistence; a failure must fail closed rather than become an unhandled rejection. */
   private persistInBackground(): void {
-    this.persistState().catch((error: unknown) => {
+    this.background(this.persistState());
+  }
+
+  /** Fire-and-forget control work: persistence failures mark the runtime unhealthy instead of crashing Node. */
+  private background(work: Promise<unknown>): void {
+    work.catch((error: unknown) => {
       if (this.stateStore) this.stateStore.healthy = false;
       console.error("Agent runtime control state could not be persisted; runtime marked unhealthy", error instanceof Error ? error.message : error);
     });
   }
 
+  /** Observational updates (tokens, tools, turns, usage) coalesce into at most one write per second. */
+  private persistSoon(): void {
+    if (this.persistTimer) return;
+    this.persistTimer = setTimeout(() => { this.persistTimer = undefined; this.persistInBackground(); }, 1_000);
+    this.persistTimer.unref?.();
+  }
+
   private async persistState(): Promise<void> {
-    for (const run of this.runs.values()) this.notifyRun(run);
+    if (this.persistTimer) { clearTimeout(this.persistTimer); this.persistTimer = undefined; }
+    for (const run of this.runs.values()) {
+      if (isTerminal(run.status) && this.observedFinal.has(run.run_id) && this.observedFinal.get(run.run_id) === run.updated_at) continue;
+      this.notifyRun(run);
+      if (isTerminal(run.status)) { this.observedFinal.set(run.run_id, run.updated_at); this.streamingAnswers.delete(run.run_id); }
+      else this.observedFinal.delete(run.run_id);
+    }
     if (!this.stateStore) return;
     try { await this.stateStore.save({
       schema_version: 1,
@@ -1000,6 +1068,34 @@ export class CodingAgentOrchestrator {
       throw error;
     }
   }
+}
+
+/** Classify a quality-gate exception so users see what actually blocked delivery. */
+function gateFailure(error: unknown): { code: string; message: string } {
+  const detail = error instanceof Error ? error.message.slice(0, 200) : "unknown error";
+  if (error instanceof ProtectedFileError) return { code: "protected_file_modified", message: `${detail}; changes were not delivered` };
+  if (error instanceof DiffLimitError) return { code: "diff_limit_exceeded", message: `${detail}; split the change or reduce its size` };
+  if (detail === "workflow_budget_exhausted") return { code: "workflow_budget_exhausted", message: "Workflow cost or time budget was exhausted before verification finished" };
+  return { code: "quality_gate_unavailable", message: `Required verification could not complete (${detail})` };
+}
+
+/** Trailers let reviewers trace a delivered commit back to its run and how (or whether) it was verified. */
+export function buildCommitMessage(run: RunRecord): string {
+  const trailers = [`Pi-Run-Id: ${run.run_id}`, `Pi-Model: ${run.provider}/${run.model}`, `Pi-Verification: ${run.verification_status ?? "unverified"}`];
+  if (run.grader_status) trailers.push(`Pi-Grader: ${run.grader_status}`);
+  return `Pi agent: ${run.run_id}\n\n${trailers.join("\n")}`;
+}
+
+/** Non-completed executions are never delivered; each outcome gets its own actionable code. */
+function settleFailure(event: Extract<PublicRunEvent, { type: "settled" }>): { code: string; message: string } {
+  if (event.outcome === "limit_reached") {
+    return event.limit === "turns"
+      ? { code: "agent_turn_limit", message: "Agent stopped at its turn limit before finishing; changes were not delivered" }
+      : { code: "agent_tool_limit", message: "Agent stopped at its tool-call limit before finishing; changes were not delivered" };
+  }
+  if (event.outcome === "truncated") return { code: "agent_output_truncated", message: "Model output hit its token limit; changes were not delivered" };
+  if (event.outcome === "aborted") return { code: "agent_aborted", message: "Agent execution was aborted before finishing; changes were not delivered" };
+  return { code: "provider_error", message: event.error_message ? `Model provider error: ${event.error_message}` : "Model provider returned an error; changes were not delivered" };
 }
 
 function validateTaskId(value: unknown): void {

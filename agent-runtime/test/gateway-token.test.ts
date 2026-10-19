@@ -88,3 +88,17 @@ test("signed optional trace context survives verification and rejects invalid co
   assert.equal((verifyGatewayToken(token,"secret") as any)?.traceparent,claims.traceparent);
   assert.equal(verifyGatewayToken(issueGatewayToken({...claims,traceparent:"bad"},"secret"),"secret"),null);
 });
+
+test("role and output-token limit claims round-trip and are covered by the signature", async () => {
+  const { issueGatewayToken, verifyGatewayToken } = await import("../src/gateway-token.js");
+  const token = issueGatewayToken({ runId: "r", workflowRunId: "w", role: "grader", outputTokenLimit: 16384, provider: "openai", model: "gpt-5.6-sol", api: "openai-responses", reasoningEffort: "high", expiresAt: Date.now() + 60_000 }, "s");
+  const claims = verifyGatewayToken(token, "s");
+  assert.equal(claims?.role, "grader");
+  assert.equal(claims?.outputTokenLimit, 16384);
+  const [payload, signature] = token.split(".");
+  const forged = JSON.parse(Buffer.from(payload, "base64url").toString());
+  forged.outputTokenLimit = 400000;
+  assert.equal(verifyGatewayToken(`${Buffer.from(JSON.stringify(forged)).toString("base64url")}.${signature}`, "s"), null);
+  const bad = issueGatewayToken({ runId: "r", role: "admin" as any, provider: "openai", model: "gpt-5.6-sol", api: "openai-responses", reasoningEffort: "high", expiresAt: Date.now() + 60_000 }, "s");
+  assert.equal(verifyGatewayToken(bad, "s"), null);
+});

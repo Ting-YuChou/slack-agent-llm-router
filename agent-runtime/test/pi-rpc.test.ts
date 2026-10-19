@@ -112,3 +112,73 @@ test("MCP tool events retain only names, status and result byte count", () => {
   assert.equal((end as any).result_bytes > 0, true);
   assert.equal(JSON.stringify(end).includes("private result"), false);
 });
+
+function settledAfter(records: Array<Record<string, unknown>>, bridge?: PiRpcBridge) {
+  const events: any[] = [];
+  const target = bridge ?? new PiRpcBridge({ writeLine: () => undefined, onEvent: (event) => events.push(event) });
+  if (!bridge) target.prompt("run-1", "fix");
+  target.feed(records.map((record) => JSON.stringify(record)).join("\n") + "\n");
+  return events.filter((event) => event.type === "settled");
+}
+
+const assistantEnd = (stopReason: string, extra: Record<string, unknown> = {}) =>
+  ({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "x" }], stopReason, ...extra } });
+
+test("settled reports the last assistant stop reason as the run outcome", () => {
+  assert.deepEqual(settledAfter([assistantEnd("stop"), { type: "agent_settled" }]).map((e) => e.outcome), ["completed"]);
+  assert.deepEqual(settledAfter([assistantEnd("length"), { type: "agent_settled" }]).map((e) => e.outcome), ["truncated"]);
+  assert.deepEqual(settledAfter([assistantEnd("aborted"), { type: "agent_settled" }]).map((e) => e.outcome), ["aborted"]);
+});
+
+test("settled error outcome carries a bounded, redacted provider message", () => {
+  const [settled] = settledAfter([assistantEnd("error", { errorMessage: `upstream failed Bearer sk-secret-token ${"z".repeat(900)}` }), { type: "agent_settled" }]);
+  assert.equal(settled.outcome, "error");
+  assert.equal(settled.stop_reason, "error");
+  assert.ok(settled.error_message.length <= 500);
+  assert.doesNotMatch(settled.error_message, /sk-secret-token/);
+});
+
+test("auto-retry: a later successful assistant message wins over an earlier error", () => {
+  const outcomes = settledAfter([assistantEnd("error", { errorMessage: "429" }), assistantEnd("stop"), { type: "agent_settled" }]).map((e) => e.outcome);
+  assert.deepEqual(outcomes, ["completed"]);
+});
+
+test("tool-use stops are intermediate; the final assistant message decides", () => {
+  assert.deepEqual(settledAfter([assistantEnd("toolUse"), assistantEnd("stop"), { type: "agent_settled" }]).map((e) => e.outcome), ["completed"]);
+});
+
+test("a policy limit entry before an abort reports which limit was hit", () => {
+  const limit = { type: "entry_appended", entry: { type: "custom", customType: "pi_agent_limit", data: { kind: "tool_calls", limit: 40 } } };
+  const [settled] = settledAfter([limit, assistantEnd("aborted"), { type: "agent_settled" }]);
+  assert.equal(settled.outcome, "limit_reached");
+  assert.equal(settled.limit, "tool_calls");
+});
+
+test("settling without any assistant message is an error, not a completion", () => {
+  const [settled] = settledAfter([{ type: "agent_settled" }]);
+  assert.equal(settled.outcome, "error");
+  assert.equal(settled.stop_reason, "no_response");
+});
+
+test("outcome tracking resets for each prompt", () => {
+  const events: any[] = [];
+  const bridge = new PiRpcBridge({ writeLine: () => undefined, onEvent: (event) => events.push(event) });
+  bridge.prompt("run-1", "first");
+  bridge.feed([assistantEnd("length"), { type: "agent_settled" }].map((r) => JSON.stringify(r)).join("\n") + "\n");
+  bridge.prompt("run-2", "second");
+  bridge.feed(JSON.stringify({ type: "agent_settled" }) + "\n");
+  assert.deepEqual(events.filter((e) => e.type === "settled").map((e) => e.outcome), ["truncated", "error"]);
+});
+
+test("a rejected prompt command surfaces as an error instead of waiting for the deadline", () => {
+  const events: any[] = [];
+  const bridge = new PiRpcBridge({ writeLine: () => undefined, onEvent: (event) => events.push(event) });
+  bridge.prompt("run-1", "fix");
+  bridge.feed(JSON.stringify({ id: "run-1", type: "response", command: "prompt", success: false, error: "busy" }) + "\n");
+  assert.deepEqual(events, [{ type: "error", code: "prompt_rejected", message: "Pi rejected the prompt before it started" }]);
+});
+
+test("streaming text deltas are distinct from the final assistant answer", () => {
+  assert.deepEqual(sanitizeRpcEvent({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Hel" } }), { type: "answer_delta", text: "Hel" });
+  assert.deepEqual(sanitizeRpcEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Hello" }] } }), { type: "answer", text: "Hello" });
+});

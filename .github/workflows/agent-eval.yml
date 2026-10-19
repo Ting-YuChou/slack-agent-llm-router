@@ -1,0 +1,102 @@
+name: Agent eval
+
+# Live coding-agent eval with hidden oracles. It spends real model budget, so
+# it only runs on manual dispatch. The offline unit tests for the runner live
+# in tests/test_agent_eval.py and run in the regular CI pytest job.
+on:
+  workflow_dispatch:
+    inputs:
+      repeats:
+        description: Runs per task (pass@1 is averaged over repeats)
+        required: true
+        default: "3"
+      max_cost_usd:
+        description: Stop starting new runs once this much model spend is reached
+        required: true
+        default: "2"
+      tasks:
+        description: Space-separated task ids (blank runs every task in eval/tasks)
+        required: false
+        default: ""
+      update_baseline:
+        description: Write the metrics to eval/baseline.json instead of comparing
+        type: boolean
+        default: false
+      runner:
+        description: Runner label; needs a Docker daemon (native Linux or Docker Desktop)
+        required: true
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-eval
+  cancel-in-progress: false
+
+jobs:
+  eval:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.0"
+          cache: npm
+          cache-dependency-path: agent-runtime/package-lock.json
+
+      - name: Build agent runtime
+        working-directory: agent-runtime
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build fixture images
+        run: |
+          docker build -t slack-pi-agent:structured-test -f agent-runtime/Dockerfile.agent agent-runtime
+          docker build -t slack-pi-model-gateway:structured-test -f agent-runtime/Dockerfile.gateway agent-runtime
+          docker build -t slack-pi-verification:structured-test -f agent-runtime/Dockerfile.verification .
+
+      - name: Write eval credential
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          test -n "$OPENAI_API_KEY" || { echo "OPENAI_API_KEY secret is not set" >&2; exit 1; }
+          umask 077
+          printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY" > .env.demo
+
+      - name: Run eval
+        env:
+          REPEATS: ${{ inputs.repeats }}
+          MAX_COST_USD: ${{ inputs.max_cost_usd }}
+          TASKS: ${{ inputs.tasks }}
+          UPDATE_BASELINE: ${{ inputs.update_baseline }}
+        run: |
+          args=(--live-openai --repeats "$REPEATS" --max-cost-usd "$MAX_COST_USD")
+          for task in $TASKS; do args+=(--task "$task"); done
+          if [ "$UPDATE_BASELINE" = "true" ]; then args+=(--update-baseline); fi
+          python scripts/agent_eval.py "${args[@]}"
+
+      - name: Remove eval credential
+        if: always()
+        run: rm -f .env.demo
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-eval-results
+          path: |
+            eval/results/*.json
+            eval/baseline.json
+          if-no-files-found: warn

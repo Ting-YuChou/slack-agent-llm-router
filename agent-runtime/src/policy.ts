@@ -10,6 +10,8 @@ export interface BashPolicyResult {
 }
 
 const BLOCKED_COMMAND_PATTERNS: Array<[RegExp, string]> = [
+  // Best effort only: Pi runs as PID 1, so the gateway's own limits are the real credential boundary.
+  [/(?:^|[;&|(]\s*)(?:env|printenv|export|set|declare\s+-x)(?:\s|$)|\/proc\/[^\s/]+\/environ|\$\{?[A-Za-z_]*(?:KEY|TOKEN|SECRET|PASSWORD|_JSON)\b/i, "secret_env_read"],
   [/\b(?:curl|wget|nc|ncat|ssh|scp|rsync|ftp)\b/i, "network_command"],
   [/\b(?:sudo|su|doas)\b/i, "privilege_escalation"],
   [/\b(?:docker|podman|kubectl|nerdctl|mount|umount)\b/i, "host_or_container_control"],

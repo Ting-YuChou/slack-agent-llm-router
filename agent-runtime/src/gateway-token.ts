@@ -9,9 +9,14 @@ import {
   type AgentReasoningEffort,
 } from "./agent-model.js";
 
+export type GatewayRole = "writer" | "grader" | "investigator";
+
 export interface GatewayClaims {
   runId: string;
   workflowRunId?: string;
+  /** Which harness role the execution plays; selects its output-token cap. */
+  role?: GatewayRole;
+  outputTokenLimit?: number;
   provider: AgentProvider;
   model: string;
   api: AgentModelApi;
@@ -88,9 +93,13 @@ export function verifyGatewayToken(token: string, secret: string, now = Date.now
     return null;
   }
   if (model.api !== claims.api || !supportsAgentEffort(model, claims.reasoningEffort)) return null;
+  if (claims.role !== undefined && !["writer", "grader", "investigator"].includes(claims.role as string)) return null;
+  if (claims.outputTokenLimit !== undefined && (!Number.isInteger(claims.outputTokenLimit) || (claims.outputTokenLimit as number) < 1 || (claims.outputTokenLimit as number) > model.maxTokens)) return null;
   return {
     runId: claims.runId,
     ...(typeof claims.workflowRunId === "string" ? {workflowRunId: claims.workflowRunId} : {}),
+    ...(claims.role !== undefined ? { role: claims.role as GatewayRole } : {}),
+    ...(claims.outputTokenLimit !== undefined ? { outputTokenLimit: claims.outputTokenLimit as number } : {}),
     provider: model.provider,
     model: model.id,
     api: model.api,

@@ -10,7 +10,8 @@ import { randomUUID, createHash, timingSafeEqual } from "node:crypto";
 import { PiRunCapture } from "./pi-capture.js";
 import { AgentTelemetry, isCredentialKey } from "./telemetry.js";
 import { AgentTracing } from "./tracing.js";
-import { DockerPiProcess } from "./container-runtime.js";
+import { DockerPiProcess, type WriterContext } from "./container-runtime.js";
+import { budgetIdFor, outputTokenLimitFor, parseDefaultRunBudget } from "./run-budget.js";
 import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT, listAgentModels, resolveAgentModel } from "./agent-model.js";
 import { JevRouter, type JevMode } from "./jev-router.js";
 import { repositoryFromRemote, parseGitHubRepositories } from "./github-repository.js";
@@ -32,9 +33,9 @@ import { createCiRuntime } from "./ci-runtime.js";
 import { taskMode } from "./task-mode.js";
 import { workflowMode } from "./structured-workflow.js";
 import type { CiRepairs } from "./ci-repair.js";
-import { loadProfile } from "./verification.js";
+import { loadProfile, type VerificationProfile } from "./verification.js";
 import { createQualityServices } from "./workflow-runtime.js";
-import { WorktreeManager } from "./worktree-manager.js";
+import { DEFAULT_DIFF_LIMITS, WorktreeManager } from "./worktree-manager.js";
 
 const exec = promisify(execFile);
 export const DEFAULT_AGENT_RUNTIME_PORT = 3001;
@@ -292,6 +293,7 @@ export async function createProductionServer() {
   await mkdir(runtimeRoot, { recursive: true });
   await mkdir(worktreeRoot, { recursive: true });
   const actualImageDigest = process.env.PI_AGENT_IMAGE_DIGEST ?? await inspectImageDigest(image);
+  if (!await readImageFile(image, "/opt/pi/extensions/secret-env.ts")) throw new Error("Agent image must be rebuilt with the secret-env extension");
   const imageSkillLock = await readImageFile(image, "/opt/pi/skills.lock.json");
   const lock = await verifyPluginLock(lockPath, { rootDir: path.dirname(lockPath), actualImageDigest });
   const skillLock = await verifySkillLock(skillLockPath, {
@@ -364,11 +366,13 @@ export async function createProductionServer() {
   }
   const priorActive = new Map<string, number>();
   const verificationBases = new Map<string, string>();
-  const budgetLedger = trustedProfile ? new BudgetLedger(path.join(runtimeRoot, "budget", "budget.sqlite")) : undefined;
+  // Every run is metered, with or without a trusted profile (no-profile runs get a default budget).
+  const budgetLedger = new BudgetLedger(path.join(runtimeRoot, "budget", "budget.sqlite"));
+  const defaultRunBudgetUsd = parseDefaultRunBudget(process.env);
   const workflowControl = trustedProfile ? new ControlStore(path.join(runtimeRoot, "control", "state.sqlite"), () => { void orchestrator.shutdown().catch(() => {}); }) : undefined;
   const releaseCoordinator = workflowControl?.acquireCoordinator();
   const quality = trustedProfile ? createQualityServices({
-    ...trustedProfile, control: workflowControl!, session: id => orchestrator.getRun(id).session_id, repoPath, worktreeRoot, verificationBases, priorActive, ledger: budgetLedger!, mapping: executionParents, root: runtimeRoot, image: actualImageDigest, network, gatewayUrl, telemetry, tracing,
+    ...trustedProfile, control: workflowControl!, session: id => orchestrator.getRun(id).session_id, repoPath, worktreeRoot, verificationBases, priorActive, ledger: budgetLedger, mapping: executionParents, root: runtimeRoot, image: actualImageDigest, network, gatewayUrl, telemetry, tracing,
     githubMcp: mcpServerIds.includes('github') ? { gatewayUrl: gatewayUrls.github!, token: (id,owner) => {
       const token = issueMcpToken({ version: 2, run: id, session: id, slackUser: owner, server: 'github', tools: [...MCP_SERVERS.github.directTools], mode: 'read_only', scope: { repository: mcpRepository! }, maxCalls: 4, expiry: Date.now() + 5 * 60_000 },deriveMcpServerSecret(mcpSigningSecret,'github'));
       telemetry?.addSecret(token,id); return token;
@@ -376,13 +380,16 @@ export async function createProductionServer() {
     phase: (id, phase, cost) => orchestrator.qualityPhase(id, phase, cost),
     token: (id, route) => {
       const model = resolveAgentModel(route?.modelRef ?? "openai/gpt-5.6-sol");
-      const token = issueGatewayToken({ runId: id, workflowRunId: executionParents.get(id), provider: model.provider, model: model.id, api: model.api, reasoningEffort: route?.effort ?? "high", expiresAt: executionExpiry(id), traceparent: tracing?.traceparent(id) }, gatewaySecret);
+      const role = route ? "investigator" : "grader";
+      const token = issueGatewayToken({ runId: id, workflowRunId: executionParents.get(id), role, outputTokenLimit: outputTokenLimitFor(role), provider: model.provider, model: model.id, api: model.api, reasoningEffort: route?.effort ?? "high", expiresAt: executionExpiry(id), traceparent: tracing?.traceparent(id) }, gatewaySecret);
       telemetry?.addSecret(token, id); return token;
     },
   }) : undefined;
   let ciRuntime: Awaited<ReturnType<typeof createCiRuntime>> | undefined;
+  const agentLimits = parseAgentLimits(process.env);
   const orchestrator: CodingAgentOrchestrator = new CodingAgentOrchestrator({
     quality,
+    requireVerification: process.env.PI_AGENT_REQUIRE_VERIFICATION === "1",
     captureTraceContext: id => tracing?.traceparent(id),
     captureState: id => ({complete: telemetry ? telemetry.completeness(id).length === 0 : null, reasons: telemetry?.completeness(id) ?? []}),
     observeLifecycle: (id, name, phase, failed, sessionId) => {
@@ -427,12 +434,14 @@ export async function createProductionServer() {
           sessionStatePath,
           gatewayUrl,
           modelRef: model.ref,
-          extensionPaths: ["/opt/pi/extensions/policy.ts", "/opt/pi/extensions/model-gateway.ts"],
+          extensionPaths: ["/opt/pi/extensions/policy.ts", "/opt/pi/extensions/model-gateway.ts", "/opt/pi/extensions/secret-env.ts"],
           pluginPaths: lock.plugins.map((plugin) => plugin.container_path),
           skillPaths: skillLock.skills.map((skill) => skill.container_path),
           toolNames: ["read", "write", "edit", "bash", "grep", "find", "ls", ...lock.plugins.flatMap((plugin) => plugin.enabled_tools)],
           continueSession: session.restored,
           safeCommands: parseSafeCommands(process.env.PI_AGENT_SAFE_COMMANDS),
+          limits: agentLimits,
+          ...(trustedProfile ? { writerContext: writerContextFor(trustedProfile.profile) } : {}),
           user: containerUser,
           ...(mcpServerIds.length > 0 ? {
             mcp: {
@@ -447,7 +456,9 @@ export async function createProductionServer() {
           const selectedModel = resolveAgentModel(route.modelRef);
           const token = issueGatewayToken({
             runId,
-            workflowRunId: executionParents.get(runId),
+            workflowRunId: budgetIdFor(runId, executionParents, budgetLedger, defaultRunBudgetUsd),
+            role: "writer",
+            outputTokenLimit: outputTokenLimitFor("writer"),
             provider: selectedModel.provider,
             model: selectedModel.id,
             api: selectedModel.api,
@@ -478,7 +489,7 @@ export async function createProductionServer() {
           traceparent: tracing?.traceparent(runId),
           expiresAt: executionExpiry(runId),
         }, gatewaySecret); telemetry?.addSecret(token, runId); return token; } : undefined,
-        telemetry, session.id, tracing, undefined, id => budgetLedger?.prompt(id),
+        telemetry, session.id, tracing, undefined, id => budgetLedger.prompt(id),
       );
     },
   });
@@ -565,7 +576,7 @@ export async function createProductionServer() {
     }),
   });
   server.on("close", () => {
-    void orchestrator.shutdown().finally(async () => { await ciRuntime?.close(); await stopRetention?.(); releaseCoordinator?.(); releaseHostCoordinator(); hostCoordinator.close(); workflowControl?.close(); budgetLedger?.close(); await telemetry?.close().catch(() => {}); await tracing?.close().catch(() => {}); });
+    void orchestrator.shutdown().finally(async () => { await ciRuntime?.close(); await stopRetention?.(); releaseCoordinator?.(); releaseHostCoordinator(); hostCoordinator.close(); workflowControl?.close(); budgetLedger.close(); await telemetry?.close().catch(() => {}); await tracing?.close().catch(() => {}); });
   });
   return server;
   } catch (error) { releaseHostCoordinator(); hostCoordinator.close(); throw error; }
@@ -673,6 +684,21 @@ function positiveInteger(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
+/** Constraints the writer sees up front and the policy extension enforces at write time. */
+export function writerContextFor(profile: VerificationProfile): WriterContext {
+  return { allowedPaths: [...profile.allowedPaths], checks: profile.checks.map((check) => check.name), rubric: [...profile.rubric], diffLimits: { ...DEFAULT_DIFF_LIMITS } };
+}
+
+export function parseAgentLimits(env: NodeJS.ProcessEnv): { maxTurns: number; maxToolCalls: number } {
+  const read = (key: string, fallback: number) => {
+    if (env[key] === undefined || env[key] === "") return fallback;
+    const value = Number(env[key]);
+    if (!Number.isInteger(value) || value < 1 || value > 1000) throw new Error(`${key} must be an integer between 1 and 1000`);
+    return value;
+  };
+  return { maxTurns: read("PI_AGENT_MAX_TURNS", 20), maxToolCalls: read("PI_AGENT_MAX_TOOL_CALLS", 40) };
+}
+
 function parseSafeCommands(value: string | undefined): string[] {
   const defaults = ["npm test", "npm run test", "npm run lint", "npm run build", "pytest", "python -m pytest"];
   if (!value) return defaults;

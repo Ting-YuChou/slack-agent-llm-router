@@ -137,3 +137,13 @@ test("approvals are owner-bound, one-time, and expire", () => {
   store.invalidateRun("run-3");
   assert.equal(store.decide(bound.id, "U1", "approve", "run-3").code, "already_used");
 });
+
+test("commands that dump the environment or credential variables are blocked", async () => {
+  const { classifyBash } = await import("../src/policy.js");
+  for (const command of ["env", "printenv", "printenv OPENAI_API_KEY", "export", "cat /proc/1/environ", "cat /proc/self/environ", "pytest && env", "echo $OPENAI_API_KEY", "echo ${PI_AGENT_MCP_SERVERS_JSON}"]) {
+    assert.deepEqual(classifyBash(command, ["pytest"]), { decision: "block", reason: "secret_env_read" }, command);
+  }
+  for (const command of ["pytest tests/test_env.py", "ls tests/env", "python -m pytest -k env"]) {
+    assert.notEqual(classifyBash(command, ["pytest", "python -m pytest"]).reason, "secret_env_read", command);
+  }
+});

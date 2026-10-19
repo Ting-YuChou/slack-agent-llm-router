@@ -3,13 +3,23 @@
 import asyncio
 import json
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 import httpx
 
 
 class AgentRuntimeError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        status: Optional[int] = None,
+        code: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.status = status
+        self.code = code
 
 
 class AgentRuntimeTimeout(AgentRuntimeError):
@@ -47,6 +57,7 @@ class AgentRuntimeClient:
         "timed_out",
         "interrupted",
     }
+    MAX_RETRY_BACKOFF_SECONDS = 30.0
 
     def __init__(
         self,
@@ -60,6 +71,7 @@ class AgentRuntimeClient:
         token_env = str(config.get("token_env", "AGENT_RUNTIME_TOKEN"))
         self._token = os.getenv(token_env, "")
         self._health_cache: Optional[Dict[str, Any]] = None
+        self._monotonic = time.monotonic
         self._health_timeout_seconds = min(connect_timeout, 2.0)
         self._client = httpx.AsyncClient(
             base_url=base_url,
@@ -331,16 +343,45 @@ class AgentRuntimeClient:
         )
 
     async def wait_for_update(
-        self, run_id: str, *, poll_seconds: float = 1.0
+        self,
+        run_id: str,
+        *,
+        poll_seconds: float = 1.0,
+        max_error_seconds: float = 300.0,
     ) -> Dict[str, Any]:
+        """Poll until the run needs Slack attention, riding out transient errors."""
+        backoff = 1.0
+        errors_since: Optional[float] = None
         while True:
-            run = await self.get_run(run_id)
+            try:
+                run = await self.get_run(run_id)
+            except AgentRuntimeError as exc:
+                if not self._is_transient(exc):
+                    raise
+                now = self._monotonic()
+                if errors_since is None:
+                    errors_since = now
+                if now - errors_since + backoff > max_error_seconds:
+                    raise
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, self.MAX_RETRY_BACKOFF_SECONDS)
+                continue
+            backoff = 1.0
+            errors_since = None
             if (
                 run["status"] in self.TERMINAL_STATES
                 or run["status"] == "awaiting_approval"
             ):
                 return run
             await asyncio.sleep(poll_seconds)
+
+    @staticmethod
+    def _is_transient(exc: AgentRuntimeError) -> bool:
+        if isinstance(
+            exc, (AgentRuntimeTimeout, AgentRuntimeUnavailable, AgentRuntimeBusy)
+        ):
+            return True
+        return exc.status is not None and exc.status >= 500
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -399,16 +440,22 @@ class AgentRuntimeClient:
             payload = {}
         error = payload.get("error", {}) if isinstance(payload, dict) else {}
         code = error.get("code") if isinstance(error, dict) else None
-        if response.status_code == 401:
-            raise AgentRuntimeUnauthorized("Agent runtime authentication failed")
-        if response.status_code == 409:
-            raise AgentRuntimeConflict("Agent runtime rejected a conflicting action")
-        if response.status_code == 429:
-            raise AgentRuntimeBusy("Agent runtime is busy")
-        if response.status_code == 504 or code == "run_timeout":
-            raise AgentRuntimeTimeout("Agent runtime request timed out")
+        status = response.status_code
+        details = {"status": status, "code": code}
+        if status == 401:
+            raise AgentRuntimeUnauthorized(
+                "Agent runtime authentication failed", **details
+            )
+        if status == 409:
+            raise AgentRuntimeConflict(
+                "Agent runtime rejected a conflicting action", **details
+            )
+        if status == 429:
+            raise AgentRuntimeBusy("Agent runtime is busy", **details)
+        if status == 504 or code == "run_timeout":
+            raise AgentRuntimeTimeout("Agent runtime request timed out", **details)
         raise AgentRuntimeError(
-            f"Agent runtime rejected the request with status {response.status_code}"
+            f"Agent runtime rejected the request with status {status}", **details
         )
 
     @staticmethod
