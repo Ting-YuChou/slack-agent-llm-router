@@ -317,7 +317,9 @@ CREATE TABLE IF NOT EXISTS agent_feedback (
   payload_json String CODEC(ZSTD(3)),
   user_id String,
   verdict String,
-  feedback_id String
+  feedback_id String,
+  reason_category String,
+  comment String
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
 
 CREATE VIEW IF NOT EXISTS agent_feedback_latest AS SELECT * FROM agent_feedback FINAL;

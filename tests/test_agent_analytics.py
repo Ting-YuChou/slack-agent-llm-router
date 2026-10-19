@@ -240,6 +240,36 @@ class AgentAnalyticsTests(unittest.TestCase):
             "private source content", rows["agent_test_results"][0]["payload_json"]
         )
 
+    def test_feedback_projects_reason_category_and_comment(self):
+        module = self.module()
+        payload = {"user_id": "u", "verdict": "needs_changes", "feedback_id": "f"}
+        detailed = module.project(
+            {
+                "kind": "feedback",
+                "payload": {
+                    **payload,
+                    "reason_category": "scope_creep",
+                    "comment": "touched [REDACTED] files",
+                },
+            }
+        )
+        module.validate_projections(detailed)
+        row = detailed["agent_feedback"][0]
+        self.assertEqual(row["reason_category"], "scope_creep")
+        self.assertEqual(row["comment"], "touched [REDACTED] files")
+        legacy = module.project({"kind": "feedback", "payload": payload})
+        module.validate_projections(legacy)
+        self.assertEqual(legacy["agent_feedback"][0]["reason_category"], "")
+        self.assertEqual(legacy["agent_feedback"][0]["comment"], "")
+        ddl = next(
+            s
+            for s in module.schema_sql()
+            if s.startswith("CREATE TABLE IF NOT EXISTS agent_feedback (")
+        )
+        self.assertIn("reason_category String", ddl)
+        self.assertIn("comment String", ddl)
+        self.assertIn(ddl, Path("docker/observability/agent-tables.sql").read_text())
+
     def test_ttl_casts_datetime64_to_clickhouse_supported_datetime(self):
         module = self.module()
         for statement in module.schema_sql():

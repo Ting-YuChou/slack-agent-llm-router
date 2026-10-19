@@ -128,6 +128,39 @@ test("feedback is authenticated, owner checked, terminal only, and has stable re
   } finally {await close(server);}
 });
 
+test("feedback accepts a reason category and a bounded, redacted comment on any terminal status", async () => {
+  let status = "timed_out"; const captures: any[] = [];
+  const server=createAgentHttpServer({token:"secret",health:()=>({}),orchestrator:{getRun:()=>({run_id:"r",session_id:"s",owner_user_id:"owner",status})} as any,
+    feedback: async (_run:any,payload:any,id:string)=>{captures.push({payload,id});return true;}} as any);
+  const base=await listen(server);
+  const submit=(body:Record<string,unknown>)=>fetch(`${base}/v1/runs/r/feedback`,{method:"POST",headers:{authorization:"Bearer secret","content-type":"application/json"},
+    body:JSON.stringify({user_id:"owner",verdict:"needs_changes",feedback_id:"click-2",...body})});
+  try {
+    assert.equal((await submit({reason_category:"vibes"})).status,400);
+    assert.equal((await submit({reason_category:7})).status,400);
+    assert.equal((await submit({comment:"x".repeat(2001)})).status,400);
+    assert.equal((await submit({comment:42})).status,400);
+    assert.equal((await submit({user_id:"other",reason_category:"style"})).status,401);
+    assert.equal(captures.length,0);
+    const comment="please retry\nOPENAI_API_KEY=sk-live-should-not-leak\nAuthorization: Bearer abc.def-ghi";
+    assert.equal((await submit({reason_category:"broke_tests",comment})).status,202);
+    assert.equal(captures[0].payload.reason_category,"broke_tests");
+    assert.match(captures[0].payload.comment,/please retry/);
+    assert.doesNotMatch(captures[0].payload.comment,/sk-live-should-not-leak|abc\.def-ghi/);
+    assert.match(captures[0].payload.comment,/\[REDACTED\]/);
+    assert.equal((await submit({reason_category:"broke_tests",comment})).status,202);
+    assert.equal(captures[1].id,captures[0].id);
+    for (const terminal of ["completed","failed","cancelled","rejected","interrupted"]) {
+      status=terminal;
+      assert.equal((await submit({reason_category:"other",comment:"x".repeat(2000),feedback_id:`click-${terminal}`})).status,202);
+    }
+    status="completed";
+    assert.equal((await submit({verdict:"accepted",feedback_id:"click-3"})).status,202);
+    assert.equal("reason_category" in captures.at(-1).payload,false);
+    assert.equal("comment" in captures.at(-1).payload,false);
+  } finally {await close(server);}
+});
+
 test("restart capture recovery skips previously recovered terminal runs", async () => {
   const module: any = await import("../src/server.js");
   assert.equal(typeof module.recoverPendingCaptures,"function");

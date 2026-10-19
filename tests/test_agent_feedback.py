@@ -33,6 +33,36 @@ async def test_feedback_client_uses_authenticated_endpoint(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_feedback_client_sends_optional_reason_and_comment(monkeypatch):
+    monkeypatch.setenv("AGENT_RUNTIME_TOKEN", "runtime-secret")
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(202, json={"status": "accepted"})
+
+    runtime = AgentRuntimeClient({}, transport=httpx.MockTransport(handler))
+    try:
+        await runtime.feedback(
+            "run1",
+            "user1",
+            "needs_changes",
+            "click1",
+            reason_category="incomplete",
+            comment="also update the docs",
+        )
+    finally:
+        await runtime.close()
+    assert json.loads(requests[0].content) == {
+        "user_id": "user1",
+        "verdict": "needs_changes",
+        "feedback_id": "click1",
+        "reason_category": "incomplete",
+        "comment": "also update the docs",
+    }
+
+
+@pytest.mark.asyncio
 async def test_slack_feedback_does_not_depend_on_active_run_cache_or_call_approval():
     runtime = SimpleNamespace(feedback=AsyncMock(), decide=AsyncMock())
     bot = SimpleNamespace(
@@ -102,3 +132,255 @@ async def test_feedback_buttons_preserve_long_result_with_valid_slack_sections()
     assert all(len(text) <= 3000 for text in sections)
     assert "".join(sections) == answer
     assert len(blocks[-1]["elements"]) == 2
+
+
+def _feedback_bot(runtime=None):
+    bot = SlackBot(
+        {"channels": []},
+        SimpleNamespace(),
+        services={"agent_runtime": runtime or SimpleNamespace()},
+    )
+    bot.web_client = SimpleNamespace(
+        views_open=AsyncMock(),
+        chat_postEphemeral=AsyncMock(),
+        chat_postMessage=AsyncMock(),
+    )
+    return bot
+
+
+def _needs_changes_click(user="owner", trigger_id="trigger-1"):
+    return {
+        "type": "block_actions",
+        "trigger_id": trigger_id,
+        "team": {"id": "T1"},
+        "user": {"id": user},
+        "channel": {"id": "C1"},
+        "container": {"thread_ts": "100.1"},
+        "actions": [
+            {
+                "action_id": "pi_agent_needs_changes",
+                "value": json.dumps(
+                    {
+                        "run_id": "r1",
+                        "team_id": "T1",
+                        "channel_id": "C1",
+                        "thread_ts": "100.1",
+                    }
+                ),
+                "action_ts": "200.1",
+            }
+        ],
+    }
+
+
+def _feedback_submission(view, user="owner", continue_session=False):
+    values = {
+        "feedback_reason": {"reason": {"selected_option": {"value": "broke_tests"}}},
+        "feedback_comment": {"comment": {"value": "  rerun the failing suite  "}},
+        "feedback_continue": {
+            "continue": {
+                "selected_options": (
+                    [{"value": "continue"}] if continue_session else []
+                )
+            }
+        },
+    }
+    return {
+        "type": "view_submission",
+        "team": {"id": "T1"},
+        "user": {"id": user},
+        "view": {
+            "callback_id": view["callback_id"],
+            "private_metadata": view["private_metadata"],
+            "state": {"values": values},
+        },
+    }
+
+
+async def _open_feedback_modal(bot):
+    socket_client = SimpleNamespace(send_socket_mode_response=AsyncMock())
+    bot._enqueue_work = AsyncMock(return_value=True)
+    await bot._handle_socket_mode_request(
+        socket_client,
+        SimpleNamespace(
+            envelope_id="E1", type="interactive", payload=_needs_changes_click()
+        ),
+    )
+    return bot.web_client.views_open.await_args.kwargs
+
+
+def _texts(value):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == "text" and isinstance(item, str):
+                yield item
+            else:
+                yield from _texts(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _texts(item)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    ["completed", "failed", "cancelled", "rejected", "timed_out", "interrupted"],
+)
+async def test_feedback_buttons_shown_for_every_terminal_status(status):
+    bot = SimpleNamespace(
+        web_client=SimpleNamespace(chat_postMessage=AsyncMock()),
+        config={"response_settings": {"max_response_length": 5000}},
+        agent_config={"feedback_enabled": True},
+        message_handler=SimpleNamespace(
+            _format_agent_response=Mock(return_value="Run timed out.")
+        ),
+    )
+    await SlackBot._post_agent_result(
+        bot,
+        {"run_id": "r", "team_id": "T1", "channel_id": "c", "thread_ts": "t"},
+        {"run_id": "r", "status": status},
+    )
+    blocks = bot.web_client.chat_postMessage.await_args.kwargs["blocks"]
+    buttons = blocks[-1]["elements"]
+    assert [b["action_id"] for b in buttons] == [
+        "pi_agent_accept_result",
+        "pi_agent_needs_changes",
+    ]
+    assert json.loads(buttons[1]["value"]) == {
+        "run_id": "r",
+        "team_id": "T1",
+        "channel_id": "c",
+        "thread_ts": "t",
+    }
+    assert all(len(text) <= 3000 for text in _texts(blocks))
+
+
+@pytest.mark.asyncio
+async def test_needs_changes_opens_modal_synchronously_without_work_queue():
+    bot = _feedback_bot()
+    opened = await _open_feedback_modal(bot)
+
+    bot._enqueue_work.assert_not_awaited()
+    assert opened["trigger_id"] == "trigger-1"
+    view = opened["view"]
+    assert view["type"] == "modal"
+    assert view["callback_id"] == "pi_agent_feedback_submit"
+    assert view["private_metadata"]
+    assert len(view["private_metadata"]) <= 3000
+    by_id = {block.get("block_id"): block for block in view["blocks"]}
+    reasons = [o["value"] for o in by_id["feedback_reason"]["element"]["options"]]
+    assert reasons == [
+        "wrong_approach",
+        "incomplete",
+        "broke_tests",
+        "scope_creep",
+        "style",
+        "other",
+    ]
+    assert by_id["feedback_comment"]["element"]["max_length"] == 2000
+    assert by_id["feedback_continue"]["element"]["type"] == "checkboxes"
+    assert all(len(text) <= 3000 for text in _texts(view))
+
+
+@pytest.mark.asyncio
+async def test_needs_changes_falls_back_to_queued_verdict_when_modal_fails():
+    bot = _feedback_bot()
+    bot.web_client.views_open = AsyncMock(side_effect=RuntimeError("expired"))
+    await _open_feedback_modal(bot)
+
+    item = bot._enqueue_work.await_args.args[0]
+    assert item.kind == "interactive"
+    assert item.payload["actions"][0]["action_id"] == "pi_agent_needs_changes"
+    assert bot.agent_feedback_nonces == {}
+
+
+@pytest.mark.asyncio
+async def test_feedback_submission_is_queued_by_callback_id():
+    bot = _feedback_bot()
+    view = (await _open_feedback_modal(bot))["view"]
+    socket_client = SimpleNamespace(send_socket_mode_response=AsyncMock())
+    await bot._handle_socket_mode_request(
+        socket_client,
+        SimpleNamespace(
+            envelope_id="E2", type="interactive", payload=_feedback_submission(view)
+        ),
+    )
+    item = bot._enqueue_work.await_args.args[0]
+    assert item.kind == "agent_view"
+
+
+@pytest.mark.asyncio
+async def test_feedback_submission_sends_category_and_comment_once():
+    runtime = SimpleNamespace(feedback=AsyncMock())
+    bot = _feedback_bot(runtime)
+    bot.message_handler._start_agent_prompt = AsyncMock()
+    view = (await _open_feedback_modal(bot))["view"]
+
+    await bot._handle_agent_view_submission(_feedback_submission(view))
+    await bot._handle_agent_view_submission(_feedback_submission(view))
+
+    runtime.feedback.assert_awaited_once_with(
+        "r1",
+        "owner",
+        "needs_changes",
+        "200.1",
+        reason_category="broke_tests",
+        comment="rerun the failing suite",
+    )
+    bot.message_handler._start_agent_prompt.assert_not_awaited()
+    assert "recorded" in bot.web_client.chat_postEphemeral.await_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_feedback_submission_from_non_owner_is_rejected():
+    runtime = SimpleNamespace(feedback=AsyncMock())
+    bot = _feedback_bot(runtime)
+    bot.message_handler._start_agent_prompt = AsyncMock()
+    view = (await _open_feedback_modal(bot))["view"]
+
+    await bot._handle_agent_view_submission(
+        _feedback_submission(view, user="intruder", continue_session=True)
+    )
+
+    runtime.feedback.assert_not_awaited()
+    bot.message_handler._start_agent_prompt.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_runtime_owner_rejection_does_not_continue_session():
+    runtime = SimpleNamespace(
+        feedback=AsyncMock(side_effect=AgentRuntimeUnauthorized())
+    )
+    bot = _feedback_bot(runtime)
+    bot.message_handler._start_agent_prompt = AsyncMock()
+    view = (await _open_feedback_modal(bot))["view"]
+
+    await bot._handle_agent_view_submission(
+        _feedback_submission(view, continue_session=True)
+    )
+
+    bot.message_handler._start_agent_prompt.assert_not_awaited()
+    assert "owner" in bot.web_client.chat_postEphemeral.await_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_checked_continue_prompts_the_session_with_the_comment():
+    runtime = SimpleNamespace(feedback=AsyncMock())
+    bot = _feedback_bot(runtime)
+    bot.message_handler._start_agent_prompt = AsyncMock(
+        return_value="🛠️ Agent run `r2` started."
+    )
+    view = (await _open_feedback_modal(bot))["view"]
+
+    await bot._handle_agent_view_submission(
+        _feedback_submission(view, continue_session=True)
+    )
+
+    runtime.feedback.assert_awaited_once()
+    call = bot.message_handler._start_agent_prompt.await_args
+    assert call.args == ("rerun the failing suite", "owner", "C1", bot.web_client)
+    assert call.kwargs["team_id"] == "T1"
+    assert call.kwargs["thread_ts"] == "100.1"
+    posted = bot.web_client.chat_postMessage.await_args.kwargs
+    assert posted["thread_ts"] == "100.1"
+    assert "r2" in posted["text"]

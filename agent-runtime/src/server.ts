@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 
 import { randomUUID, createHash, timingSafeEqual } from "node:crypto";
 import { PiRunCapture } from "./pi-capture.js";
-import { AgentTelemetry, isCredentialKey } from "./telemetry.js";
+import { AgentTelemetry, isCredentialKey, redact } from "./telemetry.js";
 import { AgentTracing } from "./tracing.js";
 import { DockerPiProcess, type ChecksContext, type WriterContext } from "./container-runtime.js";
 import { approvalSettings } from "./approval-mode.js";
@@ -59,6 +59,23 @@ interface ServerOptions {
   health: () => Record<string, unknown>;
   acceptRuns?: () => boolean;
   feedback?: (run: RunRecord, payload: Record<string, unknown>, id: string) => Promise<boolean>;
+}
+
+const FEEDBACK_REASONS = ["wrong_approach", "incomplete", "broke_tests", "scope_creep", "style", "other"];
+const FEEDBACK_COMMENT_MAX_CHARS = 2000;
+
+function feedbackDetails(body: Record<string, unknown>): { reason_category?: string; comment?: string } {
+  const details: { reason_category?: string; comment?: string } = {};
+  if (body.reason_category !== undefined) {
+    if (typeof body.reason_category !== "string" || !FEEDBACK_REASONS.includes(body.reason_category)) throw new RuntimeError("Invalid feedback reason_category", "invalid_request", 400);
+    details.reason_category = body.reason_category;
+  }
+  if (body.comment !== undefined) {
+    if (typeof body.comment !== "string" || [...body.comment].length > FEEDBACK_COMMENT_MAX_CHARS) throw new RuntimeError("Invalid feedback comment", "invalid_request", 400);
+    // Redact here as well as in telemetry so no capture sink ever sees the raw comment.
+    details.comment = redact(body.comment) as string;
+  }
+  return details;
 }
 
 export function createAgentHttpServer(options: ServerOptions) {
@@ -206,9 +223,10 @@ export function createAgentHttpServer(options: ServerOptions) {
         const verdict = requiredString(body.verdict, "verdict");
         const feedbackId = requiredString(body.feedback_id, "feedback_id");
         if (!["accepted", "needs_changes"].includes(verdict) || feedbackId.length > 200) throw new RuntimeError("Invalid feedback", "invalid_request", 400);
+        const details = feedbackDetails(body);
         if (!options.feedback) throw new RuntimeError("Feedback capture is disabled", "feedback_unavailable", 503);
         const id = createHash("sha256").update(JSON.stringify([run.run_id, user, feedbackId, verdict])).digest("hex");
-        if (!await options.feedback(run, {user_id: user, verdict, feedback_id: feedbackId}, id)) throw new RuntimeError("Feedback capture failed", "feedback_unavailable", 503);
+        if (!await options.feedback(run, {user_id: user, verdict, feedback_id: feedbackId, ...details}, id)) throw new RuntimeError("Feedback capture failed", "feedback_unavailable", 503);
         sendJson(response, 202, {status: "accepted"}); return;
       }
       const cancelMatch = /^\/v1\/runs\/([^/]+)\/cancel$/.exec(url.pathname);

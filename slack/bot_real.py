@@ -35,6 +35,13 @@ from slack.agent_bootstrap import (
     AgentBootstrapContext,
     AgentBootstrapFetchError,
 )
+from slack.agent_feedback import (
+    AGENT_FEEDBACK_CALLBACK_ID,
+    AGENT_TERMINAL_STATUSES,
+    AgentFeedbackNonce,
+    build_agent_feedback_modal,
+    parse_agent_feedback_submission,
+)
 from slack.agent_shortcut import (
     AgentShortcutNonce,
     build_agent_shortcut_modal,
@@ -2300,6 +2307,7 @@ class SlackBot:
             self.agent_config.get("monitor_poll_seconds", 2)
         )
         self.agent_shortcut_nonces: Dict[str, AgentShortcutNonce] = {}
+        self.agent_feedback_nonces: Dict[str, AgentFeedbackNonce] = {}
 
         # Running state
         self.initialized = False
@@ -2516,6 +2524,9 @@ class SlackBot:
             elif (
                 req.type == "interactive" and req.payload.get("type") == "block_actions"
             ):
+                # trigger_id expires after ~3s, so the modal cannot wait in the queue.
+                if await self._open_agent_feedback_modal(req.payload):
+                    return
                 await self._enqueue_work(
                     SlackWorkItem(
                         kind="interactive",
@@ -2533,7 +2544,7 @@ class SlackBot:
                 req.type == "interactive"
                 and req.payload.get("type") == "view_submission"
                 and req.payload.get("view", {}).get("callback_id")
-                == "run_pi_agent_from_thread_submit"
+                in {"run_pi_agent_from_thread_submit", AGENT_FEEDBACK_CALLBACK_ID}
             ):
                 await self._enqueue_work(
                     SlackWorkItem(
@@ -3757,9 +3768,17 @@ class SlackBot:
             run, max_length=max_length
         )
         extra = {}
-        if run.get("status") == "completed" and self.agent_config.get(
+        if run.get("status") in AGENT_TERMINAL_STATUSES and self.agent_config.get(
             "feedback_enabled", False
         ):
+            value = json.dumps(
+                {
+                    "run_id": run["run_id"],
+                    "team_id": tracked.get("team_id"),
+                    "channel_id": tracked["channel_id"],
+                    "thread_ts": tracked["thread_ts"],
+                }
+            )
             extra["blocks"] = [
                 {
                     "type": "section",
@@ -3777,7 +3796,7 @@ class SlackBot:
                             "type": "button",
                             "action_id": action_id,
                             "text": {"type": "plain_text", "text": label},
-                            "value": json.dumps({"run_id": run["run_id"]}),
+                            "value": value,
                         }
                         for action_id, label in [
                             ("pi_agent_accept_result", "Accept result"),
@@ -3792,6 +3811,123 @@ class SlackBot:
             text=formatted,
             **extra,
         )
+
+    async def _open_agent_feedback_modal(self, payload: Dict[str, Any]) -> bool:
+        """Open the Needs-changes modal; False lets the click record a bare verdict."""
+        actions = payload.get("actions") or []
+        if not actions or actions[0].get("action_id") != "pi_agent_needs_changes":
+            return False
+        action = actions[0]
+        trigger_id = payload.get("trigger_id")
+        user_id = payload.get("user", {}).get("id")
+        click_id = str(action.get("action_ts") or "")
+        try:
+            value = json.loads(action.get("value", "{}"))
+            run_id = value["run_id"]
+        except (KeyError, TypeError, ValueError):
+            return False
+        team = payload.get("team")
+        team_id = value.get("team_id") or (
+            team.get("id") if isinstance(team, dict) else None
+        )
+        channel_id = value.get("channel_id") or payload.get("channel", {}).get("id")
+        thread_ts = value.get("thread_ts") or (payload.get("container") or {}).get(
+            "thread_ts"
+        )
+        if not all((trigger_id, user_id, click_id, channel_id, thread_ts)):
+            return False
+
+        now = time.time()
+        self.agent_feedback_nonces = {
+            key: nonce
+            for key, nonce in self.agent_feedback_nonces.items()
+            if nonce.expires_at > now
+        }
+        nonce = uuid.uuid4().hex
+        self.agent_feedback_nonces[nonce] = AgentFeedbackNonce(
+            run_id=run_id,
+            team_id=team_id or "unknown-team",
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            owner_user_id=user_id,
+            feedback_id=click_id,
+            expires_at=now + 1800,
+        )
+        try:
+            await self.web_client.views_open(
+                trigger_id=trigger_id, view=build_agent_feedback_modal(nonce)
+            )
+        except Exception:
+            logger.warning("Agent feedback modal could not be opened", exc_info=True)
+            self.agent_feedback_nonces.pop(nonce, None)
+            return False
+        return True
+
+    async def _handle_agent_feedback_submission(self, payload: Dict[str, Any]) -> None:
+        """Consume a one-shot feedback nonce, record it, and optionally follow up."""
+        view = payload.get("view", {}) or {}
+        nonce_value = str(view.get("private_metadata") or "")
+        nonce = self.agent_feedback_nonces.get(nonce_value)
+        user_id = payload.get("user", {}).get("id")
+        if not nonce:
+            return
+        if nonce.expires_at <= time.time():
+            self.agent_feedback_nonces.pop(nonce_value, None)
+            return
+        if nonce.owner_user_id != user_id:
+            return
+        self.agent_feedback_nonces.pop(nonce_value, None)
+
+        submission = parse_agent_feedback_submission(view)
+        try:
+            await self.agent_runtime_client.feedback(
+                nonce.run_id,
+                user_id,
+                "needs_changes",
+                nonce.feedback_id,
+                reason_category=submission.reason_category,
+                comment=submission.comment or None,
+            )
+        except AgentRuntimeUnauthorized:
+            await self.web_client.chat_postEphemeral(
+                channel=nonce.channel_id,
+                user=user_id,
+                text="Only the Agent run owner can submit result feedback.",
+            )
+            return
+        except AgentRuntimeError:
+            await self.web_client.chat_postEphemeral(
+                channel=nonce.channel_id,
+                user=user_id,
+                text="Result feedback could not be recorded. Please try again.",
+            )
+            return
+        await self.web_client.chat_postEphemeral(
+            channel=nonce.channel_id, user=user_id, text="Result feedback recorded."
+        )
+        if not (submission.continue_session and submission.comment):
+            return
+
+        rate_limit_config = self._get_rate_limit_config_for_user(user_id)
+        if not self.user_manager.check_rate_limit(user_id, rate_limit_config):
+            await self._post_command_response(
+                nonce.channel_id, user_id, self._build_rate_limit_message(user_id)
+            )
+            return
+        response = await self.message_handler._start_agent_prompt(
+            submission.comment,
+            user_id,
+            nonce.channel_id,
+            self.web_client,
+            team_id=nonce.team_id,
+            thread_ts=nonce.thread_ts,
+            routing_text=submission.comment,
+        )
+        if response:
+            await self.web_client.chat_postMessage(
+                channel=nonce.channel_id, thread_ts=nonce.thread_ts, text=response
+            )
+        await self._persist_message_state(user_id=user_id)
 
     async def _handle_agent_shortcut(self, payload: Dict[str, Any]) -> None:
         """Open the Agent bootstrap modal while the Slack trigger is still valid."""
@@ -3879,6 +4015,9 @@ class SlackBot:
     async def _handle_agent_view_submission(self, payload: Dict[str, Any]) -> None:
         """Consume a one-shot modal nonce and start one quota-counted Agent prompt."""
         view = payload.get("view", {}) or {}
+        if view.get("callback_id") == AGENT_FEEDBACK_CALLBACK_ID:
+            await self._handle_agent_feedback_submission(payload)
+            return
         nonce_value = str(view.get("private_metadata") or "")
         nonce = self.agent_shortcut_nonces.get(nonce_value)
         user_id = payload.get("user", {}).get("id")
