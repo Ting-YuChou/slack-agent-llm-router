@@ -11,6 +11,7 @@ import { CandidateStore, DockerVerifier, type VerificationProfile } from "./veri
 import { GraderRunner } from "./grader.js";
 import type { QualityServices } from "./orchestrator.js";
 import { redact, type AgentTelemetry } from "./telemetry.js";
+import { HarnessError } from "./error-taxonomy.js";
 import type { AgentTracing } from "./tracing.js";
 import { WorkflowCoordinator } from './structured-workflow.js';
 import { AgentExecutionRunner } from './agent-execution-runner.js';
@@ -107,7 +108,7 @@ export function createQualityServices(options: {
     },
     record: async (kind, payload, input) => {
       const location = artifacts.get(`${input.run_id}:${input.attempt}`);
-      if (!location) throw new Error("candidate_artifact_missing");
+      if (!location) throw new HarnessError("candidate_artifact_missing", "candidate_artifact_missing");
       const json = JSON.stringify(payload);
       await writeFile(path.join(location, `${kind}.json`), telemetry?.redactText(json) ?? String(redact(json)), { mode: 0o600 });
       await telemetry?.record(input.run_id, input.run_id, kind, { ...(payload as object), attempt: input.attempt, profile_id: profile.id, profile_checksum: options.checksum }, `${kind}:${input.run_id}:${input.attempt}`);
