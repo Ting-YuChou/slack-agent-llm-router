@@ -7,10 +7,10 @@ import path from "node:path";
 import { validateWorkspacePath } from "./policy.js";
 import { redact } from "./telemetry.js";
 import { excerpt, MAX_REPORT_BYTES, parseDiagnostics, parseJUnit, type CheckFailure } from "./check-report.js";
-import type { Candidate, VerificationResult } from "./quality-gate.js";
+import type { Candidate, CheckStatus, VerificationCheck, VerificationResult } from "./quality-gate.js";
 const exec = promisify(execFile);
 /** One trusted check. `{report}` in argv becomes the check's report path under /out. */
-export interface VerificationCheckSpec { name: string; ciJob?: string; argv: string[]; cwd: string; timeoutMs: number; report?: { format: "junit" } }
+export interface VerificationCheckSpec { name: string; ciJob?: string; argv: string[]; cwd: string; timeoutMs: number; report?: { format: "junit" }; kind?: "static" | "test" }
 export interface VerificationProfile {
   id: string; repository: string; image: string; rubric: string[]; allowedPaths: string[];
   baselinePaths: string[]; checks: VerificationCheckSpec[];
@@ -32,6 +32,7 @@ export function validateProfile(raw: unknown): VerificationProfile {
   if (!Array.isArray(p.rubric) || !p.rubric.length || p.rubric.some(x => typeof x !== "string" || x.length > 2000) || new Set(p.rubric).size !== p.rubric.length) throw new Error("Invalid rubric");
   if (!Array.isArray(p.allowedPaths) || p.allowedPaths.some(x => typeof x !== "string" || !safeRelative(x))) throw new Error("Invalid allowed paths");
   if (!Array.isArray(p.checks) || !p.checks.length || p.checks.some(c => !c || !Array.isArray(c.argv) || !c.argv.length || c.argv.some(x => typeof x !== "string" || x.includes("\0")) || !safeRelative(c.cwd) || !Number.isInteger(c.timeoutMs) || c.timeoutMs <= 0 || typeof c.name !== "string")) throw new Error("Invalid verification command");
+  if (p.checks.some(c => c.kind !== undefined && !["static", "test"].includes(c.kind))) throw new Error("Invalid check kind");
   if (p.checks.some(c => (c.report !== undefined && (!c.report || c.report.format !== "junit")) || (c.report === undefined && c.argv.some(x => x.includes(REPORT_TOKEN))))) throw new Error("Invalid check report");
   if (p.baselinePaths !== undefined && (!Array.isArray(p.baselinePaths) || p.baselinePaths.some(x => typeof x !== "string" || !safeRelative(x)))) throw new Error("Invalid baseline paths");
   if ((p.maxRepairs !== undefined && (!Number.isInteger(p.maxRepairs) || p.maxRepairs < 0 || p.maxRepairs > 2)) || (p.maxCostUsd !== undefined && (!Number.isFinite(p.maxCostUsd) || p.maxCostUsd <= 0 || p.maxCostUsd > 1)) || (p.activeTimeoutMs !== undefined && (!Number.isInteger(p.activeTimeoutMs) || p.activeTimeoutMs <= 0 || p.activeTimeoutMs > 900_000))) throw new Error("Invalid workflow limits");
@@ -97,39 +98,114 @@ export class CandidateStore {
     if (candidate.hash !== actual.hash) throw new Error("candidate_changed_after_verification");
   }
 }
+/** What one verifier container produced. `exit` is null when the runner itself failed or was killed. */
+export interface ContainerResult { output: string; exit: number | null; timedOut: boolean }
+export type RunContainer = (run: { name: string; args: string[]; timeoutMs: number; signal: AbortSignal }) => Promise<ContainerResult>;
+
+export const runDockerContainer: RunContainer = async ({ name, args, timeoutMs, signal }) => {
+  const stop = () => { void exec("docker", ["kill", name], { timeout: 5000 }).catch(() => {}); };
+  signal.addEventListener("abort", stop, { once: true });
+  try {
+    const result = await exec("docker", args, { timeout: timeoutMs, signal, maxBuffer: 4 * 1024 * 1024, env: { PATH: process.env.PATH } });
+    return { output: result.stdout + result.stderr, exit: 0, timedOut: false };
+  } catch (error: any) {
+    const output = String(error.stdout ?? "") + String(error.stderr ?? "");
+    return { output, exit: typeof error.code === "number" && ![125, 126, 127].includes(error.code) && !error.killed ? error.code : null, timedOut: error.killed === true && !signal.aborted };
+  } finally { signal.removeEventListener("abort", stop); }
+};
+
+async function removeDockerContainer(id: string): Promise<void> {
+  try { await exec("docker", ["rm", "-f", id], { timeout: 5000 }); }
+  catch (error: any) { if (!/No such (?:container|object)/i.test(String(error.stderr))) throw new Error("verification_stop_unconfirmed"); }
+}
+
+/** Host-wide limit on concurrently running verifier containers. */
+export class VerifierScheduler {
+  private running = 0;
+  private readonly waiting: Array<() => void> = [];
+  constructor(readonly concurrency: number) {
+    if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 16) throw new Error("PI_AGENT_VERIFY_CONCURRENCY must be an integer from 1 to 16");
+  }
+  async run<T>(work: () => Promise<T>, signal: AbortSignal): Promise<T> {
+    signal.throwIfAborted();
+    if (this.running >= this.concurrency) {
+      await new Promise<void>((resolve, reject) => {
+        const ready = () => { signal.removeEventListener("abort", abort); resolve(); };
+        const abort = () => { const index = this.waiting.indexOf(ready); if (index >= 0) this.waiting.splice(index, 1); reject(signal.reason); };
+        this.waiting.push(ready); signal.addEventListener("abort", abort, { once: true });
+      });
+    } else this.running++;
+    try { return await work(); }
+    finally { const next = this.waiting.shift(); if (next) next(); else this.running--; }
+  }
+}
+export function verifyConcurrency(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.PI_AGENT_VERIFY_CONCURRENCY;
+  return raw === undefined || raw === "" ? 2 : Number(raw);
+}
+export const verifierScheduler = new VerifierScheduler(verifyConcurrency());
+
+/** Static checks (lint, typecheck) first: they are cheap and their diagnostics are the most precise. */
+export function orderChecks(checks: VerificationCheckSpec[]): VerificationCheckSpec[] {
+  return [...checks.filter(check => check.kind === "static"), ...checks.filter(check => check.kind !== "static")];
+}
+
+export function combineStatus(checks: VerificationCheck[]): CheckStatus {
+  return checks.some(c => c.status === "unknown") ? "unknown" : checks.every(c => c.status === "passed") ? "passed" : "failed";
+}
+
+type Mode = "baseline" | "candidate";
 export class DockerVerifier {
   private readonly active = new Set<string>();
+  private readonly runContainer: RunContainer;
+  private readonly removeContainer: (id: string) => Promise<void>;
+  private readonly scheduler: VerifierScheduler;
   async stop() { for (const id of this.active) await this.remove(id); }
-  private async remove(id: string) {
-    try { await exec("docker", ["rm", "-f", id], { timeout: 5000 }); }
-    catch (error: any) { if (!/No such (?:container|object)/i.test(String(error.stderr))) throw new Error("verification_stop_unconfirmed"); }
-    this.active.delete(id);
+  private async remove(id: string) { await this.removeContainer(id); this.active.delete(id); }
+  constructor(private readonly profile: VerificationProfile, options: { runContainer?: RunContainer; removeContainer?: (id: string) => Promise<void>; scheduler?: VerifierScheduler } = {}) {
+    this.runContainer = options.runContainer ?? runDockerContainer;
+    this.removeContainer = options.removeContainer ?? removeDockerContainer;
+    this.scheduler = options.scheduler ?? verifierScheduler;
   }
-  constructor(private readonly profile: VerificationProfile) {}
-  async verify(candidate: Candidate, signal: AbortSignal): Promise<VerificationResult> {
-    const checks: VerificationResult["checks"] = [];
-    for (const mode of ["baseline", "candidate"] as const) for (const check of this.profile.checks) {
-      signal.throwIfAborted(); const started = performance.now();
-      const container = "pi-verify-" + randomUUID();
-      const out = path.join(path.dirname(candidate.path), "out", mode); await mkdir(out, { recursive: true, mode: 0o700 });
-      const args = ["run", "--rm", "--name", container, "--label", "slack-pi-agent-session=true", "--network", "none", "--read-only", "--user", `${process.getuid?.()}:${process.getgid?.()}`, "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--cpus", "2", "--memory", "2g", "--pids-limit", "256", "--tmpfs", "/tmp:rw,nosuid,size=536870912", "--tmpfs", "/workspace:rw,nosuid,size=1073741824,mode=1777", "--mount", `type=bind,src=${candidate.path},dst=/candidate,readonly`, "--mount", `type=bind,src=${path.join(path.dirname(candidate.path), "baseline")},dst=/baseline,readonly`, "--mount", `type=bind,src=${out},dst=/out`, this.profile.image, "node", "/opt/pi/dist/src/verification-entry.js", JSON.stringify({ ...check, argv: checkArgv(check), mode, baselinePaths: this.profile.baselinePaths })];
-      this.active.add(container);
-      let output = ""; let exit: number | null = null; let timedOut = false;
-      const stop = () => { void exec("docker", ["kill", container], { timeout: 5000 }).catch(() => {}); };
-      signal.addEventListener("abort", stop, { once: true });
-      try {
-        const result = await exec("docker", args, { timeout: check.timeoutMs, signal, maxBuffer: 4 * 1024 * 1024, env: { PATH: process.env.PATH } }); output = result.stdout + result.stderr; exit = 0;
-      } catch (error: any) { output = String(error.stdout ?? "") + String(error.stderr ?? ""); exit = typeof error.code === "number" && ![125, 126, 127].includes(error.code) && !error.killed ? error.code : null; timedOut = error.killed === true && !signal.aborted; }
-      finally { signal.removeEventListener("abort", stop); await this.remove(container); }
+  /** Baseline and candidate run side by side; a failed check never hides the next one, an unknown one ends its mode. */
+  async verify(candidate: Candidate, signal: AbortSignal, modes: Mode[] = ["baseline", "candidate"], checks = this.profile.checks): Promise<VerificationResult> {
+    const ordered = orderChecks(checks);
+    const settled = await Promise.allSettled(modes.map(mode => this.runMode(candidate, mode, ordered, signal)));
+    signal.throwIfAborted();
+    const failure = settled.find(result => result.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
+    const results = settled.flatMap(result => result.status === "fulfilled" ? result.value : []);
+    return { status: combineStatus(results), checks: results };
+  }
+  private async runMode(candidate: Candidate, mode: Mode, checks: VerificationCheckSpec[], signal: AbortSignal): Promise<VerificationCheck[]> {
+    const out = path.join(path.dirname(candidate.path), "out", mode); await mkdir(out, { recursive: true, mode: 0o700 });
+    const results: VerificationCheck[] = [];
+    for (const check of checks) {
       signal.throwIfAborted();
-      const artifact = path.join(path.dirname(candidate.path), `${mode}-${check.name.replace(/[^\w-]/g, "_")}.log`);
-      await writeFile(artifact, String(redact(output)), { mode: 0o600 });
-      checks.push({ name: `${mode}:${check.name}`, status: exit === 0 ? "passed" : exit === null ? "unknown" : "failed", exit_code: exit, duration_ms: performance.now() - started, ...parseVerificationCounts(output), artifact,
-        ...(exit === 0 ? {} : { failures: await checkFailures(check, output, out), excerpt: excerpt(output) }),
-        ...(timedOut ? { timed_out: true, cause: "check_timeout" } : exit === null ? { cause: "check_runner_failed" } : {}) });
-      if (exit === null) return { status: "unknown", checks };
+      const result = await this.scheduler.run(() => this.runCheck(candidate, mode, check, out, signal), signal);
+      results.push(result);
+      if (result.status === "unknown") break;
     }
-    return { status: checks.every(c => c.status === "passed") ? "passed" : "failed", checks };
+    return results;
+  }
+  private async runCheck(candidate: Candidate, mode: Mode, check: VerificationCheckSpec, out: string, signal: AbortSignal): Promise<VerificationCheck> {
+    const started = performance.now();
+    const container = "pi-verify-" + randomUUID();
+    const args = ["run", "--rm", "--name", container, ...this.isolationArgs(candidate, out), this.profile.image, "node", "/opt/pi/dist/src/verification-entry.js", JSON.stringify({ ...check, argv: checkArgv(check), mode, baselinePaths: this.profile.baselinePaths })];
+    this.active.add(container);
+    let result: ContainerResult;
+    try { result = await this.runContainer({ name: container, args, timeoutMs: check.timeoutMs, signal }); }
+    finally { await this.remove(container); }
+    signal.throwIfAborted();
+    const { output, exit, timedOut } = result;
+    const artifact = path.join(path.dirname(candidate.path), `${mode}-${checkFileName(check.name)}.log`);
+    await writeFile(artifact, String(redact(output)), { mode: 0o600 });
+    return { name: `${mode}:${check.name}`, status: exit === 0 ? "passed" : exit === null ? "unknown" : "failed", exit_code: exit, duration_ms: performance.now() - started, ...parseVerificationCounts(output), artifact,
+      ...(exit === 0 ? {} : { failures: await checkFailures(check, output, out), excerpt: excerpt(output) }),
+      ...(timedOut ? { timed_out: true, cause: "check_timeout" } : exit === null ? { cause: "check_runner_failed" } : {}) };
+  }
+  private isolationArgs(candidate: Candidate, out: string): string[] {
+    return ["--label", "slack-pi-agent-session=true", "--network", "none", "--read-only", "--user", `${process.getuid?.()}:${process.getgid?.()}`, "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--cpus", "2", "--memory", "2g", "--pids-limit", "256", "--tmpfs", "/tmp:rw,nosuid,size=536870912", "--tmpfs", "/workspace:rw,nosuid,size=1073741824,mode=1777", "--mount", `type=bind,src=${candidate.path},dst=/candidate,readonly`, "--mount", `type=bind,src=${path.join(path.dirname(candidate.path), "baseline")},dst=/baseline,readonly`, "--mount", `type=bind,src=${out},dst=/out`];
   }
 }
 
