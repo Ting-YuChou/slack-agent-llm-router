@@ -11,6 +11,7 @@ import { WorkflowBudget } from "./workflow-budget.js";
 import type { Candidate, GateInput, GateResult } from "./quality-gate.js";
 import { classifyGateError, type RunFailure } from "./error-taxonomy.js";
 import { DEFAULT_DIFF_LIMITS, DiffLimitError } from "./worktree-manager.js";
+import type { WriterChecksRequest, WriterChecksResponse } from "./writer-checks.js";
 
 export interface QualityServices {
   evaluate(input: GateInput): Promise<GateResult>;
@@ -33,6 +34,9 @@ export interface QualityServices {
   stopDiscovery?(id: string): Promise<void>;
   validateResume?(input: GateInput): Promise<void>;
   tasks?(id: string): WorkflowNode[];
+  /** The writer's own candidate-only check runs (run_checks). */
+  runChecks?(request: WriterChecksRequest): Promise<WriterChecksResponse>;
+  writerChecks?: { maxCalls: number; checks: string[] };
 }
 interface WorkflowState { mode: WorkflowMode; discovery?: Promise<string>; priorActiveMs: number; initialActiveMs: number; requirement: string; route: RouteDecision; attempt: number; executionId: string; budget: WorkflowBudget; controller: AbortController; checking: boolean; operation?: Promise<GateResult> }
 

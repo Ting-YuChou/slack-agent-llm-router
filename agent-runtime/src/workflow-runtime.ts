@@ -14,6 +14,7 @@ import { redact, type AgentTelemetry } from "./telemetry.js";
 import type { AgentTracing } from "./tracing.js";
 import { WorkflowCoordinator } from './structured-workflow.js';
 import { AgentExecutionRunner } from './agent-execution-runner.js';
+import { WriterChecks } from "./writer-checks.js";
 import type { RouteDecision } from './jev-router.js';
 const exec = promisify(execFile);
 
@@ -69,12 +70,19 @@ export function createQualityServices(options: {
       for (const dependency of new Set([...node.dependencies, ...(node.fixed_dependencies ?? [])])) await telemetry?.record(node.workflow,node.workflow,'workflow_dependency',{ workflow_run_id: node.workflow, node_id: node.id, depends_on: dependency },`dependency:${node.workflow}:${node.id}:${dependency}`);
     },
   });
+  const assertScope = async (worktree: string, baseline: string) => {
+    const files = (await exec("git", ["diff", "--name-only", "-z", baseline], { cwd: worktree })).stdout.split("\0").filter(Boolean);
+    const untracked = (await exec("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: worktree })).stdout.split("\0").filter(Boolean);
+    assertCandidateScope([...files, ...untracked], profile.allowedPaths);
+  };
+  const writerChecks = new WriterChecks({ profile,
+    snapshot: async request => { await assertScope(request.worktree, request.baseline); return store.create(request.worktree, request.baseline, request.run_id, { baselineTree: false }); },
+    verifier: () => new DockerVerifier(profile),
+  });
   const gate = new QualityGate({
     profile,
     snapshot: async input => {
-      const files = (await exec("git", ["diff", "--name-only", "-z", input.baseline], { cwd: input.worktree })).stdout.split("\0").filter(Boolean);
-      const untracked = (await exec("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: input.worktree })).stdout.split("\0").filter(Boolean);
-      assertCandidateScope([...files, ...untracked], profile.allowedPaths);
+      await assertScope(input.worktree, input.baseline);
       const source = await store.create(input.worktree, input.baseline, input.run_id);
       const tested = options.verificationBases.get(input.run_id);
       if (!tested || tested === input.baseline) { artifacts.set(`${input.run_id}:${input.attempt}`, path.dirname(source.path)); return source; }
@@ -131,7 +139,9 @@ export function createQualityServices(options: {
     writerStarted: id => coordinator.writerStarted(id), canResume: id => coordinator.canResume(id), resumeElapsed: id => coordinator.elapsed(id), tasks: id => coordinator.tasks(id),
     resumeCheckpoint: id => options.control.get<{ updated_at: number }>('structured',id)?.updated_at ?? 0,
     stopDiscovery: id => runner.stop(id),
-    stop: async id => { options.ledger.stop(id); await runner.stop(id); await verifiers.get(id)?.stop(); await graders.get(id)?.stop(); },
+    stop: async id => { options.ledger.stop(id); await runner.stop(id); await writerChecks.stop(id); await verifiers.get(id)?.stop(); await graders.get(id)?.stop(); },
+    runChecks: request => writerChecks.run(request),
+    get writerChecks() { return { maxCalls: profile.writerChecks?.maxCalls ?? 4, checks: writerChecks.checkNames }; },
     open: (id, cost) => options.ledger.open(id, profile.maxCostUsd, cost),
     close: id => { void telemetry?.record(id, id, "budget", options.ledger.summary(id)); options.ledger.stop(id); options.verificationBases.delete(id); for (const [execution, parent] of options.mapping) if (parent === id) options.mapping.delete(execution); },
     elapsedMs: id => options.priorActive.get(id) ?? 0,

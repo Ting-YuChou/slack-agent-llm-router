@@ -21,6 +21,8 @@ export interface VerificationProfile {
   structuredWorkflow?: { enabled: boolean; concurrency: number; maxCostUsd: number; activeTimeoutMs: number; discoveryCostUsd: number };
   /** per_mode (default): one container per mode, each check isolated inside it; per_check: one container per check. */
   isolation?: "per_mode" | "per_check";
+  /** The writer's own run_checks calls: which checks run by default and how many calls a run gets. */
+  writerChecks?: { defaultChecks: string[]; maxCalls: number };
 }
 export const REPORT_TOKEN = "{report}";
 /** File-safe check name used for /out/<check>.report and /out/<check>.log. */
@@ -35,6 +37,10 @@ export function validateProfile(raw: unknown): VerificationProfile {
   if (!Array.isArray(p.rubric) || !p.rubric.length || p.rubric.some(x => typeof x !== "string" || x.length > 2000) || new Set(p.rubric).size !== p.rubric.length) throw new Error("Invalid rubric");
   if (!Array.isArray(p.allowedPaths) || p.allowedPaths.some(x => typeof x !== "string" || !safeRelative(x))) throw new Error("Invalid allowed paths");
   if (!Array.isArray(p.checks) || !p.checks.length || p.checks.some(c => !c || !Array.isArray(c.argv) || !c.argv.length || c.argv.some(x => typeof x !== "string" || x.includes("\0")) || !safeRelative(c.cwd) || !Number.isInteger(c.timeoutMs) || c.timeoutMs <= 0 || typeof c.name !== "string")) throw new Error("Invalid verification command");
+  if (p.writerChecks !== undefined) {
+    const w = p.writerChecks;
+    if (!w || typeof w !== "object" || (w.maxCalls !== undefined && (!Number.isInteger(w.maxCalls) || w.maxCalls < 1 || w.maxCalls > 10)) || (w.defaultChecks !== undefined && (!Array.isArray(w.defaultChecks) || !w.defaultChecks.length || w.defaultChecks.some(name => !p.checks.some(c => c.name === name))))) throw new Error("Invalid writer checks");
+  }
   if (p.isolation !== undefined && !["per_mode", "per_check"].includes(p.isolation)) throw new Error("Invalid verification isolation");
   if (p.checks.some(c => c.kind !== undefined && !["static", "test"].includes(c.kind))) throw new Error("Invalid check kind");
   if (p.checks.some(c => (c.report !== undefined && (!c.report || c.report.format !== "junit")) || (c.report === undefined && c.argv.some(x => x.includes(REPORT_TOKEN))))) throw new Error("Invalid check report");
@@ -51,7 +57,7 @@ export function validateProfile(raw: unknown): VerificationProfile {
     if (!Number.isInteger(config.concurrency) || config.concurrency < 1 || config.concurrency > 4 || !Number.isFinite(config.maxCostUsd) || config.maxCostUsd <= 0 || config.maxCostUsd > 5 || !Number.isInteger(config.activeTimeoutMs) || config.activeTimeoutMs <= 0 || config.activeTimeoutMs > 1_800_000 || !Number.isFinite(config.discoveryCostUsd) || config.discoveryCostUsd <= 0 || config.discoveryCostUsd >= config.maxCostUsd) throw new Error('Invalid structured workflow limits');
     p.structuredWorkflow = config;
   }
-  return { ...p, isolation: p.isolation ?? "per_mode", baselinePaths: p.baselinePaths ?? ["tests/", "agent-runtime/test/"], maxRepairs: Math.min(2, Math.max(0, p.maxRepairs ?? 2)), maxCostUsd: p.maxCostUsd ?? 1, activeTimeoutMs: p.activeTimeoutMs ?? 900_000 };
+  return { ...p, isolation: p.isolation ?? "per_mode", writerChecks: { defaultChecks: p.writerChecks?.defaultChecks ?? p.checks.map(c => c.name), maxCalls: p.writerChecks?.maxCalls ?? 4 }, baselinePaths: p.baselinePaths ?? ["tests/", "agent-runtime/test/"], maxRepairs: Math.min(2, Math.max(0, p.maxRepairs ?? 2)), maxCostUsd: p.maxCostUsd ?? 1, activeTimeoutMs: p.activeTimeoutMs ?? 900_000 };
 }
 export async function loadProfile(file: string, repo: string, worktreeRoot: string) {
   const resolved = await realpath(file);
@@ -64,7 +70,8 @@ export async function loadProfile(file: string, repo: string, worktreeRoot: stri
 }
 export class CandidateStore {
   constructor(readonly root: string) {}
-  async create(worktree: string, baseline: string, runId: string): Promise<Candidate> {
+  /** `baselineTree: false` skips the trusted baseline copy (candidate-only runs); an empty directory keeps the mount valid. */
+  async create(worktree: string, baseline: string, runId: string, options: { baselineTree?: boolean } = {}): Promise<Candidate> {
     if (!/^[a-f0-9]{40,64}$/.test(baseline)) throw new Error("Invalid baseline");
     await exec("git", ["add", "-N", "--", "."], { cwd: worktree });
     const patch = (await exec("git", ["diff", "--binary", baseline, "--"], { cwd: worktree, maxBuffer: 2 * 1024 * 1024 })).stdout;
@@ -87,6 +94,7 @@ export class CandidateStore {
     const artifact = path.join(location, "candidate.patch"); await writeFile(artifact, String(redact(patch)), { mode: 0o400 });
     // Baseline test/config copies cannot be changed by the candidate.
     const baselineDir = path.join(location, "baseline"); await mkdir(baselineDir, { mode: 0o700 });
+    if (options.baselineTree === false) return { hash: hash.digest("hex"), path: snapshot, patch, artifact };
     const originalFiles = (await exec("git", ["ls-tree", "-r", "-z", baseline], { cwd: worktree })).stdout.split("\0").filter(Boolean);
     for (const entry of originalFiles) {
       const split = entry.indexOf("\t"); const file = entry.slice(split + 1);
