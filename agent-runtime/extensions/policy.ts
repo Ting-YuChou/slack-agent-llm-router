@@ -63,10 +63,26 @@ function previewWrite(tool: string, input: Record<string, unknown>): string {
   return `${filePath}\n\n${summary.slice(0, 3_500)}`;
 }
 
+type BudgetStage = "none" | "notice" | "final";
+
+/** Next stage reached: a notice at 75% of the budget, a final warning once two or fewer remain. */
+function budgetStage(used: number, max: number): BudgetStage {
+  if (max - used <= 2) return "final";
+  return used >= Math.ceil(0.75 * max) ? "notice" : "none";
+}
+
+function budgetMessage(stage: BudgetStage, used: number, max: number, unit: string): string {
+  if (stage === "final") {
+    return `[harness] Final budget warning: ${used}/${max} ${unit} used, ${Math.max(0, max - used)} left. Stop exploring now: run the tests if you have not, then summarize what changed, what passed and what is left.`;
+  }
+  return `[harness] Budget notice: ${used}/${max} ${unit} used. Start to wrap up: finish the current change, run the tests and summarize what you did and what is left.`;
+}
+
 export default function policyExtension(pi: ExtensionAPI) {
   let turns = 0;
   let toolCalls = 0;
   let writeApproved = false;
+  const budgetSent: Record<"turns" | "toolCalls", BudgetStage> = { turns: "none", toolCalls: "none" };
 
   if (process.env.PI_AGENT_JEV_CLASSIFIER_MODE === "on") {
     pi.on("before_agent_start", (event) => {
@@ -164,5 +180,29 @@ export default function policyExtension(pi: ExtensionAPI) {
       if (!approved) return { block: true, reason: "Shell command rejected or expired" };
     }
     return undefined;
+  });
+
+  pi.on("input", () => {
+    budgetSent.turns = "none";
+    budgetSent.toolCalls = "none";
+    return undefined;
+  });
+
+  // Limits abort without warning, so tell the agent while it can still verify and summarize its work.
+  pi.on("tool_result", (event) => {
+    // Nested results go back to the calling script, not to the model.
+    if (event.parentToolCallId) return undefined;
+    const notices: string[] = [];
+    for (const [key, used, max, unit] of [["toolCalls", toolCalls, MAX_TOOL_CALLS, "tool calls"], ["turns", turns, MAX_TURNS, "turns"]] as const) {
+      const stage = budgetStage(used, max);
+      if (stage === "none" || stage === budgetSent[key] || budgetSent[key] === "final") continue;
+      budgetSent[key] = stage;
+      notices.push(budgetMessage(stage, used, max, unit));
+    }
+    if (!notices.length) return undefined;
+    return {
+      content: [...event.content, { type: "text" as const, text: notices.join("\n") }],
+      ...(event.structuredContent !== undefined ? { structuredContent: event.structuredContent } : {}),
+    };
   });
 }
