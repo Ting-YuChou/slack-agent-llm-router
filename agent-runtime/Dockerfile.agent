@@ -18,6 +18,7 @@ COPY package.json package-lock.json ./
 COPY scripts ./scripts
 RUN npm ci --ignore-scripts
 COPY tsconfig.json tsconfig.extensions.json ./
+COPY prompts ./prompts
 COPY src ./src
 COPY extensions ./extensions
 COPY plugins ./plugins
