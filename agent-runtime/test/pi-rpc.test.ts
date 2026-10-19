@@ -182,3 +182,15 @@ test("streaming text deltas are distinct from the final assistant answer", () =>
   assert.deepEqual(sanitizeRpcEvent({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Hel" } }), { type: "answer_delta", text: "Hel" });
   assert.deepEqual(sanitizeRpcEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Hello" }] } }), { type: "answer", text: "Hello" });
 });
+
+test("policy decision entries become sanitized events; malformed ones are dropped", () => {
+  const events: any[] = [];
+  const bridge = new PiRpcBridge({ writeLine: () => undefined, onEvent: (event) => events.push(event) });
+  const entry = (data: unknown) => JSON.stringify({ type: "entry_appended", entry: { type: "custom", customType: "pi_agent_policy", data } });
+  bridge.feed([
+    entry({ tool: "bash", decision: "block", reason: "network_command", argv0: "curl", cmd_hash: "0123456789abcdef", command: "curl https://x" }),
+    entry({ tool: "bash", decision: "nope", reason: "x" }),
+    entry("not an object"),
+  ].join("\n") + "\n");
+  assert.deepEqual(events, [{ type: "policy_decision", tool: "bash", decision: "block", reason: "network_command", argv0: "curl", cmd_hash: "0123456789abcdef" }]);
+});

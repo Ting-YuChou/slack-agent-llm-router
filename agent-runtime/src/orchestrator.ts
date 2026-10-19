@@ -12,6 +12,8 @@ import { WorkflowBudget } from "./workflow-budget.js";
 import type { Candidate, GateInput, GateResult } from "./quality-gate.js";
 import { classifyGateError, type RunFailure } from "./error-taxonomy.js";
 import { promptTelemetry } from "./prompts.js";
+import { computeHarnessMetrics, type HarnessMetrics } from "./harness-metrics.js";
+import { summarizePolicy, type PolicyDecision, type PolicySummary } from "./policy-decision.js";
 import { redact } from "./telemetry.js";
 import { DEFAULT_DIFF_LIMITS, DiffLimitError } from "./worktree-manager.js";
 import { rejected, type WriterChecksRequest, type WriterChecksResponse } from "./writer-checks.js";
@@ -152,6 +154,14 @@ export interface RunRecord {
   updated_at: string;
   tool_count: number;
   turn_count: number;
+  /** Counts of the container's policy decisions (allow, block, approval) for this run. */
+  policy_summary?: PolicySummary;
+  /** Owner approvals this run asked for (tool writes, shell commands, delivery) and how they ended. */
+  approvals?: ApprovalCounts;
+  /** When the writer first started a write or edit tool call, for time-to-first-edit. */
+  first_edit_at?: string;
+  /** Computed once the run is terminal; see harness-metrics.ts. */
+  harness_metrics?: HarnessMetrics;
   events: Array<Record<string, unknown>>;
   changed_files?: string[];
   diff_stat?: string;
@@ -164,6 +174,8 @@ export interface RunRecord {
 }
 
 /** The run as clients (HTTP, Slack, telemetry) see it: host artifact paths become a flag. */
+export interface ApprovalCounts { requested: number; approved: number; rejected: number; expired: number; wait_ms: number }
+
 export function publicRun<T extends Partial<RunRecord>>(run: T): Omit<T, "patch_artifact"> & { patch_retained?: true } {
   const { patch_artifact, ...rest } = run;
   return patch_artifact ? { ...rest, patch_retained: true } : rest;
@@ -241,17 +253,21 @@ export class CodingAgentOrchestrator {
   private readonly deliveries = new Map<string, { approvalId: string; digest: string }>();
   /** Text of the assistant message currently streaming, per run; replaced by the final answer. */
   private readonly streamingAnswers = new Map<string, string>();
+  /** When each open approval was shown, for the run's approval wait time. */
+  private readonly approvalOpened = new Map<string, number>();
   /** Terminal runs already reported to observers, keyed to the update they were reported at (resume revives runs). */
   private readonly observedFinal = new Map<string, string>();
   private persistTimer?: ReturnType<typeof setTimeout>;
 
   private readonly captureState?: (runId: string) => { complete: boolean | null; reasons: string[] };
   private readonly observeRun?: (run: RunRecord) => void;
+  private readonly observePolicy?: (runId: string, sessionId: string, decision: PolicyDecision) => void;
   private readonly observeLifecycle?: (runId: string, name: string, phase: "start" | "end", failed?: boolean, sessionId?: string) => void;
 
   constructor(options: {
     captureState?: CodingAgentOrchestrator["captureState"];
     observeRun?: (run: RunRecord) => void;
+    observePolicy?: CodingAgentOrchestrator["observePolicy"];
     observeLifecycle?: CodingAgentOrchestrator["observeLifecycle"];
     worktrees: Worktrees;
     startProcess: CodingAgentOrchestrator["startProcess"];
@@ -271,7 +287,7 @@ export class CodingAgentOrchestrator {
     deliveryApproval?: DeliveryApprovalOptions;
   }) {
     this.captureState = options.captureState;
-    this.observeRun = options.observeRun; this.observeLifecycle = options.observeLifecycle;
+    this.observeRun = options.observeRun; this.observePolicy = options.observePolicy; this.observeLifecycle = options.observeLifecycle;
     this.worktrees = options.worktrees;
     this.startProcess = options.startProcess;
     this.maxActiveSessions = options.maxActiveSessions ?? 2;
@@ -509,6 +525,7 @@ export class CodingAgentOrchestrator {
     if (result.code === "wrong_run" || result.code === "expired" || result.code === "already_used") {
       throw new RuntimeConflictError(`Approval is ${result.code.replace("_", " ")}`);
     }
+    this.countApproval(run, approvalId, decision === "approve" ? "approved" : "rejected");
     if (this.deliveries.get(runId)?.approvalId === approvalId) {
       await this.decideDelivery(session, run, approvalId, decision);
       return;
@@ -750,6 +767,14 @@ export class CodingAgentOrchestrator {
       this.persistSoon();
       return;
     }
+    if (event.type === "policy_decision") {
+      // Counted, not stored: one run can make hundreds of decisions.
+      const { type: _type, ...decision } = event;
+      run.policy_summary = summarizePolicy(run.policy_summary, decision);
+      try { this.observePolicy?.(run.run_id, run.session_id, decision); } catch { /* monitoring cannot fail agent runs */ }
+      this.persistSoon();
+      return;
+    }
     if (event.type === "approval") {
       const state = this.workflows.get(run.run_id);
       if (state) { state.budget.pause(); const timer = this.deadlines.get(run.run_id); if (timer) clearTimeout(timer); this.armDeadline(session, run, 300_000); }
@@ -759,6 +784,7 @@ export class CodingAgentOrchestrator {
         userId: run.owner_user_id,
         action: `${event.title}\n${event.detail}`,
       });
+      this.countApproval(run, approval.id, "requested");
       this.updateRun(run, "awaiting_approval");
       run.events.push({ ...event, approval_id: approval.id, expires_at: new Date(approval.expiresAt).toISOString() });
       this.persistInBackground();
@@ -770,6 +796,7 @@ export class CodingAgentOrchestrator {
     }
     if (event.type === "tool") {
       if (event.phase === "start") run.tool_count += 1;
+      if (event.phase === "start" && (event.tool === "write" || event.tool === "edit")) run.first_edit_at ??= new Date().toISOString();
       const mcpMatch = /^mcp__([^_]+)__(.+)$/.exec(event.tool);
       const mcpServer = mcpMatch?.[1];
       const mcpTool = mcpMatch?.[2];
@@ -1000,6 +1027,7 @@ export class CodingAgentOrchestrator {
     }
     const ttlMs = this.deliveryApproval!.ttlMs;
     const approval = this.approvals.create({ runId: run.run_id, toolCallId: "delivery", userId: run.owner_user_id, action: `Deliver ${diff.files.length} changed files` }, ttlMs);
+    this.countApproval(run, approval.id, "requested");
     this.deliveries.set(run.run_id, { approvalId: approval.id, digest });
     this.workflows.get(run.run_id)?.budget.pause();
     const previous = this.deadlines.get(run.run_id);
@@ -1060,9 +1088,19 @@ export class CodingAgentOrchestrator {
     await this.finalizeClaimedRun(session, run);
   }
 
+  private countApproval(run: RunRecord, approvalId: string, outcome: "requested" | "approved" | "rejected" | "expired"): void {
+    const counts = run.approvals ??= { requested: 0, approved: 0, rejected: 0, expired: 0, wait_ms: 0 };
+    counts[outcome] += 1;
+    if (outcome === "requested") { this.approvalOpened.set(approvalId, Date.now()); return; }
+    const opened = this.approvalOpened.get(approvalId);
+    this.approvalOpened.delete(approvalId);
+    if (opened !== undefined) counts.wait_ms += Math.max(0, Date.now() - opened);
+  }
+
   private async expireDelivery(session: SessionRecord, run: RunRecord, approvalId: string): Promise<void> {
     if (this.deliveries.get(run.run_id)?.approvalId !== approvalId || !this.claimTerminal(run)) return;
     this.deliveries.delete(run.run_id);
+    this.countApproval(run, approvalId, "expired");
     await this.failClaimedRun(session, run, { code: "delivery_expired", message: "Nobody delivered the changes before the approval expired; the patch was kept" });
   }
 
@@ -1179,6 +1217,8 @@ export class CodingAgentOrchestrator {
     }
     run.updated_at = new Date().toISOString();
     run.events.push({ type: "status", status });
+    // Recomputed in notifyRun once the final timing is known.
+    if (isTerminal(status)) run.harness_metrics = computeHarnessMetrics(run);
   }
 
   private requireSession(sessionId: string): SessionRecord {
@@ -1229,6 +1269,7 @@ export class CodingAgentOrchestrator {
         run.capture_complete = capture?.complete ?? null;
         run.capture_reasons = capture?.reasons ?? [];
       }
+      if (isTerminal(run.status)) run.harness_metrics = computeHarnessMetrics(run);
       this.observeRun?.(structuredClone(run)); } catch { /* monitoring cannot fail agent runs */ }
   }
 

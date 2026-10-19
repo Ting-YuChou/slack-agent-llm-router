@@ -309,6 +309,76 @@ class AgentAnalyticsTests(unittest.TestCase):
             "private source content", rows["agent_test_results"][0]["payload_json"]
         )
 
+    def test_harness_metrics_view_reads_run_payloads_and_feeds_dashboard(self):
+        module = self.module()
+        view = next(
+            s
+            for s in module.schema_sql()
+            if s.startswith("CREATE VIEW IF NOT EXISTS agent_harness_metrics AS")
+        )
+        self.assertIn("FROM agent_runs_latest", view)
+        for column in (
+            "outcome",
+            "turn_util",
+            "tool_util",
+            "first_attempt_pass",
+            "repair_success",
+            "writer_checks_calls",
+            "policy_blocks",
+            "time_to_first_edit_s",
+        ):
+            self.assertIn(f"AS {column}", view)
+        dashboard = json.loads(
+            Path("docker/observability/grafana/dashboards/agent.json").read_text()
+        )
+        queries = [
+            target["rawSql"]
+            for panel in dashboard["panels"]
+            for target in panel.get("targets", [])
+        ]
+        self.assertGreaterEqual(
+            sum("agent_harness_metrics" in query for query in queries), 3
+        )
+        ids = [panel["id"] for panel in dashboard["panels"]]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_policy_decisions_project_without_command_text(self):
+        module = self.module()
+        payload = {
+            "tool": "bash",
+            "decision": "approval",
+            "reason": "unlisted_bash",
+            "approved": False,
+            "argv0": "python",
+            "cmd_hash": "0123456789abcdef",
+            "latency_ms": 1200,
+        }
+        rows = module.project({"kind": "policy_decision", "payload": payload})
+        module.validate_projections(rows)
+        row = rows["agent_policy_decisions"][0]
+        self.assertEqual(
+            {key: row[key] for key in payload},
+            {**payload, "approved": 0},
+        )
+        allowed = module.project(
+            {
+                "kind": "policy_decision",
+                "payload": {"tool": "bash", "decision": "allow", "reason": "ok"},
+            }
+        )
+        module.validate_projections(allowed)
+        row = allowed["agent_policy_decisions"][0]
+        self.assertIsNone(row["approved"])
+        self.assertEqual(row["argv0"], "")
+        self.assertIsNone(row["latency_ms"])
+        ddl = next(
+            s
+            for s in module.schema_sql()
+            if s.startswith("CREATE TABLE IF NOT EXISTS agent_policy_decisions (")
+        )
+        for column in ("decision String", "reason String", "approved Nullable(UInt8)"):
+            self.assertIn(column, ddl)
+
     def test_feedback_projects_reason_category_and_comment(self):
         module = self.module()
         payload = {"user_id": "u", "verdict": "needs_changes", "feedback_id": "f"}

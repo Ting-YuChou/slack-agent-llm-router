@@ -432,6 +432,9 @@ export async function createProductionServer() {
       tracing?.lifecycle(id, name, phase, failed);
       if (name === "preparation" && failed) tracing?.endRun(id, "failed");
     },
+    observePolicy: (runId, sessionId, decision) => {
+      telemetry?.record(runId, sessionId, "policy_decision", decision).catch(() => console.error(JSON.stringify({ event: "agent_policy_telemetry_failed", run_id: runId })));
+    },
     observeRun: run => {
       const summary = {...publicRun(run), workflow_prompt: undefined, workflow_requirement: undefined, events: undefined, capture_complete: run.capture_complete ?? null};
       const signature = JSON.stringify(summary);
