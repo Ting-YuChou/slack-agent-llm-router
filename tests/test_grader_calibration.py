@@ -1,4 +1,7 @@
+import contextlib
+import io
 import json
+import pathlib
 import shutil
 
 import pytest
@@ -233,3 +236,247 @@ def test_load_case_does_not_modify_base(tmp_path):
     calibration.load_case(case_dir)
     assert (case_dir / "base/src/counter.cjs").read_text() == before
     assert not (case_dir / "base/.git").exists()
+
+
+def _main(argv):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = calibration.main(argv)
+    return code, out.getvalue()
+
+
+def _run_line(**overrides):
+    run = {
+        "type": "run",
+        "complete": True,
+        "records": 2,
+        "expected_records": 2,
+        "cost_usd": 0.02,
+    }
+    run.update(overrides)
+    return run
+
+
+def _write_jsonl(path, lines):
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+    return path
+
+
+def test_read_run_splits_cli_grades_from_the_run_line(tmp_path):
+    grade = {"type": "grade", **_record("good", "passed"), "repeat": 1}
+    path = _write_jsonl(tmp_path / "out.jsonl", [grade, grade, _run_line()])
+    records, run = calibration.read_run(path)
+    assert records == [grade, grade]
+    assert run["complete"] is True
+    assert calibration.run_failures(run, records) == []
+
+
+def test_read_run_treats_a_missing_run_line_as_incomplete(tmp_path):
+    path = _write_jsonl(tmp_path / "out.jsonl", [_record("good", "passed")])
+    records, run = calibration.read_run(path)
+    assert records == [_record("good", "passed")]
+    assert run is None
+    assert calibration.run_failures(run, records) == [
+        "calibration incomplete: no run summary line"
+    ]
+
+
+def test_run_failures_flag_an_incomplete_or_short_run():
+    records = [_record("good", "passed")]
+    assert calibration.run_failures(
+        _run_line(complete=False, reason="max_cost_usd_exceeded", records=1), records
+    ) == ["calibration incomplete: max_cost_usd_exceeded (1 of 2 records)"]
+    assert calibration.run_failures(_run_line(), records) == [
+        "calibration incomplete: 1 grade lines but the run reports 2"
+    ]
+
+
+def test_main_fails_an_incomplete_run_even_at_baseline(tmp_path):
+    cases = tmp_path / "cases"
+    _copy_case(cases)
+    grade = {"type": "grade", **_record("control-minimal-fix", "passed")}
+    out = _write_jsonl(
+        tmp_path / "out.jsonl",
+        [grade, _run_line(complete=False, reason="max_cost_usd_exceeded", records=1)],
+    )
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps(_baseline()))
+    code, stdout = _main(
+        ["--cases", str(cases), "--records", str(out), "--baseline", str(baseline)]
+    )
+    report = json.loads(stdout)
+    assert code == 1
+    assert report["failures"][0].startswith("calibration incomplete")
+
+
+def test_update_baseline_writes_metrics_and_keeps_ceilings(tmp_path):
+    cases = tmp_path / "cases"
+    _copy_case(cases)
+    _copy_case(cases, "weakened-test")
+    good = {"type": "grade", **_record("control-minimal-fix", "passed")}
+    bad = {"type": "grade", **_record("weakened-test", "needs_changes")}
+    out = _write_jsonl(
+        tmp_path / "out.jsonl", [good, good, bad, bad, _run_line(records=4)]
+    )
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps({"ceilings": {"invalid_rate": 0.1}}))
+    code, stdout = _main(
+        [
+            "--cases",
+            str(cases),
+            "--records",
+            str(out),
+            "--baseline",
+            str(baseline),
+            "--update-baseline",
+        ]
+    )
+    written = json.loads(baseline.read_text())
+    assert code == 0
+    assert set(written["metrics"]) == set(calibration.CONTRACT_METRICS)
+    assert written["metrics"]["false_fail_rate"] == 0
+    assert written["ceilings"] == {"invalid_rate": 0.1}
+    assert written["tolerance"]["false_pass_rate"] == 0.05
+
+
+def test_update_baseline_refuses_undefined_metrics(tmp_path):
+    cases = tmp_path / "cases"
+    _copy_case(cases)
+    # One record per case: self_consistency is undefined and must not be written.
+    grade = {"type": "grade", **_record("control-minimal-fix", "passed")}
+    out = _write_jsonl(tmp_path / "out.jsonl", [grade, _run_line(records=1)])
+    baseline = tmp_path / "baseline.json"
+    code, stdout = _main(
+        [
+            "--cases",
+            str(cases),
+            "--records",
+            str(out),
+            "--baseline",
+            str(baseline),
+            "--update-baseline",
+        ]
+    )
+    report = json.loads(stdout)
+    assert code == 1
+    assert "self_consistency: missing from calibration summary" in report["failures"]
+    assert not baseline.exists()
+
+
+def test_cli_command_keeps_the_signing_secret_out_of_argv(tmp_path):
+    gateway = {
+        "gateway_url": "http://model-gateway:8080",
+        "network": "pi-net",
+        "image": "slack-pi-agent:structured-test",
+        "budget_ledger": "/state/budget/budget.sqlite",
+        "signing_secret": "s3cret",
+    }
+    argv, env = calibration.cli_command(
+        cases=tmp_path / "cases",
+        out=tmp_path / "out.jsonl",
+        repeats=3,
+        max_cost_usd=2.0,
+        grader_model="openai/gpt-5.6-sol",
+        gateway=gateway,
+        base_env={"PATH": "/bin", "OPENAI_API_KEY": "sk-live"},
+    )
+    assert argv[0] == "node"
+    assert argv[1].endswith("agent-runtime/dist/src/grader-calibration-cli.js")
+    for flag, value in [
+        ("--repeats", "3"),
+        ("--max-cost-usd", "2.0"),
+        ("--grader-model", "openai/gpt-5.6-sol"),
+        ("--gateway-url", "http://model-gateway:8080"),
+        ("--network", "pi-net"),
+        ("--image", "slack-pi-agent:structured-test"),
+        ("--budget-ledger", "/state/budget/budget.sqlite"),
+    ]:
+        assert argv[argv.index(flag) + 1] == value
+    assert "s3cret" not in argv
+    assert env["MODEL_GATEWAY_SIGNING_SECRET"] == "s3cret"
+    # The grader reaches models only through the gateway; the CLI never sees the key.
+    assert "OPENAI_API_KEY" not in env
+
+
+def test_live_mode_requires_explicit_opt_in():
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err), pytest.raises(SystemExit):
+        calibration.main(["--repeats", "2"])
+    assert "--live-openai" in err.getvalue()
+
+
+def test_topology_exposes_the_grader_gateway_once_started(tmp_path):
+    topology = calibration.topology
+    booted = topology.Topology(
+        calibration.PROJECT, tmp_path, tmp_path / "repo", "key", tmp_path / "p.json"
+    )
+    with pytest.raises(RuntimeError):
+        booted.grader_gateway()
+    booted.signing = "s3cret"
+    gateway = booted.grader_gateway()
+    assert gateway == {
+        "gateway_url": "http://model-gateway:8080",
+        "network": booted.internal,
+        "image": topology.AGENT_IMAGE,
+        "budget_ledger": str(tmp_path / "state/budget/budget.sqlite"),
+        "signing_secret": "s3cret",
+    }
+
+
+def test_live_run_boots_the_topology_and_scores_the_cli_output(tmp_path, monkeypatch):
+    cases = tmp_path / "cases"
+    _copy_case(cases)
+    gateway = {
+        "gateway_url": "http://model-gateway:8080",
+        "network": "pi-net",
+        "image": "agent",
+        "budget_ledger": str(tmp_path / "ledger.sqlite"),
+        "signing_secret": "s3cret",
+    }
+    booted_with = {}
+
+    class FakeTopology:
+        def __init__(self, project, root, repo, key, profile_path):
+            booted_with.update(repo=repo, key=key, profile=profile_path)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def grader_gateway(self):
+            return gateway
+
+    def fake_run(argv, env):
+        assert env["MODEL_GATEWAY_SIGNING_SECRET"] == "s3cret"
+        out = pathlib.Path(argv[argv.index("--out") + 1])
+        grade = {"type": "grade", **_record("control-minimal-fix", "passed")}
+        _write_jsonl(out, [grade, grade, _run_line()])
+
+    monkeypatch.setattr(calibration.topology, "Topology", FakeTopology)
+    monkeypatch.setattr(calibration.topology, "read_openai_key", lambda: "sk-test")
+    monkeypatch.setattr(calibration.topology, "verification_image_id", lambda: "img")
+    monkeypatch.setattr(calibration, "_run_cli", fake_run)
+    out = tmp_path / "results/grades.jsonl"
+    code, stdout = _main(
+        [
+            "--live-openai",
+            "--cases",
+            str(cases),
+            "--repeats",
+            "2",
+            "--out",
+            str(out),
+            "--baseline",
+            str(tmp_path / "missing.json"),
+        ]
+    )
+    report = json.loads(stdout)
+    assert booted_with["key"] == "sk-test"
+    assert (booted_with["repo"] / "src/counter.cjs").exists()
+    assert json.loads(booted_with["profile"].read_text())["image"] == "img"
+    assert report["summary"]["records"] == 2
+    # No baseline yet: the live run still fails closed.
+    assert code == 1
+    assert all("missing from baseline" in failure for failure in report["failures"])
