@@ -2054,6 +2054,8 @@ class TestSlackStateStores:
             "rate_limits": {},
             "conversations": {},
             "active_threads": {},
+            "agent_runs": {},
+            "posted_ci_jobs": [],
         }
 
         await store.initialize()
@@ -2491,30 +2493,34 @@ def test_agent_approval_blocks_neutralize_fences_and_missing_expiry():
 async def test_monitor_posts_oversized_approval_card_with_valid_blocks():
     runtime = SimpleNamespace(
         wait_for_update=AsyncMock(
-            return_value={
-                "run_id": "r",
-                "session_id": "s",
-                "status": "awaiting_approval",
-                "events": [
-                    {
-                        "type": "approval",
-                        "approval_id": "a",
-                        "title": "Approve shell command",
-                        "detail": "rm -rf build && " * 300,
-                        "expires_at": "2026-10-18T12:05:00Z",
-                    }
-                ],
-            }
+            side_effect=[
+                {
+                    "run_id": "r",
+                    "session_id": "s",
+                    "status": "awaiting_approval",
+                    "events": [
+                        {
+                            "type": "approval",
+                            "approval_id": "a",
+                            "title": "Approve shell command",
+                            "detail": "rm -rf build && " * 300,
+                            "expires_at": "2026-10-18T12:05:00Z",
+                        }
+                    ],
+                },
+                {"run_id": "r", "session_id": "s", "status": "rejected"},
+            ]
         )
     )
     bot = SlackBot(
         {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
     )
     bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+    bot.agent_monitor_poll_seconds = 0
 
     await bot._monitor_agent_run({"run_id": "r", "channel_id": "c", "thread_ts": "t"})
 
-    blocks = bot.web_client.chat_postMessage.await_args.kwargs["blocks"]
+    blocks = bot.web_client.chat_postMessage.await_args_list[0].kwargs["blocks"]
     assert all(len(text) <= 3000 for text in _section_texts(blocks))
     assert "Truncated: showing" in _section_texts(blocks)[1]
     assert blocks[-1]["type"] == "actions"
