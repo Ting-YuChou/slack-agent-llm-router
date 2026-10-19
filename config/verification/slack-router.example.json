@@ -42,7 +42,8 @@
       ],
       "cwd": ".",
       "timeoutMs": 60000,
-      "ciJob": "lint"
+      "ciJob": "lint",
+      "kind": "static"
     },
     {
       "name": "flake8",
@@ -56,7 +57,8 @@
       ],
       "cwd": ".",
       "timeoutMs": 60000,
-      "ciJob": "lint"
+      "ciJob": "lint",
+      "kind": "static"
     },
     {
       "name": "mypy",
@@ -67,7 +69,8 @@
       ],
       "cwd": ".",
       "timeoutMs": 90000,
-      "ciJob": "typecheck"
+      "ciJob": "typecheck",
+      "kind": "static"
     },
     {
       "name": "pytest",
@@ -76,11 +79,18 @@
         "-m",
         "pytest",
         "tests",
-        "-q"
+        "-q",
+        "-o",
+        "junit_family=xunit1",
+        "--junitxml={report}"
       ],
       "cwd": ".",
       "timeoutMs": 180000,
-      "ciJob": "pytest"
+      "ciJob": "pytest",
+      "report": {
+        "format": "junit"
+      },
+      "kind": "test"
     },
     {
       "name": "compile",
@@ -94,7 +104,8 @@
       ],
       "cwd": ".",
       "timeoutMs": 60000,
-      "ciJob": "pytest"
+      "ciJob": "pytest",
+      "kind": "static"
     },
     {
       "name": "typecheck",
@@ -105,17 +116,24 @@
       ],
       "cwd": "agent-runtime",
       "timeoutMs": 60000,
-      "ciJob": "agent-runtime"
+      "ciJob": "agent-runtime",
+      "kind": "static"
     },
     {
       "name": "node-tests",
       "argv": [
-        "npm",
-        "test"
+        "sh",
+        "-c",
+        "npm run build && exec node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=\"$0\" 'dist/test/**/*.test.js'",
+        "{report}"
       ],
       "cwd": "agent-runtime",
       "timeoutMs": 120000,
-      "ciJob": "agent-runtime"
+      "ciJob": "agent-runtime",
+      "report": {
+        "format": "junit"
+      },
+      "kind": "test"
     }
   ],
   "maxRepairs": 2,

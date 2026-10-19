@@ -1,7 +1,7 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { promisify } from "node:util";
 
-import { PiRpcBridge, RpcProtocolError, type PublicRunEvent } from "./pi-rpc.js";
+import { PiRpcBridge, RpcProtocolError, type PublicRunEvent, type UiResponse } from "./pi-rpc.js";
 import type { AgentProcess } from "./orchestrator.js";
 import { resolveAgentModel } from "./agent-model.js";
 import type { AgentReasoningEffort } from "./agent-model.js";
@@ -48,9 +48,13 @@ export interface AgentContainerOptions {
   routeLimits?: AgentLimitConfig;
   /** Trusted-profile constraints the writer is told about and checked against at write time. */
   writerContext?: WriterContext;
+  /** The writer's run_checks tool (extensions/checks.ts): available checks and its call limit. */
+  checksContext?: ChecksContext;
   /** `none` lets the writer edit its worktree without prompts; delivery approval must then gate the commit. */
   writeApproval?: WriteApprovalMode;
 }
+
+export interface ChecksContext { checks: string[]; defaultChecks: string[]; maxCalls: number }
 
 export type WriteApprovalMode = "none" | "per_prompt";
 
@@ -82,7 +86,7 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     ...options, readOnlyWorkspace: true, toolNames: ["read", "grep", "find", "ls"],
     extensionPaths: ["/opt/pi/extensions/model-gateway.ts", "/opt/pi/extensions/discussion.ts"],
     pluginPaths: [], skillPaths: [], safeCommands: [], mcp: undefined, classifierGatewayToken: undefined,
-    graderContext: undefined, workflowContext: undefined, writerContext: undefined,
+    graderContext: undefined, workflowContext: undefined, writerContext: undefined, checksContext: undefined,
   };
   const model = resolveAgentModel(options.modelRef);
   const tools = [...options.toolNames];
@@ -135,6 +139,7 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
   if (options.graderContext) args.splice(args.indexOf("--mount"), 0, "--env", `PI_AGENT_GRADER_JSON=${JSON.stringify(options.graderContext)}`);
   if (options.workflowContext) args.splice(args.indexOf("--mount"), 0, "--env", `PI_AGENT_WORKFLOW_JSON=${JSON.stringify(options.workflowContext)}`);
   if (options.writerContext) args.splice(args.indexOf("--mount"), 0, "--env", `PI_AGENT_WRITER_JSON=${JSON.stringify(options.writerContext)}`);
+  if (options.checksContext) args.splice(args.indexOf("--mount"), 0, "--env", `PI_AGENT_CHECKS_JSON=${JSON.stringify(options.checksContext)}`);
   if (options.writeApproval) args.splice(args.indexOf("--mount"), 0, "--env", `PI_AGENT_WRITE_APPROVAL=${options.writeApproval}`);
   if (options.classifierGatewayToken) {
     args.splice(args.indexOf("--mount"), 0,
@@ -328,6 +333,7 @@ export class DockerPiProcess implements AgentProcess {
     })().catch(() => { if (!controller.signal.aborted) this.onEvent({ type: "error", code: "container_admission_failed", message: "Agent could not acquire/start an execution slot" }); });
   }
   decide(rpcUiId: string, approved: boolean): void { if(this.activeRunId) this.tracing?.approval(this.activeRunId,rpcUiId,approved); this.bridge?.respondToUi(rpcUiId, approved); }
+  respondUi(rpcUiId: string, response: UiResponse): void { this.bridge?.respondUi(rpcUiId, response); }
   async abort(runId: string): Promise<void> {
     const capture = this.capture;
     capture?.cancel();

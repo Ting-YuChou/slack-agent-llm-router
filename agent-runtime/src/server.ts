@@ -10,7 +10,7 @@ import { randomUUID, createHash, timingSafeEqual } from "node:crypto";
 import { PiRunCapture } from "./pi-capture.js";
 import { AgentTelemetry, isCredentialKey } from "./telemetry.js";
 import { AgentTracing } from "./tracing.js";
-import { DockerPiProcess, type WriterContext } from "./container-runtime.js";
+import { DockerPiProcess, type ChecksContext, type WriterContext } from "./container-runtime.js";
 import { parseAgentLimitConfig } from "./agent-limits.js";
 
 export { parseAgentLimits } from "./agent-limits.js";
@@ -354,8 +354,10 @@ export async function createProductionServer() {
   if (trustedProfile) {
     if (await inspectImageDigest(trustedProfile.profile.image) === "missing") throw new Error("Pinned verification image is missing; build Dockerfile.verification and configure its digest");
     if (!await readImageFile(trustedProfile.profile.image, "/opt/pi/dist/src/verification-entry.js")) throw new Error("Verification image is missing the trusted runner");
+    if (trustedProfile.profile.isolation !== "per_check" && !await readImageFile(trustedProfile.profile.image, "/opt/pi/dist/src/verification-runner.js")) throw new Error("Verification image must be rebuilt with the per-mode runner (or set isolation: per_check)");
     if (trustedProfile.profile.structuredWorkflow?.enabled && !await readImageFile(image, "/opt/pi/extensions/workflow-agent.ts")) throw new Error("Agent image must be rebuilt with workflow-agent extension");
     if (!await readImageFile(image, "/opt/pi/extensions/grader.ts")) throw new Error("Agent image must be rebuilt with the isolated grader extension");
+    if (!await readImageFile(image, "/opt/pi/extensions/checks.ts")) throw new Error("Agent image must be rebuilt with the run_checks extension");
     const prices = JSON.parse(process.env.PI_AGENT_MODEL_PRICES_JSON ?? "{}");
     const refs = [...configuredModels.map(model => model.ref), ...((jevMode !== "off" || jevClassifierMode === "on") ? ["openrouter/typesafe/jev-1.13"] : [])];
     if (refs.some(ref => !prices[ref] || !Number.isFinite(prices[ref].input) || prices[ref].input <= 0 || !Number.isFinite(prices[ref].output) || prices[ref].output < 0)) throw new Error("PI_AGENT_MODEL_PRICES_JSON must provide conservative prices for all enabled coding/grader/Jev models");
@@ -444,10 +446,9 @@ export async function createProductionServer() {
           sessionStatePath,
           gatewayUrl,
           modelRef: model.ref,
-          extensionPaths: ["/opt/pi/extensions/policy.ts", "/opt/pi/extensions/model-gateway.ts", "/opt/pi/extensions/secret-env.ts"],
+          ...writerTools(trustedProfile?.profile, ["/opt/pi/extensions/policy.ts", "/opt/pi/extensions/model-gateway.ts", "/opt/pi/extensions/secret-env.ts"], ["read", "write", "edit", "bash", "grep", "find", "ls", ...lock.plugins.flatMap((plugin) => plugin.enabled_tools)]),
           pluginPaths: lock.plugins.map((plugin) => plugin.container_path),
           skillPaths: skillLock.skills.map((skill) => skill.container_path),
-          toolNames: ["read", "write", "edit", "bash", "grep", "find", "ls", ...lock.plugins.flatMap((plugin) => plugin.enabled_tools)],
           continueSession: session.restored,
           safeCommands: parseSafeCommands(process.env.PI_AGENT_SAFE_COMMANDS),
           limits: agentLimits.base,
@@ -696,6 +697,17 @@ function positiveInteger(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
+/** The writer gets run_checks (tool, extension and its context) only when a trusted profile can verify. */
+export function writerTools(profile: VerificationProfile | undefined, extensionPaths: string[], toolNames: string[]): { extensionPaths: string[]; toolNames: string[]; checksContext?: ChecksContext } {
+  if (!profile) return { extensionPaths, toolNames };
+  const checks = profile.checks.map((check) => check.name);
+  return {
+    extensionPaths: [...extensionPaths, "/opt/pi/extensions/checks.ts"],
+    toolNames: [...toolNames, "run_checks"],
+    checksContext: { checks, defaultChecks: profile.writerChecks?.defaultChecks ?? checks, maxCalls: profile.writerChecks?.maxCalls ?? 4 },
+  };
+}
+
 /** Constraints the writer sees up front and the policy extension enforces at write time. */
 export function writerContextFor(profile: VerificationProfile): WriterContext {
   return { allowedPaths: [...profile.allowedPaths], checks: profile.checks.map((check) => check.name), rubric: [...profile.rubric], diffLimits: { ...DEFAULT_DIFF_LIMITS } };

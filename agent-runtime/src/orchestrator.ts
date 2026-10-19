@@ -5,13 +5,14 @@ import { listAgentModels, resolveAgentModel } from "./agent-model.js";
 import type { RouteDecision } from "./jev-router.js";
 import type { AgentLimits } from "./agent-limits.js";
 import { ApprovalStore } from "./policy.js";
-import type { PublicRunEvent, RunOutcome } from "./pi-rpc.js";
+import type { PublicRunEvent, RunOutcome, UiResponse } from "./pi-rpc.js";
 import type { RuntimeStateStore } from "./runtime-state.js";
 import { workflowMode, type WorkflowMode, type WorkflowNode } from "./structured-workflow.js";
 import { WorkflowBudget } from "./workflow-budget.js";
 import type { Candidate, GateInput, GateResult } from "./quality-gate.js";
 import { classifyGateError, type RunFailure } from "./error-taxonomy.js";
 import { DEFAULT_DIFF_LIMITS, DiffLimitError } from "./worktree-manager.js";
+import { rejected, type WriterChecksRequest, type WriterChecksResponse } from "./writer-checks.js";
 
 export interface QualityServices {
   evaluate(input: GateInput): Promise<GateResult>;
@@ -34,8 +35,17 @@ export interface QualityServices {
   stopDiscovery?(id: string): Promise<void>;
   validateResume?(input: GateInput): Promise<void>;
   tasks?(id: string): WorkflowNode[];
+  /** The writer's own candidate-only check runs (run_checks). */
+  runChecks?(request: WriterChecksRequest): Promise<WriterChecksResponse>;
+  writerChecks?: {
+    maxCalls: number; checks: string[]; defaultChecks: string[];
+    /** Worst-case run time of these checks. */
+    estimateMs(checks: string[]): number;
+    /** Time kept back for final verification and grading. */
+    reserveMs: number;
+  };
 }
-interface WorkflowState { mode: WorkflowMode; discovery?: Promise<string>; priorActiveMs: number; initialActiveMs: number; requirement: string; route: RouteDecision; attempt: number; executionId: string; budget: WorkflowBudget; controller: AbortController; checking: boolean; operation?: Promise<GateResult> }
+interface WorkflowState { mode: WorkflowMode; discovery?: Promise<string>; priorActiveMs: number; initialActiveMs: number; requirement: string; route: RouteDecision; attempt: number; executionId: string; budget: WorkflowBudget; controller: AbortController; checking: boolean; operation?: Promise<GateResult>; checksOperation?: Promise<WriterChecksResponse>; checksCalls?: number }
 
 export type RunStatus =
   | "starting"
@@ -93,6 +103,8 @@ export interface RunRecord {
   timing?: { wall_ms: number; active_ms: number; human_wait_ms: number };
   phase?: string;
   execution_status?: "running" | "succeeded" | "failed";
+  /** run_checks calls the writer made in this run. */
+  writer_checks_calls?: number;
   /** How the latest writer execution ended (Pi stop reason classification). */
   execution_outcome?: RunOutcome;
   grader_findings?: Array<{ path: string; line: number; severity: string; reason: string }>;
@@ -160,6 +172,8 @@ export interface AgentProcess {
   /** Limits the process applies for this route, recorded on the run as `limits`. */
   limitsFor?(route: RouteDecision): AgentLimits | undefined;
   decide(rpcUiId: string, approved: boolean): void;
+  /** Answers an extension UI dialog other than an approval (run_checks). */
+  respondUi(rpcUiId: string, response: UiResponse): void;
   abort(runId: string): Promise<void>;
   close(): Promise<void>;
 }
@@ -718,6 +732,10 @@ export class CodingAgentOrchestrator {
       this.persistInBackground();
       return;
     }
+    if (event.type === "checks_request") {
+      this.background(this.answerChecks(session, run, event));
+      return;
+    }
     if (event.type === "tool") {
       if (event.phase === "start") run.tool_count += 1;
       const mcpMatch = /^mcp__([^_]+)__(.+)$/.exec(event.tool);
@@ -787,6 +805,37 @@ export class CodingAgentOrchestrator {
       }
       if (this.workflows.has(run.run_id)) run.execution_status = "succeeded";
       this.background(this.completeRun(session, run));
+    }
+  }
+
+  /** Runs the writer's run_checks request within its per-run limits and answers the dialog. */
+  private async answerChecks(session: SessionRecord, run: RunRecord, event: Extract<PublicRunEvent, { type: "checks_request" }>): Promise<void> {
+    const respond = (response: WriterChecksResponse) => session.process.respondUi(event.request_id, { value: JSON.stringify(response) });
+    const workflow = this.workflows.get(run.run_id);
+    const writer = this.quality?.writerChecks;
+    if (run.task_mode === "discuss" || !workflow || !this.quality?.runChecks || !writer) { respond(rejected("unavailable", "run_checks needs a trusted verification profile and is not available in this run")); return; }
+    if (workflow.checksOperation) { respond(rejected("busy", "A run_checks call is already running; wait for its result")); return; }
+    const calls = workflow.checksCalls ?? 0;
+    if (calls >= writer.maxCalls) { respond(rejected("max_calls", `run_checks may be called at most ${writer.maxCalls} times per run`)); return; }
+    const names = event.checks?.length ? event.checks : writer.defaultChecks;
+    if (workflow.budget.remainingMs() < writer.estimateMs(names) + writer.reserveMs) { respond(rejected("insufficient_time_budget", "Not enough time left to run checks and still verify the final result; finish without them")); return; }
+    workflow.checksCalls = calls + 1; run.writer_checks_calls = workflow.checksCalls;
+    run.events.push({ type: "checks", phase: "start", checks: names });
+    this.persistSoon();
+    const operation = this.quality.runChecks({ run_id: run.run_id, worktree: session.worktreePath, baseline: session.baselineCommit, ...(event.checks ? { checks: event.checks } : {}), signal: workflow.controller.signal });
+    workflow.checksOperation = operation;
+    try {
+      const response = await operation;
+      if (workflow.controller.signal.aborted || isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return;
+      run.events.push({ type: "checks", phase: "end", status: response.status });
+      respond(response);
+    } catch {
+      if (workflow.controller.signal.aborted || isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return;
+      run.events.push({ type: "checks", phase: "end", status: "unknown" });
+      respond({ status: "unknown", reason: "run_checks_failed", checks: [], report: "The checks could not run. Continue; the final verification still runs." });
+    } finally {
+      if (workflow.checksOperation === operation) workflow.checksOperation = undefined;
+      this.persistSoon();
     }
   }
 
@@ -936,6 +985,7 @@ export class CodingAgentOrchestrator {
       workflow?.controller.abort();
       if (workflow?.discovery) await workflow.discovery.catch(() => {});
       if (workflow?.operation) await workflow.operation.catch(() => {});
+      if (workflow?.checksOperation) await workflow.checksOperation.catch(() => {});
       await session.process.abort(workflow?.executionId ?? run.run_id);
       await this.quality?.stop?.(run.run_id);
     } catch {

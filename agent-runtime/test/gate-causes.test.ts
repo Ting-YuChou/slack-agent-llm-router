@@ -10,7 +10,13 @@ import { CandidateStore, DockerVerifier, validateProfile } from "../src/verifica
 
 const profile = validateProfile({ id: "causes", repository: "org/repo", image: `sha256:${"a".repeat(64)}`, rubric: ["correct"], allowedPaths: ["src/"],
   checks: [{ name: "unit", argv: ["node", "--test"], cwd: ".", timeoutMs: 5_000 }] });
-const candidate = { hash: "h", path: "/nonexistent/candidate" };
+/** A real candidate directory: the verifier writes per-mode output next to it before calling Docker. */
+async function candidateIn(t: { after(fn: () => Promise<void>): void }) {
+  const root = await mkdtemp(path.join(tmpdir(), "cause-candidate-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, "candidate"));
+  return { hash: "h", path: path.join(root, "candidate") };
+}
 
 /** Runs `action` with PATH pointing only at `directory`, so `docker` resolves to a fake (or to nothing). */
 async function withPath<T>(directory: string, action: () => Promise<T>): Promise<T> {
@@ -36,7 +42,8 @@ test("each gate cause is classified from HarnessError and from legacy messages",
 test("a missing docker binary fails verification as docker_unavailable", async t => {
   const empty = await mkdtemp(path.join(tmpdir(), "no-docker-"));
   t.after(() => rm(empty, { recursive: true, force: true }));
-  const error = await withPath(empty, () => new DockerVerifier(profile).verify(candidate, new AbortController().signal)).catch(caught => caught);
+  const target = await candidateIn(t);
+  const error = await withPath(empty, () => new DockerVerifier(profile).verify(target, new AbortController().signal)).catch(caught => caught);
   assert.ok(error instanceof HarnessError, String(error));
   assert.equal(error.causeCode, "docker_unavailable");
 });
@@ -46,7 +53,8 @@ test("an unreachable Docker daemon fails verification as docker_unavailable, not
   t.after(() => rm(bin, { recursive: true, force: true }));
   await writeFile(path.join(bin, "docker"), "#!/bin/sh\necho 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?' >&2\nexit 1\n");
   await chmod(path.join(bin, "docker"), 0o755);
-  const error = await withPath(bin, () => new DockerVerifier(profile).verify(candidate, new AbortController().signal)).catch(caught => caught);
+  const target = await candidateIn(t);
+  const error = await withPath(bin, () => new DockerVerifier(profile).verify(target, new AbortController().signal)).catch(caught => caught);
   assert.ok(error instanceof HarnessError, String(error));
   assert.equal(error.causeCode, "docker_unavailable");
 });
@@ -57,7 +65,8 @@ test("a container that cannot be removed is verification_stop_unconfirmed", asyn
   // `docker run` reports a failing check; `docker rm` cannot confirm the container is gone.
   await writeFile(path.join(bin, "docker"), "#!/bin/sh\nif [ \"$1\" = rm ]; then echo 'Error response from daemon: removal in progress' >&2; exit 1; fi\nexit 1\n");
   await chmod(path.join(bin, "docker"), 0o755);
-  const error = await withPath(bin, () => new DockerVerifier(profile).verify(candidate, new AbortController().signal)).catch(caught => caught);
+  const target = await candidateIn(t);
+  const error = await withPath(bin, () => new DockerVerifier(profile).verify(target, new AbortController().signal)).catch(caught => caught);
   assert.ok(error instanceof HarnessError, String(error));
   assert.equal(error.causeCode, "verification_stop_unconfirmed");
 });

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites>
+	<testcase name="adds" time="0.000669" classname="test" file="/workspace/check/agent-runtime/dist/test/a.test.js" failure="Expected values to be strictly equal:&#10;&#10;1 !== 2&#10;">
+		<failure type="testCodeFailure" message="Expected values to be strictly equal:&#10;&#10;1 !== 2">
+[Error [ERR_TEST_FAILURE]: Expected values to be strictly equal:
+
+1 !== 2
+] {
+  code: 'ERR_TEST_FAILURE',
+  failureType: 'testCodeFailure',
+  cause: AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  1 !== 2
+  
+      at TestContext.&lt;anonymous> (file:///workspace/check/agent-runtime/dist/test/a.test.js:2:29)
+      at Test.runInAsyncScope (node:async_hooks:226:14)
+      at Test.run (node:internal/test_runner/test:1397:25)
+}
+		</failure>
+	</testcase>
+	<testcase name="ok" time="0.000080" classname="test" file="/workspace/check/agent-runtime/dist/test/a.test.js"/>
+	<!-- tests 2 -->
+	<!-- pass 1 -->
+	<!-- fail 1 -->
+</testsuites>

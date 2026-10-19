@@ -7,6 +7,7 @@ export type PublicRunEvent =
   | { type: "usage"; cost_usd: number }
   | { type: "tool"; phase: "start" | "end"; tool_call_id: string; tool: string; input?: Record<string, unknown>; is_error?: boolean; result_bytes?: number }
   | { type: "approval"; approval_id: string; title: string; detail: string; timeout_ms?: number }
+  | { type: "checks_request"; request_id: string; tool_call_id: string; checks?: string[] }
   | { type: "answer_delta"; text: string }
   | { type: "answer"; text: string }
   | { type: "settled"; outcome: RunOutcome; limit?: LimitKind; stop_reason?: string; error_message?: string }
@@ -17,6 +18,12 @@ export type RunOutcome = "completed" | "truncated" | "limit_reached" | "aborted"
 export type LimitKind = "turns" | "tool_calls";
 
 export class RpcProtocolError extends Error {}
+
+/** The writer's run_checks tool and the extension UI dialog it asks the host through. */
+export const RUN_CHECKS_TOOL = "run_checks";
+export const RUN_CHECKS_DIALOG = "pi-agent/run_checks";
+const DIALOG_METHODS = new Set(["select", "confirm", "input", "editor"]);
+export type UiResponse = { value: string } | { cancelled: true };
 
 export class RpcJsonlDecoder {
   private buffer = "";
@@ -129,6 +136,9 @@ export class PiRpcBridge {
   private lastAssistant?: { stopReason: string; errorMessage?: string };
   private limit?: LimitKind;
   private readonly onReady?: () => void;
+  /** run_checks tool calls currently executing, and those that already asked the host once. */
+  private readonly checkCalls = new Set<string>();
+  private readonly checkRequests = new Set<string>();
 
   constructor(options: { writeLine: (line: string) => void; onEvent: (event: PublicRunEvent) => void; onRecord?: (record: Record<string, unknown>) => void; onCommand?: (record: Record<string, unknown>) => void; onReady?: () => void }) {
     this.writeLine = options.writeLine;
@@ -177,9 +187,34 @@ export class PiRpcBridge {
           continue;
         }
       }
+      if (record.type === "tool_execution_start" && record.toolName === RUN_CHECKS_TOOL && typeof record.toolCallId === "string") this.checkCalls.add(record.toolCallId);
+      if (record.type === "tool_execution_end" && typeof record.toolCallId === "string") this.checkCalls.delete(record.toolCallId);
+      if (record.type === "extension_ui_request" && typeof record.method === "string" && DIALOG_METHODS.has(record.method) && record.method !== "confirm") {
+        this.dialog(record);
+        continue;
+      }
       const event = sanitizeRpcEvent(record);
       if (event) this.onEvent(event);
     }
+  }
+
+  /**
+   * The only dialog the host answers is run_checks, and only for a run_checks tool call that is
+   * executing and has not asked before; any other dialog is cancelled so Pi never waits on it.
+   */
+  private dialog(record: Record<string, unknown>): void {
+    const id = safeString(record.id);
+    const request = record.method === "input" && record.title === RUN_CHECKS_DIALOG ? parseChecksRequest(record.placeholder) : undefined;
+    if (!id || !request || !this.checkCalls.has(request.tool_call_id) || this.checkRequests.has(request.tool_call_id)) {
+      if (id) this.respondUi(id, { cancelled: true });
+      return;
+    }
+    this.checkRequests.add(request.tool_call_id);
+    this.onEvent({ type: "checks_request", request_id: id, ...request });
+  }
+
+  respondUi(id: string, response: UiResponse): void {
+    this.send({ type: "extension_ui_response", id, ...response });
   }
 
   prompt(id: string, message: string): void {
@@ -251,6 +286,16 @@ export class PiRpcBridge {
     try { this.onCommand?.(record); } catch { /* monitoring must not interrupt RPC */ }
     this.writeLine(`${JSON.stringify(record)}\n`);
   }
+}
+
+function parseChecksRequest(raw: unknown): { tool_call_id: string; checks?: string[] } | undefined {
+  if (typeof raw !== "string" || raw.length > 8192) return undefined;
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { return undefined; }
+  if (!isRecord(value) || typeof value.tool_call_id !== "string" || !value.tool_call_id || value.tool_call_id.length > 256) return undefined;
+  const checks = value.checks;
+  if (checks !== undefined && (!Array.isArray(checks) || checks.length > 20 || checks.some(name => typeof name !== "string" || !name || name.length > 80))) return undefined;
+  return { tool_call_id: value.tool_call_id, ...(checks?.length ? { checks: checks as string[] } : {}) };
 }
 
 function safeString(value: unknown): string {
