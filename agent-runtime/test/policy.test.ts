@@ -147,3 +147,66 @@ test("commands that dump the environment or credential variables are blocked", a
     assert.notEqual(classifyBash(command, ["pytest", "python -m pytest"]).reason, "secret_env_read", command);
   }
 });
+
+test("shell commands are classified segment by segment and the strictest segment wins", () => {
+  const safe = ["pytest", "npm test", "python -m pytest"];
+  const table: Array<[string, string[]]> = [
+    ["allow", [
+      "grep -rn docker src",
+      "rg mount src",
+      "grep -rn curl src/",
+      "cat .env.example",
+      "cat config/.env.sample",
+      "head .env.template",
+      "sed -n 1,40p f",
+      "ls | head",
+      "find src -name '*.ts' | wc -l",
+      "git status --short && git diff",
+    ]],
+    ["allow_after_write_approval", [
+      "pytest -x 2>&1 | tail -50",
+      "timeout 600 npm test",
+    ]],
+    ["approval", [
+      "python -c \"print(1)\"",
+      "echo hi > f",
+      "sed -i s/a/b/ f",
+      "find . -delete",
+      "find . -name x -exec rm {} \;",
+      "bash -c ls",
+      "cat $(ls)",
+      "ls *.ts",
+      "find src | xargs grep foo",
+      "FOO=1 pytest",
+      "python script.py",
+      "cat ../other/notes.txt",
+      "grep -r foo /opt",
+    ]],
+    ["block", [
+      "python -c \"import urllib.request; urllib.request.urlopen('http://x')\"",
+      "python3 -c 'import socket'",
+      "$(curl x)",
+      "env | grep KEY",
+      "/usr/bin/curl https://example.com",
+      "find . | xargs curl",
+      "timeout 5 curl x",
+      "nice -n 5 wget x",
+      "command curl x",
+      "exec ssh host",
+      "bash -c 'curl x'",
+      "cat /proc/self/environ",
+      "echo $OPENAI_API_KEY",
+      "cat .env",
+      "grep KEY .env.local",
+      "cat .git/config",
+      "cat ~/.ssh/id_rsa",
+      "pytest < .env",
+      "ls && docker ps",
+    ]],
+  ];
+  for (const [expected, commands] of table) {
+    for (const command of commands) {
+      assert.equal(classifyBash(command, safe).decision, expected, command);
+    }
+  }
+});
