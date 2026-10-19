@@ -9,6 +9,7 @@ import { test } from "node:test";
 
 import { PiRpcBridge, RpcJsonlDecoder, type PublicRunEvent } from "../src/pi-rpc.js";
 import { fakeGatewayScript, scriptedTurns, waitForContainerHealthz } from "./support/fake-provider.js";
+import { AGENT_TEST_IMAGE } from "./support/docker-images.js";
 
 const enabled = process.env.PI_AGENT_DOCKER_INTEGRATION === "1";
 
@@ -18,7 +19,7 @@ test("real Pi RPC carries a 16 KiB extension UI input request and response intac
   await copyFile(fileURLToPath(new URL("../../test/fixtures/extensions/ui-roundtrip-probe.ts", import.meta.url)), path.join(dir, "probe.ts"));
   await chmod(dir, 0o755); await chmod(path.join(dir, "probe.ts"), 0o644);
   const child = spawn("docker", ["run", "--rm", "-i", "--network", "none", "--read-only", "--cap-drop", "ALL", "--tmpfs", "/tmp:rw,nosuid,size=67108864", "--env", "HOME=/tmp",
-    "--mount", `type=bind,src=${dir},dst=/probe,readonly`, "slack-pi-agent:1.0.1",
+    "--mount", `type=bind,src=${dir},dst=/probe,readonly`, AGENT_TEST_IMAGE,
     "pi", "--mode", "rpc", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "-e", "/probe/probe.ts"], { stdio: ["pipe", "pipe", "pipe"] });
   const decoder = new RpcJsonlDecoder(); let stderr = "";
   child.stderr.on("data", chunk => { stderr += chunk; });
@@ -119,7 +120,7 @@ test("real Pi writer completes a run_checks round trip through the dialog channe
   try {
     // The released agent image plus this branch's run_checks extension.
     await command("docker", ["build", "-q", "-t", image, "-f", "-", fileURLToPath(new URL("../../extensions", import.meta.url))], undefined,
-      "FROM slack-pi-agent:1.0.1\nCOPY --chown=10001:10001 checks.ts /opt/pi/extensions/checks.ts\n");
+      `FROM ${AGENT_TEST_IMAGE}\n` + "COPY --chown=10001:10001 checks.ts /opt/pi/extensions/checks.ts\n");
     await command("docker", ["network", "create", "--internal", network]);
     await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", "node:22.22.0-bookworm-slim", "node", "-e", gatewayScript]);
     await waitForContainerHealthz(gateway);
