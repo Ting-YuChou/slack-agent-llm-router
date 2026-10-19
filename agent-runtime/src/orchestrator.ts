@@ -11,6 +11,7 @@ import { workflowMode, type WorkflowMode, type WorkflowNode } from "./structured
 import { WorkflowBudget } from "./workflow-budget.js";
 import type { Candidate, GateInput, GateResult } from "./quality-gate.js";
 import { classifyGateError, type RunFailure } from "./error-taxonomy.js";
+import { promptTelemetry } from "./prompts.js";
 import { redact } from "./telemetry.js";
 import { DEFAULT_DIFF_LIMITS, DiffLimitError } from "./worktree-manager.js";
 import { rejected, type WriterChecksRequest, type WriterChecksResponse } from "./writer-checks.js";
@@ -91,6 +92,10 @@ export interface SessionInput {
 }
 
 export interface RunRecord {
+  /** Aggregate hash of prompts/*.md this run was built with (PROMPTS_VERSION). */
+  prompts_version?: string;
+  /** `prompt_id@hash` of each prompt the run's role uses. */
+  prompts?: string[];
   task_mode?: TaskMode;
   workflow_mode?: WorkflowMode;
   workflow_requirement?: string;
@@ -582,6 +587,7 @@ export class CodingAgentOrchestrator {
       run_id: runId,
       workflow_mode: mode,
       task_mode: task,
+      ...promptTelemetry(task === "discuss" ? "discussion" : "implementation"),
       ...(mode === "structured" ? { workflow_requirement: requirement ?? prompt, workflow_prompt: prompt } : {}),
       session_id: session.id,
       status: "running",

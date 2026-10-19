@@ -12,6 +12,8 @@ WORKDIR /opt/pi
 COPY agent-runtime/package.json agent-runtime/package-lock.json ./
 RUN npm ci --ignore-scripts
 COPY agent-runtime/tsconfig.json agent-runtime/tsconfig.extensions.json ./
+COPY agent-runtime/scripts/build-prompts.mjs ./scripts/build-prompts.mjs
+COPY agent-runtime/prompts ./prompts
 COPY agent-runtime/src ./src
 COPY agent-runtime/extensions ./extensions
 RUN npm run build

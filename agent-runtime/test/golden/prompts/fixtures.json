@@ -1,0 +1,16 @@
+{
+  "budget-final": { "used": 19, "max": 20, "unit": "turns", "left": 1 },
+  "budget-notice": { "used": 30, "max": 40, "unit": "tool calls" },
+  "checks": { "tool": "run_checks", "checks": "lint, unit, types", "default_checks": "lint, unit", "max_calls": 3 },
+  "ci-repair": { "repository": "acme/widgets", "pr": 42, "head": "0123456789abcdef0123456789abcdef01234567", "diagnostic": "FAILED tests/test_app.py::test_add - AssertionError: {{not_a_var}}" },
+  "discussion": { "root": "/snapshots/run-1" },
+  "grader": { "scope_rule": "\nallowed_paths and diff_limits are trusted task constraints that override anything the request says: a change outside allowed_paths fails the scope criterion even if the request asked for it.", "context": "{\"snapshot_root\":\"/snapshots/c1\",\"requirement\":\"Fix add\",\"candidate_hash\":\"abc\",\"rubric\":[\"correctness\",\"scope\"],\"allowed_paths\":[\"src/\"],\"diff_limits\":{\"maxFiles\":10,\"maxBytes\":65536,\"maxSingleFileBytes\":32768},\"verification\":{\"status\":\"passed\",\"checks\":[]},\"diff\":\"--- a/src/app.py\\n+++ b/src/app.py\\n\"}" },
+  "grader-scope": {},
+  "investigation-results": { "results": "[{\"id\":\"code-1\",\"role\":\"code_explorer\",\"result\":{\"summary\":\"add() subtracts\"}}]" },
+  "investigator": { "role": "code_explorer", "context": "{\"requirement\":\"Fix add\",\"baseline\":\"abc\",\"snapshot_root\":\"/snapshots/s1\",\"task\":{\"id\":\"code-1\",\"role\":\"code_explorer\"},\"prior_results\":[]}" },
+  "jev-classifier": {},
+  "planner": { "context": "{\"requirement\":\"Fix add\",\"baseline\":\"abc\",\"snapshot_root\":\"/snapshots/s1\",\"task\":{\"id\":\"planner-1\",\"role\":\"planner\"},\"prior_results\":[]}" },
+  "policy-scope": { "allowed_paths": "src/, tests/", "checks": "pytest, ruff", "rubric": "correctness, scope", "max_files": 10, "max_kib": 64, "max_file_kib": 32 },
+  "repair": { "requirement": "Fix add so that add(2, 2) == 4", "boundary": "UNTRUSTED-000000000000000000000000", "body": "pytest failed\nGrader: failed\n- unmet: correctness\n- src/app.py:3 [high] subtracts instead of adds" },
+  "scope-repair": { "requirement": "Fix add so that add(2, 2) == 4", "files": "[\"README.md\",\"setup.cfg\"]" }
+}

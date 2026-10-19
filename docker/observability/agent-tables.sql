@@ -99,7 +99,8 @@ CREATE TABLE IF NOT EXISTS agent_executions (
   workflow_run_id String,
   role String,
   attempt UInt32,
-  phase String
+  phase String,
+  prompts_version String
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
 
 CREATE VIEW IF NOT EXISTS agent_executions_latest AS SELECT * FROM agent_executions FINAL;
@@ -139,7 +140,8 @@ CREATE TABLE IF NOT EXISTS agent_grades (
   payload_json String CODEC(ZSTD(3)),
   candidate_hash String,
   attempt UInt32,
-  status String
+  status String,
+  prompts_version String
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
 
 CREATE VIEW IF NOT EXISTS agent_grades_latest AS SELECT * FROM agent_grades FINAL;
@@ -180,7 +182,8 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   model String,
   reasoning_effort String,
   routing_json String,
-  capture_complete Nullable(UInt8)
+  capture_complete Nullable(UInt8),
+  prompts_version String
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY run_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
 
 CREATE VIEW IF NOT EXISTS agent_runs_latest AS SELECT * FROM agent_runs FINAL;
