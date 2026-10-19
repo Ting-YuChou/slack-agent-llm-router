@@ -5,6 +5,8 @@ import type { PublicRunEvent } from "../src/pi-rpc.js";
 import { CodingAgentOrchestrator, RuntimeConflictError, RuntimeForbiddenError } from "../src/orchestrator.js";
 import { HarnessError } from "../src/error-taxonomy.js";
 import { DiffLimitError, ProtectedFileError } from "../src/worktree-manager.js";
+import { limitsForRoute, parseAgentLimitConfig } from "../src/agent-limits.js";
+import type { RouteDecision } from "../src/jev-router.js";
 import { piTurn, runScenario, settledRecord } from "./support/scenario.js";
 
 const SETTLED = { type: "settled", outcome: "completed" } as const;
@@ -166,6 +168,14 @@ test("automatic session selects Sol for a complex run and Luna for its follow-up
   const second = await (orchestrator as any).prompt(first.session_id, "inspect result", "U", "inspect result");
   assert.equal(orchestrator.getRun(second.run_id).model, "gpt-5.6-luna");
   assert.equal(process.prompts[1].route?.effort, "low");
+});
+
+test("a run records the turn and tool-call limits its route was started with", async () => {
+  const { orchestrator, process } = fixture({ route: async () => ({ modelRef: "openai/gpt-5.6-sol", effort: "high", source: "jev", label: "complex" }) });
+  const config = parseAgentLimitConfig({});
+  (process as any).limitsFor = (route: RouteDecision) => limitsForRoute(route, config);
+  const created = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "route-limits", user_id: "U", prompt: "refactor", routing_text: "refactor everything" } as any);
+  assert.deepEqual(orchestrator.getRun(created.run_id).limits, { maxTurns: 30, maxToolCalls: 60 });
 });
 
 test("explicit Sol session ignores Jev and keeps Sol max on follow-up", async () => {

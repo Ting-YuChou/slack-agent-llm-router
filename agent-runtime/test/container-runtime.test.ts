@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { buildAgentDockerArgs, buildAgentSpawnEnv } from "../src/container-runtime.js";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+import { parseAgentLimitConfig } from "../src/agent-limits.js";
+import { buildAgentDockerArgs, buildAgentSpawnEnv, DockerPiProcess } from "../src/container-runtime.js";
 
 test("agent container is non-root, resource-limited, read-only, and internal-network only", () => {
   const args = buildAgentDockerArgs({
@@ -147,6 +152,37 @@ test("writer turn and tool-call limits come from host configuration", () => {
   const rendered = buildAgentDockerArgs({ ...base, limits: { maxTurns: 3, maxToolCalls: 5 } }).join(" ");
   assert.match(rendered, /PI_AGENT_MAX_TURNS=3 /);
   assert.match(rendered, /PI_AGENT_MAX_TOOL_CALLS=5 /);
+});
+
+test("a complex Jev route starts the writer container with the complex route limits", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "fake-docker-"));
+  const argsFile = path.join(dir, "run-args");
+  await writeFile(path.join(dir, "docker"), `#!/bin/sh\nif [ "$1" = run ]; then echo "$@" > "${argsFile}"; exit 0; fi\nexit 1\n`);
+  await chmod(path.join(dir, "docker"), 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${dir}:${previousPath}`;
+  const routeLimits = parseAgentLimitConfig({});
+  const piProcess = new DockerPiProcess({
+    name: "pi-session-limits", image: "pi-agent@sha256:abc", network: "pi-model-only", worktreePath: "/w", gitMetadataPath: "/repo/.git",
+    sessionStatePath: dir, gatewayUrl: "http://model-gateway:8080/v1", modelRef: "openai/gpt-5.6-sol",
+    extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"], limits: routeLimits.base, routeLimits,
+  }, () => "token", () => undefined);
+  const route = { modelRef: "openai/gpt-5.6-sol", effort: "high", source: "jev", label: "complex" } as const;
+  try {
+    assert.deepEqual(piProcess.limitsFor(route), { maxTurns: 30, maxToolCalls: 60 });
+    piProcess.prompt("run-limits-1", "refactor", route);
+    let rendered = "";
+    for (let i = 0; i < 200 && !rendered; i++) {
+      rendered = await readFile(argsFile, "utf8").catch(() => "");
+      if (!rendered) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.match(rendered, /PI_AGENT_MAX_TURNS=30 /);
+    assert.match(rendered, /PI_AGENT_MAX_TOOL_CALLS=60 /);
+  } finally {
+    await piProcess.close();
+    process.env.PATH = previousPath;
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("writer receives trusted-profile constraints; discussion mode drops them", () => {
