@@ -90,6 +90,13 @@ export class WorktreeManager {
     return { files, bytes, stat: statOutput.trim() };
   }
 
+  /** The full binary patch of the worktree against HEAD, untracked files included. */
+  async patch(worktreePath: string): Promise<string> {
+    await this.assertManagedPath(worktreePath);
+    await this.git(worktreePath, "add", "-N", "--", ".");
+    return this.gitRaw(worktreePath, "diff", "--binary", "HEAD", "--");
+  }
+
   async commit(worktreePath: string, message: string): Promise<string> {
     await this.assertManagedPath(worktreePath);
     await this.git(worktreePath, "add", "--all", "--", ".");

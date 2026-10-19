@@ -232,3 +232,12 @@ test("porcelain -z output yields every changed path, including rename sources", 
   );
   assert.deepEqual(parsePorcelainZ(""), []);
 });
+
+test("an approval can carry its own time to live", () => {
+  let now = 0;
+  const store = new ApprovalStore({ ttlMs: 300_000, now: () => now });
+  const delivery = store.create({ runId: "r", toolCallId: "delivery", userId: "U", action: "deliver" }, 1_800_000);
+  assert.equal(delivery.expiresAt, 1_800_000);
+  now = 1_000_000;
+  assert.equal(store.decide(delivery.id, "U", "approve").code, "approved");
+});

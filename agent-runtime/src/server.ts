@@ -11,6 +11,7 @@ import { PiRunCapture } from "./pi-capture.js";
 import { AgentTelemetry, isCredentialKey } from "./telemetry.js";
 import { AgentTracing } from "./tracing.js";
 import { DockerPiProcess, type ChecksContext, type WriterContext } from "./container-runtime.js";
+import { approvalSettings } from "./approval-mode.js";
 import { parseAgentLimitConfig } from "./agent-limits.js";
 
 export { parseAgentLimits } from "./agent-limits.js";
@@ -395,6 +396,8 @@ export async function createProductionServer() {
   }) : undefined;
   let ciRuntime: Awaited<ReturnType<typeof createCiRuntime>> | undefined;
   const agentLimits = parseAgentLimitConfig(process.env);
+  const approval = approvalSettings(process.env);
+  const credentialValues = () => Object.entries(process.env).filter(([key]) => isCredentialKey(key)).map(([, value]) => value!).filter(Boolean);
   const orchestrator: CodingAgentOrchestrator = new CodingAgentOrchestrator({
     quality,
     requireVerification: process.env.PI_AGENT_REQUIRE_VERIFICATION === "1",
@@ -429,6 +432,7 @@ export async function createProductionServer() {
     stateStore,
     maxActiveSessions: positiveInteger(process.env.PI_AGENT_MAX_CONCURRENCY, 2),
     deadlineMs: positiveInteger(process.env.PI_AGENT_DEADLINE_MS, 15 * 60_000),
+    ...(approval.deliveryApproval ? { deliveryApproval: { ttlMs: approval.deliveryTtlMs, secrets: credentialValues } } : {}),
     availableModelRefs: configuredModels.map((model) => model.ref),
     router,
     mcpRepository,
@@ -450,10 +454,12 @@ export async function createProductionServer() {
           pluginPaths: lock.plugins.map((plugin) => plugin.container_path),
           skillPaths: skillLock.skills.map((skill) => skill.container_path),
           continueSession: session.restored,
-          safeCommands: parseSafeCommands(process.env.PI_AGENT_SAFE_COMMANDS),
+          safeCommands: parseSafeCommands(process.env.PI_AGENT_SAFE_COMMANDS, { profiled: Boolean(trustedProfile) }),
           limits: agentLimits.base,
           routeLimits: agentLimits,
           ...(trustedProfile ? { writerContext: writerContextFor(trustedProfile.profile) } : {}),
+          // Runs that skip delivery approval keep per-write prompts, so no run loses both gates.
+          writeApproval: session.skipDelivery ? "per_prompt" : approval.writeApproval,
           user: containerUser,
           ...(mcpServerIds.length > 0 ? {
             mcp: {
@@ -713,9 +719,12 @@ export function writerContextFor(profile: VerificationProfile): WriterContext {
   return { allowedPaths: [...profile.allowedPaths], checks: profile.checks.map((check) => check.name), rubric: [...profile.rubric], diffLimits: { ...DEFAULT_DIFF_LIMITS } };
 }
 
-function parseSafeCommands(value: string | undefined): string[] {
+const TEST_RUNNERS = new Set(["npm test", "npm run test", "pytest", "python -m pytest"]);
+
+/** With a trusted profile the writer tests through run_checks (no network, no token, baseline config), not bash. */
+export function parseSafeCommands(value: string | undefined, options: { profiled: boolean } = { profiled: false }): string[] {
   const defaults = ["npm test", "npm run test", "npm run lint", "npm run build", "pytest", "python -m pytest"];
-  if (!value) return defaults;
+  if (!value) return options.profiled ? defaults.filter(command => !TEST_RUNNERS.has(command)) : defaults;
   return value.split("||").map((command) => command.trim()).filter(Boolean);
 }
 function logEvent(event: string, fields: Record<string, unknown>): void {

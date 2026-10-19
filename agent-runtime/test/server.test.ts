@@ -216,3 +216,14 @@ test("run JSON reports a retained patch without exposing its host path", async (
   assert.equal(body.patch_retained, true);
   assert.equal(text.includes("undelivered.patch"), false);
 });
+
+test("profiled writers test through run_checks, so test runners leave the default safe commands", async () => {
+  const { parseSafeCommands } = await import("../src/server.js");
+  const runners = ["npm test", "npm run test", "pytest", "python -m pytest"];
+  const unprofiled = parseSafeCommands(undefined);
+  for (const runner of runners) assert.ok(unprofiled.includes(runner), runner);
+  const profiled = parseSafeCommands(undefined, { profiled: true });
+  for (const runner of runners) assert.ok(!profiled.includes(runner), runner);
+  assert.deepEqual(profiled, ["npm run lint", "npm run build"]);
+  assert.deepEqual(parseSafeCommands("pytest || make lint", { profiled: true }), ["pytest", "make lint"], "an explicit PI_AGENT_SAFE_COMMANDS still wins");
+});
