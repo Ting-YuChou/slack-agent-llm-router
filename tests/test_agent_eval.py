@@ -1,6 +1,9 @@
+import http.server
 import json
 import shutil
 import subprocess
+import threading
+import uuid
 
 import pytest
 
@@ -110,6 +113,131 @@ def test_collect_spans_ignores_malformed_otel_lines(tmp_path):
 
     assert validator.collect_spans(tmp_path) == [{"name": "run", "traceId": "t"}]
     assert validator.collect_spans(tmp_path / "missing") == []
+
+
+def _inspect(*configs):
+    return json.dumps([{"Name": "net", "IPAM": {"Config": list(configs)}}])
+
+
+def test_bridge_gateway_returns_the_ipv4_gateway():
+    output = _inspect(
+        {"Subnet": "fd00::/64", "Gateway": "fd00::1"},
+        {"Subnet": "172.20.0.0/16", "Gateway": "172.20.0.1"},
+    )
+
+    assert validator.bridge_gateway(output) == "172.20.0.1"
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "[]",
+        _inspect(),
+        _inspect({"Subnet": "fd00::/64", "Gateway": "fd00::1"}),
+        json.dumps([{"Name": "net", "IPAM": {"Config": None}}]),
+    ],
+)
+def test_bridge_gateway_fails_without_an_ipv4_gateway(output):
+    with pytest.raises(RuntimeError):
+        validator.bridge_gateway(output)
+
+
+@pytest.mark.parametrize(
+    "platform, docker_os",
+    [
+        ("darwin", "Docker Desktop"),
+        ("darwin", "OrbStack"),
+        ("linux", "Docker Desktop"),
+        ("win32", "Docker Desktop"),
+    ],
+)
+def test_host_binding_keeps_loopback_where_docker_forwards_the_host_alias(
+    platform, docker_os
+):
+    assert validator.host_binding(platform, docker_os, "172.20.0.1") == (
+        "127.0.0.1",
+        [],
+    )
+
+
+def test_host_binding_uses_the_bridge_gateway_on_a_native_linux_daemon():
+    assert validator.host_binding("linux", "Ubuntu 24.04.1 LTS", "172.20.0.1") == (
+        "172.20.0.1",
+        ["--add-host", "host.docker.internal:172.20.0.1"],
+    )
+
+
+def _docker_ready():
+    if not shutil.which("docker"):
+        return False
+    probe = subprocess.run(["docker", "info"], capture_output=True)
+    return probe.returncode == 0
+
+
+@pytest.mark.skipif(not _docker_ready(), reason="needs a running Docker daemon")
+def test_container_on_topology_networks_reaches_host_runtime_through_alias():
+    """Same network layout as Topology.start(): the gateway container starts on an
+    --internal network, then joins an egress network, and calls the host runtime
+    at http://host.docker.internal:<port>. No model calls."""
+    suffix = uuid.uuid4().hex[:8]
+    internal = "pi-structured-smoke-" + suffix
+    external = internal + "-egress"
+    container = "pi-structured-smoke-" + suffix
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"budget-rpc-ok"
+            self.send_response(200)
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = None
+    try:
+        validator.docker("network", "create", "--internal", internal)
+        validator.docker("network", "create", external)
+        listen_host, add_host = validator.host_access(external)
+        server = http.server.ThreadingHTTPServer((listen_host, 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        port = server.server_address[1]
+        validator.docker(
+            "create",
+            "--name",
+            container,
+            "--network",
+            internal,
+            *add_host,
+            "busybox:1.36",
+            "wget",
+            "-q",
+            "-T",
+            "10",
+            "-O",
+            "-",
+            f"http://{validator.HOST_ALIAS}:{port}/",
+        )
+        validator.docker("network", "connect", external, container)
+        result = subprocess.run(
+            ["docker", "start", "-a", container],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "budget-rpc-ok"
+    finally:
+        if server:
+            server.shutdown()
+            server.server_close()
+        for args in (
+            ["rm", "-f", container],
+            ["network", "rm", external],
+            ["network", "rm", internal],
+        ):
+            subprocess.run(["docker", *args], capture_output=True)
 
 
 # --- eval runner ---------------------------------------------------------------
@@ -271,7 +399,12 @@ def test_aggregate_reports_pass_at_1_agreement_cost_and_wall_time():
     assert summary["cost_usd_p50"] == 0.2
     assert summary["wall_time_s_p50"] == 45.0
     assert summary["wall_time_s_total"] == 160.0
-    assert summary["tasks"]["t1"] == {"runs": 2, "passes": 1, "pass_at_1": 0.5}
+    assert summary["tasks"]["t1"] == {
+        "runs": 2,
+        "passes": 1,
+        "pass_at_1": 0.5,
+        "failure_codes": {"no_error_code": 1},
+    }
 
 
 def test_aggregate_excludes_runs_without_both_verdicts_from_agreement():
@@ -292,6 +425,141 @@ def test_aggregate_of_no_runs_leaves_metrics_missing():
     assert summary["runs"] == 0
     for metric in agent_eval.CONTRACT_METRICS:
         assert summary[metric] is None
+
+
+def test_aggregate_reports_a_per_task_histogram_of_failure_codes():
+    summary = agent_eval.aggregate(
+        [
+            _record(passed=False, error_code="agent_tool_limit"),
+            _record(passed=False, error_code="agent_tool_limit"),
+            _record(passed=False, error_code="quality_gate_unavailable"),
+            _record(passed=False),
+            _record(error_code="scope_violation"),
+            _record("t2"),
+        ]
+    )
+
+    assert summary["tasks"]["t1"]["failure_codes"] == {
+        "agent_tool_limit": 2,
+        "quality_gate_unavailable": 1,
+        "no_error_code": 1,
+    }
+    assert summary["tasks"]["t2"]["failure_codes"] == {}
+
+
+def test_failure_codes_leave_the_contract_metrics_unchanged():
+    records = [
+        _record(passed=False, grader="failed", oracle="failed", cost_usd=0.3),
+        _record(cost_usd=0.1, wall_time_s=10.0),
+    ]
+    coded = [dict(record, error_code="agent_tool_limit") for record in records]
+
+    plain, with_codes = agent_eval.aggregate(records), agent_eval.aggregate(coded)
+
+    for metric in agent_eval.CONTRACT_METRICS:
+        assert with_codes[metric] == plain[metric]
+    assert set(agent_eval.CONTRACT_METRICS) == {
+        "pass_at_1",
+        "grader_oracle_agreement",
+        "cost_usd_p50",
+        "wall_time_s_p50",
+    }
+
+
+# --- run error capture ---------------------------------------------------------
+
+
+def test_run_error_reads_code_and_message_from_the_final_run_state():
+    state = {
+        "status": "failed",
+        "error": {"code": "agent_tool_limit", "message": "Tool call limit reached"},
+    }
+
+    assert agent_eval.run_error(state) == (
+        "agent_tool_limit",
+        "Tool call limit reached",
+    )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"status": "completed"},
+        {"status": "failed", "error": None},
+        {"status": "failed", "error": "boom"},
+        {"status": "failed", "error": {"code": 7, "message": ["x"]}},
+    ],
+)
+def test_run_error_is_empty_without_a_well_formed_error(state):
+    assert agent_eval.run_error(state) == (None, None)
+
+
+def test_run_error_message_is_redacted_and_bounded():
+    secret = "sk-proj-" + "A1b2C3d4" * 6
+    message = (
+        f"upstream rejected {secret}; Authorization: Bearer abc.def-ghi "
+        "OPENAI_API_KEY=hunter2\n" + "x" * 5000
+    )
+
+    code, redacted = agent_eval.run_error(
+        {"error": {"code": "upstream_unavailable", "message": message}},
+        secrets=["hunter2"],
+    )
+
+    assert code == "upstream_unavailable"
+    assert len(redacted) <= agent_eval.ERROR_MESSAGE_LIMIT
+    assert secret not in redacted
+    assert "abc.def-ghi" not in redacted
+    assert "hunter2" not in redacted
+    assert "[REDACTED]" in redacted
+    assert redacted.startswith("upstream rejected")
+
+
+def test_redact_masks_known_token_shapes_without_explicit_secrets():
+    text = agent_eval.redact_text(
+        "slack xoxb-1234-5678-abcdefgh github ghp_" + "a" * 36 + " ok"
+    )
+
+    assert "xoxb-1234" not in text
+    assert "ghp_" not in text
+    assert text.endswith(" ok")
+
+
+def test_execute_records_the_run_error_code_and_message():
+    def runner(task, attempt):
+        return _outcome(
+            status="failed",
+            commit=None,
+            changed_files=[],
+            oracle="failed",
+            error_code="quality_gate_unavailable",
+            error_message="Quality gate could not run",
+        )
+
+    record = agent_eval.execute(_task("pass"), 0, runner)
+
+    assert record["passed"] is False
+    assert record["error_code"] == "quality_gate_unavailable"
+    assert record["error_message"] == "Quality gate could not run"
+
+
+def test_execute_records_no_error_for_a_clean_run():
+    record = agent_eval.execute(_task("pass"), 0, lambda task, attempt: _outcome())
+
+    assert record["error_code"] is None
+    assert record["error_message"] is None
+
+
+def test_execute_records_a_crashed_runner_as_runner_error():
+    def runner(task, attempt):
+        raise RuntimeError("docker exploded with Bearer leaked.token")
+
+    record = agent_eval.execute(_task("pass"), 0, runner)
+
+    assert record["error_code"] == "runner_error"
+    assert "docker exploded" in record["error_message"]
+    assert "leaked.token" not in record["error_message"]
+    assert "leaked.token" not in record["reason"]
 
 
 def _baseline(**metrics):
@@ -561,3 +829,59 @@ def test_run_oracle_judges_the_committed_tree_without_exposing_the_oracle(
         "src/label.cjs",
     ]
     assert agent_eval.changed_files(repo, baseline, None) == []
+
+
+def test_live_runner_takes_the_error_from_the_final_run_state(tmp_path, monkeypatch):
+    task = {
+        "id": "t1",
+        "fixture_dir": tmp_path / "fixture",
+        "task_mode": "implement",
+        "workflow_mode": "single",
+        "prompt": "fix it",
+        "profile": {"allowedPaths": ["src/"]},
+    }
+    task["fixture_dir"].mkdir()
+    (task["fixture_dir"] / "a.txt").write_text("a")
+    final = {
+        "status": "failed",
+        "verification_status": "unknown",
+        "grader_status": "unknown",
+        "estimated_cost_usd": 0.05,
+        "error": {
+            "code": "agent_tool_limit",
+            "message": "Tool limit hit using sk-live-secret-key",
+        },
+    }
+
+    class FakeTopology:
+        def __init__(self, *args):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def request(self, path, body=None):
+            return {"run_id": "run-1"}
+
+    monkeypatch.setattr(agent_eval.topology, "make_root", lambda prefix: tmp_path)
+    monkeypatch.setattr(
+        agent_eval.topology, "init_fixture_repo", lambda repo, remote: "base"
+    )
+    monkeypatch.setattr(agent_eval.topology, "Topology", FakeTopology)
+    monkeypatch.setattr(
+        agent_eval.topology,
+        "drive_run",
+        lambda booted, run_id, timeout_s: (final, set()),
+    )
+    monkeypatch.setattr(agent_eval, "run_oracle", lambda *args: "failed")
+    runner = object.__new__(agent_eval.LiveRunner)
+    runner.project, runner.timeout_s = tmp_path, 1
+    runner.key, runner.image = "sk-live-secret-key", "image-id"
+
+    outcome = runner(task, 0)
+
+    assert outcome["error_code"] == "agent_tool_limit"
+    assert outcome["error_message"] == "Tool limit hit using [REDACTED]"
