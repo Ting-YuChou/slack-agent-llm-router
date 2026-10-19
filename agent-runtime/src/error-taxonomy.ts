@@ -11,6 +11,10 @@ export type CauseCode =
   | "grader_did_not_submit"
   | "grader_invalid_submission"
   | "grader_execution_failed"
+  | "investigation_timeout"
+  | "investigation_missing_structured_result"
+  | "investigation_invalid_submission"
+  | "investigation_execution_failed"
   | "insufficient_evidence";
 
 /** A failure whose cause the harness knows; the gate reports it instead of a bare message. */
