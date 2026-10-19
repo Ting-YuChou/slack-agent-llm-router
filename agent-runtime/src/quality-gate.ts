@@ -42,7 +42,7 @@ export function publicVerification(verification: VerificationResult): Verificati
 }
 export function validateGrade(value: unknown, hash: string, rubric: string[]): Grade {
   const g = value as Grade;
-  if (!g || !["passed", "needs_changes", "unknown"].includes(g.status) || g.candidate_hash !== hash || !Array.isArray(g.criteria) || !Array.isArray(g.findings) || g.findings.length > 50 || g.criteria.length !== rubric.length) throw new Error("Invalid grader result");
+  if (!g || !["passed", "needs_changes", "unknown"].includes(g.status) || g.candidate_hash !== hash || !Array.isArray(g.criteria) || g.criteria.some(c => !c || typeof c !== "object") || !Array.isArray(g.findings) || g.findings.length > 50 || g.criteria.length !== rubric.length) throw new Error("Invalid grader result");
   if (new Set(g.criteria.map(c => c.id)).size !== rubric.length || !rubric.every(id => g.criteria.some(c => c.id === id && typeof c.passed === "boolean"))) throw new Error("Missing grader criteria");
   if (g.findings.some(f => !f || typeof f.path !== "string" || f.path.startsWith("/") || f.path.split(/[\\/]/).includes("..") || !Number.isInteger(f.line) || f.line < 1 || !["error", "warning"].includes(f.severity) || typeof f.reason !== "string" || f.reason.length > 4000)) throw new Error("Invalid grader finding");
   if (g.criteria.some(c => c.evidence !== undefined && (typeof c.evidence !== "string" || c.evidence.length > 4000))) throw new Error("Invalid grader evidence");
