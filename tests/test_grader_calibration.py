@@ -499,3 +499,14 @@ def test_live_run_boots_the_topology_and_scores_the_cli_output(tmp_path, monkeyp
     # No baseline yet: the live run still fails closed.
     assert code == 1
     assert all("missing from baseline" in failure for failure in report["failures"])
+
+
+def test_live_profile_repository_matches_the_fixture_remote():
+    # The runtime refuses to boot when the trusted profile's repository is not
+    # the checkout's origin, so the two must name the same repository.
+    case = calibration.load_case(next(calibration.CASES_DIR.iterdir()))
+    profile = calibration._live_profile(case, "sha256:" + "0" * 64)
+
+    remote = calibration.FIXTURE_REMOTE
+    assert remote.startswith("https://github.com/") and remote.endswith(".git")
+    assert profile["repository"] == remote[len("https://github.com/") : -len(".git")]

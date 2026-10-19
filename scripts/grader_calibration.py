@@ -38,6 +38,10 @@ except ImportError:  # executed as ``python scripts/grader_calibration.py``
 
 PROJECT = pathlib.Path(__file__).resolve().parents[1]
 CASES_DIR = PROJECT / "eval/grader-calibration"
+# The runtime only boots when the trusted profile's repository is the checkout's
+# origin, so the fixture repo's remote and _live_profile's repository must agree.
+FIXTURE_REPOSITORY = "fixture/grader-calibration"
+FIXTURE_REMOTE = f"https://github.com/{FIXTURE_REPOSITORY}.git"
 BASELINE = PROJECT / "eval/grader-baseline.json"
 RESULTS = PROJECT / "eval/results/grader-calibration.jsonl"
 CLI = PROJECT / "agent-runtime/dist/src/grader-calibration-cli.js"
@@ -396,7 +400,7 @@ def cli_command(
 def _live_profile(case, image):
     return {
         "id": "grader-calibration",
-        "repository": "fixture/grader-calibration",
+        "repository": FIXTURE_REPOSITORY,
         "image": image,
         "rubric": case["rubric"],
         "allowedPaths": case["allowedPaths"],
@@ -420,7 +424,7 @@ def run_live(args, cases):
     # The runtime needs a repository and profile to boot; the grader never sees them.
     repo = root / "repo"
     shutil.copytree(cases[0]["base"], repo)
-    topology.init_fixture_repo(repo, remote="https://github.com/fixture/grader.git")
+    topology.init_fixture_repo(repo, remote=FIXTURE_REMOTE)
     profile = root / "profile.json"
     profile.write_text(json.dumps(_live_profile(cases[0], image)))
     args.out.parent.mkdir(parents=True, exist_ok=True)
