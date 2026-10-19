@@ -283,3 +283,30 @@ test("S22 a fixer formats the candidate before verification, so the first attemp
   assert.match(String(delivery.excerpt), /\+export const a = 2;/, "the card shows the fixed diff the owner approves");
   assert.doesNotMatch(String(delivery.excerpt), /a=2/);
 });
+
+/** The host answers budget_status synchronously, so these scripts never pause on awaitUi. */
+test("S23 the writer's budget_status dialog gets the run's dollar budget, once per turn", async () => {
+  const budgetAsk = (id: string) => ({ type: "extension_ui_request", id, method: "input", title: "pi-agent/budget_status", placeholder: "" });
+  const usage = (cost: number) => ({ type: "message_end", message: { role: "assistant", content: [], stopReason: "toolUse", usage: { cost: { total: cost } } } });
+  const { run, responses } = await runScenario({ name: "S23 budget_status", profile,
+    quality: { maxCostUsd: 4 },
+    attempts: [{ files: fix, records: [
+      { type: "turn_start" }, usage(3), budgetAsk("ui-b1"), budgetAsk("ui-b2"),
+      ...piTurn("stop", "Fixed"), settledRecord,
+    ] }],
+    expect: { status: "completed", committed: true } });
+  assert.equal(run.status, "completed", JSON.stringify(run.error));
+  assert.deepEqual(responses.map(item => item.id), ["ui-b1"], "a second request in the same turn never reaches the host");
+  assert.deepEqual(JSON.parse((responses[0].response as { value: string }).value), { used_usd: 3, limit_usd: 4 });
+});
+
+test("S23 a run without a workflow budget answers budget_status as unavailable", async () => {
+  const { responses } = await runScenario({ name: "S23 budget_status unavailable",
+    attempts: [{ files: fix, records: [
+      { type: "turn_start" }, { type: "extension_ui_request", id: "ui-b1", method: "input", title: "pi-agent/budget_status", placeholder: "" },
+      ...piTurn("stop", "Fixed"), settledRecord,
+    ] }],
+    expect: { status: "completed", committed: false } });
+  assert.deepEqual(responses.map(item => item.id), ["ui-b1"]);
+  assert.deepEqual(JSON.parse((responses[0].response as { value: string }).value), { unavailable: true });
+});

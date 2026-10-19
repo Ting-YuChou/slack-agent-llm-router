@@ -288,3 +288,63 @@ test("each bash and write decision is appended as a policy entry without the com
   ]);
   assert.doesNotMatch(JSON.stringify(policy.entries), /sk-1|Authorization|example\.com/);
 }));
+
+/** A ctx whose host answers pi-agent/budget_status with the next reply; `asks` counts the dialogs. */
+function budgetCtx(cwd: string, replies: Array<string | undefined>) {
+  const asks: Array<[string, string | undefined]> = [];
+  let next = 0;
+  const ctx = { cwd, abort: () => undefined, ui: {
+    confirm: async () => true,
+    input: async (title: string, placeholder?: string) => { asks.push([title, placeholder]); return replies[Math.min(next++, replies.length - 1)]; },
+  } };
+  return { ctx, asks };
+}
+
+const usd = (used: number, limit = 10) => JSON.stringify({ used_usd: used, limit_usd: limit });
+// Every loadPolicy import counts as its own file in the coverage totals, so these tests share one
+// instance and start each scenario with an input, which resets the notices.
+let dollarPolicy: ReturnType<typeof loadPolicy> | undefined;
+const sharedPolicy = () => dollarPolicy ??= loadPolicy({ PI_AGENT_MAX_TOOL_CALLS: "1000", PI_AGENT_MAX_TURNS: "100" });
+
+test("dollar budget: a notice at 75% and a final warning at 90%, once each", () => withWorkspace(async (cwd) => {
+  const policy = await sharedPolicy();
+  const { ctx, asks } = budgetCtx(cwd, [usd(1), usd(7.5), usd(8), usd(9), usd(9.5), usd(9.9)]);
+  await policy.fire("input", {}, ctx);
+  const notices: Array<[number, string[]]> = [];
+  for (let turn = 1; turn <= 6; turn++) {
+    await policy.fire("turn_start", {}, ctx);
+    for (let call = 0; call < 2; call++) {
+      const text = budgetText(await callTool(policy, ctx));
+      if (text.length) notices.push([turn, text]);
+    }
+  }
+  assert.deepEqual(notices.map(([turn]) => turn), [2, 4]);
+  assert.match(notices[0][1][0], /^\[harness\] Budget notice: \$7\.50\/\$10\.00 of the model budget used/);
+  assert.match(notices[1][1][0], /^\[harness\] Final budget warning: \$9\.00\/\$10\.00 of the model budget used, \$1\.00 left/);
+  assert.equal(asks.length, 4, "one dialog per turn, and none after the final warning");
+  assert.ok(asks.every(([title, placeholder]) => title === "pi-agent/budget_status" && placeholder === ""));
+}));
+
+test("dollar budget: an unavailable, cancelled or malformed reply adds no notice", () => withWorkspace(async (cwd) => {
+  for (const reply of [JSON.stringify({ unavailable: true }), undefined, "not json", JSON.stringify({ used_usd: 9, limit_usd: 0 }), JSON.stringify({ used_usd: "9", limit_usd: 10 })]) {
+    const policy = await sharedPolicy();
+    const { ctx, asks } = budgetCtx(cwd, [reply]);
+    await policy.fire("input", {}, ctx);
+    await policy.fire("turn_start", {}, ctx);
+    assert.deepEqual(budgetText(await callTool(policy, ctx)), [], String(reply));
+    assert.equal(asks.length, 1);
+  }
+}));
+
+test("dollar budget: a new input resets the dollar notices", () => withWorkspace(async (cwd) => {
+  const policy = await sharedPolicy();
+  const { ctx } = budgetCtx(cwd, [usd(8)]);
+  const run = async () => {
+    await policy.fire("input", {}, ctx);
+    const texts: string[] = [];
+    for (let turn = 1; turn <= 3; turn++) { await policy.fire("turn_start", {}, ctx); texts.push(...budgetText(await callTool(policy, ctx))); }
+    return texts.length;
+  };
+  assert.equal(await run(), 1);
+  assert.equal(await run(), 1);
+}));

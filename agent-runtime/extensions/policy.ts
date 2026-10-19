@@ -8,11 +8,13 @@ import type { WriterContext } from "../dist/src/container-runtime.js";
 import { classifyBash, isApprovedSkillRead, isTestConfigPath, parsePorcelainZ, validateWorkspacePath } from "../dist/src/policy.js";
 import { codemodeMcpPrompt, type McpServerId } from "../dist/src/mcp-config.js";
 import { renderPrompt } from "../dist/src/prompts.js";
+import { BUDGET_STATUS_DIALOG, usdBudgetNotice } from "../dist/src/budget-notice.js";
 import { POLICY_ENTRY, policyDecisionEntry, type PolicyVerdict } from "../dist/src/policy-decision.js";
 
 const MAX_TURNS = Number(process.env.PI_AGENT_MAX_TURNS ?? "20");
 const MAX_TOOL_CALLS = Number(process.env.PI_AGENT_MAX_TOOL_CALLS ?? "40");
 const APPROVAL_TIMEOUT_MS = 300_000;
+const BUDGET_STATUS_TIMEOUT_MS = 5_000;
 // Anything but an explicit "none" keeps per-write prompts, so a typo never silently drops approval.
 const WRITE_APPROVAL = process.env.PI_AGENT_WRITE_APPROVAL === "none" ? "none" : "per_prompt";
 
@@ -108,7 +110,9 @@ export default function policyExtension(pi: ExtensionAPI) {
   let toolCalls = 0;
   let writeApproved = false;
   const writtenPaths = new Set<string>();
-  const budgetSent: Record<"turns" | "toolCalls", BudgetStage> = { turns: "none", toolCalls: "none" };
+  const budgetSent: Record<"turns" | "toolCalls" | "usd", BudgetStage> = { turns: "none", toolCalls: "none", usd: "none" };
+  /** The turn whose one budget_status dialog was already asked; the host would cancel a second. */
+  let usdAskedTurn = -1;
   // The host counts these to tune the classifier; commands go out only as a basename and a hash.
   const decide = (tool: string, decision: PolicyVerdict, reason: string, extra: { approved?: boolean; command?: string; startedAt?: number } = {}) =>
     pi.appendEntry(POLICY_ENTRY, policyDecisionEntry({ tool, decision, reason, approved: extra.approved, command: extra.command, latencyMs: extra.startedAt === undefined ? undefined : Date.now() - extra.startedAt }));
@@ -218,11 +222,13 @@ export default function policyExtension(pi: ExtensionAPI) {
   pi.on("input", () => {
     budgetSent.turns = "none";
     budgetSent.toolCalls = "none";
+    budgetSent.usd = "none";
+    usdAskedTurn = -1;
     return undefined;
   });
 
   // Limits abort without warning, so tell the agent while it can still verify and summarize its work.
-  pi.on("tool_result", (event) => {
+  pi.on("tool_result", async (event, ctx) => {
     // Nested results go back to the calling script, not to the model.
     if (event.parentToolCallId) return undefined;
     const notices: string[] = [];
@@ -231,6 +237,14 @@ export default function policyExtension(pi: ExtensionAPI) {
       if (stage === "none" || stage === budgetSent[key] || budgetSent[key] === "final") continue;
       budgetSent[key] = stage;
       notices.push(budgetMessage(stage, used, max, unit));
+    }
+    if (budgetSent.usd !== "final" && usdAskedTurn !== turns && typeof ctx.ui?.input === "function") {
+      usdAskedTurn = turns;
+      const notice = usdBudgetNotice(await ctx.ui.input(BUDGET_STATUS_DIALOG, "", { timeout: BUDGET_STATUS_TIMEOUT_MS }));
+      if (notice && notice.stage !== budgetSent.usd) {
+        budgetSent.usd = notice.stage;
+        notices.push(notice.text);
+      }
     }
     if (!notices.length) return undefined;
     return {

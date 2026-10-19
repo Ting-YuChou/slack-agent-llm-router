@@ -154,3 +154,27 @@ test("real Pi writer completes a run_checks round trip through the dialog channe
     await rm(repo, { recursive: true, force: true }); await rm(worktreeRoot, { recursive: true, force: true }); await rm(sessionStatePath, { recursive: true, force: true });
   }
 });
+
+const budgetAsk = (id: string) => ({ type: "extension_ui_request", id, method: "input", title: "pi-agent/budget_status", placeholder: "" });
+
+test("bridge turns a budget_status dialog into budget_request at most once per turn", () => {
+  const { events, sent, feed, rpc } = bridge();
+  feed({ type: "turn_start" }, budgetAsk("b1"), budgetAsk("b2"));
+  assert.deepEqual(events.filter(event => event.type === "budget_request"), [{ type: "budget_request", request_id: "b1" }]);
+  assert.deepEqual(sent, [{ type: "extension_ui_response", id: "b2", cancelled: true }]);
+  rpc.respondUi("b1", { value: "{\"used_usd\":1,\"limit_usd\":2}" });
+  feed({ type: "turn_start" }, budgetAsk("b3"));
+  assert.deepEqual(events.filter(event => event.type === "budget_request").map(event => (event as { request_id: string }).request_id), ["b1", "b3"]);
+  assert.deepEqual(sent.map(record => record.id), ["b2", "b1"]);
+});
+
+test("bridge still cancels every other dialog once budget_status is allowed", () => {
+  const { events, sent, feed } = bridge();
+  feed({ type: "turn_start" });
+  feed({ type: "extension_ui_request", id: "sel", method: "select", title: "pi-agent/budget_status", options: ["a"] });
+  feed({ type: "extension_ui_request", id: "ed", method: "editor", title: "pi-agent/budget_status" });
+  feed({ type: "extension_ui_request", id: "other", method: "input", title: "pi-agent/other" });
+  assert.deepEqual(events.filter(event => event.type === "budget_request"), []);
+  assert.deepEqual(sent.map(record => record.id), ["sel", "ed", "other"]);
+  assert.ok(sent.every(record => record.type === "extension_ui_response" && record.cancelled === true));
+});

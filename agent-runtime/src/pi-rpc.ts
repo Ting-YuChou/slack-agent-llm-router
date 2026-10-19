@@ -1,6 +1,7 @@
 import { StringDecoder } from "node:string_decoder";
 
 import { parsePolicyDecision, POLICY_ENTRY, type PolicyDecision } from "./policy-decision.js";
+import { BUDGET_STATUS_DIALOG } from "./budget-notice.js";
 import { redact } from "./telemetry.js";
 
 export type PublicRunEvent =
@@ -9,6 +10,7 @@ export type PublicRunEvent =
   | { type: "tool"; phase: "start" | "end"; tool_call_id: string; tool: string; input?: Record<string, unknown>; is_error?: boolean; result_bytes?: number }
   | { type: "approval"; approval_id: string; title: string; detail: string; timeout_ms?: number }
   | { type: "checks_request"; request_id: string; tool_call_id: string; checks?: string[] }
+  | { type: "budget_request"; request_id: string }
   | { type: "answer_delta"; text: string }
   | { type: "answer"; text: string }
   | { type: "settled"; outcome: RunOutcome; limit?: LimitKind; stop_reason?: string; error_message?: string }
@@ -141,6 +143,8 @@ export class PiRpcBridge {
   /** run_checks tool calls currently executing, and those that already asked the host once. */
   private readonly checkCalls = new Set<string>();
   private readonly checkRequests = new Set<string>();
+  /** Whether this turn's one budget_status dialog was already passed to the host. */
+  private budgetAsked = false;
 
   constructor(options: { writeLine: (line: string) => void; onEvent: (event: PublicRunEvent) => void; onRecord?: (record: Record<string, unknown>) => void; onCommand?: (record: Record<string, unknown>) => void; onReady?: () => void }) {
     this.writeLine = options.writeLine;
@@ -193,6 +197,7 @@ export class PiRpcBridge {
           continue;
         }
       }
+      if (record.type === "turn_start") this.budgetAsked = false;
       if (record.type === "tool_execution_start" && record.toolName === RUN_CHECKS_TOOL && typeof record.toolCallId === "string") this.checkCalls.add(record.toolCallId);
       if (record.type === "tool_execution_end" && typeof record.toolCallId === "string") this.checkCalls.delete(record.toolCallId);
       if (record.type === "extension_ui_request" && typeof record.method === "string" && DIALOG_METHODS.has(record.method) && record.method !== "confirm") {
@@ -205,11 +210,17 @@ export class PiRpcBridge {
   }
 
   /**
-   * The only dialog the host answers is run_checks, and only for a run_checks tool call that is
-   * executing and has not asked before; any other dialog is cancelled so Pi never waits on it.
+   * The host answers only run_checks, for a run_checks tool call that is executing and has not asked
+   * before, and budget_status, once per turn; any other dialog is cancelled so Pi never waits on it.
    */
   private dialog(record: Record<string, unknown>): void {
     const id = safeString(record.id);
+    if (id && record.method === "input" && record.title === BUDGET_STATUS_DIALOG) {
+      if (this.budgetAsked) { this.respondUi(id, { cancelled: true }); return; }
+      this.budgetAsked = true;
+      this.onEvent({ type: "budget_request", request_id: id });
+      return;
+    }
     const request = record.method === "input" && record.title === RUN_CHECKS_DIALOG ? parseChecksRequest(record.placeholder) : undefined;
     if (!id || !request || !this.checkCalls.has(request.tool_call_id) || this.checkRequests.has(request.tool_call_id)) {
       if (id) this.respondUi(id, { cancelled: true });
