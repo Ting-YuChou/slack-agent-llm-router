@@ -301,9 +301,13 @@ function budgetCtx(cwd: string, replies: Array<string | undefined>) {
 }
 
 const usd = (used: number, limit = 10) => JSON.stringify({ used_usd: used, limit_usd: limit });
+// Every loadPolicy import counts as its own file in the coverage totals, so these tests share one
+// instance and start each scenario with an input, which resets the notices.
+let dollarPolicy: ReturnType<typeof loadPolicy> | undefined;
+const sharedPolicy = () => dollarPolicy ??= loadPolicy({ PI_AGENT_MAX_TOOL_CALLS: "1000", PI_AGENT_MAX_TURNS: "100" });
 
 test("dollar budget: a notice at 75% and a final warning at 90%, once each", () => withWorkspace(async (cwd) => {
-  const policy = await loadPolicy({ PI_AGENT_MAX_TOOL_CALLS: "1000", PI_AGENT_MAX_TURNS: "100" });
+  const policy = await sharedPolicy();
   const { ctx, asks } = budgetCtx(cwd, [usd(1), usd(7.5), usd(8), usd(9), usd(9.5), usd(9.9)]);
   await policy.fire("input", {}, ctx);
   const notices: Array<[number, string[]]> = [];
@@ -323,7 +327,7 @@ test("dollar budget: a notice at 75% and a final warning at 90%, once each", () 
 
 test("dollar budget: an unavailable, cancelled or malformed reply adds no notice", () => withWorkspace(async (cwd) => {
   for (const reply of [JSON.stringify({ unavailable: true }), undefined, "not json", JSON.stringify({ used_usd: 9, limit_usd: 0 }), JSON.stringify({ used_usd: "9", limit_usd: 10 })]) {
-    const policy = await loadPolicy({ PI_AGENT_MAX_TOOL_CALLS: "1000", PI_AGENT_MAX_TURNS: "100" });
+    const policy = await sharedPolicy();
     const { ctx, asks } = budgetCtx(cwd, [reply]);
     await policy.fire("input", {}, ctx);
     await policy.fire("turn_start", {}, ctx);
@@ -333,7 +337,7 @@ test("dollar budget: an unavailable, cancelled or malformed reply adds no notice
 }));
 
 test("dollar budget: a new input resets the dollar notices", () => withWorkspace(async (cwd) => {
-  const policy = await loadPolicy({ PI_AGENT_MAX_TOOL_CALLS: "1000", PI_AGENT_MAX_TURNS: "100" });
+  const policy = await sharedPolicy();
   const { ctx } = budgetCtx(cwd, [usd(8)]);
   const run = async () => {
     await policy.fire("input", {}, ctx);

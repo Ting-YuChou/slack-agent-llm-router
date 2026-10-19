@@ -8,13 +8,12 @@ import type { WriterContext } from "../dist/src/container-runtime.js";
 import { classifyBash, isApprovedSkillRead, isTestConfigPath, parsePorcelainZ, validateWorkspacePath } from "../dist/src/policy.js";
 import { codemodeMcpPrompt, type McpServerId } from "../dist/src/mcp-config.js";
 import { renderPrompt } from "../dist/src/prompts.js";
+import { BUDGET_STATUS_DIALOG, usdBudgetNotice } from "../dist/src/budget-notice.js";
 import { POLICY_ENTRY, policyDecisionEntry, type PolicyVerdict } from "../dist/src/policy-decision.js";
 
 const MAX_TURNS = Number(process.env.PI_AGENT_MAX_TURNS ?? "20");
 const MAX_TOOL_CALLS = Number(process.env.PI_AGENT_MAX_TOOL_CALLS ?? "40");
 const APPROVAL_TIMEOUT_MS = 300_000;
-/** Must match BUDGET_STATUS_DIALOG in src/pi-rpc.ts; the host answers it at most once per turn. */
-const BUDGET_STATUS_DIALOG = "pi-agent/budget_status";
 const BUDGET_STATUS_TIMEOUT_MS = 5_000;
 // Anything but an explicit "none" keeps per-write prompts, so a typo never silently drops approval.
 const WRITE_APPROVAL = process.env.PI_AGENT_WRITE_APPROVAL === "none" ? "none" : "per_prompt";
@@ -104,31 +103,6 @@ function budgetMessage(stage: BudgetStage, used: number, max: number, unit: stri
   return stage === "final"
     ? renderPrompt("budget-final", { used, max, unit, left: Math.max(0, max - used) })
     : renderPrompt("budget-notice", { used, max, unit });
-}
-
-/** Dollar stage: a notice at 75% of the run's model budget, a final warning at 90%. */
-function usdStage(used: number, limit: number): BudgetStage {
-  if (used >= 0.9 * limit) return "final";
-  return used >= 0.75 * limit ? "notice" : "none";
-}
-
-function usdMessage(stage: BudgetStage, used: number, limit: number): string {
-  const usd = (value: number) => `$${value.toFixed(2)}`;
-  const unit = "of the model budget";
-  return stage === "final"
-    ? renderPrompt("budget-final", { used: usd(used), max: usd(limit), unit, left: usd(Math.max(0, limit - used)) })
-    : renderPrompt("budget-notice", { used: usd(used), max: usd(limit), unit });
-}
-
-/** The host's reply to budget_status; anything but finite dollar figures means unavailable. */
-function parseBudgetStatus(value: string | undefined): { used: number; limit: number } | undefined {
-  if (value === undefined) return undefined;
-  try {
-    const parsed = JSON.parse(value) as { used_usd?: unknown; limit_usd?: unknown };
-    const { used_usd: used, limit_usd: limit } = parsed;
-    if (typeof used !== "number" || typeof limit !== "number" || !Number.isFinite(used) || !Number.isFinite(limit) || used < 0 || limit <= 0) return undefined;
-    return { used, limit };
-  } catch { return undefined; }
 }
 
 export default function policyExtension(pi: ExtensionAPI) {
@@ -266,11 +240,10 @@ export default function policyExtension(pi: ExtensionAPI) {
     }
     if (budgetSent.usd !== "final" && usdAskedTurn !== turns && typeof ctx.ui?.input === "function") {
       usdAskedTurn = turns;
-      const status = parseBudgetStatus(await ctx.ui.input(BUDGET_STATUS_DIALOG, "", { timeout: BUDGET_STATUS_TIMEOUT_MS }));
-      const stage = status ? usdStage(status.used, status.limit) : "none";
-      if (status && stage !== "none" && stage !== budgetSent.usd) {
-        budgetSent.usd = stage;
-        notices.push(usdMessage(stage, status.used, status.limit));
+      const notice = usdBudgetNotice(await ctx.ui.input(BUDGET_STATUS_DIALOG, "", { timeout: BUDGET_STATUS_TIMEOUT_MS }));
+      if (notice && notice.stage !== budgetSent.usd) {
+        budgetSent.usd = notice.stage;
+        notices.push(notice.text);
       }
     }
     if (!notices.length) return undefined;

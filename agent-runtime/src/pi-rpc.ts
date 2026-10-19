@@ -1,6 +1,7 @@
 import { StringDecoder } from "node:string_decoder";
 
 import { parsePolicyDecision, POLICY_ENTRY, type PolicyDecision } from "./policy-decision.js";
+import { BUDGET_STATUS_DIALOG } from "./budget-notice.js";
 import { redact } from "./telemetry.js";
 
 export type PublicRunEvent =
@@ -25,8 +26,6 @@ export class RpcProtocolError extends Error {}
 /** The writer's run_checks tool and the extension UI dialog it asks the host through. */
 export const RUN_CHECKS_TOOL = "run_checks";
 export const RUN_CHECKS_DIALOG = "pi-agent/run_checks";
-/** The policy extension's dollar budget query; the host answers it at most once per turn. */
-export const BUDGET_STATUS_DIALOG = "pi-agent/budget_status";
 const DIALOG_METHODS = new Set(["select", "confirm", "input", "editor"]);
 export type UiResponse = { value: string } | { cancelled: true };
 
