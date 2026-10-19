@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import type { PublicRunEvent } from "../src/pi-rpc.js";
 import { CodingAgentOrchestrator, RuntimeConflictError, RuntimeForbiddenError } from "../src/orchestrator.js";
+import { HarnessError } from "../src/error-taxonomy.js";
 import { DiffLimitError, ProtectedFileError } from "../src/worktree-manager.js";
 
 const SETTLED = { type: "settled", outcome: "completed" } as const;
@@ -891,6 +892,14 @@ test("other gate failures stay quality_gate_unavailable but keep a bounded cause
   const run = await settleWorkflow(f, "gate-cause");
   assert.equal(run.error?.code, "quality_gate_unavailable");
   assert.match(run.error?.message ?? "", /docker daemon unreachable/);
+});
+
+test("gate failures with a known cause record cause_code on the run", async () => {
+  const f = gatedFixture(async () => { throw new HarnessError("docker_unavailable", "Cannot connect to the Docker daemon"); });
+  const run = await settleWorkflow(f, "gate-cause-code");
+  assert.equal(run.error?.code, "quality_gate_unavailable");
+  assert.equal(run.error?.cause_code, "docker_unavailable");
+  assert.equal(f.calls.commits, 0);
 });
 
 test("a no-profile diff over the limits fails as diff_limit_exceeded and rolls back", async () => {
