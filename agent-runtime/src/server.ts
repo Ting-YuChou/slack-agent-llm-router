@@ -348,6 +348,7 @@ export async function createProductionServer() {
   if (trustedProfile) {
     if (await inspectImageDigest(trustedProfile.profile.image) === "missing") throw new Error("Pinned verification image is missing; build Dockerfile.verification and configure its digest");
     if (!await readImageFile(trustedProfile.profile.image, "/opt/pi/dist/src/verification-entry.js")) throw new Error("Verification image is missing the trusted runner");
+    if (trustedProfile.profile.isolation !== "per_check" && !await readImageFile(trustedProfile.profile.image, "/opt/pi/dist/src/verification-runner.js")) throw new Error("Verification image must be rebuilt with the per-mode runner (or set isolation: per_check)");
     if (trustedProfile.profile.structuredWorkflow?.enabled && !await readImageFile(image, "/opt/pi/extensions/workflow-agent.ts")) throw new Error("Agent image must be rebuilt with workflow-agent extension");
     if (!await readImageFile(image, "/opt/pi/extensions/grader.ts")) throw new Error("Agent image must be rebuilt with the isolated grader extension");
     if (!await readImageFile(image, "/opt/pi/extensions/checks.ts")) throw new Error("Agent image must be rebuilt with the run_checks extension");
