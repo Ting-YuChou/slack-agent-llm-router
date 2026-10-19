@@ -50,9 +50,14 @@ export interface AgentContainerOptions {
   writerContext?: WriterContext;
   /** The writer's run_checks tool (extensions/checks.ts): available checks and its call limit. */
   checksContext?: ChecksContext;
+  /** `none` lets the writer edit its worktree without prompts; delivery approval must then gate the commit. */
+  writeApproval?: WriteApprovalMode;
 }
 
 export interface ChecksContext { checks: string[]; defaultChecks: string[]; maxCalls: number }
+
+export type WriteApprovalMode = "none" | "per_prompt";
+
 export interface WriterContext { allowedPaths: string[]; checks: string[]; rubric: string[]; diffLimits: { maxFiles: number; maxBytes: number; maxSingleFileBytes: number } }
 
 const exec = promisify(execFile);
@@ -135,6 +140,7 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
   if (options.workflowContext) args.splice(args.indexOf("--mount"), 0, "--env", `PI_AGENT_WORKFLOW_JSON=${JSON.stringify(options.workflowContext)}`);
   if (options.writerContext) args.splice(args.indexOf("--mount"), 0, "--env", `PI_AGENT_WRITER_JSON=${JSON.stringify(options.writerContext)}`);
   if (options.checksContext) args.splice(args.indexOf("--mount"), 0, "--env", `PI_AGENT_CHECKS_JSON=${JSON.stringify(options.checksContext)}`);
+  if (options.writeApproval) args.splice(args.indexOf("--mount"), 0, "--env", `PI_AGENT_WRITE_APPROVAL=${options.writeApproval}`);
   if (options.classifierGatewayToken) {
     args.splice(args.indexOf("--mount"), 0,
       "--env", "OPENROUTER_API_KEY",

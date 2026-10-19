@@ -8,6 +8,7 @@ import { validateWorkspacePath } from "./policy.js";
 import { redact } from "./telemetry.js";
 import { parseRunnerRecords, MAX_LOG_BYTES, type RunnerSpec } from "./verification-runner.js";
 import { excerpt, MAX_REPORT_BYTES, parseDiagnostics, parseJUnit, type CheckFailure } from "./check-report.js";
+import { dockerUnavailable, HarnessError } from "./error-taxonomy.js";
 import type { Candidate, CheckStatus, VerificationCheck, VerificationResult } from "./quality-gate.js";
 const exec = promisify(execFile);
 /** One trusted check. `{report}` in argv becomes the check's report path under /out. */
@@ -85,7 +86,7 @@ export class CandidateStore {
       if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Candidate contains an unsupported file");
       const checked = await validateWorkspacePath(worktree, file, "read");
       if (!checked.allowed) continue;
-      bytes += stat.size; if (bytes > 64 * 1024 * 1024 || stat.size > 2 * 1024 * 1024) throw new Error("Candidate snapshot too large");
+      bytes += stat.size; if (bytes > 64 * 1024 * 1024 || stat.size > 2 * 1024 * 1024) throw new HarnessError("snapshot_too_large", "Candidate snapshot too large");
       const content = await readFile(path.join(worktree, file));
       hash.update(file).update("\0").update(String(stat.mode & 0o111)).update("\0").update(content);
       const target = path.join(snapshot, file); await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
@@ -107,7 +108,7 @@ export class CandidateStore {
   }
   async assertUnchanged(candidate: Candidate, worktree: string, baseline: string, runId: string) {
     const actual = await this.create(worktree, baseline, runId);
-    if (candidate.hash !== actual.hash) throw new Error("candidate_changed_after_verification");
+    if (candidate.hash !== actual.hash) throw new HarnessError("candidate_changed", "candidate_changed_after_verification");
   }
 }
 /** What one verifier container produced. `exit` is null when the runner itself failed or was killed. */
@@ -121,6 +122,7 @@ export const runDockerContainer: RunContainer = async ({ name, args, timeoutMs, 
     const result = await exec("docker", args, { timeout: timeoutMs, signal, maxBuffer: 4 * 1024 * 1024, env: { PATH: process.env.PATH } });
     return { output: result.stdout + result.stderr, stdout: result.stdout, exit: 0, timedOut: false };
   } catch (error: any) {
+    if (dockerUnavailable(error)) throw new HarnessError("docker_unavailable", "Docker is unavailable for verification");
     const output = String(error.stdout ?? "") + String(error.stderr ?? "");
     return { output, stdout: String(error.stdout ?? ""), exit: typeof error.code === "number" && ![125, 126, 127].includes(error.code) && !error.killed ? error.code : null, timedOut: error.killed === true && !signal.aborted };
   } finally { signal.removeEventListener("abort", stop); }
@@ -128,7 +130,7 @@ export const runDockerContainer: RunContainer = async ({ name, args, timeoutMs, 
 
 async function removeDockerContainer(id: string): Promise<void> {
   try { await exec("docker", ["rm", "-f", id], { timeout: 5000 }); }
-  catch (error: any) { if (!/No such (?:container|object)/i.test(String(error.stderr))) throw new Error("verification_stop_unconfirmed"); }
+  catch (error: any) { if (!/No such (?:container|object)/i.test(String(error.stderr))) throw new HarnessError("verification_stop_unconfirmed", "verification_stop_unconfirmed"); }
 }
 
 /** Host-wide limit on concurrently running verifier containers. */
@@ -211,7 +213,12 @@ export class DockerVerifier {
     this.active.add(container);
     let result: ContainerResult;
     try { result = await this.runContainer({ name: container, args, timeoutMs, signal }); }
-    finally { await this.remove(container); }
+    catch (error) {
+      // No container can exist without a reachable Docker, so there is nothing left to stop.
+      if (error instanceof HarnessError && error.causeCode === "docker_unavailable") this.active.delete(container);
+      throw error;
+    }
+    finally { if (this.active.has(container)) await this.remove(container); }
     signal.throwIfAborted();
     const { records, violation } = parseRunnerRecords(result.stdout ?? "", checks.map(check => check.name));
     const results: VerificationCheck[] = [];
@@ -238,7 +245,12 @@ export class DockerVerifier {
     this.active.add(container);
     let result: ContainerResult;
     try { result = await this.runContainer({ name: container, args, timeoutMs: check.timeoutMs, signal }); }
-    finally { await this.remove(container); }
+    catch (error) {
+      // No container can exist without a reachable Docker, so there is nothing left to stop.
+      if (error instanceof HarnessError && error.causeCode === "docker_unavailable") this.active.delete(container);
+      throw error;
+    }
+    finally { if (this.active.has(container)) await this.remove(container); }
     signal.throwIfAborted();
     const { output, exit, timedOut } = result;
     const artifact = path.join(path.dirname(candidate.path), `${mode}-${checkFileName(check.name)}.log`);

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -87,6 +88,95 @@ test("without a writer context, writes are not path-scoped beyond workspace poli
   const ctx = { cwd, abort: () => undefined, ui: { confirm: async () => true } };
   await policy.fire("input", {}, ctx);
   assert.equal(await policy.fire("tool_call", { toolName: "write", input: { path: "docs/notes.md", content: "x" } }, ctx), undefined);
+}));
+
+/** The safe-command list is read per call, so it must stay in the environment while the test runs. */
+async function withSafeCommands(commands: string[], run: () => Promise<void>) {
+  const previous = process.env.PI_AGENT_SAFE_COMMANDS_JSON;
+  process.env.PI_AGENT_SAFE_COMMANDS_JSON = JSON.stringify(commands);
+  try { await run(); } finally {
+    if (previous === undefined) delete process.env.PI_AGENT_SAFE_COMMANDS_JSON; else process.env.PI_AGENT_SAFE_COMMANDS_JSON = previous;
+  }
+}
+
+async function withRepo(run: (cwd: string) => Promise<void>) {
+  await withWorkspace(async (cwd) => {
+    execFileSync("git", ["init", "-q"], { cwd });
+    await writeFile(path.join(cwd, "README.md"), "x");
+    execFileSync("git", ["add", "."], { cwd });
+    execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "init"], { cwd });
+    await run(cwd);
+  });
+}
+
+function confirmingCtx(cwd: string) {
+  const prompts: string[] = [];
+  return { prompts, ctx: { cwd, abort: () => undefined, ui: { confirm: async (_title: string, body: string) => { prompts.push(body); return true; } } } };
+}
+
+test("configured commands run without a prompt only while no test configuration has changed", () => withRepo((cwd) => withSafeCommands(["pytest"], async () => {
+  const policy = await loadPolicy({});
+  const { prompts, ctx } = confirmingCtx(cwd);
+  await policy.fire("input", {}, ctx);
+  assert.equal(await policy.fire("tool_call", { toolName: "write", input: { path: "src/a.py", content: "x" } }, ctx), undefined);
+  assert.equal(prompts.length, 1);
+  assert.equal(await policy.fire("tool_call", { toolName: "bash", input: { command: "pytest -q" } }, ctx), undefined);
+  assert.equal(prompts.length, 1);
+
+  await writeFile(path.join(cwd, "conftest.py"), "import os");
+  assert.equal(await policy.fire("tool_call", { toolName: "bash", input: { command: "pytest -q" } }, ctx), undefined);
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1]!, /test configuration changed: conftest\.py/);
+})));
+
+test("a test configuration write in this session taints configured commands", () => withRepo((cwd) => withSafeCommands(["pytest"], async () => {
+  const policy = await loadPolicy({});
+  const { prompts, ctx } = confirmingCtx(cwd);
+  await policy.fire("input", {}, ctx);
+  await policy.fire("tool_call", { toolName: "write", input: { path: "pyproject.toml", content: "x" } }, ctx);
+  await policy.fire("tool_call", { toolName: "bash", input: { command: "pytest" } }, ctx);
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1]!, /pyproject\.toml/);
+})));
+
+test("configured commands need approval when git cannot list changed files", () => withWorkspace((cwd) => withSafeCommands(["pytest"], async () => {
+  const policy = await loadPolicy({});
+  const { prompts, ctx } = confirmingCtx(cwd);
+  await policy.fire("input", {}, ctx);
+  await policy.fire("tool_call", { toolName: "write", input: { path: "src/a.py", content: "x" } }, ctx);
+  await policy.fire("tool_call", { toolName: "bash", input: { command: "pytest" } }, ctx);
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1]!, /could not list changed files/);
+})));
+
+test("write approval mode none skips write prompts but keeps scope, protection and size limits", () => withRepo((cwd) => withSafeCommands(["pytest"], async () => {
+  const policy = await loadPolicy({ PI_AGENT_WRITE_APPROVAL: "none", PI_AGENT_WRITER_JSON: JSON.stringify(writerContext) });
+  const { prompts, ctx } = confirmingCtx(cwd);
+  await policy.fire("input", {}, ctx);
+  assert.equal(await policy.fire("tool_call", { toolName: "write", input: { path: "src/a.py", content: "x" } }, ctx), undefined);
+  assert.equal(await policy.fire("tool_call", { toolName: "edit", input: { path: "src/a.py", edits: [] } }, ctx), undefined);
+  assert.equal(await policy.fire("tool_call", { toolName: "bash", input: { command: "pytest -q" } }, ctx), undefined);
+  assert.deepEqual(prompts, []);
+  for (const input of [
+    { path: "docs/a.md", content: "x" },
+    { path: "src/.env", content: "x" },
+    { path: "src/big.txt", content: "x".repeat(256 * 1024 + 1) },
+  ]) {
+    const blocked = await policy.fire("tool_call", { toolName: "write", input }, ctx) as { block?: boolean } | undefined;
+    assert.equal(blocked?.block, true, input.path);
+  }
+  assert.equal(await policy.fire("tool_call", { toolName: "bash", input: { command: "python script.py" } }, ctx), undefined);
+  assert.equal(prompts.length, 1, "unlisted shell commands still prompt");
+})));
+
+test("an unset or unknown write approval mode keeps per-write prompts", () => withWorkspace(async (cwd) => {
+  for (const env of [{}, { PI_AGENT_WRITE_APPROVAL: "nope" }] as Array<Record<string, string>>) {
+    const policy = await loadPolicy(env);
+    const { prompts, ctx } = confirmingCtx(cwd);
+    await policy.fire("input", {}, ctx);
+    await policy.fire("tool_call", { toolName: "write", input: { path: "a.txt", content: "x" } }, ctx);
+    assert.equal(prompts.length, 1, JSON.stringify(env));
+  }
 }));
 
 type Block = { type: string; text?: string };

@@ -28,8 +28,8 @@ export interface Scenario {
   /** Omit for the no-profile path. */
   profile?: { allowedPaths: string[]; maxRepairs: number };
   attempts: ScriptedAttempt[];
-  /** Per attempt: a status for a single scripted check, or the full verification result. */
-  verify?: Array<CheckStatus | VerificationResult>;
+  /** Per attempt: a status for a single scripted check, the full verification result, or an error the verifier throws. */
+  verify?: Array<CheckStatus | VerificationResult | Error>;
   /** Per grader call, not per attempt, so retries consume their own entries. */
   grade?: ScriptedGrade[];
   /** Overrides merged over the scenario's quality services. */
@@ -39,6 +39,7 @@ export interface Scenario {
   expect: {
     status: RunRecord["status"];
     errorCode?: string;
+    causeCode?: string;
     committed: boolean;
     verificationStatus?: string;
     repairPromptIncludes?: string[];
@@ -103,7 +104,8 @@ async function changedFiles(worktree: string, baseline: string): Promise<string[
   return [...tracked, ...untracked];
 }
 
-function scriptedVerification(step: CheckStatus | VerificationResult | undefined): VerificationResult {
+function scriptedVerification(step: CheckStatus | VerificationResult | Error | undefined): VerificationResult {
+  if (step instanceof Error) throw step;
   if (step && typeof step === "object") return step;
   const status = step ?? "passed";
   return { status, checks: [{ name: "scripted", status, exit_code: status === "passed" ? 0 : 1 }] };

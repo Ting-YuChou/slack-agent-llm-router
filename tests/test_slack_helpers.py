@@ -18,6 +18,7 @@ def test_slack_socket_mode_uses_supported_aiohttp_client_import():
 from src.memory import HashEmbeddingProvider, InMemoryMemoryStore, MemoryManager
 from slack.agent_bootstrap import AgentBootstrapContext
 from slack.bot_real import (
+    AGENT_ERROR_HINTS,
     ConversationContext,
     ConversationManager,
     FileSlackStateStore,
@@ -26,6 +27,7 @@ from slack.bot_real import (
     SlackMessageHandler,
     SlackWorkItem,
     UserManager,
+    _format_agent_status_line,
 )
 from src.utils.schema import (
     Attachment,
@@ -2589,3 +2591,179 @@ def test_agent_response_is_never_empty_and_tolerates_partial_findings():
     )
     assert "• `src/a.py` missing test" in response
     assert "• `unknown:3`" in response
+
+
+def _delivery_approval(files=3, excerpt="+print('hi')\n", stat=" src/a.py | 2 +-"):
+    return {
+        "type": "approval",
+        "kind": "delivery",
+        "approval_id": "a",
+        "title": "Deliver changes",
+        "expires_at": "2026-10-18T12:30:00.000Z",
+        "delivery": {
+            "files": [f"src/file_{index}.py" for index in range(files)],
+            "stat": stat,
+            "verification_status": "passed",
+            "grader_status": "approved",
+            "excerpt": excerpt,
+            "delivery_digest": "sha256:abc",
+        },
+    }
+
+
+def _block_texts(blocks):
+    texts = _section_texts(blocks)
+    for block in blocks:
+        if block["type"] == "context":
+            texts.extend(element["text"] for element in block["elements"])
+    return texts
+
+
+def test_delivery_card_lists_files_stat_and_check_results():
+    blocks = SlackBot._agent_delivery_blocks(_delivery_approval())
+    text = "\n".join(_block_texts(blocks))
+    assert "*Deliver 3 changed files?*" in text
+    for index in range(3):
+        assert f"`src/file_{index}.py`" in text
+    assert "src/a.py | 2 +-" in text
+    assert "print('hi')" in text
+    assert "Verification: *passed*" in text
+    assert "Grader: *approved*" in text
+    assert "<!date^" in text
+
+
+@pytest.mark.parametrize(
+    "files,excerpt_length", [(1, 0), (40, 0), (5, 5_000), (60, 9_000)]
+)
+def test_delivery_card_text_stays_within_3000_chars(files, excerpt_length):
+    approval = _delivery_approval(
+        files=files, excerpt="```" + "x" * excerpt_length, stat="s" * 2_000
+    )
+    texts = _block_texts(SlackBot._agent_delivery_blocks(approval))
+    assert sum(len(text) for text in texts) <= 3000
+    assert all(text.count("```") % 2 == 0 for text in texts)
+    if files > 15:
+        assert f"…and {files - 15} more." in "\n".join(texts)
+
+
+@pytest.mark.asyncio
+async def test_monitor_posts_delivery_card_with_deliver_and_discard_buttons():
+    runtime = SimpleNamespace(
+        wait_for_update=AsyncMock(
+            side_effect=[
+                {
+                    "run_id": "r",
+                    "session_id": "s",
+                    "status": "awaiting_approval",
+                    "phase": "awaiting_delivery",
+                    "events": [_delivery_approval()],
+                },
+                {"run_id": "r", "session_id": "s", "status": "completed"},
+            ]
+        )
+    )
+    bot = SlackBot(
+        {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+    )
+    bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+    bot.agent_monitor_poll_seconds = 0
+
+    await bot._monitor_agent_run({"run_id": "r", "channel_id": "c", "thread_ts": "t"})
+
+    kwargs = bot.web_client.chat_postMessage.await_args_list[0].kwargs
+    actions = kwargs["blocks"][-1]
+    assert actions["type"] == "actions"
+    assert [element["text"]["text"] for element in actions["elements"]] == [
+        "Deliver",
+        "Discard",
+    ]
+    assert [element["action_id"] for element in actions["elements"]] == [
+        "pi_agent_approve",
+        "pi_agent_reject",
+    ]
+    assert "*Deliver 3 changed files?*" in _section_texts(kwargs["blocks"])[0]
+
+
+def test_delivery_expired_status_line_suggests_the_next_step():
+    response = SlackMessageHandler._format_agent_response(
+        {
+            "run_id": "r1",
+            "status": "failed",
+            "error": {
+                "code": "delivery_expired",
+                "message": "Delivery approval expired",
+            },
+            "answer": "",
+        },
+        max_length=2000,
+    )
+    lines = response.splitlines()
+    assert "*failed* — delivery_expired" in lines[0]
+    assert lines[1].startswith("Next step: ")
+    assert "approve it in time" in lines[1]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"code": "scope_violation"},
+        {"code": "diff_limit_exceeded"},
+        {"code": "agent_tool_limit"},
+        {"code": "agent_turn_limit"},
+        {"code": "verification_failed", "cause_code": "grader_timeout"},
+        {"code": "verification_failed", "cause_code": "insufficient_evidence"},
+        {"code": "quality_gate_unavailable", "cause_code": "docker_unavailable"},
+        {"code": "delivery_expired"},
+        {"code": "delivery_rejected"},
+        {"code": "archive_failed"},
+    ],
+)
+def test_agent_status_line_appends_next_step_for_known_codes(error):
+    key = error.get("cause_code") or error["code"]
+    line = _format_agent_status_line(
+        {"run_id": "r1", "status": "failed", "error": {**error, "message": "m"}}
+    )
+    assert line.startswith(f"⚠️ Agent run `r1` *failed* — {error['code']}: m")
+    assert line.endswith(f"\nNext step: {AGENT_ERROR_HINTS[key]}")
+
+
+def test_agent_status_line_prefers_cause_code_hint_over_code_hint():
+    line = _format_agent_status_line(
+        {
+            "status": "failed",
+            "error": {"code": "agent_tool_limit", "cause_code": "docker_unavailable"},
+        }
+    )
+    assert AGENT_ERROR_HINTS["docker_unavailable"] in line
+    assert AGENT_ERROR_HINTS["agent_tool_limit"] not in line
+
+
+def test_agent_status_line_keeps_generic_text_for_unknown_codes():
+    line = _format_agent_status_line(
+        {
+            "run_id": "r1",
+            "status": "failed",
+            "error": {
+                "code": "something_new",
+                "cause_code": "also_new",
+                "message": "x",
+            },
+        }
+    )
+    assert line == "⚠️ Agent run `r1` *failed* — something_new: x"
+    assert (
+        _format_agent_status_line({"status": "cancelled"})
+        == "⚠️ Agent run *cancelled* — the run was cancelled"
+    )
+
+
+def test_agent_status_line_mentions_a_retained_patch_without_a_path():
+    line = _format_agent_status_line(
+        {
+            "status": "failed",
+            "error": {"code": "agent_aborted"},
+            "patch_retained": True,
+        }
+    )
+    assert line.endswith("\nThe undelivered patch was kept on the runtime host.")
+    assert "/" not in line.split("\n", 1)[1]

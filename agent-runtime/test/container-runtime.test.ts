@@ -218,3 +218,14 @@ test("credentials travel in the docker client's environment, never on its argv",
   const discuss = buildAgentSpawnEnv({ ...options, taskMode: "discuss" }, { PATH: "/usr/bin" });
   assert.deepEqual(Object.keys(discuss).sort(), ["OPENAI_API_KEY", "PATH"]);
 });
+
+test("the write-approval mode reaches the writer only when the host sets it", () => {
+  const base = {
+    name: "pi-session-1", image: "pi-agent@sha256:abc", network: "pi-model-only", worktreePath: "/w", gitMetadataPath: "/repo/.git",
+    sessionStatePath: "/s", gatewayUrl: "http://model-gateway:8080/v1", gatewayToken: "t", modelRef: "openai/gpt-5.6-luna",
+    extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
+  };
+  assert.ok(buildAgentDockerArgs({ ...base, writeApproval: "none" }).includes("PI_AGENT_WRITE_APPROVAL=none"));
+  assert.ok(buildAgentDockerArgs({ ...base, writeApproval: "per_prompt" }).includes("PI_AGENT_WRITE_APPROVAL=per_prompt"));
+  assert.doesNotMatch(buildAgentDockerArgs(base).join(" "), /PI_AGENT_WRITE_APPROVAL/);
+});

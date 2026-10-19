@@ -8,6 +8,8 @@ import {
   ApprovalStore,
   classifyBash,
   isApprovedSkillRead,
+  isTestConfigPath,
+  parsePorcelainZ,
   validateWorkspacePath,
 } from "../src/policy.js";
 
@@ -146,4 +148,87 @@ test("commands that dump the environment or credential variables are blocked", a
   for (const command of ["pytest tests/test_env.py", "ls tests/env", "python -m pytest -k env"]) {
     assert.notEqual(classifyBash(command, ["pytest", "python -m pytest"]).reason, "secret_env_read", command);
   }
+});
+
+test("shell commands are classified segment by segment and the strictest segment wins", () => {
+  const safe = ["pytest", "npm test", "python -m pytest"];
+  const table: Array<[string, string[]]> = [
+    ["allow", [
+      "grep -rn docker src",
+      "rg mount src",
+      "grep -rn curl src/",
+      "cat .env.example",
+      "cat config/.env.sample",
+      "head .env.template",
+      "sed -n 1,40p f",
+      "ls | head",
+      "find src -name '*.ts' | wc -l",
+      "git status --short && git diff",
+    ]],
+    ["allow_after_write_approval", [
+      "pytest -x 2>&1 | tail -50",
+      "timeout 600 npm test",
+    ]],
+    ["approval", [
+      "python -c \"print(1)\"",
+      "echo hi > f",
+      "sed -i s/a/b/ f",
+      "find . -delete",
+      "find . -name x -exec rm {} \;",
+      "bash -c ls",
+      "cat $(ls)",
+      "ls *.ts",
+      "find src | xargs grep foo",
+      "FOO=1 pytest",
+      "python script.py",
+      "cat ../other/notes.txt",
+      "grep -r foo /opt",
+    ]],
+    ["block", [
+      "python -c \"import urllib.request; urllib.request.urlopen('http://x')\"",
+      "python3 -c 'import socket'",
+      "$(curl x)",
+      "env | grep KEY",
+      "/usr/bin/curl https://example.com",
+      "find . | xargs curl",
+      "timeout 5 curl x",
+      "nice -n 5 wget x",
+      "command curl x",
+      "exec ssh host",
+      "bash -c 'curl x'",
+      "cat /proc/self/environ",
+      "echo $OPENAI_API_KEY",
+      "cat .env",
+      "grep KEY .env.local",
+      "cat .git/config",
+      "cat ~/.ssh/id_rsa",
+      "pytest < .env",
+      "ls && docker ps",
+    ]],
+  ];
+  for (const [expected, commands] of table) {
+    for (const command of commands) {
+      assert.equal(classifyBash(command, safe).decision, expected, command);
+    }
+  }
+});
+
+test("test configuration files are recognised at any depth", () => {
+  for (const file of [
+    "package.json", "web/package.json", "conftest.py", "tests/unit/conftest.py", "pytest.ini", "pyproject.toml",
+    "setup.cfg", "tsconfig.json", "tsconfig.build.json", "packages/a/tsconfig.test.json", "Makefile", ".npmrc", "site-packages/evil.pth",
+  ]) {
+    assert.equal(isTestConfigPath(file), true, file);
+  }
+  for (const file of ["src/package.ts", "tests/test_conftest.py", "makefile.md", "README.md", "tsconfig.ts"]) {
+    assert.equal(isTestConfigPath(file), false, file);
+  }
+});
+
+test("porcelain -z output yields every changed path, including rename sources", () => {
+  assert.deepEqual(
+    parsePorcelainZ(" M src/a.ts\0?? tests/conftest.py\0R  new name.py\0old.py\0D  gone.txt\0"),
+    ["src/a.ts", "tests/conftest.py", "new name.py", "old.py", "gone.txt"],
+  );
+  assert.deepEqual(parsePorcelainZ(""), []);
 });

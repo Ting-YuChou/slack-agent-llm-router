@@ -44,6 +44,10 @@ const scenarios: Array<Scenario & { todo?: string }> = [
   { name: "S9 unknown grade never commits", profile, grade: ["unknown"],
     attempts: [{ files: fix, records: [...piTurn("stop"), settledRecord] }],
     expect: { status: "failed", errorCode: "verification_failed", committed: false } },
+  { name: "S19 docker unavailable during verification names its cause", profile,
+    verify: [new HarnessError("docker_unavailable", "Docker is unavailable for verification")],
+    attempts: [{ files: fix, records: [...piTurn("stop"), settledRecord] }],
+    expect: { status: "failed", errorCode: "quality_gate_unavailable", causeCode: "docker_unavailable", committed: false } },
 ];
 
 for (const scenario of scenarios) {
@@ -52,6 +56,7 @@ for (const scenario of scenarios) {
     const { expect } = scenario;
     assert.equal(run.status, expect.status, JSON.stringify(run.error));
     if (expect.errorCode) assert.equal(run.error?.code, expect.errorCode);
+    if (expect.causeCode) assert.equal(run.error?.cause_code, expect.causeCode);
     assert.equal(commits, expect.committed ? 1 : 0);
     if (!expect.committed) assert.equal(dirty, "", "failed runs must leave the worktree rolled back");
     if (!expect.committed) assert.equal(patches.length, 1, "undelivered runs keep their patch");
