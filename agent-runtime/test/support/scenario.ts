@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 
 import { assertCandidateScope } from "../../src/candidate-scope.js";
 import { CodingAgentOrchestrator, type PatchArchiver, type QualityServices, type RunRecord } from "../../src/orchestrator.js";
+import { applyFixers } from "../../src/fixers.js";
 import { archivePatch, undeliveredPatchPath } from "../../src/patch-archive.js";
 import { PiRpcBridge, type PublicRunEvent } from "../../src/pi-rpc.js";
 import { QualityGate, type CheckStatus, type Grade, type VerificationResult } from "../../src/quality-gate.js";
@@ -39,6 +40,8 @@ export interface Scenario {
   /** Turns on delivery approval; `delivery` is how the owner answers the card (`expire` lets its short TTL run out). */
   deliveryApproval?: boolean;
   delivery?: "approve" | "reject" | "expire";
+  /** A trusted fixer the gate runs on a scratch copy before snapshotting, like a profile's `fixers`. */
+  fixer?: (workspace: string) => Promise<void>;
   /** Runs against the worktree while the delivery card is pending, before the owner answers. */
   beforeDelivery?: (worktree: string) => Promise<void>;
   expect: {
@@ -125,8 +128,11 @@ function qualityFor(scenario: Scenario, counters: { gradeCalls: number }): Quali
     profile: { id: "scenario", rubric, maxRepairs: profile.maxRepairs },
     snapshot: async input => {
       assertCandidateScope(await changedFiles(input.worktree, input.baseline), profile.allowedPaths);
+      const fixed = scenario.fixer ? await applyFixers({ fixers: [{ name: "fmt", argv: ["fmt"], cwd: ".", timeoutMs: 1000 }], worktree: input.worktree, baseline: input.baseline,
+        scratch: path.join(path.dirname(input.worktree), "..", "fixer-scratch"), signal: input.signal,
+        run: async (_fixer, workspace) => { await scenario.fixer!(workspace); return { exit: 0, timedOut: false }; } }) : undefined;
       const patch = (await exec("git", ["diff", "--binary", input.baseline], { cwd: input.worktree })).stdout;
-      return { hash: createHash("sha256").update(patch).digest("hex"), path: input.worktree, patch };
+      return { hash: createHash("sha256").update(patch).digest("hex"), path: input.worktree, patch, ...(fixed ? { fixes: fixed.fixes } : {}) };
     },
     verify: async (_candidate, input) => scriptedVerification(scenario.verify?.[input.attempt - 1]),
     grade: async candidate => {

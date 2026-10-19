@@ -14,7 +14,7 @@ test("a no-profile run reports utilization and timing but no attempt verdicts", 
   const metrics = computeHarnessMetrics(run({ execution_outcome: "completed", turn_count: 5, tool_count: 10, limits: { maxTurns: 20, maxToolCalls: 40 }, first_edit_at: "2026-10-19T10:00:30.000Z" }), now);
   assert.deepEqual(metrics, {
     outcome: "completed", turn_util: 0.25, tool_util: 0.25, attempts: 0, first_attempt_pass: null, repair_success: null,
-    writer_checks_calls: 0, approvals: 0, policy_blocks: 0, cost_usd: null, wall_s: 120, active_s: null, human_wait_s: null, time_to_first_edit_s: 30,
+    writer_checks_calls: 0, approvals: 0, policy_blocks: 0, fixed_files: 0, cost_usd: null, wall_s: 120, active_s: null, human_wait_s: null, time_to_first_edit_s: 30,
   });
 });
 
@@ -51,4 +51,12 @@ test("a first attempt that passes both gates is a first-attempt pass", () => {
   const metrics = computeHarnessMetrics(run({ attempts: [{ attempt: 1, execution_id: "e1", verification_status: "passed", grader_status: "passed" }] }), now);
   assert.equal(metrics.first_attempt_pass, true);
   assert.equal(metrics.repair_success, null);
+});
+
+test("files rewritten by fixers are summed over attempts", () => {
+  const metrics = computeHarnessMetrics(run({ attempts: [
+    { attempt: 1, execution_id: "e1", verification_status: "failed", grader_status: "unknown", fixes: [{ name: "black", files: ["a.py", "b.py"] }] },
+    { attempt: 2, execution_id: "e2", verification_status: "passed", grader_status: "passed", fixes: [{ name: "black", files: ["a.py"] }, { name: "ruff", files: ["a.py"] }] },
+  ] }), now);
+  assert.equal(metrics.fixed_files, 4);
 });

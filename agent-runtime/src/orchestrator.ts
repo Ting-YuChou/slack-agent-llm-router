@@ -12,6 +12,7 @@ import { WorkflowBudget } from "./workflow-budget.js";
 import type { Candidate, GateInput, GateResult } from "./quality-gate.js";
 import { classifyGateError, type RunFailure } from "./error-taxonomy.js";
 import { promptTelemetry } from "./prompts.js";
+import type { FixResult } from "./fixers.js";
 import { computeHarnessMetrics, type HarnessMetrics } from "./harness-metrics.js";
 import { summarizePolicy, type PolicyDecision, type PolicySummary } from "./policy-decision.js";
 import { redact } from "./telemetry.js";
@@ -121,7 +122,7 @@ export interface RunRecord {
   /** Why the last grade was a harness-made unknown, when it was. */
   grader_cause?: { code: string; message: string };
   publication_status?: string;
-  attempts?: Array<{ attempt: number; execution_id: string; candidate_hash?: string; verification_status?: string; grader_status?: string; artifact?: string }>;
+  attempts?: Array<{ attempt: number; execution_id: string; candidate_hash?: string; verification_status?: string; grader_status?: string; artifact?: string; fixes?: FixResult[]; fixer_cause?: string }>;
   run_id: string;
   session_id: string;
   status: RunStatus;
@@ -940,7 +941,8 @@ export class CodingAgentOrchestrator {
         workflow.budget.check();
         run.grader_findings = result.grade?.findings;
         run.verification_status = result.verification.status; run.grader_status = result.grade?.status ?? "pending";
-        Object.assign(run.attempts!.at(-1)!, { candidate_hash: result.candidate.hash, verification_status: run.verification_status, grader_status: run.grader_status, artifact: result.candidate.artifact });
+        Object.assign(run.attempts!.at(-1)!, { candidate_hash: result.candidate.hash, verification_status: run.verification_status, grader_status: run.grader_status, artifact: result.candidate.artifact,
+          ...(result.candidate.fixes?.length ? { fixes: result.candidate.fixes } : {}), ...(result.candidate.fixer_cause ? { fixer_cause: result.candidate.fixer_cause } : {}) });
         if (result.action === "repair") {
           workflow.attempt++; workflow.executionId = randomUUID(); workflow.checking = false;
           run.phase = "repairing"; await this.persistState();

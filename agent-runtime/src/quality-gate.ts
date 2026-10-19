@@ -1,3 +1,4 @@
+import type { FixResult } from "./fixers.js";
 import { randomBytes } from "node:crypto";
 
 import { ScopeViolationError } from "./candidate-scope.js";
@@ -27,7 +28,9 @@ export interface Grade {
   /** Grader executions spent on this candidate, retries included. */
   grader_attempts?: number;
 }
-export interface Candidate { sourceHash?: string; testedBaseline?: string; hash: string; path: string; patch?: string; artifact?: string }
+export interface Candidate { sourceHash?: string; testedBaseline?: string; hash: string; path: string; patch?: string; artifact?: string;
+  /** What the profile's fixers changed before this snapshot, and why they gave up if they did. */
+  fixes?: FixResult[]; fixer_cause?: string }
 export interface GateInput { run_id: string; worktree: string; baseline: string; requirement: string; attempt: number; signal: AbortSignal }
 export interface GateResult { action: "pass" | "repair" | "fail"; candidate: Candidate; verification: VerificationResult; grade?: Grade; repair_prompt?: string; failure?: { code: "scope_violation"; files: string[] } | { code: "verification_failed"; cause_code?: CauseCode } }
 export interface QualityGateOptions {
