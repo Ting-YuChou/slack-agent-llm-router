@@ -7,7 +7,9 @@ baseline when nothing was committed) and executed in the verification image.
 
 Results are written to ``eval/results/<model>__<prompt_version>__<checksum>.json``
 and compared against ``eval/baseline.json``; any regression beyond tolerance,
-or any missing metric, fails the run (exit 1).
+any metric above its optional baseline ceiling, or any missing metric fails the
+run (exit 1). ``--recompute-summary`` re-derives the summary of a committed
+results file without a live run.
 """
 
 import argparse
@@ -35,15 +37,21 @@ EXPECTATIONS = ("pass", "must_not_commit", "scope_violation", "no_diff")
 TASK_MODES = ("implement", "discuss")
 WORKFLOW_MODES = ("single", "structured")
 ORACLE_DIR = ".eval-oracle"
-# metric -> (direction, default tolerance). Higher-is-better metrics use an
-# absolute tolerance; lower-is-better metrics a relative one.
+# metric -> (direction, default tolerance). "higher" and "lower_abs" use an
+# absolute tolerance; "lower" a relative one (useless against a 0 reference).
 CONTRACT_METRICS = {
     "pass_at_1": ("higher", 0.1),
     "grader_oracle_agreement": ("higher", 0.1),
     "cost_usd_p50": ("lower", 0.25),
     "wall_time_s_p50": ("lower", 0.5),
+    "grader_unknown_rate": ("lower_abs", 0.1),
 }
-GRADED = ("passed", "failed")
+# The runtime grader emits passed | needs_changes | unknown; needs_changes (and
+# a legacy failed) is a fail verdict. The hidden oracle emits passed | failed.
+GRADER_VERDICTS = ("passed", "needs_changes", "failed")
+ORACLE_VERDICTS = ("passed", "failed")
+# Grader states meaning the grader ran, or was due to run, on a candidate.
+GRADER_EXPECTED = ("passed", "needs_changes", "unknown")
 ERROR_MESSAGE_LIMIT = 500
 NO_ERROR_CODE = "no_error_code"
 _CREDENTIAL_NAME = (
@@ -108,6 +116,33 @@ def run_error(state, secrets=()):
     if not isinstance(message, str):
         return code, None
     return code, _bounded(redact_text(message, secrets))
+
+
+def _string(value):
+    return value if isinstance(value, str) else None
+
+
+def run_causes(state):
+    """Return the run's ``(error.cause_code, grader_cause)``; ``None`` when absent."""
+    error = state.get("error")
+    cause_code = _string(error.get("cause_code")) if isinstance(error, dict) else None
+    grader_cause = _string(state.get("grader_cause"))
+    return cause_code, grader_cause and _bounded(redact_text(grader_cause))
+
+
+def run_attempts(state):
+    """Return each attempt's ``{"verification", "grader"}`` gates, or ``None``."""
+    attempts = state.get("attempts")
+    if not isinstance(attempts, list):
+        return None
+    return [
+        {
+            "verification": _string(attempt.get("verification_status")),
+            "grader": _string(attempt.get("grader_status")),
+        }
+        for attempt in attempts
+        if isinstance(attempt, dict)
+    ]
 
 
 def _files(root):
@@ -239,14 +274,49 @@ def _median(values):
     return statistics.median(values) if values else None
 
 
+def _gates_passed(attempt):
+    return attempt["verification"] == "passed" and attempt["grader"] == "passed"
+
+
+def _attempt_metrics(records):
+    """Informational first-attempt and repair rates; omitted without the data."""
+    histories = [record["attempts"] for record in records if record.get("attempts")]
+    if not histories:
+        return {}
+    metrics = {
+        "first_attempt_pass_rate": sum(
+            1 for attempts in histories if _gates_passed(attempts[0])
+        )
+        / len(histories)
+    }
+    repaired = [
+        attempts
+        for attempts in histories
+        if len(attempts) > 1 and not _gates_passed(attempts[0])
+    ]
+    if repaired:
+        metrics["repair_success_rate"] = sum(
+            1 for attempts in repaired if _gates_passed(attempts[-1])
+        ) / len(repaired)
+    return metrics
+
+
 def aggregate(records):
     runs = len(records)
     passes = sum(1 for record in records if record["passed"])
     graded = [
         record
         for record in records
-        if record.get("grader") in GRADED and record.get("oracle") in GRADED
+        if record.get("grader") in GRADER_VERDICTS
+        and record.get("oracle") in ORACLE_VERDICTS
     ]
+    grader_due = [
+        record
+        for record in records
+        if record.get("verification") == "passed"
+        or record.get("grader") in GRADER_EXPECTED
+    ]
+    grader_unknown = sum(1 for record in grader_due if record["grader"] == "unknown")
     agreeing = sum(
         1
         for record in graded
@@ -274,6 +344,10 @@ def aggregate(records):
         "wall_time_s_total": sum(
             value for value in walls if isinstance(value, (int, float))
         ),
+        "grader_unknown_rate": (
+            grader_unknown / len(grader_due) if grader_due else None
+        ),
+        **_attempt_metrics(records),
         "tasks": tasks,
     }
 
@@ -285,10 +359,14 @@ def _number(value):
 
 
 def evaluate_contract(summary, baseline):
-    """Compare ``summary`` to ``baseline``; fail closed on any missing metric."""
+    """Compare ``summary`` to ``baseline``; fail closed on any missing metric.
+
+    ``baseline["ceilings"]`` optionally caps metrics at an absolute maximum.
+    """
     failures = []
     expected = (baseline or {}).get("metrics") or {}
     tolerances = (baseline or {}).get("tolerance") or {}
+    ceilings = (baseline or {}).get("ceilings") or {}
     for metric, (direction, default_tolerance) in CONTRACT_METRICS.items():
         reference = _number(expected.get(metric))
         actual = _number(summary.get(metric))
@@ -310,6 +388,21 @@ def evaluate_contract(summary, baseline):
             failures.append(
                 f"{metric}: {actual:.3f} regressed above {reference:.3f} x {1 + tolerance}"
             )
+        if direction == "lower_abs" and actual > reference + tolerance:
+            failures.append(
+                f"{metric}: {actual:.3f} regressed above {reference:.3f} + {tolerance}"
+            )
+    for metric, value in ceilings.items():
+        ceiling = _number(value)
+        actual = _number(summary.get(metric))
+        if ceiling is None or ceiling < 0:
+            failures.append(f"{metric}: invalid ceiling")
+        elif actual is None:
+            missing = f"{metric}: missing from eval summary"
+            if missing not in failures:
+                failures.append(missing)
+        elif actual > ceiling:
+            failures.append(f"{metric}: {actual:.3f} exceeds ceiling {ceiling}")
     return failures
 
 
@@ -451,6 +544,7 @@ class LiveRunner:
         wall_time_s = time.monotonic() - started
         commit = state.get("commit")
         error_code, error_message = run_error(state, secrets=[self.key])
+        error_cause_code, grader_cause = run_causes(state)
         return {
             "run_id": created["run_id"],
             "fixture": str(root),
@@ -464,6 +558,9 @@ class LiveRunner:
             "wall_time_s": wall_time_s,
             "error_code": error_code,
             "error_message": error_message,
+            "error_cause_code": error_cause_code,
+            "grader_cause": grader_cause,
+            "attempts": run_attempts(state),
         }
 
 
@@ -496,6 +593,9 @@ def execute(task, attempt, runner):
         "run_id": outcome.get("run_id"),
         "error_code": outcome.get("error_code"),
         "error_message": outcome.get("error_message"),
+        "error_cause_code": outcome.get("error_cause_code"),
+        "grader_cause": outcome.get("grader_cause"),
+        "attempts": outcome.get("attempts"),
     }
 
 
@@ -539,7 +639,15 @@ def parse_args(argv=None, require_live=True):
         action="store_true",
         help="Write this run's metrics to the baseline instead of comparing",
     )
+    parser.add_argument(
+        "--recompute-summary",
+        type=pathlib.Path,
+        metavar="RESULTS_JSON",
+        help="Recompute the summary of a results file from its records; no live run",
+    )
     args = parser.parse_args(argv)
+    if args.recompute_summary:
+        return args
     if require_live and not args.live_openai:
         parser.error("--live-openai is required; this command incurs model usage")
     if args.repeats < 1:
@@ -553,8 +661,74 @@ def _now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
 
+def _contract_failures(summary, args):
+    if args.update_baseline:
+        return [
+            f"{metric}: missing from eval summary"
+            for metric in CONTRACT_METRICS
+            if _number(summary.get(metric)) is None
+        ]
+    return evaluate_contract(summary, _read_baseline(args.baseline))
+
+
+def _read_baseline(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _finish(args, result, results_path):
+    """Write ``result`` (and the baseline, if asked and clean); return the exit code."""
+    summary, failures = result["summary"], result["contract_failures"]
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    results_path.write_text(json.dumps(result, indent=2) + "\n")
+    if args.update_baseline and not failures:
+        baseline = {
+            "key": result["key"],
+            "updated_at": _now(),
+            "repeats": result["repeats"],
+            "metrics": {metric: summary[metric] for metric in CONTRACT_METRICS},
+            "tolerance": {metric: spec[1] for metric, spec in CONTRACT_METRICS.items()},
+        }
+        # Ceilings are hand-set policy; carry them over rather than reset them.
+        ceilings = _read_baseline(args.baseline).get("ceilings")
+        if ceilings:
+            baseline["ceilings"] = ceilings
+        args.baseline.write_text(json.dumps(baseline, indent=2) + "\n")
+    print(
+        json.dumps(
+            {"key": result["key"], "summary": summary, "contract_failures": failures},
+            indent=2,
+        )
+    )
+    return 1 if failures else 0
+
+
+def recompute(args):
+    """Re-derive the summary of a committed results file from its records."""
+    path = args.recompute_summary
+    try:
+        result = json.loads(path.read_text())
+        records = result["records"]
+        previous = result.get("summary") or {}
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"unreadable results file {path}: {error}", file=sys.stderr)
+        return 2
+    summary = aggregate(records)
+    summary["spent_usd"] = sum(_number(r.get("cost_usd")) or 0.0 for r in records)
+    summary["budget_exhausted"] = bool(previous.get("budget_exhausted"))
+    failures = _contract_failures(summary, args)
+    if summary["budget_exhausted"]:
+        failures.append("budget exhausted; eval incomplete")
+    result.update(summary=summary, contract_failures=failures)
+    return _finish(args, result, path)
+
+
 def main(argv=None, runner=None):
     args = parse_args(argv, require_live=runner is None)
+    if args.recompute_summary:
+        return recompute(args)
     try:
         tasks = load_tasks(args.tasks_dir, args.task)
     except TaskError as error:
@@ -588,22 +762,10 @@ def main(argv=None, runner=None):
     summary = aggregate(records)
     summary["spent_usd"] = spent
     summary["budget_exhausted"] = budget_exhausted
-    if args.update_baseline:
-        failures = [
-            f"{metric}: missing from eval summary"
-            for metric in CONTRACT_METRICS
-            if _number(summary.get(metric)) is None
-        ]
-    else:
-        try:
-            baseline = json.loads(args.baseline.read_text())
-        except (OSError, ValueError):
-            baseline = {}
-        failures = evaluate_contract(summary, baseline)
+    failures = _contract_failures(summary, args)
     if budget_exhausted:
         failures.append(f"budget exhausted after ${spent:.2f}; eval incomplete")
 
-    args.results_dir.mkdir(parents=True, exist_ok=True)
     result = {
         "key": key,
         "model": model,
@@ -615,22 +777,7 @@ def main(argv=None, runner=None):
         "contract_failures": failures,
         "records": records,
     }
-    (args.results_dir / f"{key}.json").write_text(json.dumps(result, indent=2) + "\n")
-    if args.update_baseline and not failures:
-        baseline = {
-            "key": key,
-            "updated_at": result["created_at"],
-            "repeats": args.repeats,
-            "metrics": {metric: summary[metric] for metric in CONTRACT_METRICS},
-            "tolerance": {metric: spec[1] for metric, spec in CONTRACT_METRICS.items()},
-        }
-        args.baseline.write_text(json.dumps(baseline, indent=2) + "\n")
-    print(
-        json.dumps(
-            {"key": key, "summary": summary, "contract_failures": failures}, indent=2
-        )
-    )
-    return 1 if failures else 0
+    return _finish(args, result, args.results_dir / f"{key}.json")
 
 
 if __name__ == "__main__":
