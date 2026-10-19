@@ -201,3 +201,18 @@ test("writer context mirrors the trusted profile's paths, check names, rubric an
   const context = writerContextFor({ allowedPaths: ["src", "tests"], rubric: ["correct"], checks: [{ name: "pytest", argv: ["pytest"], cwd: ".", timeoutMs: 1 }] } as any);
   assert.deepEqual(context, { allowedPaths: ["src", "tests"], checks: ["pytest"], rubric: ["correct"], diffLimits: { maxFiles: 50, maxBytes: 1048576, maxSingleFileBytes: 262144 } });
 });
+
+test("run JSON reports a retained patch without exposing its host path", async () => {
+  const server = createAgentHttpServer({
+    orchestrator: { getRun: (id: string) => ({ run_id: id, status: "failed", patch_artifact: "/runtime/artifacts/R1/undelivered.patch" }) } as any,
+    token: "runtime-secret",
+    health: () => ({ status: "healthy" }) as any,
+  });
+  const base = await listen(server);
+  const response = await fetch(`${base}/v1/runs/R1`, { headers: { authorization: "Bearer runtime-secret" } });
+  const body = await response.json();
+  const text = JSON.stringify(body);
+  await close(server);
+  assert.equal(body.patch_retained, true);
+  assert.equal(text.includes("undelivered.patch"), false);
+});
