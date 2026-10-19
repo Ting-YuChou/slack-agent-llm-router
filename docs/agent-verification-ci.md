@@ -48,6 +48,8 @@ Without `PI_AGENT_VERIFICATION_PROFILE`, implement runs are committed with `veri
 
 The grader is set by `PI_AGENT_GRADER_MODEL` (default `openai/gpt-5.6-sol`), `PI_AGENT_GRADER_EFFORT` (default `high`) and `PI_AGENT_GRADER_TIMEOUT_MS` (default 120000, range 30000 to 1800000); startup fails if the model's provider is not configured. Grader infrastructure failures (timeout, no or invalid submission, execution error) get one fresh grader before the candidate fails; a grader that itself answers `unknown` fails without a retry as `insufficient_evidence`. Either way the run records `error.cause_code` and `grader_cause`. Every passed criterion must cite a file in the candidate snapshot (`path` or `path:line`) and every finding must point at an existing line, otherwise the submission is rejected. The grader also receives the profile's `allowedPaths` and diff limits as constraints that override the request text.
 
+Profiles can list `fixers`, deterministic formatters such as `black` that run before verification. Each fixer runs in order in the verification image, with no network, on a scratch copy of the worktree. Its edits are copied back only into files the candidate already changed; new files and untouched files are dropped. Because the fixes land in the worktree, the snapshot, the unchanged-check and the delivery digest all cover the fixed diff. A fixer that crashes or times out discards every fixer's work and records `fixer_cause` on the attempt. A non-zero exit, such as unfixable lint findings, still keeps the fixes. Each attempt records `fixes`, and `harness_metrics.fixed_files` sums them.
+
 With a trusted profile the writer tests through its `run_checks` tool, which runs the profile's checks on the current changes in the verification image (no network, no gateway token, baseline test configuration). `npm test`, `npm run test`, `pytest` and `python -m pytest` therefore leave the default safe-command list and need approval if run through bash; an explicit `PI_AGENT_SAFE_COMMANDS` still replaces the defaults.
 
 Replace every placeholder; the prices example is deliberately not valid JSON until actual rates are supplied. Rates should conservatively cover cache-write premiums when applicable. Zero output price is accepted. No live price is hard-coded.
@@ -71,6 +73,17 @@ The gateway reserves a conservative amount **before** each request, caps generat
 Gateway dollar figures derived from token counts/rates are estimates; official Pi costs remain the analysis ledger. In-flight requests, unknown usage and provider billing differences prevent an absolute $1 billing guarantee. Reservation summaries and unknown-request counts are emitted separately.
 
 Startup timing distinguishes Docker CLI spawn, inspected container running, verified RPC response, configuration, first accepted model request and first nonempty output. CI approval/reproduction/publication and verification/grading have separate spans. The dashboard shows wall time, active time and human waiting; overlapping spans must not be added together.
+
+### Feedback to eval-task drafts
+
+`scripts/export_agent_feedback.py` turns telemetry into eval-task drafts: runs the owner marked `needs_changes`, runs where the grader and the owner disagree, and CI-repair runs that failed. It joins `agent_runs`, the latest owner feedback, grade and verification, and the run's first user message from ClickHouse (same `CLICKHOUSE_*` variables as `export_agent_content.py`), or reads the same joined rows from a JSON array with `--input`:
+
+```sh
+CLICKHOUSE_PASSWORD=... python scripts/export_agent_feedback.py --days 30 drafts.jsonl
+python scripts/export_agent_feedback.py --input rows.json -   # offline, to stdout
+```
+
+Each JSONL line has `draft_id` (sha256 of the run id), `reason`, `reason_category`, `comment`, `prompt`, `changed_files`, `grader_status`, `verification_status`, `prompts_version` and `created_at`. User, Slack channel/thread and run ids are never written, and comment, prompt and paths pass through the eval redaction patterns. Review each draft by hand before turning it into `eval/tasks/<id>/` with a fixture and oracle.
 
 ## Validation and operating limits
 

@@ -325,6 +325,7 @@ class AgentAnalyticsTests(unittest.TestCase):
             "repair_success",
             "writer_checks_calls",
             "policy_blocks",
+            "fixed_files",
             "time_to_first_edit_s",
         ):
             self.assertIn(f"AS {column}", view)

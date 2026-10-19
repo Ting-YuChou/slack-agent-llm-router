@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { test } from "node:test";
 
@@ -264,6 +264,24 @@ test("delivery: an empty diff completes without a delivery card", async () => {
   assert.equal(run.status, "completed");
   assert.equal(deliveryCard, undefined);
   assert.equal(commits, 0);
+});
+
+test("S22 a fixer formats the candidate before verification, so the first attempt passes and delivers the fixed diff", async () => {
+  const format = async (workspace: string) => {
+    const file = path.join(workspace, "src", "a.js");
+    await writeFile(file, (await readFile(file, "utf8")).replace("a=2", "a = 2"));
+  };
+  const { run, commits, deliveryCard } = await runScenario({ name: "S22 fixer", profile, deliveryApproval: true, delivery: "approve", fixer: format,
+    attempts: [{ files: { "src/a.js": "export const a=2;\n" }, records: [...piTurn("stop", "Fixed"), settledRecord] }],
+    expect: { status: "completed", committed: true } });
+  assert.equal(run.status, "completed", JSON.stringify(run.error));
+  assert.equal(commits, 1);
+  assert.equal(run.attempts?.length, 1);
+  assert.deepEqual(run.attempts?.[0]?.fixes, [{ name: "fmt", files: ["src/a.js"] }]);
+  assert.equal(run.harness_metrics?.fixed_files, 1);
+  const delivery = deliveryCard?.delivery as Record<string, unknown>;
+  assert.match(String(delivery.excerpt), /\+export const a = 2;/, "the card shows the fixed diff the owner approves");
+  assert.doesNotMatch(String(delivery.excerpt), /a=2/);
 });
 
 /** The host answers budget_status synchronously, so these scripts never pause on awaitUi. */
