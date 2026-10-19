@@ -6,6 +6,7 @@ import path from "node:path";
 import type { ControlStore } from "./ci-control.js";
 import { BudgetLedger } from "./budget-ledger.js";
 import { QualityGate, type GateInput } from "./quality-gate.js";
+import { assertCandidateScope } from "./candidate-scope.js";
 import { CandidateStore, DockerVerifier, type VerificationProfile } from "./verification.js";
 import { GraderRunner } from "./grader.js";
 import type { QualityServices } from "./orchestrator.js";
@@ -73,7 +74,7 @@ export function createQualityServices(options: {
     snapshot: async input => {
       const files = (await exec("git", ["diff", "--name-only", "-z", input.baseline], { cwd: input.worktree })).stdout.split("\0").filter(Boolean);
       const untracked = (await exec("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: input.worktree })).stdout.split("\0").filter(Boolean);
-      if ([...files, ...untracked].some(file => !profile.allowedPaths.some(root => root === "." || file === root || file.startsWith(root.replace(/\/$/, "") + "/")))) throw new Error("candidate_outside_allowed_scope");
+      assertCandidateScope([...files, ...untracked], profile.allowedPaths);
       const source = await store.create(input.worktree, input.baseline, input.run_id);
       const tested = options.verificationBases.get(input.run_id);
       if (!tested || tested === input.baseline) { artifacts.set(`${input.run_id}:${input.attempt}`, path.dirname(source.path)); return source; }

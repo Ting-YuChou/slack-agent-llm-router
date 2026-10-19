@@ -41,7 +41,12 @@ export interface AgentContainerOptions {
   workflowContext?: { role: string; wave: number; paths: string[]; previousTasks: unknown[]; mcpTools?: string[] };
   directMcpOnly?: boolean;
   workflowKey?: string;
+  limits?: { maxTurns: number; maxToolCalls: number };
+  /** Trusted-profile constraints the writer is told about and checked against at write time. */
+  writerContext?: WriterContext;
 }
+
+export interface WriterContext { allowedPaths: string[]; checks: string[]; rubric: string[]; diffLimits: { maxFiles: number; maxBytes: number; maxSingleFileBytes: number } }
 
 const exec = promisify(execFile);
 
@@ -50,7 +55,7 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     ...options, readOnlyWorkspace: true, toolNames: ["read", "grep", "find", "ls"],
     extensionPaths: ["/opt/pi/extensions/model-gateway.ts", "/opt/pi/extensions/discussion.ts"],
     pluginPaths: [], skillPaths: [], safeCommands: [], mcp: undefined, classifierGatewayToken: undefined,
-    graderContext: undefined, workflowContext: undefined,
+    graderContext: undefined, workflowContext: undefined, writerContext: undefined,
   };
   const model = resolveAgentModel(options.modelRef);
   const tools = [...options.toolNames];
@@ -74,8 +79,8 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     "--env", `HOME=/tmp/pi-home`,
     "--env", `${model.credentialEnv}=${options.gatewayToken}`,
     "--env", `PI_MODEL_GATEWAY_URL=${options.gatewayUrl}`,
-    "--env", "PI_AGENT_MAX_TURNS=20",
-    "--env", "PI_AGENT_MAX_TOOL_CALLS=40",
+    "--env", `PI_AGENT_MAX_TURNS=${options.limits?.maxTurns ?? 20}`,
+    "--env", `PI_AGENT_MAX_TOOL_CALLS=${options.limits?.maxToolCalls ?? 40}`,
     "--env", "PI_AGENT_BASH_TIMEOUT_MS=300000",
     "--env", `PI_AGENT_SAFE_COMMANDS_JSON=${JSON.stringify(options.safeCommands ?? [])}`,
     "--env", `PI_AGENT_SKILL_PATHS_JSON=${JSON.stringify(options.skillPaths)}`,
@@ -102,6 +107,7 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
   if (options.continueSession) args.push("--continue");
   if (options.graderContext) args.splice(args.indexOf("--mount"), 0, "--env", `PI_AGENT_GRADER_JSON=${JSON.stringify(options.graderContext)}`);
   if (options.workflowContext) args.splice(args.indexOf("--mount"), 0, "--env", `PI_AGENT_WORKFLOW_JSON=${JSON.stringify(options.workflowContext)}`);
+  if (options.writerContext) args.splice(args.indexOf("--mount"), 0, "--env", `PI_AGENT_WRITER_JSON=${JSON.stringify(options.writerContext)}`);
   if (options.classifierGatewayToken) {
     args.splice(args.indexOf("--mount"), 0,
       "--env", `OPENROUTER_API_KEY=${options.classifierGatewayToken}`,
@@ -214,7 +220,7 @@ export class DockerPiProcess implements AgentProcess {
       },
       onRecord: record => { capture?.onRecord(record); this.tracing?.rpc(runId, record); this.onRecord?.(record); },
       onEvent: (event) => {
-        if (event.type === "answer" && event.text.trim()) this.startup?.firstOutput();
+        if ((event.type === "answer" || event.type === "answer_delta") && event.text.trim()) this.startup?.firstOutput();
         if (event.type === "settled") {
           this.hasSession = true;
           void this.finalizeCapture(bridge, capture).then(() => this.bridge === bridge ? this.stopActiveContainer() : undefined).then(

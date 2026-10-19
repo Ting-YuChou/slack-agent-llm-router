@@ -73,7 +73,7 @@ export class RuntimeStateStore {
 
   async save(state: RuntimeState): Promise<void> {
     const snapshot = JSON.stringify(state, null, 2);
-    this.writeChain = this.writeChain.then(async () => {
+    const write = this.writeChain.then(async () => {
       await mkdir(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
       const temporary = `${this.filePath}.tmp`;
       const file = await open(temporary, "w", 0o600);
@@ -83,7 +83,9 @@ export class RuntimeStateStore {
       const directory = await open(path.dirname(this.filePath), "r");
       try { await directory.sync(); } finally { await directory.close(); }
     });
-    return this.writeChain.catch(error => { this.healthy = false; throw error; });
+    // Keep later saves runnable after a failure; health follows the latest write.
+    this.writeChain = write.catch(() => undefined);
+    return write.then(() => { this.healthy = true; }, error => { this.healthy = false; throw error; });
   }
 }
 

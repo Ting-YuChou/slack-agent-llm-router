@@ -10,7 +10,7 @@ import { randomUUID, createHash, timingSafeEqual } from "node:crypto";
 import { PiRunCapture } from "./pi-capture.js";
 import { AgentTelemetry, isCredentialKey } from "./telemetry.js";
 import { AgentTracing } from "./tracing.js";
-import { DockerPiProcess } from "./container-runtime.js";
+import { DockerPiProcess, type WriterContext } from "./container-runtime.js";
 import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT, listAgentModels, resolveAgentModel } from "./agent-model.js";
 import { JevRouter, type JevMode } from "./jev-router.js";
 import { repositoryFromRemote, parseGitHubRepositories } from "./github-repository.js";
@@ -32,9 +32,9 @@ import { createCiRuntime } from "./ci-runtime.js";
 import { taskMode } from "./task-mode.js";
 import { workflowMode } from "./structured-workflow.js";
 import type { CiRepairs } from "./ci-repair.js";
-import { loadProfile } from "./verification.js";
+import { loadProfile, type VerificationProfile } from "./verification.js";
 import { createQualityServices } from "./workflow-runtime.js";
-import { WorktreeManager } from "./worktree-manager.js";
+import { DEFAULT_DIFF_LIMITS, WorktreeManager } from "./worktree-manager.js";
 
 const exec = promisify(execFile);
 export const DEFAULT_AGENT_RUNTIME_PORT = 3001;
@@ -381,8 +381,10 @@ export async function createProductionServer() {
     },
   }) : undefined;
   let ciRuntime: Awaited<ReturnType<typeof createCiRuntime>> | undefined;
+  const agentLimits = parseAgentLimits(process.env);
   const orchestrator: CodingAgentOrchestrator = new CodingAgentOrchestrator({
     quality,
+    requireVerification: process.env.PI_AGENT_REQUIRE_VERIFICATION === "1",
     captureTraceContext: id => tracing?.traceparent(id),
     captureState: id => ({complete: telemetry ? telemetry.completeness(id).length === 0 : null, reasons: telemetry?.completeness(id) ?? []}),
     observeLifecycle: (id, name, phase, failed, sessionId) => {
@@ -433,6 +435,8 @@ export async function createProductionServer() {
           toolNames: ["read", "write", "edit", "bash", "grep", "find", "ls", ...lock.plugins.flatMap((plugin) => plugin.enabled_tools)],
           continueSession: session.restored,
           safeCommands: parseSafeCommands(process.env.PI_AGENT_SAFE_COMMANDS),
+          limits: agentLimits,
+          ...(trustedProfile ? { writerContext: writerContextFor(trustedProfile.profile) } : {}),
           user: containerUser,
           ...(mcpServerIds.length > 0 ? {
             mcp: {
@@ -673,6 +677,21 @@ function positiveInteger(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
+/** Constraints the writer sees up front and the policy extension enforces at write time. */
+export function writerContextFor(profile: VerificationProfile): WriterContext {
+  return { allowedPaths: [...profile.allowedPaths], checks: profile.checks.map((check) => check.name), rubric: [...profile.rubric], diffLimits: { ...DEFAULT_DIFF_LIMITS } };
+}
+
+export function parseAgentLimits(env: NodeJS.ProcessEnv): { maxTurns: number; maxToolCalls: number } {
+  const read = (key: string, fallback: number) => {
+    if (env[key] === undefined || env[key] === "") return fallback;
+    const value = Number(env[key]);
+    if (!Number.isInteger(value) || value < 1 || value > 1000) throw new Error(`${key} must be an integer between 1 and 1000`);
+    return value;
+  };
+  return { maxTurns: read("PI_AGENT_MAX_TURNS", 20), maxToolCalls: read("PI_AGENT_MAX_TOOL_CALLS", 40) };
+}
+
 function parseSafeCommands(value: string | undefined): string[] {
   const defaults = ["npm test", "npm run test", "npm run lint", "npm run build", "pytest", "python -m pytest"];
   if (!value) return defaults;
