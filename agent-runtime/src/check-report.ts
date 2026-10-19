@@ -15,7 +15,7 @@ const ANSI = /\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b[@-Z\\-_]/g;
 export function stripAnsi(text: string): string { return text.replace(ANSI, ""); }
 
 /** Maps a reported path to a repository-relative one; anything that escapes the workspace is dropped. */
-function repoPath(file: string, cwd: string): string | undefined {
+export function repoPath(file: string, cwd: string): string | undefined {
   let value = file.trim();
   if (value.startsWith(WORKSPACE)) value = value.slice(WORKSPACE.length);
   else if (path.posix.isAbsolute(value)) return undefined;
@@ -134,4 +134,60 @@ export function formatCheckFeedback(verification: VerificationResult, options: {
   }
   if (omitted) out.push(`${omitted} more omitted`);
   return out.join("\n");
+}
+
+export const MAX_REPORT_BYTES = 2 * 1024 * 1024;
+export class ReportError extends Error {}
+
+const ATTRIBUTES = String.raw`((?:\s+[\w:.-]+\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*`;
+const ENTITIES: Record<string, string> = { lt: "<", gt: ">", amp: "&", quot: '"', apos: "'" };
+
+function decode(text: string): string {
+  return text.replace(/&(#x[0-9a-f]+|#\d+|\w+);/gi, (whole, name: string) => {
+    if (name[0] === "#") { const code = name[1] === "x" || name[1] === "X" ? parseInt(name.slice(2), 16) : parseInt(name.slice(1), 10); return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : ""; }
+    return ENTITIES[name] ?? whole;
+  });
+}
+
+function attributes(raw: string): Record<string, string> {
+  const found: Record<string, string> = {};
+  for (const match of raw.matchAll(/([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g)) found[match[1]] = decode(match[2] ?? match[3] ?? "");
+  return found;
+}
+
+/** pytest prints `tests/test_a.py:8: ValueError`; Node prints stack frames under /workspace/check/. */
+function locate(body: string, file: string | undefined, cwd: string): Pick<CheckFailure, "file" | "line" | "column"> {
+  const pytest = [...body.matchAll(/^(\S+?\.py):(\d+): \w+/gm)].map(match => ({ file: repoPath(match[1], cwd), line: +match[2] }));
+  const preferred = pytest.filter(item => item.file && (!file || item.file === file)).at(-1) ?? pytest.filter(item => item.file).at(-1);
+  if (preferred) return { file: preferred.file, line: preferred.line };
+  for (const match of body.matchAll(/(?:file:\/\/)?(\/workspace\/check\/[^\s:()'"]+):(\d+):(\d+)/g)) {
+    const found = repoPath(match[1], cwd);
+    if (found && !found.includes("node_modules/")) return { file: found, line: +match[2], column: +match[3] };
+  }
+  return file ? { file } : {};
+}
+
+/** Failed and errored test cases from pytest (xunit1/xunit2) or Node junit reports. No DTDs or custom entities. */
+export function parseJUnit(report: string | Buffer, cwd = "."): CheckFailure[] {
+  if (Buffer.byteLength(report) > MAX_REPORT_BYTES) throw new ReportError("junit_report_too_large");
+  const xml = report.toString();
+  if (/<!DOCTYPE|<!ENTITY/i.test(xml)) throw new ReportError("junit_report_dtd_rejected");
+  const failures: CheckFailure[] = [];
+  const open = new RegExp(`<testcase\\b${ATTRIBUTES}(\\/?)>`, "g");
+  for (let match = open.exec(xml); match && failures.length < MAX_FAILURES; match = open.exec(xml)) {
+    const testcase = attributes(match[1]);
+    if (match[2]) continue;
+    const end = xml.indexOf("</testcase>", open.lastIndex);
+    const inner = xml.slice(open.lastIndex, end < 0 ? xml.length : end);
+    const problem = new RegExp(`<(failure|error)\\b${ATTRIBUTES}(\\/?)>`).exec(inner);
+    if (!problem) continue;
+    const details = attributes(problem[2]);
+    const close = inner.indexOf(`</${problem[1]}>`, problem.index);
+    const body = problem[3] ? "" : decode(inner.slice(problem.index + problem[0].length, close < 0 ? inner.length : close));
+    const file = testcase.file ? repoPath(testcase.file, cwd) : undefined;
+    const summary = (details.message ?? body.trim().split("\n")[0] ?? "").trim().split("\n").filter(Boolean).slice(0, 3).join(" ");
+    const name = [testcase.classname, testcase.name].filter(Boolean).join("::");
+    failures.push({ ...locate(body, file, cwd), code: problem[1] === "error" ? "test_error" : "test_failure", message: String(redact(`${name}: ${summary}`)).slice(0, MAX_MESSAGE) });
+  }
+  return failures;
 }

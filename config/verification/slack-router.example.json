@@ -76,11 +76,17 @@
         "-m",
         "pytest",
         "tests",
-        "-q"
+        "-q",
+        "-o",
+        "junit_family=xunit1",
+        "--junitxml={report}"
       ],
       "cwd": ".",
       "timeoutMs": 180000,
-      "ciJob": "pytest"
+      "ciJob": "pytest",
+      "report": {
+        "format": "junit"
+      }
     },
     {
       "name": "compile",
@@ -110,12 +116,17 @@
     {
       "name": "node-tests",
       "argv": [
-        "npm",
-        "test"
+        "sh",
+        "-c",
+        "npm run build && exec node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=\"$0\" 'dist/test/**/*.test.js'",
+        "{report}"
       ],
       "cwd": "agent-runtime",
       "timeoutMs": 120000,
-      "ciJob": "agent-runtime"
+      "ciJob": "agent-runtime",
+      "report": {
+        "format": "junit"
+      }
     }
   ],
   "maxRepairs": 2,

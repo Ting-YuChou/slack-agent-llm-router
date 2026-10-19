@@ -35,3 +35,24 @@ test('real Docker verifier restores trusted tests and isolates credentials and s
     } finally { await verifier.stop(); }
   } finally { await rm(root,{ recursive: true,force: true }); }
 });
+
+test('real Docker verifier reads junit reports from /out into structured failures', { skip: !process.env.PI_AGENT_VERIFICATION_TEST_IMAGE }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(),'docker-junit-'));
+  const repo = path.join(root,'repo'); await mkdir(path.join(repo,'tests'),{ recursive: true });
+  const git = (...args: string[]) => execFileSync('git',['-C',repo,...args]).toString().trim();
+  try {
+    git('init','-q'); await writeFile(path.join(repo,'tests/test_value.py'),'def test_value():\n    assert 1 == 2\n');
+    git('add','.'); git('-c','user.name=Test','-c','user.email=t@example.com','commit','-qm','baseline'); const baseline = git('rev-parse','HEAD');
+    const profile = validateProfile({ id: 'docker-junit',repository: 'org/repo',image: process.env.PI_AGENT_VERIFICATION_TEST_IMAGE,rubric: ['correct'],allowedPaths: ['tests/'],checks: [
+      { name: 'pytest',argv: ['python','-m','pytest','tests','-q','-p','no:cacheprovider','-o','junit_family=xunit1','--junitxml={report}'],cwd: '.',timeoutMs: 60_000,report: { format: 'junit' } },
+    ] });
+    const verifier = new DockerVerifier(profile);
+    try {
+      const result = await verifier.verify(await new CandidateStore(path.join(root,'artifacts')).create(repo,baseline,'junit'),new AbortController().signal);
+      const check = result.checks.find(item => item.name === 'candidate:pytest');
+      assert.equal(check?.status,'failed');
+      assert.equal(check?.failures?.[0]?.file,'tests/test_value.py');
+      assert.equal(check?.failures?.[0]?.line,2);
+    } finally { await verifier.stop(); }
+  } finally { await rm(root,{ recursive: true,force: true }); }
+});
