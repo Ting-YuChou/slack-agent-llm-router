@@ -3596,3 +3596,23 @@ async def test_modal_mode_choices_reach_create_session():
     kwargs = runtime.create_session.await_args.kwargs
     assert kwargs["task_mode"] == "discuss"
     assert kwargs["workflow_mode"] == "structured"
+
+
+@pytest.mark.asyncio
+async def test_shortcut_in_a_discuss_thread_preselects_discuss():
+    bot = SlackBot({"channels": []}, SimpleNamespace())
+    bot.web_client = _public_channel_client()
+    bot._track_agent_run(
+        {"session_id": "S1", "run_id": "R1"},
+        team_id="T1",
+        channel_id="C1",
+        thread_ts="100.1",
+        owner_user_id="U1",
+        mode="discuss",
+    )
+
+    await _open_agent_shortcut(bot)
+
+    modal = bot.web_client.views_open.await_args.kwargs["view"]
+    mode = next(b for b in modal["blocks"] if b.get("block_id") == "agent_mode")
+    assert mode["element"]["initial_option"]["value"] == "discuss"

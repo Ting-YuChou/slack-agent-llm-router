@@ -4693,9 +4693,17 @@ class SlackBot:
         runtime = self.agent_runtime_client
         cached_models = getattr(runtime, "cached_configured_models", None)
         model_refs = list(cached_models()) if callable(cached_models) else []
+        # Never preselect an upgrade of a read-only discussion thread.
+        thread = self.agent_threads.get(self._thread_key(channel_id, thread_ts)) or {}
+        initial_task_mode = (
+            "discuss"
+            if thread.get("owner_user_id") == user_id
+            and thread.get("mode") == "discuss"
+            else "implement"
+        )
         await self.web_client.views_open(
             trigger_id=trigger_id,
-            view=build_agent_shortcut_modal(nonce, model_refs),
+            view=build_agent_shortcut_modal(nonce, model_refs, initial_task_mode),
         )
 
     async def _is_public_agent_channel(self, channel_id: str) -> bool:
@@ -4869,6 +4877,8 @@ class SlackBot:
             model=submission.model,
             routing_text=submission.task,
             request_id=f"shortcut:{nonce_value}",
+            task_mode=submission.task_mode,
+            workflow_mode=submission.workflow_mode,
         )
         details = []
         if submission.include_context:

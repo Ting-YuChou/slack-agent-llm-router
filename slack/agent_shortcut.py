@@ -19,9 +19,14 @@ class AgentShortcutSubmission:
     task: str
     model: Optional[str]
     include_context: bool
+    # None when the form had no such field, so the runtime default applies.
+    task_mode: Optional[str] = None
+    workflow_mode: Optional[str] = None
 
 
-def build_agent_shortcut_modal(nonce: str, model_refs: List[str]) -> Dict[str, Any]:
+def build_agent_shortcut_modal(
+    nonce: str, model_refs: List[str], initial_task_mode: str = "implement"
+) -> Dict[str, Any]:
     blocks: List[Dict[str, Any]] = [
         {
             "type": "input",
@@ -59,12 +64,56 @@ def build_agent_shortcut_modal(nonce: str, model_refs: List[str]) -> Dict[str, A
                 },
             }
         )
+    implement_option = {
+        "text": {
+            "type": "plain_text",
+            "text": "Implement: edit and commit (edits need approval)",
+        },
+        "value": "implement",
+    }
+    discuss_option = {
+        "text": {"type": "plain_text", "text": "Discuss: read-only, no edits"},
+        "value": "discuss",
+    }
+    workflow_option = {
+        "text": {
+            "type": "mrkdwn",
+            "text": "Structured workflow: investigate in planned waves first",
+        },
+        "value": "structured",
+    }
     include_option = {
         "text": {"type": "mrkdwn", "text": "Include this Slack thread"},
         "value": "include",
     }
     blocks.extend(
         [
+            {
+                "type": "input",
+                "block_id": "agent_mode",
+                "label": {"type": "plain_text", "text": "Mode"},
+                "element": {
+                    "type": "radio_buttons",
+                    "action_id": "mode",
+                    "options": [implement_option, discuss_option],
+                    "initial_option": (
+                        discuss_option
+                        if initial_task_mode == "discuss"
+                        else implement_option
+                    ),
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "agent_workflow",
+                "optional": True,
+                "label": {"type": "plain_text", "text": "Workflow"},
+                "element": {
+                    "type": "checkboxes",
+                    "action_id": "workflow",
+                    "options": [workflow_option],
+                },
+            },
             {
                 "type": "input",
                 "block_id": "agent_context",
@@ -115,6 +164,13 @@ def parse_agent_shortcut_submission(view: Dict[str, Any]) -> AgentShortcutSubmis
         values.get("agent_context", {}).get("include", {}).get("selected_options", [])
         or []
     )
+    selected_mode = (
+        values.get("agent_mode", {}).get("mode", {}).get("selected_option") or {}
+    ).get("value")
+    workflow_options = (
+        values.get("agent_workflow", {}).get("workflow", {}).get("selected_options", [])
+        or []
+    )
     return AgentShortcutSubmission(
         task=task,
         model=selected_model.get("value") or None,
@@ -122,5 +178,17 @@ def parse_agent_shortcut_submission(view: Dict[str, Any]) -> AgentShortcutSubmis
             option.get("value") == "include"
             for option in include_options
             if isinstance(option, dict)
+        ),
+        task_mode=(
+            selected_mode if selected_mode in {"implement", "discuss"} else None
+        ),
+        workflow_mode=(
+            "structured"
+            if any(
+                option.get("value") == "structured"
+                for option in workflow_options
+                if isinstance(option, dict)
+            )
+            else None
         ),
     )
