@@ -4,6 +4,7 @@ agent:
   token_env: AGENT_RUNTIME_TOKEN
   connect_timeout_seconds: 2
   request_timeout_seconds: 910
+  control_timeout_seconds: 10
 
 api:
   host: 0.0.0.0

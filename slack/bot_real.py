@@ -162,6 +162,24 @@ AGENT_FOLLOWUP_FLAG_PATTERN = re.compile(
 )
 
 
+AGENT_RUNTIME_CREDENTIALS_TEXT = (
+    "Agent mode is misconfigured: the runtime rejected the bot's credentials."
+)
+AGENT_START_ERROR_TEXT = {
+    "session_busy": "This Agent session already has a run in progress; wait for it or use `agent stop`.",
+    "verification_profile_required": "Implement runs need a trusted verification profile here; use `--discuss` for a read-only run.",
+    "invalid_model": "That Agent model is not allowlisted.",
+    "provider_not_configured": "That Agent model's provider is not configured.",
+}
+
+
+def _agent_auth_error_text(exc: AgentRuntimeError, owner_text: str) -> str:
+    """Tell a bad bot token (`unauthorized`) apart from a non-owner (`*_forbidden`)."""
+    if exc.code == "unauthorized":
+        return AGENT_RUNTIME_CREDENTIALS_TEXT
+    return owner_text
+
+
 @dataclass(frozen=True)
 class AgentFollowupFlags:
     text: str
@@ -1260,8 +1278,10 @@ class SlackMessageHandler:
                 return f"Agent session `{tracked['session_id']}` is closed; its branch and commits were kept."
             except AgentRuntimeConflict:
                 return "That Agent action has already completed or is no longer valid."
-            except AgentRuntimeUnauthorized:
-                return "Only the Agent session owner can perform that action."
+            except AgentRuntimeUnauthorized as exc:
+                return _agent_auth_error_text(
+                    exc, "Only the Agent session owner can perform that action."
+                )
             except AgentRuntimeError:
                 return "Agent mode could not complete that control action."
 
@@ -1478,9 +1498,24 @@ class SlackMessageHandler:
             message = "Agent mode timed out while starting. Chat mode was not used as fallback."
         except AgentRuntimeUnavailable:
             message = "Agent mode is temporarily unavailable. Chat mode was not used as fallback."
-        except AgentRuntimeError:
-            logger.warning("Agent runtime could not complete the Slack task")
-            message = "Agent mode could not start this task. Chat mode was not used as fallback."
+        except AgentRuntimeUnauthorized as exc:
+            message = (
+                _agent_auth_error_text(
+                    exc, "Only the Agent session owner can continue this thread."
+                )
+                + " Chat mode was not used as fallback."
+            )
+        except AgentRuntimeError as exc:
+            known = AGENT_START_ERROR_TEXT.get(exc.code or "")
+            if known is None and isinstance(exc, AgentRuntimeConflict):
+                known = "This Agent thread cannot accept that request (for example, a different model)."
+            if known is None:
+                logger.warning(
+                    "Agent runtime could not complete the Slack task (code=%s)",
+                    exc.code,
+                )
+                known = "Agent mode could not start this task."
+            message = f"{known} Chat mode was not used as fallback."
         else:
             tracked = self.bot._track_agent_run(
                 result,
@@ -3982,11 +4017,13 @@ class SlackBot:
                 reason_category=submission.reason_category,
                 comment=submission.comment or None,
             )
-        except AgentRuntimeUnauthorized:
+        except AgentRuntimeUnauthorized as exc:
             await self.web_client.chat_postEphemeral(
                 channel=nonce.channel_id,
                 user=user_id,
-                text="Only the Agent run owner can submit result feedback.",
+                text=_agent_auth_error_text(
+                    exc, "Only the Agent run owner can submit result feedback."
+                ),
             )
             return
         except AgentRuntimeError:
@@ -4230,8 +4267,10 @@ class SlackBot:
                     value["run_id"], user_id, verdict, click_id
                 )
                 message = "Result feedback recorded."
-            except AgentRuntimeUnauthorized:
-                message = "Only the Agent run owner can submit result feedback."
+            except AgentRuntimeUnauthorized as exc:
+                message = _agent_auth_error_text(
+                    exc, "Only the Agent run owner can submit result feedback."
+                )
             except (AgentRuntimeError, KeyError, TypeError, ValueError):
                 message = "Result feedback could not be recorded. Please try again."
             await self.web_client.chat_postEphemeral(
@@ -4264,7 +4303,9 @@ class SlackBot:
             )
         except AgentRuntimeError as exc:
             if isinstance(exc, AgentRuntimeUnauthorized):
-                text = "Only the Agent session owner can approve this action."
+                text = _agent_auth_error_text(
+                    exc, "Only the Agent session owner can approve this action."
+                )
             elif isinstance(exc, AgentRuntimeConflict):
                 text = "This approval has expired or was already used."
             else:

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -68,11 +69,15 @@ class AgentRuntimeClient:
         base_url = str(config.get("base_url", "http://127.0.0.1:3001")).rstrip("/")
         connect_timeout = float(config.get("connect_timeout_seconds", 2))
         request_timeout = float(config.get("request_timeout_seconds", 910))
+        # Status, lookup and decision calls answer immediately; never let one
+        # hold a Slack handler for the long run-start timeout.
+        control_timeout = float(config.get("control_timeout_seconds", 10))
         token_env = str(config.get("token_env", "AGENT_RUNTIME_TOKEN"))
         self._token = os.getenv(token_env, "")
         self._health_cache: Optional[Dict[str, Any]] = None
         self._monotonic = time.monotonic
         self._health_timeout_seconds = min(connect_timeout, 2.0)
+        self._control_timeout = httpx.Timeout(control_timeout, connect=connect_timeout)
         self._client = httpx.AsyncClient(
             base_url=base_url,
             timeout=httpx.Timeout(request_timeout, connect=connect_timeout),
@@ -119,6 +124,7 @@ class AgentRuntimeClient:
         workflow_mode: Optional[str] = None,
         task_mode: Optional[str] = None,
         routing_text: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         payload = {
             "team_id": team_id,
@@ -140,11 +146,12 @@ class AgentRuntimeClient:
             "/v1/sessions",
             json=payload,
             expected_status=202,
+            idempotency_key=idempotency_key or uuid.uuid4().hex,
         )
         return self._validate_accepted(result)
 
     async def ci_repairs(self) -> List[Dict[str, Any]]:
-        result = await self._request("GET", "/v1/ci-repairs")
+        result = await self._request("GET", "/v1/ci-repairs", control=True)
         if not isinstance(result, list):
             raise AgentRuntimeInvalidResponse("Invalid CI repair list")
         return result
@@ -198,6 +205,7 @@ class AgentRuntimeClient:
                 "channel_id": channel_id,
                 "thread_ts": thread_ts,
             },
+            timeout=self._control_timeout,
         )
         if response.status_code != 200:
             self._raise_for_error(response)
@@ -223,6 +231,7 @@ class AgentRuntimeClient:
         routing_text: Optional[str] = None,
         workflow_mode: Optional[str] = None,
         task_mode: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         payload = {"prompt": prompt, "user_id": user_id}
         if task_mode is not None:
@@ -236,6 +245,7 @@ class AgentRuntimeClient:
             f"/v1/sessions/{session_id}/prompts",
             json=payload,
             expected_status=202,
+            idempotency_key=idempotency_key or uuid.uuid4().hex,
         )
         return self._validate_accepted(result)
 
@@ -249,13 +259,13 @@ class AgentRuntimeClient:
         return self._validate_accepted(result)
 
     async def tasks(self, run_id: str) -> List[Dict[str, Any]]:
-        result = await self._request("GET", f"/v1/runs/{run_id}/tasks")
+        result = await self._request("GET", f"/v1/runs/{run_id}/tasks", control=True)
         if not isinstance(result, list):
             raise AgentRuntimeInvalidResponse("Invalid workflow tasks")
         return result
 
     async def get_run(self, run_id: str) -> Dict[str, Any]:
-        result = await self._request("GET", f"/v1/runs/{run_id}")
+        result = await self._request("GET", f"/v1/runs/{run_id}", control=True)
         if not isinstance(result, dict):
             raise AgentRuntimeInvalidResponse(
                 "Agent runtime returned invalid run state"
@@ -314,6 +324,10 @@ class AgentRuntimeClient:
                 "decision": decision,
             },
             expected_status=202,
+            control=True,
+            # One approval card yields one decision; a retried click or
+            # request must not be applied twice.
+            idempotency_key=f"decision:{run_id}:{approval_id}:{user_id}:{decision}",
         )
 
     async def feedback(
@@ -335,6 +349,7 @@ class AgentRuntimeClient:
             f"/v1/runs/{run_id}/feedback",
             json=body,
             expected_status=202,
+            control=True,
         )
 
     async def cancel(self, run_id: str, user_id: str) -> None:
@@ -343,6 +358,7 @@ class AgentRuntimeClient:
             f"/v1/runs/{run_id}/cancel",
             json={"user_id": user_id},
             expected_status=202,
+            control=True,
         )
 
     async def close_session(self, session_id: str, user_id: str) -> None:
@@ -351,6 +367,7 @@ class AgentRuntimeClient:
             f"/v1/sessions/{session_id}/close",
             json={"user_id": user_id},
             expected_status=202,
+            control=True,
         )
 
     async def wait_for_update(
@@ -400,8 +417,11 @@ class AgentRuntimeClient:
     async def shutdown(self) -> None:
         await self.close()
 
-    def _headers(self) -> Dict[str, str]:
-        return {"authorization": f"Bearer {self._token}"}
+    def _headers(self, idempotency_key: Optional[str] = None) -> Dict[str, str]:
+        headers = {"authorization": f"Bearer {self._token}"}
+        if idempotency_key:
+            headers["idempotency-key"] = idempotency_key
+        return headers
 
     async def _request(
         self,
@@ -410,8 +430,16 @@ class AgentRuntimeClient:
         *,
         json: Optional[Dict[str, Any]] = None,
         expected_status: int = 200,
+        control: bool = False,
+        idempotency_key: Optional[str] = None,
     ) -> Any:
-        response = await self._send(method, path, json=json)
+        response = await self._send(
+            method,
+            path,
+            json=json,
+            timeout=self._control_timeout if control else None,
+            idempotency_key=idempotency_key,
+        )
         if response.status_code != expected_status:
             self._raise_for_error(response)
         try:
@@ -422,7 +450,7 @@ class AgentRuntimeClient:
             ) from exc
 
     async def _request_text(self, method: str, path: str) -> str:
-        response = await self._send(method, path)
+        response = await self._send(method, path, timeout=self._control_timeout)
         if response.status_code != 200:
             self._raise_for_error(response)
         return response.text
@@ -434,10 +462,18 @@ class AgentRuntimeClient:
         *,
         json: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, str]] = None,
+        timeout: Optional[httpx.Timeout] = None,
+        idempotency_key: Optional[str] = None,
     ) -> httpx.Response:
+        extra: Dict[str, Any] = {"timeout": timeout} if timeout is not None else {}
         try:
             return await self._client.request(
-                method, path, headers=self._headers(), json=json, params=params
+                method,
+                path,
+                headers=self._headers(idempotency_key),
+                json=json,
+                params=params,
+                **extra,
             )
         except httpx.TimeoutException as exc:
             raise AgentRuntimeTimeout("Agent runtime request timed out") from exc
