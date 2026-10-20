@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { BudgetAdmissionLedger } from './budget-rpc.js';
 import { priceFor } from "./run-budget.js";
-export interface ModelPrice { input: number; output: number }
+/** USD per million tokens; `cacheRead` prices cached input when the provider reports it. */
+export interface ModelPrice { input: number; output: number; cacheRead?: number }
 /** Without a role-bound limit (classifier, legacy tokens) output stays at the historical conservative cap. */
 const DEFAULT_OUTPUT_LIMIT = 4096;
 
@@ -16,7 +17,7 @@ export async function admitBudget(ledger: BudgetAdmissionLedger | undefined, pri
   const encoded = Buffer.from(JSON.stringify(body)); const id = randomUUID();
   // UTF-8 byte count overestimates input tokens; cache discounts are intentionally ignored.
   await ledger.reserve(workflow, id, (encoded.length * price.input + effective * price.output) / 1_000_000, execution);
-  let pending = "", input: number | undefined, output: number | undefined, truncated = false;
+  let pending = "", input: number | undefined, cached = 0, output: number | undefined, truncated = false;
   const decoder = new TextDecoder();
   function usage(value: any) {
     // OpenAI Responses: incomplete_details; Anthropic: stop_reason; chat completions: finish_reason.
@@ -24,7 +25,9 @@ export async function admitBudget(ledger: BudgetAdmissionLedger | undefined, pri
     const candidate = value?.response?.usage ?? value?.message?.usage ?? value?.usage;
     if (!candidate) return;
     const i = candidate.input_tokens ?? candidate.prompt_tokens, o = candidate.output_tokens ?? candidate.completion_tokens;
-    if (Number.isFinite(i) && i >= 0) input = i + (Number(candidate.cache_creation_input_tokens) || 0) + (Number(candidate.cache_read_input_tokens) || 0);
+    // OpenAI counts cached tokens inside input_tokens; Anthropic reports cache reads beside it.
+    const openaiCached = Number(candidate.input_tokens_details?.cached_tokens) || 0, anthropicRead = Number(candidate.cache_read_input_tokens) || 0;
+    if (Number.isFinite(i) && i >= 0) { const total = i + (Number(candidate.cache_creation_input_tokens) || 0) + anthropicRead; input = total; cached = Math.min(total, openaiCached + anthropicRead); }
     if (Number.isFinite(o) && o >= 0) output = o;
   }
   return {
@@ -37,7 +40,8 @@ export async function admitBudget(ledger: BudgetAdmissionLedger | undefined, pri
     },
     finish: async () => {
       try { usage(JSON.parse(pending)); } catch { /* unknown usage keeps its full reservation */ }
-      try { await ledger.settle(id, input === undefined || output === undefined ? null : (input * price.input + output * price.output) / 1_000_000); }
+      const cacheRead = Number.isFinite(price.cacheRead) && price.cacheRead! >= 0 ? price.cacheRead! : price.input;
+      try { await ledger.settle(id, input === undefined || output === undefined ? null : ((input - cached) * price.input + cached * cacheRead + output * price.output) / 1_000_000); }
       catch { /* Unacknowledged settlement retains the original reservation. */ }
       return { truncated };
     },

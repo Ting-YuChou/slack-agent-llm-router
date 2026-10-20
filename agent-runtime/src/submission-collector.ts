@@ -37,7 +37,8 @@ export async function collectSubmission<T>(options: CollectSubmissionOptions<T>)
   const done = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
   const onEvent = (event: PublicRunEvent) => {
     if (event.type === "usage") { cost += event.cost_usd; options.usage?.(event.cost_usd); }
-    if (event.type === "settled") resolve();
+    // A provider error before any submission is an execution failure, not a grader that chose not to submit.
+    if (event.type === "settled") { if (event.outcome === "error" && !submitted) reject(errors.failed(event.error_message ?? event.stop_reason ?? "error")); else resolve(); }
     if (event.type === "error") reject(errors.failed(event.code));
     if (event.type === "approval") reject(errors.failed("approval requested"));
   };

@@ -31,6 +31,6 @@ export function priceFor(ref: string, configured: Record<string, ModelPrice>): M
   if (configured[ref]) return configured[ref];
   try {
     const { cost } = resolveAgentModel(ref);
-    return cost.input > 0 ? { input: cost.input, output: cost.output } : undefined;
+    return cost.input > 0 ? { input: cost.input, output: cost.output, cacheRead: cost.cacheRead } : undefined;
   } catch { return undefined; }
 }

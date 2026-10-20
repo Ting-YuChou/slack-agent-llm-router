@@ -523,6 +523,13 @@ def main(argv=None):
             for metric in CONTRACT_METRICS
             if _number(summary.get(metric)) is None
         ]
+        # A new baseline must itself satisfy the hand-set ceilings.
+        ceilings = _read_baseline(args.baseline).get("ceilings") or DEFAULT_CEILINGS
+        failures += [
+            failure
+            for failure in evaluate_contract(summary, {"ceilings": ceilings})
+            if "exceeds ceiling" in failure
+        ]
         if not failures:
             write_baseline(summary, args.baseline, args.records)
     else:
