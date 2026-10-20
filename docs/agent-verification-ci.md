@@ -16,6 +16,19 @@ The workflow keeps Pi 1.0.1. A repository opts in by setting an external trusted
 
 `status` retains the existing API contract. `phase`, `execution_status`, `verification_status`, `grader_status`, `publication_status`, attempts and timing provide separate workflow results. Owner feedback remains independent.
 
+### Runs without a profile
+
+Without a profile, the default `PI_AGENT_APPROVAL_MODE=delivery` asks the owner only before delivery. Writes inside the worktree are not approved one by one, and `pytest` / `npm test` run without a prompt even after the agent has edited tests or source. Code the agent wrote therefore runs inside the sandbox with no human gate. This is a deliberate trade-off (decided 2026-10-20) and is pinned by `policy-extension.test.ts` ("write approval mode none …").
+
+The sandbox, not the approval, is the boundary:
+
+- The container has no network except the model gateway; credentials are stripped from the bash environment.
+- The gateway refuses provider-side tools, `store`, URL-sourced message inputs (image, file and document URLs) and over-limit concurrent streams per run, so code in the container cannot make the provider fetch or post to an arbitrary URL.
+- The budget RPC bearer is derived from, and never equal to, the gateway signing secret.
+- Every model request is metered against a run budget.
+
+Still open (Phase 4 Track S): the gateway token remains readable from `/proc/1/environ` inside the container until per-execution credential refresh lands, and runs share one internal network until per-run networks land. Deployments that cannot accept this should set `PI_AGENT_REQUIRE_VERIFICATION=1`, which limits runs without a profile to `--discuss`.
+
 ## Required setup
 
 Build the verification image from the repository root:
