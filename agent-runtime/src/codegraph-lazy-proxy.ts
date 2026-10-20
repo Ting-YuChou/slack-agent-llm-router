@@ -4,6 +4,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { MCP_SERVERS } from "./mcp-config.js";
+import { hardenedGitEnv } from "./worktree-manager.js";
 
 const exec = promisify(execFile);
 const EXCLUDED_PARTS = new Set([".git", ".codegraphcontext", "node_modules", "vendor", "dist", "build", ".next", "coverage", "__pycache__", ".venv", "venv"]);
@@ -23,7 +24,7 @@ export async function createSanitizedMirror(worktree: string, stateRoot: string,
   const mirror = path.join(stateRoot, "mirror");
   await rm(mirror, { recursive: true, force: true });
   await mkdir(mirror, { recursive: true, mode: 0o700 });
-  const { stdout } = await exec("git", ["ls-files", "-co", "--exclude-standard", "-z"], { cwd: worktree, encoding: "buffer", maxBuffer: 16 * 1024 * 1024 });
+  const { stdout } = await exec("git", ["ls-files", "-co", "--exclude-standard", "-z"], { cwd: worktree, env: hardenedGitEnv(), encoding: "buffer", maxBuffer: 16 * 1024 * 1024 });
   const entries = stdout.toString("utf8").split("\0").filter(Boolean);
   let count = 0; let total = 0;
   for (const relative of entries) {

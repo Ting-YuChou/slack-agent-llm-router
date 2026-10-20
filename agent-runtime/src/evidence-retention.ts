@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { readdir, stat, rm } from "node:fs/promises";
+import { readdir, lstat, rm } from "node:fs/promises";
 import path from "node:path";
 const exec = promisify(execFile);
 
@@ -13,21 +13,28 @@ export async function pruneEvidence(root: string, mounts: string[], before: numb
       if (!entry.isDirectory()) continue;
       const candidate = path.resolve(directory, entry.name);
       if (active.some(mount => candidate === mount || mount.startsWith(candidate + path.sep) || candidate.startsWith(mount + path.sep))) continue;
-      if ((await stat(candidate)).mtimeMs >= before) continue;
-      // Session JSONL files can be appended without updating their parent directory.
-      let scanned = 0;
-      async function recent(directory: string): Promise<boolean> {
-        for (const child of await readdir(directory, { withFileTypes: true })) {
-          if (++scanned > 10_000) return true;
-          const location = path.join(directory, child.name);
-          if ((await stat(location)).mtimeMs >= before) return true;
-          if (child.isDirectory() && await recent(location)) return true;
-        }
-        return false;
-      }
-      if (!await recent(candidate)) await rm(candidate, { recursive: true, force: true });
+      // One unreadable entry keeps only itself; the rest of the pass still runs.
+      try { await pruneEntry(candidate, before); }
+      catch { console.error(JSON.stringify({ event: "agent_evidence_prune_failed", category })); }
     }
   }
+}
+
+/** Removes an expired evidence directory unless something inside it changed recently. lstat: links are never followed. */
+async function pruneEntry(candidate: string, before: number): Promise<void> {
+  if ((await lstat(candidate)).mtimeMs >= before) return;
+  // Session JSONL files can be appended without updating their parent directory.
+  let scanned = 0;
+  async function recent(directory: string): Promise<boolean> {
+    for (const child of await readdir(directory, { withFileTypes: true })) {
+      if (++scanned > 10_000) return true;
+      const location = path.join(directory, child.name);
+      if ((await lstat(location)).mtimeMs >= before) return true;
+      if (child.isDirectory() && await recent(location)) return true;
+    }
+    return false;
+  }
+  if (!await recent(candidate)) await rm(candidate, { recursive: true, force: true });
 }
 export function startEvidenceRetention(root: string, pruneControl?: () => void) {
   let pending: Promise<void> | undefined;
