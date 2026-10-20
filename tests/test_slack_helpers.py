@@ -2995,6 +2995,31 @@ def test_agent_status_line_appends_next_step_for_known_codes(error):
     assert line.endswith(f"\nNext step: {AGENT_ERROR_HINTS[key]}")
 
 
+def _runtime_cause_codes():
+    import re
+    from pathlib import Path
+
+    source = Path("agent-runtime/src/error-taxonomy.ts").read_text()
+    union = re.search(r"export type CauseCode =(.*?);", source, re.S)
+    assert union, "CauseCode union not found in error-taxonomy.ts"
+    codes = re.findall(r'"([a-z_]+)"', union.group(1))
+    assert len(codes) >= 16
+    return codes
+
+
+@pytest.mark.parametrize("cause", _runtime_cause_codes())
+def test_every_runtime_cause_code_has_a_next_step_hint(cause):
+    line = _format_agent_status_line(
+        {
+            "run_id": "r1",
+            "status": "failed",
+            "error": {"code": "verification_failed", "cause_code": cause},
+        }
+    )
+    assert cause in AGENT_ERROR_HINTS
+    assert line.endswith(f"\nNext step: {AGENT_ERROR_HINTS[cause]}")
+
+
 def test_agent_status_line_prefers_cause_code_hint_over_code_hint():
     line = _format_agent_status_line(
         {

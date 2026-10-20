@@ -106,6 +106,58 @@ AGENT_ERROR_HINTS = {
         "Docker is unavailable on the runtime host; ask an operator to start it, "
         "then retry."
     ),
+    "snapshot_too_large": (
+        "The change was too large to snapshot for verification; split it into "
+        "smaller changes or drop large generated files, then retry."
+    ),
+    "candidate_changed": (
+        "The worktree changed while it was being verified; retry the run, "
+        "and report it if it keeps happening."
+    ),
+    "candidate_artifact_missing": (
+        "The verified change could not be found; retry the run, and ask an "
+        "operator to check the runtime's artifact storage if it repeats."
+    ),
+    "verification_stop_unconfirmed": (
+        "The verification container could not be confirmed stopped; ask an "
+        "operator to check the runtime host before retrying."
+    ),
+    "grader_did_not_submit": (
+        "The grader finished without a verdict; retry the run, and report it "
+        "if it keeps happening."
+    ),
+    "grader_invalid_submission": (
+        "The grader's verdict was malformed and rejected; retry the run, and "
+        "report it if it keeps happening."
+    ),
+    "grader_execution_failed": (
+        "The grader could not run (often a model or budget limit); retry later, "
+        "or ask an operator to check the model gateway."
+    ),
+    "investigation_timeout": (
+        "The investigation ran out of time; narrow the question or point to the "
+        "relevant files, then retry."
+    ),
+    "investigation_missing_structured_result": (
+        "The investigation ended without a structured result; retry the run, "
+        "and report it if it keeps happening."
+    ),
+    "investigation_invalid_submission": (
+        "The investigation's result was malformed and rejected; retry the run, "
+        "and report it if it keeps happening."
+    ),
+    "investigation_execution_failed": (
+        "The investigation could not run (often a model or budget limit); retry "
+        "later, or ask an operator to check the model gateway."
+    ),
+    "investigation_reported_unknown": (
+        "The investigation could not find the cause; add the error, logs or "
+        "steps to reproduce, then retry."
+    ),
+    "investigation_stop_unconfirmed": (
+        "The investigation container could not be confirmed stopped; ask an "
+        "operator to check the runtime host before retrying."
+    ),
     "delivery_expired": (
         "The delivery approval expired; rerun the request and approve it in time."
     ),
