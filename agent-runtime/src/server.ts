@@ -23,6 +23,7 @@ import { repositoryFromRemote, parseGitHubRepositories } from "./github-reposito
 import { issueClassifierGatewayToken, issueGatewayToken } from "./gateway-token.js";
 import { allServerTools, enabledMcpServers, MCP_SERVERS, parseMcpMode, parseMcpServers, type McpServerId, type McpRunServer } from "./mcp-config.js";
 import { deriveMcpServerSecret, issueMcpToken } from "./mcp-token.js";
+import { deriveBudgetRpcSecret } from "./budget-rpc.js";
 import {
   CodingAgentOrchestrator,
   publicRun,
@@ -560,9 +561,11 @@ export async function createProductionServer() {
   const stopRetention = startEvidenceRetention(runtimeRoot, workflowControl ? () => workflowControl.pruneWorkflowContent(Date.now() - 30 * 86400000) : undefined);
   if (process.env.PI_AGENT_CI_REPAIR_ENABLED === "true" && !trustedProfile) throw new Error("CI repair requires PI_AGENT_VERIFICATION_PROFILE");
   ciRuntime = process.env.PI_AGENT_CI_REPAIR_ENABLED === "true" ? await createCiRuntime({ profile: trustedProfile!.profile, root: runtimeRoot, repoPath, worktreeRoot, orchestrator, telemetry, tracing, verificationBases, priorActive }) : undefined;
-  const runtimeHealthy = () => integrityHealthy && stateStore.healthy && (workflowControl?.healthy ?? true) && (ciRuntime?.ci.healthy ?? true);
+  let processHealthy = true;
+  guardProcess(process, () => { processHealthy = false; });
+  const runtimeHealthy = () => processHealthy && integrityHealthy && stateStore.healthy && (workflowControl?.healthy ?? true) && (ciRuntime?.ci.healthy ?? true);
   const server = createAgentHttpServer({
-    budgetLedger, budgetSecret: gatewaySecret,
+    budgetLedger, budgetSecret: deriveBudgetRpcSecret(gatewaySecret),
     ci: ciRuntime?.ci,
     feedback: telemetry ? (run, payload, id) => telemetry.record(run.run_id, run.session_id, "feedback", payload, id) : undefined,
     orchestrator,
@@ -612,6 +615,7 @@ export async function createProductionServer() {
         ...lock.errors,
         ...skillLock.errors,
         ...(!stateStore.healthy ? ["Runtime control store is unavailable"] : []),
+        ...(!processHealthy ? ["An unhandled rejection occurred; restart the runtime"] : []),
         ...(mcpServerIds.some((id) => mcpServerReachable[id] === false) ? ["An optional MCP gateway is unreachable"] : []),
       ],
     }),
@@ -750,6 +754,19 @@ export function parseSafeCommands(value: string | undefined, options: { profiled
   if (!value) return options.profiled ? defaults.filter(command => !TEST_RUNNERS.has(command)) : defaults;
   return value.split("||").map((command) => command.trim()).filter(Boolean);
 }
+/**
+ * Node ends the process on an unhandled rejection; the runtime instead logs it and goes unhealthy,
+ * so it stops taking new runs while keeping worktrees and evidence for an operator.
+ */
+export function guardProcess(target: NodeJS.EventEmitter, onFailure: (error: unknown) => void, log: (line: string) => void = line => process.stderr.write(`${line}\n`)): () => void {
+  const handler = (reason: unknown) => {
+    log(JSON.stringify({ event: "agent_runtime_unhandled_rejection", error: reason instanceof Error ? reason.name : typeof reason }));
+    onFailure(reason);
+  };
+  target.on("unhandledRejection", handler);
+  return () => { target.off("unhandledRejection", handler); };
+}
+
 function logEvent(event: string, fields: Record<string, unknown>): void {
   process.stdout.write(`${JSON.stringify({ event, ...fields })}\n`);
 }

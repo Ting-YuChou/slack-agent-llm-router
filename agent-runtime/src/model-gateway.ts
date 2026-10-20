@@ -1,4 +1,4 @@
-import { BudgetRpcClient, type BudgetAdmissionLedger } from "./budget-rpc.js";
+import { BudgetRpcClient, deriveBudgetRpcSecret, type BudgetAdmissionLedger } from "./budget-rpc.js";
 import { BudgetLedger } from "./budget-ledger.js";
 import { admitBudget, type ModelPrice } from "./gateway-budget.js";
 import { allowedAnthropicBeta, sanitizeAgentRequest } from "./gateway-request-policy.js";
@@ -336,7 +336,7 @@ function sendJson(response: ServerResponse, status: number, payload: unknown): v
 
 /** Every agent request must be metered; a gateway without a budget store would pass requests through unbounded. */
 export function gatewayLedgerFromEnv(env: NodeJS.ProcessEnv, secret: string): BudgetAdmissionLedger {
-  if (env.PI_AGENT_BUDGET_RPC_URL) return new BudgetRpcClient(env.PI_AGENT_BUDGET_RPC_URL, secret);
+  if (env.PI_AGENT_BUDGET_RPC_URL) return new BudgetRpcClient(env.PI_AGENT_BUDGET_RPC_URL, deriveBudgetRpcSecret(secret));
   if (env.PI_AGENT_BUDGET_FILE) return new BudgetLedger(env.PI_AGENT_BUDGET_FILE);
   throw new Error("PI_AGENT_BUDGET_RPC_URL (or PI_AGENT_BUDGET_FILE) is required so every model request is metered");
 }
