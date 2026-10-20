@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, realpath, stat } from "node:fs/promises";
+import { mkdir, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -12,6 +12,8 @@ export interface WorktreeInfo {
   path: string;
   branch: string;
   baselineCommit: string;
+  /** The session's own bare mirror: the only Git metadata its container may mount. */
+  gitDir: string;
 }
 
 export class ProtectedFileError extends DiffLimitError {}
@@ -30,6 +32,9 @@ export interface DiffSummary {
   stat: string;
 }
 
+const MIRROR_DIR = "mirrors";
+const BASELINE_KEY = "pi-agent.baseline";
+
 export class WorktreeManager {
   private readonly repoPath: string;
   private readonly worktreeRoot: string;
@@ -41,19 +46,31 @@ export class WorktreeManager {
     this.baseRef = options.baseRef;
   }
 
+  /**
+   * Gives the session its own bare mirror holding only the baseline's history, so the writer can
+   * never read other branches, other sessions' commits or the host repository's config. The mirror
+   * is a full copy of that history (no alternates, which would expose every object), so each
+   * session costs the baseline's packed size on disk.
+   */
   async create(runId: string, trustedBase?: string): Promise<WorktreeInfo> {
-    await mkdir(this.worktreeRoot, { recursive: true });
+    await mkdir(path.join(this.worktreeRoot, MIRROR_DIR), { recursive: true });
     const safeId = runId.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64) || "run";
     const date = new Date().toISOString().slice(0, 10).replaceAll("-", "");
     const branch = `pi-agent/${date}-${safeId}`;
     const worktreePath = path.join(this.worktreeRoot, `${date}-${safeId}`);
+    const mirror = this.mirrorFor(worktreePath);
     const baselineCommit = await this.git(this.repoPath, "rev-parse", "--verify", `${trustedBase ?? this.baseRef}^{commit}`);
     try {
-      await this.git(this.repoPath, "worktree", "add", "-b", branch, worktreePath, baselineCommit);
+      await this.git(this.worktreeRoot, "init", "--quiet", "--bare", mirror);
+      await this.git(this.repoPath, "-c", "core.hooksPath=/dev/null", "push", "--quiet", "--no-verify", "--no-follow-tags",
+        "--recurse-submodules=no", mirror, `${baselineCommit}:refs/heads/${branch}`);
+      await this.git(mirror, "config", BASELINE_KEY, baselineCommit);
+      await this.git(mirror, "-c", "core.hooksPath=/dev/null", "worktree", "add", "--quiet", worktreePath, branch);
     } catch (error) {
+      await rm(mirror, { recursive: true, force: true }).catch(() => undefined);
       throw new WorktreeError("Unable to create isolated Git worktree", { cause: error });
     }
-    return { path: await realpath(worktreePath), branch, baselineCommit };
+    return { path: await realpath(worktreePath), branch, baselineCommit, gitDir: await realpath(mirror) };
   }
 
   async inspectDiff(worktreePath: string, limits: DiffLimits): Promise<DiffSummary> {
@@ -97,6 +114,7 @@ export class WorktreeManager {
     return this.gitRaw(worktreePath, "diff", "--binary", "HEAD", "--");
   }
 
+  /** Commits the worktree and, for a mirrored session, publishes its branch to the main repository. */
   async commit(worktreePath: string, message: string): Promise<string> {
     await this.assertManagedPath(worktreePath);
     await this.git(worktreePath, "add", "--all", "--", ".");
@@ -109,6 +127,8 @@ export class WorktreeManager {
         "commit", "--no-verify", "--no-gpg-sign", "-m", message,
       );
     }
+    const mirror = await this.existingMirror(worktreePath);
+    if (mirror) await this.publish(mirror, await this.sessionBranch(worktreePath));
     return this.git(worktreePath, "rev-parse", "HEAD");
   }
 
@@ -118,9 +138,65 @@ export class WorktreeManager {
     await this.git(worktreePath, "clean", "-fdx");
   }
 
+  /**
+   * Removes the worktree and its mirror. Commits past the baseline are published first, so they
+   * survive in the main repository; a branch there that never moved past the baseline is deleted.
+   * A legacy worktree on the shared repository metadata keeps its branch, as before mirrors.
+   */
   async remove(worktreePath: string): Promise<void> {
     await this.assertManagedPath(worktreePath);
-    await this.git(this.repoPath, "worktree", "remove", "--force", path.resolve(worktreePath));
+    const mirror = await this.existingMirror(worktreePath);
+    if (!mirror) {
+      await this.git(this.repoPath, "worktree", "remove", "--force", path.resolve(worktreePath));
+      return;
+    }
+    const branch = await this.sessionBranch(worktreePath);
+    const baseline = await this.git(mirror, "config", "--get", BASELINE_KEY);
+    if (!await this.isAncestor(mirror, `refs/heads/${branch}`, baseline)) await this.publish(mirror, branch);
+    await this.git(mirror, "worktree", "remove", "--force", path.resolve(worktreePath));
+    await rm(mirror, { recursive: true, force: true });
+    const published = await this.git(this.repoPath, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`).catch(() => "");
+    if (published && await this.isAncestor(this.repoPath, published, baseline)) {
+      await this.git(this.repoPath, "branch", "-D", "--", branch);
+    }
+  }
+
+  /** The bare mirror backing a managed worktree; derived from the host-side layout, never from agent-writable files. */
+  private mirrorFor(worktreePath: string): string {
+    return path.join(this.worktreeRoot, MIRROR_DIR, `${path.basename(path.resolve(worktreePath))}.git`);
+  }
+
+  private async existingMirror(worktreePath: string): Promise<string | undefined> {
+    const mirror = this.mirrorFor(worktreePath);
+    try {
+      if (!(await stat(mirror)).isDirectory()) return undefined;
+    } catch {
+      return undefined;
+    }
+    const common = path.resolve(worktreePath, await this.git(worktreePath, "rev-parse", "--git-common-dir"));
+    if (await realpath(common) !== await realpath(mirror)) throw new WorktreeError("Worktree is not backed by its session mirror");
+    return mirror;
+  }
+
+  private async sessionBranch(worktreePath: string): Promise<string> {
+    const branch = await this.git(worktreePath, "symbolic-ref", "--short", "HEAD");
+    if (!branch.startsWith("pi-agent/")) throw new WorktreeError("Worktree is not on its session branch");
+    return branch;
+  }
+
+  /** Fast-forwards the main repository's copy of the session branch from the mirror; never forces. */
+  private async publish(mirror: string, branch: string): Promise<void> {
+    await this.git(this.repoPath, "-c", "core.hooksPath=/dev/null", "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+      "--recurse-submodules=no", mirror, `refs/heads/${branch}:refs/heads/${branch}`);
+  }
+
+  private async isAncestor(cwd: string, commit: string, of: string): Promise<boolean> {
+    try {
+      await this.git(cwd, "merge-base", "--is-ancestor", commit, of);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async assertManagedPath(candidate: string): Promise<void> {
@@ -158,6 +234,11 @@ export class WorktreeManager {
     });
     return result.stdout;
   }
+}
+
+/** Container mount for a session's Git metadata: its mirror, or the shared metadata a legacy session's worktree points at. */
+export function writerGitDir(session: { gitDir?: string }, sharedGitDir: string): string {
+  return session.gitDir ?? sharedGitDir;
 }
 
 /**

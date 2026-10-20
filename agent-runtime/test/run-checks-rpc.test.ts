@@ -129,7 +129,7 @@ test("real Pi writer completes a run_checks round trip through the dialog channe
     const settled = new Promise<void>(resolve => { resolveSettled = resolve; });
     const report = { status: "failed", checks: [{ name: "lint", status: "failed" }], report: `src/a.js:1:1 E1 ${marker}` };
     piProcess = new DockerPiProcess({
-      name: `pi-checks-${suffix}`, image, network, worktreePath: isolated.path, gitMetadataPath: path.join(repo, ".git"), sessionStatePath,
+      name: `pi-checks-${suffix}`, image, network, worktreePath: isolated.path, gitMetadataPath: isolated.gitDir, sessionStatePath,
       gatewayUrl: "http://model-gateway:8080", modelRef: "openai/gpt-5.6-luna",
       extensionPaths: ["/opt/pi/extensions/model-gateway.ts", "/opt/pi/extensions/checks.ts"], pluginPaths: [], skillPaths: [],
       toolNames: ["read", "run_checks"], checksContext: { checks: ["lint"], defaultChecks: ["lint"], maxCalls: 2 },

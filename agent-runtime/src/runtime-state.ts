@@ -10,6 +10,8 @@ export interface PersistedSession {
   modelRef?: string;
   autoRouting?: boolean;
   worktreePath: string;
+  /** The session's own Git mirror; sessions persisted before mirrors lack it and keep the shared metadata. */
+  gitDir?: string;
   branch: string;
   baselineCommit: string;
   closed: boolean;

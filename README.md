@@ -491,6 +491,20 @@ never pushes, merges, or modifies the current checkout. Rejected, cancelled,
 failed, and timed-out prompts roll their isolated worktree back to the previous
 successful commit. Agent failures never silently fall back to Chat mode.
 
+Each session's worktree is backed by its own bare Git mirror under
+`<PI_AGENT_WORKTREE_ROOT>/mirrors/`. The mirror holds only the baseline commit's
+history and the session branch. The container mounts that mirror read-only and
+never the host repository's Git directory, so the agent cannot read other
+branches, other sessions' commits, or the host `.git/config`. Delivery commits
+on the host, then fetches the branch into the main repository, so the branch
+and its commits stay there after the session closes. Closing a session deletes
+its mirror, plus the main-repository branch if it never moved past the
+baseline. The isolation has a disk cost: every session stores a full copy of
+the baseline history, about the size of the repository's packed objects.
+Mirrors cannot use Git alternates to share objects, because alternates would
+expose every object in the host repository. Sessions saved before mirrors
+existed keep using the shared metadata until they close.
+
 Agent bootstrap context is read-only reference data. The default limits are 20
 messages, 10 resources, 4,000 message characters, 8,000 resource characters,
 and 12,000 characters total. UTF-8 text/code files and up to 100 current Slack

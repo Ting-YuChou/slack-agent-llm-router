@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 import { parseAgentLimitConfig } from "../src/agent-limits.js";
 import { buildAgentDockerArgs, buildAgentSpawnEnv, DockerPiProcess } from "../src/container-runtime.js";
+import { WorktreeManager, writerGitDir } from "../src/worktree-manager.js";
 
 test("agent container is non-root, resource-limited, read-only, and internal-network only", () => {
   const args = buildAgentDockerArgs({
@@ -228,4 +230,33 @@ test("the write-approval mode reaches the writer only when the host sets it", ()
   assert.ok(buildAgentDockerArgs({ ...base, writeApproval: "none" }).includes("PI_AGENT_WRITE_APPROVAL=none"));
   assert.ok(buildAgentDockerArgs({ ...base, writeApproval: "per_prompt" }).includes("PI_AGENT_WRITE_APPROVAL=per_prompt"));
   assert.doesNotMatch(buildAgentDockerArgs(base).join(" "), /PI_AGENT_WRITE_APPROVAL/);
+});
+
+test("the writer mounts its session's git mirror read-only and never the host git-common-dir", async () => {
+  const repo = await mkdtemp(path.join(os.tmpdir(), "pi-mount-repo-"));
+  const worktreeRoot = await mkdtemp(path.join(os.tmpdir(), "pi-mount-worktrees-"));
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
+  git("init", "-q", "-b", "main");
+  await writeFile(path.join(repo, "README.md"), "base\n");
+  git("add", "README.md");
+  git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "base");
+  const shared = path.resolve(repo, git("rev-parse", "--git-common-dir"));
+  const created = await new WorktreeManager({ repoPath: repo, worktreeRoot, baseRef: "HEAD" }).create("mounts");
+  const options = {
+    name: "pi-session-mirror", image: "pi-agent@sha256:abc", network: "pi-model-only", sessionStatePath: "/runtime/s",
+    gatewayUrl: "http://model-gateway:8080/v1", gatewayToken: "short-token", modelRef: "openai/gpt-5.6-luna", extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
+  };
+  const mounts = (args: string[]) => args.flatMap((arg, index) => args[index - 1] === "--mount" ? [arg] : []);
+
+  const writer = mounts(buildAgentDockerArgs({ ...options, worktreePath: created.path, gitMetadataPath: writerGitDir(created, shared) }));
+  assert.ok(writer.includes(`type=bind,src=${created.gitDir},dst=${created.gitDir},readonly`), writer.join("\n"));
+  assert.ok(writer.includes(`type=bind,src=${created.path}/.git,dst=${created.path}/.git,readonly`), writer.join("\n"));
+  const realShared = await realpath(shared);
+  assert.ok(!writer.some((mount) => mount.includes(`src=${shared}`) || mount.includes(`src=${realShared}`)), writer.join("\n"));
+
+  // A session restored from before mirrors keeps the shared metadata its worktree points at.
+  const legacy = mounts(buildAgentDockerArgs({ ...options, worktreePath: "/legacy/w", gitMetadataPath: writerGitDir({}, shared) }));
+  assert.ok(legacy.includes(`type=bind,src=${shared},dst=${shared},readonly`), legacy.join("\n"));
+  await rm(repo, { recursive: true, force: true });
+  await rm(worktreeRoot, { recursive: true, force: true });
 });
