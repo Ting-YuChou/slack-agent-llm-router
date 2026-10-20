@@ -10,7 +10,7 @@ import { parseRunnerRecords, MAX_LOG_BYTES, type RunnerSpec } from "./verificati
 import { excerpt, MAX_REPORT_BYTES, parseDiagnostics, parseJUnit, type CheckFailure } from "./check-report.js";
 import { dockerUnavailable, HarnessError } from "./error-taxonomy.js";
 import type { FixerSpec } from "./fixers.js";
-import type { Candidate, CheckStatus, VerificationCheck, VerificationResult } from "./quality-gate.js";
+import type { Candidate, CheckStatus, GraderSampling, VerificationCheck, VerificationResult } from "./quality-gate.js";
 import { RESOURCE_LIMIT_FLAGS } from "./container-flags.js";
 import { hardenedGitEnv } from "./worktree-manager.js";
 const exec = promisify(execFile);
@@ -29,6 +29,8 @@ export interface VerificationProfile {
   writerChecks?: { defaultChecks: string[]; maxCalls: number; reserveMs?: number };
   /** Deterministic formatters run on the candidate before verification; they may only touch files the diff changed. */
   fixers?: FixerSpec[];
+  /** Independent grader samples per candidate and how they combine; 1 / unanimous unless the profile asks for more. */
+  grader?: GraderSampling;
 }
 export const REPORT_TOKEN = "{report}";
 /** File-safe check name used for /out/<check>.report and /out/<check>.log. */
@@ -47,6 +49,10 @@ export function validateProfile(raw: unknown): VerificationProfile {
     const w = p.writerChecks;
     if (!w || typeof w !== "object" || (w.maxCalls !== undefined && (!Number.isInteger(w.maxCalls) || w.maxCalls < 1 || w.maxCalls > 10)) || (w.defaultChecks !== undefined && (!Array.isArray(w.defaultChecks) || !w.defaultChecks.length || w.defaultChecks.some(name => !p.checks.some(c => c.name === name)))) || (w.reserveMs !== undefined && (!Number.isInteger(w.reserveMs) || w.reserveMs < 60_000 || w.reserveMs > 900_000))) throw new Error("Invalid writer checks");
   }
+  if (p.grader !== undefined) {
+    const g = p.grader as Partial<GraderSampling> | null;
+    if (!g || typeof g !== "object" || Array.isArray(g) || Object.keys(g).some(key => key !== "samples" && key !== "aggregate") || (g.samples !== undefined && g.samples !== 1 && g.samples !== 3) || (g.aggregate !== undefined && g.aggregate !== "unanimous" && g.aggregate !== "majority")) throw new Error("Invalid grader sampling");
+  }
   if (p.isolation !== undefined && !["per_mode", "per_check"].includes(p.isolation)) throw new Error("Invalid verification isolation");
   if (p.fixers !== undefined && (!Array.isArray(p.fixers) || p.fixers.length > 5 || p.fixers.some(f => !f || typeof f.name !== "string" || !/^[\w.-]{1,64}$/.test(f.name) || !Array.isArray(f.argv) || !f.argv.length || f.argv.some(x => typeof x !== "string" || x.includes("\0") || x.includes(REPORT_TOKEN)) || typeof f.cwd !== "string" || !safeRelative(f.cwd) || !Number.isInteger(f.timeoutMs) || f.timeoutMs <= 0 || f.timeoutMs > 300_000) || new Set(p.fixers.map(f => f.name)).size !== p.fixers.length)) throw new Error("Invalid fixers");
   if (p.checks.some(c => c.kind !== undefined && !["static", "test"].includes(c.kind))) throw new Error("Invalid check kind");
@@ -64,7 +70,7 @@ export function validateProfile(raw: unknown): VerificationProfile {
     if (!Number.isInteger(config.concurrency) || config.concurrency < 1 || config.concurrency > 4 || !Number.isFinite(config.maxCostUsd) || config.maxCostUsd <= 0 || config.maxCostUsd > 5 || !Number.isInteger(config.activeTimeoutMs) || config.activeTimeoutMs <= 0 || config.activeTimeoutMs > 1_800_000 || !Number.isFinite(config.discoveryCostUsd) || config.discoveryCostUsd <= 0 || config.discoveryCostUsd >= config.maxCostUsd || typeof config.degradeUnknown !== 'boolean') throw new Error('Invalid structured workflow limits');
     p.structuredWorkflow = config;
   }
-  return { ...p, isolation: p.isolation ?? "per_mode", writerChecks: { defaultChecks: p.writerChecks?.defaultChecks ?? p.checks.map(c => c.name), maxCalls: p.writerChecks?.maxCalls ?? 4, ...(p.writerChecks?.reserveMs !== undefined ? { reserveMs: p.writerChecks.reserveMs } : {}) }, baselinePaths: p.baselinePaths ?? ["tests/", "agent-runtime/test/"], maxRepairs: Math.min(2, Math.max(0, p.maxRepairs ?? 2)), maxCostUsd: p.maxCostUsd ?? 1, activeTimeoutMs: p.activeTimeoutMs ?? 900_000 };
+  return { ...p, isolation: p.isolation ?? "per_mode", writerChecks: { defaultChecks: p.writerChecks?.defaultChecks ?? p.checks.map(c => c.name), maxCalls: p.writerChecks?.maxCalls ?? 4, ...(p.writerChecks?.reserveMs !== undefined ? { reserveMs: p.writerChecks.reserveMs } : {}) }, baselinePaths: p.baselinePaths ?? ["tests/", "agent-runtime/test/"], maxRepairs: Math.min(2, Math.max(0, p.maxRepairs ?? 2)), maxCostUsd: p.maxCostUsd ?? 1, activeTimeoutMs: p.activeTimeoutMs ?? 900_000, grader: { samples: p.grader?.samples ?? 1, aggregate: p.grader?.aggregate ?? "unanimous" } };
 }
 export async function loadProfile(file: string, repo: string, worktreeRoot: string) {
   const resolved = await realpath(file);

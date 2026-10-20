@@ -12,11 +12,17 @@ closed when the baseline or any metric is missing.
     python scripts/grader_calibration.py            # check every case loads
     python scripts/grader_calibration.py --records grades.jsonl
     python scripts/grader_calibration.py --live-openai --repeats 3 --max-cost-usd 2
+    python scripts/grader_calibration.py --live-openai --samples 3 --aggregate majority
 
 The records come from ``agent-runtime/src/grader-calibration-cli.ts``: one
 ``grade`` line per (case, repeat) and a closing ``run`` line that says whether
 the run is complete. ``--live-openai`` boots the validator topology, runs the
 CLI against its model gateway (spending real model budget) and scores it.
+
+``--samples``/``--aggregate`` grade each repeat the way a profile's ``grader``
+sampling does, so every record is one aggregated verdict and the summary's
+rates, ``cost_usd`` and ``cost_per_grade`` measure that sampling. With
+``--records`` they are what the records must have been graded with.
 """
 
 import argparse
@@ -62,6 +68,10 @@ CATEGORIES = {
 GRADE_STATUSES = ("passed", "needs_changes", "unknown")
 VALID_VERDICTS = ("passed", "needs_changes")
 NO_CAUSE = "no_cause"
+SAMPLES = (1, 3)
+AGGREGATES = ("unanimous", "majority")
+# Records written before sampling existed graded each repeat once.
+DEFAULT_SAMPLING = (1, "unanimous")
 # metric -> (direction, default tolerance), as in agent_eval.CONTRACT_METRICS:
 # "higher" and "lower_abs" use an absolute tolerance, "lower" a relative one.
 CONTRACT_METRICS = {
@@ -221,12 +231,39 @@ def _rate(numerator, denominator):
     return numerator / denominator if denominator else None
 
 
+def _sampling(records):
+    """The one (samples, aggregate) every record was graded with."""
+    settings = {
+        (
+            record.get("samples", DEFAULT_SAMPLING[0]),
+            record.get("aggregate", DEFAULT_SAMPLING[1]),
+        )
+        for record in records
+    }
+    if len(settings) != 1:
+        raise ValueError(
+            f"grade records mix grader sampling: {sorted(settings, key=str)}"
+        )
+    samples, aggregate = settings.pop()
+    if (
+        samples not in SAMPLES
+        or isinstance(samples, bool)
+        or aggregate not in AGGREGATES
+    ):
+        raise ValueError(
+            f"unknown grader sampling: samples={samples!r} aggregate={aggregate!r}"
+        )
+    return samples, aggregate
+
+
 def aggregate(records, cases):
     """Calibration metrics for grade ``records``; ``cases`` maps id -> expected.
 
     Rates over verdicts use only valid verdicts (passed | needs_changes); an
     ``unknown`` grade is invalid and counted by cause. A rate with nothing to
     measure is ``None`` so the contract fails closed instead of reading 0.
+    With sampling each record is already the aggregated verdict, so the rates
+    are the sampled grader's and ``cost_per_grade`` covers all of its samples.
     """
     if not records:
         raise ValueError("no grade records")
@@ -240,6 +277,7 @@ def aggregate(records, cases):
         if status not in GRADE_STATUSES:
             raise ValueError(f"grade record for {case} has invalid status {status!r}")
         by_case[case].append(record)
+    samples, sampling = _sampling(records)
 
     verdicts = {"pass": [0, 0], "fail": [0, 0]}  # expected -> [wrong, valid]
     invalid = collections.Counter()
@@ -259,15 +297,19 @@ def aggregate(records, cases):
     ]
     costs = [_number(record.get("cost_usd")) for record in records]
     total = len(records)
+    cost = None if None in costs else sum(costs)
     return {
         "records": total,
         "cases": len(by_case),
+        "samples": samples,
+        "aggregate": sampling,
         "false_pass_rate": _rate(*verdicts["fail"]),
         "false_fail_rate": _rate(*verdicts["pass"]),
         "self_consistency": _rate(sum(agreement), len(agreement)),
         "invalid_rate": sum(invalid.values()) / total,
         "invalid_rate_by_cause": {cause: n / total for cause, n in invalid.items()},
-        "cost_usd": None if None in costs else sum(costs),
+        "cost_usd": cost,
+        "cost_per_grade": None if cost is None else cost / total,
     }
 
 
@@ -358,8 +400,31 @@ def run_failures(run, records):
     return []
 
 
+def sampling_failures(summary, samples=None, aggregate=None):
+    """Records graded another way than asked measure a different grader."""
+    expected = (
+        summary["samples"] if samples is None else samples,
+        summary["aggregate"] if aggregate is None else aggregate,
+    )
+    actual = (summary["samples"], summary["aggregate"])
+    if actual == expected:
+        return []
+    return [
+        f"sampling mismatch: records use samples={actual[0]} aggregate={actual[1]}, "
+        f"expected samples={expected[0]} aggregate={expected[1]}"
+    ]
+
+
 def cli_command(
-    cases, out, repeats, max_cost_usd, grader_model, gateway, base_env=None
+    cases,
+    out,
+    repeats,
+    max_cost_usd,
+    grader_model,
+    gateway,
+    base_env=None,
+    samples=DEFAULT_SAMPLING[0],
+    aggregate=DEFAULT_SAMPLING[1],
 ):
     """argv and environment for a live CLI run against ``gateway``.
 
@@ -385,6 +450,10 @@ def cli_command(
         str(max_cost_usd),
         "--grader-model",
         grader_model,
+        "--samples",
+        str(samples),
+        "--aggregate",
+        aggregate,
         "--gateway-url",
         gateway["gateway_url"],
         "--network",
@@ -436,6 +505,8 @@ def run_live(args, cases):
             args.max_cost_usd,
             args.grader_model,
             booted.grader_gateway(),
+            samples=args.samples,
+            aggregate=args.aggregate,
         )
         _run_cli(argv, env)
     return args.out
@@ -451,6 +522,7 @@ def write_baseline(summary, path, records_path):
             timespec="seconds"
         ),
         "records": str(records_path.name),
+        "sampling": {"samples": summary["samples"], "aggregate": summary["aggregate"]},
         "metrics": {metric: summary[metric] for metric in CONTRACT_METRICS},
         "tolerance": {metric: spec[1] for metric, spec in CONTRACT_METRICS.items()},
     }
@@ -485,6 +557,17 @@ def parse_args(argv=None):
     parser.add_argument("--repeats", type=int, help="live: grades per case (3)")
     parser.add_argument("--max-cost-usd", type=float, help="live: stop once spent (2)")
     parser.add_argument("--grader-model", default=DEFAULT_GRADER_MODEL)
+    parser.add_argument(
+        "--samples",
+        type=int,
+        choices=SAMPLES,
+        help="grader samples per grade (live default 1)",
+    )
+    parser.add_argument(
+        "--aggregate",
+        choices=AGGREGATES,
+        help="how samples combine (live default unanimous)",
+    )
     parser.add_argument("--out", type=pathlib.Path, default=RESULTS)
     args = parser.parse_args(argv)
     if not args.live_openai:
@@ -495,6 +578,8 @@ def parse_args(argv=None):
         parser.error("--live-openai writes its own records; drop --records")
     args.repeats = 3 if args.repeats is None else args.repeats
     args.max_cost_usd = 2.0 if args.max_cost_usd is None else args.max_cost_usd
+    args.samples = DEFAULT_SAMPLING[0] if args.samples is None else args.samples
+    args.aggregate = DEFAULT_SAMPLING[1] if args.aggregate is None else args.aggregate
     if args.repeats < 1:
         parser.error("--repeats must be at least 1")
     if not args.max_cost_usd > 0:
@@ -517,6 +602,7 @@ def main(argv=None):
     records, run = read_run(args.records)
     failures = run_failures(run, records)
     summary = aggregate(records, {case["id"]: case["expected"] for case in cases})
+    failures = sampling_failures(summary, args.samples, args.aggregate) + failures
     if args.update_baseline:
         failures += [
             f"{metric}: missing from calibration summary"

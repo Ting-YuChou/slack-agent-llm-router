@@ -553,3 +553,141 @@ def test_topology_prices_match_the_model_catalog_with_cache_reads():
         "openai/gpt-5.6-sol": {"input": 4, "output": 20, "cacheRead": 0.4},
     }
     assert topology.MODEL_PRICES == catalog
+
+
+def _sampled(case, status, samples=3, aggregate="unanimous", cost=0.03):
+    return {
+        "type": "grade",
+        **_record(case, status, cost=cost),
+        "samples": samples,
+        "aggregate": aggregate,
+    }
+
+
+def test_aggregate_reports_the_sampling_and_cost_per_grade():
+    summary = calibration.aggregate(
+        [
+            _sampled("good", "passed", cost=0.02),
+            _sampled("bad", "needs_changes", cost=0.03),
+            _sampled("worse", "needs_changes", cost=0.04),
+            _sampled("worse", "passed", cost=0.03),
+        ],
+        CASES,
+    )
+    assert summary["samples"] == 3
+    assert summary["aggregate"] == "unanimous"
+    # The rates are over the aggregated verdicts, one per grade record.
+    assert summary["false_pass_rate"] == pytest.approx(1 / 3)
+    assert summary["false_fail_rate"] == 0
+    assert summary["cost_usd"] == pytest.approx(0.12)
+    assert summary["cost_per_grade"] == pytest.approx(0.03)
+
+
+def test_aggregate_treats_records_without_sampling_as_one_unanimous_sample():
+    summary = calibration.aggregate(_records(), CASES)
+    assert summary["samples"] == 1
+    assert summary["aggregate"] == "unanimous"
+    assert summary["cost_per_grade"] == pytest.approx(0.09 / 10)
+    unpriced = calibration.aggregate([{"case": "good", "status": "passed"}], CASES)
+    assert unpriced["cost_per_grade"] is None
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        [_sampled("good", "passed"), _record("good", "passed")],
+        [_sampled("good", "passed"), _sampled("good", "passed", aggregate="majority")],
+        [_sampled("good", "passed", samples=2)],
+        [_sampled("good", "passed", aggregate="any")],
+    ],
+)
+def test_aggregate_rejects_mixed_or_unknown_sampling(records):
+    with pytest.raises(ValueError):
+        calibration.aggregate(records, CASES)
+
+
+def test_cli_command_passes_the_sampling_to_the_cli(tmp_path):
+    gateway = {
+        "gateway_url": "http://model-gateway:8080",
+        "network": "pi-net",
+        "image": "agent",
+        "budget_ledger": "/state/budget/budget.sqlite",
+        "signing_secret": "s3cret",
+    }
+    common = dict(
+        cases=tmp_path / "cases",
+        out=tmp_path / "out.jsonl",
+        repeats=3,
+        max_cost_usd=2.0,
+        grader_model="openai/gpt-5.6-sol",
+        gateway=gateway,
+        base_env={},
+    )
+    argv, _ = calibration.cli_command(**common)
+    assert argv[argv.index("--samples") + 1] == "1"
+    assert argv[argv.index("--aggregate") + 1] == "unanimous"
+    argv, _ = calibration.cli_command(**common, samples=3, aggregate="majority")
+    assert argv[argv.index("--samples") + 1] == "3"
+    assert argv[argv.index("--aggregate") + 1] == "majority"
+
+
+def test_parse_args_sampling_defaults_and_choices():
+    live = calibration.parse_args(["--live-openai"])
+    assert (live.samples, live.aggregate) == (1, "unanimous")
+    sampled = calibration.parse_args(
+        ["--live-openai", "--samples", "3", "--aggregate", "majority"]
+    )
+    assert (sampled.samples, sampled.aggregate) == (3, "majority")
+    # Offline the setting is what the records must have been graded with.
+    offline = calibration.parse_args(["--records", "r.jsonl", "--samples", "3"])
+    assert (offline.samples, offline.aggregate) == (3, None)
+    for bad in (["--samples", "2"], ["--aggregate", "any"]):
+        with contextlib.redirect_stderr(io.StringIO()), pytest.raises(SystemExit):
+            calibration.parse_args(["--live-openai", *bad])
+
+
+def test_main_fails_records_graded_with_a_different_sampling(tmp_path):
+    cases = tmp_path / "cases"
+    _copy_case(cases)
+    grade = _sampled("control-minimal-fix", "passed", aggregate="majority")
+    out = _write_jsonl(tmp_path / "out.jsonl", [grade, grade, _run_line()])
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps(_baseline()))
+    argv = ["--cases", str(cases), "--records", str(out), "--baseline", str(baseline)]
+
+    code, stdout = _main([*argv, "--samples", "3", "--aggregate", "unanimous"])
+    report = json.loads(stdout)
+    assert code == 1
+    assert report["failures"][0] == (
+        "sampling mismatch: records use samples=3 aggregate=majority, "
+        "expected samples=3 aggregate=unanimous"
+    )
+    _, stdout = _main([*argv, "--samples", "3", "--aggregate", "majority"])
+    assert not any("sampling" in f for f in json.loads(stdout)["failures"])
+
+
+def test_update_baseline_records_the_sampling_it_was_measured_with(tmp_path):
+    cases = tmp_path / "cases"
+    _copy_case(cases)
+    _copy_case(cases, "weakened-test")
+    good = _sampled("control-minimal-fix", "passed")
+    bad = _sampled("weakened-test", "needs_changes")
+    out = _write_jsonl(
+        tmp_path / "out.jsonl", [good, good, bad, bad, _run_line(records=4)]
+    )
+    baseline = tmp_path / "baseline.json"
+    code, _ = _main(
+        [
+            "--cases",
+            str(cases),
+            "--records",
+            str(out),
+            "--baseline",
+            str(baseline),
+            "--update-baseline",
+        ]
+    )
+    assert code == 0
+    written = json.loads(baseline.read_text())
+    assert written["sampling"] == {"samples": 3, "aggregate": "unanimous"}
+    assert set(written["metrics"]) == set(calibration.CONTRACT_METRICS)
