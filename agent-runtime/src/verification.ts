@@ -24,7 +24,7 @@ export interface VerificationProfile {
   /** per_mode (default): one container per mode, each check isolated inside it; per_check: one container per check. */
   isolation?: "per_mode" | "per_check";
   /** The writer's own run_checks calls: which checks run by default and how many calls a run gets. */
-  writerChecks?: { defaultChecks: string[]; maxCalls: number };
+  writerChecks?: { defaultChecks: string[]; maxCalls: number; reserveMs?: number };
   /** Deterministic formatters run on the candidate before verification; they may only touch files the diff changed. */
   fixers?: FixerSpec[];
 }
@@ -43,7 +43,7 @@ export function validateProfile(raw: unknown): VerificationProfile {
   if (!Array.isArray(p.checks) || !p.checks.length || p.checks.some(c => !c || !Array.isArray(c.argv) || !c.argv.length || c.argv.some(x => typeof x !== "string" || x.includes("\0")) || !safeRelative(c.cwd) || !Number.isInteger(c.timeoutMs) || c.timeoutMs <= 0 || typeof c.name !== "string")) throw new Error("Invalid verification command");
   if (p.writerChecks !== undefined) {
     const w = p.writerChecks;
-    if (!w || typeof w !== "object" || (w.maxCalls !== undefined && (!Number.isInteger(w.maxCalls) || w.maxCalls < 1 || w.maxCalls > 10)) || (w.defaultChecks !== undefined && (!Array.isArray(w.defaultChecks) || !w.defaultChecks.length || w.defaultChecks.some(name => !p.checks.some(c => c.name === name))))) throw new Error("Invalid writer checks");
+    if (!w || typeof w !== "object" || (w.maxCalls !== undefined && (!Number.isInteger(w.maxCalls) || w.maxCalls < 1 || w.maxCalls > 10)) || (w.defaultChecks !== undefined && (!Array.isArray(w.defaultChecks) || !w.defaultChecks.length || w.defaultChecks.some(name => !p.checks.some(c => c.name === name)))) || (w.reserveMs !== undefined && (!Number.isInteger(w.reserveMs) || w.reserveMs < 60_000 || w.reserveMs > 900_000))) throw new Error("Invalid writer checks");
   }
   if (p.isolation !== undefined && !["per_mode", "per_check"].includes(p.isolation)) throw new Error("Invalid verification isolation");
   if (p.fixers !== undefined && (!Array.isArray(p.fixers) || p.fixers.length > 5 || p.fixers.some(f => !f || typeof f.name !== "string" || !/^[\w.-]{1,64}$/.test(f.name) || !Array.isArray(f.argv) || !f.argv.length || f.argv.some(x => typeof x !== "string" || x.includes("\0") || x.includes(REPORT_TOKEN)) || typeof f.cwd !== "string" || !safeRelative(f.cwd) || !Number.isInteger(f.timeoutMs) || f.timeoutMs <= 0 || f.timeoutMs > 300_000) || new Set(p.fixers.map(f => f.name)).size !== p.fixers.length)) throw new Error("Invalid fixers");
@@ -62,7 +62,7 @@ export function validateProfile(raw: unknown): VerificationProfile {
     if (!Number.isInteger(config.concurrency) || config.concurrency < 1 || config.concurrency > 4 || !Number.isFinite(config.maxCostUsd) || config.maxCostUsd <= 0 || config.maxCostUsd > 5 || !Number.isInteger(config.activeTimeoutMs) || config.activeTimeoutMs <= 0 || config.activeTimeoutMs > 1_800_000 || !Number.isFinite(config.discoveryCostUsd) || config.discoveryCostUsd <= 0 || config.discoveryCostUsd >= config.maxCostUsd || typeof config.degradeUnknown !== 'boolean') throw new Error('Invalid structured workflow limits');
     p.structuredWorkflow = config;
   }
-  return { ...p, isolation: p.isolation ?? "per_mode", writerChecks: { defaultChecks: p.writerChecks?.defaultChecks ?? p.checks.map(c => c.name), maxCalls: p.writerChecks?.maxCalls ?? 4 }, baselinePaths: p.baselinePaths ?? ["tests/", "agent-runtime/test/"], maxRepairs: Math.min(2, Math.max(0, p.maxRepairs ?? 2)), maxCostUsd: p.maxCostUsd ?? 1, activeTimeoutMs: p.activeTimeoutMs ?? 900_000 };
+  return { ...p, isolation: p.isolation ?? "per_mode", writerChecks: { defaultChecks: p.writerChecks?.defaultChecks ?? p.checks.map(c => c.name), maxCalls: p.writerChecks?.maxCalls ?? 4, ...(p.writerChecks?.reserveMs !== undefined ? { reserveMs: p.writerChecks.reserveMs } : {}) }, baselinePaths: p.baselinePaths ?? ["tests/", "agent-runtime/test/"], maxRepairs: Math.min(2, Math.max(0, p.maxRepairs ?? 2)), maxCostUsd: p.maxCostUsd ?? 1, activeTimeoutMs: p.activeTimeoutMs ?? 900_000 };
 }
 export async function loadProfile(file: string, repo: string, worktreeRoot: string) {
   const resolved = await realpath(file);
