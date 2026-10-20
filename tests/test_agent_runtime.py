@@ -545,3 +545,89 @@ async def test_control_calls_use_short_timeouts_but_create_keeps_long_one(
         ("POST", "/v1/runs/R1/cancel"),
     ):
         assert timeouts[key] == 10
+
+
+def _sse(*events):
+    return "".join(
+        f"id: {event_id}\nevent: {payload['type']}\ndata: {json.dumps(payload)}\n\n"
+        for event_id, payload in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_wait_for_update_follows_the_event_cursor_between_run_reads(
+    monkeypatch,
+):
+    started = [
+        {"type": "status", "status": "starting"},
+        {"type": "status", "status": "running"},
+    ]
+    runs = iter(
+        [
+            {
+                **_run_payload("running"),
+                "phase": "implementing",
+                "tool_count": 1,
+                "events": started,
+            },
+            {**_run_payload("completed"), "phase": "completed", "events": []},
+        ]
+    )
+    pages = iter(
+        [
+            httpx.Response(
+                200,
+                text=_sse((3, {"type": "tool", "phase": "start", "tool": "read"})),
+            ),
+            httpx.Response(503),
+            httpx.Response(
+                200,
+                text=_sse(
+                    (4, {"type": "tool", "phase": "end", "tool": "read"}),
+                    (5, {"type": "tool", "phase": "start", "tool": "edit"}),
+                ),
+            ),
+            httpx.Response(
+                200, text=_sse((6, {"type": "status", "status": "completed"}))
+            ),
+        ]
+    )
+    requests = []
+
+    def handler(request):
+        if request.url.path.endswith("/events"):
+            requests.append(("events", request.url.params["after"]))
+            return next(pages)
+        requests.append(("run", None))
+        return httpx.Response(200, json=next(runs))
+
+    progress = []
+
+    async def on_progress(run):
+        progress.append((run["status"], run["tool_count"], run.get("last_tool")))
+
+    runtime = client(handler, monkeypatch)
+    sleeps = _fake_clock(runtime, monkeypatch)
+    try:
+        run = await runtime.wait_for_update(
+            "R", poll_seconds=0.5, on_progress=on_progress
+        )
+    finally:
+        await runtime.close()
+
+    assert run["status"] == "completed"
+    # The full run is read only at start and after a status event.
+    assert requests == [
+        ("run", None),
+        ("events", "2"),
+        ("events", "3"),
+        ("events", "3"),
+        ("events", "5"),
+        ("run", None),
+    ]
+    assert progress == [
+        ("running", 1, None),
+        ("running", 2, "read"),
+        ("running", 3, "edit"),
+    ]
+    assert sleeps == [0.5, 0.5, 1, 0.5]

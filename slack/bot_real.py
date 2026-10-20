@@ -12,7 +12,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Set
+from typing import Callable, Dict, List, Optional, Any, Set
 from dataclasses import dataclass
 
 from slack_sdk.web.async_client import AsyncWebClient
@@ -1628,20 +1628,22 @@ class SlackMessageHandler:
                 and client is not None
                 and hasattr(client, "chat_update")
             ):
-                await client.chat_update(
-                    channel=channel_id,
-                    ts=root_message_ts,
-                    text=(
-                        f"🛠️ Pi coding agent started run `{result['run_id']}`"
-                        f"{f' with `{model}`' if model else ''}.\n"
-                        f"{mode_summary}\n"
-                        + (
-                            "Read-only discussion: no edits, verification or commit."
-                            if effective_task_mode == "discuss"
-                            else "Read-only exploration is automatic; edits and risky shell commands require approval here."
-                        )
-                    ),
+                started_text = (
+                    f"🛠️ Pi coding agent started run `{result['run_id']}`"
+                    f"{f' with `{model}`' if model else ''}.\n"
+                    f"{mode_summary}\n"
+                    + (
+                        "Read-only discussion: no edits, verification or commit."
+                        if effective_task_mode == "discuss"
+                        else "Read-only exploration is automatic; edits and risky shell commands require approval here."
+                    )
                 )
+                await client.chat_update(
+                    channel=channel_id, ts=root_message_ts, text=started_text
+                )
+                # The monitor keeps this message current with the run's progress.
+                tracked["status_ts"] = root_message_ts
+                tracked["status_text"] = started_text
             self.bot._start_agent_monitor(tracked)
             if root_message_ts:
                 return ""
@@ -2533,6 +2535,10 @@ class SlackBot:
         self.agent_monitor_poll_seconds = float(
             self.agent_config.get("monitor_poll_seconds", 2)
         )
+        self.agent_progress_interval_seconds = float(
+            self.agent_config.get("progress_interval_seconds", 10)
+        )
+        self.agent_progress_clock: Callable[[], float] = time.monotonic
         self.agent_shortcut_nonces: Dict[str, AgentShortcutNonce] = {}
         self.agent_feedback_nonces: Dict[str, AgentFeedbackNonce] = {}
 
@@ -3718,6 +3724,10 @@ class SlackBot:
             "posted_approval_ids": list(tracked.get("posted_approval_ids", [])),
             "result_posted": bool(tracked.get("result_posted", False)),
         }
+        # The root message the monitor rewrites with progress, when there is one.
+        for field in ("status_ts", "status_text"):
+            if isinstance(tracked.get(field), str) and tracked[field]:
+                record[field] = tracked[field]
         # Message ts of each approval card still showing buttons, by approval_id.
         cards = tracked.get("approval_cards")
         if isinstance(cards, dict) and cards:
@@ -3939,7 +3949,12 @@ class SlackBot:
         await self._persist_agent_run(tracked)
         while True:
             try:
-                run = await runtime.wait_for_update(tracked["run_id"])
+                run = await runtime.wait_for_update(
+                    tracked["run_id"],
+                    on_progress=lambda update: self._update_agent_progress(
+                        tracked, update
+                    ),
+                )
             except AgentRuntimeError as exc:
                 if exc.status == 404:
                     logger.info(
@@ -3956,14 +3971,64 @@ class SlackBot:
                 return
             await self._close_agent_approval_cards(tracked, run)
             if run.get("status") == "awaiting_approval":
+                await self._update_agent_progress(tracked, run)
                 await self._post_agent_approval(tracked, run)
                 await asyncio.sleep(self.agent_monitor_poll_seconds)
                 continue
             if not tracked.get("result_posted"):
+                await self._update_agent_progress(tracked, run, force=True)
                 await self._post_agent_result(tracked, run)
                 tracked["result_posted"] = True
                 await self._persist_agent_run(tracked)
             return
+
+    @staticmethod
+    def _agent_progress_line(run: Dict[str, Any]) -> str:
+        try:
+            cost = float(run.get("estimated_cost_usd") or 0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        line = (
+            f"Phase: *{run.get('phase') or run.get('status') or 'unknown'}*"
+            f" · Tools: {int(run.get('tool_count') or 0)}"
+            f" · Turns: {int(run.get('turn_count') or 0)}"
+            f" · Cost: ${cost:.3f}"
+        )
+        if run.get("last_tool"):
+            line += f" · Last tool: `{str(run['last_tool'])[:80]}`"
+        return line
+
+    async def _update_agent_progress(
+        self, tracked: Dict[str, Any], run: Dict[str, Any], *, force: bool = False
+    ) -> None:
+        """Rewrite the run's status message, at most once per progress interval."""
+        status_ts = tracked.get("status_ts")
+        if not status_ts or not hasattr(self.web_client, "chat_update"):
+            return
+        now = self.agent_progress_clock()
+        last = tracked.get("progress_updated_at")
+        if (
+            not force
+            and last is not None
+            and now - last < self.agent_progress_interval_seconds
+        ):
+            return
+        header = (
+            tracked.get("status_text")
+            or f"🛠️ Pi coding agent run `{run.get('run_id')}`."
+        )
+        text = f"{header}\n{self._agent_progress_line(run)}"
+        if text == tracked.get("progress_text"):
+            return
+        try:
+            await self.web_client.chat_update(
+                channel=tracked["channel_id"], ts=status_ts, text=text
+            )
+        except Exception:
+            logger.warning("Agent status message could not be updated", exc_info=True)
+            return
+        tracked["progress_updated_at"] = now
+        tracked["progress_text"] = text
 
     async def _post_agent_approval(
         self, tracked: Dict[str, Any], run: Dict[str, Any]
@@ -3997,14 +4062,27 @@ class SlackBot:
             if kind == "delivery"
             else self._agent_approval_blocks(approval)
         )
+        text = (
+            "Ready to deliver: review the changes"
+            if kind == "delivery"
+            else f"Approval required: {approval.get('title', 'Agent action')}"
+        )
+        owner = tracked.get("owner_user_id")
+        if owner:
+            # Notify the owner: a slash-command thread does not include them.
+            first = card[0]
+            card[0] = {
+                **first,
+                "text": {
+                    **first["text"],
+                    "text": f"<@{owner}> {first['text']['text']}",
+                },
+            }
+            text = f"{text} (<@{owner}>)"
         response = await self.web_client.chat_postMessage(
             channel=tracked["channel_id"],
             thread_ts=tracked["thread_ts"],
-            text=(
-                "Ready to deliver: review the changes"
-                if kind == "delivery"
-                else f"Approval required: {approval.get('title', 'Agent action')}"
-            ),
+            text=text,
             blocks=[
                 *card,
                 {
@@ -4138,6 +4216,8 @@ class SlackBot:
         # Final answers are posted whole: split into section-sized blocks
         # across as many thread messages as needed instead of cut at a limit.
         formatted = self.message_handler._format_agent_response(run)
+        if tracked.get("owner_user_id"):
+            formatted = f"<@{tracked['owner_user_id']}> {formatted}"
         chunks = _split_agent_result(formatted) or [formatted]
         messages = [
             chunks[offset : offset + AGENT_RESULT_BLOCKS_PER_MESSAGE]

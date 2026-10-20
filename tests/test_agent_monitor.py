@@ -812,3 +812,188 @@ async def test_followup_in_a_restored_discuss_thread_stays_discuss(tmp_path):
 
     assert runtime.create_session.await_args.kwargs["task_mode"] == "discuss"
     assert "--implement" in response
+
+
+def progress_state(run_id, status, tools, turns, cost, phase=None):
+    return run_state(
+        run_id,
+        status,
+        phase=phase or status,
+        tool_count=tools,
+        turn_count=turns,
+        estimated_cost_usd=cost,
+    )
+
+
+@pytest.mark.asyncio
+async def test_progress_updates_the_root_status_message_at_most_every_ten_seconds(
+    tmp_path,
+):
+    now = [0.0]
+
+    async def wait_for_update(run_id, on_progress=None, **kwargs):
+        for at, tools in [(0, 1), (4, 2), (9.9, 3), (10, 4), (15, 5), (25, 6)]:
+            now[0] = at
+            await on_progress(
+                progress_state(run_id, "running", tools, 2, 0.0123, "implementing")
+            )
+        return progress_state(run_id, "completed", 6, 3, 0.02)
+
+    bot = file_bot(
+        tmp_path, agent_runtime=SimpleNamespace(wait_for_update=wait_for_update)
+    )
+    bot.web_client = SimpleNamespace(
+        chat_postMessage=AsyncMock(), chat_update=AsyncMock()
+    )
+    bot.agent_progress_clock = lambda: now[0]
+    tracked = track(bot)
+    tracked["status_ts"] = "1.0"
+    tracked["status_text"] = "🛠️ Pi coding agent started run `R1`."
+
+    await bot._monitor_agent_run(tracked)
+
+    updates = [call.kwargs for call in bot.web_client.chat_update.await_args_list]
+    assert [(update["channel"], update["ts"]) for update in updates] == [
+        ("C1", "1.0")
+    ] * 4
+    texts = [update["text"] for update in updates]
+    assert all(
+        text.startswith("🛠️ Pi coding agent started run `R1`.\n") for text in texts
+    )
+    for text, tools in zip(texts[:3], [1, 4, 6]):
+        assert "Phase: *implementing*" in text
+        assert f"Tools: {tools}" in text
+        assert "Turns: 2" in text
+        assert "Cost: $0.012" in text
+    # The run's end always reaches the status message, throttle or not.
+    assert "Phase: *completed*" in texts[3]
+    assert "Tools: 6" in texts[3] and "Turns: 3" in texts[3]
+    assert "Cost: $0.020" in texts[3]
+    assert "*completed*" in posted_texts(bot)[-1]
+
+
+@pytest.mark.asyncio
+async def test_progress_without_a_status_message_posts_nothing(tmp_path):
+    async def wait_for_update(run_id, on_progress=None, **kwargs):
+        await on_progress(progress_state(run_id, "running", 1, 1, 0.01))
+        return run_state(run_id, "completed")
+
+    bot = file_bot(
+        tmp_path, agent_runtime=SimpleNamespace(wait_for_update=wait_for_update)
+    )
+    bot.web_client = SimpleNamespace(
+        chat_postMessage=AsyncMock(), chat_update=AsyncMock()
+    )
+
+    await bot._monitor_agent_run(track(bot))
+
+    bot.web_client.chat_update.assert_not_awaited()
+    bot.web_client.chat_postMessage.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_progress_update_does_not_stop_the_monitor(tmp_path):
+    async def wait_for_update(run_id, on_progress=None, **kwargs):
+        await on_progress(progress_state(run_id, "running", 1, 1, 0.01))
+        return run_state(run_id, "completed")
+
+    bot = file_bot(
+        tmp_path, agent_runtime=SimpleNamespace(wait_for_update=wait_for_update)
+    )
+    bot.web_client = SimpleNamespace(
+        chat_postMessage=AsyncMock(),
+        chat_update=AsyncMock(side_effect=RuntimeError("slack down")),
+    )
+    tracked = track(bot)
+    tracked["status_ts"] = "1.0"
+
+    await bot._monitor_agent_run(tracked)
+
+    assert tracked["result_posted"] is True
+
+
+@pytest.mark.asyncio
+async def test_started_message_becomes_the_durable_status_message(tmp_path):
+    runtime = SimpleNamespace(
+        create_session=AsyncMock(
+            return_value={"session_id": "S1", "run_id": "R1", "status": "starting"}
+        )
+    )
+    bot = file_bot(tmp_path, agent_runtime=runtime)
+    bot._monitor_agent_run = AsyncMock()
+    client = SimpleNamespace(
+        chat_postMessage=AsyncMock(return_value={"ts": "100.1"}),
+        chat_update=AsyncMock(),
+    )
+
+    await SlackMessageHandler(bot)._handle_command(
+        "agent fix the tests", "U1", "C1", None, client, team_id="T1"
+    )
+
+    started = client.chat_update.await_args.kwargs["text"]
+    assert bot.agent_runs["R1"]["status_ts"] == "100.1"
+    assert bot.agent_runs["R1"]["status_text"] == started
+    # The monitor persists the run first; it is mocked out here.
+    await bot._persist_agent_run(bot.agent_runs["R1"])
+    restored = file_bot(tmp_path)
+    await restored._restore_state()
+    assert restored.agent_runs["R1"]["status_ts"] == "100.1"
+    assert restored.agent_runs["R1"]["status_text"] == started
+
+
+def delivery_state(run_id, approval_id):
+    return run_state(
+        run_id,
+        "awaiting_approval",
+        events=[
+            {
+                "type": "approval",
+                "kind": "delivery",
+                "approval_id": approval_id,
+                "delivery": {"files": ["a.py"], "stat": "1 file changed"},
+            }
+        ],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending", [approval_state, delivery_state])
+async def test_approval_and_result_posts_mention_the_owner(tmp_path, pending):
+    runtime = scripted_runtime(
+        {"R1": [pending("R1", "A1"), run_state("R1", "completed", answer="done")]}
+    )
+    bot = file_bot(tmp_path, agent_runtime=runtime)
+    bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+    bot.agent_monitor_poll_seconds = 0
+
+    await bot._monitor_agent_run(track(bot))
+
+    card, result = [
+        call.kwargs for call in bot.web_client.chat_postMessage.await_args_list
+    ]
+    assert card["blocks"][0]["text"]["text"].startswith("<@U1> ")
+    assert "<@U1>" in card["text"]
+    assert result["text"].startswith("<@U1> ✅ Agent run `R1` *completed*")
+    assert result["blocks"][0]["text"]["text"].startswith(
+        "<@U1> ✅ Agent run `R1` *completed*"
+    )
+
+
+@pytest.mark.asyncio
+async def test_status_message_shows_a_run_waiting_for_approval(tmp_path):
+    waiting = delivery_state("R1", "A1")
+    waiting.update(phase="awaiting_delivery", tool_count=3, turn_count=2)
+    runtime = scripted_runtime({"R1": [waiting, run_state("R1", "rejected")]})
+    bot = file_bot(tmp_path, agent_runtime=runtime)
+    bot.web_client = SimpleNamespace(
+        chat_postMessage=AsyncMock(), chat_update=AsyncMock()
+    )
+    bot.agent_monitor_poll_seconds = 0
+    tracked = track(bot)
+    tracked["status_ts"] = "1.0"
+
+    await bot._monitor_agent_run(tracked)
+
+    texts = [call.kwargs["text"] for call in bot.web_client.chat_update.await_args_list]
+    assert "Phase: *awaiting_delivery* · Tools: 3 · Turns: 2" in texts[0]
+    assert "Phase: *rejected*" in texts[-1]
