@@ -14,6 +14,10 @@
       <networks><ip>::/0</ip></networks>
       <profile>agent_mcp_readonly</profile>
       <quota>default</quota>
+      <!-- Without <grants> an XML user can read every database. The views run as their definer. -->
+      <grants>
+        <query>GRANT SELECT ON agent_mcp.*</query>
+      </grants>
     </agent_mcp_reader>
   </users>
 </clickhouse>

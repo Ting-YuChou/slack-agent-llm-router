@@ -5,6 +5,10 @@ GRANT SELECT ON default.agent_usage TO agent_mcp_view_owner;
 GRANT SELECT ON default.agent_tool_calls TO agent_mcp_view_owner;
 GRANT SELECT ON default.agent_test_results TO agent_mcp_view_owner;
 GRANT SELECT ON default.otel_traces TO agent_mcp_view_owner;
+GRANT SELECT ON default.agent_runs_latest TO agent_mcp_view_owner;
+GRANT SELECT ON default.agent_usage_latest TO agent_mcp_view_owner;
+GRANT SELECT ON default.agent_tool_calls_latest TO agent_mcp_view_owner;
+GRANT SELECT ON default.agent_test_results_latest TO agent_mcp_view_owner;
 
 CREATE OR REPLACE VIEW agent_mcp.run_metrics_hourly
 DEFINER = agent_mcp_view_owner SQL SECURITY DEFINER AS
@@ -48,8 +52,4 @@ SELECT toStartOfHour(Timestamp) AS hour, SpanName AS span, StatusCode AS status,
 FROM default.otel_traces
 GROUP BY hour, span, status;
 
-GRANT SELECT ON agent_mcp.run_metrics_hourly TO agent_mcp_reader;
-GRANT SELECT ON agent_mcp.model_metrics_daily TO agent_mcp_reader;
-GRANT SELECT ON agent_mcp.tool_metrics_hourly TO agent_mcp_reader;
-GRANT SELECT ON agent_mcp.test_metrics_hourly TO agent_mcp_reader;
-GRANT SELECT ON agent_mcp.trace_metrics_hourly TO agent_mcp_reader;
+-- agent_mcp_reader lives in read-only XML storage, so its SELECT ON agent_mcp.* grant is in agent-mcp-users.xml.

@@ -17,6 +17,7 @@ mcp_gateway_container="${PI_MCP_GATEWAY_CONTAINER:-slack-pi-mcp-github}"
 github_mcp_container="${GITHUB_MCP_CONTAINER:-slack-github-mcp}"
 clickhouse_mcp_container="${CLICKHOUSE_MCP_CONTAINER:-slack-clickhouse-mcp}"
 clickhouse_gateway_container="${CLICKHOUSE_MCP_GATEWAY_CONTAINER:-slack-pi-mcp-clickhouse}"
+clickhouse_container="${CLICKHOUSE_CONTAINER:-slack-llm-router-clickhouse}"
 context7_gateway_container="${CONTEXT7_MCP_GATEWAY_CONTAINER:-slack-pi-mcp-context7}"
 agent_pid=""
 worker_pid=""
@@ -287,6 +288,13 @@ if [[ "${DEMO_TEST_MODE:-0}" != 1 ]]; then
     observability_network="${PI_AGENT_OBSERVABILITY_NETWORK:-slack-agent-observability}"
     if ! docker network inspect "${observability_network}" >/dev/null 2>&1; then
       printf 'ClickHouse MCP requires the agent observability network: %s\n' "${observability_network}" >&2
+      exit 2
+    fi
+    # The reader may only select these views; they read the analytics tables as their definer.
+    if ! docker exec -i "${clickhouse_container}" bash -ec \
+        'clickhouse-client --user "${CLICKHOUSE_USER}" --password "${CLICKHOUSE_PASSWORD}" --multiquery' \
+        <"${repo_root}/docker/observability/agent-mcp-views.sql" >/dev/null; then
+      printf 'Could not apply the agent_mcp views in %s; start the observability stack with the agent MCP overlay first.\n' "${clickhouse_container}" >&2
       exit 2
     fi
     docker run --detach --rm \

@@ -3,6 +3,8 @@ services:
   clickhouse:
     environment:
       AGENT_MCP_CLICKHOUSE_PASSWORD: ${AGENT_MCP_CLICKHOUSE_PASSWORD:?Set the aggregate MCP reader password}
+      # agent-mcp-views.sql creates the view definer user and grants it the raw tables.
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     volumes:
       - ./docker/observability/agent-mcp-users.xml:/etc/clickhouse-server/users.d/agent-mcp.xml:ro
     networks: [default, agent-observability]
