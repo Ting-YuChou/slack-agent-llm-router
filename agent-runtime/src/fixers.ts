@@ -5,6 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import { runDockerContainer, type RunContainer } from "./verification.js";
+import { RESOURCE_LIMIT_FLAGS } from "./container-flags.js";
 
 const exec = promisify(execFile);
 /** Same ceiling as a single writer write: a fixer cannot grow a file past what the agent could write. */
@@ -78,7 +79,7 @@ export function dockerFixerRunner(image: string, runContainer: RunContainer = ru
     const name = `pi-fixer-${randomUUID()}`;
     const args = ["run", "--rm", "--name", name, "--label", "slack-pi-agent-session=true", "--network", "none", "--read-only",
       "--user", `${process.getuid?.()}:${process.getgid?.()}`, "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-      "--cpus", "2", "--memory", "2g", "--pids-limit", "256", "--tmpfs", "/tmp:rw,nosuid,size=268435456", "--env", "HOME=/tmp",
+      ...RESOURCE_LIMIT_FLAGS, "--tmpfs", "/tmp:rw,nosuid,size=268435456", "--env", "HOME=/tmp",
       "--mount", `type=bind,src=${workspace},dst=/workspace`, "--workdir", path.posix.join("/workspace", fixer.cwd), image, ...fixer.argv];
     const result = await runContainer({ name, args, timeoutMs: fixer.timeoutMs, signal });
     return { exit: result.exit, timedOut: result.timedOut };
