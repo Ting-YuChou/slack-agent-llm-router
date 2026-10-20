@@ -165,6 +165,8 @@ test("write approval mode none skips write prompts but keeps scope, protection a
     const blocked = await policy.fire("tool_call", { toolName: "write", input }, ctx) as { block?: boolean } | undefined;
     assert.equal(blocked?.block, true, input.path);
   }
+  const bigEdit = await policy.fire("tool_call", { toolName: "edit", input: { path: "src/a.py", edits: [{ oldText: "a", newText: "x".repeat(256 * 1024 + 1) }] } }, ctx) as { block?: boolean; reason?: string } | undefined;
+  assert.equal(bigEdit?.block, true, "an edit is held to the same size limit as a write");
   assert.equal(await policy.fire("tool_call", { toolName: "bash", input: { command: "python script.py" } }, ctx), undefined);
   assert.equal(prompts.length, 1, "unlisted shell commands still prompt");
 })));

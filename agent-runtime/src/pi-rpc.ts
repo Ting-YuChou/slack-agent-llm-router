@@ -105,7 +105,8 @@ export function sanitizeRpcEvent(record: Record<string, unknown>): PublicRunEven
       ...(typeof record.timeout === "number" ? { timeout_ms: record.timeout } : {}),
     };
   }
-  if (type === "agent_settled") return { type: "settled", outcome: "completed" };
+  // The bridge classifies settles from the last assistant message; on its own a settle proves nothing.
+  if (type === "agent_settled") return { type: "settled", outcome: "error", stop_reason: "no_response" };
   if (type === "extension_error") {
     return { type: "error", code: "extension_error", message: "A trusted extension failed" };
   }

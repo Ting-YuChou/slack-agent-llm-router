@@ -194,3 +194,9 @@ test("policy decision entries become sanitized events; malformed ones are droppe
   ].join("\n") + "\n");
   assert.deepEqual(events, [{ type: "policy_decision", tool: "bash", decision: "block", reason: "network_command", argv0: "curl", cmd_hash: "0123456789abcdef" }]);
 });
+
+test("a bare agent_settled never reads as a completed run", () => {
+  const settled = sanitizeRpcEvent({ type: "agent_settled" }) as { type: string; outcome: string } | null;
+  assert.equal(settled?.type, "settled");
+  assert.notEqual(settled?.outcome, "completed");
+});

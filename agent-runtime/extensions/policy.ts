@@ -177,9 +177,12 @@ export default function policyExtension(pi: ExtensionAPI) {
         decide(event.toolName, "block", "outside_allowed_paths");
         return { block: true, reason: `outside_allowed_paths: ${target}; this task may only modify ${scope.allowedPaths.join(", ")}` };
       }
-      if (event.toolName === "write" && typeof event.input.content === "string" && Buffer.byteLength(event.input.content) > 256 * 1024) {
+      const edits = event.toolName === "edit" && Array.isArray(event.input.edits) ? event.input.edits : [];
+      const written = event.toolName === "write" ? (typeof event.input.content === "string" ? Buffer.byteLength(event.input.content) : 0)
+        : edits.reduce((total: number, edit: unknown) => total + (edit && typeof edit === "object" && typeof (edit as { newText?: unknown }).newText === "string" ? Buffer.byteLength((edit as { newText: string }).newText) : 0), 0);
+      if (written > 256 * 1024) {
         decide(event.toolName, "block", "write_too_large");
-        return { block: true, reason: "Single write exceeds 256 KiB" };
+        return { block: true, reason: `Single ${event.toolName} exceeds 256 KiB` };
       }
       if (!writeApproved && WRITE_APPROVAL === "per_prompt") {
         const startedAt = Date.now();

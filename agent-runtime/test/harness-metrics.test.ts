@@ -60,3 +60,18 @@ test("files rewritten by fixers are summed over attempts", () => {
   ] }), now);
   assert.equal(metrics.fixed_files, 4);
 });
+
+test("a repair that passed both gates is a repair success even when its delivery was discarded", () => {
+  const metrics = computeHarnessMetrics(run({ status: "failed", error: { code: "delivery_rejected", message: "rejected" },
+    attempts: [
+      { attempt: 1, execution_id: "e1", verification_status: "failed", grader_status: "unknown" },
+      { attempt: 2, execution_id: "e2", verification_status: "passed", grader_status: "passed" },
+    ] }), now);
+  assert.equal(metrics.repair_success, true);
+  const failed = computeHarnessMetrics(run({ status: "failed",
+    attempts: [
+      { attempt: 1, execution_id: "e1", verification_status: "failed", grader_status: "unknown" },
+      { attempt: 2, execution_id: "e2", verification_status: "failed", grader_status: "unknown" },
+    ] }), now);
+  assert.equal(failed.repair_success, false);
+});

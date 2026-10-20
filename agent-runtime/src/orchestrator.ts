@@ -11,7 +11,7 @@ import { workflowMode, type WorkflowMode, type WorkflowNode } from "./structured
 import { WorkflowBudget } from "./workflow-budget.js";
 import type { Candidate, GateInput, GateResult } from "./quality-gate.js";
 import { classifyGateError, failureCause, type RunFailure } from "./error-taxonomy.js";
-import { promptTelemetry } from "./prompts.js";
+import { promptTelemetry, renderPrompt } from "./prompts.js";
 import type { FixResult } from "./fixers.js";
 import { computeHarnessMetrics, type HarnessMetrics } from "./harness-metrics.js";
 import { summarizePolicy, type PolicyDecision, type PolicySummary } from "./policy-decision.js";
@@ -42,6 +42,8 @@ export interface QualityServices {
   tasks?(id: string): WorkflowNode[];
   /** The writer's own candidate-only check runs (run_checks). */
   runChecks?(request: WriterChecksRequest): Promise<WriterChecksResponse>;
+  /** Repairs the profile allows; a diff over the limits on an attempt within it is repaired, not failed. */
+  maxRepairs?: number;
   writerChecks?: {
     maxCalls: number; checks: string[]; defaultChecks: string[];
     /** Worst-case run time of these checks. */
@@ -179,7 +181,8 @@ export interface ApprovalCounts { requested: number; approved: number; rejected:
 
 export function publicRun<T extends Partial<RunRecord>>(run: T): Omit<T, "patch_artifact"> & { patch_retained?: true } {
   const { patch_artifact, ...rest } = run;
-  return patch_artifact ? { ...rest, patch_retained: true } : rest;
+  const shown = rest.attempts ? { ...rest, attempts: rest.attempts.map(({ artifact: _artifact, ...attempt }) => attempt) } : rest;
+  return patch_artifact ? { ...shown, patch_retained: true } : shown;
 }
 
 /** Archives the worktree's change before rollback; resolves to the archive path, or undefined when nothing changed. */
@@ -942,7 +945,13 @@ export class CodingAgentOrchestrator {
       try {
         await this.quality.execution(workflow.executionId, run.run_id, "implementation", workflow.attempt, "end", session.process.queueMs);
         workflow.budget.check();
-        await this.worktrees.inspectDiff(session.worktreePath, DEFAULT_DIFF_LIMITS);
+        try { await this.worktrees.inspectDiff(session.worktreePath, DEFAULT_DIFF_LIMITS); }
+        catch (error) {
+          if (!(error instanceof DiffLimitError) || workflow.attempt > (this.quality.maxRepairs ?? 0)) throw error;
+          workflow.attempt++; workflow.executionId = randomUUID(); workflow.checking = false;
+          run.phase = "repairing"; await this.persistState();
+          await this.startExecution(session, run, workflow, renderPrompt("diff-limit-repair", { requirement: workflow.requirement, limit: error.message.slice(0, 200) })); return;
+        }
         run.phase = "verifying"; await this.persistState();
         workflow.operation = this.quality.evaluate(input);
         const result = await workflow.operation; workflow.operation = undefined;
@@ -1152,7 +1161,8 @@ export class CodingAgentOrchestrator {
       this.notifyLifecycle(run.run_id, "rollback", "end");
     } catch {
       this.notifyLifecycle(run.run_id, "rollback", "end", true);
-      run.error = { code: "rollback_failed", message: "Isolated worktree needs attention" };
+      // Keep why the run failed; the rollback failure is a flag on it, not a replacement.
+      run.error = run.error ? { ...run.error, rollback_failed: true } : { code: "rollback_failed", message: "Isolated worktree needs attention" };
     }
   }
 

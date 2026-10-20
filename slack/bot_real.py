@@ -159,6 +159,14 @@ AGENT_ERROR_HINTS = {
         "The investigation container could not be confirmed stopped; ask an "
         "operator to check the runtime host before retrying."
     ),
+    "verification_timeout": (
+        "Verification ran out of time; narrow the change or ask an operator to "
+        "raise the slow check's timeout, then retry."
+    ),
+    "verification_incomplete": (
+        "A verification check never reported a result; retry the run, and ask "
+        "an operator to check the verification image if it repeats."
+    ),
     "delivery_expired": (
         "The delivery approval expired; rerun the request and approve it in time."
     ),
