@@ -11,6 +11,7 @@ import { excerpt, MAX_REPORT_BYTES, parseDiagnostics, parseJUnit, type CheckFail
 import { dockerUnavailable, HarnessError } from "./error-taxonomy.js";
 import type { FixerSpec } from "./fixers.js";
 import type { Candidate, CheckStatus, VerificationCheck, VerificationResult } from "./quality-gate.js";
+import { RESOURCE_LIMIT_FLAGS } from "./container-flags.js";
 const exec = promisify(execFile);
 /** One trusted check. `{report}` in argv becomes the check's report path under /out. */
 export interface VerificationCheckSpec { name: string; ciJob?: string; argv: string[]; cwd: string; timeoutMs: number; report?: { format: "junit" }; kind?: "static" | "test" }
@@ -265,7 +266,7 @@ export class DockerVerifier {
       ...(timedOut ? { timed_out: true, cause: "check_timeout" } : exit === null ? { cause: "check_runner_failed" } : {}) };
   }
   private isolationArgs(candidate: Candidate, out: string): string[] {
-    return ["--label", "slack-pi-agent-session=true", "--network", "none", "--read-only", "--user", `${process.getuid?.()}:${process.getgid?.()}`, "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--cpus", "2", "--memory", "2g", "--pids-limit", "256", "--tmpfs", "/tmp:rw,nosuid,size=536870912", "--tmpfs", "/workspace:rw,nosuid,size=1073741824,mode=1777", "--mount", `type=bind,src=${candidate.path},dst=/candidate,readonly`, "--mount", `type=bind,src=${path.join(path.dirname(candidate.path), "baseline")},dst=/baseline,readonly`, "--mount", `type=bind,src=${out},dst=/out`];
+    return ["--label", "slack-pi-agent-session=true", "--network", "none", "--read-only", "--user", `${process.getuid?.()}:${process.getgid?.()}`, "--cap-drop", "ALL", "--security-opt", "no-new-privileges", ...RESOURCE_LIMIT_FLAGS, "--tmpfs", "/tmp:rw,nosuid,size=536870912", "--tmpfs", "/workspace:rw,nosuid,size=1073741824,mode=1777", "--mount", `type=bind,src=${candidate.path},dst=/candidate,readonly`, "--mount", `type=bind,src=${path.join(path.dirname(candidate.path), "baseline")},dst=/baseline,readonly`, "--mount", `type=bind,src=${out},dst=/out`];
   }
 }
 

@@ -16,6 +16,7 @@ import { StartupTiming } from "./startup-timing.js";
 import { taskMode, type TaskMode } from "./task-mode.js";
 import { agentScheduler } from "./agent-scheduler.js";
 import type { DiffLimits } from "./worktree-manager.js";
+import { RESOURCE_LIMIT_FLAGS } from "./container-flags.js";
 
 export interface AgentContainerOptions {
   taskMode?: TaskMode;
@@ -103,9 +104,7 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     "--user", options.user ?? "10001:10001",
     "--cap-drop", "ALL",
     "--security-opt", "no-new-privileges",
-    "--cpus", "2",
-    "--memory", "2g",
-    "--pids-limit", "256",
+    ...RESOURCE_LIMIT_FLAGS,
     "--tmpfs", "/tmp:rw,noexec,nosuid,size=536870912",
     "--env", `HOME=/tmp/pi-home`,
     "--env", model.credentialEnv,
