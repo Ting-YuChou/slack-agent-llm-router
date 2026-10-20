@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { resolveAgentModel } from "../src/agent-model.js";
-import { budgetIdFor, outputTokenLimitFor, parseDefaultRunBudget, priceFor } from "../src/run-budget.js";
+import { budgetIdFor, outputTokenLimitFor, parseDefaultRunBudget, priceFor, releaseRunBudget } from "../src/run-budget.js";
 
 test("each harness role has its own output-token cap", () => {
   assert.equal(outputTokenLimitFor("writer"), 32768);
@@ -31,4 +31,23 @@ test("configured prices win; otherwise the model catalog price is used", () => {
   assert.deepEqual(priceFor(luna.ref, { [luna.ref]: { input: 9, output: 99 } }), { input: 9, output: 99 });
   assert.deepEqual(priceFor(luna.ref, {}), { input: luna.cost.input, output: luna.cost.output, cacheRead: luna.cost.cacheRead });
   assert.equal(priceFor("openai/unknown", {}), undefined);
+});
+
+test("an execution recorded under a workflow keeps that workflow's budget after a restart lost the in-memory map", () => {
+  const opened: string[] = [];
+  const book = { open: (id: string) => { opened.push(id); } };
+  const recorded = (id: string) => id === "exec-1" ? "workflow-1" : undefined;
+  assert.equal(budgetIdFor("exec-1", new Map(), book, 2, recorded), "workflow-1");
+  assert.deepEqual(opened, [], "no default budget is opened for a workflow execution");
+  assert.equal(budgetIdFor("run-2", new Map(), book, 2, recorded), "run-2");
+});
+
+test("a run's own default budget stops when the run ends, so its token can spend nothing more", () => {
+  const stopped: string[] = [];
+  const book = { stop: (id: string) => { stopped.push(id); } };
+  releaseRunBudget({ run_id: "run-1", status: "running" }, new Map(), book);
+  releaseRunBudget({ run_id: "run-1", status: "interrupted" }, new Map(), book);
+  releaseRunBudget({ run_id: "run-1", status: "cancelled" }, new Map(), book);
+  releaseRunBudget({ run_id: "exec-1", status: "failed" }, new Map([["exec-1", "workflow-1"]]), book);
+  assert.deepEqual(stopped, ["run-1"], "only terminal runs on their own default budget are stopped");
 });

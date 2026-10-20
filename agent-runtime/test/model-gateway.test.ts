@@ -453,3 +453,26 @@ test("the gateway process refuses to start without a budget store", async () => 
   assert.throws(() => gatewayLedgerFromEnv({}, "secret"), /PI_AGENT_BUDGET_RPC_URL/);
   assert.ok(gatewayLedgerFromEnv({ PI_AGENT_BUDGET_RPC_URL: "http://host.docker.internal:3001" }, "secret"));
 });
+
+test("a run token is capped on total model requests, not only concurrent ones", { timeout: 5_000 }, async () => {
+  const signingSecret = "signing-secret";
+  const gateway = createModelGateway({ signingSecret, providerApiKeys: { openai: "real-openai" }, maxRequestsPerToken: 3,
+    fetchFn: async () => new Response("{}", { status: 200 }) });
+  gateway.listen(0, "127.0.0.1");
+  await once(gateway, "listening");
+  const port = (gateway.address() as AddressInfo).port;
+  const luna = resolveAgentModel("openai/gpt-5.6-luna");
+  const tokenFor = (runId: string) => issueGatewayToken({ runId, provider: luna.provider, model: luna.id, api: luna.api, reasoningEffort: "max", expiresAt: Date.now() + 60_000 }, signingSecret);
+  const send = (token: string) => fetch(`http://127.0.0.1:${port}${luna.gatewayPath}`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ model: luna.id, reasoning: { effort: "max" }, input: "x" }) });
+  try {
+    const token = tokenFor("looping");
+    for (let i = 0; i < 3; i++) assert.equal((await send(token)).status, 200);
+    const over = await send(token);
+    assert.equal(over.status, 429);
+    assert.equal((await over.json()).error.code, "too_many_requests");
+    assert.equal((await send(tokenFor("other"))).status, 200, "the cap is per run token");
+  } finally {
+    gateway.close();
+    await once(gateway, "close");
+  }
+});
