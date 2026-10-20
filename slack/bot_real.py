@@ -1366,17 +1366,27 @@ class SlackMessageHandler:
         bootstrap = AgentBootstrapContext(prompt=task)
         builder = getattr(self.bot, "agent_bootstrap_builder", None)
         if include_thread_context and thread_ts and message_ts and builder is not None:
-            try:
-                bootstrap = await builder.build(
-                    client,
-                    channel_id=channel_id,
-                    thread_ts=thread_ts,
-                    owner_user_id=user_id,
-                    task=task,
-                    latest_ts=message_ts,
+            is_public_channel = getattr(self.bot, "_is_public_agent_channel", None)
+            if not callable(is_public_channel) or not await is_public_channel(
+                channel_id
+            ):
+                # Same egress rule as the shortcut: thread content from private,
+                # DM or Slack Connect channels never reaches a model provider.
+                bootstrap = AgentBootstrapContext(
+                    prompt=task, error="channel_not_public"
                 )
-            except AgentBootstrapFetchError as exc:
-                return f"Agent mode did not start because Slack thread context could not be loaded: `{exc}`."
+            else:
+                try:
+                    bootstrap = await builder.build(
+                        client,
+                        channel_id=channel_id,
+                        thread_ts=thread_ts,
+                        owner_user_id=user_id,
+                        task=task,
+                        latest_ts=message_ts,
+                    )
+                except AgentBootstrapFetchError as exc:
+                    return f"Agent mode did not start because Slack thread context could not be loaded: `{exc}`."
 
         response = await self._start_agent_prompt(
             bootstrap.prompt,

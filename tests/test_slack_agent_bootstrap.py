@@ -630,3 +630,60 @@ async def test_task_text_cannot_close_current_task_boundary():
         "</current_task",
     ]
     assert "rm -rf" in result.prompt
+
+
+@pytest.mark.asyncio
+async def test_message_budget_keeps_newest_messages_in_chronological_order():
+    client = SimpleNamespace(
+        conversations_replies=AsyncMock(
+            return_value={
+                "ok": True,
+                "messages": [
+                    {"ts": str(index), "user": "U1", "text": f"m{index}-" + "x" * 90}
+                    for index in range(1, 7)
+                ],
+            }
+        )
+    )
+    builder = AgentBootstrapBuilder(_settings(max_message_chars=250))
+
+    result = await builder.build(
+        client,
+        channel_id="C1",
+        thread_ts="1",
+        owner_user_id="U1",
+        task="task",
+    )
+
+    assert "m6-" in result.context
+    assert "m5-" in result.context
+    assert "m1-" not in result.context
+    assert result.context.index("m5-") < result.context.index("m6-")
+    assert len(result.context) <= 250
+    included = sum(f"m{index}-" in result.context for index in range(1, 7))
+    assert result.message_count == included
+    assert result.truncated is True
+    assert (
+        '<untrusted_reference_context source="slack_thread" truncated="true">'
+        in result.prompt
+    )
+
+
+@pytest.mark.asyncio
+async def test_untruncated_context_has_no_truncation_marker():
+    client = SimpleNamespace(
+        conversations_replies=AsyncMock(
+            return_value={
+                "ok": True,
+                "messages": [{"ts": "1", "user": "U1", "text": "short"}],
+            }
+        )
+    )
+    builder = AgentBootstrapBuilder(_settings())
+
+    result = await builder.build(
+        client, channel_id="C1", thread_ts="1", owner_user_id="U1", task="task"
+    )
+
+    assert result.truncated is False
+    assert 'truncated="true"' not in result.prompt

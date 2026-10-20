@@ -209,6 +209,7 @@ class TestSlackMessageHandler:
             {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
         )
         bot._monitor_agent_run = AsyncMock()
+        bot._is_public_agent_channel = AsyncMock(return_value=True)
         bot.agent_bootstrap_builder = SimpleNamespace(
             build=AsyncMock(
                 return_value=AgentBootstrapContext(prompt="context plus current task")
@@ -238,6 +239,50 @@ class TestSlackMessageHandler:
         assert (
             runtime.create_session.await_args.kwargs["routing_text"] == "fix the test"
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "channel",
+        [
+            {"is_channel": True, "is_private": False, "is_ext_shared": True},
+            {"is_channel": True, "is_private": False, "is_shared": True},
+            {"is_channel": True, "is_private": True},
+            {"is_im": True},
+        ],
+    )
+    async def test_inline_agent_command_skips_thread_context_outside_public_channels(
+        self, channel
+    ):
+        runtime = SimpleNamespace(
+            create_session=AsyncMock(
+                return_value={"session_id": "S1", "run_id": "R1", "status": "starting"}
+            )
+        )
+        bot = SlackBot(
+            {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+        )
+        bot.web_client = SimpleNamespace(
+            conversations_info=AsyncMock(return_value={"ok": True, "channel": channel})
+        )
+        bot._monitor_agent_run = AsyncMock()
+        bot.agent_bootstrap_builder = SimpleNamespace(
+            build=AsyncMock(return_value=AgentBootstrapContext(prompt="leaked"))
+        )
+        handler = SlackMessageHandler(bot)
+
+        response = await handler._handle_command(
+            "agent fix the test",
+            "U1",
+            "C1",
+            "100.1",
+            client=SimpleNamespace(),
+            team_id="T1",
+            message_ts="100.2",
+        )
+
+        bot.agent_bootstrap_builder.build.assert_not_awaited()
+        assert runtime.create_session.await_args.args[4] == "fix the test"
+        assert "without prior Slack thread context" in response
 
     @pytest.mark.asyncio
     async def test_agent_command_without_task_returns_usage_without_runtime_call(self):
