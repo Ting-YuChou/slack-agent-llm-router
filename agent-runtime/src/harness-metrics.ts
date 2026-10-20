@@ -10,6 +10,10 @@ export interface HarnessMetrics {
   fixed_files: number;
   cost_usd: number | null; wall_s: number; active_s: number | null; human_wait_s: number | null;
   time_to_first_edit_s: number | null;
+  /** First execution's dispatch-to-prompt time; the cold start every run pays. */
+  startup_s: number | null;
+  /** Dispatch-to-prompt time summed over repair attempts; what reusing a container would save. */
+  repair_startup_s: number | null;
 }
 
 const ratio = (used: number, max: number | undefined) => max ? Math.round((used / max) * 1000) / 1000 : null;
@@ -21,6 +25,7 @@ export function computeHarnessMetrics(run: RunRecord, now = Date.now()): Harness
   // Unverified runs have no gate to pass, so they have no attempt verdicts either.
   const gated = attempts.length > 0 && run.verification_status !== "unverified";
   const first = attempts[0];
+  const firstStartupMs = (first?.startup ?? run.startup)?.dispatch_to_prompt_ms;
   const created = Date.parse(run.created_at);
   return {
     outcome: run.execution_outcome ?? null,
@@ -39,5 +44,7 @@ export function computeHarnessMetrics(run: RunRecord, now = Date.now()): Harness
     active_s: run.timing ? seconds(run.timing.active_ms) : null,
     human_wait_s: run.timing ? seconds(run.timing.human_wait_ms) : null,
     time_to_first_edit_s: run.first_edit_at ? seconds(Date.parse(run.first_edit_at) - created) : null,
+    startup_s: firstStartupMs === undefined ? null : seconds(firstStartupMs),
+    repair_startup_s: attempts.length > 1 ? seconds(attempts.slice(1).reduce((sum, attempt) => sum + (attempt.startup?.dispatch_to_prompt_ms ?? 0), 0)) : null,
   };
 }

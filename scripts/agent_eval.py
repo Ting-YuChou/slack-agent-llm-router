@@ -310,6 +310,10 @@ def _harness_medians(records):
         "tool_util_p50": lambda r: (r.get("harness_metrics") or {}).get("tool_util"),
         "approvals_p50": lambda r: (r.get("approvals") or {}).get("requested"),
         "policy_blocks_p50": lambda r: (r.get("policy_summary") or {}).get("block"),
+        "startup_s_p50": lambda r: (r.get("harness_metrics") or {}).get("startup_s"),
+        "repair_startup_s_p50": lambda r: (r.get("harness_metrics") or {}).get(
+            "repair_startup_s"
+        ),
     }
     medians = {}
     for metric, read in sources.items():

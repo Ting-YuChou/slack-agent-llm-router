@@ -20,6 +20,7 @@ import { redact } from "./telemetry.js";
 import { DEFAULT_DIFF_LIMITS, DiffLimitError } from "./worktree-manager.js";
 import { MIN_CHECKS_WINDOW_MS, rejected, type WriterChecksRequest, type WriterChecksResponse } from "./writer-checks.js";
 import type { DiskQuota } from "./disk-usage.js";
+import type { AttemptStartup } from "./startup-timing.js";
 
 export interface QualityServices {
   evaluate(input: GateInput): Promise<GateResult>;
@@ -126,7 +127,9 @@ export interface RunRecord {
   /** Why the last grade was a harness-made unknown, when it was. */
   grader_cause?: { code: string; message: string };
   publication_status?: string;
-  attempts?: Array<{ attempt: number; execution_id: string; candidate_hash?: string; verification_status?: string; grader_status?: string; artifact?: string; fixes?: FixResult[]; fixer_cause?: string }>;
+  /** Startup of a run without a workflow; workflow runs record it per attempt. */
+  startup?: AttemptStartup;
+  attempts?: Array<{ attempt: number; execution_id: string; startup?: AttemptStartup; candidate_hash?: string; verification_status?: string; grader_status?: string; artifact?: string; fixes?: FixResult[]; fixer_cause?: string }>;
   run_id: string;
   session_id: string;
   status: RunStatus;
@@ -845,6 +848,12 @@ export class CodingAgentOrchestrator {
     if (!session?.activeRunId) return;
     const run = this.runs.get(session.activeRunId);
     if (!run || isTerminal(run.status)) return;
+    if (event.type === "startup") {
+      const attempt = run.attempts?.at(-1);
+      if (attempt) attempt.startup = event.startup; else run.startup = event.startup;
+      this.persistSoon();
+      return;
+    }
     if (event.type === "usage") {
       const state = this.workflows.get(run.run_id); state?.budget.report(event.cost_usd);
       run.estimated_cost_usd = (run.estimated_cost_usd ?? 0) + event.cost_usd;

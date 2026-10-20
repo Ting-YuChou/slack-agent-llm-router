@@ -15,6 +15,7 @@ test("a no-profile run reports utilization and timing but no attempt verdicts", 
   assert.deepEqual(metrics, {
     outcome: "completed", turn_util: 0.25, tool_util: 0.25, attempts: 0, first_attempt_pass: null, repair_success: null,
     writer_checks_calls: 0, approvals: 0, policy_blocks: 0, fixed_files: 0, cost_usd: null, wall_s: 120, active_s: null, human_wait_s: null, time_to_first_edit_s: 30,
+    startup_s: null, repair_startup_s: null,
   });
 });
 
@@ -74,4 +75,18 @@ test("a repair that passed both gates is a repair success even when its delivery
       { attempt: 2, execution_id: "e2", verification_status: "failed", grader_status: "unknown" },
     ] }), now);
   assert.equal(failed.repair_success, false);
+});
+
+test("startup time is the first attempt's dispatch-to-prompt; repairs report their own total", () => {
+  const startup = (ms: number) => ({ reused: false, queue_ms: 0, container_ms: ms / 2, dispatch_to_prompt_ms: ms });
+  const repaired = computeHarnessMetrics(run({ attempts: [
+    { attempt: 1, execution_id: "e1", verification_status: "failed", grader_status: "unknown", startup: startup(4000) },
+    { attempt: 2, execution_id: "e2", verification_status: "passed", grader_status: "passed", startup: startup(3000) },
+  ] }), now);
+  assert.equal(repaired.startup_s, 4);
+  assert.equal(repaired.repair_startup_s, 3);
+  const plain = computeHarnessMetrics(run({ startup: startup(2500) }), now);
+  assert.equal(plain.startup_s, 2.5);
+  assert.equal(plain.repair_startup_s, null);
+  assert.equal(computeHarnessMetrics(run({}), now).startup_s, null);
 });

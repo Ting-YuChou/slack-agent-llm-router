@@ -1156,3 +1156,17 @@ test("a worktree over its disk quota fails the run as disk_quota_exceeded and ro
   assert.equal(run.error?.code, "disk_quota_exceeded");
   assert.equal(calls.commits, 0);
 });
+
+test("the process's startup summary is recorded on the attempt it started, or on the run without a workflow", async () => {
+  const summary = { reused: false, queue_ms: 3, container_ms: 900, rpc_ready_ms: 200, configure_ms: 50, dispatch_to_prompt_ms: 1150 };
+  const plain = fixture();
+  const accepted = await plain.orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "startup-plain", user_id: "U", prompt: "fix" });
+  plain.process.emit({ type: "startup", startup: summary });
+  assert.deepEqual(plain.orchestrator.getRun(accepted.run_id).startup, summary);
+
+  const gated = gatedFixture(async () => new Promise(() => undefined));
+  const run = await gated.orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "startup-gated", user_id: "U", prompt: "fix" });
+  await prompted(gated.process);
+  gated.process.emit({ type: "startup", startup: summary });
+  assert.deepEqual(gated.orchestrator.getRun(run.run_id).attempts?.[0]?.startup, summary);
+});
