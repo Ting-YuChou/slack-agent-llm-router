@@ -18,6 +18,12 @@ export interface VerificationCheck {
   timed_out?: boolean;
 }
 export interface VerificationResult { status: CheckStatus; checks: VerificationCheck[] }
+export type GraderAggregate = "unanimous" | "majority";
+/** How many independent graders judge one candidate, and how their verdicts combine. */
+export interface GraderSampling { samples: 1 | 3; aggregate: GraderAggregate }
+export const DEFAULT_GRADER_SAMPLING: GraderSampling = { samples: 1, aggregate: "unanimous" };
+/** One sample's own verdict; `cause_code` says why an unknown sample gave none. */
+export interface SampleVerdict { status: Grade["status"]; grader_attempts: number; cause_code?: CauseCode }
 export interface Grade {
   status: "passed" | "needs_changes" | "unknown";
   candidate_hash: string;
@@ -27,6 +33,11 @@ export interface Grade {
   cause?: { code: CauseCode; message: string };
   /** Grader executions spent on this candidate, retries included. */
   grader_attempts?: number;
+  /** The sampling this verdict was aggregated under. */
+  samples?: GraderSampling["samples"];
+  aggregate?: GraderAggregate;
+  /** Every sample that ran, in order; sampling stops once no later sample can change the outcome. */
+  sample_verdicts?: SampleVerdict[];
 }
 export interface Candidate { sourceHash?: string; testedBaseline?: string; hash: string; path: string; patch?: string; artifact?: string;
   /** What the profile's fixers changed before this snapshot, and why they gave up if they did. */
@@ -34,7 +45,7 @@ export interface Candidate { sourceHash?: string; testedBaseline?: string; hash:
 export interface GateInput { run_id: string; worktree: string; baseline: string; requirement: string; attempt: number; signal: AbortSignal }
 export interface GateResult { action: "pass" | "repair" | "fail"; candidate: Candidate; verification: VerificationResult; grade?: Grade; repair_prompt?: string; failure?: { code: "scope_violation"; files: string[] } | { code: "verification_failed"; cause_code?: CauseCode } }
 export interface QualityGateOptions {
-  profile: { id: string; rubric: string[]; maxRepairs: number };
+  profile: { id: string; rubric: string[]; maxRepairs: number; grader?: GraderSampling };
   snapshot(input: GateInput): Promise<Candidate>;
   verify(candidate: Candidate, input: GateInput): Promise<VerificationResult>;
   grade(candidate: Candidate, verification: VerificationResult, input: GateInput): Promise<unknown>;
@@ -69,6 +80,26 @@ function graderCause(error: unknown): NonNullable<Grade["cause"]> {
 
 const GRADER_ATTEMPTS = 2;
 
+/**
+ * The aggregated status once no remaining sample can change it, otherwise undefined.
+ * unanimous: any needs_changes rejects; passed needs every sample to pass.
+ * majority: a strict majority of the valid (passed | needs_changes) samples; unknown samples do not vote.
+ * Either way the result is unknown only when no decided outcome remains possible.
+ */
+export function decideSamples(statuses: Array<Grade["status"]>, sampling: GraderSampling): Grade["status"] | undefined {
+  const passed = statuses.filter(status => status === "passed").length;
+  const rejected = statuses.filter(status => status === "needs_changes").length;
+  const remaining = sampling.samples - statuses.length;
+  if (sampling.aggregate === "unanimous") {
+    if (rejected) return "needs_changes";
+    if (remaining > 0) return undefined;
+    return passed === statuses.length ? "passed" : "unknown";
+  }
+  if (passed > rejected + remaining) return "passed";
+  if (rejected > passed + remaining) return "needs_changes";
+  return remaining > 0 ? undefined : "unknown";
+}
+
 function isBudgetExhausted(error: unknown): boolean {
   return error instanceof Error && error.message === "workflow_budget_exhausted";
 }
@@ -84,6 +115,23 @@ export class QualityGate {
       verification: { status: "failed", checks: [{ name: "allowed_paths", status: "failed", exit_code: null }] },
       failure: { code: "scope_violation", files: listed },
       repair_prompt: renderPrompt("scope-repair", { requirement: input.requirement, files: JSON.stringify(listed) }),
+    };
+  }
+  /** Samples independent graders until the profile's aggregate is decided; the verdict carries the deciding sample's criteria and findings. */
+  private async gradeSamples(candidate: Candidate, verification: VerificationResult, input: GateInput): Promise<Grade> {
+    const sampling = this.options.profile.grader ?? DEFAULT_GRADER_SAMPLING;
+    const grades: Grade[] = [];
+    let status: Grade["status"] | undefined;
+    while ((status = decideSamples(grades.map(grade => grade.status), sampling)) === undefined) {
+      input.signal.throwIfAborted();
+      grades.push(await this.gradeWithRetry(candidate, verification, input));
+    }
+    // An unknown outcome takes the first sample that gave no verdict, and so its cause.
+    const deciding = grades.find(grade => grade.status === status) ?? syntheticUnknown(this.options.profile.rubric, candidate.hash, { code: "insufficient_evidence", message: "Grader samples reached no verdict" });
+    return {
+      ...deciding, grader_attempts: grades.reduce((total, grade) => total + (grade.grader_attempts ?? 1), 0),
+      samples: sampling.samples, aggregate: sampling.aggregate,
+      sample_verdicts: grades.map(grade => ({ status: grade.status, grader_attempts: grade.grader_attempts ?? 1, ...(grade.cause ? { cause_code: grade.cause.code } : {}) })),
     };
   }
   /** Grader infrastructure errors get one fresh grader; a grader that judges the evidence insufficient does not. */
@@ -117,7 +165,7 @@ export class QualityGate {
     await this.options.record?.("verification", { candidate_hash: candidate.hash, source_hash: candidate.sourceHash ?? candidate.hash, tested_baseline: candidate.testedBaseline ?? input.baseline, ...verification, ...promptTelemetry("implementation") }, input);
     let grade: Grade | undefined;
     if (verification.status === "passed") {
-      grade = await this.gradeWithRetry(candidate, verification, input);
+      grade = await this.gradeSamples(candidate, verification, input);
       await this.options.record?.("grade", { ...grade, ...promptTelemetry("grader") }, input);
     }
     input.signal.throwIfAborted();

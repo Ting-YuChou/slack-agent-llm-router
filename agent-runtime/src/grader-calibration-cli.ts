@@ -1,6 +1,8 @@
 /**
  * Grades every calibration case under `--cases` K times with the real GraderRunner
  * and writes one JSONL line per (case, repeat), then a closing `run` line.
+ * `--samples 3 --aggregate unanimous|majority` grades each repeat the way a profile's
+ * `grader` sampling does: one line per aggregated verdict, its samples listed inside.
  *
  *   --scripted <file>  offline: a scripted grader process, deterministic, no model calls
  *   live               --gateway-url, --network, --image, --budget-ledger and
@@ -23,7 +25,7 @@ import { GraderRunner, type GraderProcessFactory } from "./grader.js";
 import type { RouteDecision } from "./jev-router.js";
 import type { PublicRunEvent } from "./pi-rpc.js";
 import { PROMPTS_VERSION } from "./prompts.js";
-import { QualityGate, type Candidate, type Grade, type VerificationResult } from "./quality-gate.js";
+import { QualityGate, type Candidate, type Grade, type GraderSampling, type VerificationResult } from "./quality-gate.js";
 import { outputTokenLimitFor } from "./run-budget.js";
 import { CandidateStore } from "./verification.js";
 import { DEFAULT_DIFF_LIMITS } from "./worktree-manager.js";
@@ -105,6 +107,7 @@ export function scriptedGrader(steps: ScriptedStep[]): GraderProcessFactory {
 interface LiveGateway { gatewayUrl: string; network: string; image: string; budgetLedger: string; secret: string }
 interface Options {
   cases: string; out: string; repeats: number; maxCostUsd?: number; graderModel: string; timeoutMs: number;
+  samples: GraderSampling["samples"]; aggregate: GraderSampling["aggregate"];
   script?: Script; live?: LiveGateway;
 }
 
@@ -113,6 +116,7 @@ export function parseOptions(argv: string[], env: NodeJS.ProcessEnv = process.en
     cases: { type: "string" }, out: { type: "string" }, repeats: { type: "string", default: "1" }, "max-cost-usd": { type: "string" },
     "grader-model": { type: "string", default: DEFAULT_GRADER_MODEL }, "timeout-ms": { type: "string", default: "120000" }, scripted: { type: "string" },
     "gateway-url": { type: "string" }, network: { type: "string" }, image: { type: "string" }, "budget-ledger": { type: "string" },
+    samples: { type: "string", default: "1" }, aggregate: { type: "string", default: "unanimous" },
   } });
   if (!values.cases || !values.out) throw new Error("--cases and --out are required");
   const repeats = Number(values.repeats); const timeoutMs = Number(values["timeout-ms"]);
@@ -120,9 +124,12 @@ export function parseOptions(argv: string[], env: NodeJS.ProcessEnv = process.en
   if (!Number.isInteger(repeats) || repeats < 1) throw new Error("--repeats must be a positive integer");
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1) throw new Error("--timeout-ms must be a positive integer");
   if (maxCostUsd !== undefined && !(Number.isFinite(maxCostUsd) && maxCostUsd > 0)) throw new Error("--max-cost-usd must be a positive number");
+  if (values.samples !== "1" && values.samples !== "3") throw new Error("--samples must be 1 or 3");
+  if (values.aggregate !== "unanimous" && values.aggregate !== "majority") throw new Error("--aggregate must be unanimous or majority");
+  const samples = values.samples === "3" ? 3 : 1; const aggregate = values.aggregate;
   resolveAgentModel(values["grader-model"]);
   const liveFlags = [values["gateway-url"], values.network, values.image, values["budget-ledger"]];
-  const options: Omit<Options, "script"> = { cases: values.cases, out: values.out, repeats, maxCostUsd, graderModel: values["grader-model"]!, timeoutMs };
+  const options: Omit<Options, "script"> = { cases: values.cases, out: values.out, repeats, maxCostUsd, graderModel: values["grader-model"]!, timeoutMs, samples, aggregate };
   if (values.scripted !== undefined && liveFlags.every(flag => flag === undefined)) return { options, scripted: values.scripted };
   if (values.scripted === undefined && liveFlags.every(Boolean)) {
     const secret = env.MODEL_GATEWAY_SIGNING_SECRET ?? "";
@@ -165,26 +172,33 @@ export async function calibrate(options: Options): Promise<{ complete: boolean; 
       if (stopped) break;
       const caseDir = path.join(work, item.id); await mkdir(caseDir, { recursive: true });
       const candidate = await buildCandidate(item, caseDir);
-      let cost = 0;
+      let cost = 0; let refused = false;
       const runner = graderRunner(options, item, path.join(caseDir, "state"), route, budget, spent => { cost += spent; });
       const gate = new QualityGate({
-        profile: { id: "grader-calibration", rubric: item.rubric, maxRepairs: 0 },
+        profile: { id: "grader-calibration", rubric: item.rubric, maxRepairs: 0, grader: { samples: options.samples, aggregate: options.aggregate } },
         snapshot: async () => candidate, verify: async () => item.verification,
-        grade: (snapshot, verification, input) => runner.grade(snapshot, verification, input.requirement, item.rubric, input.run_id, input.signal),
+        grade: async (snapshot, verification, input) => {
+          try { return await runner.grade(snapshot, verification, input.requirement, item.rubric, input.run_id, input.signal); }
+          catch (error) {
+            // A refusal in any sample, not only the one an unknown verdict names.
+            if (error instanceof Error && /workflow_budget_unavailable_or_exhausted/.test(error.message)) refused = true;
+            throw error;
+          }
+        },
       });
       for (let repeat = 1; repeat <= options.repeats; repeat++) {
         if (options.maxCostUsd !== undefined && spent > options.maxCostUsd) { stopped = true; break; }
-        cost = 0;
+        cost = 0; refused = false;
         const result = await gate.evaluate({ run_id: `${item.id}-${repeat}`, worktree: caseDir, baseline: "", requirement: item.requirement, attempt: 1, signal: new AbortController().signal });
-        const { cause, grader_attempts: attempts, ...grade } = result.grade!;
+        const { cause, grader_attempts: attempts, samples, aggregate, sample_verdicts: sampleVerdicts, ...grade } = result.grade!;
         spent += cost;
         // A gateway refusal is not a verdict: stop instead of scoring it as an invalid grade.
-        if (cause?.code === "grader_execution_failed" && /workflow_budget_unavailable_or_exhausted/.test(cause.message)) { stopped = true; reason = "gateway_budget_exhausted"; break; }
+        if (refused) { stopped = true; reason = "gateway_budget_exhausted"; break; }
         records++;
         lines.push(JSON.stringify({
           type: "grade", case: item.id, repeat, expected: item.expected, category: item.category, status: grade.status,
-          cause: cause ?? null, grader_attempts: attempts, prompts_version: PROMPTS_VERSION, grader_model: options.graderModel,
-          cost_usd: roundUsd(cost), grade,
+          cause: cause ?? null, grader_attempts: attempts, samples, aggregate, sample_verdicts: sampleVerdicts,
+          prompts_version: PROMPTS_VERSION, grader_model: options.graderModel, cost_usd: roundUsd(cost), grade,
         }));
       }
     }
@@ -193,7 +207,8 @@ export async function calibrate(options: Options): Promise<{ complete: boolean; 
   const complete = records === expected;
   lines.push(JSON.stringify({
     type: "run", complete, ...(complete ? {} : { reason }), records, expected_records: expected,
-    repeats: options.repeats, max_cost_usd: options.maxCostUsd ?? null, cost_usd: roundUsd(spent), grader_model: options.graderModel,
+    repeats: options.repeats, samples: options.samples, aggregate: options.aggregate, max_cost_usd: options.maxCostUsd ?? null,
+    cost_usd: roundUsd(spent), cost_per_grade: records ? roundUsd(spent / records) : null, grader_model: options.graderModel,
     prompts_version: PROMPTS_VERSION, mode: options.live ? "live" : "scripted",
   }));
   await writeFile(options.out, lines.join("\n") + "\n");
