@@ -530,6 +530,17 @@ class TestSlackMessageHandler:
         assert "--implement" in response
 
     @pytest.mark.asyncio
+    async def test_discuss_run_in_another_thread_does_not_set_new_thread_mode(self):
+        bot, runtime = self._followup_bot(previous_mode="discuss")
+        handler = SlackMessageHandler(bot)
+
+        await handler._start_agent_prompt(
+            "fix it", "U1", "C1", None, team_id="T1", thread_ts="200.1"
+        )
+
+        assert "task_mode" not in runtime.create_session.await_args.kwargs
+
+    @pytest.mark.asyncio
     async def test_discuss_thread_switches_to_implement_only_with_flag(self):
         bot, runtime = self._followup_bot(previous_mode="discuss")
         handler = SlackMessageHandler(bot)

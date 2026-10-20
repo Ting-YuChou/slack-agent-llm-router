@@ -1499,13 +1499,20 @@ class SlackMessageHandler:
             # A follow-up never silently upgrades a read-only discussion: the
             # runtime defaults to implement, so carry discuss forward unless
             # the owner explicitly passes `--implement`.
-            agent_run_for = getattr(self.bot, "_agent_run_for", None)
+            # Only this thread's own run counts, never the user's latest run
+            # elsewhere.
+            agent_threads = getattr(self.bot, "agent_threads", None) or {}
+            thread_key = getattr(self.bot, "_thread_key", None)
             previous = (
-                agent_run_for(user_id, channel_id, thread_ts)
-                if thread_ts and callable(agent_run_for)
+                agent_threads.get(thread_key(channel_id, thread_ts))
+                if thread_ts and callable(thread_key)
                 else None
             )
-            if previous and previous.get("mode") == "discuss":
+            if (
+                previous
+                and previous.get("owner_user_id") == user_id
+                and previous.get("mode") == "discuss"
+            ):
                 task_mode = "discuss"
         effective_task_mode = task_mode or "implement"
         mode_summary = self._agent_mode_summary(effective_task_mode, workflow_mode)
