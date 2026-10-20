@@ -17,7 +17,9 @@ export type CauseCode =
   | "investigation_execution_failed"
   | "investigation_reported_unknown"
   | "investigation_stop_unconfirmed"
-  | "insufficient_evidence";
+  | "insufficient_evidence"
+  | "verification_timeout"
+  | "verification_incomplete";
 
 /** A failure whose cause the harness knows; the gate reports it instead of a bare message. */
 export class HarnessError extends Error {
@@ -60,7 +62,9 @@ function causeOf(error: unknown): CauseCode | undefined {
   return error instanceof Error ? MESSAGE_CAUSES[error.message] : undefined;
 }
 
-export interface RunFailure { code: string; message: string; cause_code?: CauseCode }
+export interface RunFailure { code: string; message: string; cause_code?: CauseCode;
+  /** The worktree could not be rolled back after this failure; it needs an operator. */
+  rollback_failed?: true }
 
 /** Maps an exception escaping the quality gate to the run's public error. */
 export function classifyGateError(error: unknown): RunFailure {

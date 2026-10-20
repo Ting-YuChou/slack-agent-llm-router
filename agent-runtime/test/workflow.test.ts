@@ -251,3 +251,22 @@ test("a grader that submits unknown is not retried and fails as insufficient_evi
   assert.equal(result.grade?.cause?.code, "insufficient_evidence");
   assert.deepEqual(result.failure, { code: "verification_failed", cause_code: "insufficient_evidence" });
 });
+
+test("verification that ends unknown fails with a cause code naming why", async () => {
+  const { QualityGate } = await import("../src/quality-gate.js");
+  for (const [check, cause] of [
+    [{ name: "candidate:pytest", status: "unknown", exit_code: null, cause: "check_timeout", timed_out: true }, "verification_timeout"],
+    [{ name: "candidate:pytest", status: "unknown", exit_code: null, cause: "mode_timeout", timed_out: true }, "verification_timeout"],
+    [{ name: "candidate:pytest", status: "unknown", exit_code: null, cause: "runner_incomplete" }, "verification_incomplete"],
+  ] as const) {
+    const gate = new QualityGate({
+      profile: { id: "test", rubric: ["correct"], maxRepairs: 1 },
+      snapshot: async () => ({ hash: "h", path: "/s" }),
+      verify: async () => ({ status: "unknown", checks: [check] }),
+      grade: async () => { throw new Error("not graded"); },
+    });
+    const result = await gate.evaluate({ run_id: "r", worktree: "/w", baseline: "a".repeat(40), requirement: "fix", attempt: 1, signal: new AbortController().signal });
+    assert.equal(result.action, "fail");
+    assert.deepEqual(result.failure, { code: "verification_failed", cause_code: cause }, check.cause);
+  }
+});

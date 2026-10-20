@@ -28,7 +28,8 @@ export function computeHarnessMetrics(run: RunRecord, now = Date.now()): Harness
     tool_util: ratio(run.tool_count, run.limits?.maxToolCalls),
     attempts: attempts.length,
     first_attempt_pass: gated ? first!.verification_status === "passed" && first!.grader_status === "passed" : null,
-    repair_success: gated && attempts.length > 1 ? run.status === "completed" : null,
+    // The repaired candidate passed both gates; what the owner then did with the delivery is not a repair outcome.
+    repair_success: gated && attempts.length > 1 ? attempts.at(-1)!.verification_status === "passed" && attempts.at(-1)!.grader_status === "passed" : null,
     writer_checks_calls: run.writer_checks_calls ?? 0,
     approvals: run.approvals?.requested ?? 0,
     policy_blocks: run.policy_summary?.block ?? 0,

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { PublicRunEvent } from "../src/pi-rpc.js";
-import { CodingAgentOrchestrator, RuntimeConflictError, RuntimeForbiddenError } from "../src/orchestrator.js";
+import { CodingAgentOrchestrator, RuntimeConflictError, RuntimeForbiddenError, publicRun } from "../src/orchestrator.js";
 import { HarnessError } from "../src/error-taxonomy.js";
 import { DiffLimitError, ProtectedFileError } from "../src/worktree-manager.js";
 import { limitsForRoute, parseAgentLimitConfig } from "../src/agent-limits.js";
@@ -35,13 +35,14 @@ function fixture(router?: { route(text?: string): Promise<any> }, quality?: any,
     commitImpl: async () => "b".repeat(40),
     commitMessages: [] as string[],
     inspectError: undefined as Error | undefined,
+    rollbackError: undefined as Error | undefined,
     startedModels: [] as string[],
   };
   const worktrees = {
     create: async () => ({ path: "/managed/w1", branch: "pi-agent/20260801-run", baselineCommit: "a".repeat(40) }),
     inspectDiff: async () => { if (calls.inspectError) throw calls.inspectError; return calls.diff; },
     commit: async (_path: string, message: string) => { calls.commits += 1; calls.commitMessages.push(message); return calls.commitImpl(); },
-    rollback: async (_path: string, baseline: string) => { calls.rollback.push(baseline); },
+    rollback: async (_path: string, baseline: string) => { calls.rollback.push(baseline); if (calls.rollbackError) throw calls.rollbackError; },
     remove: async () => undefined,
   };
   const orchestrator = new CodingAgentOrchestrator({
@@ -1104,4 +1105,35 @@ test("a 3 MiB diff over the limit is archived in full and rolled back", async ()
   assert.ok(patches[0].content.length > 3 * 1024 * 1024, "the whole diff is kept below the archive cap");
   assert.doesNotMatch(patches[0].content, /patch truncated/);
   assert.match(patches[0].content, /line 3071 x/);
+});
+
+test("a failed rollback keeps the run's original error and cause and flags the rollback", async () => {
+  const f = gatedFixture(async () => { throw new HarnessError("docker_unavailable", "Cannot connect to the Docker daemon"); });
+  f.calls.rollbackError = new Error("worktree locked");
+  const run = await settleWorkflow(f, "rollback-keeps-cause");
+  assert.equal(run.error?.code, "quality_gate_unavailable");
+  assert.equal(run.error?.cause_code, "docker_unavailable");
+  assert.equal(run.error?.rollback_failed, true);
+});
+
+test("a diff over the limits on an attempt with repairs left becomes a repair naming the limit", async () => {
+  const f = fixture(undefined, { execution: () => {}, assertUnchanged: async () => {}, maxCostUsd: 5, maxRepairs: 1,
+    evaluate: async () => ({ action: "pass", candidate: { hash: "h", path: "/s" }, verification: { status: "passed", checks: [] }, grade: { status: "passed", candidate_hash: "h", criteria: [], findings: [] } }) });
+  f.calls.inspectError = new DiffLimitError("Changed file limit exceeded (51/50)");
+  const accepted = await f.orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "diff-limit-repair", user_id: "U", prompt: "fix the parser" });
+  await prompted(f.process);
+  f.process.emit(SETTLED);
+  await waitFor(() => f.process.prompts.length, count => count > 1, () => "the diff limit was never sent back as a repair");
+  assert.match(f.process.prompts[1]?.prompt ?? "", /51\/50/);
+  assert.match(f.process.prompts[1]?.prompt ?? "", /fix the parser/);
+  f.calls.inspectError = undefined;
+  f.process.emit(SETTLED);
+  const run = await settledRun(f.orchestrator, accepted.run_id, f.calls);
+  assert.equal(run.status, "completed", JSON.stringify(run.error));
+  assert.equal(run.attempts?.length, 2);
+});
+
+test("publicRun strips host artifact paths from every attempt", () => {
+  const shown = publicRun({ run_id: "r", attempts: [{ attempt: 1, execution_id: "e", artifact: "/var/lib/pi-agent/artifacts/r/candidate.patch" }] } as any);
+  assert.ok(!JSON.stringify(shown).includes("/var/lib/pi-agent"), JSON.stringify(shown));
 });

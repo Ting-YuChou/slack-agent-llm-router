@@ -24,7 +24,8 @@ const BLOCKED_COMMAND_PATTERNS: Array<[RegExp, string]> = [
   [/(?:^|\s)(?:~\/|\/Users\/|\/home\/|\/root\/|\/etc\/|\/var\/run\/docker\.sock)/i, "host_path"],
 ];
 
-const READ_ONLY_GIT = /^git\s+(?:status|diff|log|show|branch(?:\s+--show-current)?|rev-parse)(?:\s|$)/i;
+// `git branch` only when it lists: a bare name, -D, -m or --delete would change refs.
+const READ_ONLY_GIT = /^git\s+(?:(?:status|diff|log|show|rev-parse)(?:\s|$)|branch(?:\s+(?:--show-current|-a|--all|-r|--remotes|-l|--list|-v|-vv|--verbose))*\s*$)/i;
 
 export function isApprovedSkillRead(requestedPath: string, approvedPaths: string[]): boolean {
   if (!path.posix.isAbsolute(requestedPath) || path.posix.normalize(requestedPath) !== requestedPath) return false;
@@ -240,7 +241,7 @@ const PROTECTED_BASENAMES = [
   /\.(?:pem|key|p12|pfx)$/i,
 ];
 
-const TEST_CONFIG_BASENAMES = /^(?:package\.json|conftest\.py|pytest\.ini|pyproject\.toml|setup\.cfg|Makefile|\.npmrc|tsconfig.*\.json|.*\.pth)$/;
+const TEST_CONFIG_BASENAMES = /^(?:package\.json|conftest\.py|pytest\.ini|pyproject\.toml|setup\.cfg|setup\.py|tox\.ini|noxfile\.py|sitecustomize\.py|usercustomize\.py|Makefile|\.npmrc|tsconfig.*\.json|.*\.pth)$/;
 
 /** Files that change what a configured test command executes, at any depth. */
 export function isTestConfigPath(filePath: string): boolean {

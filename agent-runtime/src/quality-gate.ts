@@ -123,10 +123,16 @@ export class QualityGate {
     input.signal.throwIfAborted();
     if (verification.status === "passed" && grade?.status === "passed") return { action: "pass", candidate, verification, grade };
     const retry = verification.status !== "unknown" && grade?.status !== "unknown" && input.attempt <= this.options.profile.maxRepairs;
-    const failure = !retry && grade?.cause ? { code: "verification_failed" as const, cause_code: grade.cause.code } : undefined;
+    const cause = verification.status === "unknown" ? verificationCause(verification) : grade?.cause?.code;
+    const failure = !retry && cause ? { code: "verification_failed" as const, cause_code: cause } : undefined;
     return { action: retry ? "repair" : "fail", candidate, verification, grade, ...(failure ? { failure } : {}),
       repair_prompt: repairPrompt(input.requirement, verification, grade) };
   }
+}
+
+/** Why verification has no trustworthy result: it ran out of time, or a check never reported. */
+function verificationCause(verification: VerificationResult): CauseCode {
+  return verification.checks.some(check => check.status === "unknown" && (check.timed_out || check.cause === "check_timeout" || check.cause === "mode_timeout")) ? "verification_timeout" : "verification_incomplete";
 }
 
 /** Diagnostics go inside a block whose random boundary the candidate cannot predict or close early. */

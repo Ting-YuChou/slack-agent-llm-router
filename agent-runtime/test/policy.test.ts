@@ -217,6 +217,7 @@ test("test configuration files are recognised at any depth", () => {
   for (const file of [
     "package.json", "web/package.json", "conftest.py", "tests/unit/conftest.py", "pytest.ini", "pyproject.toml",
     "setup.cfg", "tsconfig.json", "tsconfig.build.json", "packages/a/tsconfig.test.json", "Makefile", ".npmrc", "site-packages/evil.pth",
+    "tox.ini", "setup.py", "noxfile.py", "lib/sitecustomize.py",
   ]) {
     assert.equal(isTestConfigPath(file), true, file);
   }
@@ -240,4 +241,13 @@ test("an approval can carry its own time to live", () => {
   assert.equal(delivery.expiresAt, 1_800_000);
   now = 1_000_000;
   assert.equal(store.decide(delivery.id, "U", "approve").code, "approved");
+});
+
+test("git branch is read-only only when it lists or shows branches", () => {
+  for (const command of ["git branch", "git branch --show-current", "git branch -a", "git branch --list"]) {
+    assert.equal(classifyBash(command, []).decision, "allow", command);
+  }
+  for (const command of ["git branch -D pi-agent/other", "git branch new-branch", "git branch -m old new", "git branch --delete x"]) {
+    assert.notEqual(classifyBash(command, []).decision, "allow", command);
+  }
 });
