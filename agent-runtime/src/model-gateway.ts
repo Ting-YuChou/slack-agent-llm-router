@@ -163,14 +163,20 @@ export function createModelGateway(options: {
       sendJson(response, 429, { error: { code: "too_many_streams", message: "Too many concurrent model requests for this run" } });
       return;
     }
+    // Claim the slot before any await: checking, awaiting budget admission, then incrementing let
+    // concurrent requests on one token all observe the same count and exceed the cap.
+    activeStreams.set(claims.runId, active + 1);
+    const releaseSlot = () => {
+      const remaining = (activeStreams.get(claims.runId) ?? 1) - 1;
+      if (remaining > 0) activeStreams.set(claims.runId, remaining); else activeStreams.delete(claims.runId);
+    };
     let admission: { body: Buffer; data: (chunk: Buffer) => void; finish: () => Promise<{ truncated: boolean }> | void };
     // Tests and local tools may run without a budget store; the gateway process itself refuses to start without one.
     if (!options.budgetLedger) admission = { body: rawBody, data: () => {}, finish: () => {} };
     else {
       try { admission = await admitBudget(options.budgetLedger, options.prices ?? {}, claims.workflowRunId, `${claims.provider}/${claims.model}`, rawBody, claims.runId, claims.outputTokenLimit); rawBody = admission.body; }
-      catch { sendJson(response, 429, { error: { code: "workflow_budget_unavailable_or_exhausted", message: "Model budget unavailable or exhausted" } }); return; }
+      catch { releaseSlot(); sendJson(response, 429, { error: { code: "workflow_budget_unavailable_or_exhausted", message: "Model budget unavailable or exhausted" } }); return; }
     }
-    activeStreams.set(claims.runId, active + 1);
     const requestStarted = performance.now();
     const sent = await Promise.resolve(options.budgetLedger?.firstModel(claims.runId)).catch(() => undefined);
     if (sent !== undefined) options.tracing?.firstModel(claims.runId, claims.traceparent, sent);
@@ -195,8 +201,7 @@ export function createModelGateway(options: {
       if (!response.headersSent) sendJson(response, 502, { error: { code: "upstream_unavailable", message: "Model provider unavailable" } });
       else response.destroy();
     } finally {
-      const remaining = (activeStreams.get(claims.runId) ?? 1) - 1;
-      if (remaining > 0) activeStreams.set(claims.runId, remaining); else activeStreams.delete(claims.runId);
+      releaseSlot();
       const finished = await admission.finish();
       if (finished?.truncated) span?.setAttribute("gen_ai.response.truncated", true);
       disconnect.close(); span?.end();

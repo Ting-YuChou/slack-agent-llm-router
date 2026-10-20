@@ -27,10 +27,41 @@ export function sanitizeAgentRequest(api: AgentModelSpec["api"], body: Record<st
       if (!isRecord(tool) || !toolTypeAllowed(api, tool.type)) return { ok: false, field: `tools[${index}].type` };
     }
   }
+  const content = api === "openai-responses" ? "input" : "messages";
+  const remote = remoteSource(body[content], content);
+  if (remote) return { ok: false, field: remote };
   if (api !== "openai-responses") return { ok: true, body };
   if (body.store !== undefined && body.store !== false) return { ok: false, field: "store" };
   if (body.include !== undefined && (!Array.isArray(body.include) || body.include.some((item) => !ALLOWED_INCLUDES.has(item)))) return { ok: false, field: "include" };
   return { ok: true, body: { ...body, store: false } };
+}
+
+/**
+ * Providers fetch URL-sourced images and files themselves (Responses input_image/input_file,
+ * Anthropic image/document `source.type: "url"`, chat-completions image_url), so a URL in message
+ * content is server-side egress. Only inline base64 / data: content passes; returns the offending path.
+ */
+function remoteSource(value: unknown, path: string): string | undefined {
+  if (Array.isArray(value)) {
+    for (const [index, item] of value.entries()) {
+      const found = remoteSource(item, `${path}[${index}]`);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (!isRecord(value)) return undefined;
+  for (const [key, child] of Object.entries(value)) {
+    const at = `${path}.${key}`;
+    if ((key === "image_url" || key === "file_url") && !isDataUrl(isRecord(child) ? child.url : child)) return at;
+    if (key === "source" && isRecord(child) && child.type !== "base64") return at;
+    const found = remoteSource(child, at);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function isDataUrl(value: unknown): boolean {
+  return typeof value === "string" && value.slice(0, 5).toLowerCase() === "data:";
 }
 
 function toolTypeAllowed(api: AgentModelSpec["api"], type: unknown): boolean {

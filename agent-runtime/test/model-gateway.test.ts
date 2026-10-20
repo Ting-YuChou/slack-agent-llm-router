@@ -402,6 +402,52 @@ test("a single run token cannot open more than four concurrent provider streams"
   }
 });
 
+test("the stream cap holds while budget admission is pending and slots free on every failure path", { timeout: 5_000 }, async () => {
+  const signingSecret = "signing-secret";
+  let open!: () => void;
+  let gate = new Promise<void>((resolve) => { open = resolve; });
+  let refuse = false;
+  let upstreamFails = false;
+  const gateway = createModelGateway({
+    signingSecret, providerApiKeys: { openai: "real-openai" }, prices: { "openai/gpt-5.6-luna": { input: 1, output: 1 } },
+    budgetLedger: {
+      reserve: async () => { await gate; if (refuse) throw new Error("exhausted"); },
+      settle: async () => {}, firstModel: async () => undefined,
+    },
+    fetchFn: async () => { if (upstreamFails) throw new Error("down"); return new Response("{}", { status: 200 }); },
+  });
+  gateway.listen(0, "127.0.0.1");
+  await once(gateway, "listening");
+  const port = (gateway.address() as AddressInfo).port;
+  const luna = resolveAgentModel("openai/gpt-5.6-luna");
+  const token = issueGatewayToken({ runId: "racy", workflowRunId: "wf", provider: luna.provider, model: luna.id, api: luna.api, reasoningEffort: "max", expiresAt: Date.now() + 60_000 }, signingSecret);
+  const send = () => fetch(`http://127.0.0.1:${port}${luna.gatewayPath}`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ model: luna.id, reasoning: { effort: "max" }, input: "x" }) });
+  const codes = async (responses: Response[]) => Promise.all(responses.map(async (r) => r.status === 200 ? 200 : `${r.status} ${(await r.json()).error.code}`));
+  try {
+    const racing = Array.from({ length: 6 }, send);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    open();
+    const statuses = await codes(await Promise.all(racing));
+    assert.equal(statuses.filter((s) => s === "429 too_many_streams").length, 2, JSON.stringify(statuses));
+    assert.equal(statuses.filter((s) => s === 200).length, 4, JSON.stringify(statuses));
+
+    refuse = true;
+    assert.deepEqual(await codes(await Promise.all(Array.from({ length: 4 }, send))), Array(4).fill("429 workflow_budget_unavailable_or_exhausted"));
+    refuse = false;
+    upstreamFails = true;
+    assert.deepEqual(await codes(await Promise.all(Array.from({ length: 4 }, send))), Array(4).fill("502 upstream_unavailable"));
+    upstreamFails = false;
+    gate = new Promise<void>((resolve) => { open = resolve; });
+    const afterFailures = Array.from({ length: 4 }, send);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    open();
+    assert.deepEqual(await codes(await Promise.all(afterFailures)), [200, 200, 200, 200]);
+  } finally {
+    gateway.close();
+    await once(gateway, "close");
+  }
+});
+
 test("the gateway process refuses to start without a budget store", async () => {
   const { gatewayLedgerFromEnv } = await import("../src/model-gateway.js");
   assert.throws(() => gatewayLedgerFromEnv({}, "secret"), /PI_AGENT_BUDGET_RPC_URL/);
