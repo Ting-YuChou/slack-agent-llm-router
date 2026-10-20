@@ -181,16 +181,22 @@ def schema_sql():
         statements.append(
             f"CREATE TABLE IF NOT EXISTS {table} (\n  {columns}\n) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY {key} TTL toDateTime(collected_at) + INTERVAL {days} DAY"
         )
+        # CREATE TABLE IF NOT EXISTS leaves an existing table as it was, so
+        # columns added since its creation are added one by one.
+        statements.extend(
+            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {kind}"
+            for column, kind in {**BASE, **extra}.items()
+        )
         statements.append(
-            f"CREATE VIEW IF NOT EXISTS {table}_latest AS SELECT * FROM {table} FINAL"
+            f"CREATE OR REPLACE VIEW {table}_latest AS SELECT * FROM {table} FINAL"
         )
     statements.append(
-        "CREATE VIEW IF NOT EXISTS agent_feedback_current AS SELECT run_id, user_id, argMax(verdict, version) AS verdict FROM agent_feedback_latest GROUP BY run_id, user_id"
+        "CREATE OR REPLACE VIEW agent_feedback_current AS SELECT run_id, user_id, argMax(verdict, version) AS verdict FROM agent_feedback_latest GROUP BY run_id, user_id"
     )
     # Owner feedback against the run's final grade: agrees is NULL when the
     # grader gave no verdict (unknown), so it never counts as agreement.
     statements.append(
-        """CREATE VIEW IF NOT EXISTS agent_grade_feedback_agreement AS
+        """CREATE OR REPLACE VIEW agent_grade_feedback_agreement AS
 SELECT f.run_id AS run_id, f.user_id AS user_id, g.grade_status AS grade_status,
   g.candidate_hash AS candidate_hash, g.prompts_version AS prompts_version, f.verdict AS feedback_verdict,
   multiIf(g.grade_status = 'passed', f.verdict = 'accepted',
@@ -202,7 +208,7 @@ FROM agent_feedback_current f INNER JOIN
   FROM agent_grades_latest GROUP BY run_id) g ON f.run_id = g.run_id"""
     )
     statements.append(
-        """CREATE VIEW IF NOT EXISTS agent_usage_reconciliation AS
+        """CREATE OR REPLACE VIEW agent_usage_reconciliation AS
 SELECT r.run_id AS run_id, r.capture_complete, s.start_snapshots, s.end_snapshots,
   if(s.start_snapshots>0 AND s.end_snapshots>0, s.end_tokens-s.start_tokens, NULL) AS session_token_delta,
   u.ledger_tokens, u.ledger_cost,
@@ -221,7 +227,7 @@ FROM agent_runs_latest r LEFT JOIN
     )
     # Runs carry harness_metrics once terminal (agent-runtime/src/harness-metrics.ts).
     statements.append(
-        """CREATE VIEW IF NOT EXISTS agent_harness_metrics AS
+        """CREATE OR REPLACE VIEW agent_harness_metrics AS
 SELECT run_id, status, model, collected_at,
   JSONExtractString(payload_json,'harness_metrics','outcome') AS outcome,
   JSONExtract(payload_json,'harness_metrics','turn_util','Nullable(Float64)') AS turn_util,
@@ -241,7 +247,7 @@ SELECT run_id, status, model, collected_at,
 FROM agent_runs_latest WHERE JSONHas(payload_json,'harness_metrics')"""
     )
     statements.append(
-        """CREATE VIEW IF NOT EXISTS agent_workflow_execution_durations AS
+        """CREATE OR REPLACE VIEW agent_workflow_execution_durations AS
 SELECT workflow_run_id, execution_id, any(role) AS role,
   if(countIf(phase='end' AND JSONHas(payload_json,'duration_ms'))>0,
     maxIf(JSONExtractUInt(payload_json,'duration_ms'),phase='end'),NULL) AS duration_ms,
@@ -251,7 +257,7 @@ SELECT workflow_run_id, execution_id, any(role) AS role,
 FROM agent_executions_latest GROUP BY workflow_run_id,execution_id"""
     )
     statements.append(
-        """CREATE VIEW IF NOT EXISTS agent_workflow_usage AS
+        """CREATE OR REPLACE VIEW agent_workflow_usage AS
 SELECT a.*, if(JSONHas(r.routing_json,'jevCostUsd'), JSONExtractFloat(r.routing_json,'jevCostUsd'),
   if(JSONHas(r.routing_json,'jevLatencyMs'), NULL, 0)) AS routing_cost_usd,
   if(a.incomplete_executions=0 AND routing_cost_usd IS NOT NULL,

@@ -72,6 +72,7 @@ SLACK_BUSY_MESSAGE = "The LLM Router is busy right now. Please retry in a moment
 SLACK_SECTION_TEXT_LIMIT = 3000
 AGENT_DELIVERY_CARD_LIMIT = 3000
 AGENT_DELIVERY_MAX_FILES = 15
+AGENT_DELIVERY_FILES_TEXT_LIMIT = AGENT_DELIVERY_CARD_LIMIT // 2
 AGENT_TERMINAL_STATUSES = {
     "completed",
     "rejected",
@@ -105,6 +106,58 @@ AGENT_ERROR_HINTS = {
     "docker_unavailable": (
         "Docker is unavailable on the runtime host; ask an operator to start it, "
         "then retry."
+    ),
+    "snapshot_too_large": (
+        "The change was too large to snapshot for verification; split it into "
+        "smaller changes or drop large generated files, then retry."
+    ),
+    "candidate_changed": (
+        "The worktree changed while it was being verified; retry the run, "
+        "and report it if it keeps happening."
+    ),
+    "candidate_artifact_missing": (
+        "The verified change could not be found; retry the run, and ask an "
+        "operator to check the runtime's artifact storage if it repeats."
+    ),
+    "verification_stop_unconfirmed": (
+        "The verification container could not be confirmed stopped; ask an "
+        "operator to check the runtime host before retrying."
+    ),
+    "grader_did_not_submit": (
+        "The grader finished without a verdict; retry the run, and report it "
+        "if it keeps happening."
+    ),
+    "grader_invalid_submission": (
+        "The grader's verdict was malformed and rejected; retry the run, and "
+        "report it if it keeps happening."
+    ),
+    "grader_execution_failed": (
+        "The grader could not run (often a model or budget limit); retry later, "
+        "or ask an operator to check the model gateway."
+    ),
+    "investigation_timeout": (
+        "The investigation ran out of time; narrow the question or point to the "
+        "relevant files, then retry."
+    ),
+    "investigation_missing_structured_result": (
+        "The investigation ended without a structured result; retry the run, "
+        "and report it if it keeps happening."
+    ),
+    "investigation_invalid_submission": (
+        "The investigation's result was malformed and rejected; retry the run, "
+        "and report it if it keeps happening."
+    ),
+    "investigation_execution_failed": (
+        "The investigation could not run (often a model or budget limit); retry "
+        "later, or ask an operator to check the model gateway."
+    ),
+    "investigation_reported_unknown": (
+        "The investigation could not find the cause; add the error, logs or "
+        "steps to reproduce, then retry."
+    ),
+    "investigation_stop_unconfirmed": (
+        "The investigation container could not be confirmed stopped; ask an "
+        "operator to check the runtime host before retrying."
     ),
     "delivery_expired": (
         "The delivery approval expired; rerun the request and approve it in time."
@@ -2775,6 +2828,30 @@ class SlackBot:
 
         await self._process_message(event)
 
+    async def _restored_agent_mode(self, session: Dict[str, Any]) -> str:
+        """The task mode of a thread known only to the runtime.
+
+        A follow-up inherits discuss from its thread, so a mode nobody can
+        name restores as discuss: the owner upgrades with `--implement`
+        instead of a read-only thread silently gaining write access.
+        """
+        mode = session.get("task_mode")
+        if mode in {"discuss", "implement"}:
+            return str(mode)
+        runtime = self.agent_runtime_client
+        run_id = session.get("run_id")
+        if run_id and runtime is not None and hasattr(runtime, "get_run"):
+            try:
+                run = await runtime.get_run(run_id)
+            except AgentRuntimeError:
+                run = None
+            if isinstance(run, dict):
+                # Runs created before task_mode existed were implement runs.
+                mode = run.get("task_mode") or "implement"
+                if mode in {"discuss", "implement"}:
+                    return str(mode)
+        return "discuss"
+
     async def _restore_agent_thread(self, event: Dict[str, Any]):
         runtime = self.agent_runtime_client
         if runtime is None or not hasattr(runtime, "lookup_session"):
@@ -2788,6 +2865,7 @@ class SlackBot:
             return
         if not session:
             return
+        mode = await self._restored_agent_mode(session)
         if session.get("run_id"):
             tracked = self._track_agent_run(
                 session,
@@ -2795,6 +2873,7 @@ class SlackBot:
                 channel_id=channel_id,
                 thread_ts=thread_ts,
                 owner_user_id=session["owner_user_id"],
+                mode=mode,
             )
             if session.get("active"):
                 self._start_agent_monitor(tracked)
@@ -2810,6 +2889,7 @@ class SlackBot:
             "channel_id": channel_id,
             "thread_ts": thread_ts,
             "owner_user_id": session["owner_user_id"],
+            "mode": mode,
         }
         self.agent_threads[self._thread_key(channel_id, thread_ts)] = tracked
         self.agent_user_runs[session["owner_user_id"]] = tracked
@@ -3611,6 +3691,8 @@ class SlackBot:
             "posted_approval_ids": list(previous.get("posted_approval_ids", [])),
             "result_posted": False,
         }
+        if previous.get("approval_cards"):
+            tracked["approval_cards"] = dict(previous["approval_cards"])
         self._register_agent_run(tracked)
         return tracked
 
@@ -3625,7 +3707,7 @@ class SlackBot:
 
     @staticmethod
     def _agent_run_record(tracked: Dict[str, Any]) -> Dict[str, Any]:
-        return {
+        record = {
             "run_id": tracked["run_id"],
             "session_id": tracked.get("session_id"),
             "team_id": tracked.get("team_id"),
@@ -3636,6 +3718,13 @@ class SlackBot:
             "posted_approval_ids": list(tracked.get("posted_approval_ids", [])),
             "result_posted": bool(tracked.get("result_posted", False)),
         }
+        # Message ts of each approval card still showing buttons, by approval_id.
+        cards = tracked.get("approval_cards")
+        if isinstance(cards, dict) and cards:
+            record["approval_cards"] = {
+                str(key): str(value) for key, value in cards.items()
+            }
+        return record
 
     async def _persist_agent_run(self, tracked: Dict[str, Any]):
         """Persist one tracked run and drop finished runs it superseded."""
@@ -3742,10 +3831,19 @@ class SlackBot:
         delivery = approval.get("delivery")
         delivery = delivery if isinstance(delivery, dict) else {}
         files = [str(item) for item in delivery.get("files") or []]
-        shown_files = files[:AGENT_DELIVERY_MAX_FILES]
-        file_lines = [f"• `{name[:200]}`" for name in shown_files]
-        if len(files) > len(shown_files):
-            file_lines.append(f"_…and {len(files) - len(shown_files)} more._")
+        # The list takes at most half the card so the stat and diff still fit.
+        file_lines: List[str] = []
+        used = 0
+        for index, name in enumerate(files[:AGENT_DELIVERY_MAX_FILES]):
+            line = f"• `{name[:200]}`"
+            rest = len(files) - index - 1
+            marker = len(f"\n_…and {len(files)} more._") if rest else 0
+            if used + len(line) + 1 + marker > AGENT_DELIVERY_FILES_TEXT_LIMIT:
+                break
+            file_lines.append(line)
+            used += len(line) + 1
+        if len(files) > len(file_lines):
+            file_lines.append(f"_…and {len(files) - len(file_lines)} more._")
         title = f"*Deliver {len(files)} changed file{'s' if len(files) != 1 else ''}?*"
         files_text = "\n".join(file_lines) or "_No file list provided._"
         checks = (
@@ -3856,6 +3954,7 @@ class SlackBot:
                     text="Agent status could not be retrieved; Chat mode was not used as fallback.",
                 )
                 return
+            await self._close_agent_approval_cards(tracked, run)
             if run.get("status") == "awaiting_approval":
                 await self._post_agent_approval(tracked, run)
                 await asyncio.sleep(self.agent_monitor_poll_seconds)
@@ -3898,7 +3997,7 @@ class SlackBot:
             if kind == "delivery"
             else self._agent_approval_blocks(approval)
         )
-        await self.web_client.chat_postMessage(
+        response = await self.web_client.chat_postMessage(
             channel=tracked["channel_id"],
             thread_ts=tracked["thread_ts"],
             text=(
@@ -3930,7 +4029,108 @@ class SlackBot:
             ],
         )
         posted.append(approval["approval_id"])
+        card_ts = response.get("ts") if hasattr(response, "get") else None
+        if isinstance(card_ts, str) and card_ts:
+            tracked.setdefault("approval_cards", {})[approval["approval_id"]] = card_ts
         await self._persist_agent_run(tracked)
+
+    @staticmethod
+    def _closed_agent_card_blocks(
+        blocks: List[Dict[str, Any]], outcome: str
+    ) -> List[Dict[str, Any]]:
+        """Keep a card's sections; its buttons and expiry footer give way to the outcome."""
+        kept = [
+            block
+            for block in blocks
+            if isinstance(block, dict) and block.get("type") == "section"
+        ]
+        return [
+            *kept,
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": outcome}]},
+        ]
+
+    @staticmethod
+    def _agent_card_outcome(verdict: str, user_id: Optional[str] = None) -> str:
+        now = int(time.time())
+        when = f"<!date^{now}^{{date_short_pretty}} {{time}}|{now}>"
+        by = f" by <@{user_id}>" if user_id else ""
+        return f"{verdict}{by} at {when}"
+
+    async def _update_agent_card(
+        self,
+        channel_id: str,
+        ts: str,
+        blocks: List[Dict[str, Any]],
+        outcome: str,
+    ) -> None:
+        if not hasattr(self.web_client, "chat_update"):
+            return
+        try:
+            await self.web_client.chat_update(
+                channel=channel_id,
+                ts=ts,
+                text=outcome,
+                blocks=self._closed_agent_card_blocks(blocks, outcome),
+            )
+        except Exception:
+            logger.warning("Agent approval card could not be updated", exc_info=True)
+
+    async def _close_agent_approval_cards(
+        self, tracked: Dict[str, Any], run: Dict[str, Any]
+    ) -> None:
+        """Replace the buttons of every card the run has moved past."""
+        cards = tracked.get("approval_cards")
+        if not isinstance(cards, dict) or not cards:
+            return
+        events = [event for event in run.get("events") or [] if isinstance(event, dict)]
+        pending = None
+        if run.get("status") == "awaiting_approval":
+            pending = next(
+                (
+                    event.get("approval_id")
+                    for event in reversed(events)
+                    if event.get("type") == "approval"
+                ),
+                None,
+            )
+        closed = False
+        for approval_id, ts in list(cards.items()):
+            if approval_id == pending:
+                continue
+            approval = next(
+                (
+                    event
+                    for event in events
+                    if event.get("type") == "approval"
+                    and event.get("approval_id") == approval_id
+                ),
+                {},
+            )
+            decision = next(
+                (
+                    event.get("decision")
+                    for event in events
+                    if event.get("type") == "approval_decision"
+                    and event.get("approval_id") == approval_id
+                ),
+                None,
+            )
+            verdict = {"approved": "Approved", "rejected": "Rejected"}.get(
+                str(decision)
+            )
+            outcome = self._agent_card_outcome(verdict) if verdict else "Expired"
+            blocks = (
+                self._agent_delivery_blocks(approval)
+                if approval.get("kind") == "delivery"
+                else self._agent_approval_blocks(approval)
+                if approval
+                else []
+            )
+            cards.pop(approval_id, None)
+            closed = True
+            await self._update_agent_card(tracked["channel_id"], ts, blocks, outcome)
+        if closed:
+            await self._persist_agent_run(tracked)
 
     async def _post_agent_result(
         self, tracked: Dict[str, Any], run: Dict[str, Any]
@@ -4342,11 +4542,26 @@ class SlackBot:
                 )
             return
         decision = "approve" if action["action_id"] == "pi_agent_approve" else "reject"
+        message = payload.get("message") or {}
+        card_ts = message.get("ts") or (payload.get("container") or {}).get(
+            "message_ts"
+        )
+        card_blocks = message.get("blocks") or []
+        # Claim the card first so the monitor does not close it without the decider.
+        cards = tracked.get("approval_cards") if tracked else None
+        claimed = cards.pop(approval_id, None) if isinstance(cards, dict) else None
         try:
             await self.agent_runtime_client.decide(
                 run_id, approval_id, user_id, decision
             )
         except AgentRuntimeError as exc:
+            if isinstance(exc, AgentRuntimeConflict):
+                if channel_id and card_ts:
+                    await self._update_agent_card(
+                        channel_id, card_ts, card_blocks, "Expired"
+                    )
+            elif claimed is not None and isinstance(cards, dict):
+                cards[approval_id] = claimed
             if isinstance(exc, AgentRuntimeUnauthorized):
                 text = _agent_auth_error_text(
                     exc, "Only the Agent session owner can approve this action."
@@ -4360,6 +4575,15 @@ class SlackBot:
                 channel=channel_id, user=user_id, text=text
             )
             return
+        if channel_id and card_ts:
+            await self._update_agent_card(
+                channel_id,
+                card_ts,
+                card_blocks,
+                self._agent_card_outcome(
+                    "Approved" if decision == "approve" else "Rejected", user_id
+                ),
+            )
         if not tracked:
             # The bot lost this run (e.g. restarted without state); the runtime
             # accepted the owner's decision, so resume tracking from the card.

@@ -13,7 +13,31 @@ CREATE TABLE IF NOT EXISTS agent_events (
   payload_json String CODEC(ZSTD(3))
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 30 DAY;
 
-CREATE VIEW IF NOT EXISTS agent_events_latest AS SELECT * FROM agent_events FINAL;
+ALTER TABLE agent_events ADD COLUMN IF NOT EXISTS sequence UInt64;
+
+ALTER TABLE agent_events ADD COLUMN IF NOT EXISTS schema_version UInt16;
+
+ALTER TABLE agent_events ADD COLUMN IF NOT EXISTS pi_version String;
+
+ALTER TABLE agent_events ADD COLUMN IF NOT EXISTS trace_id Nullable(String);
+
+ALTER TABLE agent_events ADD COLUMN IF NOT EXISTS source_time Nullable(DateTime64(6, 'UTC'));
+
+ALTER TABLE agent_events ADD COLUMN IF NOT EXISTS event_id String;
+
+ALTER TABLE agent_events ADD COLUMN IF NOT EXISTS run_id String;
+
+ALTER TABLE agent_events ADD COLUMN IF NOT EXISTS session_id String;
+
+ALTER TABLE agent_events ADD COLUMN IF NOT EXISTS kind String;
+
+ALTER TABLE agent_events ADD COLUMN IF NOT EXISTS collected_at DateTime64(6, 'UTC');
+
+ALTER TABLE agent_events ADD COLUMN IF NOT EXISTS version UInt64;
+
+ALTER TABLE agent_events ADD COLUMN IF NOT EXISTS payload_json String CODEC(ZSTD(3));
+
+CREATE OR REPLACE VIEW agent_events_latest AS SELECT * FROM agent_events FINAL;
 
 CREATE TABLE IF NOT EXISTS agent_workflow_nodes (
   sequence UInt64,
@@ -40,7 +64,51 @@ CREATE TABLE IF NOT EXISTS agent_workflow_nodes (
   result_ref String
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
 
-CREATE VIEW IF NOT EXISTS agent_workflow_nodes_latest AS SELECT * FROM agent_workflow_nodes FINAL;
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS sequence UInt64;
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS schema_version UInt16;
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS pi_version String;
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS trace_id Nullable(String);
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS source_time Nullable(DateTime64(6, 'UTC'));
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS event_id String;
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS run_id String;
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS session_id String;
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS kind String;
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS collected_at DateTime64(6, 'UTC');
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS version UInt64;
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS payload_json String CODEC(ZSTD(3));
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS workflow_run_id String;
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS node_id String;
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS execution_id String;
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS role String;
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS wave UInt32;
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS attempt UInt32;
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS state String;
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS duration_ms UInt64;
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS queue_ms UInt64;
+
+ALTER TABLE agent_workflow_nodes ADD COLUMN IF NOT EXISTS result_ref String;
+
+CREATE OR REPLACE VIEW agent_workflow_nodes_latest AS SELECT * FROM agent_workflow_nodes FINAL;
 
 CREATE TABLE IF NOT EXISTS agent_workflow_revisions (
   sequence UInt64,
@@ -60,7 +128,37 @@ CREATE TABLE IF NOT EXISTS agent_workflow_revisions (
   task_count UInt32
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
 
-CREATE VIEW IF NOT EXISTS agent_workflow_revisions_latest AS SELECT * FROM agent_workflow_revisions FINAL;
+ALTER TABLE agent_workflow_revisions ADD COLUMN IF NOT EXISTS sequence UInt64;
+
+ALTER TABLE agent_workflow_revisions ADD COLUMN IF NOT EXISTS schema_version UInt16;
+
+ALTER TABLE agent_workflow_revisions ADD COLUMN IF NOT EXISTS pi_version String;
+
+ALTER TABLE agent_workflow_revisions ADD COLUMN IF NOT EXISTS trace_id Nullable(String);
+
+ALTER TABLE agent_workflow_revisions ADD COLUMN IF NOT EXISTS source_time Nullable(DateTime64(6, 'UTC'));
+
+ALTER TABLE agent_workflow_revisions ADD COLUMN IF NOT EXISTS event_id String;
+
+ALTER TABLE agent_workflow_revisions ADD COLUMN IF NOT EXISTS run_id String;
+
+ALTER TABLE agent_workflow_revisions ADD COLUMN IF NOT EXISTS session_id String;
+
+ALTER TABLE agent_workflow_revisions ADD COLUMN IF NOT EXISTS kind String;
+
+ALTER TABLE agent_workflow_revisions ADD COLUMN IF NOT EXISTS collected_at DateTime64(6, 'UTC');
+
+ALTER TABLE agent_workflow_revisions ADD COLUMN IF NOT EXISTS version UInt64;
+
+ALTER TABLE agent_workflow_revisions ADD COLUMN IF NOT EXISTS payload_json String CODEC(ZSTD(3));
+
+ALTER TABLE agent_workflow_revisions ADD COLUMN IF NOT EXISTS workflow_run_id String;
+
+ALTER TABLE agent_workflow_revisions ADD COLUMN IF NOT EXISTS revision UInt32;
+
+ALTER TABLE agent_workflow_revisions ADD COLUMN IF NOT EXISTS task_count UInt32;
+
+CREATE OR REPLACE VIEW agent_workflow_revisions_latest AS SELECT * FROM agent_workflow_revisions FINAL;
 
 CREATE TABLE IF NOT EXISTS agent_workflow_dependencies (
   sequence UInt64,
@@ -80,7 +178,37 @@ CREATE TABLE IF NOT EXISTS agent_workflow_dependencies (
   depends_on String
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
 
-CREATE VIEW IF NOT EXISTS agent_workflow_dependencies_latest AS SELECT * FROM agent_workflow_dependencies FINAL;
+ALTER TABLE agent_workflow_dependencies ADD COLUMN IF NOT EXISTS sequence UInt64;
+
+ALTER TABLE agent_workflow_dependencies ADD COLUMN IF NOT EXISTS schema_version UInt16;
+
+ALTER TABLE agent_workflow_dependencies ADD COLUMN IF NOT EXISTS pi_version String;
+
+ALTER TABLE agent_workflow_dependencies ADD COLUMN IF NOT EXISTS trace_id Nullable(String);
+
+ALTER TABLE agent_workflow_dependencies ADD COLUMN IF NOT EXISTS source_time Nullable(DateTime64(6, 'UTC'));
+
+ALTER TABLE agent_workflow_dependencies ADD COLUMN IF NOT EXISTS event_id String;
+
+ALTER TABLE agent_workflow_dependencies ADD COLUMN IF NOT EXISTS run_id String;
+
+ALTER TABLE agent_workflow_dependencies ADD COLUMN IF NOT EXISTS session_id String;
+
+ALTER TABLE agent_workflow_dependencies ADD COLUMN IF NOT EXISTS kind String;
+
+ALTER TABLE agent_workflow_dependencies ADD COLUMN IF NOT EXISTS collected_at DateTime64(6, 'UTC');
+
+ALTER TABLE agent_workflow_dependencies ADD COLUMN IF NOT EXISTS version UInt64;
+
+ALTER TABLE agent_workflow_dependencies ADD COLUMN IF NOT EXISTS payload_json String CODEC(ZSTD(3));
+
+ALTER TABLE agent_workflow_dependencies ADD COLUMN IF NOT EXISTS workflow_run_id String;
+
+ALTER TABLE agent_workflow_dependencies ADD COLUMN IF NOT EXISTS node_id String;
+
+ALTER TABLE agent_workflow_dependencies ADD COLUMN IF NOT EXISTS depends_on String;
+
+CREATE OR REPLACE VIEW agent_workflow_dependencies_latest AS SELECT * FROM agent_workflow_dependencies FINAL;
 
 CREATE TABLE IF NOT EXISTS agent_executions (
   sequence UInt64,
@@ -103,7 +231,43 @@ CREATE TABLE IF NOT EXISTS agent_executions (
   prompts_version String
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
 
-CREATE VIEW IF NOT EXISTS agent_executions_latest AS SELECT * FROM agent_executions FINAL;
+ALTER TABLE agent_executions ADD COLUMN IF NOT EXISTS sequence UInt64;
+
+ALTER TABLE agent_executions ADD COLUMN IF NOT EXISTS schema_version UInt16;
+
+ALTER TABLE agent_executions ADD COLUMN IF NOT EXISTS pi_version String;
+
+ALTER TABLE agent_executions ADD COLUMN IF NOT EXISTS trace_id Nullable(String);
+
+ALTER TABLE agent_executions ADD COLUMN IF NOT EXISTS source_time Nullable(DateTime64(6, 'UTC'));
+
+ALTER TABLE agent_executions ADD COLUMN IF NOT EXISTS event_id String;
+
+ALTER TABLE agent_executions ADD COLUMN IF NOT EXISTS run_id String;
+
+ALTER TABLE agent_executions ADD COLUMN IF NOT EXISTS session_id String;
+
+ALTER TABLE agent_executions ADD COLUMN IF NOT EXISTS kind String;
+
+ALTER TABLE agent_executions ADD COLUMN IF NOT EXISTS collected_at DateTime64(6, 'UTC');
+
+ALTER TABLE agent_executions ADD COLUMN IF NOT EXISTS version UInt64;
+
+ALTER TABLE agent_executions ADD COLUMN IF NOT EXISTS payload_json String CODEC(ZSTD(3));
+
+ALTER TABLE agent_executions ADD COLUMN IF NOT EXISTS execution_id String;
+
+ALTER TABLE agent_executions ADD COLUMN IF NOT EXISTS workflow_run_id String;
+
+ALTER TABLE agent_executions ADD COLUMN IF NOT EXISTS role String;
+
+ALTER TABLE agent_executions ADD COLUMN IF NOT EXISTS attempt UInt32;
+
+ALTER TABLE agent_executions ADD COLUMN IF NOT EXISTS phase String;
+
+ALTER TABLE agent_executions ADD COLUMN IF NOT EXISTS prompts_version String;
+
+CREATE OR REPLACE VIEW agent_executions_latest AS SELECT * FROM agent_executions FINAL;
 
 CREATE TABLE IF NOT EXISTS agent_verifications (
   sequence UInt64,
@@ -123,7 +287,37 @@ CREATE TABLE IF NOT EXISTS agent_verifications (
   status String
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
 
-CREATE VIEW IF NOT EXISTS agent_verifications_latest AS SELECT * FROM agent_verifications FINAL;
+ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS sequence UInt64;
+
+ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS schema_version UInt16;
+
+ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS pi_version String;
+
+ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS trace_id Nullable(String);
+
+ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS source_time Nullable(DateTime64(6, 'UTC'));
+
+ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS event_id String;
+
+ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS run_id String;
+
+ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS session_id String;
+
+ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS kind String;
+
+ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS collected_at DateTime64(6, 'UTC');
+
+ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS version UInt64;
+
+ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS payload_json String CODEC(ZSTD(3));
+
+ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS candidate_hash String;
+
+ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS attempt UInt32;
+
+ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS status String;
+
+CREATE OR REPLACE VIEW agent_verifications_latest AS SELECT * FROM agent_verifications FINAL;
 
 CREATE TABLE IF NOT EXISTS agent_grades (
   sequence UInt64,
@@ -144,7 +338,39 @@ CREATE TABLE IF NOT EXISTS agent_grades (
   prompts_version String
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
 
-CREATE VIEW IF NOT EXISTS agent_grades_latest AS SELECT * FROM agent_grades FINAL;
+ALTER TABLE agent_grades ADD COLUMN IF NOT EXISTS sequence UInt64;
+
+ALTER TABLE agent_grades ADD COLUMN IF NOT EXISTS schema_version UInt16;
+
+ALTER TABLE agent_grades ADD COLUMN IF NOT EXISTS pi_version String;
+
+ALTER TABLE agent_grades ADD COLUMN IF NOT EXISTS trace_id Nullable(String);
+
+ALTER TABLE agent_grades ADD COLUMN IF NOT EXISTS source_time Nullable(DateTime64(6, 'UTC'));
+
+ALTER TABLE agent_grades ADD COLUMN IF NOT EXISTS event_id String;
+
+ALTER TABLE agent_grades ADD COLUMN IF NOT EXISTS run_id String;
+
+ALTER TABLE agent_grades ADD COLUMN IF NOT EXISTS session_id String;
+
+ALTER TABLE agent_grades ADD COLUMN IF NOT EXISTS kind String;
+
+ALTER TABLE agent_grades ADD COLUMN IF NOT EXISTS collected_at DateTime64(6, 'UTC');
+
+ALTER TABLE agent_grades ADD COLUMN IF NOT EXISTS version UInt64;
+
+ALTER TABLE agent_grades ADD COLUMN IF NOT EXISTS payload_json String CODEC(ZSTD(3));
+
+ALTER TABLE agent_grades ADD COLUMN IF NOT EXISTS candidate_hash String;
+
+ALTER TABLE agent_grades ADD COLUMN IF NOT EXISTS attempt UInt32;
+
+ALTER TABLE agent_grades ADD COLUMN IF NOT EXISTS status String;
+
+ALTER TABLE agent_grades ADD COLUMN IF NOT EXISTS prompts_version String;
+
+CREATE OR REPLACE VIEW agent_grades_latest AS SELECT * FROM agent_grades FINAL;
 
 CREATE TABLE IF NOT EXISTS agent_deliveries (
   sequence UInt64,
@@ -163,7 +389,35 @@ CREATE TABLE IF NOT EXISTS agent_deliveries (
   status String
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
 
-CREATE VIEW IF NOT EXISTS agent_deliveries_latest AS SELECT * FROM agent_deliveries FINAL;
+ALTER TABLE agent_deliveries ADD COLUMN IF NOT EXISTS sequence UInt64;
+
+ALTER TABLE agent_deliveries ADD COLUMN IF NOT EXISTS schema_version UInt16;
+
+ALTER TABLE agent_deliveries ADD COLUMN IF NOT EXISTS pi_version String;
+
+ALTER TABLE agent_deliveries ADD COLUMN IF NOT EXISTS trace_id Nullable(String);
+
+ALTER TABLE agent_deliveries ADD COLUMN IF NOT EXISTS source_time Nullable(DateTime64(6, 'UTC'));
+
+ALTER TABLE agent_deliveries ADD COLUMN IF NOT EXISTS event_id String;
+
+ALTER TABLE agent_deliveries ADD COLUMN IF NOT EXISTS run_id String;
+
+ALTER TABLE agent_deliveries ADD COLUMN IF NOT EXISTS session_id String;
+
+ALTER TABLE agent_deliveries ADD COLUMN IF NOT EXISTS kind String;
+
+ALTER TABLE agent_deliveries ADD COLUMN IF NOT EXISTS collected_at DateTime64(6, 'UTC');
+
+ALTER TABLE agent_deliveries ADD COLUMN IF NOT EXISTS version UInt64;
+
+ALTER TABLE agent_deliveries ADD COLUMN IF NOT EXISTS payload_json String CODEC(ZSTD(3));
+
+ALTER TABLE agent_deliveries ADD COLUMN IF NOT EXISTS candidate_hash String;
+
+ALTER TABLE agent_deliveries ADD COLUMN IF NOT EXISTS status String;
+
+CREATE OR REPLACE VIEW agent_deliveries_latest AS SELECT * FROM agent_deliveries FINAL;
 
 CREATE TABLE IF NOT EXISTS agent_runs (
   sequence UInt64,
@@ -186,7 +440,43 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   prompts_version String
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY run_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
 
-CREATE VIEW IF NOT EXISTS agent_runs_latest AS SELECT * FROM agent_runs FINAL;
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS sequence UInt64;
+
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS schema_version UInt16;
+
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS pi_version String;
+
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS trace_id Nullable(String);
+
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS source_time Nullable(DateTime64(6, 'UTC'));
+
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS event_id String;
+
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS run_id String;
+
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS session_id String;
+
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS kind String;
+
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS collected_at DateTime64(6, 'UTC');
+
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS version UInt64;
+
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS payload_json String CODEC(ZSTD(3));
+
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS status String;
+
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS model String;
+
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS reasoning_effort String;
+
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS routing_json String;
+
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS capture_complete Nullable(UInt8);
+
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS prompts_version String;
+
+CREATE OR REPLACE VIEW agent_runs_latest AS SELECT * FROM agent_runs FINAL;
 
 CREATE TABLE IF NOT EXISTS agent_usage (
   sequence UInt64,
@@ -219,7 +509,63 @@ CREATE TABLE IF NOT EXISTS agent_usage (
   cost_total Nullable(Float64)
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
 
-CREATE VIEW IF NOT EXISTS agent_usage_latest AS SELECT * FROM agent_usage FINAL;
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS sequence UInt64;
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS schema_version UInt16;
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS pi_version String;
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS trace_id Nullable(String);
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS source_time Nullable(DateTime64(6, 'UTC'));
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS event_id String;
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS run_id String;
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS session_id String;
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS kind String;
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS collected_at DateTime64(6, 'UTC');
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS version UInt64;
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS payload_json String CODEC(ZSTD(3));
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS pi_session_id String;
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS entry_id String;
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS parent_id Nullable(String);
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS source String;
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS input Nullable(UInt64);
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS output Nullable(UInt64);
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS cache_read Nullable(UInt64);
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS cache_write Nullable(UInt64);
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS cache_write_1h Nullable(UInt64);
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS reasoning Nullable(UInt64);
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS total_tokens Nullable(UInt64);
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS cost_input Nullable(Float64);
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS cost_output Nullable(Float64);
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS cost_cache_read Nullable(Float64);
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS cost_cache_write Nullable(Float64);
+
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS cost_total Nullable(Float64);
+
+CREATE OR REPLACE VIEW agent_usage_latest AS SELECT * FROM agent_usage FINAL;
 
 CREATE TABLE IF NOT EXISTS agent_tool_calls (
   sequence UInt64,
@@ -240,7 +586,39 @@ CREATE TABLE IF NOT EXISTS agent_tool_calls (
   is_error Nullable(UInt8)
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
 
-CREATE VIEW IF NOT EXISTS agent_tool_calls_latest AS SELECT * FROM agent_tool_calls FINAL;
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS sequence UInt64;
+
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS schema_version UInt16;
+
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS pi_version String;
+
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS trace_id Nullable(String);
+
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS source_time Nullable(DateTime64(6, 'UTC'));
+
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS event_id String;
+
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS run_id String;
+
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS session_id String;
+
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS kind String;
+
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS collected_at DateTime64(6, 'UTC');
+
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS version UInt64;
+
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS payload_json String CODEC(ZSTD(3));
+
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS tool_call_id String;
+
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS tool String;
+
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS phase String;
+
+ALTER TABLE agent_tool_calls ADD COLUMN IF NOT EXISTS is_error Nullable(UInt8);
+
+CREATE OR REPLACE VIEW agent_tool_calls_latest AS SELECT * FROM agent_tool_calls FINAL;
 
 CREATE TABLE IF NOT EXISTS agent_session_stats (
   sequence UInt64,
@@ -259,7 +637,35 @@ CREATE TABLE IF NOT EXISTS agent_session_stats (
   pi_session_id String
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
 
-CREATE VIEW IF NOT EXISTS agent_session_stats_latest AS SELECT * FROM agent_session_stats FINAL;
+ALTER TABLE agent_session_stats ADD COLUMN IF NOT EXISTS sequence UInt64;
+
+ALTER TABLE agent_session_stats ADD COLUMN IF NOT EXISTS schema_version UInt16;
+
+ALTER TABLE agent_session_stats ADD COLUMN IF NOT EXISTS pi_version String;
+
+ALTER TABLE agent_session_stats ADD COLUMN IF NOT EXISTS trace_id Nullable(String);
+
+ALTER TABLE agent_session_stats ADD COLUMN IF NOT EXISTS source_time Nullable(DateTime64(6, 'UTC'));
+
+ALTER TABLE agent_session_stats ADD COLUMN IF NOT EXISTS event_id String;
+
+ALTER TABLE agent_session_stats ADD COLUMN IF NOT EXISTS run_id String;
+
+ALTER TABLE agent_session_stats ADD COLUMN IF NOT EXISTS session_id String;
+
+ALTER TABLE agent_session_stats ADD COLUMN IF NOT EXISTS kind String;
+
+ALTER TABLE agent_session_stats ADD COLUMN IF NOT EXISTS collected_at DateTime64(6, 'UTC');
+
+ALTER TABLE agent_session_stats ADD COLUMN IF NOT EXISTS version UInt64;
+
+ALTER TABLE agent_session_stats ADD COLUMN IF NOT EXISTS payload_json String CODEC(ZSTD(3));
+
+ALTER TABLE agent_session_stats ADD COLUMN IF NOT EXISTS phase String;
+
+ALTER TABLE agent_session_stats ADD COLUMN IF NOT EXISTS pi_session_id String;
+
+CREATE OR REPLACE VIEW agent_session_stats_latest AS SELECT * FROM agent_session_stats FINAL;
 
 CREATE TABLE IF NOT EXISTS agent_content_chunks (
   sequence UInt64,
@@ -281,7 +687,41 @@ CREATE TABLE IF NOT EXISTS agent_content_chunks (
   data String CODEC(ZSTD(3))
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 30 DAY;
 
-CREATE VIEW IF NOT EXISTS agent_content_chunks_latest AS SELECT * FROM agent_content_chunks FINAL;
+ALTER TABLE agent_content_chunks ADD COLUMN IF NOT EXISTS sequence UInt64;
+
+ALTER TABLE agent_content_chunks ADD COLUMN IF NOT EXISTS schema_version UInt16;
+
+ALTER TABLE agent_content_chunks ADD COLUMN IF NOT EXISTS pi_version String;
+
+ALTER TABLE agent_content_chunks ADD COLUMN IF NOT EXISTS trace_id Nullable(String);
+
+ALTER TABLE agent_content_chunks ADD COLUMN IF NOT EXISTS source_time Nullable(DateTime64(6, 'UTC'));
+
+ALTER TABLE agent_content_chunks ADD COLUMN IF NOT EXISTS event_id String;
+
+ALTER TABLE agent_content_chunks ADD COLUMN IF NOT EXISTS run_id String;
+
+ALTER TABLE agent_content_chunks ADD COLUMN IF NOT EXISTS session_id String;
+
+ALTER TABLE agent_content_chunks ADD COLUMN IF NOT EXISTS kind String;
+
+ALTER TABLE agent_content_chunks ADD COLUMN IF NOT EXISTS collected_at DateTime64(6, 'UTC');
+
+ALTER TABLE agent_content_chunks ADD COLUMN IF NOT EXISTS version UInt64;
+
+ALTER TABLE agent_content_chunks ADD COLUMN IF NOT EXISTS payload_json String CODEC(ZSTD(3));
+
+ALTER TABLE agent_content_chunks ADD COLUMN IF NOT EXISTS content_id String;
+
+ALTER TABLE agent_content_chunks ADD COLUMN IF NOT EXISTS chunk_index UInt32;
+
+ALTER TABLE agent_content_chunks ADD COLUMN IF NOT EXISTS chunk_count UInt32;
+
+ALTER TABLE agent_content_chunks ADD COLUMN IF NOT EXISTS sha256 String;
+
+ALTER TABLE agent_content_chunks ADD COLUMN IF NOT EXISTS data String CODEC(ZSTD(3));
+
+CREATE OR REPLACE VIEW agent_content_chunks_latest AS SELECT * FROM agent_content_chunks FINAL;
 
 CREATE TABLE IF NOT EXISTS agent_test_results (
   sequence UInt64,
@@ -303,7 +743,41 @@ CREATE TABLE IF NOT EXISTS agent_test_results (
   failed Nullable(UInt64)
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
 
-CREATE VIEW IF NOT EXISTS agent_test_results_latest AS SELECT * FROM agent_test_results FINAL;
+ALTER TABLE agent_test_results ADD COLUMN IF NOT EXISTS sequence UInt64;
+
+ALTER TABLE agent_test_results ADD COLUMN IF NOT EXISTS schema_version UInt16;
+
+ALTER TABLE agent_test_results ADD COLUMN IF NOT EXISTS pi_version String;
+
+ALTER TABLE agent_test_results ADD COLUMN IF NOT EXISTS trace_id Nullable(String);
+
+ALTER TABLE agent_test_results ADD COLUMN IF NOT EXISTS source_time Nullable(DateTime64(6, 'UTC'));
+
+ALTER TABLE agent_test_results ADD COLUMN IF NOT EXISTS event_id String;
+
+ALTER TABLE agent_test_results ADD COLUMN IF NOT EXISTS run_id String;
+
+ALTER TABLE agent_test_results ADD COLUMN IF NOT EXISTS session_id String;
+
+ALTER TABLE agent_test_results ADD COLUMN IF NOT EXISTS kind String;
+
+ALTER TABLE agent_test_results ADD COLUMN IF NOT EXISTS collected_at DateTime64(6, 'UTC');
+
+ALTER TABLE agent_test_results ADD COLUMN IF NOT EXISTS version UInt64;
+
+ALTER TABLE agent_test_results ADD COLUMN IF NOT EXISTS payload_json String CODEC(ZSTD(3));
+
+ALTER TABLE agent_test_results ADD COLUMN IF NOT EXISTS tool_call_id String;
+
+ALTER TABLE agent_test_results ADD COLUMN IF NOT EXISTS status String;
+
+ALTER TABLE agent_test_results ADD COLUMN IF NOT EXISTS parser String;
+
+ALTER TABLE agent_test_results ADD COLUMN IF NOT EXISTS passed Nullable(UInt64);
+
+ALTER TABLE agent_test_results ADD COLUMN IF NOT EXISTS failed Nullable(UInt64);
+
+CREATE OR REPLACE VIEW agent_test_results_latest AS SELECT * FROM agent_test_results FINAL;
 
 CREATE TABLE IF NOT EXISTS agent_feedback (
   sequence UInt64,
@@ -325,7 +799,41 @@ CREATE TABLE IF NOT EXISTS agent_feedback (
   comment String
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
 
-CREATE VIEW IF NOT EXISTS agent_feedback_latest AS SELECT * FROM agent_feedback FINAL;
+ALTER TABLE agent_feedback ADD COLUMN IF NOT EXISTS sequence UInt64;
+
+ALTER TABLE agent_feedback ADD COLUMN IF NOT EXISTS schema_version UInt16;
+
+ALTER TABLE agent_feedback ADD COLUMN IF NOT EXISTS pi_version String;
+
+ALTER TABLE agent_feedback ADD COLUMN IF NOT EXISTS trace_id Nullable(String);
+
+ALTER TABLE agent_feedback ADD COLUMN IF NOT EXISTS source_time Nullable(DateTime64(6, 'UTC'));
+
+ALTER TABLE agent_feedback ADD COLUMN IF NOT EXISTS event_id String;
+
+ALTER TABLE agent_feedback ADD COLUMN IF NOT EXISTS run_id String;
+
+ALTER TABLE agent_feedback ADD COLUMN IF NOT EXISTS session_id String;
+
+ALTER TABLE agent_feedback ADD COLUMN IF NOT EXISTS kind String;
+
+ALTER TABLE agent_feedback ADD COLUMN IF NOT EXISTS collected_at DateTime64(6, 'UTC');
+
+ALTER TABLE agent_feedback ADD COLUMN IF NOT EXISTS version UInt64;
+
+ALTER TABLE agent_feedback ADD COLUMN IF NOT EXISTS payload_json String CODEC(ZSTD(3));
+
+ALTER TABLE agent_feedback ADD COLUMN IF NOT EXISTS user_id String;
+
+ALTER TABLE agent_feedback ADD COLUMN IF NOT EXISTS verdict String;
+
+ALTER TABLE agent_feedback ADD COLUMN IF NOT EXISTS feedback_id String;
+
+ALTER TABLE agent_feedback ADD COLUMN IF NOT EXISTS reason_category String;
+
+ALTER TABLE agent_feedback ADD COLUMN IF NOT EXISTS comment String;
+
+CREATE OR REPLACE VIEW agent_feedback_latest AS SELECT * FROM agent_feedback FINAL;
 
 CREATE TABLE IF NOT EXISTS agent_policy_decisions (
   sequence UInt64,
@@ -349,11 +857,49 @@ CREATE TABLE IF NOT EXISTS agent_policy_decisions (
   latency_ms Nullable(UInt64)
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 30 DAY;
 
-CREATE VIEW IF NOT EXISTS agent_policy_decisions_latest AS SELECT * FROM agent_policy_decisions FINAL;
+ALTER TABLE agent_policy_decisions ADD COLUMN IF NOT EXISTS sequence UInt64;
 
-CREATE VIEW IF NOT EXISTS agent_feedback_current AS SELECT run_id, user_id, argMax(verdict, version) AS verdict FROM agent_feedback_latest GROUP BY run_id, user_id;
+ALTER TABLE agent_policy_decisions ADD COLUMN IF NOT EXISTS schema_version UInt16;
 
-CREATE VIEW IF NOT EXISTS agent_grade_feedback_agreement AS
+ALTER TABLE agent_policy_decisions ADD COLUMN IF NOT EXISTS pi_version String;
+
+ALTER TABLE agent_policy_decisions ADD COLUMN IF NOT EXISTS trace_id Nullable(String);
+
+ALTER TABLE agent_policy_decisions ADD COLUMN IF NOT EXISTS source_time Nullable(DateTime64(6, 'UTC'));
+
+ALTER TABLE agent_policy_decisions ADD COLUMN IF NOT EXISTS event_id String;
+
+ALTER TABLE agent_policy_decisions ADD COLUMN IF NOT EXISTS run_id String;
+
+ALTER TABLE agent_policy_decisions ADD COLUMN IF NOT EXISTS session_id String;
+
+ALTER TABLE agent_policy_decisions ADD COLUMN IF NOT EXISTS kind String;
+
+ALTER TABLE agent_policy_decisions ADD COLUMN IF NOT EXISTS collected_at DateTime64(6, 'UTC');
+
+ALTER TABLE agent_policy_decisions ADD COLUMN IF NOT EXISTS version UInt64;
+
+ALTER TABLE agent_policy_decisions ADD COLUMN IF NOT EXISTS payload_json String CODEC(ZSTD(3));
+
+ALTER TABLE agent_policy_decisions ADD COLUMN IF NOT EXISTS tool String;
+
+ALTER TABLE agent_policy_decisions ADD COLUMN IF NOT EXISTS decision String;
+
+ALTER TABLE agent_policy_decisions ADD COLUMN IF NOT EXISTS reason String;
+
+ALTER TABLE agent_policy_decisions ADD COLUMN IF NOT EXISTS approved Nullable(UInt8);
+
+ALTER TABLE agent_policy_decisions ADD COLUMN IF NOT EXISTS argv0 String;
+
+ALTER TABLE agent_policy_decisions ADD COLUMN IF NOT EXISTS cmd_hash String;
+
+ALTER TABLE agent_policy_decisions ADD COLUMN IF NOT EXISTS latency_ms Nullable(UInt64);
+
+CREATE OR REPLACE VIEW agent_policy_decisions_latest AS SELECT * FROM agent_policy_decisions FINAL;
+
+CREATE OR REPLACE VIEW agent_feedback_current AS SELECT run_id, user_id, argMax(verdict, version) AS verdict FROM agent_feedback_latest GROUP BY run_id, user_id;
+
+CREATE OR REPLACE VIEW agent_grade_feedback_agreement AS
 SELECT f.run_id AS run_id, f.user_id AS user_id, g.grade_status AS grade_status,
   g.candidate_hash AS candidate_hash, g.prompts_version AS prompts_version, f.verdict AS feedback_verdict,
   multiIf(g.grade_status = 'passed', f.verdict = 'accepted',
@@ -364,7 +910,7 @@ FROM agent_feedback_current f INNER JOIN
     argMax(prompts_version, (attempt, version)) AS prompts_version
   FROM agent_grades_latest GROUP BY run_id) g ON f.run_id = g.run_id;
 
-CREATE VIEW IF NOT EXISTS agent_usage_reconciliation AS
+CREATE OR REPLACE VIEW agent_usage_reconciliation AS
 SELECT r.run_id AS run_id, r.capture_complete, s.start_snapshots, s.end_snapshots,
   if(s.start_snapshots>0 AND s.end_snapshots>0, s.end_tokens-s.start_tokens, NULL) AS session_token_delta,
   u.ledger_tokens, u.ledger_cost,
@@ -381,7 +927,7 @@ FROM agent_runs_latest r LEFT JOIN
   (SELECT run_id, count() AS ledger_rows, count(total_tokens) AS reported_tokens, count(cost_total) AS reported_costs, sum(total_tokens) AS ledger_tokens, sum(cost_total) AS ledger_cost
    FROM agent_usage_latest GROUP BY run_id) u ON r.run_id=u.run_id;
 
-CREATE VIEW IF NOT EXISTS agent_harness_metrics AS
+CREATE OR REPLACE VIEW agent_harness_metrics AS
 SELECT run_id, status, model, collected_at,
   JSONExtractString(payload_json,'harness_metrics','outcome') AS outcome,
   JSONExtract(payload_json,'harness_metrics','turn_util','Nullable(Float64)') AS turn_util,
@@ -400,7 +946,7 @@ SELECT run_id, status, model, collected_at,
   JSONExtract(payload_json,'harness_metrics','time_to_first_edit_s','Nullable(Float64)') AS time_to_first_edit_s
 FROM agent_runs_latest WHERE JSONHas(payload_json,'harness_metrics');
 
-CREATE VIEW IF NOT EXISTS agent_workflow_execution_durations AS
+CREATE OR REPLACE VIEW agent_workflow_execution_durations AS
 SELECT workflow_run_id, execution_id, any(role) AS role,
   if(countIf(phase='end' AND JSONHas(payload_json,'duration_ms'))>0,
     maxIf(JSONExtractUInt(payload_json,'duration_ms'),phase='end'),NULL) AS duration_ms,
@@ -409,7 +955,7 @@ SELECT workflow_run_id, execution_id, any(role) AS role,
   greatest(toInt64(duration_ms)-toInt64(queue_ms),0) AS active_agent_ms
 FROM agent_executions_latest GROUP BY workflow_run_id,execution_id;
 
-CREATE VIEW IF NOT EXISTS agent_workflow_usage AS
+CREATE OR REPLACE VIEW agent_workflow_usage AS
 SELECT a.*, if(JSONHas(r.routing_json,'jevCostUsd'), JSONExtractFloat(r.routing_json,'jevCostUsd'),
   if(JSONHas(r.routing_json,'jevLatencyMs'), NULL, 0)) AS routing_cost_usd,
   if(a.incomplete_executions=0 AND routing_cost_usd IS NOT NULL,

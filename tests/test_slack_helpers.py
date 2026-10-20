@@ -2914,6 +2914,22 @@ def test_delivery_card_text_stays_within_3000_chars(files, excerpt_length):
         assert f"…and {files - 15} more." in "\n".join(texts)
 
 
+@pytest.mark.parametrize("files", [12, 15, 40])
+def test_delivery_card_bounds_a_list_of_long_file_names(files):
+    approval = _delivery_approval(files=files, stat="s" * 500)
+    approval["delivery"]["files"] = [
+        f"src/{index:02d}/" + "n" * 300 for index in range(files)
+    ]
+    blocks = SlackBot._agent_delivery_blocks(approval)
+    texts = _block_texts(blocks)
+    assert sum(len(text) for text in texts) <= 3000
+    files_text = _section_texts(blocks)[1]
+    shown = files_text.count("• `")
+    assert 0 < shown < files
+    assert files_text.endswith(f"_…and {files - shown} more._")
+    assert "s" * 100 in "\n".join(texts)
+
+
 @pytest.mark.asyncio
 async def test_monitor_posts_delivery_card_with_deliver_and_discard_buttons():
     runtime = SimpleNamespace(
@@ -2993,6 +3009,31 @@ def test_agent_status_line_appends_next_step_for_known_codes(error):
     )
     assert line.startswith(f"⚠️ Agent run `r1` *failed* — {error['code']}: m")
     assert line.endswith(f"\nNext step: {AGENT_ERROR_HINTS[key]}")
+
+
+def _runtime_cause_codes():
+    import re
+    from pathlib import Path
+
+    source = Path("agent-runtime/src/error-taxonomy.ts").read_text()
+    union = re.search(r"export type CauseCode =(.*?);", source, re.S)
+    assert union, "CauseCode union not found in error-taxonomy.ts"
+    codes = re.findall(r'"([a-z_]+)"', union.group(1))
+    assert len(codes) >= 16
+    return codes
+
+
+@pytest.mark.parametrize("cause", _runtime_cause_codes())
+def test_every_runtime_cause_code_has_a_next_step_hint(cause):
+    line = _format_agent_status_line(
+        {
+            "run_id": "r1",
+            "status": "failed",
+            "error": {"code": "verification_failed", "cause_code": cause},
+        }
+    )
+    assert cause in AGENT_ERROR_HINTS
+    assert line.endswith(f"\nNext step: {AGENT_ERROR_HINTS[cause]}")
 
 
 def test_agent_status_line_prefers_cause_code_hint_over_code_hint():
