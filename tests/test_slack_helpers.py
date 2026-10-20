@@ -536,8 +536,6 @@ class TestSlackMessageHandler:
     @pytest.mark.asyncio
     async def test_discuss_run_in_another_thread_does_not_set_new_thread_mode(self):
         bot, runtime = self._followup_bot(previous_mode="discuss")
-        # The discuss run has finished; an active one would hit the per-user cap.
-        bot.agent_runs["R1"]["result_posted"] = True
         handler = SlackMessageHandler(bot)
 
         await handler._start_agent_prompt(
@@ -3336,6 +3334,17 @@ async def test_modal_agent_start_acks_then_bootstraps_in_the_background():
     assert "R1" in bot.web_client.chat_update.await_args.kwargs["text"]
 
 
+def _watch_until(bot, finished, run_id="R1"):
+    """Keep the monitor of `run_id` watching until `finished` is set."""
+
+    async def monitor(tracked):
+        if tracked["run_id"] == run_id:
+            await finished.wait()
+            tracked["result_posted"] = True
+
+    bot._monitor_agent_run = monitor
+
+
 @pytest.mark.asyncio
 async def test_per_user_agent_cap_names_the_active_run():
     runtime = SimpleNamespace(
@@ -3346,7 +3355,8 @@ async def test_per_user_agent_cap_names_the_active_run():
     bot = SlackBot(
         {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
     )
-    bot._monitor_agent_run = AsyncMock()
+    finished = asyncio.Event()
+    _watch_until(bot, finished)
     bot.web_client = SimpleNamespace(chat_postEphemeral=AsyncMock())
     active = bot._track_agent_run(
         {"session_id": "S1", "run_id": "R1", "status": "running"},
@@ -3355,6 +3365,7 @@ async def test_per_user_agent_cap_names_the_active_run():
         thread_ts="100.1",
         owner_user_id="U1",
     )
+    bot._start_agent_monitor(active)
     handler = bot.message_handler
     client = SimpleNamespace(
         chat_postMessage=AsyncMock(return_value={"ts": "300.1"}),
@@ -3372,7 +3383,9 @@ async def test_per_user_agent_cap_names_the_active_run():
         {"text": "agent fix it", "user_id": "U1", "channel_id": "C2", "team_id": "T1"}
     )
     assert "R1" in bot.web_client.chat_postEphemeral.await_args.kwargs["text"]
-    assert not bot.background_tasks
+    assert not [
+        task for task in bot.background_tasks if task.get_name() == "pi_agent_start"
+    ]
     runtime.create_session.assert_not_awaited()
 
     # A follow-up in the active run's own thread is not a second agent.
@@ -3385,12 +3398,10 @@ async def test_per_user_agent_cap_names_the_active_run():
         ["fix"], "U2", "C2", client, team_id="T1", thread_ts="200.1"
     )
     assert runtime.create_session.await_count == 2
-    await _drain_background_tasks(bot)
 
-    # Once the result is posted the slot is free again.
-    for tracked in list(bot.agent_runs.values()):
-        if tracked["owner_user_id"] == "U1":
-            tracked["result_posted"] = True
+    # Once R1 finishes the slot is free again.
+    finished.set()
+    await _drain_background_tasks(bot)
     assert active["result_posted"] is True
     await handler._handle_agent_command(
         ["fix", "another", "bug"], "U1", "C2", client, team_id="T1", thread_ts="200.2"
@@ -3400,19 +3411,17 @@ async def test_per_user_agent_cap_names_the_active_run():
 
 
 @pytest.mark.asyncio
-async def test_per_user_agent_cap_is_configurable():
+async def test_per_user_agent_cap_ignores_a_run_nobody_is_watching():
     runtime = SimpleNamespace(
         create_session=AsyncMock(
             return_value={"session_id": "S2", "run_id": "R2", "status": "starting"}
         )
     )
     bot = SlackBot(
-        {"channels": []},
-        SimpleNamespace(),
-        services={"agent_runtime": runtime},
-        agent_config={"max_active_runs_per_user": 2},
+        {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
     )
     bot._monitor_agent_run = AsyncMock()
+    # Its monitor gave up without posting a result, e.g. on a runtime error.
     bot._track_agent_run(
         {"session_id": "S1", "run_id": "R1", "status": "running"},
         team_id="T1",
@@ -3426,8 +3435,47 @@ async def test_per_user_agent_cap_is_configurable():
     )
 
     assert "R2" in response
-    runtime.create_session.assert_awaited_once()
     await _drain_background_tasks(bot)
+
+
+@pytest.mark.asyncio
+async def test_per_user_agent_cap_is_configurable():
+    runtime = SimpleNamespace(
+        create_session=AsyncMock(
+            return_value={"session_id": "S2", "run_id": "R2", "status": "starting"}
+        )
+    )
+    finished = asyncio.Event()
+    bots = []
+    for limit, started in [(1, False), (2, True)]:
+        bot = SlackBot(
+            {"channels": []},
+            SimpleNamespace(),
+            services={"agent_runtime": runtime},
+            agent_config={"max_active_runs_per_user": limit},
+        )
+        bots.append(bot)
+        _watch_until(bot, finished)
+        bot._start_agent_monitor(
+            bot._track_agent_run(
+                {"session_id": "S1", "run_id": "R1", "status": "running"},
+                team_id="T1",
+                channel_id="C1",
+                thread_ts="100.1",
+                owner_user_id="U1",
+            )
+        )
+
+        response = await bot.message_handler._handle_agent_command(
+            ["fix"], "U1", "C2", SimpleNamespace(), team_id="T1", thread_ts="200.1"
+        )
+
+        assert ("R2" in response) is started
+        assert ("R1" in response) is not started
+    runtime.create_session.assert_awaited_once()
+    finished.set()
+    for bot in bots:
+        await _drain_background_tasks(bot)
 
 
 @pytest.mark.asyncio

@@ -3990,9 +3990,11 @@ class SlackBot:
     ) -> Optional[str]:
         """Why the owner cannot start another agent now, or None if they can.
 
-        A follow-up in a thread reuses that thread's session, so runs and
-        starts in the same thread never count against the cap. CI repair runs
-        are opened by the CI inbox, not by the owner, and do not count either.
+        A run counts while its monitor is watching it: a monitor that gave up
+        must not lock its owner out. A follow-up in a thread reuses that
+        thread's session, so runs and starts in the same thread never count.
+        CI repair runs are opened by the CI inbox, not by the owner, and do
+        not count either.
         """
         this_thread = (
             self._thread_key(channel_id, thread_ts)
@@ -4003,8 +4005,8 @@ class SlackBot:
             tracked
             for tracked in self.agent_runs.values()
             if tracked.get("owner_user_id") == user_id
-            and tracked.get("run_id")
             and not tracked.get("result_posted")
+            and self._is_agent_run_monitored(tracked.get("run_id"))
             and tracked.get("mode") != "ci_repair"
             and (
                 this_thread is None
@@ -4032,6 +4034,10 @@ class SlackBot:
             "You already have an Agent run starting. Wait for it to open its "
             "thread, then start the new task."
         )
+
+    def _is_agent_run_monitored(self, run_id: Optional[str]) -> bool:
+        task = self.agent_monitor_tasks.get(run_id) if run_id else None
+        return task is not None and not task.done()
 
     def _reserve_agent_start(
         self, user_id: str, channel_id: Optional[str], thread_ts: Optional[str]
