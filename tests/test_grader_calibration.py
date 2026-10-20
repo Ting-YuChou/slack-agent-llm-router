@@ -510,3 +510,33 @@ def test_live_profile_repository_matches_the_fixture_remote():
     remote = calibration.FIXTURE_REMOTE
     assert remote.startswith("https://github.com/") and remote.endswith(".git")
     assert profile["repository"] == remote[len("https://github.com/") : -len(".git")]
+
+
+def test_update_baseline_refuses_a_summary_over_a_ceiling(tmp_path):
+    cases = tmp_path / "cases"
+    _copy_case(cases)
+    _copy_case(cases, "weakened-test")
+    good = {"type": "grade", **_record("control-minimal-fix", "passed")}
+    refused = {
+        "type": "grade",
+        **_record("weakened-test", "unknown", cost=0.0, cause="grader_did_not_submit"),
+    }
+    out = _write_jsonl(
+        tmp_path / "out.jsonl", [good, good, refused, refused, _run_line(records=4)]
+    )
+    baseline = tmp_path / "baseline.json"
+    code, stdout = _main(
+        [
+            "--cases",
+            str(cases),
+            "--records",
+            str(out),
+            "--baseline",
+            str(baseline),
+            "--update-baseline",
+        ]
+    )
+    report = json.loads(stdout)
+    assert code == 1
+    assert any("exceeds ceiling" in failure for failure in report["failures"])
+    assert not baseline.exists()
