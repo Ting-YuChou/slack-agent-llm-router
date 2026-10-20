@@ -103,3 +103,10 @@ test("an already aborted signal rejects before the execution starts", async () =
   await assert.rejects(collectSubmission({ process: () => { started = true; }, toolName: "submit", validate, timeoutMs: 1_000, signal: controller.signal, errors }), (error: unknown) => error === reason);
   assert.equal(started, false);
 });
+
+test("settling on a provider error without a submission reports the execution failure, not did-not-submit", async () => {
+  const failed: Step = { event: { type: "settled", outcome: "error", stop_reason: "error", error_message: "429 workflow_budget_unavailable_or_exhausted" } as PublicRunEvent };
+  await assert.rejects(collect([failed]), cause("grader_execution_failed", /workflow_budget_unavailable_or_exhausted/));
+  // A submission made before the error still counts.
+  assert.deepEqual((await collect([...submit({ ok: true }), failed])).value, { ok: true });
+});
