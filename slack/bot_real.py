@@ -101,6 +101,10 @@ AGENT_ERROR_HINTS = {
     "diff_limit_exceeded": (
         "Split the request into smaller changes, each within the diff limits."
     ),
+    "disk_quota_exceeded": (
+        "The worktree outgrew its disk quota; avoid generating large files or "
+        "dependencies in the repository, then retry."
+    ),
     "agent_tool_limit": (
         "Narrow the request or split it so the agent needs fewer tool calls."
     ),
