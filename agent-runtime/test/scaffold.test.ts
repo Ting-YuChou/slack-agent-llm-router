@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -55,4 +55,15 @@ test("demo image setup refreshes the deployment image lock", () => {
   assert.match(source, /plugin checksum is invalid/);
   assert.match(source, /skill checksum is invalid/);
   assert.match(source, /docker.*image.*inspect/s);
+});
+
+test("every agent-runtime base image is pinned by digest", () => {
+  const root = fileURLToPath(new URL("../../", import.meta.url));
+  const dockerfiles = readdirSync(root).filter(name => name.startsWith("Dockerfile."));
+  assert.ok(dockerfiles.length >= 5, dockerfiles.join(","));
+  for (const name of dockerfiles) {
+    const froms = readFileSync(`${root}/${name}`, "utf8").split("\n").filter(line => /^FROM\s/i.test(line));
+    assert.ok(froms.length > 0, name);
+    for (const line of froms) assert.match(line, /^FROM\s+\S+@sha256:[a-f0-9]{64}(\s|$)/, `${name}: ${line}`);
+  }
 });
