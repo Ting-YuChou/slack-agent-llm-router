@@ -90,7 +90,7 @@ class AgentAnalyticsTests(unittest.TestCase):
             s
             for s in module.schema_sql()
             if s.startswith(
-                "CREATE VIEW IF NOT EXISTS agent_grade_feedback_agreement AS"
+                "CREATE OR REPLACE VIEW agent_grade_feedback_agreement AS"
             )
         )
         self.assertIn("agent_grades_latest", view)
@@ -314,7 +314,7 @@ class AgentAnalyticsTests(unittest.TestCase):
         view = next(
             s
             for s in module.schema_sql()
-            if s.startswith("CREATE VIEW IF NOT EXISTS agent_harness_metrics AS")
+            if s.startswith("CREATE OR REPLACE VIEW agent_harness_metrics AS")
         )
         self.assertIn("FROM agent_runs_latest", view)
         for column in (
@@ -410,6 +410,30 @@ class AgentAnalyticsTests(unittest.TestCase):
         self.assertIn("comment String", ddl)
         self.assertIn(ddl, Path("docker/observability/agent-tables.sql").read_text())
 
+    def test_existing_tables_gain_every_column_before_views_are_replaced(self):
+        module = self.module()
+        sql = module.schema_sql()
+        for table, extra in module.TABLES.items():
+            create = sql.index(
+                next(s for s in sql if s.startswith(f"CREATE TABLE IF NOT EXISTS {table} ("))
+            )
+            latest = sql.index(
+                f"CREATE OR REPLACE VIEW {table}_latest AS SELECT * FROM {table} FINAL"
+            )
+            for column, kind in {**module.BASE, **extra}.items():
+                alter = (
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {kind}"
+                )
+                self.assertIn(alter, sql)
+                self.assertLess(create, sql.index(alter))
+                self.assertLess(sql.index(alter), latest)
+        # A view created before a column existed keeps its old column list,
+        # so every view is replaced on migrate instead of left as is.
+        for statement in sql:
+            self.assertFalse(statement.startswith("CREATE VIEW IF NOT EXISTS"))
+            if "VIEW" in statement.split(" AS")[0]:
+                self.assertTrue(statement.startswith("CREATE OR REPLACE VIEW "))
+
     def test_ttl_casts_datetime64_to_clickhouse_supported_datetime(self):
         module = self.module()
         for statement in module.schema_sql():
@@ -429,7 +453,7 @@ class AgentAnalyticsTests(unittest.TestCase):
         statement = next(
             sql
             for sql in module.schema_sql()
-            if sql.startswith("CREATE VIEW IF NOT EXISTS agent_usage_reconciliation")
+            if sql.startswith("CREATE OR REPLACE VIEW agent_usage_reconciliation")
         )
         self.assertIn("SELECT r.run_id AS run_id", statement)
 
