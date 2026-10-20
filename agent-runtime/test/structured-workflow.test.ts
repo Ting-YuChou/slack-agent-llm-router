@@ -156,3 +156,44 @@ test('malformed required findings are retried once and never become a successful
     assert.equal(tries,2); assert.equal(coordinator.tasks('r').find(node => node.id === 'a')!.state,'unknown');
   } finally { store.close(); rmSync(root,{ recursive: true,force: true }); }
 });
+
+test('plan and finding paths are normalized before scope comparison', () => {
+  const m = structuredWorkflowModule;
+  const plan = m.validatePlan({ tasks: [{ ...task('a'), paths: ['./src/', 'lib//util'] }] }, []);
+  assert.deepEqual(plan.tasks[0].paths, ['src', 'lib/util']);
+  const result = m.validateInvestigation({ status: 'succeeded', findings: [{ path: './src/counter.ts', line: 3, reason: 'Counter reset fails' }], evidence: ['src/counter.ts:3'], unresolved: [], suggested_tasks: [] }, { paths: ['./src'] });
+  assert.equal(result.findings[0].path, 'src/counter.ts');
+  assert.throws(() => m.validateInvestigation({ status: 'succeeded', findings: [{ path: './srcx/a.ts', line: 1, reason: 'x' }], evidence: ['e'], unresolved: [], suggested_tasks: [] }, { paths: ['src'] }), /evidence/);
+});
+
+test('a node that honestly reports unknown twice degrades to unresolved only when the profile allows it', async () => {
+  const { WorkflowCoordinator } = await import('../src/structured-workflow.js');
+  const unknown = { status: 'unknown', findings: [], evidence: [], unresolved: ['Could not locate the reset path'], suggested_tasks: [] };
+  const ok = { status: 'succeeded', findings: [{ path: 'src/counter.ts', line: 1, reason: 'Counter reset fails' }], evidence: ['src/counter.ts:1'], unresolved: [], suggested_tasks: [] };
+  const execute = async (request: any) => request.node.role === 'planner'
+    ? { tasks: request.node.wave === 1 ? [task('a'), task('b'), task('c', ['a'])] : [] }
+    : request.node.id === 'a' ? unknown : ok;
+  const input = { run_id: 'r', owner: 'u', requirement: 'fix', baseline: 'a'.repeat(40), fingerprint: 'f' };
+  for (const degradeUnknown of [false, true]) {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'degrade-')); const store = new ControlStore(path.join(root, 'db'));
+    try {
+      const coordinator = new WorkflowCoordinator({ store, concurrency: 2, degradeUnknown, execute });
+      const discovery = coordinator.discover({ ...input, snapshot: { hash: 'h', path: root } }, new AbortController().signal);
+      if (!degradeUnknown) { await assert.rejects(discovery, /investigation_unknown/); continue; }
+      const prompt = await discovery;
+      const a = coordinator.tasks('r').find(node => node.id === 'a')!;
+      assert.equal(a.state, 'unresolved'); assert.equal(a.attempt, 2);
+      assert.equal(coordinator.tasks('r').find(node => node.id === 'c')!.state, 'succeeded');
+      assert.match(prompt, /Could not locate the reset path/);
+      assert.match(prompt, /unresolved/);
+    } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
+test('profiles may opt into degrading unknown investigations; the default stays fail-closed', async () => {
+  const { validateProfile } = await import('../src/verification.js');
+  const profile = { id: 'p', repository: 'o/r', image: 'sha256:' + 'a'.repeat(64), rubric: ['correct'], checks: [{ name: 'test', argv: ['pytest'], cwd: '.', timeoutMs: 1000 }], allowedPaths: ['src/'], structuredWorkflow: { enabled: true } };
+  assert.equal((validateProfile(profile) as any).structuredWorkflow.degradeUnknown, false);
+  assert.equal((validateProfile({ ...profile, structuredWorkflow: { enabled: true, degradeUnknown: true } }) as any).structuredWorkflow.degradeUnknown, true);
+  assert.throws(() => validateProfile({ ...profile, structuredWorkflow: { enabled: true, degradeUnknown: 'yes' } }));
+});

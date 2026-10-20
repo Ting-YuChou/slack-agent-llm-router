@@ -82,3 +82,50 @@ test('grader submit_grade rejects evidence the snapshot does not contain', async
   const result = await submit.execute('t2', grounded);
   assert.equal(result.details.status, 'passed');
 }));
+
+test('read-only roles resolve relative paths against the snapshot, not the session cwd', async () => withSnapshot(async root => {
+  const workflow = await loadExtension('workflow-agent', { PI_AGENT_WORKTREE: root, PI_AGENT_WORKFLOW_JSON: JSON.stringify({ role: 'code_explorer', paths: ['src'] }) });
+  const read: Record<string, unknown> = { path: 'src/a.ts' };
+  assert.equal(await workflow('read', read), undefined);
+  assert.equal(read.path, path.join(root, 'src', 'a.ts'));
+  assert.equal((await workflow('read', { path: 'README.md' })).block, true);
+  assert.equal((await workflow('read', { path: '../escape' })).block, true);
+
+  const grader = await loadExtension('grader', { PI_AGENT_WORKTREE: root, PI_AGENT_GRADER_JSON: JSON.stringify({ candidate_hash: 'h', rubric: [] }) });
+  const graded: Record<string, unknown> = { path: './src/a.ts' };
+  assert.equal(await grader('read', graded), undefined);
+  assert.equal(graded.path, path.join(root, 'src', 'a.ts'));
+}));
+
+test('workflow agent with several task paths defaults path-less search to the first task path', async () => withSnapshot(async root => {
+  const call = await loadExtension('workflow-agent', { PI_AGENT_WORKTREE: root, PI_AGENT_WORKFLOW_JSON: JSON.stringify({ role: 'code_explorer', paths: ['src', 'README.md'] }) });
+  const input: Record<string, unknown> = { pattern: 'a' };
+  assert.equal(await call('grep', input), undefined);
+  assert.equal(input.path, path.join(root, 'src'));
+}));
+
+test('workflow agent keeps the submit tool reachable after the read budget is spent', async () => withSnapshot(async root => {
+  let aborted = 0;
+  const previous = { w: process.env.PI_AGENT_WORKTREE, j: process.env.PI_AGENT_WORKFLOW_JSON };
+  process.env.PI_AGENT_WORKTREE = root;
+  process.env.PI_AGENT_WORKFLOW_JSON = JSON.stringify({ role: 'code_explorer', paths: ['src'] });
+  const handlers = new Map<string, (...args: any[]) => any>();
+  try {
+    const extension = await import(`${pathToFileURL(path.resolve(import.meta.dirname, '../../extensions/workflow-agent.ts')).href}?${Math.random()}`);
+    extension.default({ on: (event: string, handler: (...args: any[]) => any) => handlers.set(event, handler), registerTool: () => undefined });
+  } finally {
+    if (previous.w === undefined) delete process.env.PI_AGENT_WORKTREE; else process.env.PI_AGENT_WORKTREE = previous.w;
+    if (previous.j === undefined) delete process.env.PI_AGENT_WORKFLOW_JSON; else process.env.PI_AGENT_WORKFLOW_JSON = previous.j;
+  }
+  const ctx = { cwd: SESSION_CWD, abort: () => { aborted++; } };
+  const call = (toolName: string, input: Record<string, unknown>) => handlers.get('tool_call')!({ toolName, input }, ctx);
+  // Blocked calls count toward the budget too.
+  for (let i = 0; i < 20; i++) await call('read', { path: i % 2 ? 'src/a.ts' : 'README.md' });
+  const over = await call('read', { path: 'src/a.ts' });
+  assert.equal(over.block, true);
+  assert.match(over.reason, /submit_investigation/);
+  assert.equal(aborted, 0);
+  assert.equal(await call('submit_investigation', {}), undefined);
+  for (let i = 0; i < 5; i++) await call('grep', { pattern: 'x' });
+  assert.equal(aborted, 1);
+}));

@@ -9,18 +9,23 @@ export default function workflowAgent(pi: ExtensionAPI) {
   if (!config || !Array.isArray(config.paths)) throw new Error('Workflow agent context required');
   const root = process.env.PI_AGENT_WORKTREE!;
   const tool = config.role === 'planner' ? 'submit_plan' : 'submit_investigation';
+  // Reads are budgeted; the submit tool is not, so a spent budget still ends in a result.
+  const READ_LIMIT = 20, ABORT_LIMIT = 25;
   let calls = 0, submitted = false;
   pi.on('tool_call', async (event, ctx) => {
-    if (++calls > 20) { ctx.abort(); return { block: true, reason: 'Investigation tool limit' }; }
+    if (event.toolName === tool && !submitted) return;
+    if (++calls > READ_LIMIT) {
+      if (calls > ABORT_LIMIT) ctx.abort();
+      return { block: true, reason: `Investigation tool limit reached; call ${tool} now and list remaining gaps as unresolved` };
+    }
     if (submitted || !['read', 'grep', 'find', 'ls', tool, ...(config.mcpTools ?? [])].includes(event.toolName)) return { block: true, reason: 'Restricted workflow agent' };
     if (config.mcpTools?.includes(event.toolName)) return;
-    if (event.toolName !== tool) {
-      const input = event.input as Record<string, unknown>;
-      // The session cwd is outside the snapshot; path-less ls/find/grep default to the task scope.
-      const defaultPath = config.paths.length === 1 ? path.resolve(root, String(config.paths[0])) : root;
-      if (input.path === undefined) input.path = defaultPath;
-      if (!(await validateSnapshotRead(root,ctx.cwd,typeof input.path === 'string' ? input.path : defaultPath,config.paths)).allowed) return { block: true, reason: 'Read is outside the task snapshot scope' };
-    }
+    const input = event.input as Record<string, unknown>;
+    // The session cwd is outside the snapshot: relative paths resolve against the snapshot root,
+    // and path-less ls/find/grep default to the first task path.
+    const requested = typeof input.path === 'string' ? input.path : String(config.paths[0]);
+    const resolved = input.path = path.resolve(root, requested);
+    if (!(await validateSnapshotRead(root,root,resolved,config.paths)).allowed) return { block: true, reason: 'Read is outside the task snapshot scope' };
   });
   const task = Type.Object({ id: Type.String(), role: Type.Union([Type.Literal('code_explorer'),Type.Literal('ci_investigator'),Type.Literal('test_analyst')]), purpose: Type.String(), paths: Type.Array(Type.String()), dependencies: Type.Array(Type.String()), expected_output: Type.String() });
   const parameters = config.role === 'planner'

@@ -79,7 +79,7 @@ export function createQualityServices(options: {
     token: (id,route) => options.token(id,route,"investigator"), prompt: id => options.ledger.prompt(id),
     cost: (id,cost) => options.phase(id,'investigating',cost), createProcess: options.createExecutionProcess,
   });
-  const coordinator = new WorkflowCoordinator({ store: options.control, concurrency: profile.structuredWorkflow?.concurrency ?? 2,
+  const coordinator = new WorkflowCoordinator({ store: options.control, concurrency: profile.structuredWorkflow?.concurrency ?? 2, degradeUnknown: profile.structuredWorkflow?.degradeUnknown ?? false,
     execute: request => runner.run(request),
     record: async node => {
       await options.phase(node.workflow,node.role === 'planner' ? 'planning' : 'investigating');

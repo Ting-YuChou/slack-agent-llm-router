@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import path from "node:path";
 import { validateSnapshotRead } from "../dist/src/policy.js";
 import { Type } from "typebox";
 import { validateGrade } from "../dist/src/quality-gate.js";
@@ -10,15 +11,17 @@ export default function grader(pi: ExtensionAPI) {
   let submitted = false;
   let calls = 0;
   pi.on("tool_call", async (event, ctx) => {
+    // The verdict itself never counts against the read budget.
+    if (event.toolName === "submit_grade" && !submitted) return;
     if (++calls > 40) { ctx.abort(); return { block: true, reason: "Grader tool limit" }; }
 
     if (!["read", "grep", "find", "ls", "submit_grade"].includes(event.toolName)) return { block: true, reason: "Grader is read-only" };
     if (submitted) return { block: true, reason: "Grade already submitted" };
     if (event.toolName !== "submit_grade") {
       const input = event.input as Record<string, unknown>;
-      // The session cwd is outside the snapshot; path-less ls/find/grep must target the snapshot root.
-      if (input.path === undefined) input.path = root;
-      if (!(await validateSnapshotRead(root,ctx.cwd,typeof input.path === 'string' ? input.path : root)).allowed) return { block: true, reason: "Only candidate snapshot is readable" };
+      // The session cwd is outside the snapshot: relative and path-less reads target the snapshot root.
+      const resolved = input.path = path.resolve(root, typeof input.path === "string" ? input.path : ".");
+      if (!(await validateSnapshotRead(root,root,resolved)).allowed) return { block: true, reason: "Only candidate snapshot is readable" };
     }
   });
   pi.registerTool({

@@ -20,7 +20,7 @@ export interface VerificationProfile {
   maxRepairs: number; maxCostUsd: number; activeTimeoutMs: number;
   ciCheckout?: "head" | "merge";
   slack?: { team_id: string; channel_id: string; user_id: string }; workflows?: string[];
-  structuredWorkflow?: { enabled: boolean; concurrency: number; maxCostUsd: number; activeTimeoutMs: number; discoveryCostUsd: number };
+  structuredWorkflow?: { enabled: boolean; concurrency: number; maxCostUsd: number; activeTimeoutMs: number; discoveryCostUsd: number; degradeUnknown?: boolean };
   /** per_mode (default): one container per mode, each check isolated inside it; per_check: one container per check. */
   isolation?: "per_mode" | "per_check";
   /** The writer's own run_checks calls: which checks run by default and how many calls a run gets. */
@@ -58,8 +58,8 @@ export function validateProfile(raw: unknown): VerificationProfile {
   if (p.structuredWorkflow !== undefined) {
     const s = p.structuredWorkflow;
     if (!s || typeof s.enabled !== 'boolean') throw new Error('Invalid structured workflow configuration');
-    const config = { enabled: s.enabled, concurrency: s.concurrency ?? 2, maxCostUsd: s.maxCostUsd ?? 5, activeTimeoutMs: s.activeTimeoutMs ?? 1_800_000, discoveryCostUsd: s.discoveryCostUsd ?? 1.5 };
-    if (!Number.isInteger(config.concurrency) || config.concurrency < 1 || config.concurrency > 4 || !Number.isFinite(config.maxCostUsd) || config.maxCostUsd <= 0 || config.maxCostUsd > 5 || !Number.isInteger(config.activeTimeoutMs) || config.activeTimeoutMs <= 0 || config.activeTimeoutMs > 1_800_000 || !Number.isFinite(config.discoveryCostUsd) || config.discoveryCostUsd <= 0 || config.discoveryCostUsd >= config.maxCostUsd) throw new Error('Invalid structured workflow limits');
+    const config = { enabled: s.enabled, concurrency: s.concurrency ?? 2, maxCostUsd: s.maxCostUsd ?? 5, activeTimeoutMs: s.activeTimeoutMs ?? 1_800_000, discoveryCostUsd: s.discoveryCostUsd ?? 1.5, degradeUnknown: s.degradeUnknown ?? false };
+    if (!Number.isInteger(config.concurrency) || config.concurrency < 1 || config.concurrency > 4 || !Number.isFinite(config.maxCostUsd) || config.maxCostUsd <= 0 || config.maxCostUsd > 5 || !Number.isInteger(config.activeTimeoutMs) || config.activeTimeoutMs <= 0 || config.activeTimeoutMs > 1_800_000 || !Number.isFinite(config.discoveryCostUsd) || config.discoveryCostUsd <= 0 || config.discoveryCostUsd >= config.maxCostUsd || typeof config.degradeUnknown !== 'boolean') throw new Error('Invalid structured workflow limits');
     p.structuredWorkflow = config;
   }
   return { ...p, isolation: p.isolation ?? "per_mode", writerChecks: { defaultChecks: p.writerChecks?.defaultChecks ?? p.checks.map(c => c.name), maxCalls: p.writerChecks?.maxCalls ?? 4 }, baselinePaths: p.baselinePaths ?? ["tests/", "agent-runtime/test/"], maxRepairs: Math.min(2, Math.max(0, p.maxRepairs ?? 2)), maxCostUsd: p.maxCostUsd ?? 1, activeTimeoutMs: p.activeTimeoutMs ?? 900_000 };
