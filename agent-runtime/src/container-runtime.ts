@@ -24,6 +24,7 @@ export interface AgentContainerOptions {
   image: string;
   network: string;
   worktreePath: string;
+  /** The session's own Git mirror (see writerGitDir); never the host repository's git-common-dir. */
   gitMetadataPath: string;
   sessionStatePath: string;
   gatewayUrl: string;

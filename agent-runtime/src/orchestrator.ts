@@ -210,7 +210,7 @@ export interface AgentProcess {
 interface Worktrees {
   /** Full patch against HEAD; delivery approval binds its digest when available. */
   patch?(path: string): Promise<string>;
-  create(runId: string, trustedBase?: string): Promise<{ path: string; branch: string; baselineCommit: string }>;
+  create(runId: string, trustedBase?: string): Promise<{ path: string; branch: string; baselineCommit: string; gitDir?: string }>;
   inspectDiff(path: string, limits: { maxFiles: number; maxBytes: number; maxSingleFileBytes: number }): Promise<{ files: string[]; bytes: number; stat: string }>;
   commit(path: string, message: string): Promise<string>;
   rollback(path: string, baseline: string): Promise<void>;
@@ -224,6 +224,8 @@ interface SessionRecord {
   modelRef: string;
   autoRouting: boolean;
   worktreePath: string;
+  /** The session's own Git mirror; absent for sessions created before mirrors (shared metadata). */
+  gitDir?: string;
   branch: string;
   baselineCommit: string;
   process: AgentProcess;
@@ -236,7 +238,7 @@ interface SessionRecord {
 
 export class CodingAgentOrchestrator {
   private readonly worktrees: Worktrees;
-  private readonly startProcess: (session: { id: string; ownerUserId: string; worktreePath: string; modelRef: string; restored?: boolean; skipDelivery?: boolean }, onEvent: (event: PublicRunEvent) => void) => Promise<AgentProcess>;
+  private readonly startProcess: (session: { id: string; ownerUserId: string; worktreePath: string; gitDir?: string; modelRef: string; restored?: boolean; skipDelivery?: boolean }, onEvent: (event: PublicRunEvent) => void) => Promise<AgentProcess>;
   private readonly maxActiveSessions: number;
   private readonly deadlineMs: number;
   private readonly availableModelRefs: Set<string>;
@@ -365,7 +367,7 @@ export class CodingAgentOrchestrator {
       let session!: SessionRecord;
       const modelRef = saved.modelRef ?? resolveAgentModel().ref;
       const process = await this.startProcess(
-        { id: saved.id, ownerUserId: saved.ownerUserId, worktreePath: saved.worktreePath, modelRef, restored: true, ...(saved.skipDelivery ? { skipDelivery: true } : {}) },
+        { id: saved.id, ownerUserId: saved.ownerUserId, worktreePath: saved.worktreePath, ...(saved.gitDir ? { gitDir: saved.gitDir } : {}), modelRef, restored: true, ...(saved.skipDelivery ? { skipDelivery: true } : {}) },
         (event) => this.handleProcessEvent(session.id, event),
       );
       session = { ...saved, modelRef, autoRouting: saved.autoRouting === true, process };
@@ -462,7 +464,7 @@ export class CodingAgentOrchestrator {
       let process: AgentProcess;
       try {
         process = await this.startProcess(
-          { id: sessionId, ownerUserId: input.user_id, worktreePath: worktree.path, modelRef: route.modelRef, ...(trusted.delivery === "skip" ? { skipDelivery: true } : {}) },
+          { id: sessionId, ownerUserId: input.user_id, worktreePath: worktree.path, ...(worktree.gitDir ? { gitDir: worktree.gitDir } : {}), modelRef: route.modelRef, ...(trusted.delivery === "skip" ? { skipDelivery: true } : {}) },
           (event) => this.handleProcessEvent(session.id, event),
         );
       } catch (error) {
@@ -476,6 +478,7 @@ export class CodingAgentOrchestrator {
         modelRef: route.modelRef,
         autoRouting,
         worktreePath: worktree.path,
+        ...(worktree.gitDir ? { gitDir: worktree.gitDir } : {}),
         branch: worktree.branch,
         baselineCommit: worktree.baselineCommit,
         process,
@@ -1441,6 +1444,7 @@ export class CodingAgentOrchestrator {
         modelRef: session.modelRef,
         autoRouting: session.autoRouting,
         worktreePath: session.worktreePath,
+        ...(session.gitDir ? { gitDir: session.gitDir } : {}),
         branch: session.branch,
         baselineCommit: session.baselineCommit,
         activeRunId: session.activeRunId,
