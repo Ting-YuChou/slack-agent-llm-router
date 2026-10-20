@@ -1086,6 +1086,8 @@ class TestSlackAgentApprovals:
         }
 
         await bot._handle_agent_view_submission(payload)
+        # The worker only acks; bootstrap and create_session run in the background.
+        await _drain_background_tasks(bot)
 
         bot.agent_bootstrap_builder.build.assert_awaited_once()
         assert runtime.create_session.await_args.args == (

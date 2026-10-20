@@ -13,7 +13,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Any, Set
+from typing import Awaitable, Callable, Dict, List, Optional, Any, Set
 from dataclasses import dataclass
 
 from slack_sdk.web.async_client import AsyncWebClient
@@ -46,6 +46,7 @@ from slack.agent_feedback import (
 )
 from slack.agent_shortcut import (
     AgentShortcutNonce,
+    AgentShortcutSubmission,
     build_agent_shortcut_modal,
     parse_agent_shortcut_submission,
 )
@@ -71,6 +72,10 @@ MEMORY_SLASH_ONLY_MESSAGE = (
 )
 SLACK_BUSY_MESSAGE = "The LLM Router is busy right now. Please retry in a moment."
 SLACK_PRIORITY_WORK_KINDS = frozenset({"interactive"})
+AGENT_STARTING_MESSAGE = (
+    "🛠️ Starting the Pi coding agent; it will open a thread in this channel "
+    "when its worktree is ready."
+)
 SLACK_SECTION_TEXT_LIMIT = 3000
 AGENT_DELIVERY_CARD_LIMIT = 3000
 AGENT_DELIVERY_MAX_FILES = 15
@@ -1283,6 +1288,7 @@ class SlackMessageHandler:
                     team_id=team_id,
                     thread_ts=thread_ts,
                     message_ts=message_ts,
+                    background_start=command_surface == "slash",
                 )
             return await self.commands[command](args, user_id, channel_id, client)
         return await self._handle_query(
@@ -1364,8 +1370,14 @@ class SlackMessageHandler:
         team_id: Optional[str] = None,
         thread_ts: Optional[str] = None,
         message_ts: Optional[str] = None,
+        background_start: bool = False,
     ) -> str:
-        """Start or control a stateful Pi coding-agent thread."""
+        """Start or control a stateful Pi coding-agent thread.
+
+        With `background_start`, a new task is acknowledged at once and its
+        bootstrap and `create_session` run in a background task, so a slow
+        start never holds a Slack worker.
+        """
         if not args:
             return "Usage: `/llm agent <task>`"
 
@@ -1495,6 +1507,54 @@ class SlackMessageHandler:
         if not task:
             return "Usage: `/llm agent [--model provider/model] <task>`"
 
+        start = self._bootstrap_and_start_agent(
+            task,
+            user_id,
+            channel_id,
+            client,
+            team_id=team_id,
+            thread_ts=thread_ts,
+            message_ts=message_ts,
+            model=model,
+            include_thread_context=include_thread_context,
+            workflow_mode=selected_workflow,
+            task_mode=selected_task_mode,
+        )
+        if not background_start:
+            return await start
+        self.bot._spawn_background_task(
+            self._finish_background_agent_start(start, user_id, channel_id),
+            "pi_agent_start",
+        )
+        return AGENT_STARTING_MESSAGE
+
+    async def _finish_background_agent_start(
+        self, start: Awaitable[str], user_id: str, channel_id: str
+    ) -> None:
+        """Run a deferred agent start and tell the owner how it ended."""
+        try:
+            response = await start
+        except Exception:
+            logger.exception("Background Agent start failed")
+            response = "Agent mode could not start this task. Chat mode was not used as fallback."
+        if response:
+            await self.bot._post_command_response(channel_id, user_id, response)
+
+    async def _bootstrap_and_start_agent(
+        self,
+        task: str,
+        user_id: str,
+        channel_id: str,
+        client: AsyncWebClient,
+        *,
+        team_id: Optional[str],
+        thread_ts: Optional[str],
+        message_ts: Optional[str],
+        model: Optional[str],
+        include_thread_context: bool,
+        workflow_mode: Optional[str],
+        task_mode: Optional[str],
+    ) -> str:
         bootstrap = AgentBootstrapContext(prompt=task)
         builder = getattr(self.bot, "agent_bootstrap_builder", None)
         if include_thread_context and thread_ts and message_ts and builder is not None:
@@ -1530,8 +1590,8 @@ class SlackMessageHandler:
             model=model,
             routing_text=task,
             request_id=message_ts,
-            **({"workflow_mode": selected_workflow} if selected_workflow else {}),
-            **({"task_mode": selected_task_mode} if selected_task_mode else {}),
+            **({"workflow_mode": workflow_mode} if workflow_mode else {}),
+            **({"task_mode": task_mode} if task_mode else {}),
         )
         if bootstrap.error:
             response += (
@@ -4540,7 +4600,45 @@ class SlackBot:
             thread_ts=nonce.thread_ts,
             text="🛠️ Pi coding agent is loading the Slack thread snapshot…",
         )
-        status_ts = status.get("ts")
+        # Bootstrap and create_session can take minutes; never hold a worker.
+        self._spawn_background_task(
+            self._start_agent_from_submission(
+                nonce, nonce_value, submission, user_id, status.get("ts")
+            ),
+            "pi_agent_shortcut_start",
+        )
+
+    async def _start_agent_from_submission(
+        self,
+        nonce: AgentShortcutNonce,
+        nonce_value: str,
+        submission: AgentShortcutSubmission,
+        user_id: str,
+        status_ts: Optional[str],
+    ) -> None:
+        try:
+            await self._bootstrap_agent_submission(
+                nonce, nonce_value, submission, user_id, status_ts
+            )
+        except Exception:
+            logger.exception("Agent shortcut start failed")
+            if status_ts:
+                await self.web_client.chat_update(
+                    channel=nonce.channel_id,
+                    ts=status_ts,
+                    text="Agent mode could not start this task. Chat mode was not used as fallback.",
+                )
+        finally:
+            await self._persist_message_state(user_id=user_id)
+
+    async def _bootstrap_agent_submission(
+        self,
+        nonce: AgentShortcutNonce,
+        nonce_value: str,
+        submission: AgentShortcutSubmission,
+        user_id: str,
+        status_ts: Optional[str],
+    ) -> None:
         bootstrap = AgentBootstrapContext(prompt=submission.task)
         if submission.include_context:
             try:
@@ -4600,7 +4698,6 @@ class SlackBot:
                 ts=status_ts,
                 text=final_status,
             )
-        await self._persist_message_state(user_id=user_id)
 
     async def _handle_agent_interactive(self, payload: Dict[str, Any]):
         actions = payload.get("actions") or []
