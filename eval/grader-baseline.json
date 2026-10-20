@@ -1,0 +1,22 @@
+{
+  "updated_at": "2026-10-20T10:59:12+00:00",
+  "records": "grader-calibration.jsonl",
+  "metrics": {
+    "false_pass_rate": 0.0,
+    "false_fail_rate": 0.0,
+    "self_consistency": 1.0,
+    "invalid_rate": 0.0,
+    "cost_usd": 1.2390052
+  },
+  "tolerance": {
+    "false_pass_rate": 0.05,
+    "false_fail_rate": 0.1,
+    "self_consistency": 0.1,
+    "invalid_rate": 0.05,
+    "cost_usd": 0.25
+  },
+  "ceilings": {
+    "invalid_rate": 0.1,
+    "false_pass_rate": 0.2
+  }
+}
