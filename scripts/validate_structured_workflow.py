@@ -6,9 +6,12 @@ VERIFICATION_IMAGE = "slack-pi-verification:structured-test"
 GATEWAY_IMAGE = "slack-pi-model-gateway:structured-test"
 OWNER = "fixture-owner"
 ACTIVE_STATUSES = ("running", "starting", "awaiting_approval")
+# Catalog prices (USD per million tokens, agent-runtime/src/agent-model.ts).
+# The gateway ledger is the run's hard spend cap, so a markup or full-rate
+# cached input would exhaust it well below the real spend.
 MODEL_PRICES = {
-    "openai/gpt-5.6-luna": {"input": 1, "output": 8},
-    "openai/gpt-5.6-sol": {"input": 8, "output": 40},
+    "openai/gpt-5.6-luna": {"input": 0.2, "output": 1.2, "cacheRead": 0.02},
+    "openai/gpt-5.6-sol": {"input": 4, "output": 20, "cacheRead": 0.4},
 }
 
 
