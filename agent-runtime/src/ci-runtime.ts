@@ -22,6 +22,17 @@ export function ciRepairPrompt(target: RepairTarget): string {
   return renderPrompt('ci-repair', { repository: target.repository, pr: target.pr, head: target.head, diagnostic: String(redact(target.diagnostic)).slice(0, CI_REPAIR_DIAGNOSTIC_LIMIT) });
 }
 
+const TERMINAL_INBOX_REASONS = /^(?:workflow_must_identify_one_pr|stale_fork_or_unsupported_ci_identity|no_allowlisted_failed_workflow_for_head|pr_not_found)$/;
+
+/** Terminal reasons finish the row; anything else backs off and goes `dead` after INBOX_MAX_ATTEMPTS. */
+export function recordInboxFailure(store: ControlStore, delivery: string, error: unknown, now = Date.now()) {
+  const reason = error instanceof Error ? error.message : "investigation_failed";
+  let state;
+  if (TERMINAL_INBOX_REASONS.test(reason)) { store.finish(delivery); state = store.inboxState(delivery); }
+  else state = store.fail(delivery, now);
+  store.put("inbox_error", delivery, { reason, attempts: state?.attempts ?? 0, status: state?.status ?? "missing", at: new Date(now).toISOString() });
+}
+
 export async function createCiRuntime(options: { priorActive: Map<string, number>; verificationBases: Map<string, string>; profile: VerificationProfile; root: string; repoPath: string; worktreeRoot: string; orchestrator: CodingAgentOrchestrator; tracing?: AgentTracing; telemetry?: AgentTelemetry }) {
   const { profile, root, repoPath, orchestrator, telemetry } = options;
   if (!profile.slack?.team_id || !profile.slack.channel_id || !profile.slack.user_id || !profile.workflows?.length) throw new Error("CI repair requires profile Slack owner mapping and workflow allowlist");
@@ -94,13 +105,9 @@ export async function createCiRuntime(options: { priorActive: Map<string, number
             store.put("inbox_repair", row.delivery, { id: job.run_id });
           }
           store.finish(row.delivery);
-        } catch (error) {
-          const reason = error instanceof Error ? error.message : "investigation_failed";
-          store.put("inbox_error", row.delivery, { reason, at: new Date().toISOString() });
-          if (/^(?:workflow_must_identify_one_pr|stale_fork_or_unsupported_ci_identity|no_allowlisted_failed_workflow_for_head|pr_not_found)$/.test(reason)) store.finish(row.delivery);
-        }
+        } catch (error) { recordInboxFailure(store, row.delivery, error); }
       }
-    } catch { /* durable inbox remains pending; next bounded poll retries */ }
+    } catch { /* durable inbox remains pending; the next poll retries rows whose backoff has elapsed */ }
     finally { draining = false; }
   };
   // drain catches everything itself; the outer catch only keeps the interval from leaking a rejection.

@@ -12,6 +12,10 @@ export function parseFailureEvent(event: any, repository: string, workflows: str
   if (event?.action !== 'completed' || run?.conclusion !== 'failure' || event?.repository?.full_name !== repository || !workflows.includes(run?.name) || typeof run.head_branch !== 'string' || run.head_branch.startsWith('pi-agent/') || !/^[a-f0-9]{40}$/.test(run.head_sha) || !Number.isSafeInteger(run.id) || !Number.isSafeInteger(run.run_attempt)) return null;
   return { repository, workflow: run.name as string, run_id: run.id as number, attempt: run.run_attempt as number, head_sha: run.head_sha as string, branch: run.head_branch as string };
 }
+/** A transient inbox failure is retried this many times before the row is parked as `dead`. */
+export const INBOX_MAX_ATTEMPTS = 8;
+/** Delay after the given (1-based) failed attempt: 5 s doubling up to a 5 min ceiling. */
+export function inboxRetryDelayMs(attempts: number): number { return Math.min(5_000 * 2 ** Math.max(0, attempts - 1), 300_000); }
 /** Execution control never shares telemetry's availability or retention policy. */
 export class ControlStore {
   healthy = true;
@@ -27,6 +31,10 @@ export class ControlStore {
       CREATE TABLE IF NOT EXISTS workflow_dependencies(workflow TEXT NOT NULL,node TEXT NOT NULL,dependency TEXT NOT NULL,PRIMARY KEY(workflow,node,dependency));
       CREATE TABLE IF NOT EXISTS coordinator_owner(id INTEGER PRIMARY KEY CHECK(id=1),pid INTEGER NOT NULL,token TEXT NOT NULL);`);
     this.db.exec('CREATE TABLE IF NOT EXISTS workflow_attempts(execution TEXT PRIMARY KEY,workflow TEXT NOT NULL,node TEXT NOT NULL,payload TEXT NOT NULL)');
+    // Stores created before inbox backoff lack these columns; ADD COLUMN keeps existing rows pending and due now.
+    const inboxColumns = new Set(this.db.prepare('PRAGMA table_info(inbox)').all().map(row => String(row.name)));
+    if (!inboxColumns.has('attempts')) this.db.exec('ALTER TABLE inbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
+    if (!inboxColumns.has('next_attempt_at')) this.db.exec('ALTER TABLE inbox ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0');
   }
   private checked<T>(operation: () => T): T {
     if (!this.healthy) throw new Error("control_store_unavailable");
@@ -37,10 +45,23 @@ export class ControlStore {
     if (!delivery || delivery.length > 200) throw new Error('invalid_delivery_id');
     return this.checked(() => this.db.prepare('INSERT OR IGNORE INTO inbox(delivery,identity,payload) VALUES(?,?,?)').run(delivery, identity, JSON.stringify(payload))).changes === 1;
   }
-  pending(): Array<{ delivery: string; payload: unknown }> {
-    return this.checked(() => this.db.prepare("SELECT delivery,payload FROM inbox WHERE status='pending' LIMIT 100").all()).map(row => ({ delivery: String(row.delivery), payload: JSON.parse(String(row.payload)) }));
+  /** Pending rows whose backoff has elapsed; `dead` rows are never returned. */
+  pending(now = Date.now()): Array<{ delivery: string; payload: unknown }> {
+    return this.checked(() => this.db.prepare("SELECT delivery,payload FROM inbox WHERE status='pending' AND next_attempt_at<=? LIMIT 100").all(now)).map(row => ({ delivery: String(row.delivery), payload: JSON.parse(String(row.payload)) }));
   }
   finish(delivery: string) { this.checked(() => this.db.prepare("UPDATE inbox SET status='done' WHERE delivery=?").run(delivery)); }
+  inboxState(delivery: string): { attempts: number; status: string } | undefined {
+    const row = this.checked(() => this.db.prepare('SELECT attempts,status FROM inbox WHERE delivery=?').get(delivery));
+    return row ? { attempts: Number(row.attempts), status: String(row.status) } : undefined;
+  }
+  /** Records one failed attempt on a pending row: schedules the next retry, or marks it `dead` at the attempt cap. */
+  fail(delivery: string, now = Date.now()): { attempts: number; status: string } | undefined {
+    const state = this.inboxState(delivery);
+    if (state?.status !== 'pending') return state;
+    const attempts = state.attempts + 1, status = attempts >= INBOX_MAX_ATTEMPTS ? 'dead' : 'pending';
+    this.checked(() => this.db.prepare("UPDATE inbox SET attempts=?,status=?,next_attempt_at=? WHERE delivery=? AND status='pending'").run(attempts, status, now + inboxRetryDelayMs(attempts), delivery));
+    return { attempts, status };
+  }
   approval(run: string, owner: string, kind: string, hash: string, target: string, now = Date.now()) {
     const id = randomUUID(); this.checked(() => this.db.prepare('INSERT INTO approvals(id,run,owner,kind,hash,target,expires) VALUES(?,?,?,?,?,?,?)').run(id, run, owner, kind, hash, target, now + 300_000)); return id;
   }
