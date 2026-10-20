@@ -1137,3 +1137,10 @@ test("publicRun strips host artifact paths from every attempt", () => {
   const shown = publicRun({ run_id: "r", attempts: [{ attempt: 1, execution_id: "e", artifact: "/var/lib/pi-agent/artifacts/r/candidate.patch" }] } as any);
   assert.ok(!JSON.stringify(shown).includes("/var/lib/pi-agent"), JSON.stringify(shown));
 });
+
+test("auto-routing falls back to a configured model when Luna is not configured", async () => {
+  const { orchestrator, calls } = fixture({ route: async () => { throw new Error("jev down"); } }, undefined, undefined, { availableModelRefs: ["anthropic/claude-sonnet-4-6"] });
+  await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "fallback-configured", user_id: "U", prompt: "fix" });
+  await waitFor(() => calls.startedModels.length, count => count > 0, () => "no process started");
+  assert.equal(calls.startedModels[0], "anthropic/claude-sonnet-4-6");
+});

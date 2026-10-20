@@ -32,6 +32,7 @@ from slack.bot_real import (
     SlackMessageHandler,
     SlackWorkItem,
     UserManager,
+    _agent_idempotency_key,
     _format_agent_status_line,
 )
 from src.utils.schema import (
@@ -1094,6 +1095,9 @@ class TestSlackAgentApprovals:
         assert runtime.create_session.await_args.kwargs == {
             "model": "openai/gpt-5.6-luna",
             "routing_text": "Implement the thread todo",
+            "idempotency_key": _agent_idempotency_key(
+                "T1", "C1", f"shortcut:{nonce}", "U1", "create"
+            ),
         }
         status = bot.web_client.chat_update.await_args.kwargs["text"]
         assert "Loaded 3 prior Slack messages and 2 resources" in status
@@ -3076,3 +3080,42 @@ def test_agent_status_line_mentions_a_retained_patch_without_a_path():
     )
     assert line.endswith("\nThe undelivered patch was kept on the runtime host.")
     assert "/" not in line.split("\n", 1)[1]
+
+
+@pytest.mark.asyncio
+async def test_agent_start_sends_a_key_derived_from_the_triggering_message():
+    agent_runtime = SimpleNamespace(
+        create_session=AsyncMock(
+            return_value={"session_id": "s", "run_id": "r", "status": "starting"}
+        )
+    )
+    bot = SlackBot(
+        {"channels": []},
+        inference_engine=SimpleNamespace(process_query=AsyncMock()),
+        services={"agent_runtime": agent_runtime},
+    )
+    bot._monitor_agent_run = AsyncMock()
+    client = SimpleNamespace(
+        chat_postMessage=AsyncMock(return_value={"ts": "100.1"}),
+        chat_update=AsyncMock(),
+    )
+    handler = SlackMessageHandler(bot)
+
+    for message_ts in ("200.5", "200.5", "200.6"):
+        await handler._handle_agent_command(
+            ["fix", "it"],
+            "U1",
+            "C1",
+            client,
+            team_id="T1",
+            thread_ts="100.1",
+            message_ts=message_ts,
+        )
+
+    keys = [
+        call.kwargs.get("idempotency_key")
+        for call in agent_runtime.create_session.await_args_list
+    ]
+    assert keys[0] and keys[0] == keys[1], "a redelivered message reuses its key"
+    assert keys[2] and keys[2] != keys[0]
+    assert "200.5" not in keys[0], "the key does not echo Slack identifiers"

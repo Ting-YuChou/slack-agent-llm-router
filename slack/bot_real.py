@@ -4,6 +4,7 @@ Enterprise-ready Slack bot with conversation continuity and advanced features
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -81,6 +82,16 @@ AGENT_TERMINAL_STATUSES = {
     "timed_out",
     "interrupted",
 }
+
+
+def _agent_idempotency_key(
+    team_id: Optional[str], channel_id: str, request_id: str, user_id: str, op: str
+) -> str:
+    """Stable per Slack request, so a redelivered event cannot start a second run."""
+    raw = "\n".join([team_id or "", channel_id, request_id, user_id, op])
+    return "slack-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:40]
+
+
 # Next step shown after a failed run's reason, keyed by error code or cause_code.
 AGENT_ERROR_HINTS = {
     "scope_violation": (
@@ -1123,6 +1134,7 @@ class SlackMessageHandler:
                 team_id=team_id,
                 thread_ts=event.get("thread_ts"),
                 routing_text=routing_text,
+                request_id=event.get("ts"),
                 **(
                     {"workflow_mode": flags.workflow_mode}
                     if flags.workflow_mode
@@ -1516,6 +1528,7 @@ class SlackMessageHandler:
             thread_ts=thread_ts,
             model=model,
             routing_text=task,
+            request_id=message_ts,
             **({"workflow_mode": selected_workflow} if selected_workflow else {}),
             **({"task_mode": selected_task_mode} if selected_task_mode else {}),
         )
@@ -1539,6 +1552,7 @@ class SlackMessageHandler:
         routing_text: Optional[str] = None,
         workflow_mode: Optional[str] = None,
         task_mode: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> str:
         runtime = getattr(self.bot, "agent_runtime_client", None)
         if runtime is None:
@@ -1595,6 +1609,10 @@ class SlackMessageHandler:
                 create_kwargs["model"] = model
             if routing_text:
                 create_kwargs["routing_text"] = routing_text
+            if request_id:
+                create_kwargs["idempotency_key"] = _agent_idempotency_key(
+                    team_id, channel_id, request_id, user_id, "create"
+                )
             result = await runtime.create_session(*create_args, **create_kwargs)
         except AgentRuntimeBusy:
             message = (
@@ -4306,6 +4324,7 @@ class SlackBot:
             team_id=nonce.team_id,
             thread_ts=nonce.thread_ts,
             routing_text=submission.comment,
+            request_id=f"feedback:{nonce.feedback_id}",
         )
         if response:
             await self.web_client.chat_postMessage(
@@ -4464,6 +4483,7 @@ class SlackBot:
             thread_ts=nonce.thread_ts,
             model=submission.model,
             routing_text=submission.task,
+            request_id=f"shortcut:{nonce_value}",
         )
         details = []
         if submission.include_context:
