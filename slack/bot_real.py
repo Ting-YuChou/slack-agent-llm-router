@@ -173,6 +173,44 @@ AGENT_START_ERROR_TEXT = {
 }
 
 
+AGENT_RESULT_BLOCK_CHARS = 3000
+AGENT_RESULT_BLOCKS_PER_MESSAGE = 10
+AGENT_RESULT_MAX_CHARS = 60000
+
+
+def _split_agent_result(text: str, limit: int = AGENT_RESULT_BLOCK_CHARS) -> List[str]:
+    """Split a result into Slack section-sized chunks without dropping content.
+
+    Chunks break on a newline when one is near the limit, and a code fence
+    left open at a break is closed and reopened so each block renders alone.
+    """
+    if len(text) > AGENT_RESULT_MAX_CHARS:
+        omitted = len(text) - AGENT_RESULT_MAX_CHARS
+        text = (
+            text[:AGENT_RESULT_MAX_CHARS].rstrip()
+            + f"\n\n_…answer truncated: {omitted:,} more characters were not posted._"
+        )
+    chunks: List[str] = []
+    remaining = text
+    open_fence = False
+    while remaining:
+        prefix = "```\n" if open_fence else ""
+        if len(prefix) + len(remaining) <= limit:
+            piece, remaining = remaining, ""
+        else:
+            budget = limit - len(prefix) - len("\n```")
+            cut = remaining.rfind("\n", 0, budget)
+            if cut < budget // 2:
+                cut = budget
+            piece, remaining = remaining[:cut], remaining[cut:].lstrip("\n")
+        chunk = prefix + piece
+        open_fence = chunk.count("```") % 2 == 1
+        if open_fence and remaining:
+            chunk += "\n```"
+        chunks.append(chunk)
+    return chunks
+
+
 def _agent_auth_error_text(exc: AgentRuntimeError, owner_text: str) -> str:
     """Tell a bad bot token (`unauthorized`) apart from a non-owner (`*_forbidden`)."""
     if exc.code == "unauthorized":
@@ -3890,13 +3928,15 @@ class SlackBot:
     async def _post_agent_result(
         self, tracked: Dict[str, Any], run: Dict[str, Any]
     ) -> None:
-        max_length = int(
-            self.config.get("response_settings", {}).get("max_response_length", 2000)
-        )
-        formatted = self.message_handler._format_agent_response(
-            run, max_length=max_length
-        )
-        extra = {}
+        # Final answers are posted whole: split into section-sized blocks
+        # across as many thread messages as needed instead of cut at a limit.
+        formatted = self.message_handler._format_agent_response(run)
+        chunks = _split_agent_result(formatted) or [formatted]
+        messages = [
+            chunks[offset : offset + AGENT_RESULT_BLOCKS_PER_MESSAGE]
+            for offset in range(0, len(chunks), AGENT_RESULT_BLOCKS_PER_MESSAGE)
+        ]
+        actions: List[Dict[str, Any]] = []
         if run.get("status") in AGENT_TERMINAL_STATUSES and self.agent_config.get(
             "feedback_enabled", False
         ):
@@ -3908,16 +3948,7 @@ class SlackBot:
                     "thread_ts": tracked["thread_ts"],
                 }
             )
-            extra["blocks"] = [
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": formatted[offset : offset + 3000],
-                    },
-                }
-                for offset in range(0, len(formatted), 3000)
-            ] + [
+            actions = [
                 {
                     "type": "actions",
                     "elements": [
@@ -3934,12 +3965,19 @@ class SlackBot:
                     ],
                 },
             ]
-        await self.web_client.chat_postMessage(
-            channel=tracked["channel_id"],
-            thread_ts=tracked["thread_ts"],
-            text=formatted,
-            **extra,
-        )
+        for index, message_chunks in enumerate(messages):
+            blocks: List[Dict[str, Any]] = [
+                {"type": "section", "text": {"type": "mrkdwn", "text": chunk}}
+                for chunk in message_chunks
+            ]
+            if index == len(messages) - 1:
+                blocks.extend(actions)
+            await self.web_client.chat_postMessage(
+                channel=tracked["channel_id"],
+                thread_ts=tracked["thread_ts"],
+                text="\n".join(message_chunks),
+                blocks=blocks,
+            )
 
     async def _open_agent_feedback_modal(self, payload: Dict[str, Any]) -> bool:
         """Open the Needs-changes modal; False lets the click record a bare verdict."""
