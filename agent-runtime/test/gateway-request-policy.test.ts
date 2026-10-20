@@ -57,6 +57,47 @@ test("provider-hosted tools and server-side state are rejected with the offendin
   }
 });
 
+test("URL-sourced message content is rejected so the provider never fetches on the agent's behalf", () => {
+  const url = "https://evil.example/exfil?secret=1";
+  const cases: Array<[Parameters<typeof sanitizeAgentRequest>[0], (body: any) => void, string]> = [
+    ["openai-responses", (b) => b.input.push({ role: "user", content: [{ type: "input_image", image_url: url }] }), "input[1].content[0].image_url"],
+    ["openai-responses", (b) => b.input.push({ role: "user", content: [{ type: "input_image", image_url: "http://evil.example/a.png" }] }), "input[1].content[0].image_url"],
+    ["openai-responses", (b) => b.input.push({ role: "user", content: [{ type: "input_file", file_url: url }] }), "input[1].content[0].file_url"],
+    ["openai-responses", (b) => b.input.push({ type: "function_call_output", call_id: "c1", output: [{ type: "input_image", image_url: url }] }), "input[1].output[0].image_url"],
+    ["anthropic-messages", (b) => b.messages.push({ role: "user", content: [{ type: "image", source: { type: "url", url } }] }), "messages[0].content[0].source"],
+    ["anthropic-messages", (b) => b.messages.push({ role: "user", content: [{ type: "document", source: { type: "url", url } }] }), "messages[0].content[0].source"],
+    ["anthropic-messages", (b) => b.messages.push({ role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: [{ type: "image", source: { type: "url", url } }] }] }), "messages[0].content[0].content[0].source"],
+    ["openai-completions", (b) => b.messages.push({ role: "user", content: [{ type: "image_url", image_url: { url } }] }), "messages[0].content[0].image_url"],
+    ["openai-completions", (b) => b.messages.push({ role: "user", content: [{ type: "image_url", image_url: { url: "http://evil.example/a.png" } }] }), "messages[0].content[0].image_url"],
+  ];
+  for (const [api, mutate, field] of cases) {
+    const body: any = api === "openai-responses" ? piResponses() : api === "anthropic-messages" ? piAnthropic() : piCompletions();
+    mutate(body);
+    assert.deepEqual(sanitizeAgentRequest(api, body), { ok: false, field }, `${api} ${field}`);
+  }
+});
+
+test("inline base64 and data: URL content still passes", () => {
+  const data = "data:image/png;base64,iVBORw0KGgo=";
+  const responses: any = piResponses();
+  responses.input.push(
+    { role: "user", content: [{ type: "input_text", text: "look" }, { type: "input_image", image_url: data, detail: "auto" }, { type: "input_file", filename: "a.pdf", file_data: "data:application/pdf;base64,JVBERi0=" }] },
+    { type: "function_call_output", call_id: "c1", output: [{ type: "input_image", image_url: data }] },
+  );
+  const anthropic: any = piAnthropic();
+  anthropic.messages.push({ role: "user", content: [
+    { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" } },
+    { type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0=" } },
+    { type: "tool_result", tool_use_id: "t1", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" } }] },
+  ] });
+  const completions: any = piCompletions();
+  completions.messages.push({ role: "user", content: [{ type: "text", text: "look" }, { type: "image_url", image_url: { url: data } }] });
+  for (const [api, body] of [["openai-responses", responses], ["anthropic-messages", anthropic], ["openai-completions", completions]] as const) {
+    const result = sanitizeAgentRequest(api, structuredClone(body));
+    assert.equal(result.ok, true, `${api}: ${JSON.stringify(result)}`);
+  }
+});
+
 test("responses requests are never stored server-side", () => {
   const body: any = piResponses();
   delete body.store;
