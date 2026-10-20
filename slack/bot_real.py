@@ -2828,6 +2828,30 @@ class SlackBot:
 
         await self._process_message(event)
 
+    async def _restored_agent_mode(self, session: Dict[str, Any]) -> str:
+        """The task mode of a thread known only to the runtime.
+
+        A follow-up inherits discuss from its thread, so a mode nobody can
+        name restores as discuss: the owner upgrades with `--implement`
+        instead of a read-only thread silently gaining write access.
+        """
+        mode = session.get("task_mode")
+        if mode in {"discuss", "implement"}:
+            return str(mode)
+        runtime = self.agent_runtime_client
+        run_id = session.get("run_id")
+        if run_id and runtime is not None and hasattr(runtime, "get_run"):
+            try:
+                run = await runtime.get_run(run_id)
+            except AgentRuntimeError:
+                run = None
+            if isinstance(run, dict):
+                # Runs created before task_mode existed were implement runs.
+                mode = run.get("task_mode") or "implement"
+                if mode in {"discuss", "implement"}:
+                    return str(mode)
+        return "discuss"
+
     async def _restore_agent_thread(self, event: Dict[str, Any]):
         runtime = self.agent_runtime_client
         if runtime is None or not hasattr(runtime, "lookup_session"):
@@ -2841,6 +2865,7 @@ class SlackBot:
             return
         if not session:
             return
+        mode = await self._restored_agent_mode(session)
         if session.get("run_id"):
             tracked = self._track_agent_run(
                 session,
@@ -2848,6 +2873,7 @@ class SlackBot:
                 channel_id=channel_id,
                 thread_ts=thread_ts,
                 owner_user_id=session["owner_user_id"],
+                mode=mode,
             )
             if session.get("active"):
                 self._start_agent_monitor(tracked)
@@ -2863,6 +2889,7 @@ class SlackBot:
             "channel_id": channel_id,
             "thread_ts": thread_ts,
             "owner_user_id": session["owner_user_id"],
+            "mode": mode,
         }
         self.agent_threads[self._thread_key(channel_id, thread_ts)] = tracked
         self.agent_user_runs[session["owner_user_id"]] = tracked

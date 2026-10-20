@@ -728,3 +728,87 @@ async def test_open_approval_card_survives_a_restart(tmp_path):
     await second._restore_state()
 
     assert second.agent_runs["R1"]["approval_cards"] == {"A1": "5.0"}
+
+
+def restore_bot(tmp_path, session, run=None):
+    runtime = scripted_runtime({})
+    runtime.lookup_session = AsyncMock(return_value=session)
+    runtime.get_run = AsyncMock(return_value=run or {})
+    runtime.create_session = AsyncMock(
+        return_value={"session_id": "S9", "run_id": "R10", "status": "starting"}
+    )
+    bot = file_bot(tmp_path, agent_runtime=runtime)
+    bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+    bot._start_agent_monitor = Mock()
+    bot._monitor_agent_run = AsyncMock()
+    return bot, runtime
+
+
+RESTORE_EVENT = {"channel": "C1", "thread_ts": "9.0", "team": "T1", "user": "U1"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "session,run,expected",
+    [
+        # The lookup names the mode.
+        ({"task_mode": "discuss"}, None, "discuss"),
+        ({"task_mode": "implement"}, None, "implement"),
+        # The lookup names a run; the run names the mode.
+        ({"run_id": "R9", "active": True}, {"task_mode": "discuss"}, "discuss"),
+        ({"run_id": "R9", "active": False}, {"task_mode": "discuss"}, "discuss"),
+        # Runs created before task_mode existed were implement runs.
+        ({"run_id": "R9", "active": True}, {"run_id": "R9"}, "implement"),
+        # Nothing names the mode: stay read-only rather than guess implement.
+        ({}, None, "discuss"),
+    ],
+)
+async def test_restored_agent_thread_keeps_its_task_mode(
+    tmp_path, session, run, expected
+):
+    bot, runtime = restore_bot(
+        tmp_path, {"session_id": "S9", "owner_user_id": "U1", **session}, run
+    )
+
+    await bot._restore_agent_thread(RESTORE_EVENT)
+
+    assert bot.agent_threads[bot._thread_key("C1", "9.0")]["mode"] == expected
+    if session.get("run_id"):
+        runtime.get_run.assert_awaited_once_with("R9")
+        assert bot.agent_runs["R9"]["mode"] == expected
+
+
+@pytest.mark.asyncio
+async def test_restored_run_lookup_failure_keeps_the_thread_read_only(tmp_path):
+    bot, runtime = restore_bot(
+        tmp_path, {"session_id": "S9", "owner_user_id": "U1", "run_id": "R9"}
+    )
+    runtime.get_run.side_effect = AgentRuntimeError("down", status=503)
+
+    await bot._restore_agent_thread(RESTORE_EVENT)
+
+    assert bot.agent_runs["R9"]["mode"] == "discuss"
+
+
+@pytest.mark.asyncio
+async def test_followup_in_a_restored_discuss_thread_stays_discuss(tmp_path):
+    bot, runtime = restore_bot(
+        tmp_path,
+        {"session_id": "S9", "owner_user_id": "U1", "run_id": "R9", "active": False},
+        {"task_mode": "discuss"},
+    )
+    await bot._restore_agent_thread(RESTORE_EVENT)
+
+    response = await SlackMessageHandler(bot).handle_message(
+        {
+            "text": "now go ahead and fix it",
+            "user": "U1",
+            "channel": "C1",
+            "thread_ts": "9.0",
+            "_team_id": "T1",
+        },
+        SimpleNamespace(),
+    )
+
+    assert runtime.create_session.await_args.kwargs["task_mode"] == "discuss"
+    assert "--implement" in response
