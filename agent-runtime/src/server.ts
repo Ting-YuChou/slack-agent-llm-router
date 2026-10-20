@@ -24,6 +24,7 @@ import { issueClassifierGatewayToken, issueGatewayToken } from "./gateway-token.
 import { allServerTools, enabledMcpServers, MCP_SERVERS, parseMcpMode, parseMcpServers, type McpServerId, type McpRunServer } from "./mcp-config.js";
 import { deriveMcpServerSecret, issueMcpToken } from "./mcp-token.js";
 import { deriveBudgetRpcSecret } from "./budget-rpc.js";
+import { IdempotencyCache, IdempotencyKeyReusedError } from "./idempotency.js";
 import {
   CodingAgentOrchestrator,
   publicRun,
@@ -52,6 +53,8 @@ const DEFAULT_AGENT_RUNTIME_HOST = "127.0.0.1";
 const MAX_REQUEST_BYTES = 64_000;
 
 interface ServerOptions {
+  /** Remembers POST /v1/sessions and /prompts results by Idempotency-Key so a client retry never starts a second run. */
+  idempotency?: IdempotencyCache;
   budgetLedger?: BudgetLedger;
   budgetSecret?: string;
   orchestrator: CodingAgentOrchestrator;
@@ -80,6 +83,7 @@ function feedbackDetails(body: Record<string, unknown>): { reason_category?: str
 }
 
 export function createAgentHttpServer(options: ServerOptions) {
+  const idempotent = <T>(request: IncomingMessage, route: string, body: unknown, work: () => Promise<T>) => idempotentRequest(options.idempotency, request, route, body, work);
   return createServer(guardedHandler("agent-runtime", async (request, response) => {
     try {
       const url = new URL(request.url ?? "/", "http://runtime.local");
@@ -137,7 +141,7 @@ export function createAgentHttpServer(options: ServerOptions) {
 
       if (request.method === "POST" && url.pathname === "/v1/sessions") {
         const body = await readJson(request);
-        const result = await options.orchestrator.createSession(body as never);
+        const result = await idempotent(request, url.pathname, body, () => options.orchestrator.createSession(body as never));
         sendJson(response, 202, result);
         return;
       }
@@ -147,7 +151,7 @@ export function createAgentHttpServer(options: ServerOptions) {
         if (body.routing_text !== undefined && typeof body.routing_text !== "string") {
           throw new RuntimeError("routing_text must be a string", "invalid_request", 400);
         }
-        const result = await options.orchestrator.prompt(
+        const result = await idempotent(request, url.pathname, body, () => options.orchestrator.prompt(
           decodeURIComponent(promptMatch[1]),
           requiredString(body.prompt, "prompt"),
           requiredString(body.user_id, "user_id"),
@@ -155,7 +159,7 @@ export function createAgentHttpServer(options: ServerOptions) {
           body.task_id as string | undefined,
           parseWorkflowMode(body.workflow_mode),
           parseTaskMode(body.task_mode),
-        );
+        ));
         sendJson(response, 202, result);
         return;
       }
@@ -564,7 +568,10 @@ export async function createProductionServer() {
   let processHealthy = true;
   guardProcess(process, () => { processHealthy = false; });
   const runtimeHealthy = () => processHealthy && integrityHealthy && stateStore.healthy && (workflowControl?.healthy ?? true) && (ciRuntime?.ci.healthy ?? true);
+  const idempotency = new IdempotencyCache({ file: path.join(runtimeRoot, "idempotency.json") });
+  await idempotency.load().catch(() => console.error(JSON.stringify({ event: "agent_idempotency_load_failed" })));
   const server = createAgentHttpServer({
+    idempotency,
     budgetLedger, budgetSecret: deriveBudgetRpcSecret(gatewaySecret),
     ci: ciRuntime?.ci,
     feedback: telemetry ? (run, payload, id) => telemetry.record(run.run_id, run.session_id, "feedback", payload, id) : undefined,
@@ -786,4 +793,17 @@ function parseTaskMode(value: unknown) {
 
 function parseWorkflowMode(value: unknown) {
   try { return workflowMode(value); } catch { throw new RuntimeError('Invalid workflow_mode','invalid_request',400); }
+}
+
+/** Runs `work` once per Idempotency-Key and request body; without a key or a cache it just runs. */
+async function idempotentRequest<T>(cache: IdempotencyCache | undefined, request: IncomingMessage, route: string, body: unknown, work: () => Promise<T>): Promise<T> {
+  const header = request.headers["idempotency-key"];
+  if (!cache || typeof header !== "string" || !header) return work();
+  if (header.length > 200 || !/^[\x21-\x7e]+$/.test(header)) throw new RuntimeError("Idempotency-Key must be 1-200 visible ASCII characters", "invalid_request", 400);
+  const fingerprint = createHash("sha256").update(JSON.stringify(body)).digest("hex");
+  try { return await cache.run(`${route}\n${header}`, fingerprint, work); }
+  catch (error) {
+    if (error instanceof IdempotencyKeyReusedError) throw new RuntimeError("Idempotency-Key was already used for a different request", "idempotency_key_reused", 422);
+    throw error;
+  }
 }

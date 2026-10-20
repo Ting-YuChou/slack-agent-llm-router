@@ -273,3 +273,31 @@ test("an unhandled rejection is logged and marks the runtime unhealthy instead o
   uninstall();
   assert.equal(target.listenerCount("unhandledRejection"), 0);
 });
+
+test("POST /v1/sessions and prompts honour Idempotency-Key", async () => {
+  const { IdempotencyCache } = await import("../src/idempotency.js");
+  const calls: string[] = [];
+  const orchestrator = {
+    createSession: async () => { calls.push("create"); return { session_id: "S1", run_id: `R${calls.length}`, status: "starting" }; },
+    prompt: async () => { calls.push("prompt"); return { session_id: "S1", run_id: `R${calls.length}`, status: "starting" }; },
+  };
+  const server = createAgentHttpServer({ orchestrator: orchestrator as any, token: "runtime-secret", health: () => ({}), idempotency: new IdempotencyCache() });
+  const base = await listen(server);
+  const post = (path: string, body: object, key?: string) => fetch(`${base}${path}`, { method: "POST", body: JSON.stringify(body),
+    headers: { authorization: "Bearer runtime-secret", "content-type": "application/json", ...(key ? { "idempotency-key": key } : {}) } });
+  const session = { team_id: "T", channel_id: "C", thread_ts: "1", user_id: "U", prompt: "fix" };
+  try {
+    const first = await (await post("/v1/sessions", session, "create-1")).json();
+    const retry = await post("/v1/sessions", session, "create-1");
+    assert.equal(retry.status, 202);
+    assert.deepEqual(await retry.json(), first);
+    assert.deepEqual(calls, ["create"]);
+    const reused = await post("/v1/sessions", { ...session, prompt: "something else" }, "create-1");
+    assert.equal(reused.status, 422);
+    assert.equal((await reused.json()).error.code, "idempotency_key_reused");
+    await post("/v1/sessions/S1/prompts", { prompt: "go", user_id: "U" }, "prompt-1");
+    await post("/v1/sessions/S1/prompts", { prompt: "go", user_id: "U" }, "prompt-1");
+    await post("/v1/sessions", session);
+    assert.deepEqual(calls, ["create", "prompt", "create"], "no key means no deduplication");
+  } finally { await close(server); }
+});

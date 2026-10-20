@@ -179,6 +179,8 @@ export interface RunRecord {
 /** The run as clients (HTTP, Slack, telemetry) see it: host artifact paths become a flag. */
 export interface ApprovalCounts { requested: number; approved: number; rejected: number; expired: number; wait_ms: number }
 
+const DEFAULT_FALLBACK_MODEL = "openai/gpt-5.6-luna";
+
 export function publicRun<T extends Partial<RunRecord>>(run: T): Omit<T, "patch_artifact"> & { patch_retained?: true } {
   const { patch_artifact, ...rest } = run;
   const shown = rest.attempts ? { ...rest, attempts: rest.attempts.map(({ artifact: _artifact, ...attempt }) => attempt) } : rest;
@@ -362,7 +364,8 @@ export class CodingAgentOrchestrator {
     const task = this.requireTaskMode(input.task_mode);
     let requestedModel;
     try {
-      requestedModel = resolveAgentModel(input.model);
+      // Auto-routing starts from the fallback model, which is always one this deployment configured.
+      requestedModel = resolveAgentModel(input.model ?? this.fallbackModelRef());
     } catch (error) {
       throw new RuntimeError("Requested Agent model is not allowlisted", "invalid_model", 400, { cause: error });
     }
@@ -468,17 +471,23 @@ export class CodingAgentOrchestrator {
     }
   }
 
+  /** Luna when it is configured, otherwise the first configured model; never a model this deployment cannot reach. */
+  private fallbackModelRef(): string {
+    return this.availableModelRefs.has(DEFAULT_FALLBACK_MODEL) ? DEFAULT_FALLBACK_MODEL : [...this.availableModelRefs][0] ?? DEFAULT_FALLBACK_MODEL;
+  }
+
   private async selectRoute(autoRouting: boolean, modelRef: string, routingText?: string, runId?: string): Promise<RouteDecision> {
     if (!autoRouting) return { modelRef, effort: "max", source: "explicit" };
+    const fallback = this.fallbackModelRef();
     let decision: RouteDecision;
     try {
       decision = this.router ? await this.router.route(routingText, runId)
-        : { modelRef: "openai/gpt-5.6-luna", effort: "max", source: "off" };
+        : { modelRef: fallback, effort: "max", source: "off" };
     } catch {
-      return { modelRef: "openai/gpt-5.6-luna", effort: "max", source: "fallback", reason: "jev_unavailable" };
+      return { modelRef: fallback, effort: "max", source: "fallback", reason: "jev_unavailable" };
     }
     if (!this.availableModelRefs.has(decision.modelRef)) {
-      return { modelRef: "openai/gpt-5.6-luna", effort: "max", source: "fallback", reason: "model_not_configured" };
+      return { modelRef: fallback, effort: "max", source: "fallback", reason: "model_not_configured" };
     }
     return decision;
   }
