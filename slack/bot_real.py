@@ -1400,6 +1400,13 @@ class SlackMessageHandler:
             tracked = self.bot._agent_run_for(user_id, channel_id, thread_ts)
             if not tracked:
                 return "No active Agent session was found for you."
+            if action != "close" and not tracked.get("run_id"):
+                # A session restored from the runtime may have no run to act on.
+                return (
+                    f"Agent session `{tracked['session_id']}` has no active run "
+                    "right now. Reply in its thread to start one, or use "
+                    "`agent close` to close the session."
+                )
             try:
                 if action == "status":
                     run = await runtime.get_run(tracked["run_id"])
@@ -3954,7 +3961,8 @@ class SlackBot:
         """Stop tracking a run in memory and in the configured state backend."""
         self._forget_agent_session(tracked)
         if self._uses_granular_redis_state():
-            await self.state_store.delete_agent_run_state(tracked["run_id"])
+            if tracked.get("run_id"):
+                await self.state_store.delete_agent_run_state(tracked["run_id"])
             return
 
         await self._persist_state()
