@@ -107,7 +107,7 @@ export interface RunRecord {
   interrupted_at?: string;
   suspended_ms?: number;
   prior_active_ms?: number;
-  workflow_summary?: { revision: number; total: number; completed: number; agent_work_ms: number; queue_ms: number };
+  workflow_summary?: { revision: number; total: number; completed: number; unresolved?: number; agent_work_ms: number; queue_ms: number };
   budget?: ReturnType<WorkflowBudget["snapshot"]>;
   timing?: { wall_ms: number; active_ms: number; human_wait_ms: number };
   phase?: string;
@@ -1263,7 +1263,7 @@ export class CodingAgentOrchestrator {
       run.traceparent ??= this.captureTraceContext?.(run.run_id);
       if (run.workflow_mode === 'structured') {
         const nodes = this.quality?.tasks?.(run.run_id) ?? [];
-        run.workflow_summary = { revision: Math.max(0,...nodes.map(node => node.wave)), total: nodes.length, completed: nodes.filter(node => node.state === 'succeeded').length, agent_work_ms: nodes.reduce((sum,node) => sum + (node.agent_work_ms ?? node.duration_ms ?? 0),0), queue_ms: nodes.reduce((sum,node) => sum + (node.queue_ms ?? 0),0) };
+        run.workflow_summary = { revision: Math.max(0,...nodes.map(node => node.wave)), total: nodes.length, completed: nodes.filter(node => node.state === 'succeeded').length, unresolved: nodes.filter(node => node.state === 'unresolved').length, agent_work_ms: nodes.reduce((sum,node) => sum + (node.agent_work_ms ?? node.duration_ms ?? 0),0), queue_ms: nodes.reduce((sum,node) => sum + (node.queue_ms ?? 0),0) };
       }
       const workflow = this.workflows.get(run.run_id);
       if (workflow) {
