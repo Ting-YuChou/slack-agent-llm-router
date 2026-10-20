@@ -5,7 +5,7 @@ import json
 import os
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 
@@ -59,6 +59,8 @@ class AgentRuntimeClient:
         "interrupted",
     }
     MAX_RETRY_BACKOFF_SECONDS = 30.0
+    # Events after which the cheap event log no longer describes the run.
+    RUN_CHANGE_EVENT_TYPES = {"status", "phase", "approval", "approval_decision"}
 
     def __init__(
         self,
@@ -376,13 +378,26 @@ class AgentRuntimeClient:
         *,
         poll_seconds: float = 1.0,
         max_error_seconds: float = 300.0,
+        on_progress: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
-        """Poll until the run needs Slack attention, riding out transient errors."""
+        """Poll until the run needs Slack attention, riding out transient errors.
+
+        With ``on_progress``, polls between full run reads follow the event log
+        from a cursor, and the run is read again only when an event shows a
+        status or phase change. Each poll reports the latest known state.
+        """
         backoff = 1.0
         errors_since: Optional[float] = None
+        run: Optional[Dict[str, Any]] = None
+        cursor = 0
         while True:
             try:
-                run = await self.get_run(run_id)
+                if run is None or on_progress is None:
+                    run = await self.get_run(run_id)
+                    cursor = len(run.get("events") or [])
+                    events = None
+                else:
+                    events = await self.get_events(run_id, after=cursor)
             except AgentRuntimeError as exc:
                 if not self._is_transient(exc):
                     raise
@@ -396,12 +411,41 @@ class AgentRuntimeClient:
                 continue
             backoff = 1.0
             errors_since = None
-            if (
-                run["status"] in self.TERMINAL_STATES
-                or run["status"] == "awaiting_approval"
+            if events is None:
+                if (
+                    run["status"] in self.TERMINAL_STATES
+                    or run["status"] == "awaiting_approval"
+                ):
+                    return run
+            elif any(
+                event.get("type") in self.RUN_CHANGE_EVENT_TYPES for event in events
             ):
-                return run
+                run = None
+                continue
+            else:
+                cursor += len(events)
+                run = self._with_tool_events(run, events)
+            if on_progress is not None:
+                await on_progress(run)
             await asyncio.sleep(poll_seconds)
+
+    @staticmethod
+    def _with_tool_events(
+        run: Dict[str, Any], events: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Count the tool calls the event log shows since the last full read."""
+        started = [
+            event
+            for event in events
+            if event.get("type") in ("tool", "mcp") and event.get("phase") == "start"
+        ]
+        if not started:
+            return run
+        return {
+            **run,
+            "tool_count": int(run.get("tool_count") or 0) + len(started),
+            "last_tool": str(started[-1].get("tool") or ""),
+        }
 
     @staticmethod
     def _is_transient(exc: AgentRuntimeError) -> bool:
