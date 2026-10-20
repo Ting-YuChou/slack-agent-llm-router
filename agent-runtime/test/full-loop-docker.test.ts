@@ -15,7 +15,7 @@ import type { PublicRunEvent } from "../src/pi-rpc.js";
 import { writerContextFor, writerTools } from "../src/server.js";
 import { validateProfile } from "../src/verification.js";
 import { createQualityServices } from "../src/workflow-runtime.js";
-import { WorktreeManager } from "../src/worktree-manager.js";
+import { WorktreeManager, writerGitDir } from "../src/worktree-manager.js";
 import { fakeGatewayScript, scriptedTurns, waitForContainerHealthz, type TurnScript } from "./support/fake-provider.js";
 import { AGENT_TEST_IMAGE } from "./support/docker-images.js";
 import { waitFor } from "./support/scenario.js";
@@ -99,7 +99,7 @@ async function runLoop(name: string, turns: TurnScript[], grade: "passed" | "unk
         await mkdir(sessionStatePath, { recursive: true });
         return new DockerPiProcess({
           name: `pi-loop-${suffix}-${session.id.slice(0, 6)}`, image: agentImage, network, worktreePath: session.worktreePath,
-          gitMetadataPath: path.join(repo, ".git"), sessionStatePath, gatewayUrl: "http://model-gateway:8080", modelRef: session.modelRef,
+          gitMetadataPath: writerGitDir(session, path.join(repo, ".git")), sessionStatePath, gatewayUrl: "http://model-gateway:8080", modelRef: session.modelRef,
           ...writerTools(profile, ["/opt/pi/extensions/policy.ts", "/opt/pi/extensions/model-gateway.ts", "/opt/pi/extensions/secret-env.ts"], ["read", "write", "edit", "bash", "grep", "find", "ls"]),
           pluginPaths: [], skillPaths: [], writerContext: writerContextFor(profile), writeApproval: "none",
           user: `${hostUid}:${hostGid}`,

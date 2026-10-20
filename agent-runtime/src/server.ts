@@ -46,7 +46,7 @@ import { workflowMode } from "./structured-workflow.js";
 import type { CiRepairs } from "./ci-repair.js";
 import { loadProfile, type VerificationProfile } from "./verification.js";
 import { createQualityServices } from "./workflow-runtime.js";
-import { DEFAULT_DIFF_LIMITS, WorktreeManager } from "./worktree-manager.js";
+import { DEFAULT_DIFF_LIMITS, WorktreeManager, writerGitDir } from "./worktree-manager.js";
 import { parseGraderConfig } from "./grader-config.js";
 
 const exec = promisify(execFile);
@@ -480,7 +480,7 @@ export async function createProductionServer() {
           image: actualImageDigest,
           network,
           worktreePath: session.worktreePath,
-          gitMetadataPath,
+          gitMetadataPath: writerGitDir(session, gitMetadataPath),
           sessionStatePath,
           gatewayUrl,
           modelRef: model.ref,

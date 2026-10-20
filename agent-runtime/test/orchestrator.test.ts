@@ -1156,3 +1156,28 @@ test("a worktree over its disk quota fails the run as disk_quota_exceeded and ro
   assert.equal(run.error?.code, "disk_quota_exceeded");
   assert.equal(calls.commits, 0);
 });
+
+test("a session's git mirror is persisted and handed to its restored container; legacy sessions restore without one", async () => {
+  const saved: any[] = [];
+  const started: Array<{ id: string; gitDir?: string; restored?: boolean }> = [];
+  const startProcess = async (session: { id: string; gitDir?: string; restored?: boolean }, onEvent: (event: PublicRunEvent) => void) => {
+    started.push({ id: session.id, gitDir: session.gitDir, restored: session.restored });
+    const process = new FakeProcess(); process.handler = onEvent; return process;
+  };
+  const worktrees = {
+    create: async () => ({ path: "/managed/w1", branch: "pi-agent/20260801-run", baselineCommit: "a".repeat(40), gitDir: "/managed/mirrors/w1.git" }),
+    inspectDiff: async () => ({ files: [], bytes: 0, stat: "" }), commit: async () => "a".repeat(40), rollback: async () => undefined, remove: async () => undefined,
+  };
+  const first = fixture(undefined, undefined, { load: async () => ({ schema_version: 1, sessions: [], runs: [] }), takeExpiredSessions: () => [], save: async (state: any) => { saved.push(structuredClone(state)); } }, { worktrees, startProcess });
+  const created = await first.orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "mirror", user_id: "U", prompt: "fix" });
+  const persisted = saved.at(-1).sessions.find((session: any) => session.id === created.session_id);
+  assert.equal(persisted.gitDir, "/managed/mirrors/w1.git");
+  assert.deepEqual(started[0], { id: created.session_id, gitDir: "/managed/mirrors/w1.git", restored: undefined });
+
+  const legacy = { id: "L", key: "T:C:legacy", ownerUserId: "U", modelRef: "openai/gpt-5.6-luna", worktreePath: "/managed/w0", branch: "pi-agent/old", baselineCommit: "c".repeat(40), closed: false, lastActivity: Date.now() };
+  started.length = 0;
+  const second = fixture(undefined, undefined, { load: async () => ({ schema_version: 1, sessions: [{ ...persisted, activeRunId: undefined }, legacy], runs: [] }), takeExpiredSessions: () => [], save: async () => {} }, { worktrees, startProcess });
+  await second.orchestrator.restore();
+  assert.deepEqual(started.find((session) => session.id === created.session_id), { id: created.session_id, gitDir: "/managed/mirrors/w1.git", restored: true });
+  assert.deepEqual(started.find((session) => session.id === "L"), { id: "L", gitDir: undefined, restored: true });
+});
