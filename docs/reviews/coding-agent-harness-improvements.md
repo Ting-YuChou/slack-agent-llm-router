@@ -593,12 +593,59 @@ Slack 是 harness 唯一的「人類介面」：核准、進度、失敗回報�
 
 ---
 
-## 附錄 B：實施狀態（2026-10-20，`origin/main` = `c15961c`）
+## 附錄 B：實施狀態（2026-10-20，`origin/main` = `9adc70c`）
 
-- **Phase 0–2**：已合進 main（#40 前後到 #56）。Phase 2 live eval：pass@1 從 0.83 升到 1.0，grader_unknown_rate 從 0.56 降到 0.0。
-- **Phase 3**：所有 slice 都已合併（#57–#69），後續修正為 #70、#71。完成條件中還有三項未達成：
-  - **grader 校準 baseline**：#71 修好 fixture remote 之後還沒重跑，所以 `eval/grader-baseline.json` 還不存在。
-  - **live agent eval**（run 39333064067）：`two-bug-fix` 3 次中有 2 次以 `investigation_unknown` 失敗，contract 不通過。#71 只補上了 `cause_code`，失敗本身還沒修。
-  - **Slack 冒煙測試**：還沒做。
-- **之前列在早期 Phase、但實際沒有落地的項目**：G5、G6、G12、C5 完全沒有做；G7（從最新訊息開始填、`!llm agent` 的出境檢查）與 G8（依 code 分流、短 timeout、Idempotency-Key）只做了一部分。
-- **Phase 4**：只有 B5 完成。F5f（已改用 `timingSafeEqual`，但 budget RPC 還沒有獨立的 HKDF key）、E4（patch 已經保存，但還不能下載或接續）、F6 的 codegraph env 做了一部分。其餘項目都還沒開始，包括 E5、B6、G9、G10、F5a–e、F5g、F6 的其他項目、核准的持久化，以及 grader 多次取樣。
+### Phase 0–3：已完成
+
+- Phase 0–3 的 slice 全部合進 main（#40–#69），後續修正為 #70–#77。
+- Phase 3 的 live 驗收：
+  - **agent eval**（run 39402941829，prompt `cb82e50be37b`）：pass@1 1.0、grader_unknown_rate 0.0、first_attempt_pass_rate 0.75，contract 通過。結果檔已放進 `eval/results/`。
+  - **grader 校準**（run 39410170536）：false_pass 0、false_fail 0、self_consistency 1.0、invalid 0，花費 $1.24，baseline 為 `eval/grader-baseline.json`。
+- 只剩 Slack 冒煙測試，需要先完成 `docs/slack-setup.md` 的設定。
+
+### 2026-10-20 稽核：Phase 0–3 的缺口
+
+逐項對照 main 的結果：大部分項目確實完成，但有下列缺口，列為 Phase 4 的 Track 0。
+
+| 等級 | 缺口 | 位置 |
+|---|---|---|
+| P0 | `run_checks` 在範例 profile 下永遠被拒絕：reserve 915s 超過 `activeTimeoutMs` 上限 900s | `writer-checks.ts`、`orchestrator.ts` answerChecks |
+| P0 | gateway 每個 token 的並行串流上限有競態：先讀計數，await 預算之後才 +1 | `model-gateway.ts:161-173` |
+| P0 | 訊息內容中 URL 來源的 image / file 沒有被擋，provider 會代為抓取 | `gateway-request-policy.ts` |
+| P0 | budget RPC 的 bearer 是 gateway 的簽章 secret（F5f 的 HKDF 還沒做） | `server.ts:565` |
+| 中 | runtime 不讀 `Idempotency-Key`，client 的 key 每次都是隨機值（G8） | `server.ts`、`src/agent_runtime.py` |
+| 中 | ClickHouse 只有 `CREATE … IF NOT EXISTS`，新欄位進不了已經存在的表 | `src/agent_analytics.py` |
+| 中 | verification 結果為 unknown 時沒有 cause_code；rollback 失敗會覆蓋 cause；Slack 只有 3/18 種 cause 有提示（E3） | `quality-gate.ts`、`orchestrator.ts`、`bot_real.py` |
+| 中 | 沒有 `unhandledRejection` handler（E2） | `server.ts` |
+| 中 | 核准卡片在決定或到期後沒有更新；delivery 卡片的檔案清單沒有算進字數預算（G1） | `bot_real.py` |
+| 中 | `diff_limit_exceeded` 不能 repair；`edit` 沒有寫入大小檢查（B3） | `orchestrator.ts`、`extensions/policy.ts` |
+| 中 | C5：fallback 寫死成 Luna | `jev-router.ts` |
+| 低 | D2 測試設定檔清單不完整、D3 的 `git branch` 規則、O2 的 `repair_success` 定義、`attempts[].artifact` 露出 host 路徑、restore 後的 thread 遺失模式 | 見 Phase 4 計畫 |
+
+決定：沒有 profile 時，在 delivery 模式下測試指令會自動放行。這個風險不靠增加核准來處理，而是在 gateway 端封住外洩路徑（上表的 P0 2–4，以及 Phase 4 的 S5、P2），並寫進文件。
+
+### Phase 4：計畫
+
+- **Track 0**：修補上表的缺口。
+- **Track S（沙箱）**：
+  - F5d 容器限制與磁碟配額
+  - F5a ClickHouse 權限與 SQL 過濾
+  - F5e MCP gateway
+  - F6 其餘項目
+  - F2 剩餘項目
+  - F5c 每個 session 一個 git mirror
+  - F5b 每個 run 一個網路
+  - F5g 在 image 內計算 hash
+- **Track U（體驗）**：
+  - 核准持久化，並移除 `write` 模式
+  - G9 進度訊息
+  - G10 併發與排隊
+  - E4-2 下載 patch，並從失敗的 attempt 接續
+  - E6
+- **Track P（效能與品質）**：
+  - 先量測 startup
+  - E5 憑證換發與容器重用（profile 旗標）
+  - B6 ImplementationBrief 與優雅降級
+  - grader 多次取樣
+- **最終驗收**：live agent eval、grader 校準、Slack 冒煙測試。每一次 live 執行前都需要使用者同意。
+- **已完成或大部分完成**：B5；F5f 的 `timingSafeEqual`；E4 的 patch 保存；F6 的 codegraph env；E6 的 commit trailer。
