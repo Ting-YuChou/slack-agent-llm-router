@@ -74,6 +74,9 @@ MEMORY_SLASH_ONLY_MESSAGE = (
 SLACK_BUSY_MESSAGE = "The LLM Router is busy right now. Please retry in a moment."
 SLACK_PRIORITY_WORK_KINDS = frozenset({"interactive"})
 AGENT_TASK_ECHO_LIMIT = 2500
+AGENT_SHORTCUT_NONCE_TTL_SECONDS = 300
+# How long an expired form is remembered, so its submission gets a notice.
+AGENT_SHORTCUT_NONCE_GRACE_SECONDS = 3600
 AGENT_STARTING_MESSAGE = (
     "🛠️ Starting the Pi coding agent; it will open a thread in this channel "
     "when its worktree is ready."
@@ -4675,7 +4678,7 @@ class SlackBot:
         self.agent_shortcut_nonces = {
             key: value
             for key, value in self.agent_shortcut_nonces.items()
-            if value.expires_at > now
+            if value.expires_at + AGENT_SHORTCUT_NONCE_GRACE_SECONDS > now
         }
         nonce = uuid.uuid4().hex
         self.agent_shortcut_nonces[nonce] = AgentShortcutNonce(
@@ -4684,7 +4687,7 @@ class SlackBot:
             thread_ts=thread_ts,
             selected_message_ts=selected_ts,
             owner_user_id=user_id,
-            expires_at=now + 300,
+            expires_at=now + AGENT_SHORTCUT_NONCE_TTL_SECONDS,
         )
 
         runtime = self.agent_runtime_client
@@ -4751,6 +4754,17 @@ class SlackBot:
             return
         if nonce.expires_at <= time.time():
             self.agent_shortcut_nonces.pop(nonce_value, None)
+            if nonce.owner_user_id == user_id:
+                task = parse_agent_shortcut_submission(view).task
+                await self.web_client.chat_postEphemeral(
+                    channel=nonce.channel_id,
+                    user=user_id,
+                    text=(
+                        "This Agent form expired before it was submitted. "
+                        "Run the shortcut again."
+                        + (_agent_task_echo(task) if task else "")
+                    ),
+                )
             return
         if nonce.owner_user_id != user_id:
             return
