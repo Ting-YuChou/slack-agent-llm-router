@@ -536,6 +536,8 @@ class TestSlackMessageHandler:
     @pytest.mark.asyncio
     async def test_discuss_run_in_another_thread_does_not_set_new_thread_mode(self):
         bot, runtime = self._followup_bot(previous_mode="discuss")
+        # The discuss run has finished; an active one would hit the per-user cap.
+        bot.agent_runs["R1"]["result_posted"] = True
         handler = SlackMessageHandler(bot)
 
         await handler._start_agent_prompt(

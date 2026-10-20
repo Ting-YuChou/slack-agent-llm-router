@@ -72,6 +72,7 @@ MEMORY_SLASH_ONLY_MESSAGE = (
 )
 SLACK_BUSY_MESSAGE = "The LLM Router is busy right now. Please retry in a moment."
 SLACK_PRIORITY_WORK_KINDS = frozenset({"interactive"})
+AGENT_TASK_ECHO_LIMIT = 2500
 AGENT_STARTING_MESSAGE = (
     "🛠️ Starting the Pi coding agent; it will open a thread in this channel "
     "when its worktree is ready."
@@ -287,6 +288,14 @@ def _split_agent_result(text: str, limit: int = AGENT_RESULT_BLOCK_CHARS) -> Lis
             chunk += "\n```"
         chunks.append(chunk)
     return chunks
+
+
+def _agent_task_echo(task: str) -> str:
+    """Quote a submitted task back so a refused form does not lose it."""
+    task = task.replace("```", "`\u200b``")
+    if len(task) > AGENT_TASK_ECHO_LIMIT:
+        task = task[:AGENT_TASK_ECHO_LIMIT] + "…"
+    return f"\nYour task was:\n```{task}```"
 
 
 def _agent_auth_error_text(exc: AgentRuntimeError, owner_text: str) -> str:
@@ -1522,6 +1531,10 @@ class SlackMessageHandler:
         )
         if not background_start:
             return await start
+        cap_message = self.bot._agent_cap_message(user_id, channel_id, thread_ts)
+        if cap_message:
+            start.close()
+            return cap_message
         self.bot._spawn_background_task(
             self._finish_background_agent_start(start, user_id, channel_id),
             "pi_agent_start",
@@ -1601,6 +1614,51 @@ class SlackMessageHandler:
         return response
 
     async def _start_agent_prompt(
+        self,
+        task: str,
+        user_id: str,
+        channel_id: str,
+        client: AsyncWebClient,
+        *,
+        team_id: Optional[str],
+        thread_ts: Optional[str],
+        model: Optional[str] = None,
+        routing_text: Optional[str] = None,
+        workflow_mode: Optional[str] = None,
+        task_mode: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> str:
+        """Start a run unless the owner already has their maximum of active runs."""
+        cap_message = getattr(self.bot, "_agent_cap_message", None)
+        reserve = getattr(self.bot, "_reserve_agent_start", None)
+        if not callable(cap_message) or not callable(reserve):
+            reservation = None
+        else:
+            # Check and reserve with no await in between, so concurrent starts
+            # by one owner cannot both pass the cap.
+            refusal = cap_message(user_id, channel_id, thread_ts)
+            if refusal:
+                return refusal
+            reservation = reserve(user_id, channel_id, thread_ts)
+        try:
+            return await self._start_agent_prompt_unchecked(
+                task,
+                user_id,
+                channel_id,
+                client,
+                team_id=team_id,
+                thread_ts=thread_ts,
+                model=model,
+                routing_text=routing_text,
+                workflow_mode=workflow_mode,
+                task_mode=task_mode,
+                request_id=request_id,
+            )
+        finally:
+            if reservation is not None:
+                self.bot._release_agent_start(user_id, reservation)
+
+    async def _start_agent_prompt_unchecked(
         self,
         task: str,
         user_id: str,
@@ -2626,6 +2684,11 @@ class SlackBot:
             self.agent_config.get("progress_interval_seconds", 10)
         )
         self.agent_progress_clock: Callable[[], float] = time.monotonic
+        self.agent_max_active_runs_per_user = max(
+            1, int(self.agent_config.get("max_active_runs_per_user", 1))
+        )
+        # Starts that passed the cap but have no run yet: owner -> token -> thread key.
+        self.agent_pending_starts: Dict[str, Dict[str, Optional[str]]] = {}
         self.agent_shortcut_nonces: Dict[str, AgentShortcutNonce] = {}
         self.agent_feedback_nonces: Dict[str, AgentFeedbackNonce] = {}
 
@@ -3875,6 +3938,76 @@ class SlackBot:
                 return tracked
         return self.agent_user_runs.get(user_id)
 
+    def _agent_cap_message(
+        self,
+        user_id: str,
+        channel_id: Optional[str],
+        thread_ts: Optional[str],
+    ) -> Optional[str]:
+        """Why the owner cannot start another agent now, or None if they can.
+
+        A follow-up in a thread reuses that thread's session, so runs and
+        starts in the same thread never count against the cap. CI repair runs
+        are opened by the CI inbox, not by the owner, and do not count either.
+        """
+        this_thread = (
+            self._thread_key(channel_id, thread_ts)
+            if channel_id and thread_ts
+            else None
+        )
+        active = [
+            tracked
+            for tracked in self.agent_runs.values()
+            if tracked.get("owner_user_id") == user_id
+            and tracked.get("run_id")
+            and not tracked.get("result_posted")
+            and tracked.get("mode") != "ci_repair"
+            and (
+                this_thread is None
+                or self._thread_key(
+                    tracked.get("channel_id", ""), tracked.get("thread_ts", "")
+                )
+                != this_thread
+            )
+        ]
+        pending = [
+            key
+            for key in self.agent_pending_starts.get(user_id, {}).values()
+            if key is None or key != this_thread
+        ]
+        if len(active) + len(pending) < self.agent_max_active_runs_per_user:
+            return None
+        if active:
+            run = active[0]
+            return (
+                f"You already have an active Agent run `{run['run_id']}` in "
+                f"<#{run['channel_id']}>. Wait for it to finish, or stop it with "
+                "`/llm agent stop`, then start the new task."
+            )
+        return (
+            "You already have an Agent run starting. Wait for it to open its "
+            "thread, then start the new task."
+        )
+
+    def _reserve_agent_start(
+        self, user_id: str, channel_id: Optional[str], thread_ts: Optional[str]
+    ) -> str:
+        token = uuid.uuid4().hex
+        self.agent_pending_starts.setdefault(user_id, {})[token] = (
+            self._thread_key(channel_id, thread_ts)
+            if channel_id and thread_ts
+            else None
+        )
+        return token
+
+    def _release_agent_start(self, user_id: str, token: str) -> None:
+        pending = self.agent_pending_starts.get(user_id)
+        if pending is None:
+            return
+        pending.pop(token, None)
+        if not pending:
+            self.agent_pending_starts.pop(user_id, None)
+
     def _forget_agent_session(self, tracked: Dict[str, Any]):
         self.agent_runs.pop(tracked.get("run_id"), None)
         self.agent_threads.pop(
@@ -4586,6 +4719,16 @@ class SlackBot:
         if not submission.task:
             return
         if not await self._is_public_agent_channel(nonce.channel_id):
+            return
+        cap_message = self._agent_cap_message(
+            user_id, nonce.channel_id, nonce.thread_ts
+        )
+        if cap_message:
+            await self.web_client.chat_postEphemeral(
+                channel=nonce.channel_id,
+                user=user_id,
+                text=cap_message + _agent_task_echo(submission.task),
+            )
             return
 
         rate_limit_config = self._get_rate_limit_config_for_user(user_id)
