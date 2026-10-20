@@ -540,3 +540,16 @@ def test_update_baseline_refuses_a_summary_over_a_ceiling(tmp_path):
     assert code == 1
     assert any("exceeds ceiling" in failure for failure in report["failures"])
     assert not baseline.exists()
+
+
+def test_topology_prices_match_the_model_catalog_with_cache_reads():
+    # The gateway ledger is the run's hard spend cap; prices above the
+    # catalog (or cached input at the full rate) exhaust it far below the
+    # real spend, as the first live calibration showed.
+    from scripts import validate_structured_workflow as topology
+
+    catalog = {
+        "openai/gpt-5.6-luna": {"input": 0.2, "output": 1.2, "cacheRead": 0.02},
+        "openai/gpt-5.6-sol": {"input": 4, "output": 20, "cacheRead": 0.4},
+    }
+    assert topology.MODEL_PRICES == catalog

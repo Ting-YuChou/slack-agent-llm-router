@@ -159,7 +159,7 @@ export async function calibrate(options: Options): Promise<{ complete: boolean; 
   // The ledger caps live spend at the gateway too, not just between gradings.
   const budget = options.live ? `grader-calibration-${path.basename(work)}` : undefined;
   if (options.live && budget) new BudgetLedger(options.live.budgetLedger).open(budget, options.maxCostUsd!);
-  const lines: string[] = []; let spent = 0; let records = 0; let stopped = false;
+  const lines: string[] = []; let spent = 0; let records = 0; let stopped = false; let reason = "max_cost_usd_exceeded";
   try {
     for (const item of cases) {
       if (stopped) break;
@@ -177,7 +177,10 @@ export async function calibrate(options: Options): Promise<{ complete: boolean; 
         cost = 0;
         const result = await gate.evaluate({ run_id: `${item.id}-${repeat}`, worktree: caseDir, baseline: "", requirement: item.requirement, attempt: 1, signal: new AbortController().signal });
         const { cause, grader_attempts: attempts, ...grade } = result.grade!;
-        spent += cost; records++;
+        spent += cost;
+        // A gateway refusal is not a verdict: stop instead of scoring it as an invalid grade.
+        if (cause?.code === "grader_execution_failed" && /workflow_budget_unavailable_or_exhausted/.test(cause.message)) { stopped = true; reason = "gateway_budget_exhausted"; break; }
+        records++;
         lines.push(JSON.stringify({
           type: "grade", case: item.id, repeat, expected: item.expected, category: item.category, status: grade.status,
           cause: cause ?? null, grader_attempts: attempts, prompts_version: PROMPTS_VERSION, grader_model: options.graderModel,
@@ -189,7 +192,7 @@ export async function calibrate(options: Options): Promise<{ complete: boolean; 
   const expected = cases.length * options.repeats;
   const complete = records === expected;
   lines.push(JSON.stringify({
-    type: "run", complete, ...(complete ? {} : { reason: "max_cost_usd_exceeded" }), records, expected_records: expected,
+    type: "run", complete, ...(complete ? {} : { reason }), records, expected_records: expected,
     repeats: options.repeats, max_cost_usd: options.maxCostUsd ?? null, cost_usd: roundUsd(spent), grader_model: options.graderModel,
     prompts_version: PROMPTS_VERSION, mode: options.live ? "live" : "scripted",
   }));

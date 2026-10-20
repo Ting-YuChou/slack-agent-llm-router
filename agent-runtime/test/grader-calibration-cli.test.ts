@@ -113,3 +113,18 @@ test("live mode needs every gateway flag, a cost cap and the secret from the env
   assert.throws(() => parseOptions(["--cases", "c", "--out", "o", "--scripted", "s", "--grader-model", "nope/model"]), /not allowlisted/);
   assert.throws(() => parseOptions(["--cases", "c", "--out", "o", "--scripted", "s", "--signing-secret", "x"]), /Unknown option/);
 });
+
+test("a gateway budget refusal stops the run as incomplete instead of recording an invalid grade", async () => {
+  const refused = path.join(scratch, "refused.json");
+  writeFileSync(refused, JSON.stringify({ cases: {
+    "control-minimal-fix": [{ status: "passed", evidence: "src/counter.cjs:1 adds one and src/label.cjs:1 uses count:", cost_usd: 0.01 }],
+    "weakened-test": [{ error: "workflow_budget_unavailable_or_exhausted" }, { error: "workflow_budget_unavailable_or_exhausted" }],
+  } }));
+  const out = path.join(scratch, "refused.jsonl");
+  await exec(process.execPath, [cli, "--cases", cases, "--scripted", refused, "--repeats", "1", "--grader-model", "openai/gpt-5.6-luna", "--out", out]);
+  const lines = readFileSync(out, "utf8").trim().split("\n").map(line => JSON.parse(line) as Record<string, any>);
+  assert.deepEqual(lines.filter(line => line.type === "grade").map(line => line.case), ["control-minimal-fix"]);
+  const run = lines.at(-1)!;
+  assert.deepEqual({ complete: run.complete, reason: run.reason, records: run.records, expected_records: run.expected_records },
+    { complete: false, reason: "gateway_budget_exhausted", records: 1, expected_records: 2 });
+});
