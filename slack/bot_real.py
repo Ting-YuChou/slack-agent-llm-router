@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -154,6 +155,20 @@ def _format_grader_finding(finding: Dict[str, Any]) -> str:
     if finding.get("line") is not None:
         location = f"{location}:{finding.get('line')}"
     return f"• `{location}` {finding.get('reason') or ''}".rstrip()
+
+
+AGENT_FOLLOWUP_FLAG_PATTERN = re.compile(
+    r"\s*(--discuss|--implement|--workflow)(?:\s+|$)"
+)
+
+
+@dataclass(frozen=True)
+class AgentFollowupFlags:
+    text: str
+    task_mode: Optional[str] = None
+    workflow_mode: Optional[str] = None
+    consumed: bool = False
+    error: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -977,6 +992,12 @@ class SlackMessageHandler:
         if event.get("thread_ts") and is_agent_thread(
             channel_id, event.get("thread_ts")
         ):
+            flags = self._parse_followup_agent_flags(text)
+            if flags.error:
+                return flags.error
+            if flags.consumed:
+                text = flags.text
+                routing_text = flags.text
             return await self._start_agent_prompt(
                 text,
                 user_id,
@@ -985,6 +1006,12 @@ class SlackMessageHandler:
                 team_id=team_id,
                 thread_ts=event.get("thread_ts"),
                 routing_text=routing_text,
+                **(
+                    {"workflow_mode": flags.workflow_mode}
+                    if flags.workflow_mode
+                    else {}
+                ),
+                **({"task_mode": flags.task_mode} if flags.task_mode else {}),
             )
 
         # Regular query - process through inference engine
@@ -998,6 +1025,46 @@ class SlackMessageHandler:
             team_id=team_id,
             message_ts=message_ts,
         )
+
+    @staticmethod
+    def _parse_followup_agent_flags(text: str) -> "AgentFollowupFlags":
+        """Consume leading `--discuss` / `--implement` / `--workflow` flags."""
+        task_mode: Optional[str] = None
+        workflow_mode: Optional[str] = None
+        remaining = text
+        consumed = False
+        while True:
+            match = AGENT_FOLLOWUP_FLAG_PATTERN.match(remaining)
+            if not match:
+                break
+            option = match.group(1)
+            if option == "--workflow":
+                workflow_mode = "structured"
+            else:
+                requested = option[2:]
+                if task_mode and task_mode != requested:
+                    return AgentFollowupFlags(
+                        text=text,
+                        error="Conflicting task modes: choose --discuss or --implement.",
+                    )
+                task_mode = requested
+            remaining = remaining[match.end() :]
+            consumed = True
+        return AgentFollowupFlags(
+            text=remaining.strip() if consumed else text,
+            task_mode=task_mode,
+            workflow_mode=workflow_mode,
+            consumed=consumed,
+        )
+
+    @staticmethod
+    def _agent_mode_summary(task_mode: str, workflow_mode: Optional[str]) -> str:
+        summary = f"Mode: *{task_mode}*"
+        if task_mode == "discuss":
+            summary += " (read-only; reply with `--implement` to make changes)"
+        if workflow_mode == "structured":
+            summary += " · structured workflow"
+        return summary
 
     async def _handle_command_or_query(
         self,
@@ -1360,6 +1427,21 @@ class SlackMessageHandler:
         if not root_ts:
             return "Agent mode needs a Slack thread to start this task."
 
+        if task_mode is None:
+            # A follow-up never silently upgrades a read-only discussion: the
+            # runtime defaults to implement, so carry discuss forward unless
+            # the owner explicitly passes `--implement`.
+            agent_run_for = getattr(self.bot, "_agent_run_for", None)
+            previous = (
+                agent_run_for(user_id, channel_id, thread_ts)
+                if thread_ts and callable(agent_run_for)
+                else None
+            )
+            if previous and previous.get("mode") == "discuss":
+                task_mode = "discuss"
+        effective_task_mode = task_mode or "implement"
+        mode_summary = self._agent_mode_summary(effective_task_mode, workflow_mode)
+
         try:
             create_args = (
                 team_id or "unknown-team",
@@ -1396,6 +1478,7 @@ class SlackMessageHandler:
                 channel_id=channel_id,
                 thread_ts=root_ts,
                 owner_user_id=user_id,
+                mode=effective_task_mode,
             )
             if (
                 root_message_ts
@@ -1408,9 +1491,10 @@ class SlackMessageHandler:
                     text=(
                         f"🛠️ Pi coding agent started run `{result['run_id']}`"
                         f"{f' with `{model}`' if model else ''}.\n"
+                        f"{mode_summary}\n"
                         + (
                             "Read-only discussion: no edits, verification or commit."
-                            if task_mode == "discuss"
+                            if effective_task_mode == "discuss"
                             else "Read-only exploration is automatic; edits and risky shell commands require approval here."
                         )
                     ),
@@ -1418,7 +1502,7 @@ class SlackMessageHandler:
             self.bot._start_agent_monitor(tracked)
             if root_message_ts:
                 return ""
-            return f"🛠️ Agent run `{result['run_id']}` started."
+            return f"🛠️ Agent run `{result['run_id']}` started.\n{mode_summary}"
 
         if root_message_ts and client is not None and hasattr(client, "chat_update"):
             await client.chat_update(
