@@ -18,6 +18,7 @@ import { summarizePolicy, type PolicyDecision, type PolicySummary } from "./poli
 import { redact } from "./telemetry.js";
 import { DEFAULT_DIFF_LIMITS, DiffLimitError } from "./worktree-manager.js";
 import { MIN_CHECKS_WINDOW_MS, rejected, type WriterChecksRequest, type WriterChecksResponse } from "./writer-checks.js";
+import type { DiskQuota } from "./disk-usage.js";
 
 export interface QualityServices {
   evaluate(input: GateInput): Promise<GateResult>;
@@ -243,6 +244,8 @@ export class CodingAgentOrchestrator {
   private readonly threadSessions = new Map<string, string>();
   private readonly runs = new Map<string, RunRecord>();
   private readonly deadlines = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly diskWatches = new Map<string, ReturnType<typeof setInterval>>();
+  private readonly diskQuota?: DiskQuota;
   private readonly terminalClaims = new Set<string>();
   private readonly pendingThreadKeys = new Set<string>();
   private readonly pendingSessionIds = new Set<string>();
@@ -291,6 +294,8 @@ export class CodingAgentOrchestrator {
     archivePatch?: PatchArchiver;
     /** Off by default: the owner approves the final diff before it is committed. */
     deliveryApproval?: DeliveryApprovalOptions;
+    /** Measures each active run's worktree; a run over the quota fails as disk_quota_exceeded. */
+    diskQuota?: DiskQuota;
   }) {
     this.captureState = options.captureState;
     this.observeRun = options.observeRun; this.observePolicy = options.observePolicy; this.observeLifecycle = options.observeLifecycle;
@@ -298,6 +303,7 @@ export class CodingAgentOrchestrator {
     this.startProcess = options.startProcess;
     this.maxActiveSessions = options.maxActiveSessions ?? 2;
     this.deadlineMs = options.deadlineMs ?? 15 * 60_000;
+    this.diskQuota = options.diskQuota;
     this.availableModelRefs = new Set(options.availableModelRefs ?? listAgentModels().map((model) => model.ref));
     this.stateStore = options.stateStore;
     this.router = options.router;
@@ -667,7 +673,7 @@ export class CodingAgentOrchestrator {
     if (workflow?.mode === 'structured') this.launchDiscovery(session, run, workflow, prompt.trim());
     else if (workflow) await this.startExecution(session, run, workflow, prompt.trim());
     else session.process.prompt(runId, prompt.trim(), route, task);
-    if (!isTerminal(run.status)) this.armDeadline(session, run, this.workflows.get(runId)?.budget.remainingMs() ?? this.deadlineMs);
+    if (!isTerminal(run.status)) { this.armDeadline(session, run, this.workflows.get(runId)?.budget.remainingMs() ?? this.deadlineMs); this.watchDisk(session, run); }
     } catch (error) {
       if (this.stateStore?.healthy !== false && !isTerminal(run.status) && !this.terminalClaims.has(runId)) await this.failRun(session, run, { code: "execution_start_failed", message: "Execution could not start within its configured controls" });
       throw error;
@@ -752,6 +758,29 @@ export class CodingAgentOrchestrator {
     const deadline = setTimeout(() => this.background(this.timeoutRun(session, run)), ms);
     deadline.unref();
     this.deadlines.set(runId, deadline);
+  }
+
+  /** The writable worktree has no filesystem quota, so the host measures it while the run is active. */
+  private watchDisk(session: SessionRecord, run: RunRecord): void {
+    const quota = this.diskQuota;
+    if (!quota || run.task_mode === "discuss" || this.diskWatches.has(run.run_id)) return;
+    let measuring = false;
+    const watch = setInterval(() => {
+      if (measuring) return;
+      measuring = true;
+      quota.usage(session.worktreePath).then(bytes => {
+        if (bytes <= quota.bytes || isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return;
+        return this.failRun(session, run, { code: "disk_quota_exceeded", message: `The worktree grew past its ${Math.round(quota.bytes / 1024 ** 2)} MiB quota; changes were not delivered` });
+      }, () => undefined).finally(() => { measuring = false; });
+    }, quota.intervalMs);
+    watch.unref();
+    this.diskWatches.set(run.run_id, watch);
+  }
+
+  private stopDiskWatch(runId: string): void {
+    const watch = this.diskWatches.get(runId);
+    if (watch) clearInterval(watch);
+    this.diskWatches.delete(runId);
   }
 
   private async startExecution(session: SessionRecord, run: RunRecord, state: WorkflowState, prompt: string) {
@@ -1219,6 +1248,7 @@ export class CodingAgentOrchestrator {
     const timer = this.deadlines.get(runId);
     if (timer) clearTimeout(timer);
     this.deadlines.delete(runId);
+    this.stopDiskWatch(runId);
     if (this.workflows.has(runId)) this.quality?.close?.(runId);
     this.workflows.delete(runId);
     for (const key of this.mcpToolStarts.keys()) {
@@ -1234,6 +1264,7 @@ export class CodingAgentOrchestrator {
     const timer = this.deadlines.get(run.run_id);
     if (timer) clearTimeout(timer);
     this.deadlines.delete(run.run_id);
+    this.stopDiskWatch(run.run_id);
     return true;
   }
 

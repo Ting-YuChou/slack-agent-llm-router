@@ -25,6 +25,7 @@ import { allServerTools, enabledMcpServers, MCP_SERVERS, parseMcpMode, parseMcpS
 import { deriveMcpServerSecret, issueMcpToken } from "./mcp-token.js";
 import { deriveBudgetRpcSecret } from "./budget-rpc.js";
 import { IdempotencyCache, IdempotencyKeyReusedError } from "./idempotency.js";
+import { diskQuotaFromEnv } from "./disk-usage.js";
 import {
   CodingAgentOrchestrator,
   publicRun,
@@ -424,6 +425,7 @@ export async function createProductionServer() {
   const credentialValues = () => Object.entries(process.env).filter(([key]) => isCredentialKey(key)).map(([, value]) => value!).filter(Boolean);
   const orchestrator: CodingAgentOrchestrator = new CodingAgentOrchestrator({
     quality,
+    diskQuota: diskQuotaFromEnv(process.env),
     requireVerification: process.env.PI_AGENT_REQUIRE_VERIFICATION === "1",
     archivePatch: async input => (await archivePatch({
       worktree: input.worktree, baseline: input.baseline, file: undeliveredPatchPath(runtimeRoot, input.run_id),

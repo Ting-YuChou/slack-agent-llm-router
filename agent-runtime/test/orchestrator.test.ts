@@ -1144,3 +1144,15 @@ test("auto-routing falls back to a configured model when Luna is not configured"
   await waitFor(() => calls.startedModels.length, count => count > 0, () => "no process started");
   assert.equal(calls.startedModels[0], "anthropic/claude-sonnet-4-6");
 });
+
+test("a worktree over its disk quota fails the run as disk_quota_exceeded and rolls back", async () => {
+  let usage = 10;
+  const { orchestrator, calls } = fixture(undefined, undefined, undefined, { diskQuota: { bytes: 100, intervalMs: 5, usage: async () => usage } });
+  const accepted = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "disk-quota", user_id: "U", prompt: "fix" });
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(orchestrator.getRun(accepted.run_id).status, "running", "under the quota the run continues");
+  usage = 101;
+  const run = await waitFor(() => orchestrator.getRun(accepted.run_id), current => current.status === "failed" && calls.rollback.length > 0, current => `status ${current.status}`);
+  assert.equal(run.error?.code, "disk_quota_exceeded");
+  assert.equal(calls.commits, 0);
+});
