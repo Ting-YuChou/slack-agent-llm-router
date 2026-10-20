@@ -89,9 +89,7 @@ class AgentAnalyticsTests(unittest.TestCase):
         view = next(
             s
             for s in module.schema_sql()
-            if s.startswith(
-                "CREATE OR REPLACE VIEW agent_grade_feedback_agreement AS"
-            )
+            if s.startswith("CREATE OR REPLACE VIEW agent_grade_feedback_agreement AS")
         )
         self.assertIn("agent_grades_latest", view)
         self.assertIn("agent_feedback_current", view)
@@ -415,15 +413,17 @@ class AgentAnalyticsTests(unittest.TestCase):
         sql = module.schema_sql()
         for table, extra in module.TABLES.items():
             create = sql.index(
-                next(s for s in sql if s.startswith(f"CREATE TABLE IF NOT EXISTS {table} ("))
+                next(
+                    s
+                    for s in sql
+                    if s.startswith(f"CREATE TABLE IF NOT EXISTS {table} (")
+                )
             )
             latest = sql.index(
                 f"CREATE OR REPLACE VIEW {table}_latest AS SELECT * FROM {table} FINAL"
             )
             for column, kind in {**module.BASE, **extra}.items():
-                alter = (
-                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {kind}"
-                )
+                alter = f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {kind}"
                 self.assertIn(alter, sql)
                 self.assertLess(create, sql.index(alter))
                 self.assertLess(sql.index(alter), latest)

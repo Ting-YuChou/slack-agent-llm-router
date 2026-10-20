@@ -8,7 +8,11 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from slack.bot_real import RedisSlackStateStore, SlackBot, SlackMessageHandler
-from src.agent_runtime import AgentRuntimeError, AgentRuntimeUnauthorized
+from src.agent_runtime import (
+    AgentRuntimeConflict,
+    AgentRuntimeError,
+    AgentRuntimeUnauthorized,
+)
 
 
 class FakeRedis:
@@ -585,3 +589,142 @@ def test_passed_verification_is_shown_unchanged():
 
     assert "*Verification:* passed" in text
     assert UNVERIFIED not in text
+
+
+def card_click(action_id="pi_agent_approve", user_id="U1"):
+    payload = approval_click(user_id=user_id, action_id=action_id)
+    payload["message"]["blocks"] = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*Edit*"}},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": "Expires"}]},
+        {"type": "actions", "elements": []},
+    ]
+    return payload
+
+
+def card_bot(tmp_path, decide):
+    bot = click_bot(tmp_path, decide)
+    bot.web_client.chat_update = AsyncMock()
+    return bot
+
+
+def updated_card(bot):
+    kwargs = bot.web_client.chat_update.await_args.kwargs
+    assert (kwargs["channel"], kwargs["ts"]) == ("C1", "5.0")
+    assert all(block["type"] != "actions" for block in kwargs["blocks"])
+    assert kwargs["blocks"][0]["text"]["text"] == "*Edit*"
+    return kwargs["blocks"][-1]["elements"][0]["text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action_id,verdict",
+    [("pi_agent_approve", "Approved"), ("pi_agent_reject", "Rejected")],
+)
+async def test_decided_card_replaces_its_buttons_with_the_decision(
+    tmp_path, action_id, verdict
+):
+    bot = card_bot(tmp_path, AsyncMock())
+    tracked = track(bot)
+    tracked["approval_cards"] = {"A1": "5.0"}
+
+    await bot._handle_agent_interactive(card_click(action_id))
+
+    text = updated_card(bot)
+    assert text.startswith(f"{verdict} by <@U1> at <!date^")
+    assert "Expires" not in json.dumps(bot.web_client.chat_update.await_args.kwargs)
+    assert tracked["approval_cards"] == {}
+
+
+@pytest.mark.asyncio
+async def test_card_for_an_expired_approval_says_expired(tmp_path):
+    bot = card_bot(
+        tmp_path,
+        AsyncMock(side_effect=AgentRuntimeConflict("gone", status=409)),
+    )
+    track(bot)["approval_cards"] = {"A1": "5.0"}
+
+    await bot._handle_agent_interactive(card_click())
+
+    assert updated_card(bot).startswith("Expired")
+    bot.web_client.chat_postEphemeral.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_decision_keeps_the_card_buttons(tmp_path):
+    bot = card_bot(tmp_path, AsyncMock(side_effect=AgentRuntimeError("x", status=500)))
+    tracked = track(bot)
+    tracked["approval_cards"] = {"A1": "5.0"}
+
+    await bot._handle_agent_interactive(card_click())
+
+    bot.web_client.chat_update.assert_not_awaited()
+    assert tracked["approval_cards"] == {"A1": "5.0"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "later_events,verdict",
+    [
+        ([], "Expired"),
+        (
+            [
+                {
+                    "type": "approval_decision",
+                    "decision": "approved",
+                    "approval_id": "A1",
+                }
+            ],
+            "Approved at <!date^",
+        ),
+        (
+            [
+                {
+                    "type": "approval_decision",
+                    "decision": "rejected",
+                    "approval_id": "A1",
+                }
+            ],
+            "Rejected at <!date^",
+        ),
+    ],
+)
+async def test_monitor_closes_cards_the_run_moved_past(tmp_path, later_events, verdict):
+    approval = {"type": "approval", "approval_id": "A1", "title": "Edit"}
+    runtime = scripted_runtime(
+        {
+            "R1": [
+                approval_state("R1", "A1"),
+                run_state("R1", "failed", events=[approval, *later_events]),
+            ]
+        }
+    )
+    bot = file_bot(tmp_path, agent_runtime=runtime)
+    bot.web_client = SimpleNamespace(
+        chat_postMessage=AsyncMock(return_value={"ts": "5.0"}),
+        chat_update=AsyncMock(),
+    )
+    bot.agent_monitor_poll_seconds = 0
+    tracked = track(bot)
+
+    await bot._monitor_agent_run(tracked)
+
+    kwargs = bot.web_client.chat_update.await_args.kwargs
+    assert (kwargs["channel"], kwargs["ts"]) == ("C1", "5.0")
+    assert kwargs["blocks"][0]["text"]["text"] == "*Edit*"
+    assert all(block["type"] != "actions" for block in kwargs["blocks"])
+    assert kwargs["blocks"][-1]["elements"][0]["text"].startswith(verdict)
+    bot.web_client.chat_update.assert_awaited_once()
+    assert tracked["approval_cards"] == {}
+
+
+@pytest.mark.asyncio
+async def test_open_approval_card_survives_a_restart(tmp_path):
+    first = file_bot(tmp_path)
+    tracked = track(first)
+    tracked["approval_cards"] = {"A1": "5.0"}
+    await first._persist_agent_run(tracked)
+
+    second = file_bot(tmp_path)
+    await second._restore_state()
+
+    assert second.agent_runs["R1"]["approval_cards"] == {"A1": "5.0"}

@@ -3663,6 +3663,8 @@ class SlackBot:
             "posted_approval_ids": list(previous.get("posted_approval_ids", [])),
             "result_posted": False,
         }
+        if previous.get("approval_cards"):
+            tracked["approval_cards"] = dict(previous["approval_cards"])
         self._register_agent_run(tracked)
         return tracked
 
@@ -3677,7 +3679,7 @@ class SlackBot:
 
     @staticmethod
     def _agent_run_record(tracked: Dict[str, Any]) -> Dict[str, Any]:
-        return {
+        record = {
             "run_id": tracked["run_id"],
             "session_id": tracked.get("session_id"),
             "team_id": tracked.get("team_id"),
@@ -3688,6 +3690,13 @@ class SlackBot:
             "posted_approval_ids": list(tracked.get("posted_approval_ids", [])),
             "result_posted": bool(tracked.get("result_posted", False)),
         }
+        # Message ts of each approval card still showing buttons, by approval_id.
+        cards = tracked.get("approval_cards")
+        if isinstance(cards, dict) and cards:
+            record["approval_cards"] = {
+                str(key): str(value) for key, value in cards.items()
+            }
+        return record
 
     async def _persist_agent_run(self, tracked: Dict[str, Any]):
         """Persist one tracked run and drop finished runs it superseded."""
@@ -3908,6 +3917,7 @@ class SlackBot:
                     text="Agent status could not be retrieved; Chat mode was not used as fallback.",
                 )
                 return
+            await self._close_agent_approval_cards(tracked, run)
             if run.get("status") == "awaiting_approval":
                 await self._post_agent_approval(tracked, run)
                 await asyncio.sleep(self.agent_monitor_poll_seconds)
@@ -3950,7 +3960,7 @@ class SlackBot:
             if kind == "delivery"
             else self._agent_approval_blocks(approval)
         )
-        await self.web_client.chat_postMessage(
+        response = await self.web_client.chat_postMessage(
             channel=tracked["channel_id"],
             thread_ts=tracked["thread_ts"],
             text=(
@@ -3982,7 +3992,108 @@ class SlackBot:
             ],
         )
         posted.append(approval["approval_id"])
+        card_ts = response.get("ts") if hasattr(response, "get") else None
+        if isinstance(card_ts, str) and card_ts:
+            tracked.setdefault("approval_cards", {})[approval["approval_id"]] = card_ts
         await self._persist_agent_run(tracked)
+
+    @staticmethod
+    def _closed_agent_card_blocks(
+        blocks: List[Dict[str, Any]], outcome: str
+    ) -> List[Dict[str, Any]]:
+        """Keep a card's sections; its buttons and expiry footer give way to the outcome."""
+        kept = [
+            block
+            for block in blocks
+            if isinstance(block, dict) and block.get("type") == "section"
+        ]
+        return [
+            *kept,
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": outcome}]},
+        ]
+
+    @staticmethod
+    def _agent_card_outcome(verdict: str, user_id: Optional[str] = None) -> str:
+        now = int(time.time())
+        when = f"<!date^{now}^{{date_short_pretty}} {{time}}|{now}>"
+        by = f" by <@{user_id}>" if user_id else ""
+        return f"{verdict}{by} at {when}"
+
+    async def _update_agent_card(
+        self,
+        channel_id: str,
+        ts: str,
+        blocks: List[Dict[str, Any]],
+        outcome: str,
+    ) -> None:
+        if not hasattr(self.web_client, "chat_update"):
+            return
+        try:
+            await self.web_client.chat_update(
+                channel=channel_id,
+                ts=ts,
+                text=outcome,
+                blocks=self._closed_agent_card_blocks(blocks, outcome),
+            )
+        except Exception:
+            logger.warning("Agent approval card could not be updated", exc_info=True)
+
+    async def _close_agent_approval_cards(
+        self, tracked: Dict[str, Any], run: Dict[str, Any]
+    ) -> None:
+        """Replace the buttons of every card the run has moved past."""
+        cards = tracked.get("approval_cards")
+        if not isinstance(cards, dict) or not cards:
+            return
+        events = [event for event in run.get("events") or [] if isinstance(event, dict)]
+        pending = None
+        if run.get("status") == "awaiting_approval":
+            pending = next(
+                (
+                    event.get("approval_id")
+                    for event in reversed(events)
+                    if event.get("type") == "approval"
+                ),
+                None,
+            )
+        closed = False
+        for approval_id, ts in list(cards.items()):
+            if approval_id == pending:
+                continue
+            approval = next(
+                (
+                    event
+                    for event in events
+                    if event.get("type") == "approval"
+                    and event.get("approval_id") == approval_id
+                ),
+                {},
+            )
+            decision = next(
+                (
+                    event.get("decision")
+                    for event in events
+                    if event.get("type") == "approval_decision"
+                    and event.get("approval_id") == approval_id
+                ),
+                None,
+            )
+            verdict = {"approved": "Approved", "rejected": "Rejected"}.get(
+                str(decision)
+            )
+            outcome = self._agent_card_outcome(verdict) if verdict else "Expired"
+            blocks = (
+                self._agent_delivery_blocks(approval)
+                if approval.get("kind") == "delivery"
+                else self._agent_approval_blocks(approval)
+                if approval
+                else []
+            )
+            cards.pop(approval_id, None)
+            closed = True
+            await self._update_agent_card(tracked["channel_id"], ts, blocks, outcome)
+        if closed:
+            await self._persist_agent_run(tracked)
 
     async def _post_agent_result(
         self, tracked: Dict[str, Any], run: Dict[str, Any]
@@ -4394,11 +4505,26 @@ class SlackBot:
                 )
             return
         decision = "approve" if action["action_id"] == "pi_agent_approve" else "reject"
+        message = payload.get("message") or {}
+        card_ts = message.get("ts") or (payload.get("container") or {}).get(
+            "message_ts"
+        )
+        card_blocks = message.get("blocks") or []
+        # Claim the card first so the monitor does not close it without the decider.
+        cards = tracked.get("approval_cards") if tracked else None
+        claimed = cards.pop(approval_id, None) if isinstance(cards, dict) else None
         try:
             await self.agent_runtime_client.decide(
                 run_id, approval_id, user_id, decision
             )
         except AgentRuntimeError as exc:
+            if isinstance(exc, AgentRuntimeConflict):
+                if channel_id and card_ts:
+                    await self._update_agent_card(
+                        channel_id, card_ts, card_blocks, "Expired"
+                    )
+            elif claimed is not None and isinstance(cards, dict):
+                cards[approval_id] = claimed
             if isinstance(exc, AgentRuntimeUnauthorized):
                 text = _agent_auth_error_text(
                     exc, "Only the Agent session owner can approve this action."
@@ -4412,6 +4538,15 @@ class SlackBot:
                 channel=channel_id, user=user_id, text=text
             )
             return
+        if channel_id and card_ts:
+            await self._update_agent_card(
+                channel_id,
+                card_ts,
+                card_blocks,
+                self._agent_card_outcome(
+                    "Approved" if decision == "approve" else "Rejected", user_id
+                ),
+            )
         if not tracked:
             # The bot lost this run (e.g. restarted without state); the runtime
             # accepted the owner's decision, so resume tracking from the card.
