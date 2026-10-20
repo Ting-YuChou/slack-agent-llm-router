@@ -3,7 +3,8 @@ import type { Server } from "node:http";
 import { test } from "node:test";
 
 import { RuntimeConflictError, RuntimeNotFoundError } from "../src/orchestrator.js";
-import { authorized, createAgentHttpServer, parseJevClassifierMode } from "../src/server.js";
+import { EventEmitter } from "node:events";
+import { authorized, createAgentHttpServer, guardProcess, parseJevClassifierMode } from "../src/server.js";
 
 async function listen(server: Server): Promise<string> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -259,4 +260,16 @@ test("profiled writers test through run_checks, so test runners leave the defaul
   for (const runner of runners) assert.ok(!profiled.includes(runner), runner);
   assert.deepEqual(profiled, ["npm run lint", "npm run build"]);
   assert.deepEqual(parseSafeCommands("pytest || make lint", { profiled: true }), ["pytest", "make lint"], "an explicit PI_AGENT_SAFE_COMMANDS still wins");
+});
+
+test("an unhandled rejection is logged and marks the runtime unhealthy instead of crashing it", () => {
+  const target = new EventEmitter();
+  const failures: unknown[] = []; const logs: string[] = [];
+  const uninstall = guardProcess(target, error => failures.push(error), line => logs.push(line));
+  target.emit("unhandledRejection", new Error("disk full"), Promise.resolve());
+  assert.equal(failures.length, 1);
+  assert.match(logs[0] ?? "", /"event":"agent_runtime_unhandled_rejection"/);
+  assert.ok(!(logs[0] ?? "").includes("disk full"), "the reason text is not logged verbatim");
+  uninstall();
+  assert.equal(target.listenerCount("unhandledRejection"), 0);
 });

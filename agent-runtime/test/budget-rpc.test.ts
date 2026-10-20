@@ -24,3 +24,26 @@ test('gateway budget RPC reserves on the sole host ledger and rejects callers wi
     ledger.stop('w'); await assert.rejects(rpc.reserve('w','late',.1));
   } finally { await new Promise<void>(resolve => server.close(() => resolve())); ledger.close(); rmSync(root,{ recursive: true,force: true }); }
 });
+
+test('the budget RPC bearer is derived from, and never equal to, the gateway signing secret', async () => {
+  const master = 'gateway-signing-secret';
+  const derived = budgetRpcModule.deriveBudgetRpcSecret(master);
+  assert.notEqual(derived, master);
+  assert.equal(derived, budgetRpcModule.deriveBudgetRpcSecret(master), 'deterministic on both sides');
+  assert.equal(Buffer.from(derived, 'base64url').length, 32);
+  assert.throws(() => budgetRpcModule.deriveBudgetRpcSecret(''), /signing secret/);
+});
+
+test('the gateway sends the derived bearer and the runtime refuses the raw signing secret', async () => {
+  const { gatewayLedgerFromEnv } = await import('../src/model-gateway.js');
+  const master = 'gateway-signing-secret';
+  const root = mkdtempSync(path.join(os.tmpdir(),'budget-rpc-')); const ledger = new BudgetLedger(path.join(root,'db'));
+  const server = createAgentHttpServer({ token: 'runtime',orchestrator: {} as any,health: () => ({}),acceptRuns: () => true,budgetLedger: ledger,budgetSecret: budgetRpcModule.deriveBudgetRpcSecret(master) } as any);
+  try {
+    await new Promise<void>(resolve => server.listen(0,'127.0.0.1',resolve)); const address = server.address() as any; const base = `http://127.0.0.1:${address.port}`;
+    ledger.open('w',5);
+    const gateway = gatewayLedgerFromEnv({ PI_AGENT_BUDGET_RPC_URL: base }, master);
+    await gateway.reserve('w','ok',.1);
+    await assert.rejects(new budgetRpcModule.BudgetRpcClient(base, master).reserve('w','raw',.1), 'a leaked signing secret is not a budget credential');
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); ledger.close(); rmSync(root,{ recursive: true,force: true }); }
+});

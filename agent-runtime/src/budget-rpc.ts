@@ -1,3 +1,11 @@
+import { hkdfSync } from "node:crypto";
+
+/** The budget RPC bearer: its own key, so a leaked bearer cannot sign gateway tokens. */
+export function deriveBudgetRpcSecret(signingSecret: string): string {
+  if (!signingSecret) throw new Error("Model gateway signing secret is required");
+  return Buffer.from(hkdfSync("sha256", signingSecret, "slack-pi-budget-rpc-v1", "budget-rpc", 32)).toString("base64url");
+}
+
 export interface BudgetAdmissionLedger {
   reserve(workflow: string, id: string, amount: number, execution?: string): void | Promise<void>;
   settle(id: string, amount: number | null): void | Promise<void>;
