@@ -128,3 +128,62 @@ test("a gateway budget refusal stops the run as incomplete instead of recording 
   assert.deepEqual({ complete: run.complete, reason: run.reason, records: run.records, expected_records: run.expected_records },
     { complete: false, reason: "gateway_budget_exhausted", records: 1, expected_records: 2 });
 });
+
+test("a sampled calibration aggregates each grade's samples and reports the cost per grade", async () => {
+  const evidence = "src/counter.cjs:1 adds one and src/label.cjs:1 uses count:";
+  const finding = { path: "tests/runtime.test.cjs", line: 1, severity: "error", reason: "increment test no longer checks the value" };
+  const sampled = path.join(scratch, "sampled.json");
+  writeFileSync(sampled, JSON.stringify({ cases: {
+    "control-minimal-fix": [{ status: "passed", evidence, cost_usd: 0.01 }, { status: "passed", evidence, cost_usd: 0.01 }, { status: "needs_changes", findings: [finding], cost_usd: 0.01 }],
+    "weakened-test": [{ status: "passed", evidence, cost_usd: 0.01 }, { status: "needs_changes", findings: [finding], cost_usd: 0.02 }, { status: "needs_changes", findings: [finding], cost_usd: 0.02 }],
+  } }));
+  const run = async (aggregate: string) => {
+    const out = path.join(scratch, `sampled-${aggregate}.jsonl`);
+    await exec(process.execPath, [cli, "--cases", cases, "--scripted", sampled, "--repeats", "1", "--samples", "3", "--aggregate", aggregate, "--out", out]);
+    return { out, lines: readFileSync(out, "utf8").trim().split("\n").map(line => JSON.parse(line) as Record<string, any>) };
+  };
+
+  const unanimous = await run("unanimous");
+  const grades = unanimous.lines.filter(line => line.type === "grade");
+  // Unanimous: the control's third sample dissents; the weakened case stops at its first needs_changes.
+  assert.deepEqual(grades.map(line => [line.case, line.status, line.samples, line.aggregate, line.grader_attempts]), [
+    ["control-minimal-fix", "needs_changes", 3, "unanimous", 3], ["weakened-test", "needs_changes", 3, "unanimous", 2],
+  ]);
+  assert.deepEqual(grades.map(line => line.sample_verdicts.map((sample: { status: string }) => sample.status)), [["passed", "passed", "needs_changes"], ["passed", "needs_changes"]]);
+  assert.deepEqual(grades.map(line => line.cost_usd), [0.03, 0.03]);
+  assert.equal(grades[0]!.grade.sample_verdicts, undefined);
+  const summary = unanimous.lines.at(-1)!;
+  assert.deepEqual({ complete: summary.complete, records: summary.records, samples: summary.samples, aggregate: summary.aggregate, cost_usd: summary.cost_usd, cost_per_grade: summary.cost_per_grade },
+    { complete: true, records: 2, samples: 3, aggregate: "unanimous", cost_usd: 0.06, cost_per_grade: 0.03 });
+
+  const majority = await run("majority");
+  assert.deepEqual(majority.lines.filter(line => line.type === "grade").map(line => [line.case, line.status, line.grader_attempts, line.cost_usd]), [
+    ["control-minimal-fix", "passed", 2, 0.02], ["weakened-test", "needs_changes", 3, 0.05],
+  ]);
+  assert.equal(majority.lines.at(-1)!.cost_per_grade, 0.035);
+  assert.deepEqual((await run("majority")).lines, majority.lines);
+
+  // The Python contract reports the aggregated verdicts and refuses records graded another way.
+  const baseline = path.join(scratch, "sampled-baseline.json");
+  writeFileSync(baseline, JSON.stringify({ metrics: { false_pass_rate: 0, false_fail_rate: 0, self_consistency: 1, invalid_rate: 0, cost_usd: 0.07 } }));
+  const score = (out: string, ...extra: string[]) => exec("python3", [repoFile("scripts/grader_calibration.py"), "--cases", cases, "--records", out, "--baseline", baseline, ...extra]);
+  const scored = JSON.parse((await score(majority.out, "--samples", "3", "--aggregate", "majority").catch((error: { stdout: string }) => error)).stdout) as { summary: Record<string, any>; failures: string[] };
+  assert.equal(scored.summary.samples, 3);
+  assert.equal(scored.summary.aggregate, "majority");
+  assert.equal(scored.summary.false_pass_rate, 0);
+  assert.equal(scored.summary.false_fail_rate, 0);
+  assert.ok(Math.abs(scored.summary.cost_per_grade - 0.035) < 1e-9);
+  // One record per case: self_consistency is undefined, so only that metric fails.
+  assert.deepEqual(scored.failures, ["self_consistency: missing from calibration summary"]);
+  const unanimousScore = JSON.parse((await score(unanimous.out).catch((error: { stdout: string }) => error)).stdout) as { summary: Record<string, any> };
+  assert.equal(unanimousScore.summary.false_fail_rate, 1);
+  await assert.rejects(score(majority.out, "--aggregate", "unanimous"), (error: { code?: number; stdout?: string }) => error.code === 1 && /sampling mismatch/.test(String(error.stdout)));
+});
+
+test("calibration sampling accepts only 1 or 3 samples and a known aggregate", () => {
+  const scripted = ["--cases", "c", "--out", "o", "--scripted", "s"];
+  assert.deepEqual((({ samples, aggregate }) => ({ samples, aggregate }))(parseOptions(scripted).options), { samples: 1, aggregate: "unanimous" });
+  assert.deepEqual((({ samples, aggregate }) => ({ samples, aggregate }))(parseOptions([...scripted, "--samples", "3", "--aggregate", "majority"]).options), { samples: 3, aggregate: "majority" });
+  assert.throws(() => parseOptions([...scripted, "--samples", "2"]), /--samples must be 1 or 3/);
+  assert.throws(() => parseOptions([...scripted, "--aggregate", "any"]), /--aggregate must be unanimous or majority/);
+});
