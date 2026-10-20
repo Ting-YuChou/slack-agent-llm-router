@@ -402,6 +402,22 @@ async def test_unauthorized_click_for_untracked_run_explains_ownership(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_bad_runtime_token_on_click_is_not_blamed_on_ownership(tmp_path):
+    bot = click_bot(
+        tmp_path,
+        AsyncMock(
+            side_effect=AgentRuntimeUnauthorized("no", status=401, code="unauthorized")
+        ),
+    )
+
+    await bot._handle_agent_interactive(approval_click())
+
+    text = bot.web_client.chat_postEphemeral.await_args.kwargs["text"]
+    assert "credentials" in text
+    assert "owner" not in text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("tracked_before", [False, True])
 async def test_failed_decision_is_reported_ephemerally(tmp_path, tracked_before):
     bot = click_bot(

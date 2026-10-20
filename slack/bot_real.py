@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -154,6 +155,76 @@ def _format_grader_finding(finding: Dict[str, Any]) -> str:
     if finding.get("line") is not None:
         location = f"{location}:{finding.get('line')}"
     return f"• `{location}` {finding.get('reason') or ''}".rstrip()
+
+
+AGENT_FOLLOWUP_FLAG_PATTERN = re.compile(
+    r"\s*(--discuss|--implement|--workflow)(?:\s+|$)"
+)
+
+
+AGENT_RUNTIME_CREDENTIALS_TEXT = (
+    "Agent mode is misconfigured: the runtime rejected the bot's credentials."
+)
+AGENT_START_ERROR_TEXT = {
+    "session_busy": "This Agent session already has a run in progress; wait for it or use `agent stop`.",
+    "verification_profile_required": "Implement runs need a trusted verification profile here; use `--discuss` for a read-only run.",
+    "invalid_model": "That Agent model is not allowlisted.",
+    "provider_not_configured": "That Agent model's provider is not configured.",
+}
+
+
+AGENT_RESULT_BLOCK_CHARS = 3000
+AGENT_RESULT_BLOCKS_PER_MESSAGE = 10
+AGENT_RESULT_MAX_CHARS = 60000
+
+
+def _split_agent_result(text: str, limit: int = AGENT_RESULT_BLOCK_CHARS) -> List[str]:
+    """Split a result into Slack section-sized chunks without dropping content.
+
+    Chunks break on a newline when one is near the limit, and a code fence
+    left open at a break is closed and reopened so each block renders alone.
+    """
+    if len(text) > AGENT_RESULT_MAX_CHARS:
+        omitted = len(text) - AGENT_RESULT_MAX_CHARS
+        text = (
+            text[:AGENT_RESULT_MAX_CHARS].rstrip()
+            + f"\n\n_…answer truncated: {omitted:,} more characters were not posted._"
+        )
+    chunks: List[str] = []
+    remaining = text
+    open_fence = False
+    while remaining:
+        prefix = "```\n" if open_fence else ""
+        if len(prefix) + len(remaining) <= limit:
+            piece, remaining = remaining, ""
+        else:
+            budget = limit - len(prefix) - len("\n```")
+            cut = remaining.rfind("\n", 0, budget)
+            if cut < budget // 2:
+                cut = budget
+            piece, remaining = remaining[:cut], remaining[cut:].lstrip("\n")
+        chunk = prefix + piece
+        open_fence = chunk.count("```") % 2 == 1
+        if open_fence and remaining:
+            chunk += "\n```"
+        chunks.append(chunk)
+    return chunks
+
+
+def _agent_auth_error_text(exc: AgentRuntimeError, owner_text: str) -> str:
+    """Tell a bad bot token (`unauthorized`) apart from a non-owner (`*_forbidden`)."""
+    if exc.code == "unauthorized":
+        return AGENT_RUNTIME_CREDENTIALS_TEXT
+    return owner_text
+
+
+@dataclass(frozen=True)
+class AgentFollowupFlags:
+    text: str
+    task_mode: Optional[str] = None
+    workflow_mode: Optional[str] = None
+    consumed: bool = False
+    error: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -977,6 +1048,12 @@ class SlackMessageHandler:
         if event.get("thread_ts") and is_agent_thread(
             channel_id, event.get("thread_ts")
         ):
+            flags = self._parse_followup_agent_flags(text)
+            if flags.error:
+                return flags.error
+            if flags.consumed:
+                text = flags.text
+                routing_text = flags.text
             return await self._start_agent_prompt(
                 text,
                 user_id,
@@ -985,6 +1062,12 @@ class SlackMessageHandler:
                 team_id=team_id,
                 thread_ts=event.get("thread_ts"),
                 routing_text=routing_text,
+                **(
+                    {"workflow_mode": flags.workflow_mode}
+                    if flags.workflow_mode
+                    else {}
+                ),
+                **({"task_mode": flags.task_mode} if flags.task_mode else {}),
             )
 
         # Regular query - process through inference engine
@@ -998,6 +1081,46 @@ class SlackMessageHandler:
             team_id=team_id,
             message_ts=message_ts,
         )
+
+    @staticmethod
+    def _parse_followup_agent_flags(text: str) -> "AgentFollowupFlags":
+        """Consume leading `--discuss` / `--implement` / `--workflow` flags."""
+        task_mode: Optional[str] = None
+        workflow_mode: Optional[str] = None
+        remaining = text
+        consumed = False
+        while True:
+            match = AGENT_FOLLOWUP_FLAG_PATTERN.match(remaining)
+            if not match:
+                break
+            option = match.group(1)
+            if option == "--workflow":
+                workflow_mode = "structured"
+            else:
+                requested = option[2:]
+                if task_mode and task_mode != requested:
+                    return AgentFollowupFlags(
+                        text=text,
+                        error="Conflicting task modes: choose --discuss or --implement.",
+                    )
+                task_mode = requested
+            remaining = remaining[match.end() :]
+            consumed = True
+        return AgentFollowupFlags(
+            text=remaining.strip() if consumed else text,
+            task_mode=task_mode,
+            workflow_mode=workflow_mode,
+            consumed=consumed,
+        )
+
+    @staticmethod
+    def _agent_mode_summary(task_mode: str, workflow_mode: Optional[str]) -> str:
+        summary = f"Mode: *{task_mode}*"
+        if task_mode == "discuss":
+            summary += " (read-only; reply with `--implement` to make changes)"
+        if workflow_mode == "structured":
+            summary += " · structured workflow"
+        return summary
 
     async def _handle_command_or_query(
         self,
@@ -1193,8 +1316,10 @@ class SlackMessageHandler:
                 return f"Agent session `{tracked['session_id']}` is closed; its branch and commits were kept."
             except AgentRuntimeConflict:
                 return "That Agent action has already completed or is no longer valid."
-            except AgentRuntimeUnauthorized:
-                return "Only the Agent session owner can perform that action."
+            except AgentRuntimeUnauthorized as exc:
+                return _agent_auth_error_text(
+                    exc, "Only the Agent session owner can perform that action."
+                )
             except AgentRuntimeError:
                 return "Agent mode could not complete that control action."
 
@@ -1299,17 +1424,27 @@ class SlackMessageHandler:
         bootstrap = AgentBootstrapContext(prompt=task)
         builder = getattr(self.bot, "agent_bootstrap_builder", None)
         if include_thread_context and thread_ts and message_ts and builder is not None:
-            try:
-                bootstrap = await builder.build(
-                    client,
-                    channel_id=channel_id,
-                    thread_ts=thread_ts,
-                    owner_user_id=user_id,
-                    task=task,
-                    latest_ts=message_ts,
+            is_public_channel = getattr(self.bot, "_is_public_agent_channel", None)
+            if not callable(is_public_channel) or not await is_public_channel(
+                channel_id
+            ):
+                # Same egress rule as the shortcut: thread content from private,
+                # DM or Slack Connect channels never reaches a model provider.
+                bootstrap = AgentBootstrapContext(
+                    prompt=task, error="channel_not_public"
                 )
-            except AgentBootstrapFetchError as exc:
-                return f"Agent mode did not start because Slack thread context could not be loaded: `{exc}`."
+            else:
+                try:
+                    bootstrap = await builder.build(
+                        client,
+                        channel_id=channel_id,
+                        thread_ts=thread_ts,
+                        owner_user_id=user_id,
+                        task=task,
+                        latest_ts=message_ts,
+                    )
+                except AgentBootstrapFetchError as exc:
+                    return f"Agent mode did not start because Slack thread context could not be loaded: `{exc}`."
 
         response = await self._start_agent_prompt(
             bootstrap.prompt,
@@ -1360,6 +1495,28 @@ class SlackMessageHandler:
         if not root_ts:
             return "Agent mode needs a Slack thread to start this task."
 
+        if task_mode is None:
+            # A follow-up never silently upgrades a read-only discussion: the
+            # runtime defaults to implement, so carry discuss forward unless
+            # the owner explicitly passes `--implement`.
+            # Only this thread's own run counts, never the user's latest run
+            # elsewhere.
+            agent_threads = getattr(self.bot, "agent_threads", None) or {}
+            thread_key = getattr(self.bot, "_thread_key", None)
+            previous = (
+                agent_threads.get(thread_key(channel_id, thread_ts))
+                if thread_ts and callable(thread_key)
+                else None
+            )
+            if (
+                previous
+                and previous.get("owner_user_id") == user_id
+                and previous.get("mode") == "discuss"
+            ):
+                task_mode = "discuss"
+        effective_task_mode = task_mode or "implement"
+        mode_summary = self._agent_mode_summary(effective_task_mode, workflow_mode)
+
         try:
             create_args = (
                 team_id or "unknown-team",
@@ -1386,9 +1543,24 @@ class SlackMessageHandler:
             message = "Agent mode timed out while starting. Chat mode was not used as fallback."
         except AgentRuntimeUnavailable:
             message = "Agent mode is temporarily unavailable. Chat mode was not used as fallback."
-        except AgentRuntimeError:
-            logger.warning("Agent runtime could not complete the Slack task")
-            message = "Agent mode could not start this task. Chat mode was not used as fallback."
+        except AgentRuntimeUnauthorized as exc:
+            message = (
+                _agent_auth_error_text(
+                    exc, "Only the Agent session owner can continue this thread."
+                )
+                + " Chat mode was not used as fallback."
+            )
+        except AgentRuntimeError as exc:
+            known = AGENT_START_ERROR_TEXT.get(exc.code or "")
+            if known is None and isinstance(exc, AgentRuntimeConflict):
+                known = "This Agent thread cannot accept that request (for example, a different model)."
+            if known is None:
+                logger.warning(
+                    "Agent runtime could not complete the Slack task (code=%s)",
+                    exc.code,
+                )
+                known = "Agent mode could not start this task."
+            message = f"{known} Chat mode was not used as fallback."
         else:
             tracked = self.bot._track_agent_run(
                 result,
@@ -1396,6 +1568,7 @@ class SlackMessageHandler:
                 channel_id=channel_id,
                 thread_ts=root_ts,
                 owner_user_id=user_id,
+                mode=effective_task_mode,
             )
             if (
                 root_message_ts
@@ -1408,9 +1581,10 @@ class SlackMessageHandler:
                     text=(
                         f"🛠️ Pi coding agent started run `{result['run_id']}`"
                         f"{f' with `{model}`' if model else ''}.\n"
+                        f"{mode_summary}\n"
                         + (
                             "Read-only discussion: no edits, verification or commit."
-                            if task_mode == "discuss"
+                            if effective_task_mode == "discuss"
                             else "Read-only exploration is automatic; edits and risky shell commands require approval here."
                         )
                     ),
@@ -1418,7 +1592,7 @@ class SlackMessageHandler:
             self.bot._start_agent_monitor(tracked)
             if root_message_ts:
                 return ""
-            return f"🛠️ Agent run `{result['run_id']}` started."
+            return f"🛠️ Agent run `{result['run_id']}` started.\n{mode_summary}"
 
         if root_message_ts and client is not None and hasattr(client, "chat_update"):
             await client.chat_update(
@@ -3761,13 +3935,15 @@ class SlackBot:
     async def _post_agent_result(
         self, tracked: Dict[str, Any], run: Dict[str, Any]
     ) -> None:
-        max_length = int(
-            self.config.get("response_settings", {}).get("max_response_length", 2000)
-        )
-        formatted = self.message_handler._format_agent_response(
-            run, max_length=max_length
-        )
-        extra = {}
+        # Final answers are posted whole: split into section-sized blocks
+        # across as many thread messages as needed instead of cut at a limit.
+        formatted = self.message_handler._format_agent_response(run)
+        chunks = _split_agent_result(formatted) or [formatted]
+        messages = [
+            chunks[offset : offset + AGENT_RESULT_BLOCKS_PER_MESSAGE]
+            for offset in range(0, len(chunks), AGENT_RESULT_BLOCKS_PER_MESSAGE)
+        ]
+        actions: List[Dict[str, Any]] = []
         if run.get("status") in AGENT_TERMINAL_STATUSES and self.agent_config.get(
             "feedback_enabled", False
         ):
@@ -3779,16 +3955,7 @@ class SlackBot:
                     "thread_ts": tracked["thread_ts"],
                 }
             )
-            extra["blocks"] = [
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": formatted[offset : offset + 3000],
-                    },
-                }
-                for offset in range(0, len(formatted), 3000)
-            ] + [
+            actions = [
                 {
                     "type": "actions",
                     "elements": [
@@ -3805,12 +3972,19 @@ class SlackBot:
                     ],
                 },
             ]
-        await self.web_client.chat_postMessage(
-            channel=tracked["channel_id"],
-            thread_ts=tracked["thread_ts"],
-            text=formatted,
-            **extra,
-        )
+        for index, message_chunks in enumerate(messages):
+            blocks: List[Dict[str, Any]] = [
+                {"type": "section", "text": {"type": "mrkdwn", "text": chunk}}
+                for chunk in message_chunks
+            ]
+            if index == len(messages) - 1:
+                blocks.extend(actions)
+            await self.web_client.chat_postMessage(
+                channel=tracked["channel_id"],
+                thread_ts=tracked["thread_ts"],
+                text="\n".join(message_chunks),
+                blocks=blocks,
+            )
 
     async def _open_agent_feedback_modal(self, payload: Dict[str, Any]) -> bool:
         """Open the Needs-changes modal; False lets the click record a bare verdict."""
@@ -3888,11 +4062,13 @@ class SlackBot:
                 reason_category=submission.reason_category,
                 comment=submission.comment or None,
             )
-        except AgentRuntimeUnauthorized:
+        except AgentRuntimeUnauthorized as exc:
             await self.web_client.chat_postEphemeral(
                 channel=nonce.channel_id,
                 user=user_id,
-                text="Only the Agent run owner can submit result feedback.",
+                text=_agent_auth_error_text(
+                    exc, "Only the Agent run owner can submit result feedback."
+                ),
             )
             return
         except AgentRuntimeError:
@@ -4136,8 +4312,10 @@ class SlackBot:
                     value["run_id"], user_id, verdict, click_id
                 )
                 message = "Result feedback recorded."
-            except AgentRuntimeUnauthorized:
-                message = "Only the Agent run owner can submit result feedback."
+            except AgentRuntimeUnauthorized as exc:
+                message = _agent_auth_error_text(
+                    exc, "Only the Agent run owner can submit result feedback."
+                )
             except (AgentRuntimeError, KeyError, TypeError, ValueError):
                 message = "Result feedback could not be recorded. Please try again."
             await self.web_client.chat_postEphemeral(
@@ -4170,7 +4348,9 @@ class SlackBot:
             )
         except AgentRuntimeError as exc:
             if isinstance(exc, AgentRuntimeUnauthorized):
-                text = "Only the Agent session owner can approve this action."
+                text = _agent_auth_error_text(
+                    exc, "Only the Agent session owner can approve this action."
+                )
             elif isinstance(exc, AgentRuntimeConflict):
                 text = "This approval has expired or was already used."
             else:

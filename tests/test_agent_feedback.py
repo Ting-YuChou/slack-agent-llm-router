@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from src.agent_runtime import AgentRuntimeClient, AgentRuntimeUnauthorized
-from slack.bot_real import SlackBot
+from slack.bot_real import SlackBot, SlackMessageHandler
 
 
 @pytest.mark.asyncio
@@ -132,6 +132,99 @@ async def test_feedback_buttons_preserve_long_result_with_valid_slack_sections()
     assert all(len(text) <= 3000 for text in sections)
     assert "".join(sections) == answer
     assert len(blocks[-1]["elements"]) == 2
+
+
+def _result_bot(feedback_enabled=False):
+    return SimpleNamespace(
+        web_client=SimpleNamespace(chat_postMessage=AsyncMock()),
+        config={"response_settings": {"max_response_length": 2000}},
+        agent_config={"feedback_enabled": feedback_enabled},
+        message_handler=SimpleNamespace(
+            _format_agent_response=SlackMessageHandler._format_agent_response
+        ),
+    )
+
+
+def _posted_sections(bot):
+    return [
+        [
+            block["text"]["text"]
+            for block in call.kwargs["blocks"]
+            if block["type"] == "section"
+        ]
+        for call in bot.web_client.chat_postMessage.await_args_list
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("feedback_enabled", [False, True])
+async def test_long_final_answer_is_split_across_messages_not_cut(feedback_enabled):
+    lines = [f"line {index:05d} " + "x" * 80 for index in range(500)]
+    answer = "\n".join(lines)
+    bot = _result_bot(feedback_enabled)
+
+    await SlackBot._post_agent_result(
+        bot,
+        {"run_id": "r", "team_id": "T1", "channel_id": "c", "thread_ts": "t"},
+        {"run_id": "r", "status": "completed", "answer": answer},
+    )
+
+    calls = bot.web_client.chat_postMessage.await_args_list
+    assert len(calls) > 1
+    assert all(call.kwargs["thread_ts"] == "t" for call in calls)
+    sections = [text for message in _posted_sections(bot) for text in message]
+    assert all(len(text) <= 3000 for text in sections)
+    posted = "\n".join(sections)
+    assert all(line in posted for line in lines)
+    assert "…" not in posted
+    for call in calls:
+        assert len(call.kwargs["blocks"]) <= 11
+        assert len(call.kwargs["text"]) <= 40000
+    actions = [
+        block
+        for call in calls
+        for block in call.kwargs["blocks"]
+        if block["type"] == "actions"
+    ]
+    if feedback_enabled:
+        assert len(actions) == 1
+        assert calls[-1].kwargs["blocks"][-1]["type"] == "actions"
+    else:
+        assert actions == []
+
+
+@pytest.mark.asyncio
+async def test_split_answer_keeps_code_fences_balanced_per_block():
+    code = "\n".join(f"print({index})  # " + "y" * 60 for index in range(200))
+    answer = f"Here is the patch:\n```\n{code}\n```\nDone."
+    bot = _result_bot()
+
+    await SlackBot._post_agent_result(
+        bot,
+        {"run_id": "r", "channel_id": "c", "thread_ts": "t"},
+        {"run_id": "r", "status": "completed", "answer": answer},
+    )
+
+    sections = [text for message in _posted_sections(bot) for text in message]
+    assert len(sections) > 1
+    assert all(text.count("```") % 2 == 0 for text in sections)
+    assert any("print(199)" in text for text in sections)
+
+
+@pytest.mark.asyncio
+async def test_enormous_answer_is_capped_with_explicit_notice():
+    bot = _result_bot()
+
+    await SlackBot._post_agent_result(
+        bot,
+        {"run_id": "r", "channel_id": "c", "thread_ts": "t"},
+        {"run_id": "r", "status": "completed", "answer": "z" * 500_000},
+    )
+
+    sections = [text for message in _posted_sections(bot) for text in message]
+    assert all(len(text) <= 3000 for text in sections)
+    assert sum(len(text) for text in sections) < 100_000
+    assert "truncated" in sections[-1]
 
 
 def _feedback_bot(runtime=None):

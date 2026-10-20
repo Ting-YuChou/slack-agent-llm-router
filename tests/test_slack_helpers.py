@@ -15,6 +15,11 @@ def test_slack_socket_mode_uses_supported_aiohttp_client_import():
     assert "SocketModeClient as AsyncSocketModeClient" in source
 
 
+from src.agent_runtime import (
+    AgentRuntimeConflict,
+    AgentRuntimeError,
+    AgentRuntimeUnauthorized,
+)
 from src.memory import HashEmbeddingProvider, InMemoryMemoryStore, MemoryManager
 from slack.agent_bootstrap import AgentBootstrapContext
 from slack.bot_real import (
@@ -209,6 +214,7 @@ class TestSlackMessageHandler:
             {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
         )
         bot._monitor_agent_run = AsyncMock()
+        bot._is_public_agent_channel = AsyncMock(return_value=True)
         bot.agent_bootstrap_builder = SimpleNamespace(
             build=AsyncMock(
                 return_value=AgentBootstrapContext(prompt="context plus current task")
@@ -238,6 +244,50 @@ class TestSlackMessageHandler:
         assert (
             runtime.create_session.await_args.kwargs["routing_text"] == "fix the test"
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "channel",
+        [
+            {"is_channel": True, "is_private": False, "is_ext_shared": True},
+            {"is_channel": True, "is_private": False, "is_shared": True},
+            {"is_channel": True, "is_private": True},
+            {"is_im": True},
+        ],
+    )
+    async def test_inline_agent_command_skips_thread_context_outside_public_channels(
+        self, channel
+    ):
+        runtime = SimpleNamespace(
+            create_session=AsyncMock(
+                return_value={"session_id": "S1", "run_id": "R1", "status": "starting"}
+            )
+        )
+        bot = SlackBot(
+            {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+        )
+        bot.web_client = SimpleNamespace(
+            conversations_info=AsyncMock(return_value={"ok": True, "channel": channel})
+        )
+        bot._monitor_agent_run = AsyncMock()
+        bot.agent_bootstrap_builder = SimpleNamespace(
+            build=AsyncMock(return_value=AgentBootstrapContext(prompt="leaked"))
+        )
+        handler = SlackMessageHandler(bot)
+
+        response = await handler._handle_command(
+            "agent fix the test",
+            "U1",
+            "C1",
+            "100.1",
+            client=SimpleNamespace(),
+            team_id="T1",
+            message_ts="100.2",
+        )
+
+        bot.agent_bootstrap_builder.build.assert_not_awaited()
+        assert runtime.create_session.await_args.args[4] == "fix the test"
+        assert "without prior Slack thread context" in response
 
     @pytest.mark.asyncio
     async def test_agent_command_without_task_returns_usage_without_runtime_call(self):
@@ -409,6 +459,224 @@ class TestSlackMessageHandler:
         runtime.create_session.assert_awaited_once_with(
             "T1", "C1", "100.1", "U1", "attachment summary"
         )
+
+    @staticmethod
+    def _followup_bot(previous_mode=None):
+        runtime = SimpleNamespace(
+            create_session=AsyncMock(
+                return_value={"session_id": "S1", "run_id": "R2", "status": "starting"}
+            )
+        )
+        bot = SlackBot(
+            {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+        )
+        bot._monitor_agent_run = AsyncMock()
+        bot._track_agent_run(
+            {"session_id": "S1", "run_id": "R1", "status": "starting"},
+            team_id="T1",
+            channel_id="C1",
+            thread_ts="100.1",
+            owner_user_id="U1",
+            mode=previous_mode,
+        )
+        return bot, runtime
+
+    @staticmethod
+    def _followup_event(text):
+        return {
+            "text": text,
+            "user": "U1",
+            "channel": "C1",
+            "thread_ts": "100.1",
+            "_team_id": "T1",
+        }
+
+    @pytest.mark.asyncio
+    async def test_agent_thread_followup_parses_leading_mode_flags(self):
+        bot, runtime = self._followup_bot()
+        handler = SlackMessageHandler(bot)
+
+        response = await handler.handle_message(
+            self._followup_event("--discuss --workflow  why does X fail?"),
+            SimpleNamespace(),
+        )
+
+        runtime.create_session.assert_awaited_once_with(
+            "T1",
+            "C1",
+            "100.1",
+            "U1",
+            "why does X fail?",
+            routing_text="why does X fail?",
+            task_mode="discuss",
+            workflow_mode="structured",
+        )
+        assert "R2" in response
+        assert "discuss" in response
+        assert bot.agent_runs["R2"]["mode"] == "discuss"
+
+    @pytest.mark.asyncio
+    async def test_discuss_thread_followup_stays_discuss_without_explicit_flag(self):
+        bot, runtime = self._followup_bot(previous_mode="discuss")
+        handler = SlackMessageHandler(bot)
+
+        response = await handler.handle_message(
+            self._followup_event("now go ahead and fix it"), SimpleNamespace()
+        )
+
+        assert runtime.create_session.await_args.kwargs["task_mode"] == "discuss"
+        assert runtime.create_session.await_args.args[4] == "now go ahead and fix it"
+        assert "discuss" in response
+        assert "--implement" in response
+
+    @pytest.mark.asyncio
+    async def test_discuss_run_in_another_thread_does_not_set_new_thread_mode(self):
+        bot, runtime = self._followup_bot(previous_mode="discuss")
+        handler = SlackMessageHandler(bot)
+
+        await handler._start_agent_prompt(
+            "fix it", "U1", "C1", None, team_id="T1", thread_ts="200.1"
+        )
+
+        assert "task_mode" not in runtime.create_session.await_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_discuss_thread_switches_to_implement_only_with_flag(self):
+        bot, runtime = self._followup_bot(previous_mode="discuss")
+        handler = SlackMessageHandler(bot)
+
+        response = await handler.handle_message(
+            self._followup_event("--implement fix it"), SimpleNamespace()
+        )
+
+        assert runtime.create_session.await_args.kwargs["task_mode"] == "implement"
+        assert runtime.create_session.await_args.args[4] == "fix it"
+        assert "implement" in response
+        assert bot.agent_runs["R2"]["mode"] == "implement"
+
+    @pytest.mark.asyncio
+    async def test_agent_thread_followup_rejects_conflicting_mode_flags(self):
+        bot, runtime = self._followup_bot()
+        handler = SlackMessageHandler(bot)
+
+        response = await handler.handle_message(
+            self._followup_event("--discuss --implement fix it"), SimpleNamespace()
+        )
+
+        assert "Conflicting task modes" in response
+        runtime.create_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_agent_thread_followup_keeps_non_leading_flags_in_prompt(self):
+        bot, runtime = self._followup_bot()
+        handler = SlackMessageHandler(bot)
+
+        await handler.handle_message(
+            self._followup_event("explain what --discuss does"), SimpleNamespace()
+        )
+
+        assert runtime.create_session.await_args.args[4] == (
+            "explain what --discuss does"
+        )
+        assert "task_mode" not in runtime.create_session.await_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_new_agent_run_started_message_shows_effective_mode(self):
+        runtime = SimpleNamespace(
+            create_session=AsyncMock(
+                return_value={"session_id": "S1", "run_id": "R1", "status": "starting"}
+            )
+        )
+        bot = SlackBot(
+            {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+        )
+        bot._monitor_agent_run = AsyncMock()
+        handler = SlackMessageHandler(bot)
+        client = SimpleNamespace(
+            chat_postMessage=AsyncMock(return_value={"ts": "100.1"}),
+            chat_update=AsyncMock(),
+        )
+
+        await handler._handle_command(
+            "agent --workflow fix the tests", "U1", "C1", None, client, team_id="T1"
+        )
+
+        text = client.chat_update.await_args.kwargs["text"]
+        assert "Mode: *implement*" in text
+        assert "structured workflow" in text
+        assert bot.agent_runs["R1"]["mode"] == "implement"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("error", "expected"),
+        [
+            (
+                AgentRuntimeUnauthorized("x", status=401, code="unauthorized"),
+                "credentials",
+            ),
+            (
+                AgentRuntimeUnauthorized("x", status=401, code="approval_forbidden"),
+                "Only the Agent session owner",
+            ),
+            (
+                AgentRuntimeConflict("x", status=409, code="session_busy"),
+                "already has a run in progress",
+            ),
+            (
+                AgentRuntimeError(
+                    "x", status=422, code="verification_profile_required"
+                ),
+                "--discuss",
+            ),
+        ],
+    )
+    async def test_agent_start_failures_branch_on_runtime_error_code(
+        self, error, expected
+    ):
+        runtime = SimpleNamespace(create_session=AsyncMock(side_effect=error))
+        bot = SlackBot(
+            {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+        )
+        handler = SlackMessageHandler(bot)
+
+        response = await handler._start_agent_prompt(
+            "task", "U1", "C1", None, team_id="T1", thread_ts="100.1"
+        )
+
+        assert expected in response
+        assert "Chat mode was not used as fallback" in response
+
+    @pytest.mark.asyncio
+    async def test_agent_control_distinguishes_bad_token_from_not_owner(self):
+        runtime = SimpleNamespace(
+            get_run=AsyncMock(
+                side_effect=AgentRuntimeUnauthorized(
+                    "x", status=401, code="unauthorized"
+                )
+            ),
+            cancel=AsyncMock(
+                side_effect=AgentRuntimeUnauthorized(
+                    "x", status=401, code="approval_forbidden"
+                )
+            ),
+        )
+        bot = SlackBot(
+            {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+        )
+        bot.agent_user_runs["U1"] = {
+            "run_id": "R1",
+            "session_id": "S1",
+            "thread_ts": "1",
+            "channel_id": "C1",
+            "owner_user_id": "U1",
+        }
+        handler = SlackMessageHandler(bot)
+
+        status = await handler._handle_command("agent status", "U1", "C1", None, None)
+        stop = await handler._handle_command("agent stop", "U1", "C1", None, None)
+
+        assert "credentials" in status
+        assert "Only the Agent session owner" in stop
 
     @pytest.mark.asyncio
     async def test_help_and_status_expose_agent_mode_and_runtime_health(self):

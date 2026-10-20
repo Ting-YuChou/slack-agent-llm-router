@@ -476,3 +476,72 @@ async def test_wait_for_update_resets_backoff_after_a_successful_poll(monkeypatc
     finally:
         await runtime.close()
     assert sleeps == [1, 2, 0.5, 1]
+
+
+@pytest.mark.asyncio
+async def test_mutating_calls_send_idempotency_keys(monkeypatch):
+    keys = []
+
+    def handler(request):
+        keys.append((request.url.path, request.headers.get("idempotency-key")))
+        if request.url.path.endswith("/decisions"):
+            return httpx.Response(202, json={"status": "accepted"})
+        return httpx.Response(
+            202, json={"session_id": "S1", "run_id": "R1", "status": "starting"}
+        )
+
+    runtime = client(handler, monkeypatch)
+    await runtime.create_session("T", "C", "1", "U", "task")
+    await runtime.create_session("T", "C", "1", "U", "task")
+    await runtime.create_session("T", "C", "1", "U", "task", idempotency_key="k-1")
+    await runtime.prompt("S1", "continue", "U")
+    await runtime.decide("R1", "A1", "U", "approve")
+    await runtime.decide("R1", "A1", "U", "approve")
+    await runtime.close()
+
+    assert all(key for _path, key in keys)
+    create_keys = [key for path, key in keys if path == "/v1/sessions"]
+    assert create_keys[0] != create_keys[1]
+    assert create_keys[2] == "k-1"
+    decide_keys = [key for path, key in keys if path.endswith("/decisions")]
+    assert decide_keys[0] == decide_keys[1]
+
+
+@pytest.mark.asyncio
+async def test_control_calls_use_short_timeouts_but_create_keeps_long_one(
+    monkeypatch,
+):
+    timeouts = {}
+
+    def handler(request):
+        timeouts[(request.method, request.url.path)] = request.extensions["timeout"][
+            "read"
+        ]
+        if request.url.path == "/v1/sessions/lookup":
+            return httpx.Response(200, json={"found": False})
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(
+                202, json={"session_id": "S1", "run_id": "R1", "status": "starting"}
+            )
+        if request.method == "GET":
+            return httpx.Response(
+                200, json={"run_id": "R1", "session_id": "S1", "status": "running"}
+            )
+        return httpx.Response(202, json={"status": "accepted"})
+
+    runtime = client(handler, monkeypatch)
+    await runtime.create_session("T", "C", "1", "U", "task")
+    await runtime.get_run("R1")
+    await runtime.lookup_session("T", "C", "1")
+    await runtime.decide("R1", "A1", "U", "approve")
+    await runtime.cancel("R1", "U")
+    await runtime.close()
+
+    assert timeouts[("POST", "/v1/sessions")] == 910
+    for key in (
+        ("GET", "/v1/runs/R1"),
+        ("GET", "/v1/sessions/lookup"),
+        ("POST", "/v1/runs/R1/decisions"),
+        ("POST", "/v1/runs/R1/cancel"),
+    ):
+        assert timeouts[key] == 10

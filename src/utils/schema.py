@@ -1270,6 +1270,7 @@ class AgentRuntimeConfig(ConfigModel):
     token_env: str = "AGENT_RUNTIME_TOKEN"
     connect_timeout_seconds: float = Field(2.0, gt=0)
     request_timeout_seconds: float = Field(910.0, gt=0)
+    control_timeout_seconds: float = Field(10.0, gt=0)
 
 
 class PlatformConfig(ConfigModel):
