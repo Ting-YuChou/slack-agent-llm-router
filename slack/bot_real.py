@@ -72,6 +72,7 @@ SLACK_BUSY_MESSAGE = "The LLM Router is busy right now. Please retry in a moment
 SLACK_SECTION_TEXT_LIMIT = 3000
 AGENT_DELIVERY_CARD_LIMIT = 3000
 AGENT_DELIVERY_MAX_FILES = 15
+AGENT_DELIVERY_FILES_TEXT_LIMIT = AGENT_DELIVERY_CARD_LIMIT // 2
 AGENT_TERMINAL_STATUSES = {
     "completed",
     "rejected",
@@ -3803,10 +3804,19 @@ class SlackBot:
         delivery = approval.get("delivery")
         delivery = delivery if isinstance(delivery, dict) else {}
         files = [str(item) for item in delivery.get("files") or []]
-        shown_files = files[:AGENT_DELIVERY_MAX_FILES]
-        file_lines = [f"• `{name[:200]}`" for name in shown_files]
-        if len(files) > len(shown_files):
-            file_lines.append(f"_…and {len(files) - len(shown_files)} more._")
+        # The list takes at most half the card so the stat and diff still fit.
+        file_lines: List[str] = []
+        used = 0
+        for index, name in enumerate(files[:AGENT_DELIVERY_MAX_FILES]):
+            line = f"• `{name[:200]}`"
+            rest = len(files) - index - 1
+            marker = len(f"\n_…and {len(files)} more._") if rest else 0
+            if used + len(line) + 1 + marker > AGENT_DELIVERY_FILES_TEXT_LIMIT:
+                break
+            file_lines.append(line)
+            used += len(line) + 1
+        if len(files) > len(file_lines):
+            file_lines.append(f"_…and {len(files) - len(file_lines)} more._")
         title = f"*Deliver {len(files)} changed file{'s' if len(files) != 1 else ''}?*"
         files_text = "\n".join(file_lines) or "_No file list provided._"
         checks = (

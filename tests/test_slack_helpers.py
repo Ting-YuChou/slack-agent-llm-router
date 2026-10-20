@@ -2914,6 +2914,22 @@ def test_delivery_card_text_stays_within_3000_chars(files, excerpt_length):
         assert f"…and {files - 15} more." in "\n".join(texts)
 
 
+@pytest.mark.parametrize("files", [12, 15, 40])
+def test_delivery_card_bounds_a_list_of_long_file_names(files):
+    approval = _delivery_approval(files=files, stat="s" * 500)
+    approval["delivery"]["files"] = [
+        f"src/{index:02d}/" + "n" * 300 for index in range(files)
+    ]
+    blocks = SlackBot._agent_delivery_blocks(approval)
+    texts = _block_texts(blocks)
+    assert sum(len(text) for text in texts) <= 3000
+    files_text = _section_texts(blocks)[1]
+    shown = files_text.count("• `")
+    assert 0 < shown < files
+    assert files_text.endswith(f"_…and {files - shown} more._")
+    assert "s" * 100 in "\n".join(texts)
+
+
 @pytest.mark.asyncio
 async def test_monitor_posts_delivery_card_with_deliver_and_discard_buttons():
     runtime = SimpleNamespace(
