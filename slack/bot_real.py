@@ -65,6 +65,7 @@ logger = logging.getLogger(__name__)
 MAX_QUERY_TOKENS = 8192
 STATE_SCHEMA_VERSION = 1
 POSTED_CI_JOBS_LIMIT = 1000
+HANDLED_MESSAGES_LIMIT = 1000
 UNVERIFIED_LABEL = "⚠️ 未驗證（沒有 verification profile）"
 MEMORY_SLASH_ONLY_MESSAGE = (
     "Memory commands are only available through Slack slash commands. "
@@ -2676,6 +2677,9 @@ class SlackBot:
         self.agent_monitoring: Set[str] = set()
         # Ordered so the oldest claims are evicted first.
         self.posted_ci_jobs: Dict[str, None] = {}
+        # "channel:ts" of messages already handled, oldest first. Slack sends
+        # both a message and an app_mention event for one mention.
+        self.handled_messages: Dict[str, None] = {}
         self.agent_monitor_tasks: Dict[str, asyncio.Task] = {}
         self.agent_monitor_poll_seconds = float(
             self.agent_config.get("monitor_poll_seconds", 2)
@@ -2972,25 +2976,58 @@ class SlackBot:
             return
 
         thread_ts = event.get("thread_ts")
-        if thread_ts and not self._is_agent_thread(channel_id, thread_ts):
-            await self._restore_agent_thread(event)
-        if thread_ts and self._is_agent_thread(channel_id, thread_ts):
-            tracked = self.agent_threads.get(self._thread_key(channel_id, thread_ts))
-            if tracked and tracked.get("owner_user_id") != event.get("user"):
-                if hasattr(self.web_client, "chat_postEphemeral"):
-                    await self.web_client.chat_postEphemeral(
-                        channel=channel_id,
-                        user=event.get("user"),
-                        text=(
-                            "Only the user who started this Agent session can send "
-                            "coding prompts in this thread."
-                        ),
-                    )
-                return
+        if await self._reject_non_owner_agent_message(event):
+            return
         if not thread_ts or not self._is_active_thread(channel_id, thread_ts):
             return
+        if not self._claim_message(event):
+            return
 
+        self._strip_bot_mention(event)
         await self._process_message(event)
+
+    def _claim_message(self, event: Dict[str, Any]) -> bool:
+        """True only the first time a Slack message is handled."""
+        channel_id = event.get("channel")
+        ts = event.get("ts")
+        if not channel_id or not ts:
+            return True
+        key = self._thread_key(channel_id, ts)
+        if key in self.handled_messages:
+            return False
+        self.handled_messages[key] = None
+        while len(self.handled_messages) > HANDLED_MESSAGES_LIMIT:
+            self.handled_messages.pop(next(iter(self.handled_messages)))
+        return True
+
+    def _strip_bot_mention(self, event: Dict[str, Any]) -> None:
+        if self.bot_user_id:
+            text = event.get("text", "")
+            event["text"] = text.replace(f"<@{self.bot_user_id}>", "").strip()
+
+    async def _reject_non_owner_agent_message(self, event: Dict[str, Any]) -> bool:
+        """Turn away anyone but the owner in an Agent thread; True if turned away."""
+        channel_id = event.get("channel")
+        thread_ts = event.get("thread_ts")
+        if not thread_ts:
+            return False
+        if not self._is_agent_thread(channel_id, thread_ts):
+            await self._restore_agent_thread(event)
+        tracked = self.agent_threads.get(self._thread_key(channel_id, thread_ts))
+        if not tracked or tracked.get("owner_user_id") == event.get("user"):
+            return False
+        if self._claim_message(event) and hasattr(
+            self.web_client, "chat_postEphemeral"
+        ):
+            await self.web_client.chat_postEphemeral(
+                channel=channel_id,
+                user=event.get("user"),
+                text=(
+                    "Only the user who started this Agent session can send "
+                    "coding prompts in this thread."
+                ),
+            )
+        return True
 
     async def _restored_agent_mode(self, session: Dict[str, Any]) -> str:
         """The task mode of a thread known only to the runtime.
@@ -3064,16 +3101,12 @@ class SlackBot:
         channel_id = event.get("channel")
         if not await self._is_channel_allowed(channel_id, event.get("channel_name")):
             return
+        if await self._reject_non_owner_agent_message(event):
+            return
+        if not self._claim_message(event):
+            return
 
-        # Remove mention from text
-        text = event.get("text", "")
-        mention_pattern = f"<@{self.bot_user_id}>"
-        text = text.replace(mention_pattern, "").strip()
-
-        # Update event with cleaned text
-        event["text"] = text
-
-        # Process as regular message
+        self._strip_bot_mention(event)
         await self._process_message(event)
 
     async def _handle_slash_command(self, command: Dict[str, Any]):
