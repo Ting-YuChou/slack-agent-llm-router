@@ -10,8 +10,9 @@ export function outputTokenLimitFor(role: GatewayRole): number {
 }
 
 /** Workflow executions spend their parent's budget; any other run is metered under a default budget of its own. */
-export function budgetIdFor(execution: string, parents: ReadonlyMap<string, string>, ledger: { open(id: string, usd: number): void }, defaultUsd: number): string {
-  const parent = parents.get(execution);
+export function budgetIdFor(execution: string, parents: ReadonlyMap<string, string>, ledger: { open(id: string, usd: number): void }, defaultUsd: number, recorded?: (execution: string) => string | undefined): string {
+  // The map is in memory; the control store's execution record outlives a restart.
+  const parent = parents.get(execution) ?? recorded?.(execution);
   if (parent) return parent;
   ledger.open(execution, defaultUsd);
   return execution;
@@ -33,4 +34,12 @@ export function priceFor(ref: string, configured: Record<string, ModelPrice>): M
     const { cost } = resolveAgentModel(ref);
     return cost.input > 0 ? { input: cost.input, output: cost.output, cacheRead: cost.cacheRead } : undefined;
   } catch { return undefined; }
+}
+
+// Not "interrupted": an interrupted structured run can resume and must keep its budget.
+const TERMINAL = new Set(["completed", "failed", "cancelled", "timed_out"]);
+
+/** A run metered under its own default budget stops that budget when it ends, so its token can spend nothing more. */
+export function releaseRunBudget(run: { run_id: string; status: string }, parents: ReadonlyMap<string, string>, ledger: { stop(id: string): void }): void {
+  if (TERMINAL.has(run.status) && !parents.has(run.run_id)) ledger.stop(run.run_id);
 }

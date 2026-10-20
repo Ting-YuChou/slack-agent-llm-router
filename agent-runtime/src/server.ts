@@ -17,7 +17,7 @@ import { approvalSettings } from "./approval-mode.js";
 import { parseAgentLimitConfig } from "./agent-limits.js";
 
 export { parseAgentLimits } from "./agent-limits.js";
-import { budgetIdFor, outputTokenLimitFor, parseDefaultRunBudget } from "./run-budget.js";
+import { budgetIdFor, outputTokenLimitFor, parseDefaultRunBudget, releaseRunBudget } from "./run-budget.js";
 import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT, listAgentModels, resolveAgentModel } from "./agent-model.js";
 import { JevRouter, type JevMode } from "./jev-router.js";
 import { repositoryFromRemote, parseGitHubRepositories } from "./github-repository.js";
@@ -446,6 +446,7 @@ export async function createProductionServer() {
       telemetry?.record(runId, sessionId, "policy_decision", decision).catch(() => console.error(JSON.stringify({ event: "agent_policy_telemetry_failed", run_id: runId })));
     },
     observeRun: run => {
+      releaseRunBudget(run, executionParents, budgetLedger);
       const summary = {...publicRun(run), workflow_prompt: undefined, workflow_requirement: undefined, events: undefined, capture_complete: run.capture_complete ?? null};
       const signature = JSON.stringify(summary);
       if (observed.get(run.run_id) === signature) return;
@@ -507,7 +508,7 @@ export async function createProductionServer() {
           const selectedModel = resolveAgentModel(route.modelRef);
           const token = issueGatewayToken({
             runId,
-            workflowRunId: budgetIdFor(runId, executionParents, budgetLedger, defaultRunBudgetUsd),
+            workflowRunId: budgetIdFor(runId, executionParents, budgetLedger, defaultRunBudgetUsd, id => workflowControl?.get<{ parent?: string }>("execution", id)?.parent),
             role: "writer",
             outputTokenLimit: outputTokenLimitFor("writer"),
             provider: selectedModel.provider,

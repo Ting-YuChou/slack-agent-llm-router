@@ -23,11 +23,15 @@ import { verifyClassifierGatewayToken, verifyGatewayToken } from "./gateway-toke
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 /** Pi issues one request at a time; extra parallel streams on one token indicate a process bypassing Pi. */
 const MAX_STREAMS_PER_TOKEN = 4;
+/** Far above any configured turn and tool limit; only a looping or abused token reaches it. */
+const MAX_REQUESTS_PER_TOKEN = 500;
 
 export type ProviderApiKeys = Partial<Record<AgentProvider | "openrouter", string>>;
 
 export function createModelGateway(options: {
   budgetLedger?: BudgetAdmissionLedger;
+  /** Model requests one run token may make in its lifetime; a safety net against a looping agent. */
+  maxRequestsPerToken?: number;
   prices?: Record<string, ModelPrice>;
   signingSecret: string;
   providerApiKeys: ProviderApiKeys;
@@ -38,6 +42,7 @@ export function createModelGateway(options: {
   const fetchFn = options.fetchFn ?? fetch;
   const classifierCalls = new Map<string, { count: number; expiresAt: number }>();
   const activeStreams = new Map<string, number>();
+  const requestCounts = new Map<string, { count: number; expiresAt: number }>();
   return createServer(guardedHandler("model-gateway", async (request, response) => {
     if (request.method === "GET" && request.url === "/health") {
       sendJson(response, 200, {
@@ -158,6 +163,14 @@ export function createModelGateway(options: {
       });
       return;
     }
+    const now = Date.now();
+    for (const [runId, entry] of requestCounts) if (entry.expiresAt < now) requestCounts.delete(runId);
+    const requests = requestCounts.get(claims.runId) ?? { count: 0, expiresAt: claims.expiresAt };
+    if (requests.count >= (options.maxRequestsPerToken ?? MAX_REQUESTS_PER_TOKEN)) {
+      sendJson(response, 429, { error: { code: "too_many_requests", message: "This run has made too many model requests" } });
+      return;
+    }
+    requestCounts.set(claims.runId, { count: requests.count + 1, expiresAt: claims.expiresAt });
     const active = activeStreams.get(claims.runId) ?? 0;
     if (active >= MAX_STREAMS_PER_TOKEN) {
       sendJson(response, 429, { error: { code: "too_many_streams", message: "Too many concurrent model requests for this run" } });
