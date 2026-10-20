@@ -139,6 +139,32 @@ test("Context7 policy bounds public documentation inputs", () => {
   assert.throws(() => authorizeContext7Tool("query-docs", { libraryId: "/x", query: "x".repeat(2001) }, context7), /query/);
 });
 
+test("Context7 policy denies queries carrying token-like secrets", () => {
+  // Built from parts so the fixtures do not look like real credentials to secret scanners.
+  const secrets = [
+    "sk-" + "proj-" + "Zt3qW8eR1yU6iO0pA5sD9fG2hJ",
+    "sk-" + "ant-api03-" + "Xc7Vb2Nm9Lk4Jh1Gf6Ds3Aq8We5",
+    "gh" + "p_" + "aB3dE6gH9jK2mN5pQ8sT1vW4yZ7cF0hL",
+    "github_" + "pat_" + "11ABCDEFG0123456789_abcdefghijklmnop",
+    "AK" + "IA" + "QWERTYUIOP234567",
+    "xo" + "xb-" + "1234567890-0987654321-AbCdEfGhIjKl",
+    "Q3k9ZpL2xV7mN8bR4tY6wE1sA5dF0gHj",
+  ];
+  for (const secret of secrets) {
+    assert.throws(() => authorizeContext7Tool("query-docs", { libraryId: "/pi/1.0.1", query: `How do I authenticate with ${secret} in the RPC API?` }, context7), /secret/, secret);
+    assert.throws(() => authorizeContext7Tool("resolve-library-id", { libraryName: "pi", query: `token=${secret}` }, context7), /secret/, secret);
+    assert.throws(() => authorizeContext7Tool("resolve-library-id", { libraryName: secret, query: "RPC API" }, context7), /secret/, secret);
+    assert.throws(() => authorizeContext7Tool("query-docs", { libraryId: `/pi/${secret}`, query: "RPC API" }, context7), /secret/, secret);
+  }
+  for (const query of [
+    "How does useQueryClientProviderWithSuspenseBoundary work in React 18.3.1?",
+    "What changed in commit 9fceb02d0ae598e95dc970b74767f19372d61af8 of next.js?",
+    "Configure sk-learn style pipelines and the ghp prefix rules in GitHub docs",
+    "https://github.com/vercel/next.js/blob/canary/packages/next/src/server/base-server.ts",
+    "Explain getServerSideProps, AbstractSingletonProxyFactoryBean and OAuth2 PKCE",
+  ]) assert.doesNotThrow(() => authorizeContext7Tool("query-docs", { libraryId: "/vercel/next.js", query }, context7), query);
+});
+
 test("Context7 tools/list fails closed on contract drift", () => {
   assert.doesNotThrow(() => validateContext7Response("tools/list", "tools/list", { result: { tools: [
     { name: "resolve-library-id", inputSchema: { type: "object", properties: { libraryName: {}, query: {} }, required: ["libraryName", "query"] } },

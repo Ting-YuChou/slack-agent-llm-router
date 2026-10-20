@@ -168,14 +168,41 @@ export function authorizeContext7Tool(tool: string, args: Record<string, unknown
   if (tool === "resolve-library-id") {
     if (typeof args.libraryName !== "string" || args.libraryName.length < 1 || args.libraryName.length > 200) deny("Context7 libraryName is invalid");
     if (typeof args.query !== "string" || args.query.length < 1 || args.query.length > 2000) deny("Context7 query is invalid");
-    return;
-  }
-  if (tool === "query-docs") {
+  } else if (tool === "query-docs") {
     if (typeof args.query !== "string" || args.query.length < 1 || args.query.length > 2000) deny("Context7 query is invalid");
     if (typeof args.libraryId !== "string" || args.libraryId.length > 300) deny("Context7 libraryId is invalid");
-    return;
+  } else {
+    deny("Context7 tool is not allowed");
   }
-  deny("Context7 tool is not allowed");
+  // Context7 is a public third-party service, so nothing that looks like a credential may leave in a query.
+  if (Object.values(args).some((value) => typeof value === "string" && containsSecret(value))) deny("Context7 input looks like it contains a secret");
+}
+
+/** Prefixed credential formats: OpenAI/Anthropic, GitHub, AWS, Slack, Google, JWTs and PEM private keys. */
+const SECRET_PATTERNS = [
+  /(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{16,}/,
+  /(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/,
+  /(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/,
+  /(?<![A-Za-z0-9])xox[abeoprs]-[A-Za-z0-9-]{10,}/,
+  /(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}/,
+  /(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\./,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+];
+
+function containsSecret(value: string): boolean {
+  if (SECRET_PATTERNS.some((pattern) => pattern.test(value))) return true;
+  // Unprefixed keys: a long run mixing upper case, lower case and digits with near-random entropy.
+  // Lower-case hex (commit SHAs) never qualifies; a long camelCase identifier with digits may, which fails closed.
+  return [...value.matchAll(/[A-Za-z0-9+=_-]{32,}/g)].some(([run]) =>
+    /[a-z]/.test(run) && /[A-Z]/.test(run) && /[0-9]/.test(run) && shannonEntropy(run) >= 4);
+}
+
+function shannonEntropy(value: string): number {
+  const counts = new Map<string, number>();
+  for (const character of value) counts.set(character, (counts.get(character) ?? 0) + 1);
+  let entropy = 0;
+  for (const count of counts.values()) entropy -= (count / value.length) * Math.log2(count / value.length);
+  return entropy;
 }
 
 export function sanitizeClickHouseResponse(method: string, tool: string, value: Record<string, any>): void {

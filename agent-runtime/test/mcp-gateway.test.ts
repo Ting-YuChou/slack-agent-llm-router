@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createServer, type RequestListener, type Server } from "node:http";
 import { test } from "node:test";
 
-import { createMcpGatewayServer, type McpAuditEvent } from "../src/mcp-gateway.js";
+import { createMcpGatewayServer, MCP_SESSION_MESSAGE_ALLOWANCE, McpCallLedger, type McpAuditEvent } from "../src/mcp-gateway.js";
 import { issueMcpToken, type McpClaims } from "../src/mcp-token.js";
 import { authorizeGitHubTool } from "../src/mcp-policy.js";
 
@@ -109,7 +110,7 @@ test("gateway filters tools/list and audits only sanitized metadata", async (t) 
   assert.equal(response.status, 200);
   assert.deepEqual((await response.json() as any).result.tools.map((tool: any) => tool.name), ["get_file_contents"]);
   assert.equal(audits.length, 1);
-  assert.deepEqual(Object.keys(audits[0]).sort(), ["error_code", "latency_ms", "scope", "result_bytes", "server", "success", "tool"].sort());
+  assert.deepEqual(Object.keys(audits[0]).sort(), ["args_sha256", "error_code", "latency_ms", "result_bytes", "run", "scope", "server", "session", "success", "tool", "user"].sort());
   assert.equal(JSON.stringify(audits).includes("Bearer"), false);
   assert.equal(JSON.stringify(audits).includes("allowed"), false);
 });
@@ -177,4 +178,101 @@ test("gateway maps upstream timeout, invalid responses and oversized results", a
     await close(upstream);
   }
   t.after(() => {});
+});
+
+test("gateway rejects GET and DELETE with 405 without reaching upstream", async (t) => {
+  let upstreamCalls = 0;
+  const upstream = createServer((_request, response) => {
+    upstreamCalls += 1;
+    response.setHeader("content-type", "text/event-stream");
+    response.end("data: {}\n\n");
+  });
+  const upstreamUrl = await listen(upstream);
+  const gateway = createMcpGatewayServer({ ...gatewayPolicy, signingSecret: secret, upstreamUrl: `${upstreamUrl}/mcp` });
+  const gatewayUrl = await listen(gateway);
+  t.after(async () => { await close(gateway); await close(upstream); });
+
+  for (const method of ["GET", "DELETE"]) {
+    const variants: Array<Record<string, string>> = [{ authorization: `Bearer ${token()}`, "mcp-session-id": "any-session" }, {}];
+    for (const headers of variants) {
+      const response = await fetch(`${gatewayUrl}/mcp`, { method, headers: { accept: "text/event-stream", ...headers } });
+      assert.equal(response.status, 405, method);
+      assert.equal(response.headers.get("allow"), "POST");
+      assert.equal((await response.json() as any).error.code, "method_not_allowed");
+    }
+  }
+  assert.equal(upstreamCalls, 0);
+});
+
+test("gateway counts initialize and tools/list toward the per-token budget", async (t) => {
+  let upstreamCalls = 0;
+  const upstream = createServer((_request, response) => {
+    upstreamCalls += 1;
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [] } }));
+  });
+  const upstreamUrl = await listen(upstream);
+  const gateway = createMcpGatewayServer({ ...gatewayPolicy, signingSecret: secret, upstreamUrl: `${upstreamUrl}/mcp` });
+  const gatewayUrl = await listen(gateway);
+  t.after(async () => { await close(gateway); await close(upstream); });
+  const limited = token({ ...baseClaims, maxCalls: 1 });
+  const budget = 1 + MCP_SESSION_MESSAGE_ALLOWANCE;
+
+  assert.equal((await post(gatewayUrl, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} }, limited)).status, 200);
+  for (let index = 1; index < budget; index += 1) {
+    assert.equal((await post(gatewayUrl, { jsonrpc: "2.0", id: index + 1, method: "tools/list", params: {} }, limited)).status, 200, `message ${index + 1}`);
+  }
+  const deniedList = await post(gatewayUrl, { jsonrpc: "2.0", id: 99, method: "tools/list", params: {} }, limited);
+  assert.equal(deniedList.status, 429);
+  assert.equal((await deniedList.json() as any).error.code, "call_budget_exceeded");
+  const deniedInitialize = await post(gatewayUrl, { jsonrpc: "2.0", id: 100, method: "initialize", params: {} }, limited);
+  assert.equal(deniedInitialize.status, 429);
+  const deniedCall = await post(gatewayUrl, { jsonrpc: "2.0", id: 101, method: "tools/call", params: { name: "get_file_contents", arguments: { owner: "acme", repo: "widgets" } } }, limited);
+  assert.equal(deniedCall.status, 429);
+  assert.equal(upstreamCalls, budget);
+});
+
+test("gateway prunes call counts for expired tokens", async (t) => {
+  const upstream = createServer((_request, response) => {
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [] } }));
+  });
+  const upstreamUrl = await listen(upstream);
+  const callLedger = new McpCallLedger();
+  const gateway = createMcpGatewayServer({ ...gatewayPolicy, signingSecret: secret, upstreamUrl: `${upstreamUrl}/mcp`, callLedger });
+  const gatewayUrl = await listen(gateway);
+  t.after(async () => { await close(gateway); await close(upstream); });
+  const list = { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} };
+
+  assert.equal((await post(gatewayUrl, list, token({ ...baseClaims, expiry: Date.now() + 100 }))).status, 200);
+  assert.equal(callLedger.size, 1);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal((await post(gatewayUrl, list, token({ ...baseClaims, run: "run-2", session: "session-2" }))).status, 200);
+  assert.equal(callLedger.size, 1);
+});
+
+test("gateway audits run, session, user and an argument hash but never raw arguments", async (t) => {
+  const upstream = createServer((_request, response) => {
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "ok" }] } }));
+  });
+  const audits: McpAuditEvent[] = [];
+  const upstreamUrl = await listen(upstream);
+  const gateway = createMcpGatewayServer({ ...gatewayPolicy, signingSecret: secret, upstreamUrl: `${upstreamUrl}/mcp`, onAudit: (event) => audits.push(event) });
+  const gatewayUrl = await listen(gateway);
+  t.after(async () => { await close(gateway); await close(upstream); });
+  const args = { owner: "acme", path: "private/raw-argument-marker.txt", repo: "widgets" };
+
+  assert.equal((await post(gatewayUrl, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "get_file_contents", arguments: args } })).status, 200);
+  assert.equal((await post(gatewayUrl, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "get_file_contents", arguments: { ...args, owner: "other" } } })).status, 403);
+  assert.equal(audits.length, 2);
+  assert.equal(audits[0]!.run, "run-1");
+  assert.equal(audits[0]!.session, "session-1");
+  assert.equal(audits[0]!.user, "U1");
+  assert.equal(audits[0]!.tool, "get_file_contents");
+  assert.equal(audits[0]!.args_sha256, createHash("sha256").update(JSON.stringify(args)).digest("hex"));
+  assert.match(audits[1]!.args_sha256 ?? "", /^[0-9a-f]{64}$/);
+  assert.notEqual(audits[1]!.args_sha256, audits[0]!.args_sha256);
+  assert.equal(audits[1]!.error_code, "scope_forbidden");
+  assert.equal(JSON.stringify(audits).includes("raw-argument-marker"), false);
 });
