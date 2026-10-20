@@ -59,10 +59,20 @@ test("approval settings never turn off both write approval and delivery approval
     }
   }
   assert.deepEqual(approvalSettings({}), { mode: "delivery", deliveryApproval: true, writeApproval: "none", deliveryTtlMs: DEFAULT_DELIVERY_TTL_MS });
-  assert.deepEqual(approvalSettings({ PI_AGENT_APPROVAL_MODE: "write" }), { mode: "write", deliveryApproval: false, writeApproval: "per_prompt", deliveryTtlMs: DEFAULT_DELIVERY_TTL_MS });
   assert.equal(approvalSettings({ PI_AGENT_DELIVERY_TTL_MS: String(MAX_DELIVERY_TTL_MS * 2) }).deliveryTtlMs, MAX_DELIVERY_TTL_MS);
-  assert.throws(() => approvalSettings({ PI_AGENT_APPROVAL_MODE: "none" }), /delivery or write/);
+  assert.throws(() => approvalSettings({ PI_AGENT_APPROVAL_MODE: "none" }), /must be delivery/);
   assert.throws(() => approvalSettings({ PI_AGENT_DELIVERY_TTL_MS: "0" }), /positive integer/);
+});
+
+test("the removed write approval mode fails startup with a pointer to delivery mode", () => {
+  for (const mode of ["write", " write ", "WRITE"]) {
+    assert.throws(() => approvalSettings({ PI_AGENT_APPROVAL_MODE: mode }), (error: Error) => {
+      assert.match(error.message, /write.*removed/i, mode);
+      assert.match(error.message, /PI_AGENT_APPROVAL_MODE=delivery/, mode);
+      assert.match(error.message, /docs\/agent-verification-ci\.md/, mode);
+      return true;
+    });
+  }
 });
 
 test("delivery approval requires a worktree patch source to bind the diff", () => {

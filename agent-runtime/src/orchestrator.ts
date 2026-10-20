@@ -4,9 +4,10 @@ import { taskMode, type TaskMode } from "./task-mode.js";
 import { listAgentModels, resolveAgentModel } from "./agent-model.js";
 import type { RouteDecision } from "./jev-router.js";
 import type { AgentLimits } from "./agent-limits.js";
-import { ApprovalStore } from "./policy.js";
+import type { ApprovalLedger } from "./approval-ledger.js";
+import { ApprovalStore, type PersistedApproval } from "./policy.js";
 import type { PublicRunEvent, RunOutcome, UiResponse } from "./pi-rpc.js";
-import type { RuntimeStateStore } from "./runtime-state.js";
+import { interruptRestartedRun, type RuntimeStateStore } from "./runtime-state.js";
 import { workflowMode, type WorkflowMode, type WorkflowNode } from "./structured-workflow.js";
 import { WorkflowBudget } from "./workflow-budget.js";
 import type { Candidate, GateInput, GateResult } from "./quality-gate.js";
@@ -239,7 +240,8 @@ export class CodingAgentOrchestrator {
   private readonly stateStore?: RuntimeStateStore;
   private readonly router?: { route(text?: string, runId?: string): Promise<RouteDecision> };
   private readonly mcpRepository?: string;
-  private readonly approvals = new ApprovalStore();
+  private readonly approvals: ApprovalStore;
+  private readonly approvalLedger?: ApprovalLedger;
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly threadSessions = new Map<string, string>();
   private readonly runs = new Map<string, RunRecord>();
@@ -296,6 +298,8 @@ export class CodingAgentOrchestrator {
     deliveryApproval?: DeliveryApprovalOptions;
     /** Measures each active run's worktree; a run over the quota fails as disk_quota_exceeded. */
     diskQuota?: DiskQuota;
+    /** Keeps pending delivery approvals across restarts; without it a restart fails them as delivery_interrupted. */
+    approvalLedger?: ApprovalLedger;
   }) {
     this.captureState = options.captureState;
     this.observeRun = options.observeRun; this.observePolicy = options.observePolicy; this.observeLifecycle = options.observeLifecycle;
@@ -313,6 +317,8 @@ export class CodingAgentOrchestrator {
     this.requireVerification = options.requireVerification === true;
     this.archivePatch = options.archivePatch;
     this.deliveryApproval = options.deliveryApproval;
+    this.approvalLedger = options.approvalLedger;
+    this.approvals = new ApprovalStore({ persistence: options.approvalLedger });
     if (this.deliveryApproval && !this.worktrees.patch) throw new Error("Delivery approval needs worktrees.patch to bind the approved diff");
   }
 
@@ -333,12 +339,16 @@ export class CodingAgentOrchestrator {
       }
       this.runs.set(run.run_id, run);
     }
+    this.approvalLedger?.prune();
+    const restoredDeliveries = new Set<string>();
     for (const saved of state.sessions) {
       if (saved.closed) continue;
       const latestRun = state.runs
         .filter((run) => run.session_id === saved.id)
         .sort((left, right) => Date.parse(left.updated_at) - Date.parse(right.updated_at))
         .at(-1);
+      const pendingDelivery = latestRun?.status === "awaiting_approval" ? this.restorableDelivery(latestRun) : undefined;
+      if (latestRun?.status === "awaiting_approval" && !pendingDelivery) interruptRestartedRun(latestRun, Date.now());
       if (latestRun?.status === "interrupted" && !(latestRun.workflow_mode === "structured" && this.quality?.canResume?.(latestRun.run_id))) {
         if (latestRun.attempts?.length && !this.quality) throw new Error("Interrupted verified workflow requires its trusted profile before recovery");
         await this.quality?.archive?.({ run_id: latestRun.run_id, worktree: saved.worktreePath, baseline: saved.baselineCommit, requirement: "Interrupted workflow", attempt: 0, signal: new AbortController().signal });
@@ -358,8 +368,45 @@ export class CodingAgentOrchestrator {
       session = { ...saved, modelRef, autoRouting: saved.autoRouting === true, process };
       this.sessions.set(session.id, session);
       this.threadSessions.set(session.key, session.id);
+      if (pendingDelivery && latestRun) {
+        restoredDeliveries.add(latestRun.run_id);
+        await this.resumeDelivery(session, latestRun, pendingDelivery);
+      }
+    }
+    // A delivery whose session did not survive (closed or expired) cannot be delivered any more.
+    for (const run of this.runs.values()) {
+      if (run.status !== "awaiting_approval" || restoredDeliveries.has(run.run_id)) continue;
+      interruptRestartedRun(run, Date.now());
+      this.approvals.invalidateRun(run.run_id);
+      const orphan = this.approvalLedger?.pendingDelivery(run.run_id);
+      if (orphan) this.approvalLedger!.markUsed(orphan.id);
     }
     await this.persistState();
+  }
+
+  /** The ledger's pending approval for a run saved while waiting for delivery, when it still matches the card. */
+  private restorableDelivery(run: RunRecord): PersistedApproval | undefined {
+    if (run.phase !== "awaiting_delivery") return undefined;
+    const approval = this.approvalLedger?.pendingDelivery(run.run_id);
+    if (!approval || approval.userId !== run.owner_user_id) return undefined;
+    const card = [...run.events].reverse().find((event) => event.type === "approval" && event.kind === "delivery");
+    if (card?.approval_id !== approval.id || (card.delivery as { delivery_digest?: unknown } | undefined)?.delivery_digest !== approval.patchHash) return undefined;
+    return approval;
+  }
+
+  /** Puts a restored delivery back on its persisted approval and expiry; one that expired while down fails now. */
+  private async resumeDelivery(session: SessionRecord, run: RunRecord, approval: PersistedApproval): Promise<void> {
+    this.approvals.restore(approval);
+    this.deliveries.set(run.run_id, { approvalId: approval.id, digest: approval.patchHash });
+    session.activeRunId = run.run_id;
+    const remaining = approval.expiresAt - Date.now();
+    if (remaining <= 0) {
+      await this.expireDelivery(session, run, approval.id);
+      return;
+    }
+    const expiry = setTimeout(() => this.background(this.expireDelivery(session, run, approval.id)), remaining);
+    expiry.unref();
+    this.deadlines.set(run.run_id, expiry);
   }
 
   async createSession(input: SessionInput, trustedBase?: string, trustedRunId?: string, trusted: { delivery?: "skip" } = {}): Promise<{ session_id: string; run_id: string; status: "starting" }> {
@@ -1053,7 +1100,8 @@ export class CodingAgentOrchestrator {
       run.cherry_pick = `git cherry-pick ${commit}`;
       run.events.push({ type: "diff", files: diff.files, stat: diff.stat, bytes: diff.bytes });
       this.updateRun(run, "completed");
-      if (workflow) { run.execution_status = "succeeded"; run.phase = "completed"; }
+      // A workflow delivery restored after a restart has no in-memory state, only its execution status.
+      if (workflow || run.execution_status) { run.execution_status = "succeeded"; run.phase = "completed"; }
       this.finishActiveRun(session, run.run_id);
     } catch {
       this.notifyLifecycle(run.run_id, "commit", "end", true);
@@ -1084,7 +1132,14 @@ export class CodingAgentOrchestrator {
       return;
     }
     const ttlMs = this.deliveryApproval!.ttlMs;
-    const approval = this.approvals.create({ runId: run.run_id, toolCallId: "delivery", userId: run.owner_user_id, action: `Deliver ${diff.files.length} changed files` }, ttlMs);
+    let approval: ReturnType<ApprovalStore["create"]>;
+    try {
+      // Persisted with its digest before the card exists, so a restart can still deliver exactly this diff.
+      approval = this.approvals.create({ runId: run.run_id, toolCallId: "delivery", userId: run.owner_user_id, action: `Deliver ${diff.files.length} changed files` }, ttlMs, digest);
+    } catch {
+      await this.failRun(session, run, { code: "approval_persist_failed", message: "The delivery approval could not be saved; nothing was committed and the patch was kept" });
+      return;
+    }
     this.countApproval(run, approval.id, "requested");
     this.deliveries.set(run.run_id, { approvalId: approval.id, digest });
     this.workflows.get(run.run_id)?.budget.pause();
@@ -1302,6 +1357,11 @@ export class CodingAgentOrchestrator {
           await this.persistState();
         } catch { run.error = { code: 'shutdown_stop_unconfirmed',message: 'Read-only workers could not be confirmed stopped; evidence retained' }; this.updateRun(run,'failed'); await this.persistState(); }
       } else if (session.activeRunId && !this.deliveries.has(session.activeRunId)) { try { await this.cancel(session.activeRunId, session.ownerUserId); } catch { /* retain worktree if stop fails */ } }
+      else if (session.activeRunId) {
+        // A pending delivery outlives the process: its approval is in the ledger and the next start re-arms the expiry.
+        const timer = this.deadlines.get(session.activeRunId); if (timer) clearTimeout(timer);
+        this.deadlines.delete(session.activeRunId);
+      }
       try { await session.process.close(); } catch { /* stop failure already audited */ }
     }
   }

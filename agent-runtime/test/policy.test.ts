@@ -140,6 +140,34 @@ test("approvals are owner-bound, one-time, and expire", () => {
   assert.equal(store.decide(bound.id, "U1", "approve", "run-3").code, "already_used");
 });
 
+test("approvals that are used or expired are pruned once a late click can no longer matter", () => {
+  let now = 0;
+  const store = new ApprovalStore({ ttlMs: 1_000, now: () => now });
+  const used = store.create({ runId: "r1", toolCallId: "t1", userId: "U", action: "a" });
+  const expired = store.create({ runId: "r2", toolCallId: "t2", userId: "U", action: "b" });
+  const invalidated = store.create({ runId: "r3", toolCallId: "t3", userId: "U", action: "c" });
+  const live = store.create({ runId: "r4", toolCallId: "t4", userId: "U", action: "d" }, 24 * 60 * 60_000);
+  assert.equal(store.decide(used.id, "U", "approve").code, "approved");
+  store.invalidateRun("r3");
+  now = 1_001;
+  assert.equal(store.decide(used.id, "U", "approve").code, "already_used", "a double click right after a decision is still reported");
+  assert.equal(store.size, 4);
+  now += 60 * 60_000;
+  store.create({ runId: "r5", toolCallId: "t5", userId: "U", action: "e" });
+  assert.equal(store.size, 2, "only the live approval and the new one remain");
+  for (const id of [used.id, expired.id, invalidated.id]) assert.equal(store.decide(id, "U", "approve").code, "not_found");
+  assert.equal(store.decide(live.id, "U", "approve").code, "approved");
+});
+
+test("a restored approval keeps its id, expiry and binding", () => {
+  let now = 0;
+  const store = new ApprovalStore({ ttlMs: 1_000, now: () => now });
+  store.restore({ id: "persisted", runId: "r", toolCallId: "delivery", userId: "U", action: "deliver", expiresAt: 5_000, used: false });
+  assert.equal(store.decide("persisted", "U", "approve", "other").code, "wrong_run");
+  now = 5_001;
+  assert.equal(store.decide("persisted", "U", "approve", "r").code, "expired");
+});
+
 test("commands that dump the environment or credential variables are blocked", async () => {
   const { classifyBash } = await import("../src/policy.js");
   for (const command of ["env", "printenv", "printenv OPENAI_API_KEY", "export", "cat /proc/1/environ", "cat /proc/self/environ", "pytest && env", "echo $OPENAI_API_KEY", "echo ${PI_AGENT_MCP_SERVERS_JSON}"]) {

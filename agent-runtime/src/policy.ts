@@ -329,25 +329,54 @@ export interface ApprovalRequest {
   used: boolean;
 }
 
+/** A delivery approval written through to durable storage, bound to the digest of the diff it shows. */
+export interface PersistedApproval extends ApprovalRequest {
+  patchHash: string;
+}
+
+/** Durable backing for approvals that must survive a restart; only delivery approvals use it. */
+export interface ApprovalPersistence {
+  record(approval: PersistedApproval): void;
+  markUsed(id: string): void;
+}
+
+/** How long a used or expired approval is kept, so a late or double click still gets a precise answer. */
+export const APPROVAL_RETENTION_MS = 10 * 60_000;
+
 export class ApprovalStore {
-  private readonly approvals = new Map<string, ApprovalRequest>();
+  private readonly approvals = new Map<string, ApprovalRequest & { usedAt?: number; persisted?: boolean }>();
   private readonly ttlMs: number;
   private readonly now: () => number;
+  private readonly persistence?: ApprovalPersistence;
 
-  constructor(options: { ttlMs?: number; now?: () => number } = {}) {
+  constructor(options: { ttlMs?: number; now?: () => number; persistence?: ApprovalPersistence } = {}) {
     this.ttlMs = options.ttlMs ?? 300_000;
     this.now = options.now ?? Date.now;
+    this.persistence = options.persistence;
   }
 
-  create(input: Omit<ApprovalRequest, "id" | "expiresAt" | "used">, ttlMs = this.ttlMs): ApprovalRequest {
+  get size(): number {
+    return this.approvals.size;
+  }
+
+  /** `patchHash` writes the approval through to persistence before it is shown to anyone. */
+  create(input: Omit<ApprovalRequest, "id" | "expiresAt" | "used">, ttlMs = this.ttlMs, patchHash?: string): ApprovalRequest {
+    this.prune();
     const approval: ApprovalRequest = {
       ...input,
       id: randomUUID(),
       expiresAt: this.now() + ttlMs,
       used: false,
     };
-    this.approvals.set(approval.id, approval);
+    if (patchHash !== undefined) this.persistence?.record({ ...approval, patchHash });
+    this.approvals.set(approval.id, { ...approval, persisted: patchHash !== undefined && this.persistence !== undefined });
     return { ...approval };
+  }
+
+  /** Re-adds an approval read back from persistence after a restart. */
+  restore(approval: ApprovalRequest): void {
+    const { id, runId, toolCallId, userId, action, expiresAt, used } = approval;
+    this.approvals.set(id, { id, runId, toolCallId, userId, action, expiresAt, used, persisted: true });
   }
 
   decide(
@@ -361,17 +390,29 @@ export class ApprovalStore {
     if (approval.userId !== userId) return { code: "wrong_user" };
     if (runId !== undefined && approval.runId !== runId) return { code: "wrong_run" };
     if (approval.used) return { code: "already_used" };
-    if (this.now() > approval.expiresAt) {
-      approval.used = true;
-      return { code: "expired" };
-    }
-    approval.used = true;
-    return { code: decision === "approve" ? "approved" : "rejected", approval: { ...approval } };
+    this.markUsed(approval);
+    if (this.now() > approval.expiresAt) return { code: "expired" };
+    const { usedAt: _usedAt, persisted: _persisted, ...request } = approval;
+    return { code: decision === "approve" ? "approved" : "rejected", approval: request };
   }
 
   invalidateRun(runId: string): void {
     for (const approval of this.approvals.values()) {
-      if (approval.runId === runId) approval.used = true;
+      if (approval.runId === runId && !approval.used) this.markUsed(approval);
+    }
+  }
+
+  private markUsed(approval: ApprovalRequest & { usedAt?: number; persisted?: boolean }): void {
+    approval.used = true;
+    approval.usedAt = this.now();
+    if (approval.persisted) this.persistence?.markUsed(approval.id);
+  }
+
+  /** Drops approvals that were used, or expired, more than APPROVAL_RETENTION_MS ago. */
+  private prune(): void {
+    const cutoff = this.now() - APPROVAL_RETENTION_MS;
+    for (const [id, approval] of this.approvals) {
+      if (approval.expiresAt < cutoff || (approval.usedAt !== undefined && approval.usedAt < cutoff)) this.approvals.delete(id);
     }
   }
 }

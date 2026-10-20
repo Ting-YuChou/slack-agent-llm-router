@@ -12,6 +12,7 @@ import { PiRunCapture } from "./pi-capture.js";
 import { AgentTelemetry, isCredentialKey, redact } from "./telemetry.js";
 import { AgentTracing } from "./tracing.js";
 import { DockerPiProcess, type ChecksContext, type WriterContext } from "./container-runtime.js";
+import { ApprovalLedger } from "./approval-ledger.js";
 import { approvalSettings } from "./approval-mode.js";
 import { parseAgentLimitConfig } from "./agent-limits.js";
 
@@ -422,6 +423,8 @@ export async function createProductionServer() {
   let ciRuntime: Awaited<ReturnType<typeof createCiRuntime>> | undefined;
   const agentLimits = parseAgentLimitConfig(process.env);
   const approval = approvalSettings(process.env);
+  // Always on, profile or not: a pending delivery approval survives a restart bound to its patch hash.
+  const approvalLedger = new ApprovalLedger(path.join(runtimeRoot, "approvals", "approvals.sqlite"));
   const credentialValues = () => Object.entries(process.env).filter(([key]) => isCredentialKey(key)).map(([, value]) => value!).filter(Boolean);
   const orchestrator: CodingAgentOrchestrator = new CodingAgentOrchestrator({
     quality,
@@ -461,7 +464,8 @@ export async function createProductionServer() {
     stateStore,
     maxActiveSessions: positiveInteger(process.env.PI_AGENT_MAX_CONCURRENCY, 2),
     deadlineMs: positiveInteger(process.env.PI_AGENT_DEADLINE_MS, 15 * 60_000),
-    ...(approval.deliveryApproval ? { deliveryApproval: { ttlMs: approval.deliveryTtlMs, secrets: credentialValues } } : {}),
+    deliveryApproval: { ttlMs: approval.deliveryTtlMs, secrets: credentialValues },
+    approvalLedger,
     availableModelRefs: configuredModels.map((model) => model.ref),
     router,
     mcpRepository,
