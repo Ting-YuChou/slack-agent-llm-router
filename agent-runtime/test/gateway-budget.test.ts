@@ -42,3 +42,22 @@ test("finish reports when the provider stopped at the output cap", async () => {
   normal.data(Buffer.from('data: {"response":{"usage":{"input_tokens":1,"output_tokens":1}}}\n\n'));
   assert.deepEqual(await normal.finish(), { truncated: false });
 });
+
+test("settlement prices cached input at the cache-read rate", async () => {
+  const settled: Array<number | null> = [];
+  const book = { reserve: async () => {}, settle: async (_id: string, amount: number | null) => { settled.push(amount); }, firstModel: () => undefined };
+  const prices = { "openai/gpt-5.6-sol": { input: 4, output: 20, cacheRead: 0.4 }, "anthropic/claude-sonnet-4-6": { input: 3, output: 15, cacheRead: 0.3 } };
+  const openai = await admitBudget(book, prices, "w", "openai/gpt-5.6-sol", Buffer.from("{}"), "e", 16384);
+  openai.data(Buffer.from('data: {"type":"response.completed","response":{"usage":{"input_tokens":1000,"input_tokens_details":{"cached_tokens":800},"output_tokens":100}}}\n\n'));
+  await openai.finish();
+  assert.ok(Math.abs(settled[0]! - (200 * 4 + 800 * 0.4 + 100 * 20) / 1_000_000) < 1e-12);
+  const anthropic = await admitBudget(book, prices, "w", "anthropic/claude-sonnet-4-6", Buffer.from("{}"), "e", 16384);
+  anthropic.data(Buffer.from('data: {"type":"message_delta","usage":{"input_tokens":100,"cache_read_input_tokens":900,"cache_creation_input_tokens":50,"output_tokens":10}}\n\n'));
+  await anthropic.finish();
+  assert.ok(Math.abs(settled[1]! - ((100 + 50) * 3 + 900 * 0.3 + 10 * 15) / 1_000_000) < 1e-12);
+  // Without a cache-read price, cached input stays at the full input rate.
+  const plain = await admitBudget(book, { "openai/gpt-5.6-sol": { input: 4, output: 20 } }, "w", "openai/gpt-5.6-sol", Buffer.from("{}"), "e", 16384);
+  plain.data(Buffer.from('data: {"type":"response.completed","response":{"usage":{"input_tokens":1000,"input_tokens_details":{"cached_tokens":800},"output_tokens":0}}}\n\n'));
+  await plain.finish();
+  assert.ok(Math.abs(settled[2]! - 1000 * 4 / 1_000_000) < 1e-12);
+});

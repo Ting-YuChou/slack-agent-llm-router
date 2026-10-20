@@ -29,6 +29,6 @@ test("the default run budget is configurable and must be positive", () => {
 test("configured prices win; otherwise the model catalog price is used", () => {
   const luna = resolveAgentModel("openai/gpt-5.6-luna");
   assert.deepEqual(priceFor(luna.ref, { [luna.ref]: { input: 9, output: 99 } }), { input: 9, output: 99 });
-  assert.deepEqual(priceFor(luna.ref, {}), { input: luna.cost.input, output: luna.cost.output });
+  assert.deepEqual(priceFor(luna.ref, {}), { input: luna.cost.input, output: luna.cost.output, cacheRead: luna.cost.cacheRead });
   assert.equal(priceFor("openai/unknown", {}), undefined);
 });
