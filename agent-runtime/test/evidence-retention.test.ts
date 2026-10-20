@@ -47,3 +47,19 @@ test('retention prunes expired read-only undelivered patches', async () => {
     await access(path.join(recent, 'undelivered-2026.patch'));
   } finally { await chmod(root, 0o700).catch(() => {}); await rm(root, { recursive: true, force: true }); }
 });
+
+test('a broken symlink in old evidence neither stops the pass nor keeps the directory', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'symlink-evidence-'));
+  try {
+    const first = path.join(root, 'artifacts', 'a-with-link');
+    const second = path.join(root, 'artifacts', 'b-plain');
+    await mkdir(first, { recursive: true }); await mkdir(second, { recursive: true });
+    const { symlink, lutimes } = await import('node:fs/promises');
+    await symlink(path.join(root, 'does-not-exist'), path.join(first, 'dangling'));
+    await lutimes(path.join(first, 'dangling'), new Date(0), new Date(0));
+    for (const directory of [first, second]) await utimes(directory, new Date(0), new Date(0));
+    await pruneEvidence(root, [], Date.now() - 30 * 86400000);
+    await assert.rejects(access(first));
+    await assert.rejects(access(second));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

@@ -12,6 +12,7 @@ import { dockerUnavailable, HarnessError } from "./error-taxonomy.js";
 import type { FixerSpec } from "./fixers.js";
 import type { Candidate, CheckStatus, VerificationCheck, VerificationResult } from "./quality-gate.js";
 import { RESOURCE_LIMIT_FLAGS } from "./container-flags.js";
+import { hardenedGitEnv } from "./worktree-manager.js";
 const exec = promisify(execFile);
 /** One trusted check. `{report}` in argv becomes the check's report path under /out. */
 export interface VerificationCheckSpec { name: string; ciJob?: string; argv: string[]; cwd: string; timeoutMs: number; report?: { format: "junit" }; kind?: "static" | "test" }
@@ -80,9 +81,9 @@ export class CandidateStore {
   /** `baselineTree: false` skips the trusted baseline copy (candidate-only runs); an empty directory keeps the mount valid. */
   async create(worktree: string, baseline: string, runId: string, options: { baselineTree?: boolean } = {}): Promise<Candidate> {
     if (!/^[a-f0-9]{40,64}$/.test(baseline)) throw new Error("Invalid baseline");
-    await exec("git", ["add", "-N", "--", "."], { cwd: worktree });
-    const patch = (await exec("git", ["diff", "--binary", baseline, "--"], { cwd: worktree, maxBuffer: 2 * 1024 * 1024 })).stdout;
-    const paths = (await exec("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], { cwd: worktree, maxBuffer: 4 * 1024 * 1024 })).stdout.split("\0").filter(Boolean);
+    await exec("git", ["add", "-N", "--", "."], { env: hardenedGitEnv(), cwd: worktree });
+    const patch = (await exec("git", ["diff", "--binary", baseline, "--"], { env: hardenedGitEnv(), cwd: worktree, maxBuffer: 2 * 1024 * 1024 })).stdout;
+    const paths = (await exec("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], { env: hardenedGitEnv(), cwd: worktree, maxBuffer: 4 * 1024 * 1024 })).stdout.split("\0").filter(Boolean);
     const location = path.join(this.root, runId.replace(/[^\w-]/g, "_"), randomUUID());
     const snapshot = path.join(location, "candidate"); await mkdir(snapshot, { recursive: true, mode: 0o700 });
     const hash = createHash("sha256").update(baseline); let bytes = 0;
@@ -102,12 +103,12 @@ export class CandidateStore {
     // Baseline test/config copies cannot be changed by the candidate.
     const baselineDir = path.join(location, "baseline"); await mkdir(baselineDir, { mode: 0o700 });
     if (options.baselineTree === false) return { hash: hash.digest("hex"), path: snapshot, patch, artifact };
-    const originalFiles = (await exec("git", ["ls-tree", "-r", "-z", baseline], { cwd: worktree })).stdout.split("\0").filter(Boolean);
+    const originalFiles = (await exec("git", ["ls-tree", "-r", "-z", baseline], { env: hardenedGitEnv(), cwd: worktree })).stdout.split("\0").filter(Boolean);
     for (const entry of originalFiles) {
       const split = entry.indexOf("\t"); const file = entry.slice(split + 1);
       const executable = entry.startsWith("100755 ");
       if (!(await validateWorkspacePath(worktree, file, "read")).allowed) continue;
-      const data = (await exec("git", ["show", `${baseline}:${file}`], { cwd: worktree, encoding: "buffer", maxBuffer: 2 * 1024 * 1024 })).stdout;
+      const data = (await exec("git", ["show", `${baseline}:${file}`], { env: hardenedGitEnv(), cwd: worktree, encoding: "buffer", maxBuffer: 2 * 1024 * 1024 })).stdout;
       const dest = path.join(baselineDir, file); await mkdir(path.dirname(dest), { recursive: true }); await writeFile(dest, data, { mode: executable ? 0o500 : 0o400 });
     }
     return { hash: hash.digest("hex"), path: snapshot, patch, artifact };

@@ -154,19 +154,28 @@ export class WorktreeManager {
       timeout: 30_000,
       maxBuffer: 4 * 1024 * 1024,
       encoding: "utf8",
-      env: {
-        PATH: process.env.PATH,
-        GIT_CONFIG_GLOBAL: "/dev/null",
-        GIT_CONFIG_SYSTEM: "/dev/null",
-        GIT_TERMINAL_PROMPT: "0",
-        GIT_AUTHOR_NAME: "Pi Coding Agent",
-        GIT_AUTHOR_EMAIL: "pi-agent@localhost",
-        GIT_COMMITTER_NAME: "Pi Coding Agent",
-        GIT_COMMITTER_EMAIL: "pi-agent@localhost",
-      },
+      env: hardenedGitEnv(),
     });
     return result.stdout;
   }
+}
+
+/**
+ * Git never reads the host's global or system config here: agent-controlled `.gitattributes` could
+ * otherwise invoke a filter, diff driver or textconv the host user configured. No credential prompts.
+ */
+export function hardenedGitEnv(): NodeJS.ProcessEnv {
+  return {
+    PATH: process.env.PATH,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_AUTHOR_NAME: "Pi Coding Agent",
+    GIT_AUTHOR_EMAIL: "pi-agent@localhost",
+    GIT_COMMITTER_NAME: "Pi Coding Agent",
+    GIT_COMMITTER_EMAIL: "pi-agent@localhost",
+  };
 }
 
 function isProtectedChangedPath(file: string): boolean {

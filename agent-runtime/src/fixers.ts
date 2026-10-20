@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 
 import { runDockerContainer, type RunContainer } from "./verification.js";
 import { RESOURCE_LIMIT_FLAGS } from "./container-flags.js";
+import { hardenedGitEnv } from "./worktree-manager.js";
 
 const exec = promisify(execFile);
 /** Same ceiling as a single writer write: a fixer cannot grow a file past what the agent could write. */
@@ -23,8 +24,8 @@ async function regularFile(file: string): Promise<boolean> { try { return (await
 
 /** Files the candidate added or modified, as regular files; deletions and symlinks are never fixed. */
 async function changedFiles(worktree: string, baseline: string): Promise<string[]> {
-  const tracked = lines((await exec("git", ["diff", "--name-only", "-z", baseline, "--"], { cwd: worktree, maxBuffer: 4 * 1024 * 1024 })).stdout);
-  const untracked = lines((await exec("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: worktree, maxBuffer: 4 * 1024 * 1024 })).stdout);
+  const tracked = lines((await exec("git", ["diff", "--name-only", "-z", baseline, "--"], { cwd: worktree, env: hardenedGitEnv(), maxBuffer: 4 * 1024 * 1024 })).stdout);
+  const untracked = lines((await exec("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: worktree, env: hardenedGitEnv(), maxBuffer: 4 * 1024 * 1024 })).stdout);
   const files: string[] = [];
   for (const file of new Set([...tracked, ...untracked])) if (await regularFile(path.join(worktree, file))) files.push(file);
   return files.sort();
@@ -42,7 +43,7 @@ export async function applyFixers(input: { fixers: FixerSpec[]; worktree: string
   const workspace = path.join(input.scratch, randomUUID());
   await mkdir(workspace, { recursive: true, mode: 0o700 });
   try {
-    const all = lines((await exec("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], { cwd: input.worktree, maxBuffer: 4 * 1024 * 1024 })).stdout);
+    const all = lines((await exec("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], { cwd: input.worktree, env: hardenedGitEnv(), maxBuffer: 4 * 1024 * 1024 })).stdout);
     for (const file of all) {
       const source = path.join(input.worktree, file);
       if (!await regularFile(source)) continue;

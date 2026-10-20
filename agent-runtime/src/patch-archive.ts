@@ -4,6 +4,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import { redactBytes } from "./telemetry.js";
+import { hardenedGitEnv } from "./worktree-manager.js";
 
 const exec = promisify(execFile);
 
@@ -24,7 +25,7 @@ export function undeliveredPatchPath(root: string, runId: string, now = new Date
 export async function archivePatch(options: { worktree: string; baseline: string; file: string; maxBytes?: number; secrets?: string[] }): Promise<ArchivedPatch | undefined> {
   if (!/^[a-f0-9]{40,64}$/.test(options.baseline)) throw new Error("Invalid baseline");
   const maxBytes = options.maxBytes ?? PATCH_ARCHIVE_MAX_BYTES;
-  await exec("git", ["add", "-N", "--", "."], { cwd: options.worktree });
+  await exec("git", ["add", "-N", "--", "."], { cwd: options.worktree, env: hardenedGitEnv() });
   const { data, truncated } = await readDiff(options.worktree, options.baseline, maxBytes);
   if (!data.length) return undefined;
   const marker = truncated ? Buffer.from(`\n# [pi-agent] patch truncated at ${maxBytes} bytes; the rest of the diff was not archived\n`) : Buffer.alloc(0);
@@ -37,7 +38,7 @@ export async function archivePatch(options: { worktree: string; baseline: string
 /** Streams `git diff --binary` and stops reading once `maxBytes` have arrived. */
 function readDiff(worktree: string, baseline: string, maxBytes: number): Promise<{ data: Buffer; truncated: boolean }> {
   return new Promise((resolve, reject) => {
-    const child = spawn("git", ["diff", "--binary", baseline, "--"], { cwd: worktree, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn("git", ["diff", "--binary", baseline, "--"], { cwd: worktree, env: hardenedGitEnv(), stdio: ["ignore", "pipe", "pipe"] });
     const chunks: Buffer[] = [];
     let size = 0;
     let truncated = false;

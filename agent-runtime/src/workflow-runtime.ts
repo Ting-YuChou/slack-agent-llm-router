@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { writeFile, unlink, access } from "node:fs/promises";
-import { DEFAULT_DIFF_LIMITS, WorktreeManager } from "./worktree-manager.js";
+import { DEFAULT_DIFF_LIMITS, WorktreeManager, hardenedGitEnv } from "./worktree-manager.js";
 import { promisify } from "node:util";
 import path from "node:path";
 import type { ControlStore } from "./ci-control.js";
@@ -90,8 +90,8 @@ export function createQualityServices(options: {
     },
   });
   const assertScope = async (worktree: string, baseline: string) => {
-    const files = (await exec("git", ["diff", "--name-only", "-z", baseline], { cwd: worktree })).stdout.split("\0").filter(Boolean);
-    const untracked = (await exec("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: worktree })).stdout.split("\0").filter(Boolean);
+    const files = (await exec("git", ["diff", "--name-only", "-z", baseline], { cwd: worktree, env: hardenedGitEnv() })).stdout.split("\0").filter(Boolean);
+    const untracked = (await exec("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: worktree, env: hardenedGitEnv() })).stdout.split("\0").filter(Boolean);
     assertCandidateScope([...files, ...untracked], profile.allowedPaths);
   };
   const writerChecks = new WriterChecks({ profile,
@@ -114,7 +114,7 @@ export function createQualityServices(options: {
       const patchFile = path.join(path.dirname(source.path), "merge-input.patch");
       try {
         await writeFile(patchFile, source.patch ?? "", { mode: 0o600 });
-        if (source.patch) await exec("git", ["apply", "--binary", "--", patchFile], { cwd: tree.path });
+        if (source.patch) await exec("git", ["apply", "--binary", "--", patchFile], { cwd: tree.path, env: hardenedGitEnv() });
         const merged = await store.create(tree.path, tested, input.run_id);
         artifacts.set(`${input.run_id}:${input.attempt}`, path.dirname(merged.path));
         return withFixes({ ...merged, patch: source.patch, sourceHash: source.hash, testedBaseline: tested });
@@ -156,7 +156,7 @@ export function createQualityServices(options: {
     validateResume: async input => {
       const saved = options.control.get<{ input: { requirement: string; baseline: string; fingerprint: string; snapshot: { path: string; hash: string; artifact?: string } } }>('structured',input.run_id)?.input;
       if (!saved || saved.requirement !== input.requirement || saved.baseline !== input.baseline || saved.fingerprint !== fingerprint) throw new Error('workflow_identity_changed');
-      if ((await exec('git',['rev-parse','HEAD'],{ cwd: input.worktree })).stdout.trim() !== input.baseline) throw new Error('workflow_baseline_changed');
+      if ((await exec('git',['rev-parse','HEAD'],{ cwd: input.worktree, env: hardenedGitEnv() })).stdout.trim() !== input.baseline) throw new Error('workflow_baseline_changed');
       await access(saved.snapshot.path); if (saved.snapshot.artifact) await access(saved.snapshot.artifact);
       const current = await store.create(input.worktree,input.baseline,input.run_id);
       if (current.hash !== saved.snapshot.hash) throw new Error('workflow_snapshot_changed');
