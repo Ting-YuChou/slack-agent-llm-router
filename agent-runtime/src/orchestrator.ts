@@ -17,7 +17,7 @@ import { computeHarnessMetrics, type HarnessMetrics } from "./harness-metrics.js
 import { summarizePolicy, type PolicyDecision, type PolicySummary } from "./policy-decision.js";
 import { redact } from "./telemetry.js";
 import { DEFAULT_DIFF_LIMITS, DiffLimitError } from "./worktree-manager.js";
-import { rejected, type WriterChecksRequest, type WriterChecksResponse } from "./writer-checks.js";
+import { MIN_CHECKS_WINDOW_MS, rejected, type WriterChecksRequest, type WriterChecksResponse } from "./writer-checks.js";
 
 export interface QualityServices {
   evaluate(input: GateInput): Promise<GateResult>;
@@ -885,11 +885,13 @@ export class CodingAgentOrchestrator {
     const calls = workflow.checksCalls ?? 0;
     if (calls >= writer.maxCalls) { respond(rejected("max_calls", `run_checks may be called at most ${writer.maxCalls} times per run`)); return; }
     const names = event.checks?.length ? event.checks : writer.defaultChecks;
-    if (workflow.budget.remainingMs() < writer.estimateMs(names) + writer.reserveMs) { respond(rejected("insufficient_time_budget", "Not enough time left to run checks and still verify the final result; finish without them")); return; }
+    const windowMs = workflow.budget.remainingMs() - writer.reserveMs;
+    // Enough room for the requested checks, or at least a minute to run them clamped to the window.
+    if (windowMs < Math.min(MIN_CHECKS_WINDOW_MS, writer.estimateMs(names))) { respond(rejected("insufficient_time_budget", "Not enough time left to run checks and still verify the final result; finish without them")); return; }
     workflow.checksCalls = calls + 1; run.writer_checks_calls = workflow.checksCalls;
     run.events.push({ type: "checks", phase: "start", checks: names });
     this.persistSoon();
-    const operation = this.quality.runChecks({ run_id: run.run_id, worktree: session.worktreePath, baseline: session.baselineCommit, ...(event.checks ? { checks: event.checks } : {}), signal: workflow.controller.signal });
+    const operation = this.quality.runChecks({ run_id: run.run_id, worktree: session.worktreePath, baseline: session.baselineCommit, ...(event.checks ? { checks: event.checks } : {}), signal: workflow.controller.signal, deadlineMs: windowMs });
     workflow.checksOperation = operation;
     try {
       const response = await operation;

@@ -6,7 +6,9 @@ import { test } from "node:test";
 
 import { ScopeViolationError } from "../src/candidate-scope.js";
 import { DockerVerifier, VerifierScheduler, validateProfile, type ContainerResult, type RunContainer } from "../src/verification.js";
-import { MAX_WRITER_CHECKS_BYTES, WriterChecks, type WriterChecksRequest } from "../src/writer-checks.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { MAX_WRITER_CHECKS_BYTES, MIN_CHECKS_WINDOW_MS, WriterChecks, type WriterChecksRequest } from "../src/writer-checks.js";
 
 const base = { id: "p", repository: "o/r", image: `sha256:${"0".repeat(64)}`, rubric: ["ok"], allowedPaths: ["src"], isolation: "per_check" as const };
 const checks = [{ name: "lint", argv: ["lint"], cwd: ".", timeoutMs: 1000 }, { name: "unit", argv: ["unit"], cwd: ".", timeoutMs: 1000 }, { name: "slow", argv: ["slow"], cwd: ".", timeoutMs: 1000 }];
@@ -91,4 +93,36 @@ test("profile writerChecks: maxCalls defaults to 4 and is at most 10", () => {
   assert.deepEqual(validateProfile({ ...base, checks }).writerChecks, { defaultChecks: ["lint", "unit", "slow"], maxCalls: 4 });
   assert.throws(() => validateProfile({ ...base, checks, writerChecks: { maxCalls: 11 } }), /writer checks/);
   assert.throws(() => validateProfile({ ...base, checks, writerChecks: { defaultChecks: ["deploy"] } }), /writer checks/);
+});
+
+test("the example profile leaves run_checks a usable window once the writer has started", () => {
+  const example = validateProfile(JSON.parse(readFileSync(fileURLToPath(new URL("../../../config/verification/slack-router.example.json", import.meta.url)), "utf8")));
+  const service = new WriterChecks({ profile: example, snapshot: async () => { throw new Error("unused"); }, verifier: () => { throw new Error("unused"); } });
+  const remaining = example.activeTimeoutMs - 30_000;
+  assert.ok(remaining - service.reserveMs >= MIN_CHECKS_WINDOW_MS, `reserve ${service.reserveMs} ms leaves no room in ${remaining} ms`);
+});
+
+test("per-check overhead is counted only when every check gets its own container", () => {
+  const unused = { snapshot: async () => { throw new Error("unused"); }, verifier: () => { throw new Error("unused"); } };
+  const perCheck = new WriterChecks({ profile: validateProfile({ ...base, checks }), ...unused });
+  const perMode = new WriterChecks({ profile: validateProfile({ ...base, isolation: "per_mode", checks }), ...unused });
+  assert.equal(perCheck.estimateMs(["lint"]), 30_000 + 1000 + 15_000);
+  assert.equal(perMode.estimateMs(["lint"]), 30_000 + 1000);
+});
+
+test("a profile can set the time kept back for final verification and grading", () => {
+  const profile = validateProfile({ ...base, checks, writerChecks: { reserveMs: 120_000 } });
+  const service = new WriterChecks({ profile, snapshot: async () => { throw new Error("unused"); }, verifier: () => { throw new Error("unused"); } });
+  assert.equal(service.reserveMs, 120_000);
+  assert.throws(() => validateProfile({ ...base, checks, writerChecks: { reserveMs: 1000 } }), /Invalid writer checks/);
+});
+
+test("checks still running at the deadline end as unknown with reason time_budget", async () => {
+  const h = await harness({ outcome: () => new Promise(() => undefined) });
+  try {
+    const response = await h.service.run(h.request({ checks: ["lint"], deadlineMs: 50 }));
+    assert.equal(response.status, "unknown");
+    assert.equal(response.reason, "time_budget");
+    assert.ok(h.signals.every(signal => signal.aborted), "the hung check is stopped");
+  } finally { await h.cleanup(); }
 });

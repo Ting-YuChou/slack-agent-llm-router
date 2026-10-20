@@ -76,6 +76,19 @@ test("run_checks is refused when it would eat the time kept for final verificati
   assert.equal(requests.length, 0);
 });
 
+test("run_checks needs room for its checks beyond the reserve and gets that window as its deadline", async () => {
+  const short = fixture({ reserveMs: 598_600 });
+  await short.orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "short", user_id: "U", prompt: "fix" });
+  short.process.emit(request("ui-1", "tc-1", ["lint", "unit"])); await tick();
+  assert.equal(short.process.answer("ui-1")?.reason, "insufficient_time_budget");
+
+  const { orchestrator, process, requests } = fixture({ reserveMs: 500_000 });
+  await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "window", user_id: "U", prompt: "fix" });
+  process.emit(request("ui-1")); await tick(); await tick();
+  const deadline = requests[0]?.deadlineMs ?? 0;
+  assert.ok(deadline > 90_000 && deadline <= 100_000, `deadline ${deadline}`);
+});
+
 test("run_checks is unavailable without a profile and in discuss mode", async () => {
   const bare = fixture({ quality: false });
   await bare.orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "bare", user_id: "U", prompt: "fix" });
