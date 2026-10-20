@@ -70,6 +70,7 @@ MEMORY_SLASH_ONLY_MESSAGE = (
     "Use `/llm remember`, `/llm memories`, or `/llm forget`."
 )
 SLACK_BUSY_MESSAGE = "The LLM Router is busy right now. Please retry in a moment."
+SLACK_PRIORITY_WORK_KINDS = frozenset({"interactive"})
 SLACK_SECTION_TEXT_LIMIT = 3000
 AGENT_DELIVERY_CARD_LIMIT = 3000
 AGENT_DELIVERY_MAX_FILES = 15
@@ -2578,6 +2579,14 @@ class SlackBot:
             maxsize=max(1, int(work_queue_config.get("capacity", 256)))
         )
         self._work_concurrency = max(1, int(work_queue_config.get("concurrency", 16)))
+        # Button clicks get their own queue and workers, so approvals still go
+        # through while every regular worker waits on a slow agent start.
+        self._priority_queue: asyncio.Queue = asyncio.Queue(
+            maxsize=max(1, int(work_queue_config.get("capacity", 256)))
+        )
+        self._priority_concurrency = max(
+            1, int(work_queue_config.get("priority_concurrency", 2))
+        )
         self._overload_reply_timeout_seconds = float(
             work_queue_config.get("overload_reply_timeout_seconds", 2)
         )
@@ -4894,27 +4903,37 @@ class SlackBot:
         self._accepting_work = True
         self._work_workers = [
             asyncio.create_task(
-                self._work_worker(index), name=f"slack_work_worker:{index}"
+                self._work_worker(index, self._work_queue),
+                name=f"slack_work_worker:{index}",
             )
             for index in range(self._work_concurrency)
+        ] + [
+            asyncio.create_task(
+                self._work_worker(index, self._priority_queue),
+                name=f"slack_priority_worker:{index}",
+            )
+            for index in range(self._priority_concurrency)
         ]
 
     async def _stop_work_workers(self) -> None:
         if not self._work_workers:
             return
         self._accepting_work = False
+        queues = (self._work_queue, self._priority_queue)
         try:
-            await self._work_queue.join()
+            for queue in queues:
+                await queue.join()
         finally:
             workers, self._work_workers = self._work_workers, []
-            while True:
-                try:
-                    self._work_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                else:
-                    self._work_queue.task_done()
-                    SLACK_METRICS.work_rejected.labels(reason="shutdown").inc()
+            for queue in queues:
+                while True:
+                    try:
+                        queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    else:
+                        queue.task_done()
+                        SLACK_METRICS.work_rejected.labels(reason="shutdown").inc()
             for worker in workers:
                 worker.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
@@ -4925,20 +4944,28 @@ class SlackBot:
         if not self._accepting_work:
             await self._reply_busy(item)
             return False
+        queue = (
+            self._priority_queue
+            if item.kind in SLACK_PRIORITY_WORK_KINDS
+            else self._work_queue
+        )
         try:
-            self._work_queue.put_nowait(item)
+            queue.put_nowait(item)
         except asyncio.QueueFull:
             SLACK_METRICS.work_rejected.labels(reason="capacity").inc()
             await self._reply_busy(item)
             return False
-        SLACK_METRICS.work_queue_depth.set(self._work_queue.qsize())
+        SLACK_METRICS.work_queue_depth.set(self._queued_work())
         return True
 
-    async def _work_worker(self, index: int) -> None:
+    def _queued_work(self) -> int:
+        return self._work_queue.qsize() + self._priority_queue.qsize()
+
+    async def _work_worker(self, index: int, queue: asyncio.Queue) -> None:
         while True:
-            item = await self._work_queue.get()
+            item = await queue.get()
             self._work_running += 1
-            SLACK_METRICS.work_queue_depth.set(self._work_queue.qsize())
+            SLACK_METRICS.work_queue_depth.set(self._queued_work())
             SLACK_METRICS.work_running.set(self._work_running)
             try:
                 if item.kind == "slash":
@@ -4956,7 +4983,7 @@ class SlackBot:
             finally:
                 self._work_running -= 1
                 SLACK_METRICS.work_running.set(self._work_running)
-                self._work_queue.task_done()
+                queue.task_done()
 
     async def _reply_busy(self, item: SlackWorkItem) -> None:
         async def send_reply():

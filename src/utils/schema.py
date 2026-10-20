@@ -821,6 +821,8 @@ class SlackAgentContextConfig(ConfigModel):
 class SlackWorkQueueConfig(ConfigModel):
     capacity: int = Field(256, ge=1)
     concurrency: int = Field(16, ge=1)
+    # Workers reserved for button clicks (approvals, feedback).
+    priority_concurrency: int = Field(2, ge=1)
     overload_reply_timeout_seconds: float = Field(2.0, gt=0)
 
 
