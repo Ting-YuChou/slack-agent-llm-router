@@ -55,13 +55,10 @@ export class RuntimeStateStore {
       return retainedSessionIds.has(run.session_id) || !Number.isFinite(timestamp) || timestamp >= auditCutoff;
     });
     for (const run of state.runs) {
-      if (["starting", "running", "awaiting_approval"].includes(run.status)) {
-        if (run.workflow_mode === "structured") run.interrupted_at = run.updated_at;
-        run.status = "interrupted";
-        run.updated_at = new Date(this.now()).toISOString();
-        run.error = { code: "runtime_restarted", message: "Agent runtime restarted during this prompt" };
-        run.events.push({ type: "status", status: "interrupted" });
-      }
+      // A run waiting for delivery has no live process to lose; the orchestrator restores it from the
+      // approval ledger, or fails it as delivery_interrupted when the ledger has no pending approval.
+      if (run.status === "awaiting_approval" && run.phase === "awaiting_delivery") continue;
+      if (["starting", "running", "awaiting_approval"].includes(run.status)) interruptRestartedRun(run, this.now());
     }
     for (const session of state.sessions) session.activeRunId = undefined;
     return state;
@@ -89,6 +86,15 @@ export class RuntimeStateStore {
     this.writeChain = write.catch(() => undefined);
     return write.then(() => { this.healthy = true; }, error => { this.healthy = false; throw error; });
   }
+}
+
+/** Marks a run the restart cut off; a tool approval waits on a live Pi dialog, so it can never resume. */
+export function interruptRestartedRun(run: RunRecord, now: number): void {
+  if (run.workflow_mode === "structured") run.interrupted_at = run.updated_at;
+  run.status = "interrupted";
+  run.updated_at = new Date(now).toISOString();
+  run.error = { code: "runtime_restarted", message: "Agent runtime restarted during this prompt" };
+  run.events.push({ type: "status", status: "interrupted" });
 }
 
 function isState(value: unknown): value is RuntimeState {

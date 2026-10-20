@@ -68,6 +68,8 @@ async function pendingDelivery(env: Awaited<ReturnType<typeof stateRoot>>, ttlMs
   const delivery = card(first.orchestrator.getRun(created.run_id));
   assert.equal(first.orchestrator.getRun(created.run_id).status, "awaiting_approval");
   await first.orchestrator.shutdown();
+  // Drain the first runtime's queued state writes; two live stores never share a file in production.
+  await (first.orchestrator as any).persistState();
   first.ledger.close();
   return { runId: created.run_id, approvalId: delivery.approval_id as string, digest: delivery.delivery.delivery_digest as string };
 }
@@ -198,4 +200,32 @@ test("the ledger prunes used and long-expired approvals", async () => {
     assert.equal(ledger.prune(), 3);
     assert.deepEqual(["R1", "R2", "R3", "R4"].map(run => ledger.pendingDelivery(run)?.id), [undefined, undefined, undefined, "fresh"]);
   } finally { ledger.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("a restored structured-workflow delivery completes its execution phase on approval", async () => {
+  const env = await stateRoot();
+  try {
+    const now = Date.now();
+    const digest = "sha256:" + (await import("node:crypto")).createHash("sha256").update(JSON.stringify(["src/a.ts"])).update("\0").update(env.calls.patch).digest("hex");
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(path.join(env.root, "runtime-state.json"), JSON.stringify({
+      schema_version: 1,
+      sessions: [{ id: "S", key: "T:C:wf", ownerUserId: "U", worktreePath: "/managed/S", branch: "b", baselineCommit: "a".repeat(40), closed: false, lastActivity: now }],
+      runs: [{ run_id: "R", session_id: "S", status: "awaiting_approval", phase: "awaiting_delivery", workflow_mode: "structured", execution_status: "running", verification_status: "passed", grader_status: "passed",
+        answer: "", owner_user_id: "U", created_at: new Date(now).toISOString(), updated_at: new Date(now).toISOString(), tool_count: 1, turn_count: 1,
+        events: [{ type: "approval", kind: "delivery", approval_id: "A", delivery: { delivery_digest: digest } }] }],
+    }));
+    const seed = new ApprovalLedger(path.join(env.root, "approvals", "approvals.sqlite"));
+    seed.record({ id: "A", runId: "R", toolCallId: "delivery", userId: "U", action: "deliver", expiresAt: now + 60_000, used: false, patchHash: digest });
+    seed.close();
+    const restarted = env.start();
+    await restarted.orchestrator.restore();
+    assert.equal(restarted.orchestrator.getRun("R").status, "awaiting_approval");
+    await restarted.orchestrator.decide("R", "A", "U", "approve");
+    const run = restarted.orchestrator.getRun("R");
+    assert.equal(run.status, "completed");
+    assert.equal(run.execution_status, "succeeded");
+    assert.equal(run.phase, "completed");
+    assert.equal(env.calls.commits, 1);
+  } finally { await env.cleanup(); }
 });

@@ -15,7 +15,8 @@ const MAX_TURNS = Number(process.env.PI_AGENT_MAX_TURNS ?? "20");
 const MAX_TOOL_CALLS = Number(process.env.PI_AGENT_MAX_TOOL_CALLS ?? "40");
 const APPROVAL_TIMEOUT_MS = 300_000;
 const BUDGET_STATUS_TIMEOUT_MS = 5_000;
-// Anything but an explicit "none" keeps per-write prompts, so a typo never silently drops approval.
+// Delivery-mode runs pass "none" (the owner approves the final diff instead). CI repair sessions skip that
+// card and keep per-write prompts. Anything but an explicit "none" prompts, so a typo never silently drops approval.
 const WRITE_APPROVAL = process.env.PI_AGENT_WRITE_APPROVAL === "none" ? "none" : "per_prompt";
 
 function safeCommands(): string[] {

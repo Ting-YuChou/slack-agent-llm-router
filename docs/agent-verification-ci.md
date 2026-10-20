@@ -29,6 +29,19 @@ The sandbox, not the approval, is the boundary:
 
 Still open (Phase 4 Track S): the gateway token remains readable from `/proc/1/environ` inside the container until per-execution credential refresh lands, and runs share one internal network until per-run networks land. Deployments that cannot accept this should set `PI_AGENT_REQUIRE_VERIFICATION=1`, which limits runs without a profile to `--discuss`.
 
+### Approvals across restarts
+
+`PI_AGENT_APPROVAL_MODE` accepts only `delivery` (the default). The old `write` mode, which asked for the first write of each prompt instead of the final diff, was removed; a runtime started with `PI_AGENT_APPROVAL_MODE=write` fails at startup and names `delivery` as the replacement. CI repair sessions still skip the delivery card and keep a prompt for each write, so no run loses both gates.
+
+Pending delivery approvals are kept in an always-on SQLite ledger, `<PI_AGENT_STATE_ROOT>/approvals/approvals.sqlite`, with or without a trusted profile. Each row binds the approval to its run, owner, expiry and the patch hash shown on the card. After a restart:
+
+- A run that was waiting for delivery stays `awaiting_approval` with the same approval id, and its remaining expiry is re-armed from the ledger.
+- Approving it commits only if the worktree still hashes to the persisted patch hash. A worktree that changed fails as `delivery_candidate_changed` and nothing is committed.
+- An approval that expired while the runtime was down fails the run as `delivery_expired` on startup, and a late click is refused.
+- When the ledger has no matching pending row (lost, or the card was decided just before the restart), the run fails as `delivery_interrupted`. In every failure the patch is archived before the worktree is rolled back.
+
+Tool approvals (a shell command or a write prompt inside a run) are not persisted. They answer a dialog in a live Pi process that a restart cannot resume, so a run waiting on one still becomes `interrupted` with `runtime_restarted`. Used or expired approvals are pruned: from memory ten minutes after they stop mattering, from the ledger after 24 hours.
+
 ## Required setup
 
 Build the verification image from the repository root:
