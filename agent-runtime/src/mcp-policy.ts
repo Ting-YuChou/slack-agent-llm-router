@@ -74,15 +74,94 @@ export function authorizeClickHouseTool(tool: string, args: Record<string, unkno
     return;
   }
   if (tool !== "run_query" || typeof args.query !== "string" || Buffer.byteLength(args.query) > 8192) deny("ClickHouse query is invalid");
-  const query = args.query!.trim();
-  if (!/^select\b/i.test(query) || /;\s*\S|\b(insert|update|delete|drop|alter|create|truncate|attach|detach|grant|revoke|system)\b/i.test(query) ||
-      /\b(url|remote|file|s3)\s*\(/i.test(query) || /\bsettings\b/i.test(query)) deny("ClickHouse query is not read-only");
-  const references = [...query.matchAll(/\b(?:from|join)\s+([\w.]+)/ig)].map((match) => match[1]!.toLowerCase());
+  const query = args.query!.trim().replace(/;\s*$/, "").trimEnd();
+  if (!/^select\b/i.test(query) || query.includes(";") || /\b(insert|update|delete|drop|alter|create|truncate|attach|detach|grant|revoke|system|outfile)\b/i.test(query) ||
+      CLICKHOUSE_TABLE_FUNCTIONS.test(query) || /\bsettings\b/i.test(query)) deny("ClickHouse query is not read-only");
+  // Comments, quoted identifiers, escapes and heredocs are what let a regex disagree with the ClickHouse lexer.
+  if (/--|\/\*|\*\/|[#`"\\$]/.test(query)) deny("ClickHouse query uses disallowed syntax");
+  const tokens = clickHouseTokens(query);
+  if (!tokens) deny("ClickHouse query uses disallowed syntax");
+  const references = clickHouseTableReferences(tokens!);
   if (references.length === 0 || references.some((name) => {
     const [database, table] = name.includes(".") ? name.split(".", 2) : ["agent_mcp", name];
     return database !== "agent_mcp" || !CLICKHOUSE_VIEWS.has(table!);
   })) deny("ClickHouse query references a disallowed table");
-  args.query = `${query} SETTINGS max_execution_time=5, max_result_rows=1000, result_overflow_mode='break', max_memory_usage=268435456`;
+  // A newline keeps the limits out of reach of anything the lexer could still read as a line comment.
+  args.query = `${query}\nSETTINGS max_execution_time=5, max_result_rows=1000, result_overflow_mode='break', max_memory_usage=268435456`;
+}
+
+/** Table functions and file-reading functions, denied wherever they appear. */
+const CLICKHOUSE_TABLE_FUNCTIONS = new RegExp(`(?<![\\w$])(?:${[
+  "url", "urlCluster", "remote", "remoteSecure", "cluster", "clusterAllReplicas", "file", "fileCluster",
+  "s3", "s3Cluster", "gcs", "oss", "cosn", "hdfs", "hdfsCluster", "azureBlobStorage", "azureBlobStorageCluster",
+  "mysql", "postgresql", "mongodb", "redis", "sqlite", "jdbc", "odbc", "executable", "input", "merge",
+  "view", "viewIfPermitted", "viewExplain", "dictionary", "iceberg", "icebergS3", "deltaLake", "hudi", "generateRandom",
+].join("|")})\\s*\\(`, "i");
+/** Keywords that end a FROM clause; ClickHouse never reads them as an implicit table alias. */
+const CLICKHOUSE_FROM_CLAUSE_END = new Set(["where", "prewhere", "group", "order", "limit", "having", "union", "except", "intersect", "format", "into"]);
+
+/**
+ * Lowercased tokens of a query whose only literals are single-quoted strings without backslashes.
+ * Strings become the number 0. Returns null on anything the lexer could read differently.
+ */
+function clickHouseTokens(query: string): string[] | null {
+  const code = query.replace(/'(?:[^']|'')*'/g, " 0 ");
+  const tokens: string[] = [];
+  const pattern = /[\t\n\r ]+|([A-Za-z_][A-Za-z0-9_]*|0x[0-9A-Fa-f]+|\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|[!-/:-@[-^{-~])/y;
+  while (pattern.lastIndex < code.length) {
+    const match = pattern.exec(code);
+    if (!match) return null;
+    const token = match[1];
+    if (token === undefined) continue;
+    // Strings were all removed, and a number glued to a word (1from) is not one token.
+    if (token === "'" || (/^\d/.test(token) && /[A-Za-z0-9_]/.test(code[pattern.lastIndex] ?? ""))) return null;
+    tokens.push(token.toLowerCase());
+  }
+  return tokens;
+}
+
+/** Tables read by FROM, JOIN or IN. Denies table functions, non-subquery parentheses and comma joins. */
+function clickHouseTableReferences(tokens: string[]): string[] {
+  const depths: number[] = [];
+  let depth = 0;
+  for (const token of tokens) {
+    if (token === ")") depth -= 1;
+    depths.push(depth);
+    if (token === "(") depth += 1;
+  }
+  const references: string[] = [];
+  for (const [index, token] of tokens.entries()) {
+    if (token !== "from" && token !== "join" && token !== "in") continue;
+    const next = tokens[index + 1];
+    if (next === "(") {
+      if (token === "in") continue;
+      if (tokens[index + 2] !== "select" && tokens[index + 2] !== "with") deny("ClickHouse query references a disallowed table");
+    } else {
+      if (!next || !/^[a-z_]/.test(next)) {
+        if (token === "in") continue;
+        deny("ClickHouse query references a disallowed table");
+      }
+      let name = next!;
+      let end = index + 2;
+      if (tokens[end] === ".") {
+        if (!/^[a-z_]/.test(tokens[end + 1] ?? "")) deny("ClickHouse query references a disallowed table");
+        name = `${name}.${tokens[end + 1]}`;
+        end += 2;
+      }
+      if (tokens[end] === "(") deny("ClickHouse query uses a table function");
+      if (tokens[end] === ".") deny("ClickHouse query references a disallowed table");
+      references.push(name);
+    }
+    if (token !== "from") continue;
+    // Within the FROM clause, a comma at the clause's own depth is a cross join.
+    for (let cursor = index + 1; cursor < tokens.length && depths[cursor]! >= depths[index]!; cursor += 1) {
+      if (depths[cursor] !== depths[index]) continue;
+      if (tokens[cursor] === "as") cursor += 1;
+      else if (CLICKHOUSE_FROM_CLAUSE_END.has(tokens[cursor]!)) break;
+      else if (tokens[cursor] === ",") deny("ClickHouse query references a disallowed table");
+    }
+  }
+  return references;
 }
 
 export function authorizeContext7Tool(tool: string, args: Record<string, unknown>, _claims: McpClaims): void {

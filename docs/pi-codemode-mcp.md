@@ -36,10 +36,12 @@ MCP_GATEWAY_SIGNING_SECRET=... node agent-runtime/scripts/derive-mcp-secret.mjs 
 
 ## ClickHouse
 
-Apply `docker/observability/agent-mcp-views.sql` after the Agent analytics tables exist.
-The `agent_mcp_reader` account defined by `agent-mcp-users.xml` can select only five aggregate views.
-The Gateway additionally rejects non-SELECT queries, raw tables, multiple statements, external table
-functions, custom SETTINGS, oversized queries, and results above 512 KiB.
+Apply `docker/observability/agent-mcp-views.sql` after the Agent analytics tables exist; the overlay's
+initializer and `scripts/run_slack_demo.sh` both do this. The ClickHouse writer needs access management
+(`CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1`, set by the overlay) to create the views' definer user.
+The `agent_mcp_reader` account defined by `agent-mcp-users.xml` holds only `SELECT ON agent_mcp.*`.
+The Gateway additionally rejects non-SELECT queries, raw tables, comma joins, multiple statements, comments,
+quoted identifiers, table functions, custom SETTINGS, oversized queries, and results above 512 KiB.
 
 The `docker-compose.agent-mcp.yaml` overlay contains the initializer, upstream MCP, and gateway.
 It expects the Agent observability profile and its internal network to be running.

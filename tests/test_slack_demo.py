@@ -386,3 +386,18 @@ def test_demo_mcp_gateway_has_dual_networks_and_cleanup():
     assert 'docker stop "${clickhouse_gateway_container}"' in launcher
     assert 'docker stop "${context7_gateway_container}"' in launcher
     assert 'docker network rm "${mcp_egress_network}"' in launcher
+
+
+def test_demo_applies_agent_mcp_views_before_starting_clickhouse_mcp():
+    launcher = (ROOT / "scripts" / "run_slack_demo.sh").read_text(encoding="utf-8")
+    clickhouse_block = launcher.split(
+        'if [[ "${clickhouse_mcp_enabled}" == true ]]; then\n    observability_network=',
+        1,
+    )[1].split("clickhouse_mcp_started=true", 1)[0]
+
+    views = clickhouse_block.index(
+        '<"${repo_root}/docker/observability/agent-mcp-views.sql"'
+    )
+    assert 'docker exec -i "${clickhouse_container}"' in clickhouse_block
+    assert "--multiquery" in clickhouse_block
+    assert views < clickhouse_block.index('--name "${clickhouse_mcp_container}"')
