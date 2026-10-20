@@ -1,5 +1,7 @@
 import asyncio
+import dataclasses
 import os
+import time
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock
@@ -22,6 +24,7 @@ from src.agent_runtime import (
 )
 from src.memory import HashEmbeddingProvider, InMemoryMemoryStore, MemoryManager
 from slack.agent_bootstrap import AgentBootstrapContext
+from slack.agent_shortcut import build_agent_shortcut_modal
 from slack.bot_real import (
     AGENT_ERROR_HINTS,
     ConversationContext,
@@ -1083,6 +1086,8 @@ class TestSlackAgentApprovals:
         }
 
         await bot._handle_agent_view_submission(payload)
+        # The worker only acks; bootstrap and create_session run in the background.
+        await _drain_background_tasks(bot)
 
         bot.agent_bootstrap_builder.build.assert_awaited_once()
         assert runtime.create_session.await_args.args == (
@@ -3119,3 +3124,543 @@ async def test_agent_start_sends_a_key_derived_from_the_triggering_message():
     assert keys[0] and keys[0] == keys[1], "a redelivered message reuses its key"
     assert keys[2] and keys[2] != keys[0]
     assert "200.5" not in keys[0], "the key does not echo Slack identifiers"
+
+
+async def _drain_background_tasks(bot):
+    while bot.background_tasks:
+        await asyncio.gather(*list(bot.background_tasks))
+
+
+def _public_channel_client(**methods):
+    return SimpleNamespace(
+        conversations_info=AsyncMock(
+            return_value={
+                "ok": True,
+                "channel": {"is_channel": True, "is_private": False},
+            }
+        ),
+        views_open=AsyncMock(),
+        **methods,
+    )
+
+
+async def _open_agent_shortcut(bot, trigger_id="trigger-1"):
+    await bot._handle_agent_shortcut(
+        {
+            "trigger_id": trigger_id,
+            "team": {"id": "T1"},
+            "user": {"id": "U1"},
+            "channel": {"id": "C1"},
+            "message": {"ts": "100.2", "thread_ts": "100.1"},
+        }
+    )
+    return bot.web_client.views_open.await_args.kwargs["view"]["private_metadata"]
+
+
+def _shortcut_submission(nonce, task, **values):
+    return {
+        "type": "view_submission",
+        "team": {"id": "T1"},
+        "user": {"id": "U1"},
+        "view": {
+            "callback_id": "run_pi_agent_from_thread_submit",
+            "private_metadata": nonce,
+            "state": {"values": {"agent_task": {"task": {"value": task}}, **values}},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_approval_clicks_are_not_blocked_by_slow_agent_starts():
+    bot = SlackBot(
+        {"channels": [], "work_queue": {"capacity": 8, "concurrency": 2}},
+        inference_engine=SimpleNamespace(),
+    )
+    socket_client = SimpleNamespace(send_socket_mode_response=AsyncMock())
+    release = asyncio.Event()
+    workers_busy = asyncio.Event()
+    started = []
+
+    async def slow_agent_start(event):
+        # Stands in for a thread follow-up whose create_session waits on a
+        # worktree and a container.
+        started.append(event)
+        if len(started) == 2:
+            workers_busy.set()
+        await release.wait()
+
+    decided = asyncio.Event()
+
+    async def decide(payload):
+        decided.set()
+
+    bot._handle_event = slow_agent_start
+    bot._handle_agent_interactive = decide
+    bot._start_work_workers()
+    for index in range(3):
+        await bot._handle_socket_mode_request(
+            socket_client,
+            SimpleNamespace(
+                envelope_id=f"E-{index}",
+                type="events_api",
+                payload={"event": {"type": "message", "ts": str(index)}},
+            ),
+        )
+    await asyncio.wait_for(workers_busy.wait(), timeout=1)
+
+    await bot._handle_socket_mode_request(
+        socket_client,
+        SimpleNamespace(
+            envelope_id="E-approve",
+            type="interactive",
+            payload={
+                "type": "block_actions",
+                "user": {"id": "U1"},
+                "channel": {"id": "C1"},
+                "actions": [
+                    {
+                        "action_id": "pi_agent_approve",
+                        "value": '{"run_id":"R1","approval_id":"A1"}',
+                    }
+                ],
+            },
+        ),
+    )
+
+    try:
+        await asyncio.wait_for(decided.wait(), timeout=1)
+    finally:
+        release.set()
+        await bot._stop_work_workers()
+
+
+@pytest.mark.asyncio
+async def test_slash_agent_start_acks_then_creates_in_the_background():
+    release = asyncio.Event()
+
+    async def slow_create_session(*args, **kwargs):
+        await release.wait()
+        return {"session_id": "S1", "run_id": "R1", "status": "starting"}
+
+    runtime = SimpleNamespace(create_session=AsyncMock(side_effect=slow_create_session))
+    bot = SlackBot(
+        {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+    )
+    bot._monitor_agent_run = AsyncMock()
+    bot.web_client = SimpleNamespace(
+        chat_postEphemeral=AsyncMock(),
+        chat_postMessage=AsyncMock(return_value={"ts": "100.1"}),
+        chat_update=AsyncMock(),
+    )
+
+    await asyncio.wait_for(
+        bot._handle_slash_command(
+            {
+                "text": "agent fix the flaky test",
+                "user_id": "U1",
+                "channel_id": "C1",
+                "team_id": "T1",
+            }
+        ),
+        timeout=1,
+    )
+
+    ack = bot.web_client.chat_postEphemeral.await_args.kwargs["text"]
+    assert "starting" in ack.lower()
+    assert "R1" not in bot.agent_runs
+
+    release.set()
+    await _drain_background_tasks(bot)
+
+    runtime.create_session.assert_awaited_once()
+    assert runtime.create_session.await_args.args[:5] == (
+        "T1",
+        "C1",
+        "100.1",
+        "U1",
+        "fix the flaky test",
+    )
+    assert bot.agent_runs["R1"]["owner_user_id"] == "U1"
+    assert "R1" in bot.web_client.chat_update.await_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_modal_agent_start_acks_then_bootstraps_in_the_background():
+    runtime = SimpleNamespace(
+        create_session=AsyncMock(
+            return_value={"session_id": "S1", "run_id": "R1", "status": "starting"}
+        )
+    )
+    bot = SlackBot(
+        {"channels": [], "agent_context": {"enabled": True}},
+        SimpleNamespace(),
+        services={"agent_runtime": runtime},
+    )
+    bot._monitor_agent_run = AsyncMock()
+    bot.web_client = _public_channel_client(
+        chat_postMessage=AsyncMock(return_value={"ts": "status-1"}),
+        chat_update=AsyncMock(),
+    )
+    release = asyncio.Event()
+
+    async def slow_build(*args, **kwargs):
+        await release.wait()
+        return AgentBootstrapContext(prompt="bootstrap prompt", message_count=1)
+
+    bot.agent_bootstrap_builder = SimpleNamespace(
+        build=AsyncMock(side_effect=slow_build)
+    )
+    nonce = await _open_agent_shortcut(bot)
+
+    await asyncio.wait_for(
+        bot._handle_agent_view_submission(
+            _shortcut_submission(
+                nonce,
+                "Implement the todo",
+                agent_context={"include": {"selected_options": [{"value": "include"}]}},
+            )
+        ),
+        timeout=1,
+    )
+
+    assert "loading" in bot.web_client.chat_postMessage.await_args.kwargs["text"]
+    runtime.create_session.assert_not_awaited()
+
+    release.set()
+    await _drain_background_tasks(bot)
+
+    runtime.create_session.assert_awaited_once()
+    assert runtime.create_session.await_args.args[4] == "bootstrap prompt"
+    assert "R1" in bot.web_client.chat_update.await_args.kwargs["text"]
+
+
+def _watch_until(bot, finished, run_id="R1"):
+    """Keep the monitor of `run_id` watching until `finished` is set."""
+
+    async def monitor(tracked):
+        if tracked["run_id"] == run_id:
+            await finished.wait()
+            tracked["result_posted"] = True
+
+    bot._monitor_agent_run = monitor
+
+
+@pytest.mark.asyncio
+async def test_per_user_agent_cap_names_the_active_run():
+    runtime = SimpleNamespace(
+        create_session=AsyncMock(
+            return_value={"session_id": "S2", "run_id": "R2", "status": "starting"}
+        )
+    )
+    bot = SlackBot(
+        {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+    )
+    finished = asyncio.Event()
+    _watch_until(bot, finished)
+    bot.web_client = SimpleNamespace(chat_postEphemeral=AsyncMock())
+    active = bot._track_agent_run(
+        {"session_id": "S1", "run_id": "R1", "status": "running"},
+        team_id="T1",
+        channel_id="C1",
+        thread_ts="100.1",
+        owner_user_id="U1",
+    )
+    bot._start_agent_monitor(active)
+    handler = bot.message_handler
+    client = SimpleNamespace(
+        chat_postMessage=AsyncMock(return_value={"ts": "300.1"}),
+        chat_update=AsyncMock(),
+    )
+
+    response = await handler._handle_agent_command(
+        ["fix", "another", "bug"], "U1", "C2", client, team_id="T1", thread_ts="200.1"
+    )
+    assert "R1" in response
+    runtime.create_session.assert_not_awaited()
+    client.chat_postMessage.assert_not_awaited()
+
+    await bot._handle_slash_command(
+        {"text": "agent fix it", "user_id": "U1", "channel_id": "C2", "team_id": "T1"}
+    )
+    assert "R1" in bot.web_client.chat_postEphemeral.await_args.kwargs["text"]
+    assert not [
+        task for task in bot.background_tasks if task.get_name() == "pi_agent_start"
+    ]
+    runtime.create_session.assert_not_awaited()
+
+    # A follow-up in the active run's own thread is not a second agent.
+    await handler._handle_agent_command(
+        ["add", "a", "test"], "U1", "C1", client, team_id="T1", thread_ts="100.1"
+    )
+    assert runtime.create_session.await_count == 1
+    # Another user is not capped by U1's run.
+    await handler._handle_agent_command(
+        ["fix"], "U2", "C2", client, team_id="T1", thread_ts="200.1"
+    )
+    assert runtime.create_session.await_count == 2
+
+    # Once R1 finishes the slot is free again.
+    finished.set()
+    await _drain_background_tasks(bot)
+    assert active["result_posted"] is True
+    await handler._handle_agent_command(
+        ["fix", "another", "bug"], "U1", "C2", client, team_id="T1", thread_ts="200.2"
+    )
+    assert runtime.create_session.await_count == 3
+    await _drain_background_tasks(bot)
+
+
+@pytest.mark.asyncio
+async def test_per_user_agent_cap_ignores_a_run_nobody_is_watching():
+    runtime = SimpleNamespace(
+        create_session=AsyncMock(
+            return_value={"session_id": "S2", "run_id": "R2", "status": "starting"}
+        )
+    )
+    bot = SlackBot(
+        {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+    )
+    bot._monitor_agent_run = AsyncMock()
+    # Its monitor gave up without posting a result, e.g. on a runtime error.
+    bot._track_agent_run(
+        {"session_id": "S1", "run_id": "R1", "status": "running"},
+        team_id="T1",
+        channel_id="C1",
+        thread_ts="100.1",
+        owner_user_id="U1",
+    )
+
+    response = await bot.message_handler._handle_agent_command(
+        ["fix"], "U1", "C2", SimpleNamespace(), team_id="T1", thread_ts="200.1"
+    )
+
+    assert "R2" in response
+    await _drain_background_tasks(bot)
+
+
+@pytest.mark.asyncio
+async def test_per_user_agent_cap_is_configurable():
+    runtime = SimpleNamespace(
+        create_session=AsyncMock(
+            return_value={"session_id": "S2", "run_id": "R2", "status": "starting"}
+        )
+    )
+    finished = asyncio.Event()
+    bots = []
+    for limit, started in [(1, False), (2, True)]:
+        bot = SlackBot(
+            {"channels": []},
+            SimpleNamespace(),
+            services={"agent_runtime": runtime},
+            agent_config={"max_active_runs_per_user": limit},
+        )
+        bots.append(bot)
+        _watch_until(bot, finished)
+        bot._start_agent_monitor(
+            bot._track_agent_run(
+                {"session_id": "S1", "run_id": "R1", "status": "running"},
+                team_id="T1",
+                channel_id="C1",
+                thread_ts="100.1",
+                owner_user_id="U1",
+            )
+        )
+
+        response = await bot.message_handler._handle_agent_command(
+            ["fix"], "U1", "C2", SimpleNamespace(), team_id="T1", thread_ts="200.1"
+        )
+
+        assert ("R2" in response) is started
+        assert ("R1" in response) is not started
+    runtime.create_session.assert_awaited_once()
+    finished.set()
+    for bot in bots:
+        await _drain_background_tasks(bot)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ["message", "app_mention"])
+async def test_message_and_mention_for_one_ts_are_handled_once_for_the_owner(first):
+    second = "app_mention" if first == "message" else "message"
+    bot = SlackBot({"channels": []}, SimpleNamespace())
+    bot.bot_user_id = "UBOT"
+    bot.web_client = SimpleNamespace(chat_postEphemeral=AsyncMock())
+    bot.agent_threads["C1:100.1"] = {
+        "owner_user_id": "U1",
+        "channel_id": "C1",
+        "thread_ts": "100.1",
+    }
+    bot._mark_thread_active("C1", "100.1")
+    bot._process_message = AsyncMock()
+
+    def event(event_type, ts, user):
+        return {
+            "type": event_type,
+            "channel": "C1",
+            "thread_ts": "100.1",
+            "ts": ts,
+            "user": user,
+            "text": "<@UBOT> add a regression test",
+        }
+
+    await bot._handle_event(event(first, "100.2", "U1"))
+    await bot._handle_event(event(second, "100.2", "U1"))
+
+    bot._process_message.assert_awaited_once()
+    assert bot._process_message.await_args.args[0]["text"] == "add a regression test"
+
+    await bot._handle_event(event(first, "100.3", "U2"))
+    await bot._handle_event(event(second, "100.3", "U2"))
+
+    bot._process_message.assert_awaited_once()
+    bot.web_client.chat_postEphemeral.assert_awaited_once()
+    assert (
+        "Only the user" in bot.web_client.chat_postEphemeral.await_args.kwargs["text"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_restored_session_without_a_run_never_cancels_none():
+    runtime = SimpleNamespace(
+        lookup_session=AsyncMock(
+            return_value={
+                "session_id": "S1",
+                "run_id": None,
+                "owner_user_id": "U1",
+                "active": False,
+                "task_mode": "implement",
+            }
+        ),
+        get_run=AsyncMock(),
+        cancel=AsyncMock(),
+        close_session=AsyncMock(),
+    )
+    bot = SlackBot(
+        {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+    )
+    bot.state_store = SimpleNamespace(
+        persist_agent_run_state=AsyncMock(), delete_agent_run_state=AsyncMock()
+    )
+    bot._uses_granular_redis_state = lambda: True
+    await bot._restore_agent_thread(
+        {"channel": "C1", "thread_ts": "100.1", "_team_id": "T1"}
+    )
+    handler = bot.message_handler
+
+    for action in ("status", "stop"):
+        for thread_ts in ("100.1", None):
+            response = await handler._handle_agent_command(
+                [action],
+                "U1",
+                "C1",
+                SimpleNamespace(),
+                team_id="T1",
+                thread_ts=thread_ts,
+            )
+            assert "no active run" in response.lower()
+            assert "S1" in response
+
+    runtime.get_run.assert_not_awaited()
+    runtime.cancel.assert_not_awaited()
+
+    response = await handler._handle_agent_command(
+        ["close"], "U1", "C1", SimpleNamespace(), team_id="T1", thread_ts="100.1"
+    )
+    assert "closed" in response
+    runtime.close_session.assert_awaited_once_with("S1", "U1")
+    bot.state_store.delete_agent_run_state.assert_not_awaited()
+    assert not bot.agent_threads
+
+
+@pytest.mark.asyncio
+async def test_expired_shortcut_form_tells_the_user_to_run_it_again():
+    runtime = SimpleNamespace(create_session=AsyncMock())
+    bot = SlackBot(
+        {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+    )
+    bot.web_client = _public_channel_client(chat_postEphemeral=AsyncMock())
+    nonce = await _open_agent_shortcut(bot)
+    bot.agent_shortcut_nonces[nonce] = dataclasses.replace(
+        bot.agent_shortcut_nonces[nonce], expires_at=time.time() - 1
+    )
+    # Opening another form meanwhile must not erase the expired one's notice.
+    await _open_agent_shortcut(bot, trigger_id="trigger-2")
+
+    await bot._handle_agent_view_submission(
+        _shortcut_submission(nonce, "A long, carefully written task")
+    )
+
+    runtime.create_session.assert_not_awaited()
+    notice = bot.web_client.chat_postEphemeral.await_args.kwargs
+    assert notice["channel"] == "C1"
+    assert notice["user"] == "U1"
+    assert "expired" in notice["text"].lower()
+    assert "run the shortcut again" in notice["text"].lower()
+    assert "A long, carefully written task" in notice["text"]
+    assert nonce not in bot.agent_shortcut_nonces
+
+
+def test_agent_shortcut_modal_offers_discuss_and_workflow():
+    modal = build_agent_shortcut_modal("nonce", [])
+    blocks = {block.get("block_id"): block for block in modal["blocks"]}
+
+    mode = blocks["agent_mode"]["element"]
+    assert [option["value"] for option in mode["options"]] == ["implement", "discuss"]
+    assert mode["initial_option"]["value"] == "implement"
+    workflow = blocks["agent_workflow"]["element"]
+    assert [option["value"] for option in workflow["options"]] == ["structured"]
+    assert "initial_options" not in workflow
+
+
+@pytest.mark.asyncio
+async def test_modal_mode_choices_reach_create_session():
+    runtime = SimpleNamespace(
+        create_session=AsyncMock(
+            return_value={"session_id": "S1", "run_id": "R1", "status": "starting"}
+        )
+    )
+    bot = SlackBot(
+        {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+    )
+    bot._monitor_agent_run = AsyncMock()
+    bot.web_client = _public_channel_client(
+        chat_postMessage=AsyncMock(return_value={"ts": "status-1"}),
+        chat_update=AsyncMock(),
+    )
+    nonce = await _open_agent_shortcut(bot)
+
+    await bot._handle_agent_view_submission(
+        _shortcut_submission(
+            nonce,
+            "Explain the router",
+            agent_mode={"mode": {"selected_option": {"value": "discuss"}}},
+            agent_workflow={
+                "workflow": {"selected_options": [{"value": "structured"}]}
+            },
+        )
+    )
+    await _drain_background_tasks(bot)
+
+    kwargs = runtime.create_session.await_args.kwargs
+    assert kwargs["task_mode"] == "discuss"
+    assert kwargs["workflow_mode"] == "structured"
+
+
+@pytest.mark.asyncio
+async def test_shortcut_in_a_discuss_thread_preselects_discuss():
+    bot = SlackBot({"channels": []}, SimpleNamespace())
+    bot.web_client = _public_channel_client()
+    bot._track_agent_run(
+        {"session_id": "S1", "run_id": "R1"},
+        team_id="T1",
+        channel_id="C1",
+        thread_ts="100.1",
+        owner_user_id="U1",
+        mode="discuss",
+    )
+
+    await _open_agent_shortcut(bot)
+
+    modal = bot.web_client.views_open.await_args.kwargs["view"]
+    mode = next(b for b in modal["blocks"] if b.get("block_id") == "agent_mode")
+    assert mode["element"]["initial_option"]["value"] == "discuss"

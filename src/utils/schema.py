@@ -821,6 +821,8 @@ class SlackAgentContextConfig(ConfigModel):
 class SlackWorkQueueConfig(ConfigModel):
     capacity: int = Field(256, ge=1)
     concurrency: int = Field(16, ge=1)
+    # Workers reserved for button clicks (approvals, feedback).
+    priority_concurrency: int = Field(2, ge=1)
     overload_reply_timeout_seconds: float = Field(2.0, gt=0)
 
 
@@ -1266,6 +1268,8 @@ class ShutdownConfig(ConfigModel):
 class AgentRuntimeConfig(ConfigModel):
     enabled: bool = False
     feedback_enabled: bool = False
+    # Agent runs one Slack user may have running at once, across threads.
+    max_active_runs_per_user: int = Field(1, ge=1)
     base_url: str = "http://127.0.0.1:3001"
     token_env: str = "AGENT_RUNTIME_TOKEN"
     connect_timeout_seconds: float = Field(2.0, gt=0)
