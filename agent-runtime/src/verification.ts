@@ -31,6 +31,8 @@ export interface VerificationProfile {
   fixers?: FixerSpec[];
   /** Independent grader samples per candidate and how they combine; 1 / unanimous unless the profile asks for more. */
   grader?: GraderSampling;
+  /** Keep the writer's container paused between a settled attempt and its repair instead of starting a new one. */
+  writerReuse?: boolean;
 }
 export const REPORT_TOKEN = "{report}";
 /** File-safe check name used for /out/<check>.report and /out/<check>.log. */
@@ -54,6 +56,7 @@ export function validateProfile(raw: unknown): VerificationProfile {
     if (!g || typeof g !== "object" || Array.isArray(g) || Object.keys(g).some(key => key !== "samples" && key !== "aggregate") || (g.samples !== undefined && g.samples !== 1 && g.samples !== 3) || (g.aggregate !== undefined && g.aggregate !== "unanimous" && g.aggregate !== "majority")) throw new Error("Invalid grader sampling");
   }
   if (p.isolation !== undefined && !["per_mode", "per_check"].includes(p.isolation)) throw new Error("Invalid verification isolation");
+  if (p.writerReuse !== undefined && typeof p.writerReuse !== "boolean") throw new Error("Invalid writer reuse");
   if (p.fixers !== undefined && (!Array.isArray(p.fixers) || p.fixers.length > 5 || p.fixers.some(f => !f || typeof f.name !== "string" || !/^[\w.-]{1,64}$/.test(f.name) || !Array.isArray(f.argv) || !f.argv.length || f.argv.some(x => typeof x !== "string" || x.includes("\0") || x.includes(REPORT_TOKEN)) || typeof f.cwd !== "string" || !safeRelative(f.cwd) || !Number.isInteger(f.timeoutMs) || f.timeoutMs <= 0 || f.timeoutMs > 300_000) || new Set(p.fixers.map(f => f.name)).size !== p.fixers.length)) throw new Error("Invalid fixers");
   if (p.checks.some(c => c.kind !== undefined && !["static", "test"].includes(c.kind))) throw new Error("Invalid check kind");
   if (p.checks.some(c => (c.report !== undefined && (!c.report || c.report.format !== "junit")) || (c.report === undefined && c.argv.some(x => x.includes(REPORT_TOKEN))))) throw new Error("Invalid check report");
@@ -70,7 +73,7 @@ export function validateProfile(raw: unknown): VerificationProfile {
     if (!Number.isInteger(config.concurrency) || config.concurrency < 1 || config.concurrency > 4 || !Number.isFinite(config.maxCostUsd) || config.maxCostUsd <= 0 || config.maxCostUsd > 5 || !Number.isInteger(config.activeTimeoutMs) || config.activeTimeoutMs <= 0 || config.activeTimeoutMs > 1_800_000 || !Number.isFinite(config.discoveryCostUsd) || config.discoveryCostUsd <= 0 || config.discoveryCostUsd >= config.maxCostUsd || typeof config.degradeUnknown !== 'boolean') throw new Error('Invalid structured workflow limits');
     p.structuredWorkflow = config;
   }
-  return { ...p, isolation: p.isolation ?? "per_mode", writerChecks: { defaultChecks: p.writerChecks?.defaultChecks ?? p.checks.map(c => c.name), maxCalls: p.writerChecks?.maxCalls ?? 4, ...(p.writerChecks?.reserveMs !== undefined ? { reserveMs: p.writerChecks.reserveMs } : {}) }, baselinePaths: p.baselinePaths ?? ["tests/", "agent-runtime/test/"], maxRepairs: Math.min(2, Math.max(0, p.maxRepairs ?? 2)), maxCostUsd: p.maxCostUsd ?? 1, activeTimeoutMs: p.activeTimeoutMs ?? 900_000, grader: { samples: p.grader?.samples ?? 1, aggregate: p.grader?.aggregate ?? "unanimous" } };
+  return { ...p, isolation: p.isolation ?? "per_mode", writerChecks: { defaultChecks: p.writerChecks?.defaultChecks ?? p.checks.map(c => c.name), maxCalls: p.writerChecks?.maxCalls ?? 4, ...(p.writerChecks?.reserveMs !== undefined ? { reserveMs: p.writerChecks.reserveMs } : {}) }, baselinePaths: p.baselinePaths ?? ["tests/", "agent-runtime/test/"], maxRepairs: Math.min(2, Math.max(0, p.maxRepairs ?? 2)), maxCostUsd: p.maxCostUsd ?? 1, activeTimeoutMs: p.activeTimeoutMs ?? 900_000, grader: { samples: p.grader?.samples ?? 1, aggregate: p.grader?.aggregate ?? "unanimous" }, writerReuse: p.writerReuse ?? false };
 }
 export async function loadProfile(file: string, repo: string, worktreeRoot: string) {
   const resolved = await realpath(file);

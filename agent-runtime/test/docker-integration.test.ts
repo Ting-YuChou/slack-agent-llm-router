@@ -431,3 +431,71 @@ test("session networks reach only their gateways: no external DNS, no egress, no
     await exec("docker", ["network", "rm", shared]).catch(() => undefined);
   }
 });
+
+test("a reused writer is frozen between attempts and its repair starts in the same container with a fresh token", { skip: !enabled, timeout: 120_000 }, async () => {
+  const suffix = Math.random().toString(16).slice(2, 10);
+  const network = `pi-reuse-${suffix}`;
+  const gateway = `model-gateway-${suffix}`;
+  const repo = await mkdtemp(path.join(tmpdir(), "pi-reuse-repo-"));
+  const worktreeRoot = await mkdtemp(path.join(tmpdir(), "pi-reuse-worktrees-"));
+  const sessionStatePath = await mkdtemp(path.join(tmpdir(), "pi-reuse-state-"));
+  const recordDir = await mkdtemp(path.join(tmpdir(), "pi-reuse-record-"));
+  await command("chmod", ["777", recordDir]);
+  await command("git", ["init", "-b", "main"], repo);
+  await writeFile(path.join(repo, "README.md"), "base\n");
+  await command("git", ["add", "README.md"], repo);
+  await command("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base"], repo);
+  const worktrees = new WorktreeManager({ repoPath: repo, worktreeRoot, baseRef: "HEAD" });
+  const isolated = await worktrees.create(`reuse-${suffix}`);
+  const gatewayScript = fakeGatewayScript(scriptedTurns([
+    { kind: "text", text: "first attempt" }, { kind: "text", text: "repair attempt" },
+  ]), { recordPath: "/record/requests.jsonl" });
+  const name = `pi-reuse-${suffix}`;
+  let piProcess: DockerPiProcess | undefined;
+  try {
+    await command("docker", ["network", "create", "--internal", network]);
+    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", "--mount", `type=bind,src=${recordDir},dst=/record`, "node:22.22.0-bookworm-slim", "node", "-e", gatewayScript]);
+    await waitForContainerHealthz(gateway);
+    const events: PublicRunEvent[] = [];
+    let resolveSettled!: () => void;
+    let settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
+    piProcess = new DockerPiProcess({
+      name, image: AGENT_TEST_IMAGE, network, worktreePath: isolated.path, gitMetadataPath: isolated.gitDir, sessionStatePath,
+      gatewayUrl: "http://model-gateway:8080", modelRef: "openai/gpt-5.6-luna", reuse: true,
+      extensionPaths: ["/opt/pi/extensions/policy.ts", "/opt/pi/extensions/model-gateway.ts", "/opt/pi/extensions/secret-env.ts"],
+      pluginPaths: [], skillPaths: [], toolNames: ["read", "write", "edit", "bash", "grep", "find", "ls"],
+      user: `${process.getuid?.()}:${process.getgid?.()}`,
+    }, (runId) => `reuse-token-${runId}`, (event) => {
+      events.push(event);
+      if (event.type === "settled" || event.type === "error") resolveSettled();
+    });
+    const route = { modelRef: "openai/gpt-5.6-luna", effort: "max", source: "explicit" } as const;
+    piProcess.prompt("exec-0001-first", "Say hello.", route);
+    await settled;
+    const container = `${name}-exec-000`;
+    // Frozen while the host verifies and grades: nothing in it can touch the worktree.
+    assert.equal(await command("docker", ["inspect", "--format", "{{.State.Paused}}", container]), "true");
+
+    settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
+    piProcess.prompt("exec-0002-repair", "Repair it.", route);
+    await settled;
+    assert.ok(!events.some((event) => event.type === "error" || event.type === "container_reuse_failed"), JSON.stringify(events));
+    assert.ok(events.some((event) => event.type === "answer" && event.text.includes("repair attempt")), JSON.stringify(events));
+    assert.equal(await command("docker", ["inspect", "--format", "{{.State.Paused}}", container]), "true");
+    const startups = events.flatMap((event) => event.type === "startup" ? [event.startup] : []);
+    assert.deepEqual(startups.map((startup) => startup.reused), [false, true]);
+    // E5: a reused repair reaches its prompt within 1.5 s and at most 30% of a cold start.
+    assert.ok(startups[1].dispatch_to_prompt_ms! <= 1500, JSON.stringify(startups));
+    assert.ok(startups[1].dispatch_to_prompt_ms! <= 0.3 * startups[0].dispatch_to_prompt_ms!, JSON.stringify(startups));
+    const requests = (await readFile(path.join(recordDir, "requests.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(requests.map((request) => request.headers.authorization), ["Bearer reuse-token-exec-0001-first", "Bearer reuse-token-exec-0002-repair"]);
+
+    await piProcess.release();
+    await assert.rejects(command("docker", ["inspect", container]), "release stops and removes the reused container");
+  } finally {
+    await piProcess?.close();
+    await command("docker", ["stop", gateway]).catch(() => "");
+    await command("docker", ["network", "rm", network]).catch(() => "");
+    await worktrees.remove(isolated.path).catch(() => undefined);
+  }
+});
