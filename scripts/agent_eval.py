@@ -674,6 +674,22 @@ def parse_args(argv=None, require_live=True):
         help="Write this run's metrics to the baseline instead of comparing",
     )
     parser.add_argument(
+        "--writer-reuse",
+        action="store_true",
+        help="Run every task with the profile's writerReuse on (paused writer reused for repairs)",
+    )
+    parser.add_argument(
+        "--grader-samples",
+        type=int,
+        choices=(1, 3),
+        help="Grade every task with this many grader samples (profile grader.samples)",
+    )
+    parser.add_argument(
+        "--grader-aggregate",
+        choices=("unanimous", "majority"),
+        help="How the samples combine (default unanimous); needs --grader-samples",
+    )
+    parser.add_argument(
         "--recompute-summary",
         type=pathlib.Path,
         metavar="RESULTS_JSON",
@@ -688,7 +704,22 @@ def parse_args(argv=None, require_live=True):
         parser.error("--repeats must be at least 1")
     if args.max_cost_usd is not None and args.max_cost_usd <= 0:
         parser.error("--max-cost-usd must be positive")
+    if args.grader_aggregate and args.grader_samples is None:
+        parser.error("--grader-aggregate needs --grader-samples")
     return args
+
+
+def profile_overrides(args):
+    """Profile fields the command line sets on every task (empty: the tasks' own profiles)."""
+    overrides = {}
+    if args.writer_reuse:
+        overrides["writerReuse"] = True
+    if args.grader_samples is not None:
+        overrides["grader"] = {
+            "samples": args.grader_samples,
+            "aggregate": args.grader_aggregate or "unanimous",
+        }
+    return overrides
 
 
 def _now():
@@ -768,6 +799,9 @@ def main(argv=None, runner=None):
     except TaskError as error:
         print(f"invalid eval task: {error}", file=sys.stderr)
         return 2
+    overrides = profile_overrides(args)
+    # Applied before the checksum, so an overridden run is keyed (and filed) apart from a plain one.
+    tasks = [{**task, "profile": {**task["profile"], **overrides}} for task in tasks]
     if runner is None:
         runner = LiveRunner(timeout_s=args.timeout_s)
     model = args.model or default_model()
@@ -805,6 +839,7 @@ def main(argv=None, runner=None):
         "model": model,
         "prompt_version": prompt_version,
         "profile_checksum": checksum,
+        **({"profile_overrides": overrides} if overrides else {}),
         "created_at": _now(),
         "repeats": args.repeats,
         "summary": summary,
