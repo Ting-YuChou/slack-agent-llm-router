@@ -10,8 +10,7 @@ COPY src ./src
 COPY extensions ./extensions
 COPY plugins ./plugins
 RUN npm run build \
-    && npm prune --omit=dev --ignore-scripts \
-    && npm audit --omit=dev --audit-level=high
+    && npm prune --omit=dev --ignore-scripts
 
 RUN groupadd --gid 10003 mcp && useradd --uid 10003 --gid 10003 --no-create-home mcp \
     && chown -R 10003:10003 /opt/mcp-gateway

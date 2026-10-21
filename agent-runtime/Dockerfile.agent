@@ -25,8 +25,7 @@ COPY plugins ./plugins
 COPY skills.lock.json ./skills.lock.json
 COPY skills ./skills
 RUN npm run build \
-    && npm prune --omit=dev --ignore-scripts \
-    && npm audit --omit=dev --audit-level=high
+    && npm prune --omit=dev --ignore-scripts
 
 RUN printf '#!/bin/sh\nexec node /opt/pi/dist/src/codegraph-lazy-proxy.js\n' > /usr/local/bin/codegraph-lazy-proxy \
     && chmod 0555 /usr/local/bin/codegraph-lazy-proxy

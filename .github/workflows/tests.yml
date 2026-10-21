@@ -117,3 +117,19 @@ jobs:
       - name: Coverage report and threshold
         run: npm run test:coverage
         working-directory: agent-runtime
+
+  # The production-dependency audit gate. It used to run inside the image builds,
+  # where it needed the registry and broke rebuilds of an unchanged tree whenever
+  # a new advisory appeared; here a new advisory fails CI instead.
+  agent-runtime-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.0"
+          cache: npm
+          cache-dependency-path: agent-runtime/package-lock.json
+      - run: npm --prefix agent-runtime ci --ignore-scripts
+      - run: npm --prefix agent-runtime audit --omit=dev --audit-level=high
