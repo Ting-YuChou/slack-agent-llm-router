@@ -703,8 +703,8 @@ export class CodingAgentOrchestrator {
         if (!waiters.size && this.eventWaiters.get(runId) === waiters) this.eventWaiters.delete(runId);
         resolve();
       };
+      // Not unref'd: the wait is bounded (the route caps it at 30 s) and must resolve even with nothing else pending.
       const timer = setTimeout(wake, waitMs);
-      timer.unref?.();
       waiters.add(wake);
       signal?.addEventListener("abort", wake, { once: true });
     });
