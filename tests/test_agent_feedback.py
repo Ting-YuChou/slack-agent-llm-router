@@ -5,8 +5,13 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 
-from src.agent_runtime import AgentRuntimeClient, AgentRuntimeUnauthorized
-from slack.bot_real import SlackBot, SlackMessageHandler
+from src.agent_runtime import (
+    AgentRuntimeClient,
+    AgentRuntimeConflict,
+    AgentRuntimeError,
+    AgentRuntimeUnauthorized,
+)
+from slack.bot_real import SlackBot, SlackMessageHandler, _agent_idempotency_key
 
 
 @pytest.mark.asyncio
@@ -477,3 +482,223 @@ async def test_checked_continue_prompts_the_session_with_the_comment():
     posted = bot.web_client.chat_postMessage.await_args.kwargs
     assert posted["thread_ts"] == "100.1"
     assert "r2" in posted["text"]
+
+
+def _patch_action_ids(blocks):
+    return [
+        element["action_id"]
+        for block in blocks
+        if block["type"] == "actions"
+        for element in block["elements"]
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("feedback_enabled", [False, True])
+async def test_failed_run_with_retained_patch_offers_download_and_resume(
+    feedback_enabled,
+):
+    bot = _result_bot(feedback_enabled)
+    await SlackBot._post_agent_result(
+        bot,
+        {
+            "run_id": "r",
+            "session_id": "s",
+            "team_id": "T1",
+            "channel_id": "c",
+            "thread_ts": "t",
+        },
+        {"run_id": "r", "status": "failed", "patch_retained": True},
+    )
+    blocks = bot.web_client.chat_postMessage.await_args.kwargs["blocks"]
+    ids = _patch_action_ids(blocks)
+    assert ids[:2] == ["pi_agent_download_patch", "pi_agent_resume_from_patch"]
+    patch_block = next(
+        block
+        for block in blocks
+        if block["type"] == "actions"
+        and block["elements"][0]["action_id"] == "pi_agent_download_patch"
+    )
+    assert json.loads(patch_block["elements"][1]["value"]) == {
+        "run_id": "r",
+        "session_id": "s",
+        "team_id": "T1",
+        "channel_id": "c",
+        "thread_ts": "t",
+    }
+    if feedback_enabled:
+        assert blocks[-1]["elements"][0]["action_id"] == "pi_agent_accept_result"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "run",
+    [
+        {"run_id": "r", "status": "failed"},
+        {"run_id": "r", "status": "completed", "patch_retained": True},
+    ],
+)
+async def test_patch_buttons_need_an_undelivered_run_with_a_retained_patch(run):
+    bot = _result_bot()
+    await SlackBot._post_agent_result(
+        bot, {"run_id": "r", "channel_id": "c", "thread_ts": "t"}, run
+    )
+    blocks = bot.web_client.chat_postMessage.await_args.kwargs["blocks"]
+    assert _patch_action_ids(blocks) == []
+
+
+def _patch_bot(runtime, tracked=None):
+    bot = SlackBot(
+        {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+    )
+    bot.web_client = SimpleNamespace(
+        chat_postEphemeral=AsyncMock(),
+        chat_postMessage=AsyncMock(return_value={"ts": "200.1"}),
+        files_upload_v2=AsyncMock(),
+    )
+    bot._start_agent_monitor = Mock()
+    bot._persist_agent_run = AsyncMock()
+    if tracked:
+        bot.agent_runs[tracked["run_id"]] = tracked
+    return bot
+
+
+def _patch_click(action_id, user="owner"):
+    return {
+        "user": {"id": user},
+        "channel": {"id": "c"},
+        "team": {"id": "T1"},
+        "actions": [
+            {
+                "action_id": action_id,
+                "action_ts": "300.1",
+                "value": json.dumps(
+                    {
+                        "run_id": "r",
+                        "session_id": "s",
+                        "team_id": "T1",
+                        "channel_id": "c",
+                        "thread_ts": "t",
+                    }
+                ),
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_download_patch_uploads_the_redacted_patch_to_the_thread():
+    runtime = SimpleNamespace(
+        get_run_patch=AsyncMock(
+            return_value={"patch": b"diff --git a/a b/a\n", "truncated": False}
+        )
+    )
+    bot = _patch_bot(runtime)
+    await bot._handle_agent_interactive(_patch_click("pi_agent_download_patch"))
+    runtime.get_run_patch.assert_awaited_once_with("r", "owner")
+    upload = bot.web_client.files_upload_v2.await_args.kwargs
+    assert upload["channel"] == "c"
+    assert upload["thread_ts"] == "t"
+    assert upload["content"] == b"diff --git a/a b/a\n"
+    assert upload["filename"] == "pi-agent-r.patch"
+    assert "truncated" not in upload["initial_comment"]
+
+
+@pytest.mark.asyncio
+async def test_download_patch_says_when_the_patch_was_truncated():
+    runtime = SimpleNamespace(
+        get_run_patch=AsyncMock(return_value={"patch": b"x", "truncated": True})
+    )
+    bot = _patch_bot(runtime)
+    await bot._handle_agent_interactive(_patch_click("pi_agent_download_patch"))
+    assert (
+        "truncated"
+        in bot.web_client.files_upload_v2.await_args.kwargs["initial_comment"]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action_id", ["pi_agent_download_patch", "pi_agent_resume_from_patch"]
+)
+async def test_patch_actions_are_owner_only(action_id):
+    runtime = SimpleNamespace(get_run_patch=AsyncMock(), resume_from_patch=AsyncMock())
+    tracked = {
+        "run_id": "r",
+        "session_id": "s",
+        "team_id": "T1",
+        "channel_id": "c",
+        "thread_ts": "t",
+        "owner_user_id": "owner",
+    }
+    bot = _patch_bot(runtime, tracked)
+    await bot._handle_agent_interactive(_patch_click(action_id, user="intruder"))
+    runtime.get_run_patch.assert_not_awaited()
+    runtime.resume_from_patch.assert_not_awaited()
+    bot.web_client.files_upload_v2.assert_not_awaited()
+    text = bot.web_client.chat_postEphemeral.await_args.kwargs["text"]
+    assert "Only the user who started this Agent run" in text
+
+
+@pytest.mark.asyncio
+async def test_runtime_refusal_of_a_non_owner_patch_download_is_reported():
+    runtime = SimpleNamespace(
+        get_run_patch=AsyncMock(
+            side_effect=AgentRuntimeError(status=403, code="patch_forbidden")
+        )
+    )
+    bot = _patch_bot(runtime)
+    await bot._handle_agent_interactive(
+        _patch_click("pi_agent_download_patch", user="intruder")
+    )
+    bot.web_client.files_upload_v2.assert_not_awaited()
+    text = bot.web_client.chat_postEphemeral.await_args.kwargs["text"]
+    assert "Only the user who started this Agent run" in text
+
+
+@pytest.mark.asyncio
+async def test_resume_from_patch_starts_and_tracks_a_new_run_with_a_stable_key():
+    runtime = SimpleNamespace(
+        resume_from_patch=AsyncMock(
+            return_value={"session_id": "s", "run_id": "r2", "status": "starting"}
+        )
+    )
+    bot = _patch_bot(runtime)
+    await bot._handle_agent_interactive(_patch_click("pi_agent_resume_from_patch"))
+    await bot._handle_agent_interactive(_patch_click("pi_agent_resume_from_patch"))
+    first, second = runtime.resume_from_patch.await_args_list
+    assert first.args[:2] == ("r", "owner")
+    expected = _agent_idempotency_key("T1", "c", "r", "owner", "resume_from_patch")
+    assert first.args[2] == expected
+    assert second.args[2] == expected
+    tracked = bot.agent_runs["r2"]
+    assert tracked["owner_user_id"] == "owner"
+    assert (tracked["channel_id"], tracked["thread_ts"]) == ("c", "t")
+    assert tracked["status_ts"] == "200.1"
+    posted = bot.web_client.chat_postMessage.await_args.kwargs
+    assert posted["thread_ts"] == "t"
+    assert "`r`" in posted["text"] and "`r2`" in posted["text"]
+    bot._start_agent_monitor.assert_called_with(tracked)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "code, expected",
+    [
+        ("session_busy", "already has a run in progress"),
+        ("patch_conflict", "no longer applies cleanly"),
+        ("worktree_not_clean", "uncommitted changes"),
+        ("patch_truncated", "truncated"),
+    ],
+)
+async def test_resume_from_patch_refusals_are_explained(code, expected):
+    runtime = SimpleNamespace(
+        resume_from_patch=AsyncMock(
+            side_effect=AgentRuntimeConflict(status=409, code=code)
+        )
+    )
+    bot = _patch_bot(runtime)
+    await bot._handle_agent_interactive(_patch_click("pi_agent_resume_from_patch"))
+    bot._start_agent_monitor.assert_not_called()
+    assert "r2" not in bot.agent_runs
+    assert expected in bot.web_client.chat_postEphemeral.await_args.kwargs["text"]

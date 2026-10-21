@@ -37,6 +37,8 @@ function fixture(router?: { route(text?: string): Promise<any> }, quality?: any,
     inspectError: undefined as Error | undefined,
     rollbackError: undefined as Error | undefined,
     startedModels: [] as string[],
+    applied: [] as Array<{ path: string; file: string }>,
+    applyError: undefined as Error | undefined,
   };
   const worktrees = {
     create: async () => ({ path: "/managed/w1", branch: "pi-agent/20260801-run", baselineCommit: "a".repeat(40) }),
@@ -44,6 +46,7 @@ function fixture(router?: { route(text?: string): Promise<any> }, quality?: any,
     commit: async (_path: string, message: string) => { calls.commits += 1; calls.commitMessages.push(message); return calls.commitImpl(); },
     rollback: async (_path: string, baseline: string) => { calls.rollback.push(baseline); if (calls.rollbackError) throw calls.rollbackError; },
     remove: async () => undefined,
+    applyPatch: async (path: string, file: string) => { if (calls.applyError) throw calls.applyError; calls.applied.push({ path, file }); },
   };
   const orchestrator = new CodingAgentOrchestrator({
     worktrees,
@@ -1211,4 +1214,58 @@ test("a session's git mirror is persisted and handed to its restored container; 
   await second.orchestrator.restore();
   assert.deepEqual(started.find((session) => session.id === created.session_id), { id: created.session_id, gitDir: "/managed/mirrors/w1.git", restored: true });
   assert.deepEqual(started.find((session) => session.id === "L"), { id: "L", gitDir: undefined, restored: true });
+});
+
+async function failedRunWithPatch(thread: string, archived: string | null = "/runtime/artifacts/R/undelivered.patch") {
+  const f = fixture(undefined, undefined, undefined, { archivePatch: async () => archived ?? undefined });
+  const accepted = await f.orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: thread, user_id: "U", prompt: "add a widget counter" });
+  f.process.emit({ type: "settled", outcome: "aborted" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.orchestrator.getRun(accepted.run_id).status, "failed");
+  return { ...f, accepted };
+}
+
+test("resume from patch applies the retained patch to the session's clean worktree and starts a new run that says so", async () => {
+  const { orchestrator, process, calls, accepted } = await failedRunWithPatch("resume-patch");
+  const rollbacks = calls.rollback.length;
+  const resumed = await orchestrator.resumeFromPatch(accepted.run_id, "U");
+  assert.equal(resumed.session_id, accepted.session_id);
+  assert.equal(resumed.status, "starting");
+  assert.notEqual(resumed.run_id, accepted.run_id);
+  assert.deepEqual(calls.applied, [{ path: "/managed/w1", file: "/runtime/artifacts/R/undelivered.patch" }]);
+  assert.equal(calls.rollback.length, rollbacks, "the applied patch is not rolled back before the run");
+  const prompt = process.prompts.at(-1)!;
+  assert.equal(prompt.runId, resumed.run_id);
+  assert.match(prompt.prompt, new RegExp(`previous attempt's patch \\(run ${accepted.run_id}\\)`));
+  assert.match(prompt.prompt, /already applied/);
+  assert.match(prompt.prompt, /agent_aborted/);
+  assert.match(prompt.prompt, /add a widget counter/);
+  assert.equal(orchestrator.getRun(resumed.run_id).status, "running");
+  assert.equal(orchestrator.getRun(accepted.run_id).status, "failed", "the old run is left as it was");
+});
+
+test("resume from patch is owner-only, needs a terminal run with a retained patch and a free session", async () => {
+  const { orchestrator, accepted, calls } = await failedRunWithPatch("resume-patch-guards");
+  await assert.rejects(orchestrator.resumeFromPatch(accepted.run_id, "someone-else"), (error: any) => error.statusCode === 403 && error.code === "patch_forbidden");
+  await assert.rejects(orchestrator.resumeFromPatch("missing", "U"), (error: any) => error.statusCode === 404);
+  const resumed = await orchestrator.resumeFromPatch(accepted.run_id, "U");
+  await assert.rejects(orchestrator.resumeFromPatch(accepted.run_id, "U"), (error: any) => error.statusCode === 409 && error.code === "session_busy");
+  await assert.rejects(orchestrator.resumeFromPatch(resumed.run_id, "U"), (error: any) => error.statusCode === 409, "an active run cannot be resumed from");
+  assert.equal(calls.applied.length, 1);
+
+  const none = await failedRunWithPatch("resume-patch-none", null);
+  await assert.rejects(none.orchestrator.resumeFromPatch(none.accepted.run_id, "U"), (error: any) => error.statusCode === 404 && error.code === "patch_not_found");
+  assert.equal(none.calls.applied.length, 0);
+});
+
+test("a patch that does not apply cleanly is refused with 409 and leaves the session free", async () => {
+  const { PatchApplyError } = await import("../src/patch-archive.js");
+  const { orchestrator, process, calls, accepted } = await failedRunWithPatch("resume-patch-conflict");
+  const prompts = process.prompts.length;
+  calls.applyError = new PatchApplyError("patch_conflict", "The retained patch does not apply cleanly");
+  await assert.rejects(orchestrator.resumeFromPatch(accepted.run_id, "U"), (error: any) => error.statusCode === 409 && error.code === "patch_conflict");
+  assert.equal(process.prompts.length, prompts);
+  calls.applyError = undefined;
+  const next = await orchestrator.prompt(accepted.session_id, "try again", "U");
+  assert.equal(next.status, "starting");
 });

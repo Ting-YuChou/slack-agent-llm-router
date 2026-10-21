@@ -3,6 +3,8 @@ import { mkdir, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
+import { applyArchivedPatch } from "./patch-archive.js";
+
 const exec = promisify(execFile);
 
 export class WorktreeError extends Error {}
@@ -130,6 +132,12 @@ export class WorktreeManager {
     const mirror = await this.existingMirror(worktreePath);
     if (mirror) await this.publish(mirror, await this.sessionBranch(worktreePath));
     return this.git(worktreePath, "rev-parse", "HEAD");
+  }
+
+  /** Applies a run's archived patch to this clean managed worktree as uncommitted changes (see applyArchivedPatch). */
+  async applyPatch(worktreePath: string, patchFile: string): Promise<void> {
+    await this.assertManagedPath(worktreePath);
+    await applyArchivedPatch(worktreePath, patchFile);
   }
 
   async rollback(worktreePath: string, baselineCommit: string): Promise<void> {

@@ -19,6 +19,7 @@ import { computeHarnessMetrics, type HarnessMetrics } from "./harness-metrics.js
 import { summarizePolicy, type PolicyDecision, type PolicySummary } from "./policy-decision.js";
 import { redact } from "./telemetry.js";
 import { DEFAULT_DIFF_LIMITS, DiffLimitError } from "./worktree-manager.js";
+import { PatchApplyError } from "./patch-archive.js";
 import { MIN_CHECKS_WINDOW_MS, rejected, type WriterChecksRequest, type WriterChecksResponse } from "./writer-checks.js";
 import type { DiskQuota } from "./disk-usage.js";
 import type { AttemptStartup } from "./startup-timing.js";
@@ -227,6 +228,8 @@ interface Worktrees {
   commit(path: string, message: string): Promise<string>;
   rollback(path: string, baseline: string): Promise<void>;
   remove(path: string): Promise<void>;
+  /** Applies an archived patch to the clean worktree; throws PatchApplyError when it cannot. */
+  applyPatch?(path: string, patchFile: string): Promise<void>;
 }
 
 interface SessionRecord {
@@ -844,6 +847,30 @@ export class CodingAgentOrchestrator {
       const cause = failureCause(error);
       if (!isTerminal(run.status) && !this.terminalClaims.has(run.run_id)) await this.failRun(session, run, { code: 'investigation_unknown', message: 'Required investigation could not complete; evidence retained', ...(cause ? { cause_code: cause } : {}) });
     });
+  }
+
+  /** Starts a new run on the session with a terminal run's retained patch applied to its clean worktree. */
+  async resumeFromPatch(runId: string, userId: string): Promise<{ session_id: string; run_id: string; status: "starting" }> {
+    const run = this.requireRun(runId);
+    if (run.owner_user_id !== userId) throw new RuntimeError("Only the run owner can resume from its patch", "patch_forbidden", 403);
+    if (!isTerminal(run.status)) throw new RuntimeConflictError("Run is still active");
+    if (!run.patch_artifact) throw new RuntimeError("No patch was retained for this run", "patch_not_found", 404);
+    if (!this.worktrees.applyPatch) throw new RuntimeError("Resuming from a patch is unavailable", "patch_resume_unavailable", 503);
+    const session = this.requireSession(run.session_id);
+    if (session.activeRunId || this.pendingSessionIds.has(session.id) || this.closingSessionIds.has(session.id)) throw new RuntimeConflictError();
+    this.pendingSessionIds.add(session.id);
+    try { await this.worktrees.applyPatch(session.worktreePath, run.patch_artifact); }
+    catch (error) {
+      if (error instanceof PatchApplyError) throw new RuntimeError(error.message, error.code, 409, { cause: error });
+      throw error;
+    } finally { this.pendingSessionIds.delete(session.id); }
+    // prompt() claims the session synchronously, so nothing can start a run between the apply and it.
+    try {
+      return await this.prompt(session.id, resumeFromPatchPrompt(run), userId, run.workflow_requirement, run.task_id, run.workflow_mode, run.task_mode);
+    } catch (error) {
+      if (!session.activeRunId) await this.worktrees.rollback(session.worktreePath, session.baselineCommit).catch(() => undefined);
+      throw error;
+    }
   }
 
   tasks(runId: string): WorkflowNode[] { this.getRun(runId); return this.quality?.tasks?.(runId) ?? []; }
@@ -1601,6 +1628,17 @@ function validateSessionInput(input: SessionInput): void {
   if (input.routing_text !== undefined && typeof input.routing_text !== "string") {
     throw new RuntimeError("routing_text must be a string", "invalid_request", 400);
   }
+}
+
+function resumeFromPatchPrompt(run: RunRecord): string {
+  const outcome = run.error ? `${run.status} (${run.error.code}: ${run.error.message})` : run.status;
+  return [
+    `Continue from the previous attempt's patch (run ${run.run_id}).`,
+    "That attempt's retained, redacted patch is already applied to this worktree as uncommitted changes; review it before building on it.",
+    `The previous attempt ended ${outcome}.`,
+    `Task: ${run.workflow_requirement ?? run.task_summary ?? "the previous attempt's task"}`,
+    "Finish the task from these changes and fix what made the previous attempt fail.",
+  ].join("\n");
 }
 
 function isTerminal(status: RunStatus): boolean {

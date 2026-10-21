@@ -683,3 +683,77 @@ async def test_wait_for_update_keeps_an_absolute_cursor_across_the_event_cap(
 
     assert run["status"] == "completed"
     assert requests == ["13", "20", "20"]
+
+
+@pytest.mark.asyncio
+async def test_get_run_patch_reads_owner_patch_bytes_and_truncation(monkeypatch):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.url.params.get("user_id") == "other":
+            return httpx.Response(
+                403, json={"error": {"code": "patch_forbidden", "message": "no"}}
+            )
+        if request.url.path == "/v1/runs/none/patch":
+            return httpx.Response(
+                404, json={"error": {"code": "patch_not_found", "message": "no"}}
+            )
+        return httpx.Response(
+            200,
+            content=b"diff --git a/a b/a\n\xff\n",
+            headers={
+                "content-type": "text/x-diff; charset=utf-8",
+                "x-patch-truncated": "true",
+                "x-patch-bytes": "5002",
+            },
+        )
+
+    runtime = client(handler, monkeypatch)
+    try:
+        patch = await runtime.get_run_patch("run/1", "U1")
+        with pytest.raises(AgentRuntimeError) as forbidden:
+            await runtime.get_run_patch("r", "other")
+        with pytest.raises(AgentRuntimeError) as missing:
+            await runtime.get_run_patch("none", "U1")
+    finally:
+        await runtime.close()
+    assert patch == {
+        "patch": b"diff --git a/a b/a\n\xff\n",
+        "truncated": True,
+        "bytes": 5002,
+    }
+    assert requests[0].method == "GET"
+    assert requests[0].url.raw_path == b"/v1/runs/run%2F1/patch?user_id=U1"
+    assert requests[0].headers["authorization"] == "Bearer runtime-token"
+    assert (forbidden.value.status, forbidden.value.code) == (403, "patch_forbidden")
+    assert (missing.value.status, missing.value.code) == (404, "patch_not_found")
+
+
+@pytest.mark.asyncio
+async def test_resume_from_patch_posts_owner_with_idempotency_key(monkeypatch):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if json.loads(request.content)["user_id"] == "busy":
+            return httpx.Response(
+                409, json={"error": {"code": "patch_conflict", "message": "no"}}
+            )
+        return httpx.Response(
+            202, json={"session_id": "S1", "run_id": "R2", "status": "starting"}
+        )
+
+    runtime = client(handler, monkeypatch)
+    try:
+        accepted = await runtime.resume_from_patch("R1", "U1", "slack-key-1")
+        with pytest.raises(AgentRuntimeConflict) as conflict:
+            await runtime.resume_from_patch("R1", "busy", "slack-key-2")
+    finally:
+        await runtime.close()
+    assert accepted == {"session_id": "S1", "run_id": "R2", "status": "starting"}
+    assert requests[0].method == "POST"
+    assert requests[0].url.path == "/v1/runs/R1/resume-from-patch"
+    assert json.loads(requests[0].content) == {"user_id": "U1"}
+    assert requests[0].headers["idempotency-key"] == "slack-key-1"
+    assert conflict.value.code == "patch_conflict"

@@ -178,3 +178,22 @@ test("a legacy session on the shared repository metadata still commits, rolls ba
   assert.equal(writerGitDir({}, shared), shared);
   assert.equal(writerGitDir({ gitDir: "/mirrors/s.git" }, shared), "/mirrors/s.git");
 });
+
+test("applyPatch reapplies a rolled-back session's archived patch and refuses paths it does not manage", async () => {
+  const { archivePatch } = await import("../src/patch-archive.js");
+  const { repo, worktrees } = await fixture();
+  const manager = new WorktreeManager({ repoPath: repo, worktreeRoot: worktrees, baseRef: "HEAD" });
+  const created = await manager.create("run-apply");
+  await writeFile(path.join(created.path, "tracked.txt"), "attempt one\n");
+  await writeFile(path.join(created.path, "added.txt"), "added\n");
+  const file = path.join(await mkdtemp(path.join(tmpdir(), "pi-patch-")), "undelivered.patch");
+  assert.ok(await archivePatch({ worktree: created.path, baseline: created.baselineCommit, file }));
+  await manager.rollback(created.path, created.baselineCommit);
+
+  await manager.applyPatch(created.path, file);
+
+  assert.equal(await readFile(path.join(created.path, "tracked.txt"), "utf8"), "attempt one\n");
+  assert.equal(await readFile(path.join(created.path, "added.txt"), "utf8"), "added\n");
+  assert.equal(await git(created.path, "rev-parse", "HEAD"), created.baselineCommit);
+  await assert.rejects(manager.applyPatch(repo, file));
+});

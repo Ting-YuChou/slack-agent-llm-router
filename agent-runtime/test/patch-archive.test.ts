@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 
-import { archivePatch, undeliveredPatchPath } from "../src/patch-archive.js";
+import { applyArchivedPatch, archivePatch, PatchApplyError, readArchivedPatch, undeliveredPatchPath } from "../src/patch-archive.js";
 
 const exec = promisify(execFile);
 
@@ -77,4 +77,65 @@ test("a patch over the cap is truncated and marked", async t => {
 test("rejects a baseline that is not a commit id", async t => {
   const { root, worktree } = await repo(t);
   await assert.rejects(archivePatch({ worktree, baseline: "--output=/tmp/x", file: path.join(root, "x.patch") }), /Invalid baseline/);
+});
+
+test("reading an archived patch redacts it again and reports a missing file as undefined", async t => {
+  const { root } = await repo(t);
+  const file = path.join(root, "kept.patch");
+  await writeFile(file, "+OPENAI_API_KEY=sk-planted-0123456789abcdef\n+runtime-token-xyz\n");
+  const read = await readArchivedPatch(file, { secrets: ["runtime-token-xyz"] });
+  assert.ok(read);
+  assert.equal(read.truncated, false);
+  const text = read.data.toString("utf8");
+  assert.doesNotMatch(text, /sk-planted-0123456789abcdef|runtime-token-xyz/);
+  assert.match(text, /\[REDACTED\]/);
+  assert.equal(await readArchivedPatch(path.join(root, "gone.patch")), undefined);
+});
+
+test("a patch over the read cap is cut there and marked as truncated", async t => {
+  const { root } = await repo(t);
+  const file = path.join(root, "big.patch");
+  await writeFile(file, "+" + "y".repeat(10_000) + "\n");
+  const read = await readArchivedPatch(file, { maxBytes: 1024 });
+  assert.ok(read?.truncated);
+  assert.equal(read.bytes, 10_002);
+  const text = read.data.toString("utf8");
+  assert.ok(text.startsWith("+" + "y".repeat(1023)));
+  assert.match(text, /\n# \[pi-agent\] patch truncated at 1024 of 10002 bytes for download\n$/);
+});
+
+test("an archived patch reapplies onto a clean worktree as uncommitted changes", async t => {
+  const { root, worktree, baseline } = await repo(t);
+  await writeFile(path.join(worktree, "a.txt"), "two\n");
+  await writeFile(path.join(worktree, "new.txt"), "brand new\n");
+  const file = path.join(root, "kept.patch");
+  assert.ok(await archivePatch({ worktree, baseline, file }));
+  await exec("git", ["reset", "-q", "--hard", baseline], { cwd: worktree });
+  await exec("git", ["clean", "-qfd"], { cwd: worktree });
+  await applyArchivedPatch(worktree, file);
+  assert.equal(await readFile(path.join(worktree, "a.txt"), "utf8"), "two\n");
+  assert.equal(await readFile(path.join(worktree, "new.txt"), "utf8"), "brand new\n");
+  assert.equal((await exec("git", ["rev-parse", "HEAD"], { cwd: worktree })).stdout.trim(), baseline);
+});
+
+test("applying refuses a dirty worktree, a conflicting patch and a truncated archive without changing files", async t => {
+  const { root, worktree, baseline } = await repo(t);
+  await writeFile(path.join(worktree, "a.txt"), "two\n");
+  const file = path.join(root, "kept.patch");
+  assert.ok(await archivePatch({ worktree, baseline, file }));
+  // Still dirty with the patch's own change.
+  await assert.rejects(applyArchivedPatch(worktree, file), (error: unknown) => error instanceof PatchApplyError && error.code === "worktree_not_clean");
+  await exec("git", ["reset", "-q", "--hard", baseline], { cwd: worktree });
+  await writeFile(path.join(worktree, "a.txt"), "moved on\n");
+  await exec("git", ["-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qam", "moved"], { cwd: worktree });
+  await assert.rejects(applyArchivedPatch(worktree, file), (error: unknown) => error instanceof PatchApplyError && error.code === "patch_conflict");
+  assert.equal(await readFile(path.join(worktree, "a.txt"), "utf8"), "moved on\n");
+  await writeFile(path.join(worktree, "big.txt"), "z".repeat(200_000) + "\n");
+  const truncated = path.join(root, "truncated.patch");
+  const archived = await archivePatch({ worktree, baseline: (await exec("git", ["rev-parse", "HEAD"], { cwd: worktree })).stdout.trim(), file: truncated, maxBytes: 4096 });
+  assert.ok(archived?.truncated);
+  await exec("git", ["reset", "-q", "--hard"], { cwd: worktree });
+  await exec("git", ["clean", "-qfd"], { cwd: worktree });
+  await assert.rejects(applyArchivedPatch(worktree, truncated), (error: unknown) => error instanceof PatchApplyError && error.code === "patch_truncated");
+  await assert.rejects(access(path.join(worktree, "big.txt")));
 });

@@ -260,6 +260,24 @@ AGENT_START_ERROR_TEXT = {
 }
 
 
+AGENT_PATCH_OWNER_TEXT = "Only the user who started this Agent run can use its patch."
+AGENT_PATCH_RESUME_ERROR_TEXT = {
+    "session_busy": AGENT_START_ERROR_TEXT["session_busy"],
+    "patch_conflict": (
+        "The kept patch no longer applies cleanly to this session's worktree; "
+        "download it or start a new task."
+    ),
+    "worktree_not_clean": (
+        "This session's worktree has uncommitted changes, so the kept patch "
+        "was not applied."
+    ),
+    "patch_truncated": (
+        "The kept patch was truncated when it was archived, so it cannot be "
+        "resumed; download it instead."
+    ),
+}
+
+
 AGENT_RESULT_BLOCK_CHARS = 3000
 AGENT_RESULT_BLOCKS_PER_MESSAGE = 10
 AGENT_RESULT_MAX_CHARS = 60000
@@ -4534,6 +4552,38 @@ class SlackBot:
                     ],
                 },
             ]
+        if (
+            run.get("status") in AGENT_TERMINAL_STATUSES
+            and run.get("status") != "completed"
+            and run.get("patch_retained") is True
+        ):
+            patch_value = json.dumps(
+                {
+                    "run_id": run["run_id"],
+                    "session_id": tracked.get("session_id") or run.get("session_id"),
+                    "team_id": tracked.get("team_id"),
+                    "channel_id": tracked["channel_id"],
+                    "thread_ts": tracked["thread_ts"],
+                }
+            )
+            actions.insert(
+                0,
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "action_id": action_id,
+                            "text": {"type": "plain_text", "text": label},
+                            "value": patch_value,
+                        }
+                        for action_id, label in [
+                            ("pi_agent_download_patch", "Download patch"),
+                            ("pi_agent_resume_from_patch", "Resume from patch"),
+                        ]
+                    ],
+                },
+            )
         for index, message_chunks in enumerate(messages):
             blocks: List[Dict[str, Any]] = [
                 {"type": "section", "text": {"type": "mrkdwn", "text": chunk}}
@@ -4923,6 +4973,12 @@ class SlackBot:
             return
         action = actions[0]
         if action.get("action_id") in {
+            "pi_agent_download_patch",
+            "pi_agent_resume_from_patch",
+        }:
+            await self._handle_agent_patch_action(payload, action)
+            return
+        if action.get("action_id") in {
             "pi_agent_accept_result",
             "pi_agent_needs_changes",
         }:
@@ -5041,6 +5097,113 @@ class SlackBot:
         if approval_id not in tracked.setdefault("posted_approval_ids", []):
             tracked["posted_approval_ids"].append(approval_id)
         self._start_agent_monitor(tracked)
+
+    async def _handle_agent_patch_action(
+        self, payload: Dict[str, Any], action: Dict[str, Any]
+    ) -> None:
+        """Download a failed run's kept patch, or start a new run from it (owner only)."""
+        user_id = payload.get("user", {}).get("id")
+        try:
+            value = json.loads(action.get("value", "{}"))
+            run_id = value["run_id"]
+        except (KeyError, TypeError, ValueError):
+            return
+        tracked = self.agent_runs.get(run_id) or {}
+        channel_id = (
+            value.get("channel_id")
+            or tracked.get("channel_id")
+            or payload.get("channel", {}).get("id")
+        )
+        thread_ts = value.get("thread_ts") or tracked.get("thread_ts")
+        team = payload.get("team")
+        team_id = (
+            value.get("team_id")
+            or tracked.get("team_id")
+            or (team.get("id") if isinstance(team, dict) else None)
+        )
+        if not user_id or not channel_id or not thread_ts:
+            return
+
+        async def tell(text: str) -> None:
+            await self.web_client.chat_postEphemeral(
+                channel=channel_id, user=user_id, text=text
+            )
+
+        if tracked and tracked.get("owner_user_id") != user_id:
+            await tell(AGENT_PATCH_OWNER_TEXT)
+            return
+        runtime = self.agent_runtime_client
+        if action["action_id"] == "pi_agent_download_patch":
+            try:
+                patch = await runtime.get_run_patch(run_id, user_id)
+            except AgentRuntimeError as exc:
+                await tell(self._agent_patch_error_text(exc))
+                return
+            comment = f"Kept patch of Agent run `{run_id}` (secrets redacted)."
+            if patch.get("truncated"):
+                comment += " It was truncated to the download size limit."
+            try:
+                await self.web_client.files_upload_v2(
+                    channel=channel_id,
+                    thread_ts=thread_ts,
+                    content=patch["patch"],
+                    filename=f"pi-agent-{run_id}.patch",
+                    title=f"Agent run {run_id} patch",
+                    initial_comment=comment,
+                )
+            except Exception:
+                logger.warning("Agent patch upload failed for %s", run_id)
+                await tell(
+                    "The patch could not be uploaded to Slack. Please try again."
+                )
+            return
+        try:
+            accepted = await runtime.resume_from_patch(
+                run_id,
+                user_id,
+                # One resume per run and owner, however often the button is clicked.
+                _agent_idempotency_key(
+                    team_id, channel_id, run_id, user_id, "resume_from_patch"
+                ),
+            )
+        except AgentRuntimeError as exc:
+            await tell(self._agent_patch_error_text(exc))
+            return
+        resumed = self._track_agent_run(
+            accepted,
+            team_id=team_id or "unknown-team",
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            owner_user_id=user_id,
+            mode=tracked.get("mode"),
+        )
+        text = (
+            f"🛠️ Pi coding agent resumed from the kept patch of run `{run_id}` "
+            f"as run `{accepted['run_id']}`."
+        )
+        posted = await self.web_client.chat_postMessage(
+            channel=channel_id, thread_ts=thread_ts, text=text
+        )
+        status_ts = posted.get("ts") if hasattr(posted, "get") else None
+        if status_ts:
+            # The monitor keeps this message current with the run's progress.
+            resumed["status_ts"] = status_ts
+            resumed["status_text"] = text
+        self._start_agent_monitor(resumed)
+
+    @staticmethod
+    def _agent_patch_error_text(exc: AgentRuntimeError) -> str:
+        if isinstance(exc, AgentRuntimeUnauthorized) or exc.status == 403:
+            return _agent_auth_error_text(exc, AGENT_PATCH_OWNER_TEXT)
+        if exc.status == 404:
+            return "No kept patch is available for this Agent run any more."
+        known = AGENT_PATCH_RESUME_ERROR_TEXT.get(exc.code or "")
+        if known:
+            return known
+        if isinstance(exc, AgentRuntimeConflict):
+            return "This Agent run cannot be resumed from its patch right now."
+        logger.warning("Agent patch action failed (code=%s)", exc.code)
+        return "The Agent patch action failed. Please try again."
 
     def _mark_thread_active(self, channel_id: Optional[str], thread_ts: Optional[str]):
         """Mark a bot thread as active for follow-up replies."""
