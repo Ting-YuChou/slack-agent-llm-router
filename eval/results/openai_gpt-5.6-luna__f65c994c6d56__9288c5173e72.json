@@ -1,0 +1,265 @@
+{
+  "key": "openai_gpt-5.6-luna__f65c994c6d56__9288c5173e72",
+  "model": "openai/gpt-5.6-luna",
+  "prompt_version": "f65c994c6d56",
+  "profile_checksum": "9288c5173e72dd3dddcc827c2b1c6bde764fdd1332ba6e1c5035e8d016839043",
+  "created_at": "2026-10-21T05:28:48+00:00",
+  "repeats": 3,
+  "summary": {
+    "runs": 3,
+    "pass_at_1": 1.0,
+    "grader_oracle_agreement": 1.0,
+    "cost_usd_p50": 0.05507644,
+    "wall_time_s_p50": 83.60785070806742,
+    "wall_time_s_total": 237.73003154201433,
+    "grader_unknown_rate": 0.0,
+    "first_attempt_pass_rate": 0.0,
+    "repair_success_rate": 1.0,
+    "tool_util_p50": 0.375,
+    "approvals_p50": 1,
+    "policy_blocks_p50": 0,
+    "startup_s_p50": 0.7,
+    "repair_startup_s_p50": 0.1,
+    "tasks": {
+      "hidden-rule-repair": {
+        "runs": 3,
+        "passes": 3,
+        "failure_codes": {},
+        "pass_at_1": 1.0
+      }
+    },
+    "spent_usd": 0.17233514,
+    "budget_exhausted": false
+  },
+  "contract_failures": [],
+  "records": [
+    {
+      "task_id": "hidden-rule-repair",
+      "attempt": 0,
+      "expect": "pass",
+      "passed": true,
+      "reason": "repaired in a reused writer",
+      "status": "completed",
+      "verification": "passed",
+      "grader": "passed",
+      "oracle": "passed",
+      "commit": "6d9b48dec1760bfa07a8fa02e9ea5edf08a43bd8",
+      "changed_files": [
+        "src/slug.cjs"
+      ],
+      "cost_usd": 0.05507644,
+      "wall_time_s": 85.02464279194828,
+      "run_id": "8eeaec62-0b74-4088-9852-d78b5080a0a2",
+      "error_code": null,
+      "error_message": null,
+      "error_cause_code": null,
+      "grader_cause": null,
+      "prompts_version": "593085a54143",
+      "approvals": {
+        "requested": 1,
+        "approved": 1,
+        "rejected": 0,
+        "expired": 0,
+        "wait_ms": 123
+      },
+      "writer_checks_calls": null,
+      "policy_summary": {
+        "allow": 3,
+        "block": 0,
+        "approval": 0,
+        "approved": 0,
+        "by_reason": {
+          "write_approval_off": 3
+        }
+      },
+      "harness_metrics": {
+        "outcome": "completed",
+        "turn_util": 0.7,
+        "tool_util": 0.375,
+        "attempts": 3,
+        "first_attempt_pass": false,
+        "repair_success": true,
+        "writer_checks_calls": 0,
+        "approvals": 1,
+        "policy_blocks": 0,
+        "fixed_files": 0,
+        "cost_usd": 0.05507644,
+        "wall_s": 80,
+        "active_s": 80,
+        "human_wait_s": 0,
+        "time_to_first_edit_s": 12,
+        "startup_s": 0.7,
+        "repair_startup_s": 0.1
+      },
+      "attempts": [
+        {
+          "verification": "failed",
+          "grader": "pending",
+          "reused": false
+        },
+        {
+          "verification": "failed",
+          "grader": "pending",
+          "reused": true
+        },
+        {
+          "verification": "passed",
+          "grader": "passed",
+          "reused": true
+        }
+      ]
+    },
+    {
+      "task_id": "hidden-rule-repair",
+      "attempt": 1,
+      "expect": "pass",
+      "passed": true,
+      "reason": "repaired in a reused writer",
+      "status": "completed",
+      "verification": "passed",
+      "grader": "passed",
+      "oracle": "passed",
+      "commit": "d1c6d108488a34558241d950bb6a5166ce7fafb0",
+      "changed_files": [
+        "src/slug.cjs"
+      ],
+      "cost_usd": 0.0530326,
+      "wall_time_s": 69.09753804199863,
+      "run_id": "5eac6a1a-f66d-494f-a637-75985f1bd2fe",
+      "error_code": null,
+      "error_message": null,
+      "error_cause_code": null,
+      "grader_cause": null,
+      "prompts_version": "593085a54143",
+      "approvals": {
+        "requested": 1,
+        "approved": 1,
+        "rejected": 0,
+        "expired": 0,
+        "wait_ms": 343
+      },
+      "writer_checks_calls": null,
+      "policy_summary": {
+        "allow": 3,
+        "block": 0,
+        "approval": 0,
+        "approved": 0,
+        "by_reason": {
+          "write_approval_off": 3
+        }
+      },
+      "harness_metrics": {
+        "outcome": "completed",
+        "turn_util": 0.6,
+        "tool_util": 0.3,
+        "attempts": 3,
+        "first_attempt_pass": false,
+        "repair_success": true,
+        "writer_checks_calls": 0,
+        "approvals": 1,
+        "policy_blocks": 0,
+        "fixed_files": 0,
+        "cost_usd": 0.0530326,
+        "wall_s": 65,
+        "active_s": 65,
+        "human_wait_s": 0,
+        "time_to_first_edit_s": 6.5,
+        "startup_s": 0.6,
+        "repair_startup_s": 0.1
+      },
+      "attempts": [
+        {
+          "verification": "failed",
+          "grader": "pending",
+          "reused": false
+        },
+        {
+          "verification": "failed",
+          "grader": "pending",
+          "reused": true
+        },
+        {
+          "verification": "passed",
+          "grader": "passed",
+          "reused": true
+        }
+      ]
+    },
+    {
+      "task_id": "hidden-rule-repair",
+      "attempt": 2,
+      "expect": "pass",
+      "passed": true,
+      "reason": "repaired in a reused writer",
+      "status": "completed",
+      "verification": "passed",
+      "grader": "passed",
+      "oracle": "passed",
+      "commit": "d938bdbbe7f65bf7b6b63ecef7aed3c75fdad0cf",
+      "changed_files": [
+        "src/slug.cjs"
+      ],
+      "cost_usd": 0.06422610000000001,
+      "wall_time_s": 83.60785070806742,
+      "run_id": "2a97b1ce-12fb-4aff-8e09-5531960334c1",
+      "error_code": null,
+      "error_message": null,
+      "error_cause_code": null,
+      "grader_cause": null,
+      "prompts_version": "593085a54143",
+      "approvals": {
+        "requested": 1,
+        "approved": 1,
+        "rejected": 0,
+        "expired": 0,
+        "wait_ms": 34
+      },
+      "writer_checks_calls": null,
+      "policy_summary": {
+        "allow": 3,
+        "block": 0,
+        "approval": 0,
+        "approved": 0,
+        "by_reason": {
+          "write_approval_off": 3
+        }
+      },
+      "harness_metrics": {
+        "outcome": "completed",
+        "turn_util": 0.65,
+        "tool_util": 0.4,
+        "attempts": 3,
+        "first_attempt_pass": false,
+        "repair_success": true,
+        "writer_checks_calls": 0,
+        "approvals": 1,
+        "policy_blocks": 0,
+        "fixed_files": 0,
+        "cost_usd": 0.06422610000000001,
+        "wall_s": 78.5,
+        "active_s": 78.5,
+        "human_wait_s": 0,
+        "time_to_first_edit_s": 9.3,
+        "startup_s": 0.7,
+        "repair_startup_s": 0.1
+      },
+      "attempts": [
+        {
+          "verification": "failed",
+          "grader": "pending",
+          "reused": false
+        },
+        {
+          "verification": "failed",
+          "grader": "pending",
+          "reused": true
+        },
+        {
+          "verification": "passed",
+          "grader": "passed",
+          "reused": true
+        }
+      ]
+    }
+  ]
+}
