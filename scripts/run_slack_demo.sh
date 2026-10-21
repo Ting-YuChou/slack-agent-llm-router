@@ -332,6 +332,15 @@ if [[ "${DEMO_TEST_MODE:-0}" != 1 ]]; then
   fi
 fi
 
+# Each agent session gets its own internal network; these gateways are attached to it under their aliases.
+if [[ -z "${PI_AGENT_NETWORK_ATTACH:-}" ]]; then
+  network_attach="${gateway_container}=model-gateway"
+  if [[ "${mcp_gateway_started}" == true ]]; then network_attach+=",${mcp_gateway_container}=mcp-github"; fi
+  if [[ "${clickhouse_gateway_started}" == true ]]; then network_attach+=",${clickhouse_gateway_container}=mcp-clickhouse-gateway"; fi
+  if [[ "${context7_gateway_started}" == true ]]; then network_attach+=",${context7_gateway_container}=mcp-context7"; fi
+  export PI_AGENT_NETWORK_ATTACH="${network_attach}"
+fi
+
 runtime_github_env=(-u GITHUB_APP_ID -u GITHUB_APP_INSTALLATION_ID -u GITHUB_APP_PRIVATE_KEY_PATH)
 if [[ "${PI_AGENT_CI_REPAIR_ENABLED:-false}" == true ]]; then runtime_github_env=(); fi
 env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u OPENCODE_API_KEY \
