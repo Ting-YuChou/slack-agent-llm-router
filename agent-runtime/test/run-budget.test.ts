@@ -51,3 +51,11 @@ test("a run's own default budget stops when the run ends, so its token can spend
   releaseRunBudget({ run_id: "exec-1", status: "failed" }, new Map([["exec-1", "workflow-1"]]), book);
   assert.deepEqual(stopped, ["run-1"], "only terminal runs on their own default budget are stopped");
 });
+
+test("every way a run can end stops its own budget, including a rejected approval", () => {
+  for (const status of ["completed", "failed", "cancelled", "timed_out", "rejected"]) {
+    const stopped: string[] = [];
+    releaseRunBudget({ run_id: "run-1", status }, new Map(), { stop: (id: string) => { stopped.push(id); } });
+    assert.deepEqual(stopped, ["run-1"], status);
+  }
+});
