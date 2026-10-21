@@ -8,7 +8,7 @@ import { agentScheduler } from "../src/agent-scheduler.js";
 import { DockerPiProcess } from "../src/container-runtime.js";
 import { CodingAgentOrchestrator } from "../src/orchestrator.js";
 import type { PublicRunEvent } from "../src/pi-rpc.js";
-import { MCP_REUSE_MAX_AGE_MS, writerReuseOptions } from "../src/server.js";
+import { cleanupOrphanAgentContainers, MCP_REUSE_MAX_AGE_MS, writerReuseOptions } from "../src/server.js";
 import { validateProfile } from "../src/verification.js";
 import { FAKE_DOCKER } from "./support/fake-docker.js";
 
@@ -154,6 +154,23 @@ test("a paused writer older than its reuse age limit is stopped and the repair c
     done = settled(); process.prompt("exec-2", "repair", route); await done;
     assert.deepEqual(await log(), ["run", "credential token-exec-1", "pause", "unpause", "stop", "run", "credential token-exec-2", "pause"]);
   });
+});
+
+test("startup unpauses a writer a crashed runtime left paused before stopping every orphan", async () => {
+  const calls: string[] = [];
+  const docker = async (args: string[]) => {
+    calls.push(args.join(" "));
+    if (args[0] !== "ps") return "";
+    return args.includes("status=paused") ? "paused-1\n" : "running-1\npaused-1\n";
+  };
+  await cleanupOrphanAgentContainers(docker);
+  assert.ok(calls.indexOf("unpause paused-1") >= 0, calls.join("\n"));
+  assert.ok(calls.indexOf("unpause paused-1") < calls.indexOf("stop --time 5 paused-1"), calls.join("\n"));
+  assert.ok(calls.includes("stop --time 5 running-1"), calls.join("\n"));
+  assert.ok(!calls.includes("unpause running-1"), calls.join("\n"));
+  // An unpause that fails still leaves stop to try; a stop that fails refuses startup.
+  await cleanupOrphanAgentContainers(async (args) => { if (args[0] === "unpause") throw new Error("not paused"); return args[0] === "ps" ? "paused-1\n" : ""; });
+  await assert.rejects(cleanupOrphanAgentContainers(async (args) => { if (args[0] === "stop") throw new Error("paused"); return args[0] === "ps" ? "paused-1\n" : ""; }), /refusing rollback\/startup/);
 });
 
 class OrderedProcess {

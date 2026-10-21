@@ -759,12 +759,15 @@ async function refuseUnpatchedDocker(): Promise<void> {
   if (engineVulnerable(version)) throw new Error(`Docker Engine ${version} lacks the CVE-2024-29018 fix (need 23.0.11, 25.0.5 or 26.0.0+); refusing to start`);
 }
 
-async function cleanupOrphanAgentContainers(): Promise<void> {
+export async function cleanupOrphanAgentContainers(
+  docker: (args: string[]) => Promise<string> = async (args) => (await exec("docker", args, { encoding: "utf8" })).stdout,
+): Promise<void> {
+  const list = async (...filters: string[]) => (await docker(["ps", "-q", "--filter", "label=slack-pi-agent-session=true", ...filters]))
+    .split("\n").map((value) => value.trim()).filter(Boolean);
   try {
-    const output = (await exec("docker", ["ps", "-q", "--filter", "label=slack-pi-agent-session=true"], { encoding: "utf8" })).stdout;
-    for (const containerId of output.split("\n").map((value) => value.trim()).filter(Boolean)) {
-      await exec("docker", ["stop", "--time", "5", containerId], { encoding: "utf8" });
-    }
+    // A writer kept paused for reuse when the runtime died; some engines refuse to stop a paused container.
+    for (const containerId of await list("--filter", "status=paused")) await docker(["unpause", containerId]).catch(() => "");
+    for (const containerId of await list()) await docker(["stop", "--time", "5", containerId]);
   } catch {
     throw new Error("Cannot confirm all orphan writers/verifiers/graders stopped; refusing rollback/startup");
   }
