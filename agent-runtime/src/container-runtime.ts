@@ -431,9 +431,12 @@ export class DockerPiProcess implements AgentProcess {
     return true;
   }
 
-  /** Stops a writer kept paused for reuse and frees its slot; nothing to do when none is paused. */
+  /**
+   * Stops a writer kept for reuse and frees its slot. Not only a paused one: a kept container that died
+   * on its own is no longer paused but still holds the slot until it is stopped. A no-op once stopped.
+   */
   async release(): Promise<void> {
-    if (this.paused) await this.stopActiveContainer();
+    await this.stopActiveContainer();
   }
   decide(rpcUiId: string, approved: boolean): void { if(this.activeRunId) this.tracing?.approval(this.activeRunId,rpcUiId,approved); this.bridge?.respondToUi(rpcUiId, approved); }
   respondUi(rpcUiId: string, response: UiResponse): void { this.bridge?.respondUi(rpcUiId, response); }

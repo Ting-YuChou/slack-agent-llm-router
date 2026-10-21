@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { agentScheduler } from "../src/agent-scheduler.js";
 import { DockerPiProcess } from "../src/container-runtime.js";
 import { CodingAgentOrchestrator } from "../src/orchestrator.js";
 import type { PublicRunEvent } from "../src/pi-rpc.js";
@@ -114,6 +115,32 @@ test("a paused writer is not reused for a different model, and discussions are n
     assert.deepEqual(await log(), ["run", "credential token-exec-1", "pause", "unpause", "stop", "run", "credential token-exec-2", "pause"]);
     done = settled(); process.prompt("exec-3", "explain", route, "discuss"); await done;
     assert.deepEqual((await log()).slice(-3), ["run", "credential token-exec-3", "stop"]);
+  });
+});
+
+/** How many agent containers could start right now (the scheduler is process-wide). */
+async function freeSlots(): Promise<number> {
+  const releases: Array<() => void> = [];
+  for (let i = 0; i < agentScheduler.limit; i++) {
+    try { releases.push(await agentScheduler.acquire(`probe-${i}`, AbortSignal.timeout(50))); } catch { break; }
+  }
+  for (const release of releases) release();
+  return releases.length;
+}
+
+test("a kept writer whose container died on its own still frees its execution slot when released", { timeout: 30_000 }, async () => {
+  await withFakeDocker(true, async ({ dir, process: piProcess, settled }) => {
+    const done = settled(); piProcess.prompt("exec-1", "fix", route); await done;
+    assert.equal(await freeSlots(), agentScheduler.limit - 1, "the paused writer holds its slot");
+    const pid = Number(await readFile(path.join(dir, "run.pid"), "utf8"));
+    process.kill(pid, "SIGTERM");
+    for (let i = 0; i < 200; i++) {
+      try { process.kill(pid, 0); } catch { break; }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await piProcess.release();
+    assert.equal(await freeSlots(), agentScheduler.limit);
   });
 });
 
