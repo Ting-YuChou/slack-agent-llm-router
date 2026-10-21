@@ -17,6 +17,7 @@ import { taskMode, type TaskMode } from "./task-mode.js";
 import { agentScheduler } from "./agent-scheduler.js";
 import type { DiffLimits } from "./worktree-manager.js";
 import { RESOURCE_LIMIT_FLAGS } from "./container-flags.js";
+import { CREDENTIAL_PLACEHOLDER, type RunCredentials } from "./run-credentials.js";
 
 export interface AgentContainerOptions {
   taskMode?: TaskMode;
@@ -30,8 +31,8 @@ export interface AgentContainerOptions {
   gitMetadataPath: string;
   sessionStatePath: string;
   gatewayUrl: string;
-  gatewayToken: string;
-  classifierGatewayToken?: string;
+  /** Enables the run-time Jev classifier; its token, like the model's, reaches Pi only through the credential dialog. */
+  classifier?: boolean;
   modelRef: string;
   reasoningEffort?: AgentReasoningEffort;
   extensionPaths: string[];
@@ -66,36 +67,31 @@ export interface WriterContext { allowedPaths: string[]; checks: string[]; rubri
 
 const exec = promisify(execFile);
 
-/** Discussion runs get neither MCP nor the classifier; mirror buildAgentDockerArgs so secrets match the argv names. */
-function effectiveSecrets(options: AgentContainerOptions): Record<string, string> {
-  const discuss = taskMode(options.taskMode) === "discuss";
-  const model = resolveAgentModel(options.modelRef);
-  return {
-    [model.credentialEnv]: options.gatewayToken,
-    ...(!discuss && options.classifierGatewayToken ? { OPENROUTER_API_KEY: options.classifierGatewayToken } : {}),
-    ...(!discuss && options.mcp ? { PI_AGENT_MCP_SERVERS_JSON: JSON.stringify(options.mcp.servers) } : {}),
-  };
-}
-
 /**
- * Credentials reach the container as `--env NAME` resolved from the docker client's own environment,
- * so they never appear on the host process list or in shell history.
+ * MCP configuration reaches the container as `--env NAME` resolved from the docker client's own
+ * environment, so it never appears on the host process list. Gateway tokens are not here at all: the
+ * container starts with a placeholder and Pi asks for each execution's tokens (CREDENTIAL_DIALOG).
+ * Discussion runs get no MCP; this mirrors buildAgentDockerArgs so the names match the argv.
  */
 export function buildAgentSpawnEnv(options: AgentContainerOptions, host: NodeJS.ProcessEnv): Record<string, string> {
-  return { ...(host.PATH ? { PATH: host.PATH } : {}), ...effectiveSecrets(options) };
+  const discuss = taskMode(options.taskMode) === "discuss";
+  return {
+    ...(host.PATH ? { PATH: host.PATH } : {}),
+    ...(!discuss && options.mcp ? { PI_AGENT_MCP_SERVERS_JSON: JSON.stringify(options.mcp.servers) } : {}),
+  };
 }
 
 export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
   if (taskMode(options.taskMode) === "discuss") options = {
     ...options, readOnlyWorkspace: true, toolNames: ["read", "grep", "find", "ls"],
     extensionPaths: ["/opt/pi/extensions/model-gateway.ts", "/opt/pi/extensions/discussion.ts"],
-    pluginPaths: [], skillPaths: [], safeCommands: [], mcp: undefined, classifierGatewayToken: undefined,
+    pluginPaths: [], skillPaths: [], safeCommands: [], mcp: undefined, classifier: undefined,
     graderContext: undefined, workflowContext: undefined, writerContext: undefined, checksContext: undefined,
   };
   const model = resolveAgentModel(options.modelRef);
   const tools = [...options.toolNames];
   const hasCodemodeMcp = !options.directMcpOnly && (options.mcp?.servers.some((item) => MCP_SERVERS[item.server].codemodeTools.length > 0) ?? false);
-  if ((options.classifierGatewayToken || hasCodemodeMcp) && !tools.includes("codemode")) tools.push("codemode");
+  if ((options.classifier || hasCodemodeMcp) && !tools.includes("codemode")) tools.push("codemode");
   const directMcpTools = options.mcp?.servers.flatMap((item) =>
     namespacedMcpToolNames(item.server, MCP_SERVERS[item.server].directTools)) ?? [];
   const args = [
@@ -112,7 +108,7 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     ...RESOURCE_LIMIT_FLAGS,
     "--tmpfs", "/tmp:rw,noexec,nosuid,size=536870912",
     "--env", `HOME=/tmp/pi-home`,
-    "--env", model.credentialEnv,
+    "--env", `${model.credentialEnv}=${CREDENTIAL_PLACEHOLDER}`,
     "--env", `PI_MODEL_GATEWAY_URL=${options.gatewayUrl}`,
     "--env", `PI_AGENT_MAX_TURNS=${options.limits?.maxTurns ?? 20}`,
     "--env", `PI_AGENT_MAX_TOOL_CALLS=${options.limits?.maxToolCalls ?? 40}`,
@@ -145,9 +141,9 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
   if (options.writerContext) args.splice(args.indexOf("--mount"), 0, "--env", `PI_AGENT_WRITER_JSON=${JSON.stringify(options.writerContext)}`);
   if (options.checksContext) args.splice(args.indexOf("--mount"), 0, "--env", `PI_AGENT_CHECKS_JSON=${JSON.stringify(options.checksContext)}`);
   if (options.writeApproval) args.splice(args.indexOf("--mount"), 0, "--env", `PI_AGENT_WRITE_APPROVAL=${options.writeApproval}`);
-  if (options.classifierGatewayToken) {
+  if (options.classifier) {
     args.splice(args.indexOf("--mount"), 0,
-      "--env", "OPENROUTER_API_KEY",
+      "--env", `OPENROUTER_API_KEY=${CREDENTIAL_PLACEHOLDER}`,
       "--env", "PI_AGENT_JEV_CLASSIFIER_MODE=on",
     );
   }
@@ -158,7 +154,7 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     );
     args.push("-e", "builtin:mcp", "-e", "/opt/pi/extensions/mcp-bootstrap.ts");
   }
-  if (options.classifierGatewayToken || hasCodemodeMcp) args.push("-e", "builtin:codemode");
+  if (options.classifier || hasCodemodeMcp) args.push("-e", "builtin:codemode");
   for (const extension of [...options.extensionPaths, ...options.pluginPaths]) args.push("-e", extension);
   for (const skill of options.skillPaths) args.push("--skill", skill);
   return args;
@@ -184,14 +180,14 @@ export class DockerPiProcess implements AgentProcess {
   private queuedStart?: Promise<void>;
   private releasePermit?: () => void;
   private closedHookRan = false;
-  private readonly options: Omit<AgentContainerOptions, "gatewayToken" | "classifierGatewayToken" | "mcp"> & { mcp?: Omit<McpRunConfig, "token"> };
+  private readonly options: Omit<AgentContainerOptions, "classifier" | "mcp"> & { mcp?: Omit<McpRunConfig, "token"> };
   private readonly tokenForRun: (runId: string, route: RouteDecision) => string;
   private readonly onEvent: (event: PublicRunEvent) => void;
   private readonly mcpTokenForRun?: (runId: string) => Partial<Record<McpServerId, string>>;
   private readonly classifierTokenForRun?: (runId: string) => string;
 
   constructor(
-    options: Omit<AgentContainerOptions, "gatewayToken" | "classifierGatewayToken" | "mcp"> & { mcp?: Omit<McpRunConfig, "token"> },
+    options: Omit<AgentContainerOptions, "classifier" | "mcp"> & { mcp?: Omit<McpRunConfig, "token"> },
     tokenForRun: (runId: string, route: RouteDecision) => string,
     onEvent: (event: PublicRunEvent) => void,
     mcpTokenForRun?: (runId: string) => Partial<Record<McpServerId, string>>,
@@ -230,6 +226,12 @@ export class DockerPiProcess implements AgentProcess {
     const { mcp: configuredMcp, ...baseOptions } = this.options;
     const mcp = selectedTask === "discuss" ? undefined : configuredMcp;
     if (mcp && !this.mcpTokenForRun) throw new Error("MCP token issuer is required when MCP is enabled");
+    const classifier = selectedTask !== "discuss" && this.classifierTokenForRun !== undefined;
+    // Issued per execution and handed to Pi only through the credential dialog, never its environment.
+    const credentials: RunCredentials = {
+      [resolveAgentModel(route.modelRef).credentialEnv]: this.tokenForRun(runId, route),
+      ...(classifier ? { OPENROUTER_API_KEY: this.classifierTokenForRun!(runId) } : {}),
+    };
     const containerOptions: AgentContainerOptions = {
       ...baseOptions,
       taskMode: selectedTask,
@@ -237,8 +239,7 @@ export class DockerPiProcess implements AgentProcess {
       modelRef: route.modelRef,
       reasoningEffort: route.effort,
       limits: this.limitsFor(route),
-      gatewayToken: this.tokenForRun(runId, route),
-      ...(selectedTask !== "discuss" && this.classifierTokenForRun ? { classifierGatewayToken: this.classifierTokenForRun(runId) } : {}),
+      ...(classifier ? { classifier } : {}),
       ...(mcp ? { mcp: {
         ...mcp,
         servers: mcp.servers.map((item) => item.server === "codegraph" ? item : ({
@@ -253,6 +254,7 @@ export class DockerPiProcess implements AgentProcess {
     });
     this.child = child;
     const bridge = new PiRpcBridge({
+      credentials: () => credentials,
       onReady: () => this.startup?.rpcReady(),
       writeLine: (line) => child.stdin.write(line),
       onCommand: record => {

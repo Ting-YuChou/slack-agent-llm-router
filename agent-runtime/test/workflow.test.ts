@@ -116,7 +116,7 @@ test("grader Docker invocation has read-only source, fresh context and no mutati
   assert.deepEqual(args.toolNames, ["read", "grep", "find", "ls", "submit_grade"]);
   assert.equal(args.mcp, undefined);
   const { buildAgentDockerArgs } = await import("../src/container-runtime.js");
-  const invocation = buildAgentDockerArgs({ ...args, gatewayToken: "fake-token" });
+  const invocation = buildAgentDockerArgs({ ...args });
   assert.ok(invocation.includes("--no-context-files"));
   assert.equal(invocation[invocation.indexOf("--workdir") + 1], "/var/lib/pi-session");
   assert.ok(!invocation.includes("--continue"));

@@ -24,7 +24,7 @@ test("the shared limits reap zombies, forbid swap and cap open files and file si
 test("writer, verifier and fixer containers all carry the shared limits", async () => {
   const writer = buildAgentDockerArgs({
     name: "pi-session-1", image: "pi-agent@sha256:abc", network: "pi-model-only", worktreePath: "/w", gitMetadataPath: "/repo/.git",
-    sessionStatePath: "/s", gatewayUrl: "http://model-gateway:8080/v1", gatewayToken: "t", modelRef: "openai/gpt-5.6-luna",
+    sessionStatePath: "/s", gatewayUrl: "http://model-gateway:8080/v1", modelRef: "openai/gpt-5.6-luna",
     extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
   });
   assert.ok(contains(writer, RESOURCE_LIMIT_FLAGS), "writer");

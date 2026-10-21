@@ -11,7 +11,7 @@ import type { RouteDecision } from './jev-router.js';
 import { MCP_SERVERS, namespacedMcpToolNames } from './mcp-config.js';
 import { renderPrompt } from './prompts.js';
 
-export function investigationDockerOptions(request: InvestigationRequest, options: { image: string; network: string; gatewayUrl: string; statePath: string }): Omit<AgentContainerOptions, 'gatewayToken'> {
+export function investigationDockerOptions(request: InvestigationRequest, options: { image: string; network: string; gatewayUrl: string; statePath: string }): AgentContainerOptions {
   const planner = request.node.role === 'planner';
   return { ...options, name: `pi-investigation-${request.node.execution!.slice(0, 8)}`, worktreePath: request.input.snapshot.path, gitMetadataPath: '', sessionStatePath: options.statePath,
     workflowKey: request.input.run_id, modelRef: planner ? 'openai/gpt-5.6-sol' : 'openai/gpt-5.6-luna', reasoningEffort: planner ? 'high' : 'max',

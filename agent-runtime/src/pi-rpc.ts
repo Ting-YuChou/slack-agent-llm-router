@@ -3,6 +3,7 @@ import { StringDecoder } from "node:string_decoder";
 
 import { parsePolicyDecision, POLICY_ENTRY, type PolicyDecision } from "./policy-decision.js";
 import { BUDGET_STATUS_DIALOG } from "./budget-notice.js";
+import { CREDENTIAL_DIALOG, type RunCredentials } from "./run-credentials.js";
 import { redact } from "./telemetry.js";
 
 export type PublicRunEvent =
@@ -148,8 +149,14 @@ export class PiRpcBridge {
   private readonly checkRequests = new Set<string>();
   /** Whether this turn's one budget_status dialog was already passed to the host. */
   private budgetAsked = false;
+  /** Whether this prompt's one credential dialog was already answered. */
+  private credentialAsked = false;
 
-  constructor(options: { writeLine: (line: string) => void; onEvent: (event: PublicRunEvent) => void; onRecord?: (record: Record<string, unknown>) => void; onCommand?: (record: Record<string, unknown>) => void; onReady?: () => void }) {
+  /** The current execution's gateway tokens, asked for when Pi's credential dialog arrives. */
+  private readonly credentials?: () => RunCredentials | undefined;
+
+  constructor(options: { writeLine: (line: string) => void; onEvent: (event: PublicRunEvent) => void; onRecord?: (record: Record<string, unknown>) => void; onCommand?: (record: Record<string, unknown>) => void; onReady?: () => void; credentials?: () => RunCredentials | undefined }) {
+    this.credentials = options.credentials;
     this.writeLine = options.writeLine;
     this.onEvent = options.onEvent;
     this.onRecord = options.onRecord;
@@ -218,6 +225,14 @@ export class PiRpcBridge {
    */
   private dialog(record: Record<string, unknown>): void {
     const id = safeString(record.id);
+    if (id && record.method === "input" && record.title === CREDENTIAL_DIALOG) {
+      const credentials = this.credentialAsked ? undefined : this.credentials?.();
+      this.credentialAsked = true;
+      if (!credentials) { this.respondUi(id, { cancelled: true }); return; }
+      // Written directly: the reply carries tokens, so it must never reach onCommand capture.
+      this.writeLine(`${JSON.stringify({ type: "extension_ui_response", id, value: JSON.stringify(credentials) })}\n`);
+      return;
+    }
     if (id && record.method === "input" && record.title === BUDGET_STATUS_DIALOG) {
       if (this.budgetAsked) { this.respondUi(id, { cancelled: true }); return; }
       this.budgetAsked = true;
@@ -239,6 +254,7 @@ export class PiRpcBridge {
 
   prompt(id: string, message: string): void {
     this.promptId = id;
+    this.credentialAsked = false;
     this.lastAssistant = undefined;
     this.limit = undefined;
     this.send({ id, type: "prompt", message });

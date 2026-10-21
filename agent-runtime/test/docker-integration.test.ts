@@ -281,7 +281,9 @@ test("real Pi requests pass the gateway allowlist and bash children cannot read 
   const isolated = await worktrees.create(`allowlist-${suffix}`);
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
-  const probe = `node -e "process.stdout.write('TOKEN='+(process.env.OPENAI_API_KEY||'none')+';MCP='+(process.env.PI_AGENT_MCP_SERVERS_JSON?'set':'none'))"`;
+  // Every process's initial environment in the container, PID 1 included, must be free of the run's token.
+  const environ = "const fs=require('fs'),path=require('path');let leak=0;for(const p of fs.readdirSync('/proc')){if(!/^[0-9]+$/.test(p))continue;try{if(fs.readFileSync(path.join('/proc',p,'environ'),'latin1').includes('fake-run-token'))leak++}catch{}}";
+  const probe = `node -e "${environ}process.stdout.write('TOKEN='+(process.env.OPENAI_API_KEY||'none')+';MCP='+(process.env.PI_AGENT_MCP_SERVERS_JSON?'set':'none')+';ENVIRON='+(leak?'leak':'clean'))"`;
   const gatewayScript = fakeGatewayScript(scriptedTurns([
     { kind: "function_call", name: "bash", arguments: { command: probe } },
     { kind: "text", text: "probe done" },
@@ -333,7 +335,11 @@ test("real Pi requests pass the gateway allowlist and bash children cannot read 
       if (beta) assert.equal(allowedAnthropicBeta(beta), beta.split(",").map((item: string) => item.trim()).join(","));
     }
     const toolOutput = JSON.stringify(openai[1].body.input);
-    assert.match(toolOutput, /TOKEN=none;MCP=none/);
+    assert.match(toolOutput, /TOKEN=none;MCP=none;ENVIRON=clean/);
+    // The token reached Pi through the credential dialog: every model request carries it.
+    for (const request of [...openai, ...claude]) {
+      assert.ok([request.headers.authorization, request.headers["x-api-key"]].some((value) => value === "Bearer fake-run-token-value" || value === "fake-run-token-value"), JSON.stringify(request.headers));
+    }
     assert.doesNotMatch(toolOutput, /fake-run-token-value/);
   } finally {
     await piProcess?.close();
@@ -373,7 +379,7 @@ test("inside the writer container git sees only the baseline history and the ses
   try {
     const args = buildAgentDockerArgs({
       name: "unused", image: AGENT_TEST_IMAGE, network: "none", worktreePath: own.path, gitMetadataPath: own.gitDir, sessionStatePath,
-      gatewayUrl: "http://model-gateway:8080", gatewayToken: "unused", modelRef: "openai/gpt-5.6-luna", extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
+      gatewayUrl: "http://model-gateway:8080", modelRef: "openai/gpt-5.6-luna", extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
       user: `${hostUid}:${hostGid}`,
     });
     const mounts = args.flatMap((arg, index) => args[index - 1] === "--mount" ? ["--mount", arg] : []);

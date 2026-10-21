@@ -113,7 +113,7 @@ test('investigation containers have fresh context, fixed role models and no muta
     const options = investigationDockerOptions({ input: { run_id: 'r', owner: 'u', requirement: 'fix', baseline: 'a'.repeat(40), snapshot: { hash: 'h', path: '/snapshot' }, fingerprint: 'f' }, node: { ...task('node'), role, workflow: 'r', wave: 1, state: 'running', attempt: 1, execution: 'unique-execution', queued_at: 0 }, results: [], signal: new AbortController().signal }, { image: 'pi', network: 'models', gatewayUrl: 'http://models', statePath: '/fresh' });
     assert.equal(options.modelRef,role === 'planner' ? 'openai/gpt-5.6-sol' : 'openai/gpt-5.6-luna');
     assert.equal(options.reasoningEffort,role === 'planner' ? 'high' : 'max');
-    const args = buildAgentDockerArgs({ ...options,gatewayToken: 'token' });
+    const args = buildAgentDockerArgs({ ...options });
     assert.ok(args.includes('--no-context-files')); assert.ok(!args.includes('--continue'));
     assert.ok(args.includes('type=bind,src=/snapshot,dst=/snapshot,readonly'));
     assert.deepEqual(options.pluginPaths,[]); assert.deepEqual(options.skillPaths,[]);

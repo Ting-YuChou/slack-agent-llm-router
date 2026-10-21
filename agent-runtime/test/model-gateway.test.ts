@@ -6,6 +6,7 @@ import { test } from "node:test";
 import { JEV_CLASSIFIER_MODEL, resolveAgentModel } from "../src/agent-model.js";
 import { issueClassifierGatewayToken, issueGatewayToken } from "../src/gateway-token.js";
 import { createModelGateway, validateAgentModelRequest } from "../src/model-gateway.js";
+import { CREDENTIAL_PLACEHOLDER } from "../src/run-credentials.js";
 
 test("gateway validates each request against the token-bound model and reasoning effort", () => {
   const openai = resolveAgentModel("openai/gpt-5.6-luna");
@@ -471,6 +472,30 @@ test("a run token is capped on total model requests, not only concurrent ones", 
     assert.equal(over.status, 429);
     assert.equal((await over.json()).error.code, "too_many_requests");
     assert.equal((await send(tokenFor("other"))).status, 200, "the cap is per run token");
+  } finally {
+    gateway.close();
+    await once(gateway, "close");
+  }
+});
+
+test("the container's credential placeholder never reaches a provider", async () => {
+  let calls = 0;
+  const gateway = createModelGateway({
+    signingSecret: "signing-secret",
+    providerApiKeys: { openai: "real-openai" },
+    fetchFn: async () => { calls++; return new Response("{}", { status: 200, headers: { "content-type": "application/json" } }); },
+  });
+  gateway.listen(0, "127.0.0.1");
+  await once(gateway, "listening");
+  const port = (gateway.address() as AddressInfo).port;
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/openai/v1/responses`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CREDENTIAL_PLACEHOLDER}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5.6-luna", input: [] }),
+    });
+    assert.equal(response.status, 401);
+    assert.equal(calls, 0);
   } finally {
     gateway.close();
     await once(gateway, "close");

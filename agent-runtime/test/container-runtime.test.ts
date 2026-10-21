@@ -8,6 +8,7 @@ import path from "node:path";
 
 import { parseAgentLimitConfig } from "../src/agent-limits.js";
 import { buildAgentDockerArgs, buildAgentSpawnEnv, DockerPiProcess } from "../src/container-runtime.js";
+import { CREDENTIAL_PLACEHOLDER } from "../src/run-credentials.js";
 import { WorktreeManager, writerGitDir } from "../src/worktree-manager.js";
 
 test("agent container is non-root, resource-limited, read-only, and internal-network only", () => {
@@ -19,7 +20,6 @@ test("agent container is non-root, resource-limited, read-only, and internal-net
     gitMetadataPath: "/repo/.git",
     sessionStatePath: "/runtime/s1",
     gatewayUrl: "http://model-gateway:8080/v1",
-    gatewayToken: "short-token",
     modelRef: "anthropic/claude-sonnet-4-6",
     extensionPaths: ["/opt/pi/extensions/policy.ts", "/opt/pi/extensions/model-gateway.ts"],
     pluginPaths: ["/opt/pi/plugins/workspace-summary.ts"],
@@ -37,7 +37,7 @@ test("agent container is non-root, resource-limited, read-only, and internal-net
     "--mode rpc", "--provider anthropic", "--model claude-sonnet-4-6", "--thinking max",
   ]) assert.match(rendered, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.doesNotMatch(rendered, /docker\.sock|OPENAI_API_KEY=[A-Za-z0-9_-]{30,}/);
-  assert.match(rendered, /--env ANTHROPIC_API_KEY(?: |$)/);
+  assert.match(rendered, new RegExp(`--env ANTHROPIC_API_KEY=${CREDENTIAL_PLACEHOLDER} `));
   assert.doesNotMatch(rendered, /short-token/);
   assert.match(rendered, /PI_AGENT_SKILL_PATHS_JSON=\["\/opt\/pi\/skills\/test-gap\/SKILL\.md"\]/);
   assert.match(rendered, /type=bind,src=\/repo-worktrees\/w1,dst=\/repo-worktrees\/w1/);
@@ -53,7 +53,6 @@ test("agent container is non-root, resource-limited, read-only, and internal-net
     gitMetadataPath: "/repo/.git",
     sessionStatePath: "/runtime/s2",
     gatewayUrl: "http://model-gateway:8080/v1",
-    gatewayToken: "short-token",
     modelRef: "opencode-go/deepseek-v4-pro",
     extensionPaths: [],
     pluginPaths: [],
@@ -62,7 +61,7 @@ test("agent container is non-root, resource-limited, read-only, and internal-net
     user: "501:20",
   });
   assert.match(hostUserArgs.join(" "), /--user 501:20/);
-  assert.match(hostUserArgs.join(" "), /--env OPENCODE_API_KEY(?: |$)/);
+  assert.match(hostUserArgs.join(" "), new RegExp(`--env OPENCODE_API_KEY=${CREDENTIAL_PLACEHOLDER} `));
   assert.match(hostUserArgs.join(" "), /--provider opencode-go --model deepseek-v4-pro --thinking max/);
 });
 
@@ -70,19 +69,19 @@ test("selected Sol run starts Pi with Sol high while retaining the internal gate
   const args = buildAgentDockerArgs({
     name: "pi-sol", image: "pi-agent:1.0.1", network: "pi-model-only",
     worktreePath: "/worktree", gitMetadataPath: "/repo/.git", sessionStatePath: "/state",
-    gatewayUrl: "http://model-gateway:8080", gatewayToken: "run-token",
+    gatewayUrl: "http://model-gateway:8080",
     modelRef: "openai/gpt-5.6-sol", reasoningEffort: "high",
     extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
   });
   assert.match(args.join(" "), /--provider openai --model gpt-5\.6-sol --thinking high/);
-  assert.match(args.join(" "), /--env OPENAI_API_KEY(?: |$)/);
+  assert.match(args.join(" "), new RegExp(`--env OPENAI_API_KEY=${CREDENTIAL_PLACEHOLDER} `));
 });
 
 test("MCP is absent when off and explicitly loads only the trusted builtin path when enabled", () => {
   const base = {
     name: "pi-mcp", image: "pi-agent:1.0.1", network: "pi-model-only",
     worktreePath: "/worktree", gitMetadataPath: "/repo/.git", sessionStatePath: "/state",
-    gatewayUrl: "http://model-gateway:8080", gatewayToken: "model-token",
+    gatewayUrl: "http://model-gateway:8080",
     modelRef: "openai/gpt-5.6-luna", extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
   };
   const off = buildAgentDockerArgs(base);
@@ -110,7 +109,7 @@ test("run-time Jev exposes codemode with only a short-lived classifier gateway t
   const base = {
     name: "pi-jev", image: "pi-agent:1.0.1", network: "pi-model-only",
     worktreePath: "/worktree", gitMetadataPath: "/repo/.git", sessionStatePath: "/state",
-    gatewayUrl: "http://model-gateway:8080", gatewayToken: "chat-run-token",
+    gatewayUrl: "http://model-gateway:8080",
     modelRef: "openai/gpt-5.6-luna", extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
   };
   const off = buildAgentDockerArgs(base);
@@ -118,10 +117,10 @@ test("run-time Jev exposes codemode with only a short-lived classifier gateway t
 
   const enabled = buildAgentDockerArgs({
     ...base,
-    classifierGatewayToken: "classifier-run-token",
+    classifier: true,
   });
   const rendered = enabled.join(" ");
-  assert.match(rendered, /--env OPENROUTER_API_KEY(?: |$)/);
+  assert.match(rendered, new RegExp(`--env OPENROUTER_API_KEY=${CREDENTIAL_PLACEHOLDER} `));
   assert.doesNotMatch(rendered, /classifier-run-token/);
   assert.match(rendered, /PI_AGENT_JEV_CLASSIFIER_MODE=on/);
   assert.match(rendered, /--no-extensions.*-e builtin:codemode/);
@@ -132,8 +131,8 @@ test("run-time Jev exposes codemode with only a short-lived classifier gateway t
 
 test('discussion mode overrides writer capabilities and mounts only read-only workspace', () => {
   const args = buildAgentDockerArgs({ taskMode: 'discuss', name: 'discuss', image: 'pi', network: 'models',
-    worktreePath: '/worktree', gitMetadataPath: '/host/.git', sessionStatePath: '/state', gatewayUrl: 'http://models', gatewayToken: 'short', modelRef: 'openai/gpt-5.6-luna',
-    extensionPaths: ['/untrusted/extension.ts'], pluginPaths: ['/writer.ts'], skillPaths: ['/skill.md'], toolNames: ['bash','write','edit','codemode'], classifierGatewayToken: 'classifier-secret',
+    worktreePath: '/worktree', gitMetadataPath: '/host/.git', sessionStatePath: '/state', gatewayUrl: 'http://models', modelRef: 'openai/gpt-5.6-luna',
+    extensionPaths: ['/untrusted/extension.ts'], pluginPaths: ['/writer.ts'], skillPaths: ['/skill.md'], toolNames: ['bash','write','edit','codemode'], classifier: true,
     mcp: { mode: 'read_only', servers: [{ server: 'github', gatewayUrl: 'http://github', token: 'mcp-secret' }] },
   } as any);
   assert.ok(args.includes('type=bind,src=/worktree,dst=/worktree,readonly'));
@@ -147,7 +146,7 @@ test('discussion mode overrides writer capabilities and mounts only read-only wo
 test("writer turn and tool-call limits come from host configuration", () => {
   const base = {
     name: "pi-session-1", image: "pi-agent@sha256:abc", network: "pi-model-only", worktreePath: "/w", gitMetadataPath: "/repo/.git",
-    sessionStatePath: "/s", gatewayUrl: "http://model-gateway:8080/v1", gatewayToken: "t", modelRef: "openai/gpt-5.6-luna",
+    sessionStatePath: "/s", gatewayUrl: "http://model-gateway:8080/v1", modelRef: "openai/gpt-5.6-luna",
     extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
   };
   assert.match(buildAgentDockerArgs(base).join(" "), /PI_AGENT_MAX_TURNS=20 .*PI_AGENT_MAX_TOOL_CALLS=40/);
@@ -190,7 +189,7 @@ test("a complex Jev route starts the writer container with the complex route lim
 test("writer receives trusted-profile constraints; discussion mode drops them", () => {
   const base = {
     name: "pi-session-1", image: "pi-agent@sha256:abc", network: "pi-model-only", worktreePath: "/w", gitMetadataPath: "/repo/.git",
-    sessionStatePath: "/s", gatewayUrl: "http://model-gateway:8080/v1", gatewayToken: "t", modelRef: "openai/gpt-5.6-luna",
+    sessionStatePath: "/s", gatewayUrl: "http://model-gateway:8080/v1", modelRef: "openai/gpt-5.6-luna",
     extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
   };
   const writerContext = { allowedPaths: ["src"], checks: ["pytest"], rubric: ["tests_cover_change"], diffLimits: { maxFiles: 50, maxBytes: 1048576, maxSingleFileBytes: 262144 } };
@@ -201,30 +200,29 @@ test("writer receives trusted-profile constraints; discussion mode drops them", 
   assert.doesNotMatch(buildAgentDockerArgs(base).join(" "), /PI_AGENT_WRITER_JSON/);
 });
 
-test("credentials travel in the docker client's environment, never on its argv", () => {
+test("gateway credentials are neither on argv nor in the docker client's environment; MCP config travels in its environment", () => {
   const options = {
     name: "pi-session-1", image: "pi-agent@sha256:abc", network: "pi-model-only", worktreePath: "/w", gitMetadataPath: "/repo/.git",
-    sessionStatePath: "/s", gatewayUrl: "http://model-gateway:8080", gatewayToken: "gateway-secret-token", modelRef: "openai/gpt-5.6-luna",
-    classifierGatewayToken: "classifier-secret-token",
+    sessionStatePath: "/s", gatewayUrl: "http://model-gateway:8080", modelRef: "openai/gpt-5.6-luna", classifier: true,
     mcp: { mode: "read_only" as const, servers: [{ server: "github" as const, gatewayUrl: "http://mcp-github:8090/mcp", token: "mcp-secret-token" }] },
     extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read", "bash"],
   };
   const rendered = buildAgentDockerArgs(options).join(" ");
   assert.doesNotMatch(rendered, /secret-token/);
+  assert.match(rendered, new RegExp(`--env OPENAI_API_KEY=${CREDENTIAL_PLACEHOLDER} `));
+  assert.match(rendered, new RegExp(`--env OPENROUTER_API_KEY=${CREDENTIAL_PLACEHOLDER} `));
   const env = buildAgentSpawnEnv(options, { PATH: "/usr/bin", OPENAI_API_KEY: "host-real-key" });
   assert.equal(env.PATH, "/usr/bin");
-  assert.equal(env.OPENAI_API_KEY, "gateway-secret-token");
-  assert.equal(env.OPENROUTER_API_KEY, "classifier-secret-token");
   assert.match(env.PI_AGENT_MCP_SERVERS_JSON ?? "", /mcp-secret-token/);
-  assert.deepEqual(Object.keys(env).sort(), ["OPENAI_API_KEY", "OPENROUTER_API_KEY", "PATH", "PI_AGENT_MCP_SERVERS_JSON"]);
+  assert.deepEqual(Object.keys(env).sort(), ["PATH", "PI_AGENT_MCP_SERVERS_JSON"]);
   const discuss = buildAgentSpawnEnv({ ...options, taskMode: "discuss" }, { PATH: "/usr/bin" });
-  assert.deepEqual(Object.keys(discuss).sort(), ["OPENAI_API_KEY", "PATH"]);
+  assert.deepEqual(Object.keys(discuss).sort(), ["PATH"]);
 });
 
 test("the write-approval mode reaches the writer only when the host sets it", () => {
   const base = {
     name: "pi-session-1", image: "pi-agent@sha256:abc", network: "pi-model-only", worktreePath: "/w", gitMetadataPath: "/repo/.git",
-    sessionStatePath: "/s", gatewayUrl: "http://model-gateway:8080/v1", gatewayToken: "t", modelRef: "openai/gpt-5.6-luna",
+    sessionStatePath: "/s", gatewayUrl: "http://model-gateway:8080/v1", modelRef: "openai/gpt-5.6-luna",
     extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
   };
   assert.ok(buildAgentDockerArgs({ ...base, writeApproval: "none" }).includes("PI_AGENT_WRITE_APPROVAL=none"));
@@ -244,7 +242,7 @@ test("the writer mounts its session's git mirror read-only and never the host gi
   const created = await new WorktreeManager({ repoPath: repo, worktreeRoot, baseRef: "HEAD" }).create("mounts");
   const options = {
     name: "pi-session-mirror", image: "pi-agent@sha256:abc", network: "pi-model-only", sessionStatePath: "/runtime/s",
-    gatewayUrl: "http://model-gateway:8080/v1", gatewayToken: "short-token", modelRef: "openai/gpt-5.6-luna", extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
+    gatewayUrl: "http://model-gateway:8080/v1", modelRef: "openai/gpt-5.6-luna", extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
   };
   const mounts = (args: string[]) => args.flatMap((arg, index) => args[index - 1] === "--mount" ? [arg] : []);
 

@@ -22,7 +22,7 @@ export interface GraderOptions {
 }
 
 const DEFAULT_GRADER_ROUTE: RouteDecision = { modelRef: DEFAULT_GRADER_MODEL, effort: "high", source: "grader" };
-export function graderDockerOptions(input: GraderOptions): Omit<AgentContainerOptions, "gatewayToken"> {
+export function graderDockerOptions(input: GraderOptions): AgentContainerOptions {
   return {
     name: `pi-grader-${input.executionId.slice(0, 8)}`, image: input.image, network: input.network,
     worktreePath: input.candidate.path, gitMetadataPath: "", sessionStatePath: input.statePath,
