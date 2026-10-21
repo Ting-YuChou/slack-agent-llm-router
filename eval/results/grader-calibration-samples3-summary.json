@@ -1,0 +1,18 @@
+{
+  "summary": {
+    "records": 30,
+    "cases": 10,
+    "samples": 3,
+    "aggregate": "unanimous",
+    "false_pass_rate": 0.0,
+    "false_fail_rate": 0.0,
+    "self_consistency": 1.0,
+    "invalid_rate": 0.0,
+    "invalid_rate_by_cause": {},
+    "cost_usd": 1.85069,
+    "cost_per_grade": 0.061689666666666663
+  },
+  "failures": [
+    "cost_usd: 1.851 regressed above 1.239 x 1.25"
+  ]
+}
