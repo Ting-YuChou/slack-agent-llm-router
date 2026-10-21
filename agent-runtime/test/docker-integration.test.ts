@@ -391,3 +391,37 @@ test("inside the writer container git sees only the baseline history and the ses
     await worktrees.remove(other.path).catch(() => undefined);
   }
 });
+
+test("session networks reach only their gateways: no external DNS, no egress, no other session", { skip: !enabled, timeout: 120_000 }, async () => {
+  const { RunNetworks } = await import("../src/run-network.js");
+  const suffix = Math.random().toString(16).slice(2, 10);
+  const gateway = `run-net-gateway-${suffix}`;
+  const shared = `run-net-shared-${suffix}`;
+  const image = "node:22.22.0-bookworm-slim";
+  const networks = new RunNetworks({ attachments: [{ container: gateway, alias: "model-gateway" }] });
+  const sessions = [`A-${suffix}`, `B-${suffix}`];
+  const containers = sessions.map(id => `run-net-${id}`);
+  try {
+    await command("docker", ["network", "create", "--internal", shared]);
+    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", shared, image, "node", "-e", "require('http').createServer((_, r) => r.end('ok')).listen(8080)"]);
+    for (const [index, id] of sessions.entries()) {
+      const network = await networks.create(id);
+      await command("docker", ["run", "--detach", "--rm", "--name", containers[index]!, "--network", network, "--dns", "127.0.0.1", image, "sleep", "300"]);
+    }
+    const inA = (script: string) => exec("docker", ["exec", containers[0]!, "node", "-e", script], { encoding: "utf8", timeout: 20_000 });
+    const resolves = (host: string) => `require('dns').lookup('${host}', e => process.exit(e ? 1 : 0))`;
+    const connects = (host: string, port: number) => `const s=require('net').connect({host:'${host}',port:${port},timeout:3000},()=>process.exit(0));s.on('error',()=>process.exit(1));s.on('timeout',()=>process.exit(1))`;
+    await inA(connects("model-gateway", 8080));
+    await assert.rejects(inA(resolves("example.com")), "external names must not resolve");
+    await assert.rejects(inA(resolves("host.docker.internal")), "the host must not resolve");
+    await assert.rejects(inA(connects("1.1.1.1", 443)), "no egress to the internet");
+    const ipB = await command("docker", ["inspect", "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", containers[1]!]);
+    assert.ok(ipB, "session B has an address");
+    await assert.rejects(inA(connects(ipB, 22)), "session A cannot reach session B");
+    await assert.rejects(inA(resolves(containers[1]!)), "session A cannot even resolve session B");
+  } finally {
+    for (const container of [...containers, gateway]) await exec("docker", ["rm", "-f", container]).catch(() => undefined);
+    for (const id of sessions) await networks.remove(id).catch(() => undefined);
+    await exec("docker", ["network", "rm", shared]).catch(() => undefined);
+  }
+});

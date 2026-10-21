@@ -27,7 +27,7 @@ The sandbox, not the approval, is the boundary:
 - The budget RPC bearer is derived from, and never equal to, the gateway signing secret.
 - Every model request is metered against a run budget.
 
-Still open (Phase 4 Track S): the gateway token remains readable from `/proc/1/environ` inside the container until per-execution credential refresh lands, and runs share one internal network until per-run networks land. Deployments that cannot accept this should set `PI_AGENT_REQUIRE_VERIFICATION=1`, which limits runs without a profile to `--discuss`.
+With `PI_AGENT_NETWORK_ATTACH` set (the demo script sets it), every session runs on its own `--internal` network that only the listed gateway containers join, so sessions cannot reach or resolve each other; agent containers use `--dns 127.0.0.1`, and the runtime refuses to start on a Docker Engine without the CVE-2024-29018 fix. Still open (Phase 4 Track P): the gateway token remains readable from `/proc/1/environ` inside the container until per-execution credential refresh lands. Deployments that cannot accept this should set `PI_AGENT_REQUIRE_VERIFICATION=1`, which limits runs without a profile to `--discuss`.
 
 ### Approvals across restarts
 

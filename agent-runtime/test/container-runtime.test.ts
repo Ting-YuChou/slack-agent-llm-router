@@ -260,3 +260,16 @@ test("the writer mounts its session's git mirror read-only and never the host gi
   await rm(repo, { recursive: true, force: true });
   await rm(worktreeRoot, { recursive: true, force: true });
 });
+
+test("closing a process runs its cleanup hook once, and a failing hook does not fail the close", async () => {
+  let runs = 0;
+  const piProcess = new DockerPiProcess({
+    name: "pi-close-hook", image: "pi-agent@sha256:abc", network: "pi-run-x", worktreePath: "/w", gitMetadataPath: "/repo/.git",
+    sessionStatePath: "/s", gatewayUrl: "http://model-gateway:8080/v1", modelRef: "openai/gpt-5.6-luna",
+    extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
+    onClosed: async () => { runs++; throw new Error("network still in use"); },
+  }, () => "token", () => {});
+  await piProcess.close();
+  await piProcess.close();
+  assert.equal(runs, 1);
+});
