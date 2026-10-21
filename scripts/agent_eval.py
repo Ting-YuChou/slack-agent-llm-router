@@ -746,6 +746,17 @@ def _read_baseline(path):
 def _finish(args, result, results_path):
     """Write ``result`` (and the baseline, if asked and clean); return the exit code."""
     summary, failures = result["summary"], result["contract_failures"]
+    overrides = result.get("profile_overrides") or {}
+    recorded = _read_baseline(args.baseline)
+    if recorded and not args.update_baseline:
+        if (recorded.get("profile_overrides") or {}) != overrides:
+            print(
+                "warning: the baseline was recorded with profile overrides "
+                f"{json.dumps(recorded.get('profile_overrides') or {}, sort_keys=True)} "
+                f"but this run used {json.dumps(overrides, sort_keys=True)}; "
+                "cost and wall time are not comparable",
+                file=sys.stderr,
+            )
     results_path.parent.mkdir(parents=True, exist_ok=True)
     results_path.write_text(json.dumps(result, indent=2) + "\n")
     if args.update_baseline and not failures:
@@ -753,11 +764,12 @@ def _finish(args, result, results_path):
             "key": result["key"],
             "updated_at": _now(),
             "repeats": result["repeats"],
+            **({"profile_overrides": overrides} if overrides else {}),
             "metrics": {metric: summary[metric] for metric in CONTRACT_METRICS},
             "tolerance": {metric: spec[1] for metric, spec in CONTRACT_METRICS.items()},
         }
         # Ceilings are hand-set policy; carry them over rather than reset them.
-        ceilings = _read_baseline(args.baseline).get("ceilings")
+        ceilings = recorded.get("ceilings")
         if ceilings:
             baseline["ceilings"] = ceilings
         args.baseline.write_text(json.dumps(baseline, indent=2) + "\n")
