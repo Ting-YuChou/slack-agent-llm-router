@@ -4258,6 +4258,8 @@ class SlackBot:
                     on_progress=lambda update: self._update_agent_progress(
                         tracked, update
                     ),
+                    # The status message is rewritten at most this often anyway.
+                    refresh_seconds=self.agent_progress_interval_seconds,
                 )
             except AgentRuntimeError as exc:
                 if exc.status == 404:

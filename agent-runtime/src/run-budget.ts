@@ -37,7 +37,8 @@ export function priceFor(ref: string, configured: Record<string, ModelPrice>): M
 }
 
 // Not "interrupted": an interrupted structured run can resume and must keep its budget.
-const TERMINAL = new Set(["completed", "failed", "cancelled", "timed_out"]);
+// "rejected" is a run whose owner turned down a tool approval; it never resumes.
+const TERMINAL = new Set(["completed", "failed", "cancelled", "timed_out", "rejected"]);
 
 /** A run metered under its own default budget stops that budget when it ends, so its token can spend nothing more. */
 export function releaseRunBudget(run: { run_id: string; status: string }, parents: ReadonlyMap<string, string>, ledger: { stop(id: string): void }): void {

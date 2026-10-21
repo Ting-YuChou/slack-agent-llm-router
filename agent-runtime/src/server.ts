@@ -462,6 +462,9 @@ export async function createProductionServer() {
   const budgetLedger = new BudgetLedger(path.join(runtimeRoot, "budget", "budget.sqlite"));
   // Outside every container mount: a writer can edit its session directory, never these seals.
   const sessionSeals = new SessionSeal(deriveSessionSealKey(gatewaySecret), path.join(runtimeRoot, "session-seals"));
+  // Orphan containers are stopped by now: seal the sessions they were writing, as their own stop would have.
+  const adopted = await sessionSeals.sealOpen((id) => path.join(runtimeRoot, "sessions", id));
+  if (adopted.length) logEvent("agent_session_seals_adopted", { sessions: adopted.length });
   const defaultRunBudgetUsd = parseDefaultRunBudget(process.env);
   const workflowControl = trustedProfile ? new ControlStore(path.join(runtimeRoot, "control", "state.sqlite"), () => { void orchestrator.shutdown().catch(() => {}); }) : undefined;
   const releaseCoordinator = workflowControl?.acquireCoordinator();
@@ -554,8 +557,8 @@ export async function createProductionServer() {
           ...(trustedProfile ? { writerContext: writerContextFor(trustedProfile.profile) } : {}),
           // Runs that skip delivery approval keep per-write prompts, so no run loses both gates.
           writeApproval: session.skipDelivery ? "per_prompt" : approval.writeApproval,
-          ...writerReuseOptions(trustedProfile?.profile, mcpServerIds.length),
-          sessionSeal: { seal: () => sessionSeals.seal(session.id, sessionStatePath), verify: () => sessionSeals.verify(session.id, sessionStatePath) },
+          ...writerReuseOptions(trustedProfile?.profile, mcpServerIds),
+          sessionSeal: { open: () => sessionSeals.open(session.id), seal: () => sessionSeals.seal(session.id, sessionStatePath), verify: () => sessionSeals.verify(session.id, sessionStatePath) },
           user: containerUser,
           ...(mcpServerIds.length > 0 ? {
             mcp: {
@@ -759,12 +762,15 @@ async function refuseUnpatchedDocker(): Promise<void> {
   if (engineVulnerable(version)) throw new Error(`Docker Engine ${version} lacks the CVE-2024-29018 fix (need 23.0.11, 25.0.5 or 26.0.0+); refusing to start`);
 }
 
-async function cleanupOrphanAgentContainers(): Promise<void> {
+export async function cleanupOrphanAgentContainers(
+  docker: (args: string[]) => Promise<string> = async (args) => (await exec("docker", args, { encoding: "utf8" })).stdout,
+): Promise<void> {
+  const list = async (...filters: string[]) => (await docker(["ps", "-q", "--filter", "label=slack-pi-agent-session=true", ...filters]))
+    .split("\n").map((value) => value.trim()).filter(Boolean);
   try {
-    const output = (await exec("docker", ["ps", "-q", "--filter", "label=slack-pi-agent-session=true"], { encoding: "utf8" })).stdout;
-    for (const containerId of output.split("\n").map((value) => value.trim()).filter(Boolean)) {
-      await exec("docker", ["stop", "--time", "5", containerId], { encoding: "utf8" });
-    }
+    // A writer kept paused for reuse when the runtime died; some engines refuse to stop a paused container.
+    for (const containerId of await list("--filter", "status=paused")) await docker(["unpause", containerId]).catch(() => "");
+    for (const containerId of await list()) await docker(["stop", "--time", "5", containerId]);
   } catch {
     throw new Error("Cannot confirm all orphan writers/verifiers/graders stopped; refusing rollback/startup");
   }
@@ -821,10 +827,13 @@ function positiveInteger(value: string | undefined, fallback: number): number {
 /** With MCP, a paused writer is resumed only this long after it started; its MCP tokens date from then. */
 export const MCP_REUSE_MAX_AGE_MS = 10 * 60_000;
 
-/** Writer reuse options for a session: the profile's opt-in, and an age limit when MCP tokens are in play. */
-export function writerReuseOptions(profile: VerificationProfile | undefined, mcpServers: number): { reuse?: boolean; reuseMaxAgeMs?: number } {
+/**
+ * Writer reuse options for a session: the profile's opt-in, and an age limit when MCP tokens are in play.
+ * Only servers reached through a gateway have tokens; a stdio server (codegraph) runs in the container.
+ */
+export function writerReuseOptions(profile: VerificationProfile | undefined, mcpServers: readonly McpServerId[]): { reuse?: boolean; reuseMaxAgeMs?: number } {
   if (!profile?.writerReuse) return {};
-  return mcpServers > 0 ? { reuse: true, reuseMaxAgeMs: MCP_REUSE_MAX_AGE_MS } : { reuse: true };
+  return mcpServers.some((id) => MCP_SERVERS[id].transport !== "stdio") ? { reuse: true, reuseMaxAgeMs: MCP_REUSE_MAX_AGE_MS } : { reuse: true };
 }
 
 /** The writer gets run_checks (tool, extension and its context) only when a trusted profile can verify. */

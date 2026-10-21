@@ -830,8 +830,10 @@ async def test_progress_updates_the_root_status_message_at_most_every_ten_second
     tmp_path,
 ):
     now = [0.0]
+    refreshes = []
 
     async def wait_for_update(run_id, on_progress=None, **kwargs):
+        refreshes.append(kwargs.get("refresh_seconds"))
         for at, tools in [(0, 1), (4, 2), (9.9, 3), (10, 4), (15, 5), (25, 6)]:
             now[0] = at
             await on_progress(
@@ -852,6 +854,8 @@ async def test_progress_updates_the_root_status_message_at_most_every_ten_second
 
     await bot._monitor_agent_run(tracked)
 
+    # Turns and cost come only from full run reads, refreshed as often as shown.
+    assert refreshes == [bot.agent_progress_interval_seconds]
     updates = [call.kwargs for call in bot.web_client.chat_update.await_args_list]
     assert [(update["channel"], update["ts"]) for update in updates] == [
         ("C1", "1.0")

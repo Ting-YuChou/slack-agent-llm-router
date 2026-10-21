@@ -99,6 +99,21 @@ test("quality failures repair without committing and unknown never commits", asy
   assert.equal(calls.rollback.length, 1);
 });
 
+test("every phase a running run moves through is logged as an event, so followers of the event log see it", async () => {
+  let evaluations = 0;
+  const { orchestrator, process } = fixture(undefined, {
+    evaluate: async () => (++evaluations === 1
+      ? { action: "repair", repair_prompt: "fix regression", verification: { status: "failed", checks: [] }, candidate: { hash: "a", path: "/x" } }
+      : { action: "pass", verification: { status: "passed", checks: [] }, grade: { status: "passed" }, candidate: { hash: "b", path: "/x" } }),
+    assertUnchanged: async () => {}, execution: () => {},
+  });
+  const r = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "phases", user_id: "U", prompt: "fix" });
+  process.emit(SETTLED); await new Promise(resolve => setImmediate(resolve));
+  process.emit(SETTLED); await waitFor(() => orchestrator.getRun(r.run_id).status, (status) => status === "completed", (status) => `run is ${status}`);
+  const phases = orchestrator.listEvents(r.run_id).filter((event) => event.type === "phase").map((event) => event.phase);
+  assert.deepEqual(phases, ["verifying", "repairing", "verifying", "finalizing"]);
+});
+
 test('structured discovery holds the session busy and finishes before the sole writer starts', async () => {
   let release!: (value: string) => void;
   const { orchestrator, process, calls } = fixture(undefined, {

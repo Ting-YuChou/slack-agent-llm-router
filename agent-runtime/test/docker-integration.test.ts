@@ -74,7 +74,7 @@ test("real Pi preserves its session while switching from Luna max to Sol high", 
         toolNames: ["read", "write", "edit", "bash", "grep", "find", "ls", "workspace_summary"],
         user: `${hostUid}:${hostGid}`,
         // The second prompt continues Pi's real session files, sealed when the first container stopped.
-        sessionSeal: { seal: () => seals.seal("integration", sessionStatePath), verify: () => seals.verify("integration", sessionStatePath).then((status) => { sealChecks.push(status); return status; }) },
+        sessionSeal: { open: () => seals.open("integration"), seal: () => seals.seal("integration", sessionStatePath), verify: () => seals.verify("integration", sessionStatePath).then((status) => { sealChecks.push(status); return status; }) },
       },
       () => "fake-run-token",
       (event) => {

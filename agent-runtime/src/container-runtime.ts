@@ -62,8 +62,8 @@ export interface AgentContainerOptions {
   reuse?: boolean;
   /** A paused writer older than this is stopped instead of resumed (its MCP tokens date from its start). */
   reuseMaxAgeMs?: number;
-  /** Seals the session directory whenever the container stops and checks it before `--continue`. */
-  sessionSeal?: { seal(): Promise<void>; verify(): Promise<SealStatus> };
+  /** Marks the session open before a container starts, seals it when it stops, and checks it before `--continue`. */
+  sessionSeal?: { open(): Promise<void>; seal(): Promise<void>; verify(): Promise<SealStatus> };
 }
 
 export interface ChecksContext { checks: string[]; defaultChecks: string[]; maxCalls: number }
@@ -349,6 +349,8 @@ export class DockerPiProcess implements AgentProcess {
         this.onEvent({ type: "error", code: "session_integrity_failed", message: "The agent session was modified after it was saved; it cannot be continued" });
         return;
       }
+      // Without the mark, a runtime that dies while this container runs leaves the session reading as tampered.
+      await this.options.sessionSeal?.open().catch(() => console.error(JSON.stringify({ event: "agent_session_seal_open_failed", session_id: this.sessionId })));
       this.start(runId, selected, selectedTask);
       this.dispatch(runId, prompt, selected);
     })().catch(() => { if (!controller.signal.aborted) this.onEvent({ type: "error", code: "container_admission_failed", message: "Agent could not acquire/start an execution slot" }); });
@@ -360,7 +362,8 @@ export class DockerPiProcess implements AgentProcess {
     try {
       const status = await this.options.sessionSeal.verify();
       if (status === "unsealed") console.error(JSON.stringify({ event: "agent_session_unsealed", session_id: this.sessionId }));
-      return status !== "tampered";
+      // Still open: its last container's stop was never sealed and startup could not seal it either.
+      return status === "valid" || status === "unsealed";
     } catch { return false; }
   }
 
@@ -431,28 +434,37 @@ export class DockerPiProcess implements AgentProcess {
     return true;
   }
 
-  /** Stops a writer kept paused for reuse and frees its slot; nothing to do when none is paused. */
+  /**
+   * Stops a writer kept for reuse and frees its slot. Not only a paused one: a kept container that died
+   * on its own is no longer paused but still holds the slot until it is stopped. A no-op once stopped.
+   */
   async release(): Promise<void> {
-    if (this.paused) await this.stopActiveContainer();
+    await this.stopActiveContainer();
   }
   decide(rpcUiId: string, approved: boolean): void { if(this.activeRunId) this.tracing?.approval(this.activeRunId,rpcUiId,approved); this.bridge?.respondToUi(rpcUiId, approved); }
   respondUi(rpcUiId: string, response: UiResponse): void { this.bridge?.respondUi(rpcUiId, response); }
+  /** Ends the run's execution; the session stays open, so what it owns (its network) is kept for the next prompt. */
   async abort(runId: string): Promise<void> {
     const capture = this.capture;
     capture?.cancel();
     this.bridge?.abort(`abort-${runId}`);
-    await this.close();
+    await this.stopExecution();
     await capture?.recover();
   }
 
+  /** Ends the session: stops its execution, then runs the session's cleanup once. */
   async close(): Promise<void> {
-    this.queueAbort?.abort();
-    await this.queuedStart;
-    await this.stopActiveContainer();
+    await this.stopExecution();
     const closed = this.closedHookRan ? undefined : this.options.onClosed;
     this.closedHookRan = true;
     // Cleanup after the container is gone must not turn a clean close into a failure.
     await closed?.().catch(() => console.error(JSON.stringify({ event: "agent_session_cleanup_failed", session_id: this.sessionId })));
+  }
+
+  private async stopExecution(): Promise<void> {
+    this.queueAbort?.abort();
+    await this.queuedStart;
+    await this.stopActiveContainer();
   }
 
   private async waitForContainer(name: string, signal: AbortSignal): Promise<void> {
@@ -549,7 +561,7 @@ export class DockerPiProcess implements AgentProcess {
   private async sealSession(child: ChildProcessWithoutNullStreams): Promise<void> {
     if (!this.options.sessionSeal || this.sealedChild === child) return;
     this.sealedChild = child;
-    // A failed seal leaves the previous one, against which the next --continue reads as tampered.
+    // A failed seal leaves the session marked open, so the next --continue is refused.
     await this.options.sessionSeal.seal().catch(() => console.error(JSON.stringify({ event: "agent_session_seal_failed", session_id: this.sessionId })));
   }
 }

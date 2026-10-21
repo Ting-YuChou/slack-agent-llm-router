@@ -10,6 +10,7 @@ import { parseAgentLimitConfig } from "../src/agent-limits.js";
 import { buildAgentDockerArgs, buildAgentSpawnEnv, DockerPiProcess } from "../src/container-runtime.js";
 import { CREDENTIAL_PLACEHOLDER } from "../src/run-credentials.js";
 import { WorktreeManager, writerGitDir } from "../src/worktree-manager.js";
+import { FAKE_DOCKER } from "./support/fake-docker.js";
 
 test("agent container is non-root, resource-limited, read-only, and internal-network only", () => {
   const args = buildAgentDockerArgs({
@@ -270,4 +271,37 @@ test("closing a process runs its cleanup hook once, and a failing hook does not 
   await piProcess.close();
   await piProcess.close();
   assert.equal(runs, 1);
+});
+
+test("aborting a run keeps the session's network: the next prompt in the session still starts on it", { timeout: 30_000 }, async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "fake-docker-abort-"));
+  await writeFile(path.join(dir, "docker"), FAKE_DOCKER);
+  await chmod(path.join(dir, "docker"), 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${dir}:${previousPath}`;
+  let closedHooks = 0;
+  let settle: () => void = () => undefined;
+  const piProcess = new DockerPiProcess({
+    name: "pi-abort-network", image: "pi-agent@sha256:abc", network: "pi-run-abort", worktreePath: "/w", gitMetadataPath: "/repo/.git",
+    sessionStatePath: dir, gatewayUrl: "http://model-gateway:8080", modelRef: "openai/gpt-5.6-luna",
+    extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
+    onClosed: async () => { closedHooks++; },
+  }, (runId) => `token-${runId}`, (event) => { if (event.type === "settled") settle(); });
+  const settled = () => new Promise<void>((resolve) => { settle = resolve; });
+  try {
+    let done = settled(); piProcess.prompt("exec-1", "fix"); await done;
+    // A failed, cancelled or rejected run is aborted; its session stays open for the owner's next message.
+    await piProcess.abort("exec-1");
+    assert.equal(closedHooks, 0, "abort must not tear down what the session still needs");
+    done = settled(); piProcess.prompt("exec-2", "try again"); await done;
+    const runs = (await readFile(path.join(dir, "run-args"), "utf8")).trim().split("\n");
+    assert.equal(runs.length, 2);
+    for (const args of runs) assert.match(args, /--network pi-run-abort /);
+    await piProcess.close();
+    assert.equal(closedHooks, 1, "closing the session removes it");
+  } finally {
+    await piProcess.close();
+    process.env.PATH = previousPath;
+    await rm(dir, { recursive: true, force: true });
+  }
 });

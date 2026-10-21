@@ -419,21 +419,30 @@ class AgentRuntimeClient:
         poll_seconds: float = 1.0,
         max_error_seconds: float = 300.0,
         on_progress: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+        refresh_seconds: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Poll until the run needs Slack attention, riding out transient errors.
 
         With ``on_progress``, polls between full run reads follow the event log
-        from a cursor, and the run is read again only when an event shows a
-        status or phase change. Each poll reports the latest known state.
+        from a cursor, and the run is read again when an event shows a status
+        or phase change, and with ``refresh_seconds`` at least that often:
+        turns and cost are never in the event log. Each poll reports the latest
+        known state.
         """
         backoff = 1.0
         errors_since: Optional[float] = None
         run: Optional[Dict[str, Any]] = None
+        read_at = 0.0
         cursor = 0
         while True:
             try:
-                if run is None or on_progress is None:
+                stale = (
+                    refresh_seconds is not None
+                    and self._monotonic() - read_at >= refresh_seconds
+                )
+                if run is None or on_progress is None or stale:
                     run = await self.get_run(run_id)
+                    read_at = self._monotonic()
                     # The runtime keeps the newest events; cursors are absolute.
                     cursor = len(run.get("events") or []) + int(
                         run.get("events_truncated") or 0

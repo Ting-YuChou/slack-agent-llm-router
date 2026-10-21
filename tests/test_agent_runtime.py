@@ -634,6 +634,80 @@ async def test_wait_for_update_follows_the_event_cursor_between_run_reads(
 
 
 @pytest.mark.asyncio
+async def test_wait_for_update_rereads_the_run_on_a_phase_event_and_each_refresh(
+    monkeypatch,
+):
+    # Turns and cost are never in the event log, so the run is read again at
+    # least every refresh_seconds; a phase change is read at once.
+    runs = iter(
+        [
+            {**_run_payload("running"), "phase": "implementing", "events": []},
+            {
+                **_run_payload("running"),
+                "phase": "implementing",
+                "turn_count": 4,
+                "estimated_cost_usd": 0.12,
+                "events": [{"type": "turn"}] * 3,
+            },
+            {
+                **_run_payload("running"),
+                "phase": "verifying",
+                "turn_count": 6,
+                "estimated_cost_usd": 0.2,
+                "events": [{"type": "turn"}] * 4,
+            },
+            {**_run_payload("completed"), "phase": "completed", "events": []},
+        ]
+    )
+    pages = iter(
+        [
+            httpx.Response(200, text=""),
+            httpx.Response(
+                200, text=_sse((4, {"type": "phase", "phase": "verifying"}))
+            ),
+            httpx.Response(
+                200, text=_sse((5, {"type": "status", "status": "completed"}))
+            ),
+        ]
+    )
+    requests = []
+
+    def handler(request):
+        if request.url.path.endswith("/events"):
+            requests.append("events")
+            return next(pages)
+        requests.append("run")
+        return httpx.Response(200, json=next(runs))
+
+    progress = []
+
+    async def on_progress(run):
+        progress.append(
+            (run.get("phase"), run.get("turn_count"), run.get("estimated_cost_usd"))
+        )
+
+    runtime = client(handler, monkeypatch)
+    _fake_clock(runtime, monkeypatch)
+    try:
+        run = await runtime.wait_for_update(
+            "R", poll_seconds=0.5, on_progress=on_progress, refresh_seconds=1.0
+        )
+    finally:
+        await runtime.close()
+
+    assert run["status"] == "completed"
+    # t=0 read, t=0.5 events, t=1 refresh read, t=1.5 events (phase) and read,
+    # t=2 events (status) and the final read.
+    assert requests == ["run", "events", "run", "events", "run", "events", "run"]
+    assert progress == [
+        ("implementing", None, None),
+        ("implementing", None, None),
+        ("implementing", 4, 0.12),
+        ("verifying", 6, 0.2),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_wait_for_update_keeps_an_absolute_cursor_across_the_event_cap(
     monkeypatch,
 ):
