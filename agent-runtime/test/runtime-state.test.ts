@@ -62,3 +62,20 @@ test("a failed write does not poison later saves, and a successful save restores
     assert.match(await readFile(file, "utf8"), /"after"/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test("the control state file is written as compact JSON", async () => {
+  const { readFile, rm } = await import("node:fs/promises");
+  const root = await mkdtemp(path.join(tmpdir(), "pi-state-compact-"));
+  try {
+    const file = path.join(root, "state.json");
+    const state = {
+      schema_version: 1 as const,
+      sessions: [],
+      runs: [{ run_id: "R1", session_id: "S1", status: "completed" as const, answer: "", owner_user_id: "U", created_at: "x", updated_at: "x", tool_count: 0, turn_count: 0, events: [{ type: "status", status: "completed" }] }],
+    };
+    await new RuntimeStateStore(file).save(state);
+    const text = await readFile(file, "utf8");
+    assert.equal(text, JSON.stringify(state));
+    assert.doesNotMatch(text, /\n/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

@@ -301,3 +301,45 @@ test("POST /v1/sessions and prompts honour Idempotency-Key", async () => {
     assert.deepEqual(calls, ["create", "prompt", "create"], "no key means no deduplication");
   } finally { await close(server); }
 });
+
+test("run events long-poll with ?wait, cap the wait at 30 s and number SSE ids absolutely across the event cap", async () => {
+  const waits: Array<{ after: number; waitMs: number; aborted: boolean }> = [];
+  const orchestrator = {
+    getRun: (id: string) => ({ run_id: id, session_id: "S1", status: "running", events: [], events_truncated: 5 }),
+    listEvents: () => [{ type: "status", status: "running" }],
+    waitForEvents: async (_id: string, after: number, waitMs: number, signal?: AbortSignal) => {
+      waits.push({ after, waitMs, aborted: signal?.aborted ?? false });
+      return { events: [{ type: "tool", phase: "start" }], offset: Math.max(after, 5) };
+    },
+  };
+  const server = createAgentHttpServer({ orchestrator: orchestrator as any, token: "runtime-secret", health: () => ({}) });
+  const base = await listen(server);
+  const headers = { authorization: "Bearer runtime-secret" };
+  try {
+    const snapshot = await (await fetch(`${base}/v1/runs/R1/events?after=0`, { headers })).text();
+    // Without wait the route answers from a snapshot, as before; ids continue after the truncated events.
+    assert.deepEqual(waits, []);
+    assert.match(snapshot, /^id: 6\nevent: status\n/);
+    const polled = await (await fetch(`${base}/v1/runs/R1/events?after=7&wait=25`, { headers })).text();
+    assert.match(polled, /^id: 8\nevent: tool\n/);
+    await fetch(`${base}/v1/runs/R1/events?after=7&wait=600`, { headers });
+    await fetch(`${base}/v1/runs/R1/events?after=7&wait=nonsense`, { headers });
+    assert.deepEqual(waits.map(({ after, waitMs }) => ({ after, waitMs })), [{ after: 7, waitMs: 25_000 }, { after: 7, waitMs: 30_000 }]);
+  } finally { await close(server); }
+});
+
+test("an empty long-poll answers 200 with no events", async () => {
+  const orchestrator = {
+    getRun: (id: string) => ({ run_id: id, session_id: "S1", status: "running", events: [] }),
+    listEvents: () => [],
+    waitForEvents: async (_id: string, after: number) => ({ events: [], offset: after }),
+  };
+  const server = createAgentHttpServer({ orchestrator: orchestrator as any, token: "runtime-secret", health: () => ({}) });
+  const base = await listen(server);
+  try {
+    const response = await fetch(`${base}/v1/runs/R1/events?after=3&wait=1`, { headers: { authorization: "Bearer runtime-secret" } });
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/);
+    assert.equal(await response.text(), "");
+  } finally { await close(server); }
+});
