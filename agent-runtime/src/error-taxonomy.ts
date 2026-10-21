@@ -44,6 +44,11 @@ const MESSAGE_CAUSES: Record<string, CauseCode> = {
   verification_stop_unconfirmed: "verification_stop_unconfirmed",
   investigation_unknown: "investigation_reported_unknown",
   investigation_stop_unconfirmed: "investigation_stop_unconfirmed",
+  // validateInvestigation's rejections, when the host re-checks a submission.
+  "Invalid investigation output": "investigation_invalid_submission",
+  "Invalid investigation evidence": "investigation_invalid_submission",
+  "Missing investigation evidence": "investigation_invalid_submission",
+  "Investigation output too large": "investigation_invalid_submission",
 };
 
 /** The most specific known cause along an error's `cause` chain, outermost first. */

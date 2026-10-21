@@ -153,7 +153,8 @@
     "concurrency": 2,
     "maxCostUsd": 5,
     "activeTimeoutMs": 1800000,
-    "discoveryCostUsd": 1.5
+    "discoveryCostUsd": 1.5,
+    "degradeUnknown": true
   },
   "fixers": [
     {

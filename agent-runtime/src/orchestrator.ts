@@ -8,7 +8,7 @@ import type { ApprovalLedger } from "./approval-ledger.js";
 import { ApprovalStore, type PersistedApproval } from "./policy.js";
 import type { PublicRunEvent, RunOutcome, UiResponse } from "./pi-rpc.js";
 import { interruptRestartedRun, type RuntimeStateStore } from "./runtime-state.js";
-import { workflowMode, type WorkflowMode, type WorkflowNode } from "./structured-workflow.js";
+import { workflowMode, type InvestigationDegraded, type WorkflowMode, type WorkflowNode } from "./structured-workflow.js";
 import { WorkflowBudget } from "./workflow-budget.js";
 import type { Candidate, GateInput, GateResult } from "./quality-gate.js";
 import { classifyGateError, failureCause, type RunFailure } from "./error-taxonomy.js";
@@ -35,7 +35,8 @@ export interface QualityServices {
   maxCostUsd?: number;
   structured?: { enabled: boolean; maxCostUsd: number; activeTimeoutMs: number };
   prepare?(id: string, mode: WorkflowMode): void;
-  discover?(input: GateInput & { owner: string; initial_active_ms: number }): Promise<string>;
+  /** Read-only discovery; resolves to the writer's implementation brief. `degraded` hears each investigation that continued unresolved. */
+  discover?(input: GateInput & { owner: string; initial_active_ms: number; degraded?(event: InvestigationDegraded): void }): Promise<string>;
   writerStarted?(id: string): void;
   canResume?(id: string): boolean;
   resumeElapsed?(id: string): number;
@@ -751,7 +752,8 @@ export class CodingAgentOrchestrator {
 
   private launchDiscovery(session: SessionRecord, run: RunRecord, state: WorkflowState, prompt: string) {
     run.phase = 'planning';
-    state.discovery = this.quality!.discover!({ run_id: run.run_id, owner: run.owner_user_id, worktree: session.worktreePath, baseline: session.baselineCommit, requirement: state.requirement, attempt: 0, signal: state.controller.signal, initial_active_ms: state.initialActiveMs });
+    state.discovery = this.quality!.discover!({ run_id: run.run_id, owner: run.owner_user_id, worktree: session.worktreePath, baseline: session.baselineCommit, requirement: state.requirement, attempt: 0, signal: state.controller.signal, initial_active_ms: state.initialActiveMs,
+      degraded: event => { if (isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return; run.events.push({ ...event }); this.persistSoon(); } });
     void state.discovery.then(async evidence => {
       state.controller.signal.throwIfAborted();
       if (isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return;
