@@ -836,14 +836,14 @@ export class CodingAgentOrchestrator {
   }
 
   private launchDiscovery(session: SessionRecord, run: RunRecord, state: WorkflowState, prompt: string) {
-    run.phase = 'planning';
+    this.setPhase(run, 'planning');
     state.discovery = this.quality!.discover!({ run_id: run.run_id, owner: run.owner_user_id, worktree: session.worktreePath, baseline: session.baselineCommit, requirement: state.requirement, attempt: 0, signal: state.controller.signal, initial_active_ms: state.initialActiveMs,
       degraded: event => { if (isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return; this.pushEvent(run, { ...event }); this.persistSoon(); } });
     void state.discovery.then(async evidence => {
       state.controller.signal.throwIfAborted();
       if (isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return;
       this.quality!.writerStarted?.(run.run_id);
-      run.phase = run.task_mode === 'discuss' ? 'discussing' : 'implementing'; await this.persistState();
+      this.setPhase(run, run.task_mode === 'discuss' ? 'discussing' : 'implementing'); await this.persistState();
       await this.startExecution(session, run, state, `${prompt}\n\n${evidence}`);
     }).catch(async (error: unknown) => {
       const cause = failureCause(error);
@@ -913,7 +913,7 @@ export class CodingAgentOrchestrator {
     const run = this.runs.get(runId); const workflow = this.workflows.get(runId);
     if (!run || !workflow || isTerminal(run.status)) return;
     workflow.budget.report(cost); run.estimated_cost_usd = (run.estimated_cost_usd ?? 0) + cost;
-    run.phase = phase; await this.persistState(); workflow.budget.check();
+    this.setPhase(run, phase); await this.persistState(); workflow.budget.check();
   }
 
   private armDeadline(session: SessionRecord, run: RunRecord, ms: number): void {
@@ -1162,10 +1162,10 @@ export class CodingAgentOrchestrator {
         catch (error) {
           if (!(error instanceof DiffLimitError) || workflow.attempt > (this.quality.maxRepairs ?? 0)) throw error;
           workflow.attempt++; workflow.executionId = randomUUID(); workflow.checking = false;
-          run.phase = "repairing"; await this.persistState();
+          this.setPhase(run, "repairing"); await this.persistState();
           await this.startExecution(session, run, workflow, renderPrompt("diff-limit-repair", { requirement: workflow.requirement, limit: error.message.slice(0, 200) })); return;
         }
-        run.phase = "verifying"; await this.persistState();
+        this.setPhase(run, "verifying"); await this.persistState();
         workflow.operation = this.quality.evaluate(input);
         const result = await workflow.operation; workflow.operation = undefined;
         if (workflow.controller.signal.aborted || isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return;
@@ -1176,7 +1176,7 @@ export class CodingAgentOrchestrator {
           ...(result.candidate.fixes?.length ? { fixes: result.candidate.fixes } : {}), ...(result.candidate.fixer_cause ? { fixer_cause: result.candidate.fixer_cause } : {}) });
         if (result.action === "repair") {
           workflow.attempt++; workflow.executionId = randomUUID(); workflow.checking = false;
-          run.phase = "repairing"; await this.persistState();
+          this.setPhase(run, "repairing"); await this.persistState();
           await this.startExecution(session, run, workflow, result.repair_prompt!); return;
         }
         if (result.action === "fail") {
@@ -1191,7 +1191,7 @@ export class CodingAgentOrchestrator {
         if (!await this.releaseWriter(session, run)) return;
         await this.quality.assertUnchanged(result.candidate, input);
         workflow.controller.signal.throwIfAborted();
-        run.phase = "finalizing"; await this.persistState();
+        this.setPhase(run, "finalizing"); await this.persistState();
       } catch (error) {
         workflow.operation = undefined;
         if (!isTerminal(run.status) && !this.terminalClaims.has(run.run_id)) {
@@ -1341,7 +1341,7 @@ export class CodingAgentOrchestrator {
       await this.failClaimedRun(session, run, { code: "delivery_candidate_changed", message: "The worktree changed after the delivery card was posted; nothing was committed" });
       return;
     }
-    run.phase = "finalizing";
+    this.setPhase(run, "finalizing");
     await this.finalizeClaimedRun(session, run);
   }
 
@@ -1465,6 +1465,13 @@ export class CodingAgentOrchestrator {
     this.deadlines.delete(run.run_id);
     this.stopDiskWatch(run.run_id);
     return true;
+  }
+
+  /** Moves a running run to its next phase and logs it, so followers of the event log see it without reading the run. */
+  private setPhase(run: RunRecord, phase: string): void {
+    if (run.phase === phase) return;
+    run.phase = phase;
+    this.pushEvent(run, { type: "phase", phase });
   }
 
   private updateRun(run: RunRecord, status: RunStatus): void {
