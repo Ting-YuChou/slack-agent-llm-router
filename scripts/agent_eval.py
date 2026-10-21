@@ -477,6 +477,7 @@ def build_profile(task, image):
                 "maxCostUsd": 5,
                 "activeTimeoutMs": 1800000,
                 "discoveryCostUsd": 1.5,
+                "degradeUnknown": True,
             },
         )
     return profile

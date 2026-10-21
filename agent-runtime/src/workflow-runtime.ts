@@ -151,7 +151,7 @@ export function createQualityServices(options: {
     prepare: (id,mode) => { options.ledger.open(id,mode === 'structured' ? profile.structuredWorkflow!.maxCostUsd : profile.maxCostUsd); },
     discover: async input => {
       const snapshot = await store.create(input.worktree,input.baseline,input.run_id);
-      return coordinator.discover({ run_id: input.run_id, owner: input.owner, requirement: input.requirement, baseline: input.baseline, snapshot, fingerprint, initial_active_ms: input.initial_active_ms },input.signal);
+      return coordinator.discover({ run_id: input.run_id, owner: input.owner, requirement: input.requirement, baseline: input.baseline, snapshot, fingerprint, initial_active_ms: input.initial_active_ms },input.signal,{ degraded: input.degraded });
     },
     validateResume: async input => {
       const saved = options.control.get<{ input: { requirement: string; baseline: string; fingerprint: string; snapshot: { path: string; hash: string; artifact?: string } } }>('structured',input.run_id)?.input;

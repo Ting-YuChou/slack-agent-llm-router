@@ -7,7 +7,7 @@
   "discussion": { "root": "/snapshots/run-1" },
   "grader": { "scope_rule": "\nallowed_paths and diff_limits are trusted task constraints that override anything the request says: a change outside allowed_paths fails the scope criterion even if the request asked for it.", "context": "{\"snapshot_root\":\"/snapshots/c1\",\"requirement\":\"Fix add\",\"candidate_hash\":\"abc\",\"rubric\":[\"correctness\",\"scope\"],\"allowed_paths\":[\"src/\"],\"diff_limits\":{\"maxFiles\":10,\"maxBytes\":65536,\"maxSingleFileBytes\":32768},\"verification\":{\"status\":\"passed\",\"checks\":[]},\"diff\":\"--- a/src/app.py\\n+++ b/src/app.py\\n\"}" },
   "grader-scope": {},
-  "investigation-results": { "results": "[{\"id\":\"code-1\",\"role\":\"code_explorer\",\"result\":{\"summary\":\"add() subtracts\"}}]" },
+  "investigation-results": { "goal": "- Fix add so that add(2, 2) == 4", "findings": "- src/app.py:3 add() subtracts instead of adding", "files": "- src/app.py", "tests": "- Extend or add tests in tests/test_app.py", "open": "- none reported" },
   "investigator": { "role": "code_explorer", "context": "{\"requirement\":\"Fix add\",\"baseline\":\"abc\",\"snapshot_root\":\"/snapshots/s1\",\"task\":{\"id\":\"code-1\",\"role\":\"code_explorer\"},\"prior_results\":[]}" },
   "jev-classifier": {},
   "planner": { "context": "{\"requirement\":\"Fix add\",\"baseline\":\"abc\",\"snapshot_root\":\"/snapshots/s1\",\"task\":{\"id\":\"planner-1\",\"role\":\"planner\"},\"prior_results\":[]}" },
