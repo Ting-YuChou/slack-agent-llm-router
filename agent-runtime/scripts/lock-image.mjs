@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const runtimeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const lockPath = path.join(runtimeRoot, "plugins.lock.json");
+// The runtime reads the same variable, so a copied lock (the eval's) can be locked in place.
+const lockPath = path.resolve(process.env.PI_AGENT_PLUGIN_LOCK ?? path.join(runtimeRoot, "plugins.lock.json"));
 const skillLockPath = path.join(runtimeRoot, "skills.lock.json");
 const image = process.argv[2] ?? "slack-pi-agent:1.0.1";
 const lock = JSON.parse(readFileSync(lockPath, "utf8"));
@@ -36,7 +37,20 @@ if (!/^sha256:[a-f0-9]{64}$/.test(imageDigest)) {
   throw new Error(`Docker returned an invalid image digest for ${image}`);
 }
 
+// What the container actually loads, hashed inside the image by digest; the runtime refuses to start
+// on any difference (src/image-manifest.ts).
+const { computeImageManifest } = await import(pathToFileURL(path.join(runtimeRoot, "dist/src/image-manifest.js")).href);
+const manifest = await computeImageManifest(imageDigest);
+for (const [inImage, digest] of Object.entries(manifest)) {
+  const relative = path.posix.relative("/opt/pi", inImage);
+  if (!/^(?:extensions|plugins|skills)\//.test(relative) || !digest.startsWith("sha256:")) continue;
+  const hostPath = path.join(runtimeRoot, relative);
+  const hostDigest = existsSync(hostPath) ? `sha256:${createHash("sha256").update(readFileSync(hostPath)).digest("hex")}` : "missing";
+  if (hostDigest !== digest) throw new Error(`Refusing to lock an image built from a different tree: ${relative}`);
+}
+
 lock.image_digest = imageDigest;
+lock.image_manifest = manifest;
 const temporaryPath = `${lockPath}.tmp`;
 writeFileSync(temporaryPath, `${JSON.stringify(lock, null, 2)}\n`, { mode: 0o600 });
 renameSync(temporaryPath, lockPath);

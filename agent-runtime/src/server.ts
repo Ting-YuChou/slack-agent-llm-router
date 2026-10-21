@@ -45,6 +45,7 @@ import { createCiRuntime } from "./ci-runtime.js";
 import { taskMode } from "./task-mode.js";
 import { workflowMode } from "./structured-workflow.js";
 import type { CiRepairs } from "./ci-repair.js";
+import { assertImageManifest } from "./image-manifest.js";
 import { loadProfile, type VerificationProfile } from "./verification.js";
 import { createQualityServices } from "./workflow-runtime.js";
 import { DEFAULT_DIFF_LIMITS, WorktreeManager, writerGitDir } from "./worktree-manager.js";
@@ -365,6 +366,8 @@ export async function createProductionServer() {
   if (!await readImageFile(image, "/opt/pi/extensions/secret-env.ts")) throw new Error("Agent image must be rebuilt with the secret-env extension");
   const imageSkillLock = await readImageFile(image, "/opt/pi/skills.lock.json");
   const lock = await verifyPluginLock(lockPath, { rootDir: path.dirname(lockPath), actualImageDigest });
+  // The digest pins the image; the manifest proves the policy, extensions, plugins and skills inside it are the locked ones.
+  await assertImageManifest(lockPath, actualImageDigest);
   const skillLock = await verifySkillLock(skillLockPath, {
     rootDir: path.dirname(skillLockPath),
     imageLockContent: imageSkillLock,

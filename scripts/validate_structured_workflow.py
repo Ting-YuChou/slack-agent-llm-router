@@ -192,13 +192,15 @@ class Topology:
 
     def _prepare_locks(self):
         self.locks.mkdir()
-        plugin = json.loads(
-            (self.project / "agent-runtime/plugins.lock.json").read_text()
+        lock = self.locks / "plugins.lock.json"
+        shutil.copy(self.project / "agent-runtime/plugins.lock.json", lock)
+        # Pins the test image's digest and in-image manifest, which the runtime checks at startup.
+        run(
+            "node",
+            str(self.project / "agent-runtime/scripts/lock-image.mjs"),
+            AGENT_IMAGE,
+            env={**os.environ, "PI_AGENT_PLUGIN_LOCK": str(lock)},
         )
-        plugin["image_digest"] = docker(
-            "image", "inspect", "--format={{.Id}}", AGENT_IMAGE
-        )
-        (self.locks / "plugins.lock.json").write_text(json.dumps(plugin))
         shutil.copytree(self.project / "agent-runtime/plugins", self.locks / "plugins")
         shutil.copy(
             self.project / "agent-runtime/skills.lock.json",
