@@ -47,7 +47,7 @@ test("stale run networks from a previous runtime are removed at boot", async () 
 test("agent containers forward no DNS beyond the internal network", () => {
   const args = buildAgentDockerArgs({
     name: "pi-session-1", image: "pi-agent@sha256:abc", network: "pi-run-1", worktreePath: "/w", gitMetadataPath: "/repo/.git",
-    sessionStatePath: "/s", gatewayUrl: "http://model-gateway:8080/v1", gatewayToken: "t", modelRef: "openai/gpt-5.6-luna",
+    sessionStatePath: "/s", gatewayUrl: "http://model-gateway:8080/v1", modelRef: "openai/gpt-5.6-luna",
     extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
   });
   const rendered = args.join(" ");
