@@ -9,6 +9,7 @@ import { CodingAgentOrchestrator } from "../src/orchestrator.js";
 import type { PublicRunEvent } from "../src/pi-rpc.js";
 import { MCP_REUSE_MAX_AGE_MS, writerReuseOptions } from "../src/server.js";
 import { validateProfile } from "../src/verification.js";
+import { FAKE_DOCKER } from "./support/fake-docker.js";
 
 const base = { id: "p", repository: "o/r", image: `sha256:${"0".repeat(64)}`, rubric: ["ok"], allowedPaths: ["src"], checks: [{ name: "t", argv: ["true"], cwd: ".", timeoutMs: 1000 }] };
 
@@ -25,42 +26,6 @@ test("writer reuse is off unless the profile turns it on; with MCP a paused writ
   assert.ok(MCP_REUSE_MAX_AGE_MS <= 10 * 60_000);
 });
 
-/**
- * A docker CLI stand-in: `run` speaks enough Pi RPC to configure, ask for credentials and settle each
- * prompt; every other subcommand is logged, and fails when a `fail-<subcommand>` file exists.
- */
-const FAKE_DOCKER = `#!/usr/bin/env node
-const fs = require("fs"), path = require("path");
-const dir = __dirname, log = (line) => fs.appendFileSync(path.join(dir, "log"), line + "\\n");
-const [cmd] = process.argv.slice(2);
-if (cmd === "run") {
-  log("run"); fs.writeFileSync(path.join(dir, "run.pid"), String(process.pid));
-  let model = {}, level = "", buf = "";
-  const out = (record) => process.stdout.write(JSON.stringify(record) + "\\n");
-  process.stdin.on("data", (chunk) => {
-    buf += chunk; let i;
-    while ((i = buf.indexOf("\\n")) >= 0) {
-      const r = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1);
-      if (r.type === "set_model") { model = { provider: r.provider, id: r.modelId }; out({ id: r.id, type: "response", command: r.type, success: true }); }
-      else if (r.type === "set_thinking_level") { level = r.level; out({ id: r.id, type: "response", command: r.type, success: true }); }
-      else if (r.type === "get_state") out({ id: r.id, type: "response", command: r.type, success: true, data: { model, thinkingLevel: level } });
-      else if (r.type === "prompt") { out({ id: r.id, type: "response", command: "prompt", success: true }); out({ type: "extension_ui_request", id: "cred-" + r.id, method: "input", title: "pi-agent/credential", placeholder: "" }); }
-      else if (r.type === "extension_ui_response") {
-        log("credential " + (r.value ? JSON.parse(r.value).OPENAI_API_KEY : "cancelled"));
-        out({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" } });
-        out({ type: "agent_settled" });
-      }
-    }
-  });
-  process.stdin.on("end", () => process.exit(0));
-  process.on("SIGTERM", () => process.exit(0));
-} else if (cmd === "inspect") process.stdout.write("true\\n");
-else {
-  log(cmd);
-  if (fs.existsSync(path.join(dir, "fail-" + cmd))) process.exit(1);
-  if (cmd === "stop") { try { process.kill(Number(fs.readFileSync(path.join(dir, "run.pid"), "utf8")), "SIGTERM"); } catch {} }
-}
-`;
 
 async function withFakeDocker(reuse: boolean | { reuse: boolean; reuseMaxAgeMs?: number }, body: (h: { dir: string; process: DockerPiProcess; events: PublicRunEvent[]; settled: () => Promise<void>; log: () => Promise<string[]> }) => Promise<void>) {
   const dir = await mkdtemp(path.join(os.tmpdir(), "fake-docker-reuse-"));

@@ -19,6 +19,7 @@ import { parseAgentLimitConfig } from "./agent-limits.js";
 export { parseAgentLimits } from "./agent-limits.js";
 import { budgetIdFor, executionActive, outputTokenLimitFor, parseDefaultRunBudget, releaseRunBudget } from "./run-budget.js";
 import { deriveMcpRevocationSecret } from "./execution-status.js";
+import { deriveSessionSealKey, SessionSeal } from "./session-seal.js";
 import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT, listAgentModels, resolveAgentModel } from "./agent-model.js";
 import { JevRouter, type JevMode } from "./jev-router.js";
 import { repositoryFromRemote, parseGitHubRepositories } from "./github-repository.js";
@@ -459,6 +460,8 @@ export async function createProductionServer() {
   const verificationBases = new Map<string, string>();
   // Every run is metered, with or without a trusted profile (no-profile runs get a default budget).
   const budgetLedger = new BudgetLedger(path.join(runtimeRoot, "budget", "budget.sqlite"));
+  // Outside every container mount: a writer can edit its session directory, never these seals.
+  const sessionSeals = new SessionSeal(deriveSessionSealKey(gatewaySecret), path.join(runtimeRoot, "session-seals"));
   const defaultRunBudgetUsd = parseDefaultRunBudget(process.env);
   const workflowControl = trustedProfile ? new ControlStore(path.join(runtimeRoot, "control", "state.sqlite"), () => { void orchestrator.shutdown().catch(() => {}); }) : undefined;
   const releaseCoordinator = workflowControl?.acquireCoordinator();
@@ -552,6 +555,7 @@ export async function createProductionServer() {
           // Runs that skip delivery approval keep per-write prompts, so no run loses both gates.
           writeApproval: session.skipDelivery ? "per_prompt" : approval.writeApproval,
           ...writerReuseOptions(trustedProfile?.profile, mcpServerIds.length),
+          sessionSeal: { seal: () => sessionSeals.seal(session.id, sessionStatePath), verify: () => sessionSeals.verify(session.id, sessionStatePath) },
           user: containerUser,
           ...(mcpServerIds.length > 0 ? {
             mcp: {

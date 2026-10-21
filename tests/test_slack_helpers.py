@@ -3009,6 +3009,7 @@ def test_delivery_expired_status_line_suggests_the_next_step():
         {"code": "delivery_expired"},
         {"code": "delivery_rejected"},
         {"code": "archive_failed"},
+        {"code": "session_integrity_failed"},
     ],
 )
 def test_agent_status_line_appends_next_step_for_known_codes(error):
