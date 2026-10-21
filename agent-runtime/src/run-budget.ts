@@ -43,3 +43,8 @@ const TERMINAL = new Set(["completed", "failed", "cancelled", "timed_out"]);
 export function releaseRunBudget(run: { run_id: string; status: string }, parents: ReadonlyMap<string, string>, ledger: { stop(id: string): void }): void {
   if (TERMINAL.has(run.status) && !parents.has(run.run_id)) ledger.stop(run.run_id);
 }
+
+/** Whether the budget an execution spends (its parent run's, or its own) is still open. */
+export function executionActive(execution: string, parents: ReadonlyMap<string, string>, ledger: { active(id: string): boolean }, recorded?: (execution: string) => string | undefined): boolean {
+  return ledger.active(parents.get(execution) ?? recorded?.(execution) ?? execution);
+}

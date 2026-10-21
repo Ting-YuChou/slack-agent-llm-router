@@ -59,6 +59,8 @@ export interface AgentContainerOptions {
   writeApproval?: WriteApprovalMode;
   /** Pause a settled writer and resume it for the next compatible execution (profile `writerReuse`). */
   reuse?: boolean;
+  /** A paused writer older than this is stopped instead of resumed (its MCP tokens date from its start). */
+  reuseMaxAgeMs?: number;
 }
 
 export interface ChecksContext { checks: string[]; defaultChecks: string[]; maxCalls: number }
@@ -188,6 +190,7 @@ export class DockerPiProcess implements AgentProcess {
   private reused = false;
   private activeTask?: TaskMode;
   private containerKey?: string;
+  private containerStartedAt = 0;
   private credentials?: RunCredentials;
   private readonly options: Omit<AgentContainerOptions, "classifier" | "mcp"> & { mcp?: Omit<McpRunConfig, "token"> };
   private readonly tokenForRun: (runId: string, route: RouteDecision) => string;
@@ -237,7 +240,7 @@ export class DockerPiProcess implements AgentProcess {
     if (mcp && !this.mcpTokenForRun) throw new Error("MCP token issuer is required when MCP is enabled");
     const classifier = selectedTask !== "discuss" && this.classifierTokenForRun !== undefined;
     this.credentials = this.credentialsFor(runId, route, selectedTask);
-    this.activeTask = selectedTask; this.reused = false;
+    this.activeTask = selectedTask; this.reused = false; this.containerStartedAt = Date.now();
     this.containerKey = this.reuseKey(route, selectedTask);
     const containerOptions: AgentContainerOptions = {
       ...baseOptions,
@@ -383,11 +386,14 @@ export class DockerPiProcess implements AgentProcess {
 
   /**
    * Resumes the paused writer for a compatible execution with that execution's credentials; false when a
-   * fresh container must start instead (none paused, a different model or limits, or unpause failed).
+   * fresh container must start instead (none paused, a different model or limits, older than
+   * reuseMaxAgeMs, or unpause failed). MCP tokens, unlike model tokens, stay those issued at start: they
+   * belong to the same run, which only a run's own repairs reuse, and are revoked when it ends.
    */
   private async resume(runId: string, prompt: string, route: RouteDecision, task: TaskMode): Promise<boolean> {
     const name = this.activeContainerName;
-    if (!this.paused || !name || !this.bridge || this.child?.exitCode !== null || this.options.mcp || this.containerKey !== this.reuseKey(route, task)) return false;
+    if (!this.paused || !name || !this.bridge || this.child?.exitCode !== null || this.containerKey !== this.reuseKey(route, task)) return false;
+    if (this.options.reuseMaxAgeMs !== undefined && Date.now() - this.containerStartedAt > this.options.reuseMaxAgeMs) return false;
     const startup = new StartupTiming((stage, phase, failed) => this.tracing?.lifecycle(runId, stage, phase, failed));
     startup.start();
     try { await exec("docker", ["unpause", name], { env: { PATH: process.env.PATH } }); }

@@ -18,6 +18,8 @@ export class BudgetLedger {
     this.db.prepare("INSERT OR IGNORE INTO budgets(id,limit_usd,initial_usd) VALUES(?,?,?)").run(id,limit,initial);
   }
   stop(id: string) { this.db.prepare("UPDATE budgets SET active=0 WHERE id=?").run(id); }
+  /** An unknown budget is not active: a token whose budget was never opened has nothing to spend. */
+  active(id: string): boolean { return (this.db.prepare("SELECT active FROM budgets WHERE id=?").get(id) as { active?: number } | undefined)?.active === 1; }
   executionScope(execution: string, workflow: string, stage: string, cap: number) {
     if (!Number.isFinite(cap) || cap <= 0) throw new Error('Invalid stage cap');
     this.db.prepare('INSERT OR IGNORE INTO execution_scopes VALUES(?,?,?,?)').run(execution,workflow,stage,cap);

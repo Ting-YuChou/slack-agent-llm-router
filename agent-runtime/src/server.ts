@@ -17,7 +17,8 @@ import { approvalSettings } from "./approval-mode.js";
 import { parseAgentLimitConfig } from "./agent-limits.js";
 
 export { parseAgentLimits } from "./agent-limits.js";
-import { budgetIdFor, outputTokenLimitFor, parseDefaultRunBudget, releaseRunBudget } from "./run-budget.js";
+import { budgetIdFor, executionActive, outputTokenLimitFor, parseDefaultRunBudget, releaseRunBudget } from "./run-budget.js";
+import { deriveMcpRevocationSecret } from "./execution-status.js";
 import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT, listAgentModels, resolveAgentModel } from "./agent-model.js";
 import { JevRouter, type JevMode } from "./jev-router.js";
 import { repositoryFromRemote, parseGitHubRepositories } from "./github-repository.js";
@@ -63,6 +64,10 @@ interface ServerOptions {
   idempotency?: IdempotencyCache;
   budgetLedger?: BudgetLedger;
   budgetSecret?: string;
+  /** Whether an execution's run is still active, for the gateways' revocation checks. */
+  executionActive?: (execution: string) => boolean;
+  /** Bearers MCP gateways present to ask for execution status (deriveMcpRevocationSecret). */
+  mcpRevocationSecrets?: string[];
   orchestrator: CodingAgentOrchestrator;
   ci?: CiRepairs;
   token: string;
@@ -97,6 +102,12 @@ export function createAgentHttpServer(options: ServerOptions) {
   return createServer(guardedHandler("agent-runtime", async (request, response) => {
     try {
       const url = new URL(request.url ?? "/", "http://runtime.local");
+      if (url.pathname === '/internal/mcp/active') {
+        if (!options.mcpRevocationSecrets?.some(secret => authorized(request, secret))) { sendError(response,401,'unauthorized','MCP gateway authentication required'); return; }
+        if (request.method !== 'POST' || !options.executionActive) { sendError(response,503,'execution_status_unavailable','Execution status unavailable'); return; }
+        const execution = requiredString(asRecord(await readJson(request)).execution,'execution');
+        sendJson(response,200,{ result: options.executionActive(execution) }); return;
+      }
       if (url.pathname.startsWith('/internal/budget/')) {
         if (!options.budgetSecret || !authorized(request,options.budgetSecret)) { sendError(response,401,'unauthorized','Gateway budget authentication required'); return; }
         if (request.method !== 'POST' || !options.budgetLedger) { sendError(response,503,'budget_unavailable','Host budget store unavailable'); return; }
@@ -107,6 +118,7 @@ export function createAgentHttpServer(options: ServerOptions) {
           if (url.pathname === '/internal/budget/reserve') ledger.reserve(id(body.workflow),id(body.id),Number(body.amount),body.execution === undefined ? undefined : id(body.execution));
           else if (url.pathname === '/internal/budget/settle') ledger.settle(id(body.id),body.amount === null ? null : Number(body.amount));
           else if (url.pathname === '/internal/budget/first-model') { sendJson(response,200,{ result: ledger.firstModel(id(body.execution)) }); return; }
+          else if (url.pathname === '/internal/budget/active') { sendJson(response,200,{ result: options.executionActive ? options.executionActive(id(body.execution)) : ledger.active(id(body.execution)) }); return; }
           else { sendError(response,404,'not_found','Unknown budget operation'); return; }
           sendJson(response,200,{});
         } catch { sendError(response,429,'budget_unavailable_or_exhausted','Budget admission refused'); }
@@ -539,7 +551,7 @@ export async function createProductionServer() {
           ...(trustedProfile ? { writerContext: writerContextFor(trustedProfile.profile) } : {}),
           // Runs that skip delivery approval keep per-write prompts, so no run loses both gates.
           writeApproval: session.skipDelivery ? "per_prompt" : approval.writeApproval,
-          reuse: writerReuseEnabled(trustedProfile?.profile, mcpServerIds.length),
+          ...writerReuseOptions(trustedProfile?.profile, mcpServerIds.length),
           user: containerUser,
           ...(mcpServerIds.length > 0 ? {
             mcp: {
@@ -626,6 +638,9 @@ export async function createProductionServer() {
   const server = createAgentHttpServer({
     idempotency,
     budgetLedger, budgetSecret: deriveBudgetRpcSecret(gatewaySecret),
+    // Gateways refuse the tokens of a run whose budget is stopped (releaseRunBudget at its end).
+    executionActive: (execution) => executionActive(execution, executionParents, budgetLedger, id => workflowControl?.get<{ parent?: string }>("execution", id)?.parent),
+    mcpRevocationSecrets: mcpSigningSecret ? mcpServerIds.filter((id) => id !== "codegraph").map((id) => deriveMcpRevocationSecret(deriveMcpServerSecret(mcpSigningSecret, id))) : [],
     ci: ciRuntime?.ci,
     feedback: telemetry ? (run, payload, id) => telemetry.record(run.run_id, run.session_id, "feedback", payload, id) : undefined,
     patchSecrets: credentialValues,
@@ -799,12 +814,16 @@ function positiveInteger(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
-/** The writer gets run_checks (tool, extension and its context) only when a trusted profile can verify. */
-/** Writer reuse needs the profile's opt-in and no MCP: MCP tokens are fixed when the container starts. */
-export function writerReuseEnabled(profile: VerificationProfile | undefined, mcpServers: number): boolean {
-  return Boolean(profile?.writerReuse) && mcpServers === 0;
+/** With MCP, a paused writer is resumed only this long after it started; its MCP tokens date from then. */
+export const MCP_REUSE_MAX_AGE_MS = 10 * 60_000;
+
+/** Writer reuse options for a session: the profile's opt-in, and an age limit when MCP tokens are in play. */
+export function writerReuseOptions(profile: VerificationProfile | undefined, mcpServers: number): { reuse?: boolean; reuseMaxAgeMs?: number } {
+  if (!profile?.writerReuse) return {};
+  return mcpServers > 0 ? { reuse: true, reuseMaxAgeMs: MCP_REUSE_MAX_AGE_MS } : { reuse: true };
 }
 
+/** The writer gets run_checks (tool, extension and its context) only when a trusted profile can verify. */
 export function writerTools(profile: VerificationProfile | undefined, extensionPaths: string[], toolNames: string[]): { extensionPaths: string[]; toolNames: string[]; checksContext?: ChecksContext } {
   if (!profile) return { extensionPaths, toolNames };
   const checks = profile.checks.map((check) => check.name);

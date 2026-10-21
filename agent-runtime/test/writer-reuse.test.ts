@@ -7,20 +7,22 @@ import { test } from "node:test";
 import { DockerPiProcess } from "../src/container-runtime.js";
 import { CodingAgentOrchestrator } from "../src/orchestrator.js";
 import type { PublicRunEvent } from "../src/pi-rpc.js";
-import { writerReuseEnabled } from "../src/server.js";
+import { MCP_REUSE_MAX_AGE_MS, writerReuseOptions } from "../src/server.js";
 import { validateProfile } from "../src/verification.js";
 
 const base = { id: "p", repository: "o/r", image: `sha256:${"0".repeat(64)}`, rubric: ["ok"], allowedPaths: ["src"], checks: [{ name: "t", argv: ["true"], cwd: ".", timeoutMs: 1000 }] };
 
-test("writer reuse is off unless the profile turns it on, and only for runs without MCP", () => {
+test("writer reuse is off unless the profile turns it on; with MCP a paused writer is reused only while young", () => {
   assert.equal(validateProfile(base).writerReuse, false);
   assert.equal(validateProfile({ ...base, writerReuse: true }).writerReuse, true);
   for (const writerReuse of [1, "true", null, {}]) assert.throws(() => validateProfile({ ...base, writerReuse }), /Invalid writer reuse/, JSON.stringify(writerReuse));
-  assert.equal(writerReuseEnabled(undefined, 0), false);
-  assert.equal(writerReuseEnabled(validateProfile(base), 0), false);
-  assert.equal(writerReuseEnabled(validateProfile({ ...base, writerReuse: true }), 0), true);
-  // MCP tokens are read once, when the container starts; a reused container would keep the first execution's.
-  assert.equal(writerReuseEnabled(validateProfile({ ...base, writerReuse: true }), 1), false);
+  assert.deepEqual(writerReuseOptions(undefined, 0), {});
+  assert.deepEqual(writerReuseOptions(validateProfile(base), 0), {});
+  assert.deepEqual(writerReuseOptions(validateProfile({ ...base, writerReuse: true }), 0), { reuse: true });
+  // MCP tokens are issued when the container starts, for its run, and revoked when the run ends; the
+  // age limit makes a late repair cold-start with fresh ones before the first expire.
+  assert.deepEqual(writerReuseOptions(validateProfile({ ...base, writerReuse: true }), 1), { reuse: true, reuseMaxAgeMs: MCP_REUSE_MAX_AGE_MS });
+  assert.ok(MCP_REUSE_MAX_AGE_MS <= 10 * 60_000);
 });
 
 /**
@@ -60,7 +62,7 @@ else {
 }
 `;
 
-async function withFakeDocker(reuse: boolean, body: (h: { dir: string; process: DockerPiProcess; events: PublicRunEvent[]; settled: () => Promise<void>; log: () => Promise<string[]> }) => Promise<void>) {
+async function withFakeDocker(reuse: boolean | { reuse: boolean; reuseMaxAgeMs?: number }, body: (h: { dir: string; process: DockerPiProcess; events: PublicRunEvent[]; settled: () => Promise<void>; log: () => Promise<string[]> }) => Promise<void>) {
   const dir = await mkdtemp(path.join(os.tmpdir(), "fake-docker-reuse-"));
   await writeFile(path.join(dir, "docker"), FAKE_DOCKER);
   await chmod(path.join(dir, "docker"), 0o755);
@@ -69,9 +71,9 @@ async function withFakeDocker(reuse: boolean, body: (h: { dir: string; process: 
   const events: PublicRunEvent[] = [];
   let waiters: Array<() => void> = [];
   const piProcess = new DockerPiProcess({
-    name: `pi-session-reuse-${reuse}`, image: "pi-agent@sha256:abc", network: "pi-model-only", worktreePath: "/w", gitMetadataPath: "/repo/.git",
+    name: `pi-session-reuse-${JSON.stringify(reuse).replace(/\W/g, "")}`, image: "pi-agent@sha256:abc", network: "pi-model-only", worktreePath: "/w", gitMetadataPath: "/repo/.git",
     sessionStatePath: dir, gatewayUrl: "http://model-gateway:8080", modelRef: "openai/gpt-5.6-luna",
-    extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"], reuse,
+    extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"], ...(typeof reuse === "boolean" ? { reuse } : reuse),
   }, (runId) => `token-${runId}`, (event) => {
     events.push(event);
     if (event.type === "settled" || event.type === "error") { const ready = waiters; waiters = []; for (const wake of ready) wake(); }
@@ -147,6 +149,15 @@ test("a paused writer is not reused for a different model, and discussions are n
     assert.deepEqual(await log(), ["run", "credential token-exec-1", "pause", "unpause", "stop", "run", "credential token-exec-2", "pause"]);
     done = settled(); process.prompt("exec-3", "explain", route, "discuss"); await done;
     assert.deepEqual((await log()).slice(-3), ["run", "credential token-exec-3", "stop"]);
+  });
+});
+
+test("a paused writer older than its reuse age limit is stopped and the repair cold-starts", { timeout: 30_000 }, async () => {
+  await withFakeDocker({ reuse: true, reuseMaxAgeMs: 0 }, async ({ process, settled, log }) => {
+    let done = settled(); process.prompt("exec-1", "fix", route); await done;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    done = settled(); process.prompt("exec-2", "repair", route); await done;
+    assert.deepEqual(await log(), ["run", "credential token-exec-1", "pause", "unpause", "stop", "run", "credential token-exec-2", "pause"]);
   });
 });
 

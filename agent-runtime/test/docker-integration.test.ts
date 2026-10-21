@@ -182,6 +182,23 @@ test("Pi 1.0.1 resumes a session persisted by Pi 0.83", { skip: !enabled, timeou
   }
 });
 
+/** A GitHub MCP stand-in answering get_file_contents for acme/widgets. */
+const fakeMcpScript = String.raw`
+const http=require("node:http");
+http.createServer((req,res)=>{let body="";req.on("data",c=>body+=c);req.on("end",()=>{
+  if(req.url==="/healthz"){res.writeHead(200);res.end("ok");return;}
+  if(req.method==="GET"){res.writeHead(405);res.end();return;}
+  if(req.method==="DELETE"){res.writeHead(200);res.end();return;}
+  const msg=JSON.parse(body||"{}");
+  if(msg.method==="notifications/initialized"){res.writeHead(202);res.end();return;}
+  let result;
+  if(msg.method==="initialize") result={protocolVersion:"2025-06-18",capabilities:{tools:{}},serverInfo:{name:"github",version:"test"}};
+  else if(msg.method==="tools/list") result={tools:[{name:"get_file_contents",description:"Read a repository file",inputSchema:{type:"object",properties:{owner:{type:"string"},repo:{type:"string"},path:{type:"string"}},required:["owner","repo","path"]}}]};
+  else if(msg.method==="tools/call"&&msg.params?.name==="get_file_contents"&&msg.params?.arguments?.owner==="acme"&&msg.params?.arguments?.repo==="widgets") result={content:[{type:"text",text:"trusted-mcp-marker"}]};
+  else {res.writeHead(400);res.end("unexpected MCP request");return;}
+  res.writeHead(200,{"content-type":"application/json","mcp-session-id":"fake-session"});res.end(JSON.stringify({jsonrpc:"2.0",id:msg.id,result}));
+});}).listen(8090,"0.0.0.0");`;
+
 test("Pi builtin MCP uses only the trusted GitHub registration and ignores project mcp.json", { skip: !enabled, timeout: 60_000 }, async () => {
   const suffix = Math.random().toString(16).slice(2, 10);
   const network = `pi-mcp-${suffix}`;
@@ -204,21 +221,7 @@ test("Pi builtin MCP uses only the trusted GitHub registration and ignores proje
   assert.notEqual(hostGid, undefined);
   assert.notEqual(hostUid, 0, "integration test must run as a non-root host user");
 
-const fakeMcpScript = String.raw`
-const http=require("node:http");
-http.createServer((req,res)=>{let body="";req.on("data",c=>body+=c);req.on("end",()=>{
-  if(req.url==="/healthz"){res.writeHead(200);res.end("ok");return;}
-  if(req.method==="GET"){res.writeHead(405);res.end();return;}
-  if(req.method==="DELETE"){res.writeHead(200);res.end();return;}
-  const msg=JSON.parse(body||"{}");
-  if(msg.method==="notifications/initialized"){res.writeHead(202);res.end();return;}
-  let result;
-  if(msg.method==="initialize") result={protocolVersion:"2025-06-18",capabilities:{tools:{}},serverInfo:{name:"github",version:"test"}};
-  else if(msg.method==="tools/list") result={tools:[{name:"get_file_contents",description:"Read a repository file",inputSchema:{type:"object",properties:{owner:{type:"string"},repo:{type:"string"},path:{type:"string"}},required:["owner","repo","path"]}}]};
-  else if(msg.method==="tools/call"&&msg.params?.name==="get_file_contents"&&msg.params?.arguments?.owner==="acme"&&msg.params?.arguments?.repo==="widgets") result={content:[{type:"text",text:"trusted-mcp-marker"}]};
-  else {res.writeHead(400);res.end("unexpected MCP request");return;}
-  res.writeHead(200,{"content-type":"application/json","mcp-session-id":"fake-session"});res.end(JSON.stringify({jsonrpc:"2.0",id:msg.id,result}));
-});}).listen(8090,"0.0.0.0");`;
+
   const fakeModelScript = fakeGatewayScript(scriptedTurns([
     {
       kind: "function_call", name: "mcp__github__get_file_contents", arguments: { owner: "acme", repo: "widgets", path: "README.md" },
@@ -495,6 +498,69 @@ test("a reused writer is frozen between attempts and its repair starts in the sa
   } finally {
     await piProcess?.close();
     await command("docker", ["stop", gateway]).catch(() => "");
+    await command("docker", ["network", "rm", network]).catch(() => "");
+    await worktrees.remove(isolated.path).catch(() => undefined);
+  }
+});
+
+test("a reused writer keeps its MCP tools across the pause: the repair reads through GitHub MCP in the same container", { skip: !enabled, timeout: 120_000 }, async () => {
+  const suffix = Math.random().toString(16).slice(2, 10);
+  const network = `pi-mcp-reuse-${suffix}`;
+  const modelGateway = `model-gateway-mcp-reuse-${suffix}`;
+  const mcpGateway = `mcp-gateway-reuse-${suffix}`;
+  const repo = await mkdtemp(path.join(tmpdir(), "pi-mcp-reuse-repo-"));
+  const worktreeRoot = await mkdtemp(path.join(tmpdir(), "pi-mcp-reuse-worktrees-"));
+  const sessionStatePath = await mkdtemp(path.join(tmpdir(), "pi-mcp-reuse-state-"));
+  await command("git", ["init", "-b", "main"], repo);
+  await writeFile(path.join(repo, "README.md"), "base\n");
+  await command("git", ["add", "."], repo);
+  await command("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base"], repo);
+  const worktrees = new WorktreeManager({ repoPath: repo, worktreeRoot, baseRef: "HEAD" });
+  const isolated = await worktrees.create(`mcp-reuse-${suffix}`);
+  const read = { kind: "function_call" as const, name: "mcp__github__get_file_contents", arguments: { owner: "acme", repo: "widgets", path: "README.md" } };
+  const fakeModelScript = fakeGatewayScript(scriptedTurns([
+    read, { kind: "text", text: "first read trusted-mcp-marker" },
+    read, { kind: "text", text: "repair read trusted-mcp-marker" },
+  ]));
+  let piProcess: DockerPiProcess | undefined;
+  try {
+    await command("docker", ["network", "create", "--internal", network]);
+    await command("docker", ["run", "--detach", "--rm", "--name", modelGateway, "--network", network, "--network-alias", "model-gateway", "node:22.22.0-bookworm-slim", "node", "-e", fakeModelScript]);
+    await command("docker", ["run", "--detach", "--rm", "--name", mcpGateway, "--network", network, "--network-alias", "mcp-gateway", "node:22.22.0-bookworm-slim", "node", "-e", fakeMcpScript]);
+    await waitForContainerHealthz(modelGateway);
+    await waitForContainerHealthz(mcpGateway, 8090);
+    const events: PublicRunEvent[] = [];
+    let resolveSettled!: () => void;
+    let settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
+    const mcpTokens: string[] = [];
+    piProcess = new DockerPiProcess({
+      name: `pi-mcp-reuse-${suffix}`, image: AGENT_TEST_IMAGE, network,
+      worktreePath: isolated.path, gitMetadataPath: isolated.gitDir, sessionStatePath,
+      gatewayUrl: "http://model-gateway:8080", modelRef: "openai/gpt-5.6-luna", reuse: true, reuseMaxAgeMs: 10 * 60_000,
+      extensionPaths: ["/opt/pi/extensions/model-gateway.ts"], pluginPaths: [], skillPaths: [], toolNames: ["read"],
+      user: `${process.getuid?.()}:${process.getgid?.()}`,
+      mcp: { mode: "github_read_only", servers: [{ server: "github", gatewayUrl: "http://mcp-gateway:8090/mcp", token: "" }] },
+    }, () => "fake-model-token", (event) => {
+      events.push(event);
+      if (event.type === "settled" || event.type === "error") resolveSettled();
+    }, (runId) => { mcpTokens.push(runId); return { github: `mcp-token-${runId}` }; });
+    const route = { modelRef: "openai/gpt-5.6-luna", effort: "max", source: "explicit" } as const;
+    piProcess.prompt("exec-first", "Read README.md from acme/widgets with GitHub MCP.", route);
+    await settled;
+    settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
+    piProcess.prompt("exec-repair", "Read it again.", route);
+    await settled;
+    const diagnostic = JSON.stringify({ events, mcp: await command("docker", ["logs", mcpGateway]) });
+    assert.deepEqual(events.flatMap((event) => event.type === "startup" ? [event.startup.reused] : []), [false, true], diagnostic);
+    assert.equal(events.filter((event) => event.type === "tool" && event.tool === "mcp__github__get_file_contents" && event.phase === "end" && !event.is_error).length, 2, diagnostic);
+    assert.ok(events.some((event) => event.type === "answer" && event.text.includes("repair read trusted-mcp-marker")), diagnostic);
+    // MCP tokens are issued once, when the container starts; the repair keeps them.
+    assert.deepEqual(mcpTokens, ["exec-first"]);
+    assert.ok(!events.some((event) => event.type === "error" || event.type === "container_reuse_failed"), diagnostic);
+  } finally {
+    await piProcess?.close();
+    await command("docker", ["stop", modelGateway]).catch(() => "");
+    await command("docker", ["stop", mcpGateway]).catch(() => "");
     await command("docker", ["network", "rm", network]).catch(() => "");
     await worktrees.remove(isolated.path).catch(() => undefined);
   }
