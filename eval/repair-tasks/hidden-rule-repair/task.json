@@ -1,0 +1,59 @@
+{
+  "id": "hidden-rule-repair",
+  "description": "Drives exactly one repair to exercise writerReuse live. The prompt names only the dash bug; the acceptance check, whose argv the writer never sees, also requires spelling out '&' as 'and'. run_checks is refused (reserveMs equals the time limit), so the first attempt fails verification and the failing assertion reaches the repair prompt.",
+  "task_mode": "implement",
+  "workflow_mode": "single",
+  "expect": "pass",
+  "requires_repair": true,
+  "prompt": "slugify('Hello World') in src/slug.cjs returns 'hello world' instead of 'hello-world'. Fix slugify so words are joined with a dash.",
+  "routing_text": "Fix the slugify dash bug.",
+  "profile": {
+    "rubric": [
+      "slugify joins words with a dash",
+      "The acceptance check passes without weakening tests"
+    ],
+    "allowedPaths": [
+      "src/"
+    ],
+    "baselinePaths": [
+      "tests/"
+    ],
+    "writerReuse": true,
+    "writerChecks": {
+      "defaultChecks": [
+        "unit"
+      ],
+      "maxCalls": 1,
+      "reserveMs": 900000
+    },
+    "checks": [
+      {
+        "name": "unit",
+        "argv": [
+          "node",
+          "--test",
+          "tests/slug.test.cjs"
+        ],
+        "cwd": ".",
+        "timeoutMs": 30000
+      },
+      {
+        "name": "acceptance",
+        "argv": [
+          "node",
+          "-e",
+          "const assert=require('node:assert/strict');const {slugify}=require('./src/slug.cjs');assert.equal(slugify('Hello World'),'hello-world');assert.equal(slugify('Tom & Jerry'),'tom-and-jerry','house style: an ampersand is spelled out as and, so slugify(\"Tom & Jerry\") must be \"tom-and-jerry\"');assert.equal(slugify('R&D Update'),'r-and-d-update','house style: an ampersand is spelled out as and, so slugify(\"R&D Update\") must be \"r-and-d-update\"');"
+        ],
+        "cwd": ".",
+        "timeoutMs": 30000
+      }
+    ]
+  },
+  "oracle": {
+    "argv": [
+      "node",
+      "--test",
+      ".eval-oracle/slug-oracle.test.cjs"
+    ]
+  }
+}

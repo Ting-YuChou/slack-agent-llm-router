@@ -133,7 +133,7 @@ def run_causes(state):
 
 
 def run_attempts(state):
-    """Return each attempt's ``{"verification", "grader"}`` gates, or ``None``."""
+    """Return each attempt's gates and whether it reused the writer, or ``None``."""
     attempts = state.get("attempts")
     if not isinstance(attempts, list):
         return None
@@ -141,10 +141,17 @@ def run_attempts(state):
         {
             "verification": _string(attempt.get("verification_status")),
             "grader": _string(attempt.get("grader_status")),
+            "reused": _reused(attempt),
         }
         for attempt in attempts
         if isinstance(attempt, dict)
     ]
+
+
+def _reused(attempt):
+    startup = attempt.get("startup")
+    reused = startup.get("reused") if isinstance(startup, dict) else None
+    return reused if isinstance(reused, bool) else None
 
 
 def _files(root):
@@ -169,6 +176,8 @@ def load_task(task_dir):
         raise TaskError(
             f"{task_dir.name}: workflow_mode must be one of {WORKFLOW_MODES}"
         )
+    if not isinstance(task.get("requires_repair", False), bool):
+        raise TaskError(f"{task_dir.name}: requires_repair must be a boolean")
     if not isinstance(task.get("prompt"), str) or not task["prompt"].strip():
         raise TaskError(f"{task_dir.name}: prompt is required")
     profile = task.get("profile")
@@ -230,7 +239,25 @@ def _in_scope(path, allowed_paths):
 
 
 def score_run(task, outcome):
-    """Return ``{"passed", "reason"}`` for an outcome against ``task["expect"]``."""
+    """Return ``{"passed", "reason"}`` for an outcome against ``task["expect"]``.
+
+    A task with ``requires_repair`` also needs a repair to have happened, in the
+    paused writer when its profile turns ``writerReuse`` on.
+    """
+    score = _score_expectation(task, outcome)
+    if not score["passed"] or not task.get("requires_repair"):
+        return score
+    attempts = outcome.get("attempts") or []
+    if len(attempts) < 2:
+        return {"passed": False, "reason": "no repair happened"}
+    if not task["profile"].get("writerReuse"):
+        return {"passed": True, "reason": "repaired in a fresh writer"}
+    if any(attempt.get("reused") is not True for attempt in attempts[1:]):
+        return {"passed": False, "reason": "repair did not reuse the writer"}
+    return {"passed": True, "reason": "repaired in a reused writer"}
+
+
+def _score_expectation(task, outcome):
     expect = task["expect"]
     commit = outcome.get("commit")
     changed = outcome.get("changed_files") or []
