@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { buildAgentDockerArgs, DockerPiProcess } from "../src/container-runtime.js";
 import type { PublicRunEvent } from "../src/pi-rpc.js";
 import { WorktreeManager } from "../src/worktree-manager.js";
+import { deriveSessionSealKey, SessionSeal } from "../src/session-seal.js";
 import { fakeGatewayScript, scriptedTurns, waitForContainerHealthz } from "./support/fake-provider.js";
 import { AGENT_TEST_IMAGE } from "./support/docker-images.js";
 
@@ -26,6 +27,8 @@ test("real Pi preserves its session while switching from Luna max to Sol high", 
   const repo = await mkdtemp(path.join(tmpdir(), "pi-integration-repo-"));
   const worktreeRoot = await mkdtemp(path.join(tmpdir(), "pi-integration-worktrees-"));
   const sessionStatePath = await mkdtemp(path.join(tmpdir(), "pi-integration-state-"));
+  const seals = new SessionSeal(deriveSessionSealKey("integration-secret"), await mkdtemp(path.join(tmpdir(), "pi-integration-seals-")));
+  const sealChecks: string[] = [];
   await command("git", ["init", "-b", "main"], repo);
   await writeFile(path.join(repo, "README.md"), "base\n");
   await command("git", ["add", "README.md"], repo);
@@ -70,6 +73,8 @@ test("real Pi preserves its session while switching from Luna max to Sol high", 
         skillPaths: ["/opt/pi/skills/test-gap/SKILL.md"],
         toolNames: ["read", "write", "edit", "bash", "grep", "find", "ls", "workspace_summary"],
         user: `${hostUid}:${hostGid}`,
+        // The second prompt continues Pi's real session files, sealed when the first container stopped.
+        sessionSeal: { seal: () => seals.seal("integration", sessionStatePath), verify: () => seals.verify("integration", sessionStatePath).then((status) => { sealChecks.push(status); return status; }) },
       },
       () => "fake-run-token",
       (event) => {
@@ -100,6 +105,7 @@ test("real Pi preserves its session while switching from Luna max to Sol high", 
       JSON.stringify(events),
     );
     assert.ok(!events.some((event) => event.type === "error"), JSON.stringify(events));
+    assert.deepEqual(sealChecks, ["valid"]);
   } finally {
     await piProcess?.close();
     await command("docker", ["stop", gateway]).catch(() => "");

@@ -635,9 +635,15 @@ Slack 是 harness 唯一的「人類介面」：核准、進度、失敗回報�
 | P | P4 | ImplementationBrief、investigation 失敗時降級 | #100 |
 | P | P5 | grader 多次取樣（profile 旗標） | #97 |
 
-**未做**：
-- S4b（session jsonl 的 HMAC）：低優先，尚未實作。
-- MCP token 仍在容器啟動時經 env 傳入，所以開啟 MCP 時不重用容器（P3 的限制）；run 結束時撤銷 MCP 與 classifier token 也還沒做。
+**後續補完**（2026-10-21）：
+
+| Slice | 內容 | PR |
+|---|---|---|
+| S4b | 容器停止時以 HKDF 推導的 key 對 Pi session 目錄算 HMAC，存在所有容器 mount 之外；`--continue` 前驗證，被改過就以 `session_integrity_failed` 失敗、不啟動容器。只涵蓋兩次 run 之間的竄改：run 進行中 Pi 本身會寫這個目錄。 | #111（併進了 #110 的分支，經 #112 合入 main） |
+| 撤銷 | run 結束時 MCP 與 classifier token 一併失效：host 提供「execution 所屬的 run 是否仍有效」查詢，classifier 路徑與三個 MCP gateway 每次請求都問；無法確認時拒絕（`revocation_unavailable`）。model token 原本就會在預算停止後被拒。 | #110 |
+| 重用 + MCP | 重用的容器只服務同一個 run 的 repair，啟動時發的 MCP token 屬於這個 run，且 run 結束就撤銷，所以開啟 MCP 也能重用；暫停超過 10 分鐘（token 壽命 16／31 分鐘）就改為冷啟動。逐次 prompt 換發 MCP token 的做法經 spike 證實會與第一個 tool call 競態，沒有採用。 | #110 |
+
+仍然存在：MCP token 經容器 env 傳入（容器內可讀到），但範圍限於所屬 run、run 結束即撤銷、並受 maxCalls 限制。
 
 ### Phase 4 最終驗收（P-ACC，2026-10-21，本機執行）
 
