@@ -1,11 +1,16 @@
+import asyncio
 import os
 from pathlib import Path
+import re
 import subprocess
 import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import yaml
 
+from slack.bot_real import SlackBot
 from src.utils.schema import PlatformConfig
 
 
@@ -33,7 +38,8 @@ def test_demo_config_is_single_provider_and_needs_no_infrastructure():
     assert config.slack.enabled is True
     assert config.slack.bot_token_env == "SLACK_BOT_TOKEN"
     assert config.slack.app_token_env == "SLACK_APP_TOKEN"
-    assert config.slack.state_backend == "memory"
+    assert config.slack.state_backend == "file"
+    assert config.slack.state_file == ".pi-agent-runtime/slack_state.json"
     assert config.slack.memory.enabled is False
     assert config.slack.agent_context.enabled is True
     assert config.slack.agent_context.max_thread_messages == 20
@@ -57,6 +63,7 @@ def test_demo_config_is_single_provider_and_needs_no_infrastructure():
     assert config.agent.token_env == "AGENT_RUNTIME_TOKEN"
     assert config.agent.connect_timeout_seconds == 2
     assert config.agent.request_timeout_seconds == 910
+    assert config.agent.feedback_enabled is True
 
 
 def test_demo_manifest_declares_socket_mode_command_and_events():
@@ -95,6 +102,97 @@ def test_demo_manifest_declares_socket_mode_command_and_events():
         "files:read",
         "lists:read",
     }.issubset(set(manifest["oauth_config"]["scopes"]["bot"]))
+
+
+# Bot-token scopes each Slack Web API method needs; an empty set means none.
+WEB_API_METHOD_SCOPES = {
+    "auth_test": set(),
+    "chat_postEphemeral": {"chat:write"},
+    "chat_postMessage": {"chat:write"},
+    "chat_update": {"chat:write"},
+    "conversations_info": {"channels:read"},
+    "conversations_list": {"channels:read"},
+    "files_upload_v2": {"files:write"},
+    "views_open": set(),
+}
+
+
+def test_demo_manifest_grants_every_scope_the_bot_calls_need():
+    source = (ROOT / "slack" / "bot_real.py").read_text(encoding="utf-8")
+    called = set(re.findall(r"\bweb_client\.([A-Za-z_][A-Za-z0-9_]*)\(", source))
+    manifest = yaml.safe_load(
+        (ROOT / "slack" / "app-manifest.demo.yaml").read_text(encoding="utf-8")
+    )
+    granted = set(manifest["oauth_config"]["scopes"]["bot"])
+
+    assert "files_upload_v2" in called
+    unmapped = called - set(WEB_API_METHOD_SCOPES)
+    assert not unmapped, f"add the required scopes for {sorted(unmapped)}"
+    missing = {
+        method: sorted(WEB_API_METHOD_SCOPES[method] - granted)
+        for method in sorted(called)
+        if WEB_API_METHOD_SCOPES[method] - granted
+    }
+    assert missing == {}
+
+
+def test_demo_state_file_is_gitignored():
+    raw_config = yaml.safe_load(
+        (ROOT / "config" / "config.demo.yaml").read_text(encoding="utf-8")
+    )
+    state_file = raw_config["slack"]["state_file"]
+
+    result = subprocess.run(
+        ["git", "check-ignore", "--quiet", state_file],
+        cwd=ROOT,
+        check=False,
+    )
+
+    assert result.returncode == 0
+
+
+def demo_bot(tmp_path, **services):
+    raw_config = yaml.safe_load(
+        (ROOT / "config" / "config.demo.yaml").read_text(encoding="utf-8")
+    )
+    config = PlatformConfig.model_validate(raw_config)
+    slack_config = config.slack.model_dump()
+    slack_config["state_file"] = str(tmp_path / Path(config.slack.state_file).name)
+    return SlackBot(
+        slack_config,
+        SimpleNamespace(),
+        services=services,
+        agent_config=config.agent.model_dump(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_demo_bot_restart_restores_agent_runs_ci_jobs_and_monitors(tmp_path):
+    first = demo_bot(tmp_path)
+    tracked = first._track_agent_run(
+        {"session_id": "S1", "run_id": "R1"},
+        team_id="T1",
+        channel_id="C1",
+        thread_ts="1.0",
+        owner_user_id="U1",
+        mode="implement",
+    )
+    await first._persist_agent_run(tracked)
+    assert await first._claim_ci_job("J1") is True
+
+    second = demo_bot(tmp_path, agent_runtime=SimpleNamespace())
+    second._monitor_agent_run = AsyncMock()
+    await second._restore_state()
+    second._reconcile_agent_runs()
+    while second.background_tasks:
+        await asyncio.gather(*list(second.background_tasks))
+
+    assert second.agent_runs["R1"]["session_id"] == "S1"
+    assert second._is_agent_thread("C1", "1.0")
+    assert list(second.posted_ci_jobs) == ["J1"]
+    assert await second._claim_ci_job("J1") is False
+    second._monitor_agent_run.assert_awaited_once()
+    assert second._monitor_agent_run.await_args.args[0]["run_id"] == "R1"
 
 
 def test_demo_runner_starts_agent_sidecar_then_worker_runtime(tmp_path):

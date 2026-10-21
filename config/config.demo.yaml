@@ -10,6 +10,7 @@ agent:
   enabled: true
   base_url: http://127.0.0.1:3001
   token_env: AGENT_RUNTIME_TOKEN
+  feedback_enabled: true
   connect_timeout_seconds: 2
   request_timeout_seconds: 910
   control_timeout_seconds: 10
@@ -120,7 +121,8 @@ slack:
     max_files: 10
     max_file_size_bytes: 10000000
     download_timeout_seconds: 30
-  state_backend: memory
+  state_backend: file
+  state_file: .pi-agent-runtime/slack_state.json
   memory:
     enabled: false
     backend: memory
