@@ -18,6 +18,7 @@ import { agentScheduler } from "./agent-scheduler.js";
 import type { DiffLimits } from "./worktree-manager.js";
 import { RESOURCE_LIMIT_FLAGS } from "./container-flags.js";
 import { CREDENTIAL_PLACEHOLDER, type RunCredentials } from "./run-credentials.js";
+import type { SealStatus } from "./session-seal.js";
 
 export interface AgentContainerOptions {
   taskMode?: TaskMode;
@@ -61,6 +62,8 @@ export interface AgentContainerOptions {
   reuse?: boolean;
   /** A paused writer older than this is stopped instead of resumed (its MCP tokens date from its start). */
   reuseMaxAgeMs?: number;
+  /** Seals the session directory whenever the container stops and checks it before `--continue`. */
+  sessionSeal?: { seal(): Promise<void>; verify(): Promise<SealStatus> };
 }
 
 export interface ChecksContext { checks: string[]; defaultChecks: string[]; maxCalls: number }
@@ -192,6 +195,7 @@ export class DockerPiProcess implements AgentProcess {
   private containerKey?: string;
   private containerStartedAt = 0;
   private credentials?: RunCredentials;
+  private sealedChild?: ChildProcessWithoutNullStreams;
   private readonly options: Omit<AgentContainerOptions, "classifier" | "mcp"> & { mcp?: Omit<McpRunConfig, "token"> };
   private readonly tokenForRun: (runId: string, route: RouteDecision) => string;
   private readonly onEvent: (event: PublicRunEvent) => void;
@@ -340,9 +344,24 @@ export class DockerPiProcess implements AgentProcess {
       if (controller.signal.aborted) { release(); return; }
       this.queueMs = Date.now() - queuedAt;
       this.releasePermit = release; this.tracing?.lifecycle(runId, "queue", "end");
+      if (!await this.sessionIntact()) {
+        this.releasePermit?.(); this.releasePermit = undefined;
+        this.onEvent({ type: "error", code: "session_integrity_failed", message: "The agent session was modified after it was saved; it cannot be continued" });
+        return;
+      }
       this.start(runId, selected, selectedTask);
       this.dispatch(runId, prompt, selected);
     })().catch(() => { if (!controller.signal.aborted) this.onEvent({ type: "error", code: "container_admission_failed", message: "Agent could not acquire/start an execution slot" }); });
+  }
+
+  /** A session Pi will `--continue` must still be the one sealed when its last container stopped. */
+  private async sessionIntact(): Promise<boolean> {
+    if (!this.hasSession || !this.options.sessionSeal) return true;
+    try {
+      const status = await this.options.sessionSeal.verify();
+      if (status === "unsealed") console.error(JSON.stringify({ event: "agent_session_unsealed", session_id: this.sessionId }));
+      return status !== "tampered";
+    } catch { return false; }
   }
 
   /** Configures the ready container's model for this execution and sends the prompt. */
@@ -469,7 +488,8 @@ export class DockerPiProcess implements AgentProcess {
   private async stopActiveContainerOnce(): Promise<void> {
     this.startupAbort?.abort();
     const child = this.child;
-    if (!child || child.exitCode !== null) return;
+    if (!child) return;
+    if (child.exitCode !== null) { await this.sealSession(child); return; }
     this.closing = true;
     if(this.activeRunId) this.tracing?.lifecycle(this.activeRunId, "container_stop", "start");
     const containerName = this.activeContainerName;
@@ -522,6 +542,15 @@ export class DockerPiProcess implements AgentProcess {
       });
     });
     if(this.activeRunId) this.tracing?.lifecycle(this.activeRunId, "container_stop", "end");
+    await this.sealSession(child);
+  }
+
+  /** Seals what Pi left in the session directory, once per container, after it has stopped. */
+  private async sealSession(child: ChildProcessWithoutNullStreams): Promise<void> {
+    if (!this.options.sessionSeal || this.sealedChild === child) return;
+    this.sealedChild = child;
+    // A failed seal leaves the previous one, against which the next --continue reads as tampered.
+    await this.options.sessionSeal.seal().catch(() => console.error(JSON.stringify({ event: "agent_session_seal_failed", session_id: this.sessionId })));
   }
 }
 

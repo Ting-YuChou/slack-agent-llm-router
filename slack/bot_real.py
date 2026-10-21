@@ -112,6 +112,10 @@ AGENT_ERROR_HINTS = {
     "diff_limit_exceeded": (
         "Split the request into smaller changes, each within the diff limits."
     ),
+    "session_integrity_failed": (
+        "The saved agent session changed after it was stored, so it was not "
+        "continued; start a new thread to begin a fresh session."
+    ),
     "disk_quota_exceeded": (
         "The worktree outgrew its disk quota; avoid generating large files or "
         "dependencies in the repository, then retry."
