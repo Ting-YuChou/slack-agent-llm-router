@@ -90,3 +90,16 @@ def test_grader_calibration_is_a_manual_budgeted_live_run():
     upload = next(s for s in job["steps"] if "upload-artifact" in s.get("uses", ""))
     assert upload["if"] == "always()"
     assert "eval/grader-baseline.json" in upload["with"]["path"]
+
+
+def test_npm_audit_gate_runs_in_ci_not_in_image_builds():
+    # An audit inside `docker build` needs the registry and fails rebuilds of an
+    # unchanged tree whenever a new advisory lands, so the gate lives in CI.
+    for dockerfile in (ROOT / "agent-runtime").glob("Dockerfile.*"):
+        assert "npm audit" not in dockerfile.read_text(), f"{dockerfile.name} audits"
+    job = _workflow("tests.yml")["jobs"]["agent-runtime-audit"]
+    runs = [step.get("run", "") for step in job["steps"]]
+    audit = "npm --prefix agent-runtime audit --omit=dev --audit-level=high"
+    assert audit in runs
+    install = next(i for i, run in enumerate(runs) if "npm" in run and " ci" in run)
+    assert install < runs.index(audit), "the audit runs before npm ci"
