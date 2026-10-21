@@ -2315,6 +2315,42 @@ class TestSlackStateStores:
         assert await store.load_state() == snapshot
 
     @pytest.mark.asyncio
+    async def test_file_state_store_writes_owner_only_and_fsyncs_before_rename(
+        self, tmp_path, monkeypatch
+    ):
+        state_file = tmp_path / "state" / "slack_state.json"
+        state_file.parent.mkdir()
+        state_file.write_text("{}", encoding="utf-8")
+        state_file.chmod(0o644)
+        events = []
+        real_fsync = os.fsync
+        real_replace = os.replace
+
+        def fsync(fd):
+            events.append("fsync")
+            real_fsync(fd)
+
+        def replace(src, dst, **kwargs):
+            events.append(("replace", os.stat(src).st_mode & 0o777))
+            real_replace(src, dst, **kwargs)
+
+        monkeypatch.setattr(os, "fsync", fsync)
+        monkeypatch.setattr(os, "replace", replace)
+        previous_umask = os.umask(0o022)
+        try:
+            store = FileSlackStateStore({"file_path": str(state_file)})
+            await store.save_state({"schema_version": 1, "users": {}})
+        finally:
+            os.umask(previous_umask)
+
+        assert state_file.stat().st_mode & 0o777 == 0o600
+        assert events[0] == "fsync"
+        assert ("replace", 0o600) in events
+        assert events.index("fsync") < events.index(("replace", 0o600))
+        assert list(state_file.parent.iterdir()) == [state_file]
+        assert await store.load_state() == {"schema_version": 1, "users": {}}
+
+    @pytest.mark.asyncio
     async def test_redis_state_store_round_trips_snapshot(self):
         store = RedisSlackStateStore(
             {

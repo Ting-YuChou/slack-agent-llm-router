@@ -396,11 +396,21 @@ class FileSlackStateStore(SlackStateStore):
         try:
             self.file_path.parent.mkdir(parents=True, exist_ok=True)
             tmp_path = self.file_path.with_suffix(f"{self.file_path.suffix}.tmp")
-            tmp_path.write_text(
-                json.dumps(snapshot, ensure_ascii=True, sort_keys=True, indent=2),
-                encoding="utf-8",
-            )
-            tmp_path.replace(self.file_path)
+            payload = json.dumps(snapshot, ensure_ascii=True, sort_keys=True, indent=2)
+            # The snapshot holds Slack user and thread data: owner-only, and
+            # durable before the rename makes it the live state file.
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                os.fchmod(handle.fileno(), 0o600)
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, self.file_path)
+            dir_fd = os.open(self.file_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
         except Exception as exc:
             logger.warning(f"Failed to write Slack state file {self.file_path}: {exc}")
 

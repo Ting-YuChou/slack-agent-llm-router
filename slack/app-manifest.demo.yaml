@@ -30,6 +30,7 @@ oauth_config:
       - chat:write
       - commands
       - files:read
+      - files:write
       - lists:read
 
 settings:
