@@ -254,6 +254,7 @@ export class DockerPiProcess implements AgentProcess {
         capture?.onCommand(record);
         if (record.type === "prompt") {
           this.startup?.configured(); this.startup?.promptSent();
+          if (this.startup) this.onEvent({ type: "startup", startup: { reused: false, queue_ms: this.queueMs, ...this.startup.summary() } });
           this.onPrompt?.(runId);
           this.tracing?.log(runId, "agent.prompt_sent");
         }

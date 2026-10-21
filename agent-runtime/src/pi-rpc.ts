@@ -1,3 +1,4 @@
+import type { AttemptStartup } from "./startup-timing.js";
 import { StringDecoder } from "node:string_decoder";
 
 import { parsePolicyDecision, POLICY_ENTRY, type PolicyDecision } from "./policy-decision.js";
@@ -15,7 +16,8 @@ export type PublicRunEvent =
   | { type: "answer"; text: string }
   | { type: "settled"; outcome: RunOutcome; limit?: LimitKind; stop_reason?: string; error_message?: string }
   | { type: "error"; code: string; message: string }
-  | ({ type: "policy_decision" } & PolicyDecision);
+  | ({ type: "policy_decision" } & PolicyDecision)
+  | { type: "startup"; startup: AttemptStartup };
 
 /** How a Pi prompt ended; only `completed` may be delivered. */
 export type RunOutcome = "completed" | "truncated" | "limit_reached" | "aborted" | "error";

@@ -325,6 +325,8 @@ class AgentAnalyticsTests(unittest.TestCase):
             "policy_blocks",
             "fixed_files",
             "time_to_first_edit_s",
+            "startup_s",
+            "repair_startup_s",
         ):
             self.assertIn(f"AS {column}", view)
         dashboard = json.loads(

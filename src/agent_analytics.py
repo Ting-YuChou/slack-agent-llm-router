@@ -243,7 +243,9 @@ SELECT run_id, status, model, collected_at,
   JSONExtractFloat(payload_json,'harness_metrics','wall_s') AS wall_s,
   JSONExtract(payload_json,'harness_metrics','active_s','Nullable(Float64)') AS active_s,
   JSONExtract(payload_json,'harness_metrics','human_wait_s','Nullable(Float64)') AS human_wait_s,
-  JSONExtract(payload_json,'harness_metrics','time_to_first_edit_s','Nullable(Float64)') AS time_to_first_edit_s
+  JSONExtract(payload_json,'harness_metrics','time_to_first_edit_s','Nullable(Float64)') AS time_to_first_edit_s,
+  JSONExtract(payload_json,'harness_metrics','startup_s','Nullable(Float64)') AS startup_s,
+  JSONExtract(payload_json,'harness_metrics','repair_startup_s','Nullable(Float64)') AS repair_startup_s
 FROM agent_runs_latest WHERE JSONHas(payload_json,'harness_metrics')"""
     )
     statements.append(

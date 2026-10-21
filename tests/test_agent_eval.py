@@ -1264,3 +1264,22 @@ def test_recompute_summary_rejects_an_unreadable_results_file(tmp_path):
     missing = tmp_path / "missing.json"
 
     assert agent_eval.main(["--recompute-summary", str(missing)]) == 2
+
+
+def test_aggregate_reports_startup_medians_without_making_them_contract_metrics():
+    def record(startup, repair):
+        return {
+            **_record(passed=True),
+            "harness_metrics": {"startup_s": startup, "repair_startup_s": repair},
+        }
+
+    summary = agent_eval.aggregate(
+        [record(4.0, None), record(6.0, 3.0), record(5.0, 5.0)]
+    )
+
+    assert summary["startup_s_p50"] == 5.0
+    assert summary["repair_startup_s_p50"] == 4.0
+    assert not set(agent_eval.CONTRACT_METRICS) & {
+        "startup_s_p50",
+        "repair_startup_s_p50",
+    }
