@@ -337,7 +337,11 @@ make demo-agent-images
 ```
 
 The image target verifies the pinned plugin and Skill checksums, builds the hardened Agent
-image, and records that exact local image digest in `agent-runtime/plugins.lock.json`.
+image, and records that exact local image digest in `agent-runtime/plugins.lock.json`,
+together with an `image_manifest`: SHA-256 hashes, computed inside the image, of every
+extension (including the policy), plugin and Skill it loads and one digest of its compiled
+sources. Locking refuses an image built from a different tree than the checkout, and the
+runtime refuses to start when the image's manifest differs from the lock.
 Review unexpected lock changes before starting the demo. Run the launcher as a
 regular host user, not root, so the container can write only to that user's
 dedicated worktree and Pi session directory.

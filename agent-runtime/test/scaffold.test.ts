@@ -55,6 +55,8 @@ test("demo image setup refreshes the deployment image lock", () => {
   assert.match(source, /plugin checksum is invalid/);
   assert.match(source, /skill checksum is invalid/);
   assert.match(source, /docker.*image.*inspect/s);
+  assert.match(source, /image_manifest = manifest/);
+  assert.match(source, /built from a different tree/);
 });
 
 test("every agent-runtime base image is pinned by digest", () => {
