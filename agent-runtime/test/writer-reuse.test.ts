@@ -1,0 +1,219 @@
+import assert from "node:assert/strict";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { test } from "node:test";
+
+import { DockerPiProcess } from "../src/container-runtime.js";
+import { CodingAgentOrchestrator } from "../src/orchestrator.js";
+import type { PublicRunEvent } from "../src/pi-rpc.js";
+import { writerReuseEnabled } from "../src/server.js";
+import { validateProfile } from "../src/verification.js";
+
+const base = { id: "p", repository: "o/r", image: `sha256:${"0".repeat(64)}`, rubric: ["ok"], allowedPaths: ["src"], checks: [{ name: "t", argv: ["true"], cwd: ".", timeoutMs: 1000 }] };
+
+test("writer reuse is off unless the profile turns it on, and only for runs without MCP", () => {
+  assert.equal(validateProfile(base).writerReuse, false);
+  assert.equal(validateProfile({ ...base, writerReuse: true }).writerReuse, true);
+  for (const writerReuse of [1, "true", null, {}]) assert.throws(() => validateProfile({ ...base, writerReuse }), /Invalid writer reuse/, JSON.stringify(writerReuse));
+  assert.equal(writerReuseEnabled(undefined, 0), false);
+  assert.equal(writerReuseEnabled(validateProfile(base), 0), false);
+  assert.equal(writerReuseEnabled(validateProfile({ ...base, writerReuse: true }), 0), true);
+  // MCP tokens are read once, when the container starts; a reused container would keep the first execution's.
+  assert.equal(writerReuseEnabled(validateProfile({ ...base, writerReuse: true }), 1), false);
+});
+
+/**
+ * A docker CLI stand-in: `run` speaks enough Pi RPC to configure, ask for credentials and settle each
+ * prompt; every other subcommand is logged, and fails when a `fail-<subcommand>` file exists.
+ */
+const FAKE_DOCKER = `#!/usr/bin/env node
+const fs = require("fs"), path = require("path");
+const dir = __dirname, log = (line) => fs.appendFileSync(path.join(dir, "log"), line + "\\n");
+const [cmd] = process.argv.slice(2);
+if (cmd === "run") {
+  log("run"); fs.writeFileSync(path.join(dir, "run.pid"), String(process.pid));
+  let model = {}, level = "", buf = "";
+  const out = (record) => process.stdout.write(JSON.stringify(record) + "\\n");
+  process.stdin.on("data", (chunk) => {
+    buf += chunk; let i;
+    while ((i = buf.indexOf("\\n")) >= 0) {
+      const r = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1);
+      if (r.type === "set_model") { model = { provider: r.provider, id: r.modelId }; out({ id: r.id, type: "response", command: r.type, success: true }); }
+      else if (r.type === "set_thinking_level") { level = r.level; out({ id: r.id, type: "response", command: r.type, success: true }); }
+      else if (r.type === "get_state") out({ id: r.id, type: "response", command: r.type, success: true, data: { model, thinkingLevel: level } });
+      else if (r.type === "prompt") { out({ id: r.id, type: "response", command: "prompt", success: true }); out({ type: "extension_ui_request", id: "cred-" + r.id, method: "input", title: "pi-agent/credential", placeholder: "" }); }
+      else if (r.type === "extension_ui_response") {
+        log("credential " + (r.value ? JSON.parse(r.value).OPENAI_API_KEY : "cancelled"));
+        out({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" } });
+        out({ type: "agent_settled" });
+      }
+    }
+  });
+  process.stdin.on("end", () => process.exit(0));
+  process.on("SIGTERM", () => process.exit(0));
+} else if (cmd === "inspect") process.stdout.write("true\\n");
+else {
+  log(cmd);
+  if (fs.existsSync(path.join(dir, "fail-" + cmd))) process.exit(1);
+  if (cmd === "stop") { try { process.kill(Number(fs.readFileSync(path.join(dir, "run.pid"), "utf8")), "SIGTERM"); } catch {} }
+}
+`;
+
+async function withFakeDocker(reuse: boolean, body: (h: { dir: string; process: DockerPiProcess; events: PublicRunEvent[]; settled: () => Promise<void>; log: () => Promise<string[]> }) => Promise<void>) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "fake-docker-reuse-"));
+  await writeFile(path.join(dir, "docker"), FAKE_DOCKER);
+  await chmod(path.join(dir, "docker"), 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${dir}:${previousPath}`;
+  const events: PublicRunEvent[] = [];
+  let waiters: Array<() => void> = [];
+  const piProcess = new DockerPiProcess({
+    name: `pi-session-reuse-${reuse}`, image: "pi-agent@sha256:abc", network: "pi-model-only", worktreePath: "/w", gitMetadataPath: "/repo/.git",
+    sessionStatePath: dir, gatewayUrl: "http://model-gateway:8080", modelRef: "openai/gpt-5.6-luna",
+    extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"], reuse,
+  }, (runId) => `token-${runId}`, (event) => {
+    events.push(event);
+    if (event.type === "settled" || event.type === "error") { const ready = waiters; waiters = []; for (const wake of ready) wake(); }
+  });
+  const settled = () => new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`no settle; events ${JSON.stringify(events)}`)), 10_000);
+    waiters.push(() => { clearTimeout(timer); resolve(); });
+  });
+  const log = async () => (await readFile(path.join(dir, "log"), "utf8").catch(() => "")).trim().split("\n").filter(Boolean);
+  try { await body({ dir, process: piProcess, events, settled, log }); }
+  finally {
+    await piProcess.close();
+    process.env.PATH = previousPath;
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+const route = { modelRef: "openai/gpt-5.6-luna", effort: "max", source: "explicit" } as const;
+
+test("with reuse, a settled writer is paused, and its repair runs in the same container with fresh credentials", { timeout: 30_000 }, async () => {
+  await withFakeDocker(true, async ({ process, events, settled, log }) => {
+    let done = settled(); process.prompt("exec-1", "fix", route); await done;
+    // Paused before the host sees the settle, so nothing runs while verification and grading do.
+    assert.deepEqual(await log(), ["run", "credential token-exec-1", "pause"]);
+    done = settled(); process.prompt("exec-2", "repair", route); await done;
+    assert.deepEqual(await log(), ["run", "credential token-exec-1", "pause", "unpause", "credential token-exec-2", "pause"]);
+    const startups = events.filter((event) => event.type === "startup").map((event) => (event as Extract<PublicRunEvent, { type: "startup" }>).startup);
+    assert.equal(startups.length, 2);
+    assert.equal(startups[0].reused, false);
+    assert.equal(startups[1].reused, true);
+    assert.equal(startups[1].queue_ms, 0);
+    assert.equal(typeof startups[1].dispatch_to_prompt_ms, "number");
+    // Every other ending stops the container; a paused one is unpaused first.
+    await process.release();
+    assert.deepEqual((await log()).slice(-2), ["unpause", "stop"]);
+  });
+});
+
+test("cancelling a paused writer unpauses it before stopping it", { timeout: 30_000 }, async () => {
+  await withFakeDocker(true, async ({ process, settled, log }) => {
+    const done = settled(); process.prompt("exec-1", "fix", route); await done;
+    await process.abort("exec-1");
+    assert.deepEqual(await log(), ["run", "credential token-exec-1", "pause", "unpause", "stop"]);
+  });
+});
+
+test("when the paused writer cannot be resumed, the repair cold-starts and says so", { timeout: 30_000 }, async () => {
+  await withFakeDocker(true, async ({ dir, process, events, settled, log }) => {
+    let done = settled(); process.prompt("exec-1", "fix", route); await done;
+    await writeFile(path.join(dir, "fail-unpause"), "");
+    done = settled(); process.prompt("exec-2", "repair", route); await done;
+    assert.ok(events.some((event) => event.type === "container_reuse_failed"), JSON.stringify(events));
+    const lines = await log();
+    assert.deepEqual(lines.filter((line) => line === "run").length, 2);
+    assert.ok(lines.indexOf("stop") > lines.indexOf("unpause"), lines.join(","));
+    assert.equal(lines.at(-1), "pause");
+    assert.ok(lines.includes("credential token-exec-2"));
+  });
+});
+
+test("without reuse every execution gets its own container, stopped at settle", { timeout: 30_000 }, async () => {
+  await withFakeDocker(false, async ({ process, settled, log }) => {
+    let done = settled(); process.prompt("exec-1", "fix", route); await done;
+    done = settled(); process.prompt("exec-2", "repair", route); await done;
+    assert.deepEqual(await log(), ["run", "credential token-exec-1", "stop", "run", "credential token-exec-2", "stop"]);
+  });
+});
+
+test("a paused writer is not reused for a different model, and discussions are never paused", { timeout: 30_000 }, async () => {
+  await withFakeDocker(true, async ({ process, settled, log }) => {
+    let done = settled(); process.prompt("exec-1", "fix", route); await done;
+    done = settled(); process.prompt("exec-2", "fix", { modelRef: "openai/gpt-5.6-sol", effort: "high", source: "explicit" }); await done;
+    assert.deepEqual(await log(), ["run", "credential token-exec-1", "pause", "unpause", "stop", "run", "credential token-exec-2", "pause"]);
+    done = settled(); process.prompt("exec-3", "explain", route, "discuss"); await done;
+    assert.deepEqual((await log()).slice(-3), ["run", "credential token-exec-3", "stop"]);
+  });
+});
+
+class OrderedProcess {
+  handler: (event: PublicRunEvent) => void = () => undefined;
+  constructor(private readonly order: string[], private readonly releaseError?: Error) {}
+  prompt(runId: string) { this.order.push(`prompt ${runId.length ? "exec" : ""}`); }
+  decide() {}
+  respondUi() {}
+  async release() { this.order.push("release"); if (this.releaseError) throw this.releaseError; }
+  async abort() { this.order.push("abort"); }
+  async close() {}
+  emit(event: PublicRunEvent) { this.handler(event); }
+}
+
+function ordered(results: Array<"repair" | "pass" | "fail">, releaseError?: Error) {
+  const order: string[] = [];
+  const process = new OrderedProcess(order, releaseError);
+  let evaluations = 0;
+  const quality = {
+    execution: () => {}, assertUnchanged: async () => { order.push("assert_unchanged"); },
+    evaluate: async () => {
+      order.push("evaluate");
+      const action = results[evaluations++];
+      return { action, ...(action === "repair" ? { repair_prompt: "fix it" } : {}), verification: { status: action === "pass" ? "passed" : "failed", checks: [] }, candidate: { hash: "h", path: "/c" } };
+    },
+  };
+  const orchestrator = new CodingAgentOrchestrator({
+    worktrees: {
+      create: async () => ({ path: "/managed/w1", branch: "pi-agent/run", baselineCommit: "a".repeat(40) }),
+      inspectDiff: async () => ({ files: ["src/a.ts"], bytes: 10, stat: "1 file changed" }),
+      commit: async () => { order.push("commit"); return "b".repeat(40); },
+      rollback: async () => { order.push("rollback"); },
+      remove: async () => undefined,
+    },
+    startProcess: async (_session: unknown, onEvent: (event: PublicRunEvent) => void) => { process.handler = onEvent; return process; },
+    maxActiveSessions: 2, deadlineMs: 10_000, quality,
+  } as any);
+  return { orchestrator, process, order };
+}
+
+const tick = async () => { for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve)); };
+const SETTLED = { type: "settled", outcome: "completed" } as const;
+
+test("a passing run releases its writer before committing; a repair keeps it", async () => {
+  const { orchestrator, process, order } = ordered(["repair", "pass"]);
+  const run = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "reuse-pass", user_id: "U", prompt: "fix" });
+  process.emit(SETTLED); await tick();
+  process.emit(SETTLED); await tick();
+  assert.equal(orchestrator.getRun(run.run_id).status, "completed");
+  assert.deepEqual(order, ["prompt exec", "evaluate", "prompt exec", "evaluate", "release", "assert_unchanged", "commit"]);
+});
+
+test("a failing run stops its writer before rolling back", async () => {
+  const { orchestrator, process, order } = ordered(["fail"]);
+  const run = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "reuse-fail", user_id: "U", prompt: "fix" });
+  process.emit(SETTLED); await tick();
+  assert.equal(orchestrator.getRun(run.run_id).status, "failed");
+  assert.ok(order.indexOf("abort") >= 0 && order.indexOf("abort") < order.indexOf("rollback"), order.join(","));
+  assert.ok(!order.includes("commit"));
+});
+
+test("a writer that cannot be stopped is never committed", async () => {
+  const { orchestrator, process, order } = ordered(["pass"], new Error("docker stop failed"));
+  const run = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "reuse-stuck", user_id: "U", prompt: "fix" });
+  process.emit(SETTLED); await tick();
+  assert.equal(orchestrator.getRun(run.run_id).status, "failed");
+  assert.equal(orchestrator.getRun(run.run_id).error?.code, "container_stop_failed");
+  assert.ok(!order.includes("commit"), order.join(","));
+});

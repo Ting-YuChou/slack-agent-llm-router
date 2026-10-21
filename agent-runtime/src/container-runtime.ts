@@ -57,6 +57,8 @@ export interface AgentContainerOptions {
   checksContext?: ChecksContext;
   /** `none` lets the writer edit its worktree without prompts; delivery approval must then gate the commit. */
   writeApproval?: WriteApprovalMode;
+  /** Pause a settled writer and resume it for the next compatible execution (profile `writerReuse`). */
+  reuse?: boolean;
 }
 
 export interface ChecksContext { checks: string[]; defaultChecks: string[]; maxCalls: number }
@@ -180,6 +182,13 @@ export class DockerPiProcess implements AgentProcess {
   private queuedStart?: Promise<void>;
   private releasePermit?: () => void;
   private closedHookRan = false;
+  /** The settled writer is frozen (docker pause) and still holds its execution slot. */
+  private paused = false;
+  /** Whether the current execution resumed a paused container rather than starting one. */
+  private reused = false;
+  private activeTask?: TaskMode;
+  private containerKey?: string;
+  private credentials?: RunCredentials;
   private readonly options: Omit<AgentContainerOptions, "classifier" | "mcp"> & { mcp?: Omit<McpRunConfig, "token"> };
   private readonly tokenForRun: (runId: string, route: RouteDecision) => string;
   private readonly onEvent: (event: PublicRunEvent) => void;
@@ -227,11 +236,9 @@ export class DockerPiProcess implements AgentProcess {
     const mcp = selectedTask === "discuss" ? undefined : configuredMcp;
     if (mcp && !this.mcpTokenForRun) throw new Error("MCP token issuer is required when MCP is enabled");
     const classifier = selectedTask !== "discuss" && this.classifierTokenForRun !== undefined;
-    // Issued per execution and handed to Pi only through the credential dialog, never its environment.
-    const credentials: RunCredentials = {
-      [resolveAgentModel(route.modelRef).credentialEnv]: this.tokenForRun(runId, route),
-      ...(classifier ? { OPENROUTER_API_KEY: this.classifierTokenForRun!(runId) } : {}),
-    };
+    this.credentials = this.credentialsFor(runId, route, selectedTask);
+    this.activeTask = selectedTask; this.reused = false;
+    this.containerKey = this.reuseKey(route, selectedTask);
     const containerOptions: AgentContainerOptions = {
       ...baseOptions,
       taskMode: selectedTask,
@@ -253,25 +260,29 @@ export class DockerPiProcess implements AgentProcess {
       env: buildAgentSpawnEnv(containerOptions, process.env),
     });
     this.child = child;
-    const bridge = new PiRpcBridge({
-      credentials: () => credentials,
+    const bridge: PiRpcBridge = new PiRpcBridge({
+      credentials: () => this.bridge === bridge ? this.credentials : undefined,
       onReady: () => this.startup?.rpcReady(),
       writeLine: (line) => child.stdin.write(line),
+      // The bridge outlives one execution when the container is reused; always attribute to the current one.
       onCommand: record => {
-        capture?.onCommand(record);
+        this.capture?.onCommand(record);
+        const current = this.activeRunId ?? runId;
         if (record.type === "prompt") {
           this.startup?.configured(); this.startup?.promptSent();
-          if (this.startup) this.onEvent({ type: "startup", startup: { reused: false, queue_ms: this.queueMs, ...this.startup.summary() } });
-          this.onPrompt?.(runId);
-          this.tracing?.log(runId, "agent.prompt_sent");
+          if (this.startup) this.onEvent({ type: "startup", startup: { reused: this.reused, queue_ms: this.queueMs, ...this.startup.summary() } });
+          this.onPrompt?.(current);
+          this.tracing?.log(current, "agent.prompt_sent");
         }
       },
-      onRecord: record => { capture?.onRecord(record); this.tracing?.rpc(runId, record); this.onRecord?.(record); },
+      onRecord: record => { this.capture?.onRecord(record); this.tracing?.rpc(this.activeRunId ?? runId, record); this.onRecord?.(record); },
       onEvent: (event) => {
         if ((event.type === "answer" || event.type === "answer_delta") && event.text.trim()) this.startup?.firstOutput();
         if (event.type === "settled") {
           this.hasSession = true;
-          void this.finalizeCapture(bridge, capture).then(() => this.bridge === bridge ? this.stopActiveContainer() : undefined).then(
+          // A completed writer may be repaired: freeze it (verification sees a still worktree) instead of stopping it.
+          const keep = this.options.reuse === true && event.outcome === "completed" && this.activeTask !== "discuss";
+          void this.finalizeCapture(bridge, this.capture).then(() => this.bridge !== bridge ? undefined : keep ? this.pauseActiveContainer() : this.stopActiveContainer()).then(
             () => { if (this.bridge === bridge) this.onEvent(event); },
             () => { if (this.bridge === bridge) this.onEvent({
               type: "error",
@@ -307,7 +318,7 @@ export class DockerPiProcess implements AgentProcess {
     });
     child.on("exit", (code) => {
       bridge.failPending();
-      if (this.child === child) this.activeContainerName = undefined;
+      if (this.child === child) { this.activeContainerName = undefined; this.paused = false; }
       if (!this.closing && code !== 0) this.onEvent({ type: "error", code: "container_exited", message: "Agent container exited unexpectedly" });
     });
     child.stderr.resume();
@@ -316,31 +327,88 @@ export class DockerPiProcess implements AgentProcess {
   prompt(runId: string, prompt: string, route?: RouteDecision, requestedTask?: TaskMode): void {
     const selectedTask = taskMode(requestedTask ?? this.options.taskMode);
     const selected = route ?? { modelRef: this.options.modelRef, effort: resolveAgentModel(this.options.modelRef).reasoningEffort, source: "explicit" };
-    const startPrompt = () => {
-      this.start(runId, selected, selectedTask);
-      const model = resolveAgentModel(selected.modelRef);
-      const bridge = this.bridge!; const capture = this.capture;
-      void this.readiness!.then(() => bridge.configureAndPrompt(runId, prompt, model.provider, model.id, selected.effort, async () => {
-        await capture?.beforePrompt(bridge);
-        if (this.bridge !== bridge || this.closing) throw new RpcProtocolError("Pi configuration was interrupted");
-      })).catch(() => {
-        if (this.bridge !== bridge || this.closing) return;
-        this.onEvent({ type: "error", code: "pi_configuration_failed", message: "Pi model configuration could not be verified" });
-        this.stopActiveContainer().catch(() => {
-          if (this.bridge === bridge) this.onEvent({ type: "error", code: "container_stop_failed", message: "Agent container could not be confirmed stopped" });
-        });
-      });
-    };
     this.queueAbort?.abort(); const controller = new AbortController(); this.queueAbort = controller;
     this.queuedStart = (async () => {
+      if (await this.resume(runId, prompt, selected, selectedTask)) return;
       await this.stopActiveContainer(); controller.signal.throwIfAborted();
       const queuedAt = Date.now();
       this.tracing?.lifecycle(runId, "queue", "start");
       const release = await agentScheduler.acquire(this.options.workflowKey ?? this.sessionId, controller.signal);
       if (controller.signal.aborted) { release(); return; }
       this.queueMs = Date.now() - queuedAt;
-      this.releasePermit = release; this.tracing?.lifecycle(runId, "queue", "end"); startPrompt();
+      this.releasePermit = release; this.tracing?.lifecycle(runId, "queue", "end");
+      this.start(runId, selected, selectedTask);
+      this.dispatch(runId, prompt, selected);
     })().catch(() => { if (!controller.signal.aborted) this.onEvent({ type: "error", code: "container_admission_failed", message: "Agent could not acquire/start an execution slot" }); });
+  }
+
+  /** Configures the ready container's model for this execution and sends the prompt. */
+  private dispatch(runId: string, prompt: string, route: RouteDecision): void {
+    const model = resolveAgentModel(route.modelRef);
+    const bridge = this.bridge!; const capture = this.capture;
+    void this.readiness!.then(() => bridge.configureAndPrompt(runId, prompt, model.provider, model.id, route.effort, async () => {
+      await capture?.beforePrompt(bridge);
+      if (this.bridge !== bridge || this.closing) throw new RpcProtocolError("Pi configuration was interrupted");
+    })).catch(() => {
+      if (this.bridge !== bridge || this.closing) return;
+      this.onEvent({ type: "error", code: "pi_configuration_failed", message: "Pi model configuration could not be verified" });
+      this.stopActiveContainer().catch(() => {
+        if (this.bridge === bridge) this.onEvent({ type: "error", code: "container_stop_failed", message: "Agent container could not be confirmed stopped" });
+      });
+    });
+  }
+
+  /** Each execution's own tokens, issued now and handed to Pi only through the credential dialog. */
+  private credentialsFor(runId: string, route: RouteDecision, task: TaskMode): RunCredentials {
+    return {
+      [resolveAgentModel(route.modelRef).credentialEnv]: this.tokenForRun(runId, route),
+      ...(task !== "discuss" && this.classifierTokenForRun ? { OPENROUTER_API_KEY: this.classifierTokenForRun(runId) } : {}),
+    };
+  }
+
+  /** What a container is fixed to at start (provider key name, limits, task); a reused one must match. */
+  private reuseKey(route: RouteDecision, task: TaskMode): string {
+    return JSON.stringify([route.modelRef, this.limitsFor(route) ?? null, task]);
+  }
+
+  /** Freezes a settled writer, keeping its execution slot, so a repair can resume it; stops it if it cannot. */
+  private async pauseActiveContainer(): Promise<void> {
+    const name = this.activeContainerName;
+    if (!name || !this.child || this.child.exitCode !== null) return;
+    try {
+      await exec("docker", ["pause", name], { env: { PATH: process.env.PATH } });
+      this.paused = true;
+    } catch { await this.stopActiveContainer(); }
+  }
+
+  /**
+   * Resumes the paused writer for a compatible execution with that execution's credentials; false when a
+   * fresh container must start instead (none paused, a different model or limits, or unpause failed).
+   */
+  private async resume(runId: string, prompt: string, route: RouteDecision, task: TaskMode): Promise<boolean> {
+    const name = this.activeContainerName;
+    if (!this.paused || !name || !this.bridge || this.child?.exitCode !== null || this.options.mcp || this.containerKey !== this.reuseKey(route, task)) return false;
+    const startup = new StartupTiming((stage, phase, failed) => this.tracing?.lifecycle(runId, stage, phase, failed));
+    startup.start();
+    try { await exec("docker", ["unpause", name], { env: { PATH: process.env.PATH } }); }
+    catch {
+      startup.fail();
+      this.onEvent({ type: "container_reuse_failed" });
+      return false;
+    }
+    this.paused = false;
+    startup.cliSpawned(); startup.containerRunning(); startup.rpcReady();
+    this.activeRunId = runId; this.startup = startup; this.queueMs = 0; this.reused = true;
+    this.credentials = this.credentialsFor(runId, route, task);
+    this.capture = this.telemetry ? new PiRunCapture(this.telemetry, runId, this.sessionId, this.options.sessionStatePath, name) : undefined;
+    this.readiness = Promise.resolve();
+    this.dispatch(runId, prompt, route);
+    return true;
+  }
+
+  /** Stops a writer kept paused for reuse and frees its slot; nothing to do when none is paused. */
+  async release(): Promise<void> {
+    if (this.paused) await this.stopActiveContainer();
   }
   decide(rpcUiId: string, approved: boolean): void { if(this.activeRunId) this.tracing?.approval(this.activeRunId,rpcUiId,approved); this.bridge?.respondToUi(rpcUiId, approved); }
   respondUi(rpcUiId: string, response: UiResponse): void { this.bridge?.respondUi(rpcUiId, response); }
@@ -399,6 +467,9 @@ export class DockerPiProcess implements AgentProcess {
     this.closing = true;
     if(this.activeRunId) this.tracing?.lifecycle(this.activeRunId, "container_stop", "start");
     const containerName = this.activeContainerName;
+    // Older engines refuse to stop a paused container; a failed unpause still leaves stop to try.
+    if (containerName && this.paused) await exec("docker", ["unpause", containerName], { env: { PATH: process.env.PATH } }).catch(() => undefined);
+    this.paused = false;
     if (containerName) {
       try {
         await exec("docker", ["stop", "--time", "5", containerName], {

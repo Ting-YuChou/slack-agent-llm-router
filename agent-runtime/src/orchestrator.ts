@@ -216,6 +216,8 @@ export interface AgentProcess {
   /** Answers an extension UI dialog other than an approval (run_checks). */
   respondUi(rpcUiId: string, response: UiResponse): void;
   abort(runId: string): Promise<void>;
+  /** Stops a writer kept for reuse; called before a run's change is committed or handed to approval. */
+  release?(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -933,6 +935,11 @@ export class CodingAgentOrchestrator {
     if (!session?.activeRunId) return;
     const run = this.runs.get(session.activeRunId);
     if (!run || isTerminal(run.status)) return;
+    if (event.type === "container_reuse_failed") {
+      this.pushEvent(run, event);
+      this.persistSoon();
+      return;
+    }
     if (event.type === "startup") {
       const attempt = run.attempts?.at(-1);
       if (attempt) attempt.startup = event.startup; else run.startup = event.startup;
@@ -1153,6 +1160,8 @@ export class CodingAgentOrchestrator {
           const cause = result.failure?.code === "verification_failed" ? result.failure.cause_code : undefined;
           await this.failRun(session, run, { code: "verification_failed", message: "Candidate retained as an isolated artifact; verification/grading did not pass", ...(cause ? { cause_code: cause } : {}) }); return;
         }
+        // Writers are kept for reuse only under a trusted profile, so only runs with a workflow can hold one.
+        if (!await this.releaseWriter(session, run)) return;
         await this.quality.assertUnchanged(result.candidate, input);
         workflow.controller.signal.throwIfAborted();
         run.phase = "finalizing"; await this.persistState();
@@ -1171,6 +1180,20 @@ export class CodingAgentOrchestrator {
     // Claim synchronously after settle so cancellation cannot race finalization.
     if (!this.claimTerminal(run)) return;
     await this.finalizeClaimedRun(session, run);
+  }
+
+  /**
+   * Stops a writer kept paused for a possible repair, before its change is checked one last time and
+   * committed or offered for approval; false when it could not be stopped and the run was failed.
+   */
+  private async releaseWriter(session: SessionRecord, run: RunRecord): Promise<boolean> {
+    try { await session.process.release?.(); return true; }
+    catch {
+      if (!isTerminal(run.status) && !this.terminalClaims.has(run.run_id)) {
+        await this.failRun(session, run, { code: "container_stop_failed", message: "Changes were not delivered because the Agent container could not be confirmed stopped" });
+      }
+      return false;
+    }
   }
 
   /** Commits the worktree for a run whose terminal claim the caller already holds. */

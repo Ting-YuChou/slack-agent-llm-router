@@ -18,7 +18,8 @@ export type PublicRunEvent =
   | { type: "settled"; outcome: RunOutcome; limit?: LimitKind; stop_reason?: string; error_message?: string }
   | { type: "error"; code: string; message: string }
   | ({ type: "policy_decision" } & PolicyDecision)
-  | { type: "startup"; startup: AttemptStartup };
+  | { type: "startup"; startup: AttemptStartup }
+  | { type: "container_reuse_failed" };
 
 /** How a Pi prompt ended; only `completed` may be delivered. */
 export type RunOutcome = "completed" | "truncated" | "limit_reached" | "aborted" | "error";

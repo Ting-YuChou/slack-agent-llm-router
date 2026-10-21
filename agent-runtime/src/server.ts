@@ -512,6 +512,7 @@ export async function createProductionServer() {
           ...(trustedProfile ? { writerContext: writerContextFor(trustedProfile.profile) } : {}),
           // Runs that skip delivery approval keep per-write prompts, so no run loses both gates.
           writeApproval: session.skipDelivery ? "per_prompt" : approval.writeApproval,
+          reuse: writerReuseEnabled(trustedProfile?.profile, mcpServerIds.length),
           user: containerUser,
           ...(mcpServerIds.length > 0 ? {
             mcp: {
@@ -771,6 +772,11 @@ function positiveInteger(value: string | undefined, fallback: number): number {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 /** The writer gets run_checks (tool, extension and its context) only when a trusted profile can verify. */
+/** Writer reuse needs the profile's opt-in and no MCP: MCP tokens are fixed when the container starts. */
+export function writerReuseEnabled(profile: VerificationProfile | undefined, mcpServers: number): boolean {
+  return Boolean(profile?.writerReuse) && mcpServers === 0;
+}
+
 export function writerTools(profile: VerificationProfile | undefined, extensionPaths: string[], toolNames: string[]): { extensionPaths: string[]; toolNames: string[]; checksContext?: ChecksContext } {
   if (!profile) return { extensionPaths, toolNames };
   const checks = profile.checks.map((check) => check.name);
