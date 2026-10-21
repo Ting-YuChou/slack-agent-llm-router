@@ -87,6 +87,13 @@ export function createModelGateway(options: {
       for (const [runId, entry] of classifierCalls) {
         if (entry.expiresAt < now) classifierCalls.delete(runId);
       }
+      // Workflow-bound tokens are refused by budget admission once the run ends; the rest ask whether their run is still active.
+      if (!claims.workflowRunId && options.budgetLedger?.active) {
+        let active: boolean;
+        try { active = await options.budgetLedger.active(claims.runId); }
+        catch { sendJson(response, 503, { error: { code: "revocation_unavailable", message: "Whether this run is still active could not be confirmed" } }); return; }
+        if (!active) { sendJson(response, 429, { error: { code: "token_revoked", message: "This run has ended; its classifier token is revoked" } }); return; }
+      }
       const budget = classifierCalls.get(claims.runId) ?? { count: 0, expiresAt: claims.expiresAt };
       if (budget.count >= claims.maxCalls) {
         sendJson(response, 429, {

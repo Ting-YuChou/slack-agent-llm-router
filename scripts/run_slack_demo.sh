@@ -274,6 +274,7 @@ if [[ "${DEMO_TEST_MODE:-0}" != 1 ]]; then
       --tmpfs /tmp:rw,noexec,nosuid,size=67108864 \
       --mount "type=bind,src=${GITHUB_APP_PRIVATE_KEY_PATH},dst=/run/secrets/github-app.pem,readonly" \
       --env "MCP_GATEWAY_SERVER_SIGNING_SECRET=${github_mcp_signing_secret}" \
+      --env "PI_AGENT_REVOCATION_RPC_URL=http://host.docker.internal:${PI_AGENT_PORT:-3001}" \
       --env GITHUB_APP_ID \
       --env GITHUB_APP_INSTALLATION_ID \
       --env GITHUB_APP_PRIVATE_KEY_PATH=/run/secrets/github-app.pem \
@@ -313,6 +314,7 @@ if [[ "${DEMO_TEST_MODE:-0}" != 1 ]]; then
       --read-only --user 10003:10003 --cap-drop ALL --security-opt no-new-privileges \
       --cpus 1 --memory 256m --pids-limit 128 --tmpfs /tmp:rw,noexec,nosuid,size=67108864 \
       --env "MCP_GATEWAY_SERVER_SIGNING_SECRET=${clickhouse_mcp_signing_secret}" --env MCP_SERVER_ID=clickhouse \
+      --env "PI_AGENT_REVOCATION_RPC_URL=http://host.docker.internal:${PI_AGENT_PORT:-3001}" \
       --env MCP_UPSTREAM_URL=http://mcp-clickhouse:8000/mcp --env CLICKHOUSE_MCP_BEARER_TOKEN \
       "${mcp_gateway_image}" >/dev/null
     clickhouse_gateway_started=true
@@ -325,6 +327,7 @@ if [[ "${DEMO_TEST_MODE:-0}" != 1 ]]; then
       --read-only --user 10003:10003 --cap-drop ALL --security-opt no-new-privileges \
       --cpus 1 --memory 256m --pids-limit 128 --tmpfs /tmp:rw,noexec,nosuid,size=67108864 \
       --env "MCP_GATEWAY_SERVER_SIGNING_SECRET=${context7_mcp_signing_secret}" --env MCP_SERVER_ID=context7 \
+      --env "PI_AGENT_REVOCATION_RPC_URL=http://host.docker.internal:${PI_AGENT_PORT:-3001}" \
       --env MCP_UPSTREAM_URL=https://mcp.context7.com/mcp --env CONTEXT7_API_KEY \
       "${mcp_gateway_image}" >/dev/null
     context7_gateway_started=true

@@ -10,6 +10,8 @@ export interface BudgetAdmissionLedger {
   reserve(workflow: string, id: string, amount: number, execution?: string): void | Promise<void>;
   settle(id: string, amount: number | null): void | Promise<void>;
   firstModel(execution: string, now?: number): number | undefined | Promise<number | undefined>;
+  /** Whether the execution's run is still active; a gateway refuses the tokens of ended runs. */
+  active?(execution: string): boolean | Promise<boolean>;
 }
 
 /** SQLite has one owner on the host. Docker gateways never open its WAL files. */
@@ -25,5 +27,6 @@ export class BudgetRpcClient implements BudgetAdmissionLedger {
   }
   async reserve(workflow: string, id: string, amount: number, execution?: string) { await this.post('reserve',{ workflow,id,amount,execution }); }
   async settle(id: string, amount: number | null) { await this.post('settle',{ id,amount }); }
+  async active(execution: string): Promise<boolean> { return await this.post('active',{ execution }) === true; }
   async firstModel(execution: string, now = Date.now()) { const value = await this.post('first-model',{ execution,now }); return typeof value === 'number' ? value : undefined; }
 }

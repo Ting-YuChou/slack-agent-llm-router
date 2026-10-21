@@ -30,6 +30,8 @@ export interface McpAuditEvent {
 }
 
 export interface McpGatewayOptions {
+  /** Whether a token's execution belongs to a run that is still active; ended runs' tokens are refused. */
+  isActive?: (run: string) => Promise<boolean>;
   server: McpServerId;
   allowedTools: readonly string[];
   signingSecret: string;
@@ -100,6 +102,18 @@ export function createMcpGatewayServer(options: McpGatewayOptions) {
     if (!claims || claims.tools.some((tool) => !options.allowedTools.includes(tool))) {
       sendError(response, 401, "unauthorized", "A valid MCP token is required");
       return;
+    }
+    if (options.isActive) {
+      let active: boolean;
+      try { active = await options.isActive(claims.run); }
+      catch {
+        sendError(response, 503, "revocation_unavailable", "Whether this run is still active could not be confirmed");
+        return;
+      }
+      if (!active) {
+        sendError(response, 401, "token_revoked", "This run has ended; its MCP token is revoked");
+        return;
+      }
     }
     for (const [sessionId, binding] of sessionBindings) {
       if (binding.expiry < Date.now()) sessionBindings.delete(sessionId);

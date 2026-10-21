@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { GitHubAppTokenProvider } from "./github-app-token.js";
 import { allServerTools, MCP_SERVERS, type McpServerId } from "./mcp-config.js";
 import { createMcpGatewayServer } from "./mcp-gateway.js";
+import { executionStatusFromEnv } from "./execution-status.js";
 import { authorizeClickHouseTool, authorizeContext7Tool, authorizeGitHubTool, githubMcpTokenScope, sanitizeClickHouseResponse, validateContext7Response } from "./mcp-policy.js";
 
 const serverId = parseServer(process.env.MCP_SERVER_ID);
@@ -26,8 +27,11 @@ const upstreamHeaders = async (): Promise<Record<string, string>> => {
   return { Authorization: `Bearer ${required("CLICKHOUSE_MCP_BEARER_TOKEN")}` };
 };
 
+// With the host's status endpoint configured, tokens of ended runs are refused (fail closed if it is unreachable).
+const executionStatus = executionStatusFromEnv(process.env, signingSecret);
 const gateway = createMcpGatewayServer({
   server: serverId, allowedTools: allServerTools(serverId), signingSecret, upstreamUrl,
+  ...(executionStatus ? { isActive: (run: string) => executionStatus.active(run) } : {}),
   timeoutMs: positiveInteger(process.env.MCP_GATEWAY_TIMEOUT_MS, serverId === "github" ? 30_000 : 10_000),
   maxRequestBytes: positiveInteger(process.env.MCP_GATEWAY_MAX_REQUEST_BYTES, serverId === "context7" || serverId === "clickhouse" ? 16_384 : 256_000),
   maxResultBytes: positiveInteger(process.env.MCP_GATEWAY_MAX_RESULT_BYTES, MCP_SERVERS[serverId].maxResultBytes),

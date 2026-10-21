@@ -388,6 +388,17 @@ def test_demo_mcp_gateway_has_dual_networks_and_cleanup():
     assert 'docker network rm "${mcp_egress_network}"' in launcher
 
 
+def test_demo_mcp_gateways_ask_the_host_whether_a_run_is_still_active():
+    launcher = (ROOT / "scripts/run_slack_demo.sh").read_text()
+    revocation = (
+        '--env "PI_AGENT_REVOCATION_RPC_URL='
+        'http://host.docker.internal:${PI_AGENT_PORT:-3001}"'
+    )
+    for secret in ("github", "clickhouse", "context7"):
+        launch = launcher.split(f"${{{secret}_mcp_signing_secret}}", 1)[1]
+        assert revocation in launch.split('"${mcp_gateway_image}"', 1)[0], secret
+
+
 def test_demo_applies_agent_mcp_views_before_starting_clickhouse_mcp():
     launcher = (ROOT / "scripts" / "run_slack_demo.sh").read_text(encoding="utf-8")
     clickhouse_block = launcher.split(
