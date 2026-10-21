@@ -78,6 +78,7 @@ jobs:
             dist/test/docker-integration.test.js \
             dist/test/run-checks-rpc.test.js \
             dist/test/verification-docker.test.js \
-            dist/test/full-loop-docker.test.js | tee docker-tests.log
+            dist/test/full-loop-docker.test.js \
+            dist/test/image-manifest.test.js | tee docker-tests.log
           # A missing gate or image would skip silently; this job exists to run them.
           grep -q "^ℹ skipped 0$" docker-tests.log || { echo "Docker suites were skipped" >&2; exit 1; }

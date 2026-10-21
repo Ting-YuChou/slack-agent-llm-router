@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -38,16 +38,12 @@ if (!/^sha256:[a-f0-9]{64}$/.test(imageDigest)) {
 }
 
 // What the container actually loads, hashed inside the image by digest; the runtime refuses to start
-// on any difference (src/image-manifest.ts).
-const { computeImageManifest } = await import(pathToFileURL(path.join(runtimeRoot, "dist/src/image-manifest.js")).href);
+// on any difference (src/image-manifest.ts). An image built from a different tree is never locked.
+const { assertImageMatchesHost, computeImageManifest } = await import(pathToFileURL(path.join(runtimeRoot, "dist/src/image-manifest.js")).href);
+await assertImageMatchesHost(imageDigest, runtimeRoot).catch((error) => {
+  throw new Error(`Refusing to lock an image built from a different tree: ${error.message}`);
+});
 const manifest = await computeImageManifest(imageDigest);
-for (const [inImage, digest] of Object.entries(manifest)) {
-  const relative = path.posix.relative("/opt/pi", inImage);
-  if (!/^(?:extensions|plugins|skills)\//.test(relative) || !digest.startsWith("sha256:")) continue;
-  const hostPath = path.join(runtimeRoot, relative);
-  const hostDigest = existsSync(hostPath) ? `sha256:${createHash("sha256").update(readFileSync(hostPath)).digest("hex")}` : "missing";
-  if (hostDigest !== digest) throw new Error(`Refusing to lock an image built from a different tree: ${relative}`);
-}
 
 lock.image_digest = imageDigest;
 lock.image_manifest = manifest;
