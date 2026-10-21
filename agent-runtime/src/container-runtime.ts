@@ -437,22 +437,28 @@ export class DockerPiProcess implements AgentProcess {
   }
   decide(rpcUiId: string, approved: boolean): void { if(this.activeRunId) this.tracing?.approval(this.activeRunId,rpcUiId,approved); this.bridge?.respondToUi(rpcUiId, approved); }
   respondUi(rpcUiId: string, response: UiResponse): void { this.bridge?.respondUi(rpcUiId, response); }
+  /** Ends the run's execution; the session stays open, so what it owns (its network) is kept for the next prompt. */
   async abort(runId: string): Promise<void> {
     const capture = this.capture;
     capture?.cancel();
     this.bridge?.abort(`abort-${runId}`);
-    await this.close();
+    await this.stopExecution();
     await capture?.recover();
   }
 
+  /** Ends the session: stops its execution, then runs the session's cleanup once. */
   async close(): Promise<void> {
-    this.queueAbort?.abort();
-    await this.queuedStart;
-    await this.stopActiveContainer();
+    await this.stopExecution();
     const closed = this.closedHookRan ? undefined : this.options.onClosed;
     this.closedHookRan = true;
     // Cleanup after the container is gone must not turn a clean close into a failure.
     await closed?.().catch(() => console.error(JSON.stringify({ event: "agent_session_cleanup_failed", session_id: this.sessionId })));
+  }
+
+  private async stopExecution(): Promise<void> {
+    this.queueAbort?.abort();
+    await this.queuedStart;
+    await this.stopActiveContainer();
   }
 
   private async waitForContainer(name: string, signal: AbortSignal): Promise<void> {
