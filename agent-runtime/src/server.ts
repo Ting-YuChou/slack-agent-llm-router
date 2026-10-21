@@ -462,6 +462,9 @@ export async function createProductionServer() {
   const budgetLedger = new BudgetLedger(path.join(runtimeRoot, "budget", "budget.sqlite"));
   // Outside every container mount: a writer can edit its session directory, never these seals.
   const sessionSeals = new SessionSeal(deriveSessionSealKey(gatewaySecret), path.join(runtimeRoot, "session-seals"));
+  // Orphan containers are stopped by now: seal the sessions they were writing, as their own stop would have.
+  const adopted = await sessionSeals.sealOpen((id) => path.join(runtimeRoot, "sessions", id));
+  if (adopted.length) logEvent("agent_session_seals_adopted", { sessions: adopted.length });
   const defaultRunBudgetUsd = parseDefaultRunBudget(process.env);
   const workflowControl = trustedProfile ? new ControlStore(path.join(runtimeRoot, "control", "state.sqlite"), () => { void orchestrator.shutdown().catch(() => {}); }) : undefined;
   const releaseCoordinator = workflowControl?.acquireCoordinator();
@@ -555,7 +558,7 @@ export async function createProductionServer() {
           // Runs that skip delivery approval keep per-write prompts, so no run loses both gates.
           writeApproval: session.skipDelivery ? "per_prompt" : approval.writeApproval,
           ...writerReuseOptions(trustedProfile?.profile, mcpServerIds),
-          sessionSeal: { seal: () => sessionSeals.seal(session.id, sessionStatePath), verify: () => sessionSeals.verify(session.id, sessionStatePath) },
+          sessionSeal: { open: () => sessionSeals.open(session.id), seal: () => sessionSeals.seal(session.id, sessionStatePath), verify: () => sessionSeals.verify(session.id, sessionStatePath) },
           user: containerUser,
           ...(mcpServerIds.length > 0 ? {
             mcp: {
