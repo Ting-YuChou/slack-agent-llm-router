@@ -516,6 +516,107 @@ def test_topology_removes_what_it_started_when_startup_fails(tmp_path, monkeypat
     assert closed == [["pi-structured-models-" + booted.suffix]]
 
 
+# --- repair-driving tasks ------------------------------------------------------
+
+REPAIR_TASK = agent_eval.PROJECT / "eval/repair-tasks/hidden-rule-repair"
+
+
+def _repair_outcome(*reused):
+    attempts = [{"verification": "failed", "grader": None, "reused": False}]
+    attempts += [
+        {"verification": "passed", "grader": "passed", "reused": flag}
+        for flag in reused
+    ]
+    return _outcome(attempts=attempts)
+
+
+def test_a_repair_task_fails_without_a_repair_and_without_reuse():
+    task = {
+        "expect": "pass",
+        "requires_repair": True,
+        "profile": {"allowedPaths": ["src/"], "writerReuse": True},
+    }
+    passed = agent_eval.score_run(task, _repair_outcome(True))
+    assert passed == {"passed": True, "reason": "repaired in a reused writer"}
+    first_try = agent_eval.score_run(
+        task,
+        _outcome(attempts=[{"verification": "passed", "grader": "passed"}]),
+    )
+    assert first_try == {"passed": False, "reason": "no repair happened"}
+    cold = agent_eval.score_run(task, _repair_outcome(False))
+    assert cold == {"passed": False, "reason": "repair did not reuse the writer"}
+    # Without writerReuse a cold repair is what is expected.
+    task["profile"]["writerReuse"] = False
+    assert agent_eval.score_run(task, _repair_outcome(False))["passed"] is True
+    # The task's own expectation still decides first.
+    failed = agent_eval.score_run(task, {**_repair_outcome(True), "oracle": "failed"})
+    assert failed == {"passed": False, "reason": "hidden oracle failed"}
+
+
+def test_requires_repair_must_be_a_boolean(tmp_path):
+    _write_task(tmp_path, requires_repair="yes")
+    with pytest.raises(agent_eval.TaskError, match="requires_repair"):
+        agent_eval.load_task(tmp_path / "t1")
+
+
+def test_run_attempts_report_whether_each_attempt_reused_the_writer():
+    state = {
+        "attempts": [
+            {"verification_status": "failed", "startup": {"reused": False}},
+            {"verification_status": "passed", "startup": {"reused": True}},
+            {"verification_status": "passed"},
+        ]
+    }
+    assert [a["reused"] for a in agent_eval.run_attempts(state)] == [
+        False,
+        True,
+        None,
+    ]
+
+
+def _run_node(argv, cwd):
+    return subprocess.run(argv, cwd=cwd, capture_output=True, text=True).returncode
+
+
+def test_the_repair_task_hides_a_rule_that_only_verification_reveals(tmp_path):
+    [task] = agent_eval.load_tasks(REPAIR_TASK.parent)
+    assert task["id"] == "hidden-rule-repair" and task["requires_repair"] is True
+    assert task["id"] not in {
+        t["id"] for t in agent_eval.load_tasks(agent_eval.PROJECT / "eval/tasks")
+    }
+    profile = task["profile"]
+    assert profile["writerReuse"] is True
+    # run_checks is always refused: its reserve equals the (default) time limit.
+    assert profile["writerChecks"]["reserveMs"] == 900000
+    assert "activeTimeoutMs" not in profile
+    # Only verification may reveal the ampersand rule.
+    assert "&" not in task["prompt"] and "ampersand" not in task["prompt"].lower()
+    checks = {check["name"]: check for check in profile["checks"]}
+    acceptance = checks["acceptance"]["argv"]
+
+    tree = tmp_path / "tree"
+    shutil.copytree(task["fixture_dir"], tree)
+    shutil.copytree(task["oracle_dir"], tree / agent_eval.ORACLE_DIR)
+    oracle = task["oracle"]["argv"]
+    slug = tree / "src/slug.cjs"
+    naive = "replace(/\\s+/g, '-')"
+    slug.write_text(
+        "function slugify(t) { return t.trim().toLowerCase()."
+        + naive
+        + "; }\nmodule.exports = { slugify };\n"
+    )
+    assert _run_node(checks["unit"]["argv"], tree) == 0
+    assert _run_node(acceptance, tree) != 0
+    assert _run_node(oracle, tree) != 0
+    slug.write_text(
+        "function slugify(t) { return t.trim().toLowerCase()"
+        ".replace(/\\s*&\\s*/g, ' and ').replace(/\\s+/g, '-'); }\n"
+        "module.exports = { slugify };\n"
+    )
+    assert _run_node(acceptance, tree) == 0
+    assert _run_node(oracle, tree) == 0
+
+
 # --- run error capture ---------------------------------------------------------
 
 
@@ -1113,8 +1214,8 @@ def test_live_runner_takes_the_error_from_the_final_run_state(tmp_path, monkeypa
     assert outcome["grader_cause"] == "grader_timeout"
     assert outcome["prompts_version"] == "6da0aeafa863"
     assert outcome["attempts"] == [
-        {"verification": "failed", "grader": "not_run"},
-        {"verification": None, "grader": None},
+        {"verification": "failed", "grader": "not_run", "reused": None},
+        {"verification": None, "grader": None, "reused": None},
     ]
 
 
