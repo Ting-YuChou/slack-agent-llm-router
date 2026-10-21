@@ -29,3 +29,10 @@ test("every eval task profile passes validateProfile once given an image", () =>
     assert.doesNotThrow(() => validateProfile(profile), id);
   }
 });
+
+test("the example profile degrades unresolved investigations once structured workflow is on", () => {
+  const raw = readJson("config/verification/slack-router.example.json");
+  const profile = validateProfile({ ...raw, structuredWorkflow: { ...raw.structuredWorkflow, enabled: true } });
+
+  assert.equal(profile.structuredWorkflow?.degradeUnknown, true);
+});
