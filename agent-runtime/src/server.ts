@@ -554,7 +554,7 @@ export async function createProductionServer() {
           ...(trustedProfile ? { writerContext: writerContextFor(trustedProfile.profile) } : {}),
           // Runs that skip delivery approval keep per-write prompts, so no run loses both gates.
           writeApproval: session.skipDelivery ? "per_prompt" : approval.writeApproval,
-          ...writerReuseOptions(trustedProfile?.profile, mcpServerIds.length),
+          ...writerReuseOptions(trustedProfile?.profile, mcpServerIds),
           sessionSeal: { seal: () => sessionSeals.seal(session.id, sessionStatePath), verify: () => sessionSeals.verify(session.id, sessionStatePath) },
           user: containerUser,
           ...(mcpServerIds.length > 0 ? {
@@ -821,10 +821,13 @@ function positiveInteger(value: string | undefined, fallback: number): number {
 /** With MCP, a paused writer is resumed only this long after it started; its MCP tokens date from then. */
 export const MCP_REUSE_MAX_AGE_MS = 10 * 60_000;
 
-/** Writer reuse options for a session: the profile's opt-in, and an age limit when MCP tokens are in play. */
-export function writerReuseOptions(profile: VerificationProfile | undefined, mcpServers: number): { reuse?: boolean; reuseMaxAgeMs?: number } {
+/**
+ * Writer reuse options for a session: the profile's opt-in, and an age limit when MCP tokens are in play.
+ * Only servers reached through a gateway have tokens; a stdio server (codegraph) runs in the container.
+ */
+export function writerReuseOptions(profile: VerificationProfile | undefined, mcpServers: readonly McpServerId[]): { reuse?: boolean; reuseMaxAgeMs?: number } {
   if (!profile?.writerReuse) return {};
-  return mcpServers > 0 ? { reuse: true, reuseMaxAgeMs: MCP_REUSE_MAX_AGE_MS } : { reuse: true };
+  return mcpServers.some((id) => MCP_SERVERS[id].transport !== "stdio") ? { reuse: true, reuseMaxAgeMs: MCP_REUSE_MAX_AGE_MS } : { reuse: true };
 }
 
 /** The writer gets run_checks (tool, extension and its context) only when a trusted profile can verify. */

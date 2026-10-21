@@ -18,12 +18,15 @@ test("writer reuse is off unless the profile turns it on; with MCP a paused writ
   assert.equal(validateProfile(base).writerReuse, false);
   assert.equal(validateProfile({ ...base, writerReuse: true }).writerReuse, true);
   for (const writerReuse of [1, "true", null, {}]) assert.throws(() => validateProfile({ ...base, writerReuse }), /Invalid writer reuse/, JSON.stringify(writerReuse));
-  assert.deepEqual(writerReuseOptions(undefined, 0), {});
-  assert.deepEqual(writerReuseOptions(validateProfile(base), 0), {});
-  assert.deepEqual(writerReuseOptions(validateProfile({ ...base, writerReuse: true }), 0), { reuse: true });
+  assert.deepEqual(writerReuseOptions(undefined, []), {});
+  assert.deepEqual(writerReuseOptions(validateProfile(base), []), {});
+  assert.deepEqual(writerReuseOptions(validateProfile({ ...base, writerReuse: true }), []), { reuse: true });
   // MCP tokens are issued when the container starts, for its run, and revoked when the run ends; the
   // age limit makes a late repair cold-start with fresh ones before the first expire.
-  assert.deepEqual(writerReuseOptions(validateProfile({ ...base, writerReuse: true }), 1), { reuse: true, reuseMaxAgeMs: MCP_REUSE_MAX_AGE_MS });
+  assert.deepEqual(writerReuseOptions(validateProfile({ ...base, writerReuse: true }), ["github"]), { reuse: true, reuseMaxAgeMs: MCP_REUSE_MAX_AGE_MS });
+  assert.deepEqual(writerReuseOptions(validateProfile({ ...base, writerReuse: true }), ["codegraph", "context7"]), { reuse: true, reuseMaxAgeMs: MCP_REUSE_MAX_AGE_MS });
+  // codegraph runs inside the container and has no token to expire.
+  assert.deepEqual(writerReuseOptions(validateProfile({ ...base, writerReuse: true }), ["codegraph"]), { reuse: true });
   assert.ok(MCP_REUSE_MAX_AGE_MS <= 10 * 60_000);
 });
 
