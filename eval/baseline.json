@@ -1,12 +1,19 @@
 {
-  "key": "openai_gpt-5.6-luna__a4f39169832a__035297f99f3f",
-  "updated_at": "2026-10-19T13:33:35+00:00",
+  "key": "openai_gpt-5.6-luna__f65c994c6d56__6f0b0c2d246d",
+  "updated_at": "2026-10-21T05:18:40+00:00",
   "repeats": 3,
+  "profile_overrides": {
+    "writerReuse": true,
+    "grader": {
+      "samples": 3,
+      "aggregate": "unanimous"
+    }
+  },
   "metrics": {
     "pass_at_1": 1.0,
     "grader_oracle_agreement": 1.0,
-    "cost_usd_p50": 0.043603499999999996,
-    "wall_time_s_p50": 41.29281454154989,
+    "cost_usd_p50": 0.13634072000000003,
+    "wall_time_s_p50": 79.30570033349795,
     "grader_unknown_rate": 0.0,
     "first_attempt_pass_rate": 0.75
   },

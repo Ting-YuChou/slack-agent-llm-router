@@ -653,5 +653,9 @@ CI 的 eval workflow 不能傳 profile 覆寫，所以兩項都在本機以 main
   - contract 沒過的是成本與時間：cost p50 $0.136（baseline $0.044）、wall time p50 79s（baseline 41s）。主要來源：通過的候選在 unanimous 下要跑滿 3 次 Sol grader；0.1 修好之後 writer 實際會呼叫 `run_checks`（每個 run 1–2 次）。兩者的比例需要一次不加覆寫的 eval 才能分開。
   - **所有實作 run 都第一次就通過，沒有發生 repair，所以 `writerReuse` 在這次 live eval 中沒有被觸發**；重用目前只有真 Docker + 假 provider 的測試驗證（reused attempt 29 ms，cold 523 ms）。
   - 結果檔：`eval/results/openai_gpt-5.6-luna__f65c994c6d56__6f0b0c2d246d.json`。
-- baseline（`eval/baseline.json`、`eval/grader-baseline.json`）都沒有更新，要不要以這次結果為新 baseline 另外決定。
+- **baseline 已以這兩次結果更新**（2026-10-21，使用者決定；以 `--recompute-summary` / `--records` 加 `--update-baseline` 離線寫入，沒有再花費）：
+  - `eval/baseline.json`：cost p50 $0.136、wall time p50 79s，品質指標不變；記錄 `profile_overrides`（`writerReuse`、grader samples 3）。之後不同覆寫的 run 跟它比較時，會警告成本與時間不可比。
+  - `eval/grader-baseline.json`：samples 3 / unanimous，cost $1.85。
+  - 成本變高是設計代價：3 次 Sol grader 取樣，以及 writer 實際執行 `run_checks`。
+  - **`writerReuse` 還沒經過 live 驗證**：這次沒有任何 run 進入 repair。
 - Slack 冒煙測試仍待使用者完成 `docs/slack-setup.md` 的設定。
