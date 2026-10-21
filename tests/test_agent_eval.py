@@ -494,6 +494,26 @@ def test_single_eval_profiles_stay_without_structured_workflow():
     assert "structuredWorkflow" not in agent_eval.build_profile(task, "img")
 
 
+def test_topology_removes_what_it_started_when_startup_fails(tmp_path, monkeypatch):
+    booted = validator.Topology(
+        validator.PROJECT, tmp_path, tmp_path / "repo", "key", tmp_path / "p.json"
+    )
+    closed = []
+
+    def start():
+        booted.names.append("pi-structured-models-" + booted.suffix)
+        raise RuntimeError("runtime startup failed; inspect private fixture log")
+
+    monkeypatch.setattr(booted, "start", start)
+    monkeypatch.setattr(booted, "close", lambda: closed.append(list(booted.names)))
+
+    with pytest.raises(RuntimeError, match="startup failed"):
+        with booted:
+            pass
+
+    assert closed == [["pi-structured-models-" + booted.suffix]]
+
+
 # --- run error capture ---------------------------------------------------------
 
 
