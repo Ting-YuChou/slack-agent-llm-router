@@ -631,3 +631,55 @@ async def test_wait_for_update_follows_the_event_cursor_between_run_reads(
         ("running", 3, "edit"),
     ]
     assert sleeps == [0.5, 0.5, 1, 0.5]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_update_keeps_an_absolute_cursor_across_the_event_cap(
+    monkeypatch,
+):
+    # The runtime keeps the newest events of a run and counts the dropped ones.
+    runs = iter(
+        [
+            {
+                **_run_payload("running"),
+                "events": [{"type": "status", "status": "running"}] * 3,
+                "events_truncated": 10,
+            },
+            {**_run_payload("completed"), "events": []},
+        ]
+    )
+    pages = iter(
+        [
+            # Events 14-19 were dropped by the cap before this poll read them.
+            httpx.Response(
+                200,
+                text=_sse((20, {"type": "tool", "phase": "start", "tool": "read"})),
+            ),
+            httpx.Response(200, text=""),
+            httpx.Response(
+                200, text=_sse((21, {"type": "status", "status": "completed"}))
+            ),
+        ]
+    )
+    requests = []
+
+    def handler(request):
+        if request.url.path.endswith("/events"):
+            requests.append(request.url.params["after"])
+            return next(pages)
+        return httpx.Response(200, json=next(runs))
+
+    async def on_progress(run):
+        return None
+
+    runtime = client(handler, monkeypatch)
+    _fake_clock(runtime, monkeypatch)
+    try:
+        run = await runtime.wait_for_update(
+            "R", poll_seconds=0.5, on_progress=on_progress
+        )
+    finally:
+        await runtime.close()
+
+    assert run["status"] == "completed"
+    assert requests == ["13", "20", "20"]

@@ -2,6 +2,7 @@ import { mkdir, open, readFile, rename } from "node:fs/promises";
 import path from "node:path";
 
 import type { RunRecord } from "./orchestrator.js";
+import { appendRunEvent } from "./run-events.js";
 
 export interface PersistedSession {
   id: string;
@@ -73,7 +74,7 @@ export class RuntimeStateStore {
   }
 
   async save(state: RuntimeState): Promise<void> {
-    const snapshot = JSON.stringify(state, null, 2);
+    const snapshot = JSON.stringify(state);
     const write = this.writeChain.then(async () => {
       await mkdir(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
       const temporary = `${this.filePath}.tmp`;
@@ -96,7 +97,7 @@ export function interruptRestartedRun(run: RunRecord, now: number): void {
   run.status = "interrupted";
   run.updated_at = new Date(now).toISOString();
   run.error = { code: "runtime_restarted", message: "Agent runtime restarted during this prompt" };
-  run.events.push({ type: "status", status: "interrupted" });
+  appendRunEvent(run, { type: "status", status: "interrupted" });
 }
 
 function isState(value: unknown): value is RuntimeState {

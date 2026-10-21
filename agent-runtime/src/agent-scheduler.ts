@@ -1,3 +1,14 @@
+export const DEFAULT_AGENT_CONTAINER_LIMIT = 4;
+
+/** Host-wide cap on concurrent agent containers; health reports the same value. */
+export function agentContainerLimit(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.PI_AGENT_CONTAINER_LIMIT?.trim();
+  if (!raw) return DEFAULT_AGENT_CONTAINER_LIMIT;
+  const limit = Number(raw);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 32) throw new Error("PI_AGENT_CONTAINER_LIMIT must be an integer from 1 to 32");
+  return limit;
+}
+
 type Waiter = { key: string; signal: AbortSignal; resolve(release: () => void): void; reject(error: unknown): void; abort(): void };
 
 /** One host-wide permit pool; queues rotate between workflows, not between model calls. */
@@ -5,7 +16,7 @@ export class AgentScheduler {
   private active = 0;
   private last?: string;
   private queue: Waiter[] = [];
-  constructor(readonly limit = 4) { if (!Number.isInteger(limit) || limit < 1 || limit > 32) throw new Error('Invalid agent concurrency'); }
+  constructor(readonly limit = DEFAULT_AGENT_CONTAINER_LIMIT) { if (!Number.isInteger(limit) || limit < 1 || limit > 32) throw new Error('Invalid agent concurrency'); }
   acquire(key: string, signal: AbortSignal): Promise<() => void> {
     signal.throwIfAborted();
     return new Promise((resolve, reject) => {
@@ -27,4 +38,4 @@ export class AgentScheduler {
   }
 }
 
-export const agentScheduler = new AgentScheduler();
+export const agentScheduler = new AgentScheduler(agentContainerLimit());
