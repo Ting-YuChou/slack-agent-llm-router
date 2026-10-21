@@ -34,7 +34,7 @@ import {
   RuntimeError,
   type RunRecord,
 } from "./orchestrator.js";
-import { archivePatch, undeliveredPatchPath } from "./patch-archive.js";
+import { archivePatch, PATCH_DOWNLOAD_MAX_BYTES, readArchivedPatch, undeliveredPatchPath } from "./patch-archive.js";
 import { verifyPluginLock } from "./plugin-lock.js";
 import { RuntimeStateStore } from "./runtime-state.js";
 import { verifySkillLock } from "./skill-lock.js";
@@ -68,6 +68,10 @@ interface ServerOptions {
   health: () => Record<string, unknown>;
   acceptRuns?: () => boolean;
   feedback?: (run: RunRecord, payload: Record<string, unknown>, id: string) => Promise<boolean>;
+  /** Host credential values redacted from a retained patch again when the owner downloads it. */
+  patchSecrets?: () => string[];
+  /** Download cap for GET /v1/runs/:id/patch; defaults to PATCH_DOWNLOAD_MAX_BYTES. */
+  patchMaxBytes?: number;
 }
 
 const FEEDBACK_REASONS = ["wrong_approach", "incomplete", "broke_tests", "scope_creep", "style", "other"];
@@ -186,6 +190,26 @@ export function createAgentHttpServer(options: ServerOptions) {
         const body = asRecord(await readJson(request)), id = decodeURIComponent(resumeMatch[1]);
         const user = requiredString(body.user_id,'user_id');
         sendJson(response,202,options.ci?.has(id) ? await options.ci.resume(id,user) : await options.orchestrator.resume(id,user)); return;
+      }
+      const patchMatch = /^\/v1\/runs\/([^/]+)\/patch$/.exec(url.pathname);
+      if (request.method === "GET" && patchMatch) {
+        const run = options.orchestrator.getRun(decodeURIComponent(patchMatch[1]));
+        if (run.owner_user_id !== requiredString(url.searchParams.get("user_id"), "user_id")) throw new RuntimeError("Only the run owner can read its patch", "patch_forbidden", 403);
+        const patch = run.patch_artifact ? await readArchivedPatch(run.patch_artifact, { maxBytes: options.patchMaxBytes ?? PATCH_DOWNLOAD_MAX_BYTES, secrets: options.patchSecrets?.() ?? [] }) : undefined;
+        if (!patch) throw new RuntimeError("No patch was retained for this run", "patch_not_found", 404);
+        response.writeHead(200, {
+          "content-type": "text/x-diff; charset=utf-8", "cache-control": "no-store",
+          "x-patch-truncated": String(patch.truncated), "x-patch-bytes": String(patch.bytes),
+        });
+        response.end(patch.data);
+        return;
+      }
+      const patchResumeMatch = /^\/v1\/runs\/([^/]+)\/resume-from-patch$/.exec(url.pathname);
+      if (request.method === "POST" && patchResumeMatch) {
+        const body = asRecord(await readJson(request));
+        const user = requiredString(body.user_id, "user_id");
+        sendJson(response, 202, await idempotent(request, url.pathname, body, () => options.orchestrator.resumeFromPatch(decodeURIComponent(patchResumeMatch[1]), user)));
+        return;
       }
       const runMatch = /^\/v1\/runs\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && runMatch) {
@@ -601,6 +625,7 @@ export async function createProductionServer() {
     budgetLedger, budgetSecret: deriveBudgetRpcSecret(gatewaySecret),
     ci: ciRuntime?.ci,
     feedback: telemetry ? (run, payload, id) => telemetry.record(run.run_id, run.session_id, "feedback", payload, id) : undefined,
+    patchSecrets: credentialValues,
     orchestrator,
     token,
     acceptRuns: runtimeHealthy,

@@ -6,6 +6,7 @@ import os
 import time
 import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -257,6 +258,45 @@ class AgentRuntimeClient:
             f"/v1/runs/{run_id}/resume",
             json={"user_id": user_id},
             expected_status=202,
+        )
+        return self._validate_accepted(result)
+
+    async def get_run_patch(self, run_id: str, user_id: str) -> Dict[str, Any]:
+        """The owner's retained, redacted patch of an undelivered run.
+
+        Returns ``{"patch": bytes, "truncated": bool, "bytes": int}``; a patch over
+        the runtime's download cap ends in a truncation marker line.
+        """
+        response = await self._send(
+            "GET",
+            f"/v1/runs/{quote(run_id, safe='')}/patch",
+            params={"user_id": user_id},
+            timeout=self._control_timeout,
+        )
+        if response.status_code != 200:
+            self._raise_for_error(response)
+        try:
+            size = int(response.headers.get("x-patch-bytes", len(response.content)))
+        except ValueError as exc:
+            raise AgentRuntimeInvalidResponse(
+                "Agent runtime returned an invalid patch"
+            ) from exc
+        return {
+            "patch": response.content,
+            "truncated": response.headers.get("x-patch-truncated") == "true",
+            "bytes": size,
+        }
+
+    async def resume_from_patch(
+        self, run_id: str, user_id: str, idempotency_key: str
+    ) -> Dict[str, Any]:
+        """Start a new run on the session from a terminal run's retained patch."""
+        result = await self._request(
+            "POST",
+            f"/v1/runs/{quote(run_id, safe='')}/resume-from-patch",
+            json={"user_id": user_id},
+            expected_status=202,
+            idempotency_key=idempotency_key,
         )
         return self._validate_accepted(result)
 

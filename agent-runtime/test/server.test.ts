@@ -343,3 +343,97 @@ test("an empty long-poll answers 200 with no events", async () => {
     assert.equal(await response.text(), "");
   } finally { await close(server); }
 });
+
+async function patchServer(t: { after(fn: () => Promise<void>): void }, content: string | undefined, extra: Record<string, unknown> = {}) {
+  const { mkdtemp, rm, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const path = await import("node:path");
+  const dir = await mkdtemp(path.join(tmpdir(), "server-patch-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "undelivered.patch");
+  if (content !== undefined) await writeFile(file, content);
+  const runs: Record<string, any> = {
+    R1: { run_id: "R1", session_id: "S1", status: "failed", owner_user_id: "U1", patch_artifact: file },
+    R2: { run_id: "R2", session_id: "S1", status: "failed", owner_user_id: "U1" },
+  };
+  const server = createAgentHttpServer({
+    orchestrator: { getRun: (id: string) => { if (!runs[id]) throw new RuntimeNotFoundError(); return runs[id]; } } as any,
+    token: "runtime-secret", health: () => ({}), ...extra,
+  });
+  return { server, base: await listen(server), file };
+}
+
+test("GET /v1/runs/:id/patch returns the owner the retained patch, redacted, and 404 without one", async t => {
+  const { server, base, file } = await patchServer(t, "diff --git a/a b/a\n+OPENAI_API_KEY=sk-planted-0123456789abcdef\n+uses host-secret-value\n", { patchSecrets: () => ["host-secret-value"] });
+  const get = (path: string) => fetch(`${base}${path}`, { headers: { authorization: "Bearer runtime-secret" } });
+  try {
+    const owner = await get("/v1/runs/R1/patch?user_id=U1");
+    assert.equal(owner.status, 200);
+    assert.match(owner.headers.get("content-type") ?? "", /text\/x-diff/);
+    assert.equal(owner.headers.get("x-patch-truncated"), "false");
+    const text = await owner.text();
+    assert.match(text, /^diff --git a\/a b\/a\n/);
+    assert.doesNotMatch(text, /sk-planted-0123456789abcdef|host-secret-value/);
+    assert.match(text, /\[REDACTED\]/);
+    assert.ok(!text.includes(file), "the host path is never sent");
+    const other = await get("/v1/runs/R1/patch?user_id=U2");
+    assert.equal(other.status, 403);
+    assert.equal((await other.json()).error.code, "patch_forbidden");
+    assert.equal((await get("/v1/runs/R1/patch")).status, 400);
+    const none = await get("/v1/runs/R2/patch?user_id=U1");
+    assert.equal(none.status, 404);
+    assert.equal((await none.json()).error.code, "patch_not_found");
+    assert.equal((await get("/v1/runs/missing/patch?user_id=U1")).status, 404);
+    assert.equal((await fetch(`${base}/v1/runs/R1/patch?user_id=U1`)).status, 401);
+  } finally { await close(server); }
+});
+
+test("GET /v1/runs/:id/patch truncates a patch over the download cap with a marker, and 404s a deleted archive", async t => {
+  const big = await patchServer(t, "+" + "x".repeat(5000) + "\n", { patchMaxBytes: 1000 });
+  try {
+    const response = await fetch(`${big.base}/v1/runs/R1/patch?user_id=U1`, { headers: { authorization: "Bearer runtime-secret" } });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-patch-truncated"), "true");
+    assert.equal(response.headers.get("x-patch-bytes"), "5002");
+    const text = await response.text();
+    assert.ok(text.length < 1200);
+    assert.match(text, /# \[pi-agent\] patch truncated at 1000 of 5002 bytes for download/);
+  } finally { await close(big.server); }
+  const gone = await patchServer(t, undefined);
+  try {
+    const response = await fetch(`${gone.base}/v1/runs/R1/patch?user_id=U1`, { headers: { authorization: "Bearer runtime-secret" } });
+    assert.equal(response.status, 404);
+    assert.equal((await response.json()).error.code, "patch_not_found");
+  } finally { await close(gone.server); }
+});
+
+test("POST /v1/runs/:id/resume-from-patch starts the owner's resume run once per Idempotency-Key and maps refusals", async () => {
+  const { IdempotencyCache } = await import("../src/idempotency.js");
+  const calls: unknown[][] = [];
+  let refusal: Error | undefined;
+  const orchestrator = {
+    resumeFromPatch: async (id: string, user: string) => {
+      calls.push([id, user]);
+      if (refusal) throw refusal;
+      return { session_id: "S1", run_id: `R-next-${calls.length}`, status: "starting" };
+    },
+  };
+  const server = createAgentHttpServer({ orchestrator: orchestrator as any, token: "runtime-secret", health: () => ({}), idempotency: new IdempotencyCache() });
+  const base = await listen(server);
+  const post = (body: object, key?: string) => fetch(`${base}/v1/runs/R1/resume-from-patch`, { method: "POST", body: JSON.stringify(body),
+    headers: { authorization: "Bearer runtime-secret", "content-type": "application/json", ...(key ? { "idempotency-key": key } : {}) } });
+  try {
+    const first = await post({ user_id: "U1" }, "resume-1");
+    assert.equal(first.status, 202);
+    const accepted = await first.json();
+    assert.deepEqual(accepted, { session_id: "S1", run_id: "R-next-1", status: "starting" });
+    const retry = await post({ user_id: "U1" }, "resume-1");
+    assert.equal(retry.status, 202);
+    assert.deepEqual(await retry.json(), accepted);
+    assert.deepEqual(calls, [["R1", "U1"]]);
+    assert.equal((await post({})).status, 400);
+    refusal = new RuntimeConflictError("The retained patch does not apply cleanly");
+    const conflict = await post({ user_id: "U1" }, "resume-2");
+    assert.equal(conflict.status, 409);
+  } finally { await close(server); }
+});
