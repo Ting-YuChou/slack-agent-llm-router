@@ -494,6 +494,26 @@ def test_single_eval_profiles_stay_without_structured_workflow():
     assert "structuredWorkflow" not in agent_eval.build_profile(task, "img")
 
 
+def test_topology_removes_what_it_started_when_startup_fails(tmp_path, monkeypatch):
+    booted = validator.Topology(
+        validator.PROJECT, tmp_path, tmp_path / "repo", "key", tmp_path / "p.json"
+    )
+    closed = []
+
+    def start():
+        booted.names.append("pi-structured-models-" + booted.suffix)
+        raise RuntimeError("runtime startup failed; inspect private fixture log")
+
+    monkeypatch.setattr(booted, "start", start)
+    monkeypatch.setattr(booted, "close", lambda: closed.append(list(booted.names)))
+
+    with pytest.raises(RuntimeError, match="startup failed"):
+        with booted:
+            pass
+
+    assert closed == [["pi-structured-models-" + booted.suffix]]
+
+
 # --- run error capture ---------------------------------------------------------
 
 
@@ -813,6 +833,60 @@ def test_eval_main_exits_zero_and_writes_keyed_results_when_contract_holds(tmp_p
     assert result["summary"]["runs"] == 2
     assert result["contract_failures"] == []
     assert [record["task_id"] for record in result["records"]] == ["t1", "t1"]
+
+
+def test_eval_profile_overrides_reach_every_task_and_key_the_results(tmp_path):
+    _write_task(tmp_path / "tasks")
+    _write_baseline(tmp_path)
+    seen = []
+    stub = _stub_runner()
+
+    def runner(task, attempt):
+        seen.append(task["profile"])
+        return stub(task, attempt)
+
+    assert agent_eval.main(_eval_args(tmp_path), runner=_stub_runner()) == 0
+    [plain] = (tmp_path / "results").glob("*.json")
+    code = agent_eval.main(
+        _eval_args(
+            tmp_path,
+            "--writer-reuse",
+            "--grader-samples",
+            "3",
+            "--grader-aggregate",
+            "majority",
+        ),
+        runner=runner,
+    )
+
+    assert code == 0
+    assert seen[0]["writerReuse"] is True
+    assert seen[0]["grader"] == {"samples": 3, "aggregate": "majority"}
+    assert seen[0]["allowedPaths"]
+    results = sorted((tmp_path / "results").glob("*.json"))
+    assert (
+        len(results) == 2
+    ), "an overridden profile must not overwrite the plain results"
+    [overridden] = [path for path in results if path != plain]
+    result = json.loads(overridden.read_text())
+    assert result["profile_overrides"] == {
+        "writerReuse": True,
+        "grader": {"samples": 3, "aggregate": "majority"},
+    }
+    assert "profile_overrides" not in json.loads(plain.read_text())
+
+
+def test_eval_profile_overrides_are_validated():
+    args = agent_eval.parse_args(["--live-openai", "--grader-samples", "3"])
+    assert agent_eval.profile_overrides(args) == {
+        "grader": {"samples": 3, "aggregate": "unanimous"}
+    }
+    assert agent_eval.profile_overrides(agent_eval.parse_args(["--live-openai"])) == {}
+    for bad in (["--grader-samples", "2"], ["--grader-aggregate", "any"]):
+        with pytest.raises(SystemExit):
+            agent_eval.parse_args(["--live-openai", *bad])
+    with pytest.raises(SystemExit):
+        agent_eval.parse_args(["--live-openai", "--grader-aggregate", "majority"])
 
 
 def test_eval_main_exits_one_when_a_run_regresses(tmp_path):

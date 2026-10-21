@@ -183,7 +183,12 @@ class Topology:
         self.env = None
 
     def __enter__(self):
-        self.start()
+        try:
+            self.start()
+        except BaseException:
+            # __exit__ never runs for a failed __enter__; remove what start() created.
+            self.close()
+            raise
         return self
 
     def __exit__(self, *exc):
