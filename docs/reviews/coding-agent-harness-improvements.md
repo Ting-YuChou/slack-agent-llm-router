@@ -593,7 +593,7 @@ Slack 是 harness 唯一的「人類介面」：核准、進度、失敗回報�
 
 ---
 
-## 附錄 B：實施狀態（2026-10-21，`origin/main` = `002561a`）
+## 附錄 B：實施狀態（2026-10-21，`origin/main` = `db5ae54`）
 
 ### Phase 0–3：已完成
 
@@ -642,6 +642,7 @@ Slack 是 harness 唯一的「人類介面」：核准、進度、失敗回報�
 | S4b | 容器停止時以 HKDF 推導的 key 對 Pi session 目錄算 HMAC，存在所有容器 mount 之外；`--continue` 前驗證，被改過就以 `session_integrity_failed` 失敗、不啟動容器。只涵蓋兩次 run 之間的竄改：run 進行中 Pi 本身會寫這個目錄。 | #111（併進了 #110 的分支，經 #112 合入 main） |
 | 撤銷 | run 結束時 MCP 與 classifier token 一併失效：host 提供「execution 所屬的 run 是否仍有效」查詢，classifier 路徑與三個 MCP gateway 每次請求都問；無法確認時拒絕（`revocation_unavailable`）。model token 原本就會在預算停止後被拒。 | #110 |
 | 重用 + MCP | 重用的容器只服務同一個 run 的 repair，啟動時發的 MCP token 屬於這個 run，且 run 結束就撤銷，所以開啟 MCP 也能重用；暫停超過 10 分鐘（token 壽命 16／31 分鐘）就改為冷啟動。逐次 prompt 換發 MCP token 的做法經 spike 證實會與第一個 tool call 競態，沒有採用。 | #110 |
+| Review 修正 | runtime 崩潰後：先 unpause 留下的暫停 writer 再停孤兒容器、run 中途留下的 session 補封印而不是拒絕、容器已死也釋放保留 writer 的 execution slot；被拒的 run 停掉自己的預算；abort 一個 run 不拆掉 session 網路；Slack 進度訊息記錄 phase 變化並更新 turns 與花費。 | #113 |
 
 仍然存在：MCP token 經容器 env 傳入（容器內可讀到），但範圍限於所屬 run、run 結束即撤銷、並受 maxCalls 限制。
 
@@ -668,4 +669,94 @@ CI 的 eval workflow 不能傳 profile 覆寫，所以兩項都在本機以 main
   - 3/3 通過，結果都是「repaired in a reused writer」：每個 run 有 3 次 attempt，兩次 repair 都回報 `startup.reused: true`（acceptance check 一次只報一個失敗的 `&` 案例，所以要修兩次）。
   - repair startup p50 0.1s（兩次重用的總和），冷啟動 0.7s；pass@1 1.0、agreement 1.0、grader_unknown 0；cost p50 $0.055，花費 $0.17。
   - 結果檔 `eval/results/openai_gpt-5.6-luna__f65c994c6d56__9288c5173e72.json`，baseline 為 `eval/repair-baseline.json`（first_attempt_pass_rate 依設計為 0）。
-- Slack 冒煙測試仍待使用者完成 `docs/slack-setup.md` 的設定。
+- **仍未完成：Slack 冒煙測試**。原本等使用者照 `docs/slack-setup.md` 設定，但 Phase 5 稽核發現 demo 本身跑不起來（見下一節第 1 類），而且 `docs/slack-setup.md` 不在 main 上。現在卡在 Phase 5 的 Track R（R1–R4），完成後併入 Phase 5 的 P-ACC 執行。
+
+### Phase 5：稽核與計畫（2026-10-21，`origin/main` = `db5ae54`）
+
+稽核方式：三個唯讀 agent 逐項對照本文件第 2–10 節與目前的程式，關鍵發現再回到程式碼確認。結論是大部分建議已經落地（DONE），剩下四類問題：
+
+1. **demo 跑不起來，或者跑起來卻用到舊 image**（Slack 冒煙測試卡住的原因）：
+   - commit 進 repo 的 `agent-runtime/plugins.lock.json` 沒有 `image_manifest`，runtime 啟動時會 throw（`server.ts:383`；讀程式碼推論，沒有實跑）。
+   - 沒有機制偵測 image 比 host tree 舊，`lock-image.mjs` 也不比對 `src`。用 P2 之前 build 的 image，每個 model 呼叫都會 401。
+   - `make demo-agent-images` 會改寫 tracked 的 lock 檔。
+   - `docs/slack-setup.md` 不在 main 上，只在未合併的 `claude/slack-setup-guide`（`593f244`，寫於 Phase 4 之前）。
+   - demo manifest 缺 `files:write`，Download patch 會失敗；demo 的 `state_backend: memory` 讓 G3 的重啟恢復失效；`feedback_enabled` 預設關閉，收不到 owner 標籤。
+2. **Phase 4 殘留**：
+   - Slack 重送觸發 idempotency 422 時，使用者只看到泛用錯誤；`create_session` 在 client 端逾時後，run 沒有人監看。
+   - G8 的錯誤處理只做了一部分。
+   - session 目錄沒有配額。
+   - `npm audit` 在 image build 內執行；verification image 的 pip 沒有用 `--require-hashes`（S4c 漏做）。
+3. **review 建議裡仍是 PARTIAL 或 MISSING 的項目**：
+   - D4：容器 stderr 被丟棄。
+   - D6 / B3：沒有 `diff_summary`，檔案數與總量也不在寫入當下檢查。
+   - C1、C2、C3、C5、A2 的小缺口。
+   - E3、O1、O2、O3 的觀測缺口。
+   - Slack 的 G1、G5、G7、G9、G10、G12。
+4. **eval / CI 閘門變鬆**：
+   - `agent-eval.yml` 不能傳 profile 覆寫，和 baseline 不可比時只會警告。
+   - CI 跑不了 repair suite。
+   - 缺少這些情境的 eval 任務：degrade、交付被拒或到期、只有 `run_checks` 抓得到的 bug、MCP。
+   - T6 的剩餘項目。
+
+使用者的決定：
+- 大項目只做 **D6**（`diff_summary` 與寫入當下的上限檢查）；MCP token、C4、E1 延後到 Phase 6（見下）。
+- 範例 profile 改成 `writerReuse: true`，grader 維持 1 個 sample；CI 的 eval 預設沿用 baseline 記錄的覆寫。
+- 會動到 `.github/workflows/` 的 slice 可以做，每個 PR 寫明改了什麼、為什麼改。
+
+規則沿用 Phase 4：每個 slice 一個 commit、Red → Green、branch 從 `main` 開；live 花費只出現在最後的 P-ACC，每一項執行前先問使用者。
+
+#### Phase 5 slice 清單
+
+| Track | Slice | 內容 | 狀態 |
+|---|---|---|---|
+| Step 0 | — | 稽核與計畫寫進附錄 B（本節） | 本 PR |
+| R | R1 | image manifest 涵蓋 `src`，啟動時比對 host 原始碼，image 太舊就 throw 並提示 `make demo-agent-images`；lock-image 遇到 `src` 差異拒絕上鎖（動 `agent-docker.yml`） | 待做 |
+| R | R2 | `demo-agent-images` 把 lock 寫到 `.pi-agent-runtime/locks/` 的副本，tracked lock 不變；run script 加 `--check` 與啟動前檢查 | 待做 |
+| R | R3 | demo manifest 補 `files:write`、`state_backend: file`、`feedback_enabled: true`，修正 `FileSlackStateStore`（0600、fsync、第二個 instance 能恢復）；刻意改寫 `test_slack_demo.py` 的 `"memory"` 斷言 | 待做 |
+| R | R4 | `docs/slack-setup.md`（cherry-pick `593f244`）補上 Phase 4 行為、lock 副本、`--check`、「每個呼叫都 401 代表 image 太舊」，由測試比對 scope、env、help 子指令 | 待做 |
+| D | D1 | 範例 profile 改成 `writerReuse: true`，grader 不設 samples 覆寫（使用者決定；動 `config/verification/`） | 待做 |
+| S | S10 | 重送觸發 422 時以 lookup 找回 session 並接上 monitor；action key 由 Slack action 推導；`create_session` 逾時後用同一個 key 重試一次（只改 client） | 待做 |
+| S | S11 | G8：例外帶 server 的 `error.message`、`*_forbidden` 對應 `AgentRuntimeForbidden`、暫時性錯誤 full jitter 重試、monitor 放棄後退避重接 | 待做 |
+| S | S12 | session 目錄配額（`session_quota_exceeded`）；只有 S4b 之前建立的 session 允許 `unsealed` | 待做 |
+| S | S13a | `npm audit` 移出 image build，改由 CI job 執行（閘門搬位置，沒有拿掉；動 `tests.yml`） | 待做 |
+| S | S13b | verification image 以 `pip install --require-hashes` 安裝（依賴變更，開工前再問使用者） | 待做 |
+| L | L1 | D4：容器非 0 結束時，失敗 evidence 與 span 帶 redact 過的 stderr 尾端（≤16 KiB、記憶體有上限） | 待做 |
+| L | L2 | C2：`diff-limit-repair` 歸入 `WRITER_PROMPTS`，掃描所有 prompt id 都屬於某個角色 | 待做 |
+| L | L3 | D6、B3：寫入當下檢查檔案數與總 bytes，新增 `diff_summary` 工具（含 bash 造成的變更） | 待做 |
+| L | L4 | C3：沒有 profile 的 run 也回報預算，active time 剩不到 25% 時提示剩餘分鐘 | 待做 |
+| L | L5 | C1：planner 與 investigator 拿到 baseline commit 版本的 AGENTS.md（grader 不拿） | 待做 |
+| L | L6 | A2：截斷的請求記成 run event 與 `truncated_requests` metric；profile 可設 `limits.outputTokens`（不超過程式上限） | 待做 |
+| U | U6 | G9：thread、shortcut、後續訊息開始的 run 也有進度訊息，並顯示經過時間 | 待做 |
+| U | U7 | G10：`!llm agent` 與後續訊息在背景啟動，agent 與聊天分開 rate bucket，slash `resume` 會啟動 monitor | 待做 |
+| U | U8 | G5、G7：後續訊息的附件送到 agent，bootstrap 每個請求有 timeout 並受整體時間預算限制、並行下載與分頁數有上限 | 待做 |
+| U | U9 | G12：完整 help、模型清單來自 runtime health、非 agent thread 的 lookup 負面快取、`bot.py` stub 回報 unhealthy | 待做 |
+| U | U10 | G1、C5：CI repair 核准卡片寫出路徑與 job；Jev 判定 `read_only` 的 implement run 顯示 `--discuss` 提示（只提示） | 待做 |
+| M | M1 | E3：gateway 429 加 `cause` 欄位（`code` 不變），span 帶 `cause_code` | 待做 |
+| M | M2 | O2：check 的 `kind`、eval 的 `cost_by_role`（解釋 Phase 4 成本上漲）、cost per accepted change、各工具錯誤率、`repair_success_rate@k` | 待做 |
+| M | M3 | O1、O3：三個 extension 也發 `policy_decision`，span 補 route 與 outcome 屬性，新增 repair 與 phase span、Grafana panel | 待做 |
+| V | V1 | CI eval 預設沿用 baseline 的覆寫，`--strict-overrides` 讓不一致直接 fail，新增 `suite` input 可跑 repair suite（動 `agent-eval.yml`、`grader-calibration.yml`） | 待做 |
+| V | V2 | 新 eval 任務：structured workflow 降級、交付被拒或到期、只有 `run_checks` 抓得到的 bug、codegraph MCP；validator 加 `--delivery-decision` | 待做 |
+| V | V3 | T6 剩餘：`waitFor` 取代固定 setImmediate 次數、fake gateway image 用 digest、移除 `any` import、改正測試數量、opt-in Python 整合測試進 CI（動 `agent-docker.yml`、`tests.yml`） | 待做 |
+| V | V4 | promote script 把 feedback 草稿轉成 eval 任務，沒有人工 oracle 就拒絕 | 待做 |
+
+注意事項：
+- L3、L5 會改變 image manifest，合併後要重新執行 `make demo-agent-images`（R1 會在啟動時提示）。
+- Phase 5 的 P-ACC：Slack 冒煙測試（R1–R4 之後）、agent eval（含 V2 新任務）、repair suite、grader 校準（samples 1），合計約 $4–6，每一項執行前先問使用者。完成後更新本附錄。
+
+### 延後到 Phase 6
+
+- **MCP token 移出容器 env**：Pi 的 MCP `auth` 只接受 https 或 loopback，需要先做 spike，確認容器內的 loopback proxy 能不能滿足這個限制。做成的話也一併解決「重用時 repair 共用 MCP 次數」。
+- **C4 結構化 task spec**：需要 A/B eval 證明效益才做。
+- **E1 把 run 存進 SQLite**：先量測，`persistState` p99 ≥ 50 ms 才做。
+- **A2 自動續寫**：只有在 Phase 5 P-ACC 的截斷率超過 writer 請求的 2% 時才做（L6 先量測）。
+
+### 不做
+
+- revocation cache：會延遲撤銷生效。
+- 縮小 server 的 idempotency fingerprint：已有測試釘住目前行為，S10 在 client 端達到同樣效果。
+- 把 `*_forbidden` 改成 403：會改寫三個既有斷言，S11 改用 `code` 分類。
+- FIFO 排隊位置。
+- `noUnusedLocals`：要改 tsconfig。
+- apt 版本釘選：Debian 會移除舊版本，build 會壞掉；base image 已經用 digest 釘住。
+- 排程跑 live eval：每次花費都要先問使用者。
+- 自動把 implement 改成 discuss：U10 只給提示。
