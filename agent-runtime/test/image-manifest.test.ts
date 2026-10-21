@@ -7,7 +7,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 
-import { assertImageManifest, compareImageManifest, computeImageManifest, imageManifestScript } from "../src/image-manifest.js";
+import { assertImageManifest, assertImageMatchesHost, compareImageManifest, computeHostSources, computeImageManifest, computeImageSources, imageManifestScript, sourceManifestScript } from "../src/image-manifest.js";
 import { AGENT_TEST_IMAGE } from "./support/docker-images.js";
 
 const exec = promisify(execFile);
@@ -81,6 +81,69 @@ test("startup refuses an image whose loaded code differs from the lock", async (
     await writeFile(lockPath, JSON.stringify({ schema_version: 1 }));
     await assert.rejects(assertImageManifest(lockPath, "sha256:abc", async () => JSON.stringify(image)), /no image_manifest/);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+/** An agent-runtime checkout as Dockerfile.agent copies it to /opt/pi, with what the image never copies beside it. */
+async function fakeRuntimeTree(base: string) {
+  const at = (file: string) => path.join(base, file);
+  for (const dir of ["src", "prompts", "extensions", "plugins", "skills/test-gap", "node_modules/x", "dist/src", "test"]) await mkdir(at(dir), { recursive: true });
+  await writeFile(at("src/policy.ts"), "export const a = 1;\n");
+  await writeFile(at("prompts/writer.md"), "# writer\n");
+  await writeFile(at("extensions/policy.ts"), "export default 1;\n");
+  await writeFile(at("plugins/lsp.ts"), "lsp\n");
+  await writeFile(at("skills/test-gap/SKILL.md"), "# skill\n");
+  await writeFile(at("skills.lock.json"), "{}\n");
+  await writeFile(at("node_modules/x/index.js"), "ignored\n");
+  await writeFile(at("dist/src/policy.js"), "ignored\n");
+  await writeFile(at("test/policy.test.ts"), "ignored\n");
+}
+
+const runSourceScript = async (base: string) => JSON.parse((await exec("node", ["-e", sourceManifestScript(base)], { encoding: "utf8" })).stdout) as Record<string, string>;
+
+test("the sources an image was built from hash the same on the host as inside the image", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "image-sources-"));
+  try {
+    const host = path.join(root, "agent-runtime");
+    const image = path.join(root, "image/opt/pi");
+    await fakeRuntimeTree(host);
+    await fakeRuntimeTree(image);
+    const fromHost = await computeHostSources(host);
+    assert.deepEqual(Object.keys(fromHost).sort(), [
+      "/opt/pi/extensions/policy.ts", "/opt/pi/plugins/lsp.ts", "/opt/pi/prompts/writer.md", "/opt/pi/skills.lock.json", "/opt/pi/skills/test-gap/SKILL.md", "/opt/pi/src/policy.ts",
+    ]);
+    assert.equal(fromHost["/opt/pi/src/policy.ts"], sha("export const a = 1;\n"));
+    // The same script runs in the image, rooted at /opt/pi there.
+    assert.deepEqual(await runSourceScript(image), fromHost);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("startup refuses an image built from a different agent-runtime tree, even when the lock matches it", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "image-stale-"));
+  try {
+    await fakeRuntimeTree(root);
+    const image = await computeHostSources(root);
+    const calls: string[][] = [];
+    await assertImageMatchesHost("sha256:abc", root, async (args) => { calls.push(args); return JSON.stringify(image); });
+    assert.match(calls[0].join(" "), /^run --rm --network none --read-only --entrypoint node sha256:abc -e /);
+    // An image built before a source change: its compiled policy and extensions are older than the host's.
+    await writeFile(path.join(root, "src/policy.ts"), "export const a = 2;\n");
+    await writeFile(path.join(root, "extensions/credentials.ts"), "export default 2;\n");
+    await assert.rejects(
+      assertImageMatchesHost("sha256:abc", root, async () => JSON.stringify(image)),
+      (error: Error) => /sha256:abc/.test(error.message)
+        && /changed: src\/policy\.ts/.test(error.message)
+        && /missing from the image: extensions\/credentials\.ts/.test(error.message)
+        && /make demo-agent-images/.test(error.message),
+    );
+    for (const output of ["", "not json", "{}", JSON.stringify({ "/etc/passwd": sha("a") })]) {
+      await assert.rejects(computeImageSources("sha256:abc", async () => output), /image sources/i, output);
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("a freshly built agent image carries exactly the host's agent-runtime sources", { skip: !enabled, timeout: 180_000 }, async () => {
+  const id = (await exec("docker", ["image", "inspect", "--format={{.Id}}", AGENT_TEST_IMAGE], { encoding: "utf8" })).stdout.trim();
+  await assertImageMatchesHost(id, path.resolve(import.meta.dirname, "../.."));
 });
 
 test("a one-byte change to the policy extension inside a real image fails the manifest check", { skip: !enabled, timeout: 180_000 }, async () => {

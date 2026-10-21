@@ -57,6 +57,8 @@ test("demo image setup refreshes the deployment image lock", () => {
   assert.match(source, /docker.*image.*inspect/s);
   assert.match(source, /image_manifest = manifest/);
   assert.match(source, /built from a different tree/);
+  // Every source the image is built from, src/ included, not only the files the container loads.
+  assert.match(source, /await assertImageMatchesHost\(imageDigest, runtimeRoot\)/);
 });
 
 test("every agent-runtime base image is pinned by digest", () => {
