@@ -657,5 +657,9 @@ CI 的 eval workflow 不能傳 profile 覆寫，所以兩項都在本機以 main
   - `eval/baseline.json`：cost p50 $0.136、wall time p50 79s，品質指標不變；記錄 `profile_overrides`（`writerReuse`、grader samples 3）。之後不同覆寫的 run 跟它比較時，會警告成本與時間不可比。
   - `eval/grader-baseline.json`：samples 3 / unanimous，cost $1.85。
   - 成本變高是設計代價：3 次 Sol grader 取樣，以及 writer 實際執行 `run_checks`。
-  - **`writerReuse` 還沒經過 live 驗證**：這次沒有任何 run 進入 repair。
+  - 上面這次 eval 沒有任何 run 進入 repair，所以 `writerReuse` 由下面的專用任務做 live 驗證。
+- **writerReuse live 驗證**（#108 的 `eval/repair-tasks/hidden-rule-repair`，2026-10-21，3 repeats）：
+  - 3/3 通過，結果都是「repaired in a reused writer」：每個 run 有 3 次 attempt，兩次 repair 都回報 `startup.reused: true`（acceptance check 一次只報一個失敗的 `&` 案例，所以要修兩次）。
+  - repair startup p50 0.1s（兩次重用的總和），冷啟動 0.7s；pass@1 1.0、agreement 1.0、grader_unknown 0；cost p50 $0.055，花費 $0.17。
+  - 結果檔 `eval/results/openai_gpt-5.6-luna__f65c994c6d56__9288c5173e72.json`，baseline 為 `eval/repair-baseline.json`（first_attempt_pass_rate 依設計為 0）。
 - Slack 冒煙測試仍待使用者完成 `docs/slack-setup.md` 的設定。
