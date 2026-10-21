@@ -8,6 +8,7 @@ import type { ApprovalLedger } from "./approval-ledger.js";
 import { ApprovalStore, type PersistedApproval } from "./policy.js";
 import type { PublicRunEvent, RunOutcome, UiResponse } from "./pi-rpc.js";
 import { interruptRestartedRun, type RuntimeStateStore } from "./runtime-state.js";
+import { appendRunEvent, eventsAfter } from "./run-events.js";
 import { workflowMode, type WorkflowMode, type WorkflowNode } from "./structured-workflow.js";
 import { WorkflowBudget } from "./workflow-budget.js";
 import type { Candidate, GateInput, GateResult } from "./quality-gate.js";
@@ -170,7 +171,12 @@ export interface RunRecord {
   first_edit_at?: string;
   /** Computed once the run is terminal; see harness-metrics.ts. */
   harness_metrics?: HarnessMetrics;
+  /** The newest MAX_RUN_EVENTS events; event cursors count from the first event ever recorded. */
   events: Array<Record<string, unknown>>;
+  /** Oldest events dropped by the cap, so absolute cursor = events_truncated + index. */
+  events_truncated?: number;
+  /** Redacted, single-line, bounded task summary used as the commit subject. */
+  task_summary?: string;
   changed_files?: string[];
   diff_stat?: string;
   branch?: string;
@@ -183,6 +189,11 @@ export interface RunRecord {
 
 /** The run as clients (HTTP, Slack, telemetry) see it: host artifact paths become a flag. */
 export interface ApprovalCounts { requested: number; approved: number; rejected: number; expired: number; wait_ms: number }
+
+export { MAX_RUN_EVENTS } from "./run-events.js";
+
+/** Terminal runs are kept this long after their last update, in memory and in the state file. */
+export const RUN_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 const DEFAULT_FALLBACK_MODEL = "openai/gpt-5.6-luna";
 
@@ -274,6 +285,9 @@ export class CodingAgentOrchestrator {
   /** Terminal runs already reported to observers, keyed to the update they were reported at (resume revives runs). */
   private readonly observedFinal = new Map<string, string>();
   private persistTimer?: ReturnType<typeof setTimeout>;
+  /** Long-poll waiters per run, woken by the next event. */
+  private readonly eventWaiters = new Map<string, Set<() => void>>();
+  private readonly runRetentionMs: number;
 
   private readonly captureState?: (runId: string) => { complete: boolean | null; reasons: string[] };
   private readonly observeRun?: (run: RunRecord) => void;
@@ -305,6 +319,8 @@ export class CodingAgentOrchestrator {
     diskQuota?: DiskQuota;
     /** Keeps pending delivery approvals across restarts; without it a restart fails them as delivery_interrupted. */
     approvalLedger?: ApprovalLedger;
+    /** How long terminal runs stay readable after their last update; defaults to RUN_RETENTION_MS. */
+    runRetentionMs?: number;
   }) {
     this.captureState = options.captureState;
     this.observeRun = options.observeRun; this.observePolicy = options.observePolicy; this.observeLifecycle = options.observeLifecycle;
@@ -324,6 +340,7 @@ export class CodingAgentOrchestrator {
     this.deliveryApproval = options.deliveryApproval;
     this.approvalLedger = options.approvalLedger;
     this.approvals = new ApprovalStore({ persistence: options.approvalLedger });
+    this.runRetentionMs = options.runRetentionMs ?? RUN_RETENTION_MS;
     if (this.deliveryApproval && !this.worktrees.patch) throw new Error("Delivery approval needs worktrees.patch to bind the approved diff");
   }
 
@@ -611,14 +628,14 @@ export class CodingAgentOrchestrator {
       workflow?.budget.resume();
       if (workflow) this.armDeadline(session, run, workflow.budget.remainingMs());
       this.updateRun(run, "running");
-      run.events.push({ type: "approval_decision", decision: "approved", approval_id: approvalId });
+      this.pushEvent(run, { type: "approval_decision", decision: "approved", approval_id: approvalId });
     } else {
       if (!await this.stopBeforeRollback(session, run)) {
         await this.persistState();
         return;
       }
       this.updateRun(run, "rejected");
-      run.events.push({ type: "approval_decision", decision: "rejected", approval_id: approvalId });
+      this.pushEvent(run, { type: "approval_decision", decision: "rejected", approval_id: approvalId });
       this.finishActiveRun(session, runId);
       await this.safeRollback(session, run);
     }
@@ -666,8 +683,69 @@ export class CodingAgentOrchestrator {
     }
   }
 
+  /** Events after an absolute cursor; a cursor behind the cap resumes at the oldest event kept. */
   listEvents(runId: string, after = 0): Array<Record<string, unknown>> {
-    return this.getRun(runId).events.slice(Math.max(0, after));
+    return eventsAfter(this.requireRun(runId), after).events;
+  }
+
+  /** Long-poll for events after `after`: returns at once when there are some, else on the next event, timeout or abort. */
+  async waitForEvents(runId: string, after: number, waitMs: number, signal?: AbortSignal): Promise<{ events: Array<Record<string, unknown>>; offset: number }> {
+    const run = this.requireRun(runId);
+    const ready = eventsAfter(run, after);
+    if (ready.events.length || waitMs <= 0 || isTerminal(run.status) || signal?.aborted) return ready;
+    await new Promise<void>((resolve) => {
+      const waiters = this.eventWaiters.get(runId) ?? new Set<() => void>();
+      this.eventWaiters.set(runId, waiters);
+      const wake = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", wake);
+        waiters.delete(wake);
+        if (!waiters.size && this.eventWaiters.get(runId) === waiters) this.eventWaiters.delete(runId);
+        resolve();
+      };
+      const timer = setTimeout(wake, waitMs);
+      timer.unref?.();
+      waiters.add(wake);
+      signal?.addEventListener("abort", wake, { once: true });
+    });
+    const current = this.runs.get(runId);
+    return current ? eventsAfter(current, after) : { events: [], offset: Math.max(0, after) };
+  }
+
+  private requireRun(runId: string): RunRecord {
+    const run = this.runs.get(runId);
+    if (!run) throw new RuntimeNotFoundError("Run not found");
+    return run;
+  }
+
+  private pushEvent(run: RunRecord, event: Record<string, unknown>): void {
+    appendRunEvent(run, event);
+    this.wakeEventWaiters(run.run_id);
+  }
+
+  private wakeEventWaiters(runId: string): void {
+    for (const wake of [...this.eventWaiters.get(runId) ?? []]) wake();
+  }
+
+  /** Drops terminal runs past retention; an interrupted run stays while its open session may resume it. */
+  private pruneRuns(now = Date.now()): void {
+    const cutoff = now - this.runRetentionMs;
+    const openSessions = new Set<string>();
+    const activeRuns = new Set<string>();
+    for (const session of this.sessions.values()) {
+      if (!session.closed) openSessions.add(session.id);
+      if (session.activeRunId) activeRuns.add(session.activeRunId);
+    }
+    for (const [runId, run] of this.runs) {
+      // An unparseable timestamp is kept, as the state store does on load.
+      if (!isTerminal(run.status) || !(Date.parse(run.updated_at) < cutoff) || activeRuns.has(runId)) continue;
+      if (run.status === "interrupted" && openSessions.has(run.session_id)) continue;
+      this.runs.delete(runId);
+      this.observedFinal.delete(runId);
+      this.streamingAnswers.delete(runId);
+      this.terminalClaims.delete(runId);
+      this.wakeEventWaiters(runId);
+    }
   }
 
   private async startRun(session: SessionRecord, runId: string, prompt: string, route: RouteDecision, requestedAt: string, taskId?: string, requirement?: string, mode: WorkflowMode = "single", task: TaskMode = "implement"): Promise<void> {
@@ -696,6 +774,8 @@ export class CodingAgentOrchestrator {
       events: [{ type: "status", status: "starting" }],
       branch: session.branch,
     };
+    const summary = summarizeTask(requirement ?? prompt);
+    if (summary) run.task_summary = summary;
     const limits = session.process.limitsFor?.(route);
     if (limits) run.limits = limits;
     if (task === "implement" && !this.quality) run.verification_status = "unverified";
@@ -888,7 +968,7 @@ export class CodingAgentOrchestrator {
       });
       this.countApproval(run, approval.id, "requested");
       this.updateRun(run, "awaiting_approval");
-      run.events.push({ ...event, approval_id: approval.id, expires_at: new Date(approval.expiresAt).toISOString() });
+      this.pushEvent(run, { ...event, approval_id: approval.id, expires_at: new Date(approval.expiresAt).toISOString() });
       this.persistInBackground();
       return;
     }
@@ -931,7 +1011,7 @@ export class CodingAgentOrchestrator {
           serverSummary.total_latency_ms += run.mcp_latency_ms;
           serverSummary.result_bytes += event.result_bytes ?? 0;
         }
-        run.events.push({
+        this.pushEvent(run, {
           type: "mcp",
           phase: event.phase,
           server: mcpServer,
@@ -940,7 +1020,7 @@ export class CodingAgentOrchestrator {
           ...(event.phase === "end" ? { success: event.is_error !== true } : {}),
         });
       } else {
-        run.events.push(event);
+        this.pushEvent(run, event);
       }
       this.persistSoon();
       return;
@@ -955,7 +1035,7 @@ export class CodingAgentOrchestrator {
     if (event.type === "answer") {
       this.streamingAnswers.delete(run.run_id);
       run.answer = event.text;
-      run.events.push(event);
+      this.pushEvent(run, event);
       this.persistSoon();
       return;
     }
@@ -989,18 +1069,18 @@ export class CodingAgentOrchestrator {
     // Enough room for the requested checks, or at least a minute to run them clamped to the window.
     if (windowMs < Math.min(MIN_CHECKS_WINDOW_MS, writer.estimateMs(names))) { respond(rejected("insufficient_time_budget", "Not enough time left to run checks and still verify the final result; finish without them")); return; }
     workflow.checksCalls = calls + 1; run.writer_checks_calls = workflow.checksCalls;
-    run.events.push({ type: "checks", phase: "start", checks: names });
+    this.pushEvent(run, { type: "checks", phase: "start", checks: names });
     this.persistSoon();
     const operation = this.quality.runChecks({ run_id: run.run_id, worktree: session.worktreePath, baseline: session.baselineCommit, ...(event.checks ? { checks: event.checks } : {}), signal: workflow.controller.signal, deadlineMs: windowMs });
     workflow.checksOperation = operation;
     try {
       const response = await operation;
       if (workflow.controller.signal.aborted || isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return;
-      run.events.push({ type: "checks", phase: "end", status: response.status });
+      this.pushEvent(run, { type: "checks", phase: "end", status: response.status });
       respond(response);
     } catch {
       if (workflow.controller.signal.aborted || isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return;
-      run.events.push({ type: "checks", phase: "end", status: "unknown" });
+      this.pushEvent(run, { type: "checks", phase: "end", status: "unknown" });
       respond({ status: "unknown", reason: "run_checks_failed", checks: [], report: "The checks could not run. Continue; the final verification still runs." });
     } finally {
       if (workflow.checksOperation === operation) workflow.checksOperation = undefined;
@@ -1110,7 +1190,7 @@ export class CodingAgentOrchestrator {
       run.diff_stat = diff.stat;
       run.commit = commit;
       run.cherry_pick = `git cherry-pick ${commit}`;
-      run.events.push({ type: "diff", files: diff.files, stat: diff.stat, bytes: diff.bytes });
+      this.pushEvent(run, { type: "diff", files: diff.files, stat: diff.stat, bytes: diff.bytes });
       this.updateRun(run, "completed");
       // A workflow delivery restored after a restart has no in-memory state, only its execution status.
       if (workflow || run.execution_status) { run.execution_status = "succeeded"; run.phase = "completed"; }
@@ -1164,7 +1244,7 @@ export class CodingAgentOrchestrator {
     run.changed_files = diff.files;
     run.diff_stat = diff.stat;
     this.updateRun(run, "awaiting_approval");
-    run.events.push({
+    this.pushEvent(run, {
       type: "approval",
       kind: "delivery",
       approval_id: approval.id,
@@ -1193,7 +1273,7 @@ export class CodingAgentOrchestrator {
     const pending = this.deliveries.get(run.run_id)!;
     if (!this.claimTerminal(run)) throw new RuntimeConflictError("Run is already finalizing");
     this.deliveries.delete(run.run_id);
-    run.events.push({ type: "approval_decision", decision: decision === "approve" ? "approved" : "rejected", approval_id: approvalId });
+    this.pushEvent(run, { type: "approval_decision", decision: decision === "approve" ? "approved" : "rejected", approval_id: approvalId });
     if (decision === "reject") {
       await this.failClaimedRun(session, run, { code: "delivery_rejected", message: "The owner discarded the changes; the patch was kept" });
       return;
@@ -1344,7 +1424,7 @@ export class CodingAgentOrchestrator {
       if (run.grader_status === "pending") run.grader_status = "unknown";
     }
     run.updated_at = new Date().toISOString();
-    run.events.push({ type: "status", status });
+    this.pushEvent(run, { type: "status", status });
     // Recomputed in notifyRun once the final timing is known.
     if (isTerminal(status)) run.harness_metrics = computeHarnessMetrics(run);
   }
@@ -1434,6 +1514,7 @@ export class CodingAgentOrchestrator {
       if (isTerminal(run.status)) { this.observedFinal.set(run.run_id, run.updated_at); this.streamingAnswers.delete(run.run_id); }
       else this.observedFinal.delete(run.run_id);
     }
+    this.pruneRuns();
     if (!this.stateStore) return;
     try { await this.stateStore.save({
       schema_version: 1,
@@ -1472,7 +1553,25 @@ export class CodingAgentOrchestrator {
 export function buildCommitMessage(run: RunRecord): string {
   const trailers = [`Pi-Run-Id: ${run.run_id}`, `Pi-Model: ${run.provider}/${run.model}`, `Pi-Verification: ${run.verification_status ?? "unverified"}`];
   if (run.grader_status) trailers.push(`Pi-Grader: ${run.grader_status}`);
-  return `Pi agent: ${run.run_id}\n\n${trailers.join("\n")}`;
+  const summary = run.task_summary ? boundSubject(run.task_summary) : undefined;
+  return `${COMMIT_SUBJECT_PREFIX}${summary || run.run_id}\n\n${trailers.join("\n")}`;
+}
+
+const COMMIT_SUBJECT_PREFIX = "Pi agent: ";
+const COMMIT_SUBJECT_MAX = 72;
+
+/** One redacted line that fits the commit subject after its prefix; undefined when nothing is left. */
+export function summarizeTask(text: string): string | undefined {
+  // Redact before joining lines: a credential assignment masks the rest of its own line only.
+  return boundSubject(String(redact(text)));
+}
+
+function boundSubject(text: string): string | undefined {
+  const line = text.replace(/[\s\p{Cc}]+/gu, " ").trim();
+  if (!line) return undefined;
+  const max = COMMIT_SUBJECT_MAX - COMMIT_SUBJECT_PREFIX.length;
+  const chars = Array.from(line);
+  return chars.length <= max ? line : `${chars.slice(0, max - 1).join("").trimEnd()}…`;
 }
 
 /** Non-completed executions are never delivered; each outcome gets its own actionable code. */

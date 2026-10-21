@@ -48,11 +48,13 @@ import { loadProfile, type VerificationProfile } from "./verification.js";
 import { createQualityServices } from "./workflow-runtime.js";
 import { DEFAULT_DIFF_LIMITS, WorktreeManager, writerGitDir } from "./worktree-manager.js";
 import { parseGraderConfig } from "./grader-config.js";
+import { agentScheduler } from "./agent-scheduler.js";
 
 const exec = promisify(execFile);
 export const DEFAULT_AGENT_RUNTIME_PORT = 3001;
 const DEFAULT_AGENT_RUNTIME_HOST = "127.0.0.1";
 const MAX_REQUEST_BYTES = 64_000;
+const MAX_EVENT_WAIT_MS = 30_000;
 
 interface ServerOptions {
   /** Remembers POST /v1/sessions and /prompts results by Idempotency-Key so a client retry never starts a second run. */
@@ -196,9 +198,18 @@ export function createAgentHttpServer(options: ServerOptions) {
         if (options.ci?.has(runId)) {
           const job = await options.ci.get(runId); sendSse(response, job.events ?? [], 0); return;
         }
-        options.orchestrator.getRun(runId);
         const after = Math.max(0, Number(url.searchParams.get("after") ?? "0") || 0);
-        sendSse(response, options.orchestrator.listEvents(runId, after), after);
+        // ?wait=N long-polls up to N seconds (at most 30) for the first event after the cursor.
+        const waitMs = Math.min(MAX_EVENT_WAIT_MS, Math.max(0, Number(url.searchParams.get("wait") ?? "0") || 0) * 1000);
+        if (waitMs > 0) {
+          const disconnected = new AbortController();
+          response.once("close", () => disconnected.abort());
+          const { events, offset } = await options.orchestrator.waitForEvents(runId, after, waitMs, disconnected.signal);
+          if (!response.destroyed) sendSse(response, events, offset);
+          return;
+        }
+        const run = options.orchestrator.getRun(runId);
+        sendSse(response, options.orchestrator.listEvents(runId, after), Math.max(after, run.events_truncated ?? 0));
         return;
       }
       const decisionMatch = /^\/v1\/runs\/([^/]+)\/decisions$/.exec(url.pathname);
@@ -592,7 +603,7 @@ export async function createProductionServer() {
       version: "1.0.1",
       pi_version: "1.0.1",
       structured_workflow: trustedProfile?.profile.structuredWorkflow ?? { enabled: false },
-      agent_container_limit: 4,
+      agent_container_limit: agentScheduler.limit,
       verification_profile: trustedProfile ? { id: trustedProfile.profile.id, checksum: trustedProfile.checksum } : null,
       telemetry: telemetry?.health() ?? {status: "disabled"},
       mcp_mode: mcpMode,

@@ -394,7 +394,10 @@ class AgentRuntimeClient:
             try:
                 if run is None or on_progress is None:
                     run = await self.get_run(run_id)
-                    cursor = len(run.get("events") or [])
+                    # The runtime keeps the newest events; cursors are absolute.
+                    cursor = len(run.get("events") or []) + int(
+                        run.get("events_truncated") or 0
+                    )
                     events = None
                 else:
                     events = await self.get_events(run_id, after=cursor)
@@ -423,7 +426,8 @@ class AgentRuntimeClient:
                 run = None
                 continue
             else:
-                cursor += len(events)
+                last_id = events[-1].get("event_id") if events else None
+                cursor = last_id if isinstance(last_id, int) else cursor + len(events)
                 run = self._with_tool_events(run, events)
             if on_progress is not None:
                 await on_progress(run)

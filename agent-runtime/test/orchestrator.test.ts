@@ -854,7 +854,8 @@ test("an unverified no-profile change is labelled unverified in the run and the 
   assert.equal(run.status, "completed");
   assert.equal(run.verification_status, "unverified");
   const message = calls.commitMessages[0];
-  assert.match(message, new RegExp(`^Pi agent: ${accepted.run_id}\n\n`));
+  // The subject summarises the task ("fix"); the run id moved to the Pi-Run-Id trailer below.
+  assert.match(message, /^Pi agent: fix\n\n/);
   assert.match(message, new RegExp(`\nPi-Run-Id: ${accepted.run_id}(\n|$)`));
   assert.match(message, /\nPi-Model: openai\/gpt-5\.6-luna(\n|$)/);
   assert.match(message, /\nPi-Verification: unverified(\n|$)/);
