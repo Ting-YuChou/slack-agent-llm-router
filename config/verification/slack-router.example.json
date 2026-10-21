@@ -139,6 +139,7 @@
   "maxRepairs": 2,
   "maxCostUsd": 1,
   "activeTimeoutMs": 900000,
+  "writerReuse": true,
   "workflows": [
     "CI"
   ],

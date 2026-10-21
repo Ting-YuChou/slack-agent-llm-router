@@ -36,3 +36,13 @@ test("the example profile degrades unresolved investigations once structured wor
 
   assert.equal(profile.structuredWorkflow?.degradeUnknown, true);
 });
+
+test("the example profile reuses writers across repairs with the default single grader sample", () => {
+  const raw = readJson("config/verification/slack-router.example.json");
+  const profile = validateProfile(raw);
+
+  assert.equal(raw.writerReuse, true);
+  assert.equal(profile.writerReuse, true);
+  assert.equal(raw.grader?.samples, undefined, "the example profile must not override grader samples");
+  assert.equal(profile.grader?.samples, 1);
+});
