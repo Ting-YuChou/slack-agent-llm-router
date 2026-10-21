@@ -468,6 +468,32 @@ def test_failure_codes_leave_the_contract_metrics_unchanged():
     }
 
 
+# --- eval profiles -------------------------------------------------------------
+
+
+def test_structured_eval_profiles_degrade_unresolved_investigations():
+    task = {
+        "id": "t1",
+        "workflow_mode": "structured",
+        "profile": {"allowedPaths": ["src/"]},
+    }
+
+    profile = agent_eval.build_profile(task, "sha256:" + "0" * 64)
+
+    assert profile["structuredWorkflow"]["enabled"] is True
+    assert profile["structuredWorkflow"]["degradeUnknown"] is True
+
+
+def test_single_eval_profiles_stay_without_structured_workflow():
+    task = {
+        "id": "t1",
+        "workflow_mode": "single",
+        "profile": {"allowedPaths": ["src/"]},
+    }
+
+    assert "structuredWorkflow" not in agent_eval.build_profile(task, "img")
+
+
 # --- run error capture ---------------------------------------------------------
 
 

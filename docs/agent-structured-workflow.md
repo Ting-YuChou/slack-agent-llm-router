@@ -13,7 +13,8 @@ Build the updated agent, gateway and verification images. Copy the example verif
     "concurrency": 2,
     "maxCostUsd": 5,
     "activeTimeoutMs": 1800000,
-    "discoveryCostUsd": 1.5
+    "discoveryCostUsd": 1.5,
+    "degradeUnknown": true
   }
 }
 ```
@@ -44,11 +45,11 @@ At completion the host also checks for unexpected workspace changes; any change 
 
 The host locks the requirement, baseline and profile checksum, and marks the parent session busy before investigation. A planner submits a validated graph through `submit_plan`. Supported investigator roles are `code_explorer`, `ci_investigator` and `test_analyst`; workers submit findings through `submit_investigation`. The host rejects cycles, unknown dependencies, escaping paths, unsupported roles and more than eight investigation tasks across both waves.
 
-The second planner sees completed results and can add another wave. Each task waits for its dependencies. Invalid output and execution failures get at most one retry with a new context; unresolved required work blocks delivery. Planner executions have two-minute deadlines; investigators have three-minute deadlines and a 20-tool-call limit. Parent time and cost limits also apply.
+The second planner sees completed results and can add another wave. Each task waits for its dependencies. Invalid output, execution failures, timeouts and `unknown` results get at most one retry with a new context. By default an investigation that still fails blocks delivery. With `degradeUnknown: true` (the example profile and the eval profiles set it), an investigator that still fails after its retry becomes `unresolved`: the run gets an `investigation_degraded` event naming the node, role, wave, attempt and cause, and the writer starts with that gap listed. A planner failure, a budget or stop failure, or every investigation ending unresolved still fails the run as `investigation_unknown`. Planner executions have two-minute deadlines; investigators have three-minute deadlines and a 20-tool-call limit. Parent time and cost limits also apply.
 
 Every planner/investigator has a fresh directory and context, a read-only baseline snapshot, no repository context-file discovery and no writer plugins or skills. File reads are restricted to task paths. Shell, editing, writing and child spawning are unavailable. A configured CI investigator can use the trusted GitHub MCP's direct read tools, with a repository-scoped, four-call token. It does not receive Codemode, other MCP namespaces or GitHub credentials. Other roles use snapshot reads in v1.
 
-All workers must stop before the writer starts. Investigation output is labeled untrusted evidence. The grader still receives only the original requirement, fixed rubric, candidate identity/snapshot, diff and verifier output; it never receives writer or planner conversations. Passing investigation is not passing verification.
+All workers must stop before the writer starts. The writer never sees the nodes' raw JSON. It gets an implementation brief of at most 8 KiB, built from validated results only. The brief has these sections: goal (the requirement and the planner's summary), findings as `path:line` plus claim, files to change, fixed constraints, tests to add, and open questions (unresolved gaps, degraded nodes and suggested follow-ups). Each item is one clipped line. When the brief is too long, items are dropped from the end of the longest list and replaced with an omitted count. Investigation output is labeled untrusted evidence. The grader still receives only the original requirement, fixed rubric, candidate identity/snapshot, diff and verifier output; it never receives writer or planner conversations. Passing investigation is not passing verification.
 
 ## Budgets, cancellation and restart
 

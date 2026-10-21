@@ -125,6 +125,22 @@ test('a failed discovery reports why it failed', async () => {
   assert.deepEqual(orchestrator.getRun(run.run_id).error, { code: 'investigation_unknown', message: 'Required investigation could not complete; evidence retained', cause_code: 'investigation_timeout' });
 });
 
+test('a degraded investigation becomes a run event and the writer still starts', async () => {
+  const degraded = { type: 'investigation_degraded', node_id: 'a', role: 'code_explorer', wave: 1, attempt: 2, cause: 'investigation_timeout' };
+  const { orchestrator, process } = fixture(undefined, {
+    structured: { enabled: true, maxCostUsd: 5, activeTimeoutMs: 1_800_000 },
+    discover: async (input: any) => { input.degraded(degraded); return '## Open questions and unresolved\n- a (code_explorer) did not complete (investigation_timeout)'; },
+    writerStarted: () => {}, execution: () => {}, assertUnchanged: async () => {},
+    evaluate: async () => ({ action: 'fail', candidate: { hash: 'h', path: '/s' }, verification: { status: 'unknown', checks: [] } }),
+  });
+  const run = await orchestrator.createSession({ team_id: 'T', channel_id: 'C', thread_ts: 'degraded', user_id: 'U', prompt: 'fix', workflow_mode: 'structured' } as any);
+  for (let i = 0; i < 20 && !process.prompts.length; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(orchestrator.getRun(run.run_id).events.filter(event => event.type === 'investigation_degraded'), [degraded]);
+  assert.equal(process.prompts.length, 1); assert.match(process.prompts[0].prompt, /did not complete \(investigation_timeout\)/);
+  assert.notEqual(orchestrator.getRun(run.run_id).status, 'failed');
+  process.emit(SETTLED); await new Promise(resolve => setImmediate(resolve));
+});
+
 test('structured requests fail closed without an enabled trusted profile', async () => {
   const { orchestrator, process } = fixture();
   await assert.rejects(orchestrator.createSession({ team_id: 'T', channel_id: 'C', thread_ts: 'no-profile', user_id: 'U', prompt: 'fix', workflow_mode: 'structured' } as any), /structured|profile/i);

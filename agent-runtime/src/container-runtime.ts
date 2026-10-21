@@ -20,6 +20,8 @@ import { RESOURCE_LIMIT_FLAGS } from "./container-flags.js";
 
 export interface AgentContainerOptions {
   taskMode?: TaskMode;
+  /** Runs once the process is closed and its container stopped (e.g. removing the session's network). */
+  onClosed?: () => Promise<void>;
   name: string;
   image: string;
   network: string;
@@ -101,6 +103,8 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     "--name", options.name,
     "--label", "slack-pi-agent-session=true",
     "--network", options.network,
+    // Names on the internal network still resolve; nothing else is forwarded (CVE-2024-29018 defence in depth).
+    "--dns", "127.0.0.1",
     "--read-only",
     "--user", options.user ?? "10001:10001",
     "--cap-drop", "ALL",
@@ -179,6 +183,7 @@ export class DockerPiProcess implements AgentProcess {
   private queueAbort?: AbortController;
   private queuedStart?: Promise<void>;
   private releasePermit?: () => void;
+  private closedHookRan = false;
   private readonly options: Omit<AgentContainerOptions, "gatewayToken" | "classifierGatewayToken" | "mcp"> & { mcp?: Omit<McpRunConfig, "token"> };
   private readonly tokenForRun: (runId: string, route: RouteDecision) => string;
   private readonly onEvent: (event: PublicRunEvent) => void;
@@ -349,6 +354,10 @@ export class DockerPiProcess implements AgentProcess {
     this.queueAbort?.abort();
     await this.queuedStart;
     await this.stopActiveContainer();
+    const closed = this.closedHookRan ? undefined : this.options.onClosed;
+    this.closedHookRan = true;
+    // Cleanup after the container is gone must not turn a clean close into a failure.
+    await closed?.().catch(() => console.error(JSON.stringify({ event: "agent_session_cleanup_failed", session_id: this.sessionId })));
   }
 
   private async waitForContainer(name: string, signal: AbortSignal): Promise<void> {

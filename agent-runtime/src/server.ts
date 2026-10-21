@@ -27,6 +27,7 @@ import { deriveMcpServerSecret, issueMcpToken } from "./mcp-token.js";
 import { deriveBudgetRpcSecret } from "./budget-rpc.js";
 import { IdempotencyCache, IdempotencyKeyReusedError } from "./idempotency.js";
 import { diskQuotaFromEnv } from "./disk-usage.js";
+import { engineVulnerable, parseNetworkAttachments, RunNetworks } from "./run-network.js";
 import {
   CodingAgentOrchestrator,
   publicRun,
@@ -377,7 +378,12 @@ export async function createProductionServer() {
     worktreeRoot,
     baseRef: process.env.PI_AGENT_BASE_REF ?? "HEAD",
   });
+  await refuseUnpatchedDocker();
   await cleanupOrphanAgentContainers();
+  const networkAttachments = parseNetworkAttachments(process.env.PI_AGENT_NETWORK_ATTACH);
+  // With gateways to attach, every session gets its own internal network; otherwise all share PI_AGENT_NETWORK.
+  const runNetworks = networkAttachments.length ? new RunNetworks({ attachments: networkAttachments }) : undefined;
+  await runNetworks?.removeStale();
   const stateStore = new RuntimeStateStore(path.join(runtimeRoot, "runtime-state.json"));
   const telemetryEnabled = process.env.PI_AGENT_TELEMETRY_ENABLED === "true";
   const telemetry = telemetryEnabled ? new AgentTelemetry({
@@ -489,7 +495,8 @@ export async function createProductionServer() {
         {
           name: `pi-session-${session.id.slice(0, 8)}`,
           image: actualImageDigest,
-          network,
+          network: runNetworks ? await runNetworks.create(session.id) : network,
+          ...(runNetworks ? { onClosed: () => runNetworks.remove(session.id) } : {}),
           worktreePath: session.worktreePath,
           gitMetadataPath: writerGitDir(session, gitMetadataPath),
           sessionStatePath,
@@ -694,6 +701,14 @@ async function readImageFile(image: string, filePath: string): Promise<string> {
   } catch {
     return "";
   }
+}
+
+/** Internal networks only isolate on engines with the CVE-2024-29018 fix. */
+async function refuseUnpatchedDocker(): Promise<void> {
+  let version: string;
+  try { version = (await exec("docker", ["version", "--format", "{{.Server.Version}}"], { encoding: "utf8", timeout: 10_000 })).stdout.trim(); }
+  catch { throw new Error("Cannot read the Docker Engine version; refusing to start"); }
+  if (engineVulnerable(version)) throw new Error(`Docker Engine ${version} lacks the CVE-2024-29018 fix (need 23.0.11, 25.0.5 or 26.0.0+); refusing to start`);
 }
 
 async function cleanupOrphanAgentContainers(): Promise<void> {
