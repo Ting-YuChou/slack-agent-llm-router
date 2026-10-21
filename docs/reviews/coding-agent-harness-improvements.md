@@ -593,59 +593,69 @@ Slack 是 harness 唯一的「人類介面」：核准、進度、失敗回報�
 
 ---
 
-## 附錄 B：實施狀態（2026-10-20，`origin/main` = `9adc70c`）
+## 附錄 B：實施狀態（2026-10-21，`origin/main` = `002561a`）
 
 ### Phase 0–3：已完成
 
 - Phase 0–3 的 slice 全部合進 main（#40–#69），後續修正為 #70–#77。
 - Phase 3 的 live 驗收：
-  - **agent eval**（run 39402941829，prompt `cb82e50be37b`）：pass@1 1.0、grader_unknown_rate 0.0、first_attempt_pass_rate 0.75，contract 通過。結果檔已放進 `eval/results/`。
+  - **agent eval**（run 39402941829，prompt `cb82e50be37b`）：pass@1 1.0、grader_unknown_rate 0.0、first_attempt_pass_rate 0.75，contract 通過。
   - **grader 校準**（run 39410170536）：false_pass 0、false_fail 0、self_consistency 1.0、invalid 0，花費 $1.24，baseline 為 `eval/grader-baseline.json`。
-- 只剩 Slack 冒煙測試，需要先完成 `docs/slack-setup.md` 的設定。
+- 2026-10-20 的稽核找到 4 個 P0 與一批 PARTIAL 缺口，全部列入 Phase 4 的 Track 0，並已修好（見下表）。
 
-### 2026-10-20 稽核：Phase 0–3 的缺口
+### Phase 4：實施狀態
 
-逐項對照 main 的結果：大部分項目確實完成，但有下列缺口，列為 Phase 4 的 Track 0。
+| Track | Slice | 內容 | PR |
+|---|---|---|---|
+| Step 0 | — | 稽核與計畫、Phase 3 eval 結果檔 | #78 |
+| 0 | 0.1 | `run_checks` 的 reserve 與 deadline（P0） | #80 |
+| 0 | 0.2 | gateway 串流上限競態、訊息內容的 URL 來源（P0） | #79 |
+| 0 | 0.3 | budget RPC 用 HKDF 推導的 key、`unhandledRejection`（P0） | #82 |
+| 0 | 0.4 | `Idempotency-Key` 真正生效、fallback 模型（G8、C5） | #86 |
+| 0 | 0.5 | cause_code、rollback 失敗旗標、diff 超限可 repair 與其他低優先項目 | #84 |
+| 0 | 0.6 | ClickHouse ALTER、Slack 提示、卡片更新、模式保留 | #81 |
+| 0 | 0.7 | 沒有 profile 時的風險寫進文件 | #87 |
+| S | S1 | 容器資源旗標、worktree 磁碟配額 | #88、#89 |
+| S | S2 | MCP gateway：405、計數、audit、Context7 secret 掃描 | #93 |
+| S | S3 | ClickHouse grants 與 SQL 過濾 | #90 |
+| S | S4a | `hardenedGitEnv()` 全面套用、retention 逐項處理 | #92 |
+| S | S4c | CI inbox 退避、base image 以 digest 釘版本 | #83 |
+| S | S5 | budget 對應存進 ledger、每 token 請求上限、run 結束停預算 | #95 |
+| S | S6 | 每個 session 一個只含 baseline 的 git mirror | #98 |
+| S | S7 | 每個 session 一個 `--internal` 網路、`--dns 127.0.0.1`、拒絕未修補 CVE-2024-29018 的 engine | #99 |
+| S | S8 | image 內計算 manifest（extensions、plugins、skills、`dist/src`），lock 與啟動時比對 | #105 |
+| U | U1 | 核准存進 SQLite ledger、移除 `write` 模式 | #94 |
+| U | U2 | Slack 進度訊息（events cursor） | #85 |
+| U | U3 | Slack 併發、去重、modal 選項 | #91 |
+| U | U4 | 下載 patch、從 patch 接續 | #104 |
+| U | U5 | run 保留期限、event 上限、compact 狀態檔、events long-poll | #101 |
+| P | P1 | startup 量測寫進 attempts、harness metrics、ClickHouse | #96 |
+| P | P2 | gateway token 改由 RPC dialog 逐次交付，容器 env 只有 placeholder | #102 |
+| P | P3 | `writerReuse`：settle 後 `docker pause`，repair 時 unpause 重用 | #103 |
+| P | P4 | ImplementationBrief、investigation 失敗時降級 | #100 |
+| P | P5 | grader 多次取樣（profile 旗標） | #97 |
 
-| 等級 | 缺口 | 位置 |
-|---|---|---|
-| P0 | `run_checks` 在範例 profile 下永遠被拒絕：reserve 915s 超過 `activeTimeoutMs` 上限 900s | `writer-checks.ts`、`orchestrator.ts` answerChecks |
-| P0 | gateway 每個 token 的並行串流上限有競態：先讀計數，await 預算之後才 +1 | `model-gateway.ts:161-173` |
-| P0 | 訊息內容中 URL 來源的 image / file 沒有被擋，provider 會代為抓取 | `gateway-request-policy.ts` |
-| P0 | budget RPC 的 bearer 是 gateway 的簽章 secret（F5f 的 HKDF 還沒做） | `server.ts:565` |
-| 中 | runtime 不讀 `Idempotency-Key`，client 的 key 每次都是隨機值（G8） | `server.ts`、`src/agent_runtime.py` |
-| 中 | ClickHouse 只有 `CREATE … IF NOT EXISTS`，新欄位進不了已經存在的表 | `src/agent_analytics.py` |
-| 中 | verification 結果為 unknown 時沒有 cause_code；rollback 失敗會覆蓋 cause；Slack 只有 3/18 種 cause 有提示（E3） | `quality-gate.ts`、`orchestrator.ts`、`bot_real.py` |
-| 中 | 沒有 `unhandledRejection` handler（E2） | `server.ts` |
-| 中 | 核准卡片在決定或到期後沒有更新；delivery 卡片的檔案清單沒有算進字數預算（G1） | `bot_real.py` |
-| 中 | `diff_limit_exceeded` 不能 repair；`edit` 沒有寫入大小檢查（B3） | `orchestrator.ts`、`extensions/policy.ts` |
-| 中 | C5：fallback 寫死成 Luna | `jev-router.ts` |
-| 低 | D2 測試設定檔清單不完整、D3 的 `git branch` 規則、O2 的 `repair_success` 定義、`attempts[].artifact` 露出 host 路徑、restore 後的 thread 遺失模式 | 見 Phase 4 計畫 |
+**未做**：
+- S4b（session jsonl 的 HMAC）：低優先，尚未實作。
+- MCP token 仍在容器啟動時經 env 傳入，所以開啟 MCP 時不重用容器（P3 的限制）；run 結束時撤銷 MCP 與 classifier token 也還沒做。
 
-決定：沒有 profile 時，在 delivery 模式下測試指令會自動放行。這個風險不靠增加核准來處理，而是在 gateway 端封住外洩路徑（上表的 P0 2–4，以及 Phase 4 的 S5、P2），並寫進文件。
+### Phase 4 最終驗收（P-ACC，2026-10-21，本機執行）
 
-### Phase 4：計畫
+CI 的 eval workflow 不能傳 profile 覆寫，所以兩項都在本機以 main（`002561a`）重建的 image 執行；eval 的覆寫參數見 #106。
 
-- **Track 0**：修補上表的缺口。
-- **Track S（沙箱）**：
-  - F5d 容器限制與磁碟配額
-  - F5a ClickHouse 權限與 SQL 過濾
-  - F5e MCP gateway
-  - F6 其餘項目
-  - F2 剩餘項目
-  - F5c 每個 session 一個 git mirror
-  - F5b 每個 run 一個網路
-  - F5g 在 image 內計算 hash
-- **Track U（體驗）**：
-  - 核准持久化，並移除 `write` 模式
-  - G9 進度訊息
-  - G10 併發與排隊
-  - E4-2 下載 patch，並從失敗的 attempt 接續
-  - E6
-- **Track P（效能與品質）**：
-  - 先量測 startup
-  - E5 憑證換發與容器重用（profile 旗標）
-  - B6 ImplementationBrief 與優雅降級
-  - grader 多次取樣
-- **最終驗收**：live agent eval、grader 校準、Slack 冒煙測試。每一次 live 執行前都需要使用者同意。
-- **已完成或大部分完成**：B5；F5f 的 `timingSafeEqual`；E4 的 patch 保存；F6 的 codegraph env；E6 的 commit trailer。
+- **grader 校準**（K=3、samples 3、unanimous、Sol）：
+  - false_pass 0、false_fail 0、self_consistency 1.0、invalid 0，花費 $1.85（每次評分 $0.062）。
+  - 符合驗收（false_pass = 0、false_fail 不高於 baseline）。
+  - 唯一沒過的是成本：baseline 是單次取樣（$1.24），3 次取樣是 1.49 倍；fail 的 case 提早停止，所以遠低於 3 倍。
+  - 紀錄：`eval/results/grader-calibration-samples3.jsonl`、`grader-calibration-samples3-summary.json`。
+- **agent eval**（3 repeats、`writerReuse`、structured workflow、grader samples 3）：
+  - 12/12 通過：pass@1 1.0、grader_oracle_agreement 1.0、grader_unknown_rate 0、first_attempt_pass_rate 0.75（與 baseline 相同），花費 $1.44。
+  - contract 沒過的是成本與時間：cost p50 $0.136（baseline $0.044）、wall time p50 79s（baseline 41s）。主要來源：通過的候選在 unanimous 下要跑滿 3 次 Sol grader；0.1 修好之後 writer 實際會呼叫 `run_checks`（每個 run 1–2 次）。兩者的比例需要一次不加覆寫的 eval 才能分開。
+  - **所有實作 run 都第一次就通過，沒有發生 repair，所以 `writerReuse` 在這次 live eval 中沒有被觸發**；重用目前只有真 Docker + 假 provider 的測試驗證（reused attempt 29 ms，cold 523 ms）。
+  - 結果檔：`eval/results/openai_gpt-5.6-luna__f65c994c6d56__6f0b0c2d246d.json`。
+- **baseline 已以這兩次結果更新**（2026-10-21，使用者決定；以 `--recompute-summary` / `--records` 加 `--update-baseline` 離線寫入，沒有再花費）：
+  - `eval/baseline.json`：cost p50 $0.136、wall time p50 79s，品質指標不變；記錄 `profile_overrides`（`writerReuse`、grader samples 3）。之後不同覆寫的 run 跟它比較時，會警告成本與時間不可比。
+  - `eval/grader-baseline.json`：samples 3 / unanimous，cost $1.85。
+  - 成本變高是設計代價：3 次 Sol grader 取樣，以及 writer 實際執行 `run_checks`。
+  - **`writerReuse` 還沒經過 live 驗證**：這次沒有任何 run 進入 repair。
+- Slack 冒煙測試仍待使用者完成 `docs/slack-setup.md` 的設定。

@@ -1,4 +1,6 @@
+import contextlib
 import http.server
+import io
 import json
 import shutil
 import subprocess
@@ -874,6 +876,27 @@ def test_eval_profile_overrides_reach_every_task_and_key_the_results(tmp_path):
         "grader": {"samples": 3, "aggregate": "majority"},
     }
     assert "profile_overrides" not in json.loads(plain.read_text())
+
+
+def test_baseline_records_its_profile_overrides_and_a_mismatch_is_warned(tmp_path):
+    _write_task(tmp_path / "tasks")
+    _write_baseline(tmp_path)
+    overridden = _eval_args(tmp_path, "--writer-reuse", "--grader-samples", "3")
+
+    def stderr_of(argv):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            agent_eval.main(argv, runner=_stub_runner())
+        return err.getvalue()
+
+    stderr_of([*overridden, "--update-baseline"])
+    baseline = json.loads((tmp_path / "baseline.json").read_text())
+    assert baseline["profile_overrides"] == {
+        "writerReuse": True,
+        "grader": {"samples": 3, "aggregate": "unanimous"},
+    }
+    assert "not comparable" not in stderr_of(overridden)
+    assert "not comparable" in stderr_of(_eval_args(tmp_path))
 
 
 def test_eval_profile_overrides_are_validated():

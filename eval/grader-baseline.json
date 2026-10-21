@@ -1,12 +1,16 @@
 {
-  "updated_at": "2026-10-20T10:59:12+00:00",
-  "records": "grader-calibration.jsonl",
+  "updated_at": "2026-10-21T05:18:41+00:00",
+  "records": "grader-calibration-samples3.jsonl",
+  "sampling": {
+    "samples": 3,
+    "aggregate": "unanimous"
+  },
   "metrics": {
     "false_pass_rate": 0.0,
     "false_fail_rate": 0.0,
     "self_consistency": 1.0,
     "invalid_rate": 0.0,
-    "cost_usd": 1.2390052
+    "cost_usd": 1.85069
   },
   "tolerance": {
     "false_pass_rate": 0.05,
