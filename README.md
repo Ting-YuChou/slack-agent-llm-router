@@ -15,7 +15,7 @@ Multi-model LLM router with a FastAPI API, Slack bot integration, Kafka/ClickHou
 
 ## Current Routing Behavior
 
-The default host-run config in [config/config.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.yaml) is tuned like this:
+The default host-run config in [config/config.yaml](config/config.yaml) is tuned like this:
 
 - `gpt-5` is the default model
 - `claude-sonnet-4-6` gets extra weight for `enterprise` users and difficult `analysis` / `reasoning` requests
@@ -26,7 +26,7 @@ The default host-run config in [config/config.yaml](/Users/zhoutingyou/Desktop/S
 - fast-lane routing is explicit-SLA only: set `metadata.requires_low_latency: true`, `metadata.latency_sla: "low"` or `"interactive"`, use API `priority >= 4`, or use Slack `/llm fast <query>`
 - fast-lane requests still need to be simple enough for the configured fast-lane model; complex reasoning, long-context, and attachment-heavy requests stay on the normal capability-aware path
 
-The compose runtime config in [config/config.compose.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.compose.yaml) is intentionally cloud-only:
+The compose runtime config in [config/config.compose.yaml](config/config.compose.yaml) is intentionally cloud-only:
 
 - it does not start a local `vLLM` server
 - it disables local-model scoring bias so the API does not route to a non-existent local model
@@ -218,8 +218,8 @@ Search results are deduplicated by normalized URL, capped per source domain, and
 can exclude configured `blocked_domains`. Current-info queries automatically ask
 Tavily for fresher/news-oriented results.
 The follow-up designs for constrained URL reading and multi-tool orchestration live
-in [docs/tools/url_fetch_design.md](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/docs/tools/url_fetch_design.md)
-and [docs/tools/tool_runner_roadmap.md](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/docs/tools/tool_runner_roadmap.md).
+in [docs/tools/url_fetch_design.md](docs/tools/url_fetch_design.md)
+and [docs/tools/tool_runner_roadmap.md](docs/tools/tool_runner_roadmap.md).
 
 ## Slack Behavior
 
@@ -306,7 +306,7 @@ uses Pi's coding-agent runtime with isolated `read`, `write`, `edit`, `bash`,
 Chat mode keeps the single OpenAI demo route; Agent sessions can explicitly use
 an allowlisted OpenAI, Anthropic, or OpenCode Go model. Redis, Kafka, ClickHouse, Flink, RAG, Tavily
 web search, response cache, and the provider scheduler are disabled in
-[config/config.demo.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.demo.yaml).
+[config/config.demo.yaml](config/config.demo.yaml).
 
 Agent monitoring can be enabled separately through the optional
 [observability overlay](docker-compose.agent-observability.yaml). It captures
@@ -320,10 +320,11 @@ grader, bounded repairs and owner-approved CI repair draft PRs. See the
 the boundaries between local tests and live integration acceptance.
 
 1. In Slack, create an app **from a manifest** and paste
-   [slack/app-manifest.demo.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/slack/app-manifest.demo.yaml).
+   [slack/app-manifest.demo.yaml](slack/app-manifest.demo.yaml).
 2. Install the app to the workspace. When updating an existing demo app,
-   re-apply the manifest and reinstall it so the message shortcut and new
-   `lists:read` scope are granted.
+   re-apply the manifest and reinstall it so the message shortcut and the
+   `lists:read` and `files:write` scopes are granted (`files:write` is needed
+   for **Download patch**).
 3. Under **Basic Information → App-Level Tokens**, generate an app token with
    `connections:write`. Keep the resulting `xapp-` token.
 4. Invite the bot to `#ai-testing`. If you use another channel, update
@@ -342,7 +343,11 @@ together with an `image_manifest`: SHA-256 hashes, computed inside the image, of
 extension (including the policy), plugin and Skill it loads and one digest of its compiled
 sources. Locking refuses an image built from a different tree than the checkout, and the
 runtime refuses to start when the image's manifest differs from the lock.
-Review unexpected lock changes before starting the demo. Run the launcher as a
+At startup the runtime also compares the sources the image was built from (`src`,
+`prompts`, `extensions`, `plugins`, `skills`) with this checkout. An image built
+before a code change is refused with the stale files listed and
+`rebuild and relock it: make demo-agent-images`; rerun the target after every
+`agent-runtime` change. Review unexpected lock changes before starting the demo. Run the launcher as a
 regular host user, not root, so the container can write only to that user's
 dedicated worktree and Pi session directory.
 
@@ -456,9 +461,14 @@ Try these two paths:
 
 - `/llm explain Transformer` — normal Chat mode through ModelRouter.
 - `/llm agent 找出一個測試缺口並修正` — starts a stateful Pi coding agent in
-  a dedicated branch, host worktree, and hardened container. Read-only tools run
-  automatically. The first edit and non-allowlisted shell commands require an
-  owner-only Slack approval.
+  a dedicated branch, host worktree, and hardened container. Read-only tools and
+  edits inside that worktree run automatically; non-allowlisted shell commands
+  need an owner-only Slack approval. Nothing is committed until the owner
+  approves the final diff (see below).
+- `/llm agent --discuss <question>` — read-only discussion of the project, with no
+  verification or commit. `--implement` asks for changes explicitly, and
+  `--workflow` runs the [structured investigation](docs/agent-structured-workflow.md)
+  before the writer.
 - From an existing Slack message or thread, open the message actions menu and
   choose **Run Pi Agent**. The modal lets the owner enter a task, choose a cached
   configured Agent model, and include a bounded snapshot of that thread.
@@ -472,9 +482,15 @@ Try these two paths:
 - `/llm agent /skill:test-gap 找出一個測試缺口並修正` — explicitly invokes
   the bundled `test-gap` Skill. Pi may also select it from its description and
   read that exact immutable `SKILL.md` automatically.
-- Reply normally inside that bot thread to continue the same Pi session.
+- Reply normally inside that bot thread to continue the same Pi session. A reply
+  may start with `--discuss`, `--implement`, or `--workflow`. A discussion stays
+  read-only until a reply passes `--implement`.
 - `/llm agent status`, `/llm agent stop`, and `/llm agent close` inspect or
   control your latest session without consuming query quota.
+- `/llm agent resume <run_id>` resumes a structured workflow that stopped before
+  its writer started. `/llm agent repair-ci <PR_URL|RUN_ID>` and
+  `/llm agent publish-repair <RUN_ID>` drive owner-approved CI repairs (see the
+  [verification and CI repair guide](docs/agent-verification-ci.md)).
 
 With Jev enabled, only the current task text (up to 4,000 characters) goes to
 OpenRouter. High-confidence read-only work uses Luna `low`, a small patch uses
@@ -489,11 +505,28 @@ regression; require the complex-task Sol group to improve separately. Confirm
 the OpenAI key can call Sol before that trial.
 
 Each new coding prompt counts as one Slack query; internal model turns and tools
-do not. A successful prompt is committed on its `pi-agent/...` branch and Slack
-shows the changed files, diff stat, commit, and cherry-pick command. The runtime
-never pushes, merges, or modifies the current checkout. Rejected, cancelled,
-failed, and timed-out prompts roll their isolated worktree back to the previous
-successful commit. Agent failures never silently fall back to Chat mode.
+do not. Each user may run one Agent prompt at a time by default
+(`agent.max_active_runs_per_user`). While a run works, Slack keeps one status
+message in the thread up to date (phase, turns, tool calls, and cost, at most
+every 10 seconds) and mentions the owner on approval and result messages.
+
+When the writer finishes, Slack posts a **Deliver / Discard** card with the
+changed files and diff stat. It expires after 30 minutes by default
+(`PI_AGENT_DELIVERY_TTL_MS`) and survives a runtime restart; delivery fails if
+the worktree changed after the card was posted. **Deliver** commits on the
+`pi-agent/...` branch and Slack shows the commit and cherry-pick command. The
+runtime never pushes, merges, or modifies the current checkout. Discarded,
+cancelled, failed, and timed-out prompts roll their isolated worktree back to the
+previous successful commit; when a patch was kept first, the result offers
+**Download patch** and **Resume from patch** (which starts a new run on a clean
+worktree with that patch applied). Agent failures never silently fall back to
+Chat mode. With `agent.feedback_enabled` (on in the demo config), every result
+also has **Accept result** and **Needs changes**; the latter asks for a reason
+and can continue the session with your comment.
+
+The demo bot keeps its Slack state in `.pi-agent-runtime/slack_state.json`
+(`slack.state_backend: file`), so a bot restart resumes monitoring runs it was
+tracking and does not repost CI notifications.
 
 Each session's worktree is backed by its own bare Git mirror under
 `<PI_AGENT_WORKTREE_ROOT>/mirrors/`. The mirror holds only the baseline commit's
@@ -574,7 +607,7 @@ export SLACK_APP_TOKEN=xapp-your-slack-app-token
 
 ### Option 1: Full Stack With Docker Compose
 
-The root [docker-compose.yml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/docker-compose.yml) starts:
+The root [docker-compose.yml](docker-compose.yml) starts:
 
 - Redis
 - Kafka
@@ -597,7 +630,7 @@ docker compose logs -f api workers
 docker compose config
 ```
 
-Compose uses [config/config.compose.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.compose.yaml).
+Compose uses [config/config.compose.yaml](config/config.compose.yaml).
 Set `LLM_ROUTER_WEB_SEARCH_ENABLED=true` plus `TAVILY_API_KEY` in `.env` to enable
 Tavily web search without editing the checked-in config.
 
@@ -641,9 +674,9 @@ python main.py start --config config/config.yaml
 
 ## Configuration Files
 
-- [config/config.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.yaml): host-run configuration, includes optional local `vLLM`
-- [config/config.compose.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.compose.yaml): compose runtime configuration, uses service names like `redis`, `kafka`, `clickhouse`
-- [config/config.demo.yaml](/Users/zhoutingyou/Desktop/Slack%20LLM%20Router/config/config.demo.yaml): Slack Chat and Pi Agent demo with the general data pipeline disabled
+- [config/config.yaml](config/config.yaml): host-run configuration, includes optional local `vLLM`
+- [config/config.compose.yaml](config/config.compose.yaml): compose runtime configuration, uses service names like `redis`, `kafka`, `clickhouse`
+- [config/config.demo.yaml](config/config.demo.yaml): Slack Chat and Pi Agent demo with the general data pipeline disabled
 - [config/demo.env.example](config/demo.env.example): Jev, Agent, MCP, and observability environment template
 - [docker-compose.agent-mcp.yaml](docker-compose.agent-mcp.yaml): optional read-only MCP gateways and ClickHouse aggregate-view initialization
 
@@ -651,7 +684,7 @@ Important defaults in `config/config.yaml`:
 
 - API auth enabled with `X-API-Key`
 - Redis cache enabled for inference responses
-- Slack state backend defaults to `memory` and can be switched to `file` or `redis`
+- Slack state backend defaults to `memory` and can be switched to `file` or `redis` (the demo config uses `file`)
 - pipeline disabled by default for host-run config
 - Streamlit enabled in host config, but not started by root compose
 
@@ -716,6 +749,19 @@ python -m pytest tests/test_pipeline.py -q
 ```
 
 `pytest.ini` disables built-in capture because the current local macOS / conda base combination can crash on `readline`.
+
+Agent runtime (TypeScript):
+
+```bash
+npm --prefix agent-runtime ci
+npm --prefix agent-runtime run typecheck
+npm --prefix agent-runtime test
+npm --prefix agent-runtime run lint
+```
+
+Docker-backed suites are opt-in with `PI_AGENT_DOCKER_INTEGRATION=1`; point
+`PI_AGENT_TEST_AGENT_IMAGE` at an image built from the current tree. See
+[AGENTS.md](AGENTS.md) for the full command list and the live-eval budget rules.
 
 ## Notes And Limitations
 
