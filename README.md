@@ -776,7 +776,9 @@ npm --prefix agent-runtime run lint
 Docker-backed suites are opt-in with `PI_AGENT_DOCKER_INTEGRATION=1`; point
 `PI_AGENT_TEST_AGENT_IMAGE` at an image built from the current tree, and
 `PI_AGENT_VERIFICATION_TEST_IMAGE` at a verification image, or the tests that
-need one are skipped. See
+need one are skipped. The Kafka/ClickHouse integration tests are opt-in with
+`AGENT_OBSERVABILITY_INTEGRATION=1`; the `agent-integration` job in
+`.github/workflows/tests.yml` shows the services and variables they need. See
 [AGENTS.md](AGENTS.md) for the full command list and the live-eval budget rules.
 
 ## Notes And Limitations

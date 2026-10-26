@@ -9,7 +9,7 @@ import { test } from "node:test";
 
 import { PiRpcBridge, RpcJsonlDecoder, type PublicRunEvent } from "../src/pi-rpc.js";
 import { fakeGatewayScript, scriptedTurns, waitForContainerHealthz } from "./support/fake-provider.js";
-import { AGENT_TEST_IMAGE } from "./support/docker-images.js";
+import { AGENT_TEST_IMAGE, FAKE_GATEWAY_IMAGE } from "./support/docker-images.js";
 
 const enabled = process.env.PI_AGENT_DOCKER_INTEGRATION === "1";
 
@@ -122,7 +122,7 @@ test("real Pi writer completes a run_checks round trip through the dialog channe
     await command("docker", ["build", "-q", "-t", image, "-f", "-", fileURLToPath(new URL("../../extensions", import.meta.url))], undefined,
       `FROM ${AGENT_TEST_IMAGE}\n` + "COPY --chown=10001:10001 checks.ts /opt/pi/extensions/checks.ts\n");
     await command("docker", ["network", "create", "--internal", network]);
-    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", "node:22.22.0-bookworm-slim", "node", "-e", gatewayScript]);
+    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", FAKE_GATEWAY_IMAGE, "node", "-e", gatewayScript]);
     await waitForContainerHealthz(gateway);
     const events: PublicRunEvent[] = [];
     let resolveSettled!: () => void;

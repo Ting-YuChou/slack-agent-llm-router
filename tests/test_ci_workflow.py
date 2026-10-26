@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import re
 
 import yaml
 
@@ -17,6 +18,11 @@ DOCKERFILES = (
     "agent-runtime/Dockerfile.gateway",
     "agent-runtime/Dockerfile.verification",
 )
+INTEGRATION_TESTS = (
+    "tests/test_agent_observability_integration.py",
+    "tests/test_agent_mcp_reader_integration.py",
+)
+DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
 
 
 def _workflow(name):
@@ -42,6 +48,41 @@ def test_docker_job_builds_every_harness_image_and_runs_every_opt_in_suite():
     assert "PI_AGENT_TEST_AGENT_IMAGE" in env
     # The verification suites need a digest; the job resolves it after building.
     assert "PI_AGENT_VERIFICATION_TEST_IMAGE" in text
+
+
+def test_docker_job_pulls_the_digest_pinned_fake_gateway_image():
+    images = (ROOT / "agent-runtime/test/support/docker-images.ts").read_text()
+    image = re.search(r'FAKE_GATEWAY_IMAGE = "([^"]+)"', images).group(1)
+    assert DIGEST.search(image), f"{image} is not pinned by digest"
+    job = _workflow("agent-docker.yml")["jobs"]["agent-runtime-docker"]
+    assert f"docker pull {image}" in _run_text(job)
+    for suite in DOCKER_SUITES:
+        source = (ROOT / f"agent-runtime/test/{suite}.test.ts").read_text()
+        assert not re.search(r"[\"']node:\d", source), f"{suite} runs a tag-only image"
+
+
+def test_integration_job_runs_the_opt_in_python_tests_against_pinned_services():
+    job = _workflow("tests.yml")["jobs"]["agent-integration"]
+    env = job["env"]
+    for path in INTEGRATION_TESTS:
+        source = (ROOT / path).read_text()
+        # Every variable the test reads, its opt-in flag included, is set by the job.
+        names = set(re.findall(r'os\.environ(?:\[|\.get\()"(AGENT_\w+)"', source))
+        assert "AGENT_OBSERVABILITY_INTEGRATION" in names, f"{path} is not gated"
+        assert names <= set(env), f"{path} needs {sorted(names - set(env))}"
+    assert env["AGENT_OBSERVABILITY_INTEGRATION"] == "1"
+    assert {"kafka", "clickhouse"} <= set(job["services"])
+    for name, service in job["services"].items():
+        assert DIGEST.search(service["image"]), f"service {name} is not pinned"
+    text = _run_text(job)
+    for path in INTEGRATION_TESTS:
+        assert path in text, f"{path} does not run"
+    for image in re.findall(r"^\s*([a-z0-9./-]+:[\w.-]+(?:@\S+)?) \\$", text, re.M):
+        assert DIGEST.search(image), f"{image} is not pinned by digest"
+    assert "otel/opentelemetry-collector-contrib" in text
+    # The tests skip themselves without their services, so a skip fails the job.
+    assert re.search(r"grep -qE \"\[0-9\]\+ skipped\".*exit 1", text)
+    assert job["defaults"]["run"]["shell"] == "bash", "pytest | tee needs pipefail"
 
 
 def test_docker_job_runs_on_harness_changes():

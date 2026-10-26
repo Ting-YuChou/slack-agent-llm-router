@@ -163,7 +163,7 @@ test("feedback accepts a reason category and a bounded, redacted comment on any 
 });
 
 test("restart capture recovery skips previously recovered terminal runs", async () => {
-  const module: any = await import("../src/server.js");
+  const module = await import("../src/server.js");
   assert.equal(typeof module.recoverPendingCaptures,"function");
   const runs: any[] = [{run_id:"fresh",status:"interrupted"},{run_id:"old",status:"interrupted",capture_complete:false},{run_id:"done",status:"completed"}];
   const recovered: string[] = [];
@@ -174,7 +174,7 @@ test("restart capture recovery skips previously recovered terminal runs", async 
 });
 
 test("failed terminal writes persist failure before releasing even if persistence fails", async () => {
-  const module: any = await import("../src/server.js");
+  const module = await import("../src/server.js");
   assert.equal(typeof module.settleCaptureWrite,"function");
   const calls: string[] = [];
   const telemetry = {releaseRun:(id:string)=>calls.push(`release:${id}`)};

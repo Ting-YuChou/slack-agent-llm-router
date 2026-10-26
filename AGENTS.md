@@ -35,6 +35,7 @@ npm --prefix agent-runtime run lint               # after a build: no-floating-p
 ```
 
 Docker-backed agent-runtime tests are opt-in: `PI_AGENT_DOCKER_INTEGRATION=1 npm --prefix agent-runtime test`.
+The Kafka/ClickHouse integration tests are opt-in with `AGENT_OBSERVABILITY_INTEGRATION=1`; the `agent-integration` job in `.github/workflows/tests.yml` shows the services and variables they need.
 Anything with `--live-openai` (for example `scripts/agent_eval.py`) spends real model budget; do not run it unless asked.
 
 ## Do not touch

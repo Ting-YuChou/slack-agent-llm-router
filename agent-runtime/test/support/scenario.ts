@@ -12,6 +12,10 @@ import { archivePatch, undeliveredPatchPath } from "../../src/patch-archive.js";
 import { PiRpcBridge, type PublicRunEvent } from "../../src/pi-rpc.js";
 import { QualityGate, type CheckStatus, type Grade, type VerificationResult } from "../../src/quality-gate.js";
 import { WorktreeManager } from "../../src/worktree-manager.js";
+import { waitFor } from "./wait.js";
+
+// Kept for tests that still import it from here; it lives in ./wait.js.
+export { waitFor };
 
 const exec = promisify(execFile);
 
@@ -239,17 +243,6 @@ function restore(key: string, value: string | undefined): void {
 }
 
 const TERMINAL = new Set(["completed", "rejected", "cancelled", "failed", "timed_out", "interrupted"]);
-
-/** Polls `read` (sync or async) until `done` accepts its value. */
-export async function waitFor<T>(read: () => T | Promise<T>, done: (value: T) => boolean, describe: (value: T) => string, timeoutMs = 10_000): Promise<T> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const value = await read();
-    if (done(value)) return value;
-    await new Promise(resolve => setTimeout(resolve, 5));
-  }
-  throw new Error(describe(await read()));
-}
 
 function waitForTerminal(read: () => RunRecord): Promise<RunRecord> {
   return waitFor(read, run => TERMINAL.has(run.status), run => `run did not reach a terminal status; last status ${run.status}`);
