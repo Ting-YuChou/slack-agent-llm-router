@@ -239,7 +239,8 @@ Files up to the configured size limit are downloaded with the bot token; text-li
 Slack tiering:
 
 - `slack.user_tiers.overrides` maps Slack user IDs to `free` / `premium` / `enterprise`
-- `slack.rate_limiting.by_tier` applies tier-specific hourly and burst limits
+- `slack.rate_limiting.by_tier` applies tier-specific hourly and burst limits;
+  chat queries and Agent requests each get these limits in a bucket of their own
 - model visibility respects the routed model's tier access rules
 
 Slack state backends:
@@ -493,9 +494,10 @@ Try these two paths:
 - `/llm agent status`, `/llm agent stop`, and `/llm agent close` inspect or
   control your latest session without consuming query quota.
 - `/llm agent resume <run_id>` resumes an interrupted structured workflow (or
-  structured CI repair) that stopped before its writer started. Run it in the
-  run's thread to get its approvals and result there; from anywhere else, check
-  on it with `/llm agent status`. `/llm agent repair-ci <PR_URL|RUN_ID>` and
+  structured CI repair) that stopped before its writer started. Its status
+  message, approvals and result go to the run's own thread wherever you run
+  the command; when the bot cannot find that thread, it opens a new one in the
+  current channel. `/llm agent repair-ci <PR_URL|RUN_ID>` and
   `/llm agent publish-repair <RUN_ID>` drive owner-approved CI repairs (see the
   [verification and CI repair guide](docs/agent-verification-ci.md)).
 
@@ -512,7 +514,9 @@ regression; require the complex-task Sol group to improve separately. Confirm
 the OpenAI key can call Sol before that trial.
 
 Each new coding prompt counts as one Slack query; internal model turns and tools
-do not. Each user may run one Agent prompt at a time by default
+do not. Agent requests and chat queries are rate-limited in separate buckets
+with the same limits, so a burst of one never blocks the other. Each user may
+run one Agent prompt at a time by default
 (`agent.max_active_runs_per_user`). Every Agent run has a status message that
 Slack keeps up to date, at most every 10 seconds: phase, turns, tool calls,
 cost, and the time elapsed since the run started. A new `/llm agent` thread

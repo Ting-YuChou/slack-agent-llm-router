@@ -73,6 +73,27 @@ class TestUserManager:
         assert manager.check_rate_limit("u1", config) is True
         assert manager.check_rate_limit("u1", config) is False
 
+    def test_agent_requests_have_their_own_rate_limit_bucket(self, monkeypatch):
+        manager = UserManager()
+        monkeypatch.setattr("slack.bot_real.time.time", lambda: 1_000_000.0)
+        config = {"requests_per_hour": 3, "burst_requests": 2}
+
+        assert manager.check_rate_limit("u1", config) is True
+        assert manager.check_rate_limit("u1", config) is True
+        assert manager.check_rate_limit("u1", config) is False
+        assert manager.check_rate_limit("u1", config, bucket="agent") is True
+        assert manager.check_rate_limit("u1", config, bucket="agent") is True
+        assert manager.check_rate_limit("u1", config, bucket="agent") is False
+        assert manager.check_rate_limit("u1", config) is False
+        # Both buckets keep the hourly limit too, an hour's window apart.
+        monkeypatch.setattr("slack.bot_real.time.time", lambda: 1_000_400.0)
+        assert manager.check_rate_limit("u1", config) is True
+        assert manager.check_rate_limit("u1", config) is False
+        assert manager.check_rate_limit("u1", config, bucket="agent") is True
+        assert manager.check_rate_limit("u1", config, bucket="agent") is False
+        # Every request that went through counts as one Slack query.
+        assert len(manager.rate_limits["u1"]) == 6
+
 
 class TestConversationHelpers:
     def test_conversation_context_caps_history(self):
@@ -2137,6 +2158,17 @@ class TestSlackBot:
 
         assert observed_config == {"requests_per_hour": 500, "burst_requests": 20}
         assert bot.user_manager.get_user_tier("U1") == UserTier.PREMIUM
+
+    @pytest.mark.asyncio
+    async def test_user_stats_report_what_is_left_of_the_chat_bucket(self):
+        bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
+        config = bot._get_rate_limit_config_for_user("U1")
+        assert bot.user_manager.check_rate_limit("U1", config)
+        assert bot.user_manager.check_rate_limit("U1", config, bucket="agent")
+
+        stats = await bot.get_user_stats("U1")
+
+        assert stats["remaining_requests"] == config["requests_per_hour"] - 1
 
     @pytest.mark.asyncio
     async def test_attachment_only_message_uses_default_query_text(
