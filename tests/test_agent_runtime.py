@@ -764,6 +764,109 @@ async def test_mutating_calls_send_idempotency_keys(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_control_calls_send_the_callers_idempotency_key(monkeypatch):
+    keys = {}
+
+    def handler(request):
+        keys[request.url.path] = request.headers.get("idempotency-key")
+        return httpx.Response(
+            202,
+            json={
+                "session_id": "S",
+                "run_id": "R",
+                "status": "awaiting_approval"
+                if request.url.path.startswith("/v1/ci-repairs")
+                else "starting",
+            },
+        )
+
+    runtime = client(handler, monkeypatch)
+    try:
+        await runtime.resume("R", "U", idempotency_key="k-resume")
+        await runtime.repair_ci(
+            "7", "U", team_id="T", channel_id="C", idempotency_key="k-repair"
+        )
+        await runtime.retry_publication(
+            "R", "U", team_id="T", channel_id="C", idempotency_key="k-publish"
+        )
+        await runtime.cancel("R", "U", idempotency_key="k-cancel")
+    finally:
+        await runtime.close()
+
+    assert keys == {
+        "/v1/runs/R/resume": "k-resume",
+        "/v1/ci-repairs": "k-repair",
+        "/v1/ci-repairs/R/publication": "k-publish",
+        "/v1/runs/R/cancel": "k-cancel",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("given_key", [None, "k-1"])
+async def test_create_session_retries_a_client_timeout_once_with_the_same_key(
+    monkeypatch, given_key
+):
+    requests = []
+
+    def handler(request):
+        requests.append(
+            (request.headers.get("idempotency-key"), json.loads(request.content))
+        )
+        if len(requests) == 1:
+            # The runtime may have accepted the run; only its answer was lost.
+            raise httpx.ReadTimeout("slow", request=request)
+        return httpx.Response(
+            202, json={"session_id": "S1", "run_id": "R1", "status": "starting"}
+        )
+
+    runtime, sleeps = _retrying_client(handler, monkeypatch)
+    try:
+        result = await runtime.create_session(
+            "T", "C", "1", "U", "task", idempotency_key=given_key
+        )
+    finally:
+        await runtime.close()
+
+    assert result == {"session_id": "S1", "run_id": "R1", "status": "starting"}
+    assert len(requests) == 2
+    assert requests[0] == requests[1], "the retry repeats the same request and key"
+    key = requests[0][0]
+    assert key and (given_key is None or key == given_key)
+    assert sleeps == [0.5]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failures,expected,sent",
+    [
+        (["timeout", "timeout"], AgentRuntimeTimeout, 2),
+        (["connect"], AgentRuntimeUnavailable, 1),
+        ([504], AgentRuntimeTimeout, 1),
+        ([503], AgentRuntimeError, 1),
+        ([429], AgentRuntimeBusy, 1),
+    ],
+)
+async def test_create_session_retries_only_one_client_timeout(
+    monkeypatch, failures, expected, sent
+):
+    requests = []
+
+    def handler(request):
+        requests.append(request.headers.get("idempotency-key"))
+        return _transient_failure(failures[len(requests) - 1], request)
+
+    runtime, _sleeps = _retrying_client(handler, monkeypatch)
+    try:
+        with pytest.raises(expected):
+            await runtime.create_session("T", "C", "1", "U", "task")
+    finally:
+        await runtime.close()
+
+    assert len(requests) == sent
+    assert len(set(requests)) == 1
+
+
+@pytest.mark.asyncio
 async def test_control_calls_use_short_timeouts_but_create_keeps_long_one(
     monkeypatch,
 ):

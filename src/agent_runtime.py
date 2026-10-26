@@ -72,6 +72,11 @@ def is_transient_error(exc: AgentRuntimeError) -> bool:
     return exc.status is not None and exc.status >= 500
 
 
+def _is_client_timeout(exc: AgentRuntimeError) -> bool:
+    """The bot stopped waiting: the runtime may still have done the work."""
+    return isinstance(exc, AgentRuntimeTimeout) and exc.status is None
+
+
 class AgentRuntimeClient:
     """Call the loopback-only asynchronous Pi coding-agent API."""
 
@@ -175,12 +180,19 @@ class AgentRuntimeClient:
             payload["model"] = model
         if routing_text is not None:
             payload["routing_text"] = routing_text
-        result = await self._request(
-            "POST",
-            "/v1/sessions",
-            json=payload,
-            expected_status=202,
-            idempotency_key=idempotency_key or uuid.uuid4().hex,
+        key = idempotency_key or uuid.uuid4().hex
+        # A timed-out start may still have been accepted. Asking once more with
+        # the same key and body returns that run instead of starting another.
+        result = await self.retry_transient(
+            lambda: self._request(
+                "POST",
+                "/v1/sessions",
+                json=payload,
+                expected_status=202,
+                idempotency_key=key,
+            ),
+            attempts=2,
+            retryable=_is_client_timeout,
         )
         return self._validate_accepted(result)
 
@@ -200,6 +212,7 @@ class AgentRuntimeClient:
         team_id: str,
         channel_id: str,
         workflow_mode: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         result = await self._request(
             "POST",
@@ -216,17 +229,25 @@ class AgentRuntimeClient:
                 "channel_id": channel_id,
             },
             expected_status=202,
+            idempotency_key=idempotency_key,
         )
         return self._validate_accepted(result, expected_status="awaiting_approval")
 
     async def retry_publication(
-        self, run_id: str, user_id: str, *, team_id: str, channel_id: str
+        self,
+        run_id: str,
+        user_id: str,
+        *,
+        team_id: str,
+        channel_id: str,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         result = await self._request(
             "POST",
             f"/v1/ci-repairs/{run_id}/publication",
             json={"user_id": user_id, "team_id": team_id, "channel_id": channel_id},
             expected_status=202,
+            idempotency_key=idempotency_key,
         )
         return self._validate_accepted(result, expected_status="awaiting_approval")
 
@@ -289,12 +310,15 @@ class AgentRuntimeClient:
         )
         return self._validate_accepted(result)
 
-    async def resume(self, run_id: str, user_id: str) -> Dict[str, Any]:
+    async def resume(
+        self, run_id: str, user_id: str, *, idempotency_key: Optional[str] = None
+    ) -> Dict[str, Any]:
         result = await self._request(
             "POST",
             f"/v1/runs/{run_id}/resume",
             json={"user_id": user_id},
             expected_status=202,
+            idempotency_key=idempotency_key,
         )
         return self._validate_accepted(result)
 
@@ -436,13 +460,16 @@ class AgentRuntimeClient:
             control=True,
         )
 
-    async def cancel(self, run_id: str, user_id: str) -> None:
+    async def cancel(
+        self, run_id: str, user_id: str, *, idempotency_key: Optional[str] = None
+    ) -> None:
         await self._request(
             "POST",
             f"/v1/runs/{run_id}/cancel",
             json={"user_id": user_id},
             expected_status=202,
             control=True,
+            idempotency_key=idempotency_key,
         )
 
     async def close_session(self, session_id: str, user_id: str) -> None:
@@ -551,11 +578,13 @@ class AgentRuntimeClient:
         operation: Callable[[], Awaitable[T]],
         *,
         attempts: Optional[int] = None,
+        retryable: Callable[[AgentRuntimeError], bool] = is_transient_error,
     ) -> T:
         """Run an idempotent call again after a transient error, with full jitter.
 
         Each retry sleeps a uniform share of the capped exponential delay, so
-        Slack handlers retrying at once spread out. Other errors raise at once.
+        Slack handlers retrying at once spread out. Other errors, and those
+        ``retryable`` turns down, raise at once.
         """
         attempts = self._retry_attempts if attempts is None else max(1, attempts)
         failures = 0
@@ -564,7 +593,7 @@ class AgentRuntimeClient:
                 return await operation()
             except AgentRuntimeError as exc:
                 failures += 1
-                if failures >= attempts or not is_transient_error(exc):
+                if failures >= attempts or not retryable(exc):
                     raise
             ceiling = min(
                 self._retry_max_seconds,
