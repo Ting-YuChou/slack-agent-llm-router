@@ -8,7 +8,7 @@ import type { WriterContext } from "../dist/src/container-runtime.js";
 import { classifyBash, isApprovedSkillRead, isTestConfigPath, parsePorcelainZ, validateWorkspacePath } from "../dist/src/policy.js";
 import { codemodeMcpPrompt, type McpServerId } from "../dist/src/mcp-config.js";
 import { renderPrompt } from "../dist/src/prompts.js";
-import { BUDGET_STATUS_DIALOG, usdBudgetNotice } from "../dist/src/budget-notice.js";
+import { BUDGET_STATUS_DIALOG, activeTimeNotice, usdBudgetNotice } from "../dist/src/budget-notice.js";
 import { POLICY_ENTRY, policyDecisionEntry, type PolicyVerdict } from "../dist/src/policy-decision.js";
 
 const MAX_TURNS = Number(process.env.PI_AGENT_MAX_TURNS ?? "20");
@@ -101,9 +101,10 @@ function budgetStage(used: number, max: number): BudgetStage {
 }
 
 function budgetMessage(stage: BudgetStage, used: number, max: number, unit: string): string {
+  const left = Math.max(0, max - used);
   return stage === "final"
-    ? renderPrompt("budget-final", { used, max, unit, left: Math.max(0, max - used) })
-    : renderPrompt("budget-notice", { used, max, unit });
+    ? renderPrompt("budget-final", { used, max, unit, left })
+    : renderPrompt("budget-notice", { used, max, unit, left });
 }
 
 export default function policyExtension(pi: ExtensionAPI) {
@@ -111,9 +112,9 @@ export default function policyExtension(pi: ExtensionAPI) {
   let toolCalls = 0;
   let writeApproved = false;
   const writtenPaths = new Set<string>();
-  const budgetSent: Record<"turns" | "toolCalls" | "usd", BudgetStage> = { turns: "none", toolCalls: "none", usd: "none" };
+  const budgetSent: Record<"turns" | "toolCalls" | "usd" | "time", BudgetStage> = { turns: "none", toolCalls: "none", usd: "none", time: "none" };
   /** The turn whose one budget_status dialog was already asked; the host would cancel a second. */
-  let usdAskedTurn = -1;
+  let statusAskedTurn = -1;
   // The host counts these to tune the classifier; commands go out only as a basename and a hash.
   const decide = (tool: string, decision: PolicyVerdict, reason: string, extra: { approved?: boolean; command?: string; startedAt?: number } = {}) =>
     pi.appendEntry(POLICY_ENTRY, policyDecisionEntry({ tool, decision, reason, approved: extra.approved, command: extra.command, latencyMs: extra.startedAt === undefined ? undefined : Date.now() - extra.startedAt }));
@@ -227,7 +228,8 @@ export default function policyExtension(pi: ExtensionAPI) {
     budgetSent.turns = "none";
     budgetSent.toolCalls = "none";
     budgetSent.usd = "none";
-    usdAskedTurn = -1;
+    budgetSent.time = "none";
+    statusAskedTurn = -1;
     return undefined;
   });
 
@@ -242,11 +244,13 @@ export default function policyExtension(pi: ExtensionAPI) {
       budgetSent[key] = stage;
       notices.push(budgetMessage(stage, used, max, unit));
     }
-    if (budgetSent.usd !== "final" && usdAskedTurn !== turns && typeof ctx.ui?.input === "function") {
-      usdAskedTurn = turns;
-      const notice = usdBudgetNotice(await ctx.ui.input(BUDGET_STATUS_DIALOG, "", { timeout: BUDGET_STATUS_TIMEOUT_MS }));
-      if (notice && notice.stage !== budgetSent.usd) {
-        budgetSent.usd = notice.stage;
+    // One reply carries the dollars and, once it runs short, the active time. It is not asked after the final dollar warning.
+    if (budgetSent.usd !== "final" && statusAskedTurn !== turns && typeof ctx.ui?.input === "function") {
+      statusAskedTurn = turns;
+      const reply = await ctx.ui.input(BUDGET_STATUS_DIALOG, "", { timeout: BUDGET_STATUS_TIMEOUT_MS });
+      for (const [key, notice] of [["usd", usdBudgetNotice(reply)], ["time", activeTimeNotice(reply)]] as const) {
+        if (!notice || notice.stage === budgetSent[key] || budgetSent[key] === "final") continue;
+        budgetSent[key] = notice.stage;
         notices.push(notice.text);
       }
     }

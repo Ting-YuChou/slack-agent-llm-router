@@ -327,6 +327,42 @@ test("dollar budget: a notice at 75% and a final warning at 90%, once each", () 
   assert.ok(asks.every(([title, placeholder]) => title === "pi-agent/budget_status" && placeholder === ""));
 }));
 
+const MINUTE = 60_000;
+const timed = (usedMs: number, limitMs = 15 * MINUTE) => JSON.stringify({ used_usd: 1, limit_usd: 10, used_ms: usedMs, limit_ms: limitMs });
+
+test("active time: under a quarter left, a notice names the minutes left, then a final warning, once each", () => withWorkspace(async (cwd) => {
+  const policy = await sharedPolicy();
+  const { ctx, asks } = budgetCtx(cwd, [timed(11.25 * MINUTE), timed(11.5 * MINUTE), timed(12 * MINUTE), timed(13 * MINUTE), timed(816_000), timed(14 * MINUTE)]);
+  await policy.fire("input", {}, ctx);
+  const notices: Array<[number, string[]]> = [];
+  for (let turn = 1; turn <= 6; turn++) {
+    await policy.fire("turn_start", {}, ctx);
+    for (let call = 0; call < 2; call++) {
+      const text = budgetText(await callTool(policy, ctx));
+      if (text.length) notices.push([turn, text]);
+    }
+  }
+  assert.deepEqual(notices.map(([turn]) => turn), [2, 5], "exactly a quarter left is not yet short; each stage is sent once");
+  assert.deepEqual(notices.map(([, text]) => text.length), [1, 1]);
+  assert.match(notices[0][1][0], /^\[harness\] Budget notice: 11\.5\/15 minutes of the time budget used, 3\.5 minutes left\. Start to wrap up/);
+  assert.match(notices[1][1][0], /^\[harness\] Final budget warning: 13\.6\/15 minutes of the time budget used, 1\.4 minutes left\. Stop exploring/);
+  assert.equal(asks.length, 6, "the dialog is still asked once per turn: the dollars never reached their final warning");
+}));
+
+test("budget notices say how much is left, in dollars and in tool calls", () => withWorkspace(async (cwd) => {
+  const policy = await sharedPolicy();
+  const { ctx } = budgetCtx(cwd, [usd(7.5)]);
+  await policy.fire("input", {}, ctx);
+  await policy.fire("turn_start", {}, ctx);
+  assert.match(budgetText(await callTool(policy, ctx))[0] ?? "", /^\[harness\] Budget notice: \$7\.50\/\$10\.00 of the model budget used, \$2\.50 left\./);
+  const calls = await loadPolicy({ PI_AGENT_MAX_TOOL_CALLS: "12", PI_AGENT_MAX_TURNS: "100" });
+  const plain = { cwd, abort: () => undefined, ui: { confirm: async () => true } };
+  await calls.fire("input", {}, plain);
+  const notices: string[] = [];
+  for (let call = 1; call <= 9; call++) notices.push(...budgetText(await callTool(calls, plain)));
+  assert.deepEqual(notices.map(text => text.match(/^\[harness\] Budget notice: [^.]*\./)?.[0]), ["[harness] Budget notice: 9/12 tool calls used, 3 left."]);
+}));
+
 test("dollar budget: an unavailable, cancelled or malformed reply adds no notice", () => withWorkspace(async (cwd) => {
   for (const reply of [JSON.stringify({ unavailable: true }), undefined, "not json", JSON.stringify({ used_usd: 9, limit_usd: 0 }), JSON.stringify({ used_usd: "9", limit_usd: 10 })]) {
     const policy = await sharedPolicy();

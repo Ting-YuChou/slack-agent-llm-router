@@ -21,6 +21,7 @@ import { redact } from "./telemetry.js";
 import { DEFAULT_DIFF_LIMITS, DiffLimitError } from "./worktree-manager.js";
 import { PatchApplyError } from "./patch-archive.js";
 import { MIN_CHECKS_WINDOW_MS, rejected, type WriterChecksRequest, type WriterChecksResponse } from "./writer-checks.js";
+import { SHORT_TIME_SHARE } from "./budget-notice.js";
 import type { DiskQuota } from "./disk-usage.js";
 import type { AttemptStartup } from "./startup-timing.js";
 
@@ -272,6 +273,8 @@ export class CodingAgentOrchestrator {
   private readonly threadSessions = new Map<string, string>();
   private readonly runs = new Map<string, RunRecord>();
   private readonly deadlines = new Map<string, ReturnType<typeof setTimeout>>();
+  /** When each armed deadline fires and how long it was set for, keyed by its timer so it goes when the timer does. */
+  private readonly deadlineClocks = new WeakMap<ReturnType<typeof setTimeout>, { endsAt: number; ms: number }>();
   private readonly diskWatches = new Map<string, Array<ReturnType<typeof setInterval>>>();
   private readonly diskQuota?: DiskQuota;
   private readonly sessionQuota?: DiskQuota;
@@ -304,6 +307,7 @@ export class CodingAgentOrchestrator {
   private readonly observeRun?: (run: RunRecord) => void;
   private readonly observePolicy?: (runId: string, sessionId: string, decision: PolicyDecision) => void;
   private readonly observeLifecycle?: (runId: string, name: string, phase: "start" | "end", failed?: boolean, sessionId?: string) => void;
+  private readonly budgetStatus?: (runId: string) => { used_usd: number; limit_usd: number } | undefined;
 
   constructor(options: {
     captureState?: CodingAgentOrchestrator["captureState"];
@@ -334,6 +338,8 @@ export class CodingAgentOrchestrator {
     approvalLedger?: ApprovalLedger;
     /** How long terminal runs stay readable after their last update; defaults to RUN_RETENTION_MS. */
     runRetentionMs?: number;
+    /** Dollars spent of the host ledger budget that meters a run without a workflow budget, for its budget_status dialog. */
+    budgetStatus?: CodingAgentOrchestrator["budgetStatus"];
   }) {
     this.captureState = options.captureState;
     this.observeRun = options.observeRun; this.observePolicy = options.observePolicy; this.observeLifecycle = options.observeLifecycle;
@@ -355,6 +361,7 @@ export class CodingAgentOrchestrator {
     this.approvalLedger = options.approvalLedger;
     this.approvals = new ApprovalStore({ persistence: options.approvalLedger });
     this.runRetentionMs = options.runRetentionMs ?? RUN_RETENTION_MS;
+    this.budgetStatus = options.budgetStatus;
     if (this.deliveryApproval && !this.worktrees.patch) throw new Error("Delivery approval needs worktrees.patch to bind the approved diff");
   }
 
@@ -931,6 +938,23 @@ export class CodingAgentOrchestrator {
     const deadline = setTimeout(() => this.background(this.timeoutRun(session, run)), ms);
     deadline.unref();
     this.deadlines.set(runId, deadline);
+    this.deadlineClocks.set(deadline, { endsAt: Date.now() + ms, ms });
+  }
+
+  /** The run's active time once less than SHORT_TIME_SHARE of it is left; until then budget_status carries dollars only. */
+  private shortActiveTime(run: RunRecord): { used_ms: number; limit_ms: number } | undefined {
+    const time = this.activeTime(run);
+    return time && time.left < SHORT_TIME_SHARE * time.limit ? { used_ms: time.limit - time.left, limit_ms: time.limit } : undefined;
+  }
+
+  /** The run's active-time budget and what is left of it: its workflow budget's, or else its deadline's. */
+  private activeTime(run: RunRecord): { limit: number; left: number } | undefined {
+    const workflow = this.workflows.get(run.run_id);
+    // The workflow budget holds what was left when it started; the run's budget also counts what came before.
+    if (workflow) return { limit: workflow.initialActiveMs + workflow.budget.limitMs, left: workflow.budget.remainingMs() };
+    const timer = this.deadlines.get(run.run_id);
+    const clock = timer && this.deadlineClocks.get(timer);
+    return clock && { limit: clock.ms, left: Math.max(0, clock.endsAt - Date.now()) };
   }
 
   /**
@@ -1035,9 +1059,12 @@ export class CodingAgentOrchestrator {
       return;
     }
     if (event.type === "budget_request") {
-      // Only dollar figures cross the dialog; runs without a workflow budget have none to give.
+      // Only budget figures cross the dialog. A run without a workflow budget is metered by the host ledger.
       const budget = this.workflows.get(run.run_id)?.budget;
-      session.process.respondUi(event.request_id, { value: JSON.stringify(budget ? { used_usd: budget.estimatedUsd, limit_usd: budget.limitUsd } : { unavailable: true }) });
+      let usd: { used_usd: number; limit_usd: number } | undefined;
+      try { usd = budget ? { used_usd: budget.estimatedUsd, limit_usd: budget.limitUsd } : this.budgetStatus?.(run.run_id); }
+      catch { /* The gateway still enforces the budget; the writer only misses a notice. */ }
+      session.process.respondUi(event.request_id, { value: JSON.stringify({ ...(usd ?? { unavailable: true }), ...this.shortActiveTime(run) }) });
       return;
     }
     if (event.type === "tool") {

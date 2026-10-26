@@ -1,4 +1,5 @@
 import { resolveAgentModel } from "./agent-model.js";
+import type { BudgetLedger } from "./budget-ledger.js";
 import type { ModelPrice } from "./gateway-budget.js";
 import type { GatewayRole } from "./gateway-token.js";
 
@@ -48,4 +49,11 @@ export function releaseRunBudget(run: { run_id: string; status: string }, parent
 /** Whether the budget an execution spends (its parent run's, or its own) is still open. */
 export function executionActive(execution: string, parents: ReadonlyMap<string, string>, ledger: { active(id: string): boolean }, recorded?: (execution: string) => string | undefined): boolean {
   return ledger.active(parents.get(execution) ?? recorded?.(execution) ?? execution);
+}
+
+/** Dollars spent of the ledger budget an execution is metered under, for its writer's budget_status dialog. */
+export function runBudgetStatus(execution: string, parents: ReadonlyMap<string, string>, ledger: Pick<BudgetLedger, "open" | "summary">, defaultUsd: number, recorded?: (execution: string) => string | undefined): { used_usd: number; limit_usd: number } | undefined {
+  // The same budget its gateway token spends; the gateway refuses a request once this reaches the limit.
+  const { estimated_usd, initial_cost_usd = 0, limit_usd } = ledger.summary(budgetIdFor(execution, parents, ledger, defaultUsd, recorded));
+  return limit_usd === undefined ? undefined : { used_usd: initial_cost_usd + estimated_usd, limit_usd };
 }
