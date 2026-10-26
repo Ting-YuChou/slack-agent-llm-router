@@ -30,6 +30,13 @@ clickhouse_mcp_started=false
 clickhouse_gateway_started=false
 context7_gateway_started=false
 cleanup_started=false
+check_only=false
+if [[ $# -eq 1 && "$1" == --check ]]; then
+  check_only=true
+elif [[ $# -gt 0 ]]; then
+  printf 'Usage: %s [--check]\n  --check  verify settings, images and locks without starting anything\n' "$0" >&2
+  exit 2
+fi
 
 stop_child() {
   local child_pid="$1"
@@ -50,7 +57,7 @@ cleanup() {
   cleanup_started=true
   stop_child "${worker_pid}"
   stop_child "${agent_pid}"
-  if [[ "${DEMO_TEST_MODE:-0}" != 1 ]]; then
+  if [[ "${DEMO_TEST_MODE:-0}" != 1 && "${check_only}" != true ]]; then
     while IFS= read -r container_id; do
       if [[ -n "${container_id}" ]]; then docker stop "${container_id}" >/dev/null 2>&1 || true; fi
     done < <(docker ps -q --filter label=slack-pi-agent-session=true 2>/dev/null || true)
@@ -171,6 +178,9 @@ if [[ "${clickhouse_mcp_enabled}" == true ]]; then
     if [[ -z "${!name:-}" ]]; then printf 'Missing required ClickHouse MCP setting: %s\n' "${name}" >&2; exit 2; fi
   done
 fi
+# make demo-agent-images locks the local image in these gitignored copies; the tracked locks are never rewritten.
+plugin_lock="${PI_AGENT_PLUGIN_LOCK:-${repo_root}/.pi-agent-runtime/locks/plugins.lock.json}"
+skill_lock="${PI_AGENT_SKILL_LOCK:-${repo_root}/.pi-agent-runtime/locks/skills.lock.json}"
 configured_providers="openai"
 if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then configured_providers="${configured_providers},anthropic"; fi
 if [[ -n "${OPENCODE_API_KEY:-}" ]]; then configured_providers="${configured_providers},opencode-go"; fi
@@ -197,7 +207,42 @@ if [[ "${DEMO_TEST_MODE:-0}" != 1 ]]; then
   export PI_AGENT_IMAGE="${agent_image}"
   PI_AGENT_IMAGE_DIGEST="$(docker image inspect --format='{{.Id}}' "${agent_image}")"
   export PI_AGENT_IMAGE_DIGEST
+  for lock in "${plugin_lock}" "${skill_lock}"; do
+    if [[ ! -f "${lock}" ]]; then
+      printf 'Missing demo lock %s. Run: make demo-agent-images\n' "${lock}" >&2
+      exit 2
+    fi
+  done
+  # lock-image writes the lock with JSON.stringify(lock, null, 2), so the top-level key is indented by two spaces.
+  locked_digest="$(sed -nE 's/^  "image_digest": "(sha256:[a-f0-9]{64})",?$/\1/p' "${plugin_lock}")"
+  if [[ "${locked_digest}" != "${PI_AGENT_IMAGE_DIGEST}" ]]; then
+    printf 'Demo lock %s pins %s, but %s is %s. Run: make demo-agent-images\n' \
+      "${plugin_lock}" "${locked_digest:-no image}" "${agent_image}" "${PI_AGENT_IMAGE_DIGEST}" >&2
+    exit 2
+  fi
+  # The runtime's own startup checks, run here so a stale image or lock is named before anything starts.
+  if ! DEMO_RUNTIME_DIR="${agent_runtime_dir}" DEMO_IMAGE_DIGEST="${PI_AGENT_IMAGE_DIGEST}" DEMO_PLUGIN_LOCK="${plugin_lock}" \
+      node --input-type=module -e '
+const { pathToFileURL } = await import("node:url");
+const manifest = await import(pathToFileURL(process.env.DEMO_RUNTIME_DIR + "/dist/src/image-manifest.js").href);
+try {
+  await manifest.assertImageMatchesHost(process.env.DEMO_IMAGE_DIGEST, process.env.DEMO_RUNTIME_DIR);
+  await manifest.assertImageManifest(process.env.DEMO_PLUGIN_LOCK, process.env.DEMO_IMAGE_DIGEST);
+} catch (error) {
+  process.stderr.write(error.message + "\n");
+  process.exit(1);
+}'; then
+    printf 'Run: make demo-agent-images\n' >&2
+    exit 2
+  fi
+fi
+export PI_AGENT_PLUGIN_LOCK="${plugin_lock}" PI_AGENT_SKILL_LOCK="${skill_lock}"
+if [[ "${check_only}" == true ]]; then
+  printf 'Demo preflight passed: settings, images and locks match this checkout.\n'
+  exit 0
+fi
 
+if [[ "${DEMO_TEST_MODE:-0}" != 1 ]]; then
   if ! docker network inspect "${agent_network}" >/dev/null 2>&1; then
     docker network create --internal "${agent_network}" >/dev/null
     network_created=true
