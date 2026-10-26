@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 
 import { resolveAgentModel } from "../src/agent-model.js";
-import { budgetIdFor, outputTokenLimitFor, parseDefaultRunBudget, priceFor, releaseRunBudget } from "../src/run-budget.js";
+import { BudgetLedger } from "../src/budget-ledger.js";
+import { budgetIdFor, outputTokenLimitFor, parseDefaultRunBudget, priceFor, releaseRunBudget, runBudgetStatus } from "../src/run-budget.js";
 
 test("each harness role has its own output-token cap", () => {
   assert.equal(outputTokenLimitFor("writer"), 32768);
@@ -57,5 +61,24 @@ test("every way a run can end stops its own budget, including a rejected approva
     const stopped: string[] = [];
     releaseRunBudget({ run_id: "run-1", status }, new Map(), { stop: (id: string) => { stopped.push(id); } });
     assert.deepEqual(stopped, ["run-1"], status);
+  }
+});
+
+test("budget_status reads the ledger budget a run spends: its own default one, or its workflow's", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "run-budget-status-"));
+  const ledger = new BudgetLedger(path.join(dir, "budget.sqlite"));
+  try {
+    const defaultUsd = parseDefaultRunBudget({});
+    assert.deepEqual(runBudgetStatus("run-1", new Map(), ledger, defaultUsd), { used_usd: 0, limit_usd: 5 });
+    ledger.reserve("run-1", "r1", 0.5); ledger.settle("r1", 1.25);
+    ledger.reserve("run-1", "r2", 0.25);
+    assert.deepEqual(runBudgetStatus("run-1", new Map(), ledger, defaultUsd), { used_usd: 1.5, limit_usd: 5 }, "settled spend plus open reservations");
+    ledger.open("workflow-1", 8, 0.5);
+    assert.deepEqual(runBudgetStatus("exec-1", new Map([["exec-1", "workflow-1"]]), ledger, defaultUsd), { used_usd: 0.5, limit_usd: 8 });
+    assert.deepEqual(runBudgetStatus("exec-2", new Map(), ledger, defaultUsd, id => id === "exec-2" ? "workflow-1" : undefined), { used_usd: 0.5, limit_usd: 8 });
+    assert.equal(runBudgetStatus("exec-3", new Map([["exec-3", "workflow-3"]]), ledger, defaultUsd), undefined, "a workflow budget never opened has no figures");
+  } finally {
+    ledger.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });

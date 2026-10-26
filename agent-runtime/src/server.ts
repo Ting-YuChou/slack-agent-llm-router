@@ -17,7 +17,7 @@ import { approvalSettings } from "./approval-mode.js";
 import { parseAgentLimitConfig } from "./agent-limits.js";
 
 export { parseAgentLimits } from "./agent-limits.js";
-import { budgetIdFor, executionActive, outputTokenLimitFor, parseDefaultRunBudget, releaseRunBudget } from "./run-budget.js";
+import { budgetIdFor, executionActive, outputTokenLimitFor, parseDefaultRunBudget, releaseRunBudget, runBudgetStatus } from "./run-budget.js";
 import { deriveMcpRevocationSecret } from "./execution-status.js";
 import { deriveSessionSealKey, SessionSeal } from "./session-seal.js";
 import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT, listAgentModels, resolveAgentModel } from "./agent-model.js";
@@ -532,6 +532,8 @@ export async function createProductionServer() {
     deadlineMs: positiveInteger(process.env.PI_AGENT_DEADLINE_MS, 15 * 60_000),
     deliveryApproval: { ttlMs: approval.deliveryTtlMs, secrets: credentialValues },
     approvalLedger,
+    // A run without a profile has no workflow budget; its writer hears what it spent of its default ledger budget.
+    budgetStatus: runId => runBudgetStatus(runId, executionParents, budgetLedger, defaultRunBudgetUsd, id => workflowControl?.get<{ parent?: string }>("execution", id)?.parent),
     availableModelRefs: configuredModels.map((model) => model.ref),
     router,
     mcpRepository,

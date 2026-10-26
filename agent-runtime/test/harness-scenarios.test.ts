@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { BudgetLedger } from "../src/budget-ledger.js";
 import { HarnessError } from "../src/error-taxonomy.js";
 import { publicRun } from "../src/orchestrator.js";
+import { parseDefaultRunBudget, runBudgetStatus } from "../src/run-budget.js";
 import { awaitUi, piTurn, runScenario, settledRecord, type Scenario } from "./support/scenario.js";
 
 const fix = { "src/a.js": "export const a = 2;\n" };
@@ -309,4 +312,24 @@ test("S23 a run without a workflow budget answers budget_status as unavailable",
     expect: { status: "completed", committed: false } });
   assert.deepEqual(responses.map(item => item.id), ["ui-b1"]);
   assert.deepEqual(JSON.parse((responses[0].response as { value: string }).value), { unavailable: true });
+});
+
+test("S23 a run without a profile answers budget_status with its default ledger budget", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "s23-ledger-"));
+  const ledger = new BudgetLedger(path.join(dir, "budget.sqlite"));
+  try {
+    const { responses } = await runScenario({ name: "S23 budget_status default budget",
+      // As the server answers it: the budget the run's gateway token spends, opened at the default limit.
+      budgetStatus: runId => runBudgetStatus(runId, new Map(), ledger, parseDefaultRunBudget({})),
+      attempts: [{ files: fix, records: [
+        { type: "turn_start" }, { type: "extension_ui_request", id: "ui-b1", method: "input", title: "pi-agent/budget_status", placeholder: "" },
+        ...piTurn("stop", "Fixed"), settledRecord,
+      ] }],
+      expect: { status: "completed", committed: false } });
+    assert.deepEqual(responses.map(item => item.id), ["ui-b1"]);
+    assert.deepEqual(JSON.parse((responses[0].response as { value: string }).value), { used_usd: 0, limit_usd: 5 });
+  } finally {
+    ledger.close();
+    await rm(dir, { recursive: true, force: true });
+  }
 });

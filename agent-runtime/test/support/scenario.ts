@@ -39,6 +39,8 @@ export interface Scenario {
   grade?: ScriptedGrade[];
   /** Overrides merged over the scenario's quality services. */
   quality?: Partial<QualityServices>;
+  /** The host's ledger reader for budget_status, as the server passes it to the orchestrator. */
+  budgetStatus?: ConstructorParameters<typeof CodingAgentOrchestrator>[0]["budgetStatus"];
   /** Replaces the real patch archiver (which writes under the scenario root's artifacts/). */
   archivePatch?: PatchArchiver;
   /** Turns on delivery approval; `delivery` is how the owner answers the card (`expire` lets its short TTL run out). */
@@ -199,6 +201,7 @@ export async function runScenario(scenario: Scenario): Promise<ScenarioResult> {
       },
       deadlineMs: 30_000,
       quality: qualityFor(scenario, counters),
+      ...(scenario.budgetStatus ? { budgetStatus: scenario.budgetStatus } : {}),
       archivePatch: archiver,
       ...(scenario.deliveryApproval ? { deliveryApproval: { ttlMs: scenario.delivery === "expire" ? 50 : 30_000 } } : {}),
     });
