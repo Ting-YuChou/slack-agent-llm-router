@@ -11,11 +11,12 @@ from unittest.mock import AsyncMock
 import pytest
 import yaml
 
-from slack.bot_real import SlackBot
+from slack.bot_real import SlackBot, SlackMessageHandler
 from src.utils.schema import PlatformConfig
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SETUP_GUIDE = ROOT / "docs" / "slack-setup.md"
 
 
 def test_demo_config_is_single_provider_and_needs_no_infrastructure():
@@ -769,3 +770,65 @@ def test_demo_runner_rejects_unknown_arguments(tmp_path):
     assert result.returncode == 2
     assert "--check" in result.stderr
     assert not log.exists()
+
+
+def test_setup_guide_lists_every_bot_scope_the_manifest_requests():
+    manifest = yaml.safe_load(
+        (ROOT / "slack" / "app-manifest.demo.yaml").read_text(encoding="utf-8")
+    )
+    guide = SETUP_GUIDE.read_text(encoding="utf-8")
+
+    scopes = manifest["oauth_config"]["scopes"]["bot"]
+    assert "files:write" in scopes
+    assert [scope for scope in scopes if f"`{scope}`" not in guide] == []
+
+
+def demo_required_env_vars():
+    """Every variable whose absence makes run_slack_demo.sh exit, optional MCP ones included."""
+    launcher = (ROOT / "scripts" / "run_slack_demo.sh").read_text(encoding="utf-8")
+    names = set()
+    for group in re.findall(r"^\s*for name in ([A-Z0-9_ ]+); do$", launcher, re.M):
+        names.update(group.split())
+    names.update(
+        re.findall(
+            r'-z "\$\{([A-Z][A-Z0-9_]*):-\}" \]\]; then printf \'[^\']* is required',
+            launcher,
+        )
+    )
+    return names
+
+
+def test_setup_guide_lists_every_env_var_the_launcher_requires():
+    guide = SETUP_GUIDE.read_text(encoding="utf-8")
+
+    required = demo_required_env_vars()
+    assert {
+        "OPENAI_API_KEY",
+        "SLACK_BOT_TOKEN",
+        "SLACK_APP_TOKEN",
+        "GITHUB_APP_ID",
+        "CONTEXT7_API_KEY",
+    } <= required
+    missing = sorted(
+        name
+        for name in required
+        if not re.search(rf"(?<![A-Z0-9_]){name}(?![A-Z0-9_])", guide)
+    )
+    assert missing == []
+
+
+@pytest.mark.asyncio
+async def test_setup_guide_lists_every_agent_subcommand_in_the_help():
+    handler = SlackMessageHandler(SimpleNamespace(agent_runtime_client=object()))
+    help_text = await handler._handle_help_command([], "U1", "C1", None)
+    guide = SETUP_GUIDE.read_text(encoding="utf-8")
+
+    subcommands = [
+        option
+        for usage in re.findall(r"`/llm agent ([^`]+)`", help_text)
+        for option in usage.split()[0].split("|")
+    ]
+    assert {"<task>", "--discuss", "--implement", "status", "close"} <= set(subcommands)
+    assert [
+        option for option in subcommands if f"/llm agent {option}" not in guide
+    ] == []
