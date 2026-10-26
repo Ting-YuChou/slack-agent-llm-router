@@ -1336,6 +1336,19 @@ class SlackMessageHandler:
             if flags.consumed:
                 text = flags.text
                 routing_text = flags.text
+            files_note = ""
+            files = [
+                item for item in event.get("files") or [] if isinstance(item, dict)
+            ]
+            builder = getattr(self.bot, "agent_bootstrap_builder", None)
+            if files and builder is not None:
+                # Like the files of an initial request's thread, these reach
+                # the agent as untrusted reference context for the task.
+                loaded = await builder.build_message_files(
+                    client, files=files, owner_user_id=user_id, task=text
+                )
+                text = loaded.prompt
+                files_note = self._attached_files_note(loaded)
             return await self._start_agent_prompt(
                 text,
                 user_id,
@@ -1345,6 +1358,7 @@ class SlackMessageHandler:
                 thread_ts=event.get("thread_ts"),
                 routing_text=routing_text,
                 request_id=event.get("ts"),
+                **({"status_note": files_note} if files_note else {}),
                 **(
                     {"workflow_mode": flags.workflow_mode}
                     if flags.workflow_mode
@@ -1395,6 +1409,21 @@ class SlackMessageHandler:
             workflow_mode=workflow_mode,
             consumed=consumed,
         )
+
+    @staticmethod
+    def _attached_files_note(loaded: AgentBootstrapContext) -> str:
+        details = [f"Loaded {loaded.resource_count} attached resources."]
+        if loaded.truncated:
+            details.append("Attachments truncated to configured limits.")
+        if loaded.partial:
+            details.append("Attachments are partial: the time budget ran out.")
+        if loaded.warnings:
+            details.append(
+                "Skipped or partial resources: `"
+                + "`, `".join(loaded.warnings[:10])
+                + "`."
+            )
+        return "\n".join(details)
 
     @staticmethod
     def _agent_mode_summary(task_mode: str, workflow_mode: Optional[str]) -> str:
@@ -5289,6 +5318,7 @@ class SlackBot:
                     thread_ts=nonce.thread_ts,
                     owner_user_id=user_id,
                     task=submission.task,
+                    selected_ts=nonce.selected_message_ts,
                 )
             except AgentBootstrapFetchError as exc:
                 if status_ts:
@@ -5310,6 +5340,10 @@ class SlackBot:
             )
             if bootstrap.truncated:
                 details.append("Context truncated to configured limits.")
+            if bootstrap.partial:
+                details.append(
+                    "Context is partial: the Slack fetch time budget ran out."
+                )
             if bootstrap.error:
                 details.append(
                     f"Started without prior Slack context: `{bootstrap.error}`."
