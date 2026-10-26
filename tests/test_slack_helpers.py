@@ -3163,6 +3163,36 @@ async def test_agent_start_sends_a_key_derived_from_the_triggering_message():
     assert "200.5" not in keys[0], "the key does not echo Slack identifiers"
 
 
+@pytest.mark.asyncio
+async def test_agent_start_message_describes_delivery_approval():
+    agent_runtime = SimpleNamespace(
+        create_session=AsyncMock(
+            return_value={"session_id": "s", "run_id": "r", "status": "starting"}
+        )
+    )
+    bot = SlackBot(
+        {"channels": []},
+        inference_engine=SimpleNamespace(process_query=AsyncMock()),
+        services={"agent_runtime": agent_runtime},
+    )
+    bot._monitor_agent_run = AsyncMock()
+    client = SimpleNamespace(
+        chat_postMessage=AsyncMock(return_value={"ts": "100.1"}),
+        chat_update=AsyncMock(),
+    )
+    handler = SlackMessageHandler(bot)
+
+    await handler._handle_agent_command(
+        ["fix", "it"], "U1", "C1", client, team_id="T1", message_ts="100.1"
+    )
+
+    started = client.chat_update.await_args.kwargs["text"]
+    # Delivery mode runs worktree edits without a prompt; the owner approves the diff.
+    assert "edits and risky shell commands require approval" not in started
+    assert "Edits in this worktree run automatically" in started
+    assert "approves the final diff" in started
+
+
 def _agent_control_bot(method):
     accepted = {"run_id": "R", "session_id": "S", "status": "starting"}
     if method in {"repair_ci", "retry_publication"}:
