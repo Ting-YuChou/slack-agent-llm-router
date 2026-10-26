@@ -6,6 +6,12 @@ VERIFICATION_IMAGE = "slack-pi-verification:structured-test"
 GATEWAY_IMAGE = "slack-pi-model-gateway:structured-test"
 OWNER = "fixture-owner"
 ACTIVE_STATUSES = ("running", "starting", "awaiting_approval")
+# How the fixture owner answers the delivery card: approve it, reject it, or let it lapse.
+DELIVERY_DECISIONS = ("deliver", "discard", "expire")
+# The run error a declined delivery must end with; nothing may be committed.
+DECLINED_DELIVERY = {"discard": "delivery_rejected", "expire": "delivery_expired"}
+# An expire run leaves its card unanswered; a short TTL lapses well within the run timeout.
+EXPIRING_DELIVERY_TTL_MS = 20000
 # Catalog prices (USD per million tokens, agent-runtime/src/agent-model.ts).
 # The gateway ledger is the run's hard spend cap, so a markup or full-rate
 # cached input would exhaust it well below the real spend.
@@ -28,6 +34,14 @@ def parse_args(argv=None):
         "--exercise-resume",
         action="store_true",
         help="Interrupt read-only discovery after one worker completes and resume the same run",
+    )
+    parser.add_argument(
+        "--delivery-decision",
+        choices=DELIVERY_DECISIONS,
+        default="deliver",
+        help="How the fixture owner answers the delivery card (default deliver); "
+        "discard rejects it and expire lets it lapse, and either must end the run "
+        "without a commit",
     )
     args = parser.parse_args(argv)
     if not args.live_openai:
@@ -100,6 +114,13 @@ def init_fixture_repo(
     return git(repo, "rev-parse", "HEAD")
 
 
+def delivery_env(decision):
+    """Runtime env a delivery decision needs: an expire run's card must lapse quickly."""
+    if decision == "expire":
+        return {"PI_AGENT_DELIVERY_TTL_MS": str(EXPIRING_DELIVERY_TTL_MS)}
+    return {}
+
+
 def collect_spans(observer):
     spans = []
     otel = pathlib.Path(observer) / "otel.jsonl"
@@ -157,9 +178,12 @@ def host_access(network):
 
 
 class Topology:
-    """Isolated docker networks, OTEL receiver, model gateway and host runtime."""
+    """Isolated docker networks, OTEL receiver, model gateway and host runtime.
 
-    def __init__(self, project, root, repo, key, profile_path):
+    ``env`` adds to, or overrides, the runtime's settings (an MCP mode, a delivery TTL).
+    """
+
+    def __init__(self, project, root, repo, key, profile_path, env=None):
         self.project = project
         self.root = root
         self.repo = repo
@@ -181,6 +205,7 @@ class Topology:
         self.signing = None
         self.base = None
         self.env = None
+        self.extra_env = dict(env or {})
 
     def __enter__(self):
         try:
@@ -349,6 +374,7 @@ class Topology:
                 "AGENT_KAFKA_BROKERS": "127.0.0.1:1",
             }
         )
+        env.update(self.extra_env)
         self.env = env
         self.log = open(root / "runtime.log", "w")
         self.start_runtime()
@@ -398,6 +424,14 @@ class Topology:
         with urllib.request.urlopen(req, timeout=20) as response:
             return json.load(response)
 
+    def download(self, path):
+        """GET ``path`` and return the raw body, such as a run's retained patch."""
+        req = urllib.request.Request(
+            self.base + path, headers={"authorization": "Bearer " + self.token}
+        )
+        with urllib.request.urlopen(req, timeout=20) as response:
+            return response.read()
+
     def close(self):
         if self.runtime:
             self.runtime.terminate()
@@ -427,12 +461,18 @@ class Topology:
         return collect_spans(self.observer)
 
 
-def drive_run(topology, run_id, timeout_s=360, poll_s=0.5):
-    """Approve each pending approval as the fixture owner until the run ends.
+def drive_run(topology, run_id, timeout_s=360, poll_s=0.5, delivery="deliver"):
+    """Answer each pending approval as the fixture owner until the run ends.
 
-    A run still active at the deadline is cancelled; returns (state, approvals).
+    Every approval is approved except the delivery card, which ``delivery``
+    decides: ``deliver`` approves it, ``discard`` rejects it and ``expire`` leaves
+    it unanswered until it lapses. A run still active at the deadline is
+    cancelled; returns (state, the ids of the approvals answered).
     """
+    if delivery not in DELIVERY_DECISIONS:
+        raise ValueError(f"delivery must be one of {DELIVERY_DECISIONS}")
     approvals = set()
+    unanswered = set()
     deadline = time.monotonic() + timeout_s
     while True:
         state = topology.request("/v1/runs/" + run_id)
@@ -442,17 +482,21 @@ def drive_run(topology, run_id, timeout_s=360, poll_s=0.5):
                     event
                     for event in reversed(state["events"])
                     if event.get("type") == "approval"
-                    and event["approval_id"] not in approvals
+                    and event["approval_id"] not in approvals | unanswered
                 ),
                 None,
             )
-            if approval:
+            card = approval is not None and approval.get("kind") == "delivery"
+            if card and delivery == "expire":
+                unanswered.add(approval["approval_id"])
+            elif approval:
+                decision = "reject" if card and delivery == "discard" else "approve"
                 topology.request(
                     "/v1/runs/" + run_id + "/decisions",
                     {
                         "user_id": OWNER,
                         "approval_id": approval["approval_id"],
-                        "decision": "approve",
+                        "decision": decision,
                     },
                 )
                 approvals.add(approval["approval_id"])
@@ -508,11 +552,13 @@ def run_acceptance(args):
     root = make_root("structured-acceptance-")
     repo = root / "repo"
     repo.mkdir()
+    delivery = args.delivery_decision
     report = {
         "fixture": str(root),
         "external_publication": False,
         "approvals": "simulated fixture owner",
         "models": "live OpenAI",
+        "delivery_decision": delivery,
         "status": "starting",
     }
     topology = None
@@ -550,7 +596,9 @@ def run_acceptance(args):
             },
         }
         (root / "profile.json").write_text(json.dumps(profile))
-        topology = Topology(project, root, repo, key, root / "profile.json")
+        topology = Topology(
+            project, root, repo, key, root / "profile.json", env=delivery_env(delivery)
+        )
         topology.start()
         created = topology.request(
             "/v1/sessions",
@@ -568,7 +616,7 @@ def run_acceptance(args):
         report["run_id"] = run_id
         if args.exercise_resume:
             report["resume"] = exercise_resume(topology, root, run_id)
-        state, approvals = drive_run(topology, run_id)
+        state, approvals = drive_run(topology, run_id, delivery=delivery)
         tasks = topology.request("/v1/runs/" + run_id + "/tasks")
         (root / "result.json").write_text(
             json.dumps({"run": state, "tasks": tasks}, indent=2)
@@ -591,6 +639,7 @@ def run_acceptance(args):
                 "cost_usd": state.get("estimated_cost_usd"),
                 "timing": state.get("timing"),
                 "commit": state.get("commit"),
+                "error_code": (state.get("error") or {}).get("code"),
                 "approval_count": len(approvals),
             }
         )
@@ -606,13 +655,18 @@ def run_acceptance(args):
 
 
 def exit_code(report):
-    """Fail the acceptance unless the run completed and every gate passed."""
-    passed = (
-        report.get("status") == "completed"
-        and report.get("verification") == "passed"
-        and report.get("grader") == "passed"
-    )
-    return 0 if passed else 1
+    """Fail the acceptance unless the gates passed and the run ended as decided.
+
+    A delivered run must complete; a discarded or expired one must end with that
+    decision's error code and without a commit.
+    """
+    gates = report.get("verification") == "passed" and report.get("grader") == "passed"
+    declined = DECLINED_DELIVERY.get(report.get("delivery_decision", "deliver"))
+    if declined:
+        ended = report.get("error_code") == declined and not report.get("commit")
+    else:
+        ended = report.get("status") == "completed"
+    return 0 if gates and ended else 1
 
 
 def main(argv=None):

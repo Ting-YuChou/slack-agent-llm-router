@@ -16,6 +16,14 @@ Without an override flag a run uses the ``profile_overrides`` its baseline was
 recorded with, so the two stay comparable; ``--no-baseline-overrides`` runs the
 tasks' own profiles. A run whose overrides differ from the baseline's is warned
 about, or failed with ``--strict-overrides``.
+
+Beyond its ``expect``, a task can require run signals: ``requires_repair``,
+``requires_run_checks`` (the writer ran run_checks and its first attempt passed),
+``requires_degrade`` (a structured investigation degraded to an unresolved gap)
+and ``mcp_servers`` (the run gets these servers and each must answer a call).
+A ``delivery_decision`` of ``discard`` or ``expire`` has the fixture owner reject
+the delivery card or let it lapse; the run must end with that decision's error
+code, and the oracle judges the patch it kept.
 """
 
 import argparse
@@ -43,6 +51,8 @@ EXPECTATIONS = ("pass", "must_not_commit", "scope_violation", "no_diff")
 TASK_MODES = ("implement", "discuss")
 WORKFLOW_MODES = ("single", "structured")
 ORACLE_DIR = ".eval-oracle"
+# MCP servers the eval topology can give a run: stdio servers, which need no gateway.
+EVAL_MCP_SERVERS = ("codegraph",)
 # suite -> (tasks directory, baseline), relative to the project.
 SUITES = {
     "tasks": ("eval/tasks", "eval/baseline.json"),
@@ -145,6 +155,15 @@ def run_causes(state):
     return cause_code, grader_cause and _bounded(redact_text(grader_cause))
 
 
+def run_degrades(state):
+    """Causes of the structured investigations that degraded to an unresolved gap."""
+    return [
+        _string(event.get("cause"))
+        for event in state.get("events") or []
+        if isinstance(event, dict) and event.get("type") == "investigation_degraded"
+    ]
+
+
 def run_attempts(state):
     """Return each attempt's gates and whether it reused the writer, or ``None``."""
     attempts = state.get("attempts")
@@ -189,8 +208,32 @@ def load_task(task_dir):
         raise TaskError(
             f"{task_dir.name}: workflow_mode must be one of {WORKFLOW_MODES}"
         )
-    if not isinstance(task.get("requires_repair", False), bool):
-        raise TaskError(f"{task_dir.name}: requires_repair must be a boolean")
+    for flag in ("requires_repair", "requires_run_checks", "requires_degrade"):
+        if not isinstance(task.get(flag, False), bool):
+            raise TaskError(f"{task_dir.name}: {flag} must be a boolean")
+    if task.get("requires_degrade") and task.get("workflow_mode") != "structured":
+        raise TaskError(
+            f"{task_dir.name}: requires_degrade needs a structured workflow"
+        )
+    decision = task.get("delivery_decision", "deliver")
+    if decision not in topology.DELIVERY_DECISIONS:
+        raise TaskError(
+            f"{task_dir.name}: delivery_decision must be one of "
+            f"{topology.DELIVERY_DECISIONS}"
+        )
+    if decision != "deliver" and task["expect"] != "must_not_commit":
+        raise TaskError(
+            f"{task_dir.name}: a declined delivery must expect must_not_commit"
+        )
+    servers = task.get("mcp_servers", [])
+    if not isinstance(servers, list) or not all(
+        server in EVAL_MCP_SERVERS for server in servers
+    ):
+        raise TaskError(
+            f"{task_dir.name}: mcp_servers may list only {EVAL_MCP_SERVERS}"
+        )
+    if servers and task["task_mode"] == "discuss":
+        raise TaskError(f"{task_dir.name}: discuss runs get no mcp_servers")
     if not isinstance(task.get("prompt"), str) or not task["prompt"].strip():
         raise TaskError(f"{task_dir.name}: prompt is required")
     profile = task.get("profile")
@@ -254,11 +297,17 @@ def _in_scope(path, allowed_paths):
 def score_run(task, outcome):
     """Return ``{"passed", "reason"}`` for an outcome against ``task["expect"]``.
 
-    A task with ``requires_repair`` also needs a repair to have happened, in the
-    paused writer when its profile turns ``writerReuse`` on.
+    The outcome must also show every run signal the task requires (see the module
+    docstring). A task with ``requires_repair`` also needs a repair to have
+    happened, in the paused writer when its profile turns ``writerReuse`` on.
     """
     score = _score_expectation(task, outcome)
-    if not score["passed"] or not task.get("requires_repair"):
+    if not score["passed"]:
+        return score
+    missing = _missing_signal(task, outcome)
+    if missing:
+        return {"passed": False, "reason": missing}
+    if not task.get("requires_repair"):
         return score
     attempts = outcome.get("attempts") or []
     if len(attempts) < 2:
@@ -268,6 +317,33 @@ def score_run(task, outcome):
     if any(attempt.get("reused") is not True for attempt in attempts[1:]):
         return {"passed": False, "reason": "repair did not reuse the writer"}
     return {"passed": True, "reason": "repaired in a reused writer"}
+
+
+def _missing_signal(task, outcome):
+    """Why ``outcome`` lacks a run signal ``task`` requires; ``None`` if it has them all."""
+    declined = topology.DECLINED_DELIVERY.get(task.get("delivery_decision", "deliver"))
+    if declined and outcome.get("error_code") != declined:
+        ended = outcome.get("error_code") or outcome.get("status")
+        return f"run ended {ended}, not {declined}"
+    if task.get("requires_run_checks"):
+        if not outcome.get("writer_checks_calls"):
+            return "the writer never ran run_checks"
+        attempts = outcome.get("attempts") or []
+        if not attempts or not _gates_passed(attempts[0]):
+            return "run_checks did not catch the bug before final verification"
+    if task.get("requires_degrade") and not outcome.get("degraded_investigations"):
+        return "no investigation degraded"
+    for server in task.get("mcp_servers", []):
+        if not _mcp_answered(outcome, server):
+            return f"no {server} MCP call succeeded"
+    return None
+
+
+def _mcp_answered(outcome, server):
+    servers = (outcome.get("mcp_summary") or {}).get("servers") or {}
+    entry = servers.get(server) or {}
+    calls, failures = _number(entry.get("calls")), _number(entry.get("failures") or 0)
+    return calls is not None and failures is not None and calls > failures
 
 
 def _score_expectation(task, outcome):
@@ -523,6 +599,44 @@ def build_profile(task, image):
     return profile
 
 
+def runtime_env(task):
+    """Runtime settings a task needs on top of the topology's: MCP servers, a delivery TTL."""
+    env = topology.delivery_env(task.get("delivery_decision", "deliver"))
+    if task.get("mcp_servers"):
+        env.update(
+            PI_AGENT_MCP_MODE="read_only",
+            PI_AGENT_MCP_SERVERS=",".join(task["mcp_servers"]),
+        )
+    return env
+
+
+def candidate_tree(booted, run_id, repo, baseline):
+    """The tree a declined run's retained patch makes of ``baseline``, or ``None``.
+
+    Nothing was committed, so this is the change the owner declined; the oracle
+    judges it as it would a commit. ``repo``'s HEAD, index and files stay as they are.
+    """
+    try:
+        patch = booted.download(f"/v1/runs/{run_id}/patch?user_id={topology.OWNER}")
+        with tempfile.TemporaryDirectory(prefix="agent-eval-index-") as scratch:
+            env = {**os.environ, "GIT_INDEX_FILE": str(pathlib.Path(scratch) / "index")}
+            for argv, data in (
+                (["read-tree", baseline], None),
+                (["apply", "--cached"], patch),
+                (["write-tree"], None),
+            ):
+                result = subprocess.run(
+                    ["git", "-C", str(repo), *argv],
+                    input=data,
+                    env=env,
+                    capture_output=True,
+                    check=True,
+                )
+        return result.stdout.decode().strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
 def changed_files(repo, baseline, commit):
     if not commit:
         return []
@@ -585,9 +699,15 @@ class LiveRunner:
             repo, remote=f"https://github.com/fixture/{task['id']}.git"
         )
         (root / "profile.json").write_text(json.dumps(build_profile(task, self.image)))
+        decision = task.get("delivery_decision", "deliver")
         started = time.monotonic()
         with topology.Topology(
-            self.project, root, repo, self.key, root / "profile.json"
+            self.project,
+            root,
+            repo,
+            self.key,
+            root / "profile.json",
+            env=runtime_env(task),
         ) as booted:
             created = booted.request(
                 "/v1/sessions",
@@ -603,10 +723,13 @@ class LiveRunner:
                 },
             )
             state, _ = topology.drive_run(
-                booted, created["run_id"], timeout_s=self.timeout_s
+                booted, created["run_id"], timeout_s=self.timeout_s, delivery=decision
             )
+            commit = state.get("commit")
+            tree = commit or baseline
+            if not commit and decision != "deliver":
+                tree = candidate_tree(booted, created["run_id"], repo, baseline)
         wall_time_s = time.monotonic() - started
-        commit = state.get("commit")
         error_code, error_message = run_error(state, secrets=[self.key])
         error_cause_code, grader_cause = run_causes(state)
         return {
@@ -617,7 +740,7 @@ class LiveRunner:
             "grader": state.get("grader_status"),
             "commit": commit,
             "changed_files": changed_files(repo, baseline, commit),
-            "oracle": run_oracle(task, repo, commit or baseline, self.image),
+            "oracle": run_oracle(task, repo, tree, self.image) if tree else "error",
             "cost_usd": state.get("estimated_cost_usd"),
             "wall_time_s": wall_time_s,
             "error_code": error_code,
@@ -630,6 +753,8 @@ class LiveRunner:
             "policy_summary": state.get("policy_summary"),
             "harness_metrics": state.get("harness_metrics"),
             "attempts": run_attempts(state),
+            "degraded_investigations": run_degrades(state),
+            "mcp_summary": state.get("mcp_summary"),
         }
 
 
@@ -670,6 +795,8 @@ def execute(task, attempt, runner):
         "policy_summary": outcome.get("policy_summary"),
         "harness_metrics": outcome.get("harness_metrics"),
         "attempts": outcome.get("attempts"),
+        "degraded_investigations": outcome.get("degraded_investigations"),
+        "mcp_summary": outcome.get("mcp_summary"),
     }
 
 

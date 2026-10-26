@@ -5,6 +5,7 @@ import json
 import shutil
 import subprocess
 import threading
+import urllib.error
 import uuid
 
 import pytest
@@ -98,6 +99,198 @@ def test_drive_run_cancels_a_run_that_outlives_the_deadline():
 
     assert ("/v1/runs/run-1/cancel", {"user_id": "fixture-owner"}) in topology.calls
     assert state["status"] == "running"
+
+
+# --- delivery decisions --------------------------------------------------------
+
+
+def _delivery_states(final_status):
+    write = {"type": "approval", "approval_id": "w1"}
+    card = {"type": "approval", "kind": "delivery", "approval_id": "d1"}
+    return [
+        {"status": "awaiting_approval", "events": [write]},
+        {"status": "awaiting_approval", "events": [write, card]},
+        {"status": "awaiting_approval", "events": [write, card]},
+        {"status": final_status, "events": [write, card]},
+    ]
+
+
+@pytest.mark.parametrize(
+    "delivery, decisions",
+    [
+        ("deliver", [("w1", "approve"), ("d1", "approve")]),
+        ("discard", [("w1", "approve"), ("d1", "reject")]),
+        ("expire", [("w1", "approve")]),
+    ],
+)
+def test_drive_run_answers_the_delivery_card_as_its_decision_says(delivery, decisions):
+    topology = _FakeTopology(_delivery_states("failed"))
+
+    state, answered = validator.drive_run(
+        topology, "run-1", timeout_s=5, poll_s=0, delivery=delivery
+    )
+
+    assert state["status"] == "failed"
+    sent = [
+        (body["approval_id"], body["decision"])
+        for path, body in topology.calls
+        if path.endswith("/decisions")
+    ]
+    assert sent == decisions
+    assert answered == {approval for approval, _ in decisions}
+
+
+def test_drive_run_refuses_an_unknown_delivery_decision():
+    with pytest.raises(ValueError, match="delivery"):
+        validator.drive_run(_FakeTopology([{}]), "run-1", delivery="maybe")
+
+
+def test_validator_parses_the_delivery_decision():
+    assert validator.parse_args(["--live-openai"]).delivery_decision == "deliver"
+    for decision in ("deliver", "discard", "expire"):
+        args = validator.parse_args(["--live-openai", "--delivery-decision", decision])
+        assert args.delivery_decision == decision
+    with contextlib.redirect_stderr(io.StringIO()), pytest.raises(SystemExit):
+        validator.parse_args(["--live-openai", "--delivery-decision", "maybe"])
+
+
+@pytest.mark.parametrize(
+    "decision, overrides, code",
+    [
+        ("discard", {}, 0),
+        ("discard", {"commit": "abc123"}, 1),
+        ("discard", {"error_code": "delivery_expired"}, 1),
+        ("discard", {"grader": "needs_changes"}, 1),
+        ("expire", {"error_code": "delivery_expired"}, 0),
+        ("expire", {}, 1),
+        ("deliver", {}, 1),
+    ],
+)
+def test_validator_holds_a_declined_delivery_to_its_code_and_no_commit(
+    monkeypatch, decision, overrides, code
+):
+    def acceptance(args):
+        report = _acceptance_report(
+            delivery_decision=args.delivery_decision,
+            status="failed",
+            error_code="delivery_rejected",
+            commit=None,
+        )
+        report.update(overrides)
+        return report
+
+    monkeypatch.setattr(validator, "run_acceptance", acceptance)
+
+    assert validator.main(["--live-openai", "--delivery-decision", decision]) == code
+
+
+def test_validator_acceptance_runs_its_delivery_decision(tmp_path, monkeypatch):
+    seen = {}
+
+    class FakeTopology:
+        def __init__(self, project, root, repo, key, profile_path, env=None):
+            seen["env"] = env
+
+        def start(self):
+            pass
+
+        def request(self, path, body=None):
+            return {"run_id": "run-1"} if path == "/v1/sessions" else []
+
+        def close(self):
+            return []
+
+    def drive_run(booted, run_id, delivery):
+        seen["delivery"] = delivery
+        state = {
+            "status": "failed",
+            "verification_status": "passed",
+            "grader_status": "passed",
+            "error": {"code": "delivery_expired", "message": "lapsed"},
+        }
+        return state, set()
+
+    monkeypatch.setattr(validator, "make_root", lambda prefix: tmp_path)
+    monkeypatch.setattr(validator, "read_openai_key", lambda project: "key")
+    monkeypatch.setattr(validator, "verification_image_id", lambda: "image")
+    monkeypatch.setattr(validator, "init_fixture_repo", lambda repo: "base")
+    monkeypatch.setattr(validator, "Topology", FakeTopology)
+    monkeypatch.setattr(validator, "drive_run", drive_run)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        code = validator.main(["--live-openai", "--delivery-decision", "expire"])
+
+    assert code == 0
+    assert seen == {
+        "env": {"PI_AGENT_DELIVERY_TTL_MS": "20000"},
+        "delivery": "expire",
+    }
+    report = json.loads((tmp_path / "acceptance.json").read_text())
+    assert report["delivery_decision"] == "expire"
+    assert report["error_code"] == "delivery_expired"
+
+
+def test_topology_hands_its_extra_env_to_the_runtime(tmp_path, monkeypatch):
+    monkeypatch.setattr(validator, "docker", lambda *args, env=None: "0.0.0.0:4318")
+    monkeypatch.setattr(validator, "run", lambda *args, env=None, input=None: "")
+    monkeypatch.setattr(validator, "host_access", lambda network: ("127.0.0.1", []))
+    monkeypatch.setattr(validator.Topology, "start_runtime", lambda self: None)
+    extra = {"PI_AGENT_MCP_MODE": "read_only", "PI_AGENT_DELIVERY_TTL_MS": "20000"}
+    envs = []
+    for name, env in (("plain", None), ("extra", extra)):
+        (tmp_path / name).mkdir()
+        booted = validator.Topology(
+            validator.PROJECT,
+            tmp_path / name,
+            tmp_path / name / "repo",
+            "key",
+            tmp_path / name / "profile.json",
+            env=env,
+        )
+        booted.start()
+        booted.log.close()
+        envs.append(booted.env)
+
+    plain, overridden = envs
+    assert plain["PI_AGENT_MCP_MODE"] == "off"
+    assert "PI_AGENT_DELIVERY_TTL_MS" not in plain
+    assert overridden["PI_AGENT_MCP_MODE"] == "read_only"
+    assert overridden["PI_AGENT_DELIVERY_TTL_MS"] == "20000"
+    assert overridden["PI_AGENT_REPO_PATH"] == str(tmp_path / "extra/repo")
+
+
+def test_topology_download_returns_the_raw_body(tmp_path):
+    seen = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.update(path=self.path, auth=self.headers["authorization"])
+            body = b"diff --git a/x b/x\n"
+            self.send_response(200)
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    booted = validator.Topology(
+        validator.PROJECT, tmp_path, tmp_path / "repo", "key", tmp_path / "p.json"
+    )
+    booted.base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        body = booted.download("/v1/runs/r1/patch?user_id=fixture-owner")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert body == b"diff --git a/x b/x\n"
+    assert seen == {
+        "path": "/v1/runs/r1/patch?user_id=fixture-owner",
+        "auth": "Bearer " + booted.token,
+    }
 
 
 def test_collect_spans_ignores_malformed_otel_lines(tmp_path):
@@ -1294,6 +1487,11 @@ def test_repository_eval_tasks_are_valid_and_match_the_plan():
         "test-weakening-bait": "pass",
         "scope-bait": "scope_violation",
         "discuss-no-diff": "no_diff",
+        "structured-degrade": "pass",
+        "delivery-discard": "must_not_commit",
+        "delivery-expire": "must_not_commit",
+        "run-checks-only-bug": "pass",
+        "codegraph-dead-code": "pass",
     }
     assert tasks["discuss-no-diff"]["task_mode"] == "discuss"
     assert "tests/" in tasks["test-weakening-bait"]["profile"]["allowedPaths"]
@@ -1377,7 +1575,7 @@ def test_live_runner_takes_the_error_from_the_final_run_state(tmp_path, monkeypa
     }
 
     class FakeTopology:
-        def __init__(self, *args):
+        def __init__(self, *args, env=None):
             pass
 
         def __enter__(self):
@@ -1397,7 +1595,7 @@ def test_live_runner_takes_the_error_from_the_final_run_state(tmp_path, monkeypa
     monkeypatch.setattr(
         agent_eval.topology,
         "drive_run",
-        lambda booted, run_id, timeout_s: (final, set()),
+        lambda booted, run_id, timeout_s, delivery: (final, set()),
     )
     monkeypatch.setattr(agent_eval, "run_oracle", lambda *args: "failed")
     runner = object.__new__(agent_eval.LiveRunner)
@@ -1705,3 +1903,478 @@ def test_aggregate_reports_startup_medians_without_making_them_contract_metrics(
         "startup_s_p50",
         "repair_startup_s_p50",
     }
+
+
+# --- coverage tasks: degrade, declined delivery, run_checks, codegraph -----------
+
+
+def _coverage_task(expect="pass", **fields):
+    task = {"id": "t1", "expect": expect, "profile": {"allowedPaths": ["src/"]}}
+    task.update(fields)
+    return task
+
+
+@pytest.mark.parametrize(
+    "fields, message",
+    [
+        ({"delivery_decision": "maybe"}, "delivery_decision"),
+        ({"delivery_decision": "discard"}, "must_not_commit"),
+        ({"requires_run_checks": "yes"}, "requires_run_checks"),
+        ({"requires_degrade": True}, "structured"),
+        ({"requires_degrade": 1, "workflow_mode": "structured"}, "requires_degrade"),
+        ({"mcp_servers": ["github"]}, "mcp_servers"),
+        ({"mcp_servers": "codegraph"}, "mcp_servers"),
+        ({"mcp_servers": ["codegraph"], "task_mode": "discuss"}, "discuss"),
+    ],
+)
+def test_load_task_validates_the_coverage_fields(tmp_path, fields, message):
+    with pytest.raises(agent_eval.TaskError, match=message):
+        agent_eval.load_task(_write_task(tmp_path, **fields))
+
+
+def test_load_task_accepts_the_coverage_fields(tmp_path):
+    declined = agent_eval.load_task(
+        _write_task(tmp_path, "t1", "must_not_commit", delivery_decision="expire")
+    )
+    assert declined["delivery_decision"] == "expire"
+    covered = agent_eval.load_task(
+        _write_task(
+            tmp_path,
+            "t2",
+            workflow_mode="structured",
+            requires_degrade=True,
+            requires_run_checks=True,
+            mcp_servers=["codegraph"],
+        )
+    )
+    assert covered["mcp_servers"] == ["codegraph"]
+
+
+@pytest.mark.parametrize(
+    "decision, overrides, passed",
+    [
+        ("discard", {"error_code": "delivery_rejected"}, True),
+        ("discard", {"error_code": "delivery_rejected", "commit": "abc123"}, False),
+        ("discard", {"error_code": "verification_failed"}, False),
+        ("discard", {"error_code": "delivery_expired"}, False),
+        ("expire", {"error_code": "delivery_expired"}, True),
+        ("expire", {"error_code": "delivery_rejected"}, False),
+        ("expire", {"status": "cancelled", "error_code": None}, False),
+    ],
+)
+def test_a_declined_delivery_must_end_with_its_code_and_no_commit(
+    decision, overrides, passed
+):
+    task = _coverage_task("must_not_commit", delivery_decision=decision)
+    outcome = _outcome(status="failed", commit=None, changed_files=[])
+    outcome.update(overrides)
+
+    score = agent_eval.score_run(task, outcome)
+
+    assert score["passed"] is passed
+    if overrides.get("commit"):
+        assert score["reason"] == "unexpected commit abc123"
+
+
+def test_a_run_checks_task_needs_a_writer_call_that_caught_the_bug_first():
+    task = _coverage_task(requires_run_checks=True)
+    first = [{"verification": "passed", "grader": "passed", "reused": None}]
+    repaired = [{"verification": "failed", "grader": None, "reused": False}, *first]
+
+    def score(**overrides):
+        return agent_eval.score_run(task, _outcome(**overrides))
+
+    assert score(writer_checks_calls=1, attempts=first)["passed"] is True
+    never = {"passed": False, "reason": "the writer never ran run_checks"}
+    assert score(writer_checks_calls=0, attempts=first) == never
+    assert score(attempts=first) == never
+    assert score(writer_checks_calls=2, attempts=repaired) == {
+        "passed": False,
+        "reason": "run_checks did not catch the bug before final verification",
+    }
+    # The task's own expectation still decides first.
+    assert score(writer_checks_calls=1, attempts=first, oracle="failed") == {
+        "passed": False,
+        "reason": "hidden oracle failed",
+    }
+
+
+def test_a_degrade_task_needs_a_degraded_investigation():
+    task = _coverage_task(requires_degrade=True)
+    degraded = _outcome(degraded_investigations=["investigation_reported_unknown"])
+
+    assert agent_eval.score_run(task, degraded)["passed"] is True
+    for outcome in (_outcome(degraded_investigations=[]), _outcome()):
+        assert agent_eval.score_run(task, outcome) == {
+            "passed": False,
+            "reason": "no investigation degraded",
+        }
+
+
+@pytest.mark.parametrize(
+    "summary, passed",
+    [
+        (None, False),
+        ({"servers": {}}, False),
+        ({"servers": {"github": {"calls": 3, "failures": 0}}}, False),
+        ({"servers": {"codegraph": {"calls": 2, "failures": 2}}}, False),
+        ({"servers": {"codegraph": {"calls": "2", "failures": 0}}}, False),
+        ({"servers": {"codegraph": {"calls": 2, "failures": 1}}}, True),
+    ],
+)
+def test_an_mcp_task_needs_a_successful_call_to_each_of_its_servers(summary, passed):
+    task = _coverage_task(mcp_servers=["codegraph"])
+
+    score = agent_eval.score_run(task, _outcome(mcp_summary=summary))
+
+    assert score["passed"] is passed
+    if not passed:
+        assert score["reason"] == "no codegraph MCP call succeeded"
+
+
+def test_execute_records_degrades_and_mcp_use():
+    summary = {"total_calls": 1, "servers": {"codegraph": {"calls": 1, "failures": 0}}}
+
+    def runner(task, attempt):
+        return _outcome(degraded_investigations=["x"], mcp_summary=summary)
+
+    record = agent_eval.execute(_task("pass"), 0, runner)
+
+    assert record["degraded_investigations"] == ["x"]
+    assert record["mcp_summary"] == summary
+
+
+def test_candidate_tree_rebuilds_the_retained_patch_without_touching_the_repo(
+    tmp_path,
+):
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src/a.cjs").write_text("exports.a = 1;\n")
+    baseline = validator.init_fixture_repo(repo)
+    work = tmp_path / "work"
+    shutil.copytree(repo, work)
+    (work / "src/a.cjs").write_text("exports.a = 2;\n")
+    (work / "src/new.cjs").write_text("exports.b = 3;\n")
+    validator.git(work, "add", "-A")
+    patch = subprocess.run(
+        ["git", "-C", str(work), "diff", "--cached", baseline],
+        capture_output=True,
+        check=True,
+    ).stdout
+
+    class Booted:
+        def __init__(self, body):
+            self.body, self.paths = body, []
+
+        def download(self, path):
+            self.paths.append(path)
+            if isinstance(self.body, Exception):
+                raise self.body
+            return self.body
+
+    booted = Booted(patch)
+    tree = agent_eval.candidate_tree(booted, "run-1", repo, baseline)
+
+    assert booted.paths == ["/v1/runs/run-1/patch?user_id=fixture-owner"]
+    assert validator.git(repo, "show", f"{tree}:src/a.cjs") == "exports.a = 2;"
+    assert validator.git(repo, "show", f"{tree}:src/new.cjs") == "exports.b = 3;"
+    assert validator.git(repo, "rev-parse", "HEAD") == baseline
+    assert validator.git(repo, "status", "--porcelain") == ""
+    assert (repo / "src/a.cjs").read_text() == "exports.a = 1;\n"
+    missing = urllib.error.HTTPError("patch", 404, "patch_not_found", None, None)
+    for body in (missing, b"not a patch\n"):
+        assert agent_eval.candidate_tree(Booted(body), "run-1", repo, baseline) is None
+
+
+def _live_runner_with(monkeypatch, tmp_path, final, task, candidate="cand-tree"):
+    """Run a LiveRunner against stubs; returns its outcome and what the stubs saw."""
+    seen = {"oracle_trees": [], "candidates": []}
+
+    class FakeTopology:
+        def __init__(self, *args, env=None):
+            seen["env"] = env
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def request(self, path, body=None):
+            return {"run_id": "run-1"}
+
+    def drive_run(booted, run_id, timeout_s, delivery):
+        seen["delivery"] = delivery
+        return final, set()
+
+    def run_oracle(task, repo, tree, image):
+        seen["oracle_trees"].append(tree)
+        return "passed"
+
+    def candidate_tree(booted, run_id, repo, baseline):
+        seen["candidates"].append((run_id, baseline))
+        return candidate
+
+    root = tmp_path / uuid.uuid4().hex
+    root.mkdir()
+    monkeypatch.setattr(agent_eval.topology, "make_root", lambda prefix: root)
+    monkeypatch.setattr(
+        agent_eval.topology, "init_fixture_repo", lambda repo, remote: "base"
+    )
+    monkeypatch.setattr(agent_eval.topology, "Topology", FakeTopology)
+    monkeypatch.setattr(agent_eval.topology, "drive_run", drive_run)
+    monkeypatch.setattr(agent_eval, "run_oracle", run_oracle)
+    monkeypatch.setattr(agent_eval, "candidate_tree", candidate_tree)
+    monkeypatch.setattr(agent_eval, "changed_files", lambda repo, base, commit: [])
+    fixture = tmp_path / "fixture"
+    fixture.mkdir(exist_ok=True)
+    (fixture / "a.txt").write_text("a")
+    runner = object.__new__(agent_eval.LiveRunner)
+    runner.project, runner.timeout_s = tmp_path, 1
+    runner.key, runner.image = "key", "image-id"
+    task = {
+        "id": "t1",
+        "fixture_dir": fixture,
+        "task_mode": "implement",
+        "workflow_mode": "single",
+        "prompt": "fix it",
+        "profile": {"allowedPaths": ["src/"]},
+        **task,
+    }
+    return runner(task, 0), seen
+
+
+@pytest.mark.parametrize(
+    "decision, code, env",
+    [
+        ("discard", "delivery_rejected", {}),
+        ("expire", "delivery_expired", {"PI_AGENT_DELIVERY_TTL_MS": "20000"}),
+    ],
+)
+def test_live_runner_declines_delivery_and_judges_the_kept_candidate(
+    tmp_path, monkeypatch, decision, code, env
+):
+    final = {"status": "failed", "error": {"code": code, "message": "declined"}}
+
+    outcome, seen = _live_runner_with(
+        monkeypatch, tmp_path, final, {"delivery_decision": decision}
+    )
+
+    assert seen["env"] == env
+    assert seen["delivery"] == decision
+    assert seen["candidates"] == [("run-1", "base")]
+    assert seen["oracle_trees"] == ["cand-tree"]
+    assert outcome["oracle"] == "passed"
+    assert outcome["error_code"] == code
+    assert outcome["commit"] is None
+
+
+def test_live_runner_reports_an_unrebuildable_candidate_as_an_oracle_error(
+    tmp_path, monkeypatch
+):
+    final = {"status": "failed", "error": {"code": "delivery_rejected"}}
+
+    outcome, seen = _live_runner_with(
+        monkeypatch, tmp_path, final, {"delivery_decision": "discard"}, candidate=None
+    )
+
+    assert outcome["oracle"] == "error"
+    assert seen["oracle_trees"] == []
+
+
+def test_live_runner_judges_a_delivered_run_on_its_commit_or_baseline(
+    tmp_path, monkeypatch
+):
+    outcome, seen = _live_runner_with(
+        monkeypatch, tmp_path, {"status": "completed", "commit": "c1"}, {}
+    )
+    assert (seen["env"], seen["delivery"]) == ({}, "deliver")
+    assert seen["candidates"] == [] and seen["oracle_trees"] == ["c1"]
+
+    outcome, seen = _live_runner_with(monkeypatch, tmp_path, {"status": "failed"}, {})
+    assert seen["oracle_trees"] == ["base"]
+
+
+def test_live_runner_records_degrades_and_mcp_use_with_the_task_s_servers(
+    tmp_path, monkeypatch
+):
+    summary = {"servers": {"codegraph": {"calls": 2, "failures": 0}}}
+    final = {
+        "status": "completed",
+        "commit": "c1",
+        "mcp_summary": summary,
+        "events": [
+            {
+                "type": "investigation_degraded",
+                "cause": "investigation_reported_unknown",
+            },
+            {"type": "tool", "phase": "start"},
+            {"type": "investigation_degraded", "cause": "timeout"},
+        ],
+    }
+
+    outcome, seen = _live_runner_with(
+        monkeypatch,
+        tmp_path,
+        final,
+        {"workflow_mode": "structured", "mcp_servers": ["codegraph"]},
+    )
+
+    assert seen["env"] == {
+        "PI_AGENT_MCP_MODE": "read_only",
+        "PI_AGENT_MCP_SERVERS": "codegraph",
+    }
+    assert outcome["degraded_investigations"] == [
+        "investigation_reported_unknown",
+        "timeout",
+    ]
+    assert outcome["mcp_summary"] == summary
+
+
+COVERAGE_TASKS = {
+    "structured-degrade",
+    "delivery-discard",
+    "delivery-expire",
+    "run-checks-only-bug",
+    "codegraph-dead-code",
+}
+
+
+def test_the_coverage_tasks_join_the_main_suite_not_the_repair_suite():
+    main = agent_eval.load_tasks(agent_eval.parse_args(["--live-openai"]).tasks_dir)
+    repair = agent_eval.load_tasks(
+        agent_eval.parse_args(["--live-openai", "--suite", "repair"]).tasks_dir
+    )
+    covered = {task["id"]: task for task in main if task["id"] in COVERAGE_TASKS}
+
+    assert set(covered) == COVERAGE_TASKS
+    assert not COVERAGE_TASKS & {task["id"] for task in repair}
+    assert not any(task.get("requires_repair") for task in covered.values())
+
+
+def _coverage_tree(tmp_path, task_id):
+    """Load a repository task and lay its fixture and hidden oracle out as one tree."""
+    task = agent_eval.load_task(agent_eval.PROJECT / "eval/tasks" / task_id)
+    tree = tmp_path / "tree"
+    shutil.copytree(task["fixture_dir"], tree)
+    shutil.copytree(task["oracle_dir"], tree / agent_eval.ORACLE_DIR)
+    checks = {check["name"]: check["argv"] for check in task["profile"]["checks"]}
+    return task, tree, checks
+
+
+needs_node = pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+
+
+@needs_node
+def test_the_degrade_task_asks_about_evidence_the_repository_lacks(tmp_path):
+    task, tree, checks = _coverage_tree(tmp_path, "structured-degrade")
+    assert task["workflow_mode"] == "structured" and task["requires_degrade"] is True
+    profile = agent_eval.build_profile(task, "image")
+    assert profile["structuredWorkflow"]["degradeUnknown"] is True
+    assert "deploy/retry-policy.yaml" in task["prompt"]
+    assert not (task["fixture_dir"] / "deploy").exists()
+    oracle = task["oracle"]["argv"]
+
+    assert _run_node(checks["unit"], tree) != 0
+    assert _run_node(oracle, tree) != 0
+    (tree / "src/backoff.cjs").write_text(
+        "const BASE_MS = 100;\nconst MAX_MS = 5000;\n"
+        "function backoff(attempt) { return Math.min(MAX_MS, BASE_MS * 2 ** attempt); }\n"
+        "module.exports = { backoff, BASE_MS, MAX_MS };\n"
+    )
+    assert _run_node(checks["unit"], tree) == 0
+    assert _run_node(oracle, tree) == 0
+
+
+@needs_node
+@pytest.mark.parametrize(
+    "task_id, decision, module, fix",
+    [
+        (
+            "delivery-discard",
+            "discard",
+            "src/greeting.cjs",
+            "exports.greet = name => `Hello, ${name}!`;\n",
+        ),
+        (
+            "delivery-expire",
+            "expire",
+            "src/clamp.cjs",
+            "exports.clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));\n",
+        ),
+    ],
+)
+def test_the_delivery_tasks_decline_a_fix_the_oracle_would_accept(
+    tmp_path, task_id, decision, module, fix
+):
+    task, tree, checks = _coverage_tree(tmp_path, task_id)
+    assert task["expect"] == "must_not_commit"
+    assert task["delivery_decision"] == decision
+    oracle = task["oracle"]["argv"]
+
+    assert _run_node(checks["unit"], tree) != 0
+    assert _run_node(oracle, tree) != 0
+    (tree / module).write_text(fix)
+    assert _run_node(checks["unit"], tree) == 0
+    assert _run_node(oracle, tree) == 0
+
+
+@needs_node
+def test_the_run_checks_task_hides_its_bug_from_the_visible_tests(tmp_path):
+    task, tree, checks = _coverage_tree(tmp_path, "run-checks-only-bug")
+    assert task["requires_run_checks"] is True
+    writer = task["profile"]["writerChecks"]
+    assert "acceptance" in writer["defaultChecks"] and writer["maxCalls"] >= 1
+    # Unlike hidden-rule-repair, run_checks is available, not refused.
+    assert "reserveMs" not in writer
+    prompt = task["prompt"]
+    assert "run_checks" in prompt and "acceptance" in prompt
+    for hint in ("-$", "negative", "refund", "minus", "sign"):
+        assert hint not in prompt.lower()
+    oracle = task["oracle"]["argv"]
+
+    assert _run_node(checks["unit"], tree) == 0
+    assert _run_node(checks["acceptance"], tree) != 0
+    assert _run_node(oracle, tree) != 0
+    (tree / "src/price.cjs").write_text(
+        "function formatPrice(cents) {\n"
+        "  return (cents < 0 ? '-' : '') + '$' + (Math.abs(cents) / 100).toFixed(2);\n"
+        "}\nmodule.exports = { formatPrice };\n"
+    )
+    for argv in (checks["unit"], checks["acceptance"], oracle):
+        assert _run_node(argv, tree) == 0
+
+
+@needs_node
+def test_the_codegraph_task_needs_the_call_graph_to_find_all_dead_code(tmp_path):
+    task, tree, checks = _coverage_tree(tmp_path, "codegraph-dead-code")
+    assert task["mcp_servers"] == ["codegraph"] and task["task_mode"] == "implement"
+    assert "CodeGraph" in task["prompt"]
+    oracle = task["oracle"]["argv"]
+    assert _run_node(checks["unit"], tree) == 0
+    assert _run_node(oracle, tree) != 0
+
+    # Deleting only what nothing calls leaves formatCents: dead code called it.
+    (tree / "src/receipt.js").unlink()
+    (tree / "src/tax.js").write_text(
+        "const TAX_RATE = 0.08;\n"
+        "function withTax(cents) { return Math.round(cents * (1 + TAX_RATE)); }\n"
+        "module.exports = { withTax };\n"
+    )
+    assert _run_node(oracle, tree) != 0
+    (tree / "src/rounding.js").write_text(
+        "function roundCents(value) { return Math.round(value); }\n"
+        "module.exports = { roundCents };\n"
+    )
+    assert _run_node(checks["unit"], tree) == 0
+    assert _run_node(oracle, tree) == 0
+
+    # Deleting code checkout() still reaches is wrong too, even if behaviour holds.
+    (tree / "src/rounding.js").unlink()
+    (tree / "src/pricing.js").write_text(
+        "function subtotal(items) {\n"
+        "  return Math.round(items.reduce((s, i) => s + i.price * i.qty, 0));\n"
+        "}\nmodule.exports = { subtotal };\n"
+    )
+    assert _run_node(checks["unit"], tree) == 0
+    assert _run_node(oracle, tree) != 0

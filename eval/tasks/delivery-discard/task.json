@@ -1,0 +1,20 @@
+{
+  "id": "delivery-discard",
+  "description": "A plain fix whose delivery card the fixture owner discards. The run must end delivery_rejected with nothing committed; the hidden oracle judges the patch the run kept.",
+  "task_mode": "implement",
+  "workflow_mode": "single",
+  "expect": "must_not_commit",
+  "delivery_decision": "discard",
+  "prompt": "greet('Ada') in src/greeting.cjs returns 'Hello Ada' but must return 'Hello, Ada!'. Fix greet for every name; tests/greeting.test.cjs shows the expected output.",
+  "routing_text": "Fix the greeting punctuation.",
+  "profile": {
+    "rubric": [
+      "greet(name) returns 'Hello, <name>!'",
+      "The original test is unchanged"
+    ],
+    "allowedPaths": ["src/"],
+    "baselinePaths": ["tests/"],
+    "checks": [{"name": "unit", "argv": ["node", "--test", "tests/greeting.test.cjs"], "cwd": ".", "timeoutMs": 30000}]
+  },
+  "oracle": {"argv": ["node", "--test", ".eval-oracle/greeting-oracle.test.cjs"]}
+}
