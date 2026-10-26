@@ -1,5 +1,6 @@
 PYTHON ?= python
 DOCKER_COMPOSE ?= docker compose
+DEMO_LOCK_DIR := $(CURDIR)/.pi-agent-runtime/locks
 
 .PHONY: up down api api-dev workers demo-agent-install demo-agent-images demo-slack loadtest-api loadtest-redis-control-plane cleanup-v1-provider-scheduler-keys smoke smoke-kafka smoke-web-search smoke-redis-stack-memory smoke-flink smoke-flink-runtime smoke-flink-analytics smoke-flink-analytics-runtime integration integration-kafka integration-flink integration-flink-runtime integration-flink-analytics integration-flink-analytics-runtime
 
@@ -21,10 +22,14 @@ workers:
 demo-agent-install:
 	npm --prefix agent-runtime ci --ignore-scripts
 
+# Locks the local Agent image in gitignored copies, which run_slack_demo.sh reads; the tracked locks stay as committed.
 demo-agent-images:
 	npm --prefix agent-runtime run build
 	docker build -f agent-runtime/Dockerfile.agent -t slack-pi-agent:1.0.1 agent-runtime
-	npm --prefix agent-runtime run lock-image -- slack-pi-agent:1.0.1
+	rm -rf "$(DEMO_LOCK_DIR)"
+	mkdir -p "$(DEMO_LOCK_DIR)"
+	cp -R agent-runtime/plugins.lock.json agent-runtime/skills.lock.json agent-runtime/plugins agent-runtime/skills "$(DEMO_LOCK_DIR)/"
+	PI_AGENT_PLUGIN_LOCK="$(DEMO_LOCK_DIR)/plugins.lock.json" npm --prefix agent-runtime run lock-image -- slack-pi-agent:1.0.1
 	docker build -f agent-runtime/Dockerfile.gateway -t slack-pi-model-gateway:0.1.0 agent-runtime
 	docker build -f agent-runtime/Dockerfile.mcp-gateway -t slack-pi-mcp-gateway:0.1.0 agent-runtime
 	docker build -f agent-runtime/Dockerfile.clickhouse-mcp -t slack-pi-clickhouse-mcp:0.7.0 agent-runtime

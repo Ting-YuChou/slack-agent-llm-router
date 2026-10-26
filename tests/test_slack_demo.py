@@ -2,6 +2,7 @@ import asyncio
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import time
 from types import SimpleNamespace
@@ -510,3 +511,261 @@ def test_demo_applies_agent_mcp_views_before_starting_clickhouse_mcp():
     assert 'docker exec -i "${clickhouse_container}"' in clickhouse_block
     assert "--multiquery" in clickhouse_block
     assert views < clickhouse_block.index('--name "${clickhouse_mcp_container}"')
+
+
+DEMO_LOCKS = Path(".pi-agent-runtime") / "locks"
+FAKE_DIGEST = "sha256:" + "a" * 64
+
+
+def fake_executable(path, body):
+    path.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def test_demo_lock_copies_are_gitignored():
+    result = subprocess.run(
+        ["git", "check-ignore", "--quiet", str(DEMO_LOCKS / "plugins.lock.json")],
+        cwd=ROOT,
+        check=False,
+    )
+
+    assert result.returncode == 0
+
+
+def test_demo_agent_images_locks_copies_and_leaves_tracked_locks_unchanged(tmp_path):
+    fake_repo = tmp_path / "repo"
+    runtime = fake_repo / "agent-runtime"
+    runtime.mkdir(parents=True)
+    for name in ("plugins.lock.json", "skills.lock.json"):
+        shutil.copy(ROOT / "agent-runtime" / name, runtime / name)
+    for name in ("plugins", "skills"):
+        shutil.copytree(ROOT / "agent-runtime" / name, runtime / name)
+    tracked = {
+        name: (runtime / name).read_bytes()
+        for name in ("plugins.lock.json", "skills.lock.json")
+    }
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_executable(bin_dir / "docker", "exit 0\n")
+    # Mimics lock-image.mjs: it rewrites PI_AGENT_PLUGIN_LOCK, or the tracked lock without it.
+    fake_executable(
+        bin_dir / "npm",
+        """if [[ " $* " == *" lock-image "* ]]; then
+  lock="${PI_AGENT_PLUGIN_LOCK:-agent-runtime/plugins.lock.json}"
+  printf '%s\\n' "${lock}" > "${FAKE_LOCK_LOG}"
+  printf '{"schema_version": 1, "image_digest": "%s", "plugins": []}\\n' "${FAKE_DIGEST}" > "${lock}"
+fi
+""",
+    )
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "FAKE_DIGEST": FAKE_DIGEST,
+        "FAKE_LOCK_LOG": str(tmp_path / "lock.log"),
+    }
+
+    result = subprocess.run(
+        ["make", "-f", str(ROOT / "Makefile"), "demo-agent-images"],
+        cwd=fake_repo,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    locks = fake_repo / DEMO_LOCKS
+    assert (tmp_path / "lock.log").read_text().strip() == str(
+        locks / "plugins.lock.json"
+    )
+    for name, content in tracked.items():
+        assert (runtime / name).read_bytes() == content
+    assert FAKE_DIGEST in (locks / "plugins.lock.json").read_text()
+    assert (locks / "skills.lock.json").read_bytes() == tracked["skills.lock.json"]
+    for name in ("plugins", "skills"):
+        for source in (runtime / name).rglob("*"):
+            if source.is_file():
+                copy = locks / source.relative_to(runtime)
+                assert copy.read_bytes() == source.read_bytes()
+
+
+def demo_launcher_repo(tmp_path, *, digest=FAKE_DIGEST, with_locks=True):
+    """A repository holding only the launcher, with docker, node, npm, curl and python faked."""
+    fake_repo = tmp_path / "repo"
+    launcher = fake_repo / "scripts" / "run_slack_demo.sh"
+    launcher.parent.mkdir(parents=True)
+    shutil.copy(ROOT / "scripts" / "run_slack_demo.sh", launcher)
+    (fake_repo / "agent-runtime" / "node_modules").mkdir(parents=True)
+    if with_locks:
+        locks = fake_repo / DEMO_LOCKS
+        locks.mkdir(parents=True)
+        (locks / "plugins.lock.json").write_text(
+            f'{{\n  "schema_version": 1,\n  "image_digest": "{digest}",\n'
+            '  "plugins": []\n}\n',
+            encoding="utf-8",
+        )
+        (locks / "skills.lock.json").write_text(
+            '{\n  "schema_version": 1,\n  "skills": []\n}\n', encoding="utf-8"
+        )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "commands.log"
+    fake_executable(
+        bin_dir / "docker",
+        """printf 'docker %s\\n' "$*" >> "${FAKE_COMMAND_LOG}"
+if [[ "${1:-}" == image && "${2:-}" == inspect ]]; then
+  image="${*: -1}"
+  if [[ " ${FAKE_MISSING_IMAGES:-} " == *" ${image} "* ]]; then exit 1; fi
+  if [[ " $* " == *"{{.Id}}"* ]]; then printf '%s\\n' "${FAKE_IMAGE_DIGEST}"; fi
+fi
+exit 0
+""",
+    )
+    fake_executable(
+        bin_dir / "node",
+        """if [[ "${1:-}" == "--version" ]]; then printf 'v22.22.3\\n'; exit 0; fi
+if [[ "${1:-}" == "--input-type=module" ]]; then
+  printf 'node image-check %s %s %s\\n' "${DEMO_RUNTIME_DIR:-}" "${DEMO_IMAGE_DIGEST:-}" "${DEMO_PLUGIN_LOCK:-}" >> "${FAKE_COMMAND_LOG}"
+  if [[ -n "${FAKE_IMAGE_CHECK_ERROR:-}" ]]; then printf '%s\\n' "${FAKE_IMAGE_CHECK_ERROR}" >&2; exit 1; fi
+  exit 0
+fi
+printf 'node %s\\n' "$*" >> "${FAKE_COMMAND_LOG}"
+printf 'plugin-lock:%s\\nskill-lock:%s\\n' "${PI_AGENT_PLUGIN_LOCK-unset}" "${PI_AGENT_SKILL_LOCK-unset}"
+""",
+    )
+    fake_executable(bin_dir / "npm", "exit 0\n")
+    fake_executable(bin_dir / "curl", "printf '%s\\n' '{\"status\":\"healthy\"}'\n")
+    fake_executable(
+        bin_dir / "python",
+        """printf 'python %s\\n' "$*" >> "${FAKE_COMMAND_LOG}"\n""",
+    )
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "PYTHON": str(bin_dir / "python"),
+        "DEMO_ENV_FILE": str(tmp_path / "does-not-exist"),
+        "OPENAI_API_KEY": "secret-openai-value",
+        "SLACK_BOT_TOKEN": "xoxb-secret-value",
+        "SLACK_APP_TOKEN": "xapp-secret-value",
+        "AGENT_RUNTIME_TOKEN": "runtime-test",
+        "MODEL_GATEWAY_SIGNING_SECRET": "gateway-test",
+        "FAKE_COMMAND_LOG": str(log),
+        "FAKE_IMAGE_DIGEST": FAKE_DIGEST,
+    }
+    for name in ("PI_AGENT_PLUGIN_LOCK", "PI_AGENT_SKILL_LOCK", "DEMO_TEST_MODE"):
+        env.pop(name, None)
+    return fake_repo, env, log
+
+
+def run_demo_launcher(fake_repo, env, *args):
+    return subprocess.run(
+        ["bash", str(fake_repo / "scripts" / "run_slack_demo.sh"), *args],
+        cwd=fake_repo,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_demo_runner_points_the_runtime_at_the_lock_copies(tmp_path):
+    fake_repo, env, log = demo_launcher_repo(tmp_path)
+
+    result = run_demo_launcher(fake_repo, env)
+
+    assert result.returncode == 0, result.stderr
+    locks = fake_repo / DEMO_LOCKS
+    assert f"plugin-lock:{locks / 'plugins.lock.json'}" in result.stdout
+    assert f"skill-lock:{locks / 'skills.lock.json'}" in result.stdout
+    assert "start-workers" in log.read_text()
+
+
+@pytest.mark.parametrize("missing", ["plugins.lock.json", "skills.lock.json"])
+def test_demo_runner_refuses_a_missing_lock_copy(tmp_path, missing):
+    fake_repo, env, log = demo_launcher_repo(tmp_path)
+    (fake_repo / DEMO_LOCKS / missing).unlink()
+
+    result = run_demo_launcher(fake_repo, env)
+
+    assert result.returncode == 2
+    assert missing in result.stderr
+    assert "make demo-agent-images" in result.stderr
+    assert "docker run" not in log.read_text()
+    assert "server.js" not in log.read_text()
+
+
+def test_demo_runner_refuses_a_lock_copy_for_another_image(tmp_path):
+    fake_repo, env, log = demo_launcher_repo(tmp_path, digest="sha256:" + "b" * 64)
+
+    result = run_demo_launcher(fake_repo, env)
+
+    assert result.returncode == 2
+    assert "make demo-agent-images" in result.stderr
+    assert "docker run" not in log.read_text()
+    assert "server.js" not in log.read_text()
+
+
+def test_demo_check_passes_without_starting_anything(tmp_path):
+    fake_repo, env, log = demo_launcher_repo(tmp_path)
+
+    result = run_demo_launcher(fake_repo, env, "--check")
+
+    assert result.returncode == 0, result.stderr
+    assert "Demo preflight passed" in result.stdout
+    commands = log.read_text()
+    runtime = fake_repo / "agent-runtime"
+    lock = fake_repo / DEMO_LOCKS / "plugins.lock.json"
+    assert f"node image-check {runtime} {FAKE_DIGEST} {lock}" in commands
+    assert "docker run" not in commands
+    assert "docker network create" not in commands
+    assert "docker ps" not in commands
+    assert "server.js" not in commands
+    assert "python" not in commands
+
+
+def test_demo_check_reports_an_image_built_from_another_tree(tmp_path):
+    fake_repo, env, log = demo_launcher_repo(tmp_path)
+    env[
+        "FAKE_IMAGE_CHECK_ERROR"
+    ] = "Agent image was built from a different agent-runtime tree (changed: src/x.ts)"
+
+    result = run_demo_launcher(fake_repo, env, "--check")
+
+    assert result.returncode == 2
+    assert "different agent-runtime tree (changed: src/x.ts)" in result.stderr
+    assert "make demo-agent-images" in result.stderr
+    assert "Demo preflight passed" not in result.stdout
+
+
+def test_demo_check_names_missing_settings_without_printing_values(tmp_path):
+    fake_repo, env, log = demo_launcher_repo(tmp_path)
+    del env["SLACK_APP_TOKEN"]
+
+    result = run_demo_launcher(fake_repo, env, "--check")
+
+    assert result.returncode == 2
+    assert "SLACK_APP_TOKEN" in result.stderr
+    output = result.stdout + result.stderr
+    for value in ("secret-openai-value", "xoxb-secret-value"):
+        assert value not in output
+
+
+def test_demo_check_reports_a_missing_image(tmp_path):
+    fake_repo, env, log = demo_launcher_repo(tmp_path)
+    env["FAKE_MISSING_IMAGES"] = "slack-pi-model-gateway:0.1.0"
+
+    result = run_demo_launcher(fake_repo, env, "--check")
+
+    assert result.returncode == 2
+    assert "slack-pi-model-gateway:0.1.0" in result.stderr
+    assert "make demo-agent-images" in result.stderr
+
+
+def test_demo_runner_rejects_unknown_arguments(tmp_path):
+    fake_repo, env, log = demo_launcher_repo(tmp_path)
+
+    result = run_demo_launcher(fake_repo, env, "--chek")
+
+    assert result.returncode == 2
+    assert "--check" in result.stderr
+    assert not log.exists()

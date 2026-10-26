@@ -338,7 +338,8 @@ make demo-agent-images
 ```
 
 The image target verifies the pinned plugin and Skill checksums, builds the hardened Agent
-image, and records that exact local image digest in `agent-runtime/plugins.lock.json`,
+image, and records that exact local image digest in a gitignored copy of the locks under
+`.pi-agent-runtime/locks/` (the tracked `agent-runtime/*.lock.json` files are never rewritten),
 together with an `image_manifest`: SHA-256 hashes, computed inside the image, of every
 extension (including the policy), plugin and Skill it loads and one digest of its compiled
 sources. Locking refuses an image built from a different tree than the checkout, and the
@@ -347,7 +348,10 @@ At startup the runtime also compares the sources the image was built from (`src`
 `prompts`, `extensions`, `plugins`, `skills`) with this checkout. An image built
 before a code change is refused with the stale files listed and
 `rebuild and relock it: make demo-agent-images`; rerun the target after every
-`agent-runtime` change. Review unexpected lock changes before starting the demo. Run the launcher as a
+`agent-runtime` change. `scripts/run_slack_demo.sh` points the runtime at those copies and
+exits with `Run: make demo-agent-images` when one is missing or pins another image;
+`scripts/run_slack_demo.sh --check` runs the same checks (settings present, images built,
+image and locks matching this checkout) without starting anything. Run the launcher as a
 regular host user, not root, so the container can write only to that user's
 dedicated worktree and Pi session directory.
 
