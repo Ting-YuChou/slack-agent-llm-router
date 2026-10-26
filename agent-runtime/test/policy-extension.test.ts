@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -15,17 +15,18 @@ export async function loadPolicy(env: Record<string, string>) {
     const handlers = new Map<string, Array<(...args: any[]) => any>>();
     const log: string[] = [];
     const entries: Array<{ customType: string; data: unknown }> = [];
+    const tools = new Map<string, any>();
     extension.default({
       on: (event: string, handler: (...args: any[]) => any) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
       appendEntry: (customType: string, data: unknown) => { log.push(`entry:${customType}`); entries.push({ customType, data }); },
-      registerTool: () => undefined,
+      registerTool: (tool: { name: string }) => tools.set(tool.name, tool),
     });
     const fire = async (event: string, payload: unknown, ctx: unknown) => {
       let result: unknown;
       for (const handler of handlers.get(event) ?? []) result = (await handler(payload, ctx)) ?? result;
       return result;
     };
-    return { fire, log, entries };
+    return { fire, log, entries, tools };
   } finally {
     for (const [key, value] of Object.entries(previous)) if (value === undefined) delete process.env[key]; else process.env[key] = value;
   }
@@ -385,4 +386,97 @@ test("dollar budget: a new input resets the dollar notices", () => withWorkspace
   };
   assert.equal(await run(), 1);
   assert.equal(await run(), 1);
+}));
+
+const withLimits = (diffLimits: Record<string, unknown>) => JSON.stringify({ ...writerContext, diffLimits: { ...writerContext.diffLimits, ...diffLimits } });
+
+/** Changes the worktree the way a bash command would, outside the policy's view. */
+async function shellWrite(cwd: string, file: string, content: string) {
+  await mkdir(path.dirname(path.join(cwd, file)), { recursive: true });
+  await writeFile(path.join(cwd, file), content);
+}
+
+type Verdict = { block?: boolean; reason?: string } | undefined;
+
+test("a write to a new path is blocked with diff_file_limit once maxFiles paths have changed", () => withRepo(async (cwd) => {
+  const policy = await loadPolicy({ PI_AGENT_WRITE_APPROVAL: "none", PI_AGENT_WRITER_JSON: withLimits({ maxFiles: 2 }) });
+  const { ctx } = confirmingCtx(cwd);
+  await policy.fire("input", {}, ctx);
+  await shellWrite(cwd, "README.md", "changed by bash");
+  await shellWrite(cwd, "src/a.py", "print(1)\n");
+  const blocked = await policy.fire("tool_call", { toolName: "write", input: { path: "src/b.py", content: "x" } }, ctx) as Verdict;
+  assert.equal(blocked?.block, true);
+  assert.match(blocked?.reason ?? "", /^diff_file_limit: src\/b\.py/);
+  assert.match(blocked?.reason ?? "", /2 of 2/);
+  assert.equal((policy.entries.at(-1)?.data as { reason?: string }).reason, "diff_file_limit");
+  const edit = await policy.fire("tool_call", { toolName: "edit", input: { path: "src/c.py", edits: [{ oldText: "", newText: "x" }] } }, ctx) as Verdict;
+  assert.match(edit?.reason ?? "", /^diff_file_limit/);
+  assert.equal(await policy.fire("tool_call", { toolName: "write", input: { path: "src/a.py", content: "print(2)\n" } }, ctx), undefined, "a changed path may be written again");
+}));
+
+test("a write that takes the cumulative diff over maxBytes is blocked", () => withRepo(async (cwd) => {
+  const policy = await loadPolicy({ PI_AGENT_WRITE_APPROVAL: "none", PI_AGENT_WRITER_JSON: withLimits({ maxBytes: 1000 }) });
+  const { ctx } = confirmingCtx(cwd);
+  await policy.fire("input", {}, ctx);
+  await shellWrite(cwd, "src/a.py", "a".repeat(600));
+  assert.equal(await policy.fire("tool_call", { toolName: "write", input: { path: "src/b.py", content: "b".repeat(300) } }, ctx), undefined);
+  const blocked = await policy.fire("tool_call", { toolName: "write", input: { path: "src/b.py", content: "b".repeat(401) } }, ctx) as Verdict;
+  assert.equal(blocked?.block, true);
+  assert.match(blocked?.reason ?? "", /^diff_byte_limit: src\/b\.py/);
+  assert.equal((policy.entries.at(-1)?.data as { reason?: string }).reason, "diff_byte_limit");
+  const edit = await policy.fire("tool_call", { toolName: "edit", input: { path: "src/a.py", edits: [{ oldText: "a", newText: "c".repeat(401) }] } }, ctx) as Verdict;
+  assert.match(edit?.reason ?? "", /^diff_byte_limit: src\/a\.py/);
+}));
+
+test("rewriting the same path does not count its bytes twice, with or without git", async () => {
+  for (const setup of [withRepo, withWorkspace]) await setup(async (cwd) => {
+    const policy = await loadPolicy({ PI_AGENT_WRITE_APPROVAL: "none", PI_AGENT_WRITER_JSON: withLimits({ maxBytes: 1000, maxFiles: 2 }) });
+    const { ctx } = confirmingCtx(cwd);
+    await policy.fire("input", {}, ctx);
+    for (let round = 0; round < 3; round++) {
+      assert.equal(await policy.fire("tool_call", { toolName: "write", input: { path: "src/a.py", content: "a".repeat(600) } }, ctx), undefined, `round ${round}`);
+      await shellWrite(cwd, "src/a.py", "a".repeat(600));
+    }
+    const blocked = await policy.fire("tool_call", { toolName: "write", input: { path: "src/b.py", content: "b".repeat(401) } }, ctx) as Verdict;
+    assert.match(blocked?.reason ?? "", /^diff_byte_limit/, setup.name);
+  });
+});
+
+test("the per-write cap is the smaller of 256 KiB and maxSingleFileBytes, never larger", () => withWorkspace(async (cwd) => {
+  const strict = await loadPolicy({ PI_AGENT_WRITE_APPROVAL: "none", PI_AGENT_WRITER_JSON: withLimits({ maxSingleFileBytes: 100 }) });
+  const { ctx } = confirmingCtx(cwd);
+  await strict.fire("input", {}, ctx);
+  assert.equal(await strict.fire("tool_call", { toolName: "write", input: { path: "src/a.py", content: "x".repeat(100) } }, ctx), undefined);
+  const blocked = await strict.fire("tool_call", { toolName: "write", input: { path: "src/a.py", content: "x".repeat(101) } }, ctx) as Verdict;
+  assert.equal(blocked?.block, true);
+  assert.match(blocked?.reason ?? "", /100 bytes/);
+  assert.equal((strict.entries.at(-1)?.data as { reason?: string }).reason, "write_too_large");
+  const edit = await strict.fire("tool_call", { toolName: "edit", input: { path: "src/a.py", edits: [{ oldText: "x", newText: "y".repeat(101) }] } }, ctx) as Verdict;
+  assert.equal(edit?.block, true);
+
+  for (const maxSingleFileBytes of [4 * 1024 * 1024, null, -1]) {
+    const loose = await loadPolicy({ PI_AGENT_WRITE_APPROVAL: "none", PI_AGENT_WRITER_JSON: withLimits({ maxSingleFileBytes, maxBytes: 8 * 1024 * 1024 }) });
+    await loose.fire("input", {}, ctx);
+    const big = await loose.fire("tool_call", { toolName: "write", input: { path: "src/big.txt", content: "x".repeat(256 * 1024 + 1) } }, ctx) as Verdict;
+    assert.equal(big?.block, true, String(maxSingleFileBytes));
+  }
+}));
+
+test("diff_summary reports numstat against the baseline, bash changes included, and the remaining budget", () => withRepo(async (cwd) => {
+  const policy = await loadPolicy({ PI_AGENT_WRITE_APPROVAL: "none", PI_AGENT_WRITER_JSON: withLimits({ maxFiles: 5, maxBytes: 4096, maxSingleFileBytes: 1024 }) });
+  const tool = policy.tools.get("diff_summary");
+  assert.ok(tool, "the policy extension registers diff_summary");
+  await shellWrite(cwd, "README.md", "x\ny\n");
+  await shellWrite(cwd, "src/new.py", "a = 1\nb = 2\nc = 3\n");
+  const result = await tool.execute("call-1", {}, undefined, undefined, { cwd }) as { content: Array<{ text: string }>; details: Record<string, number> };
+  const text = result.content.map((block) => block.text).join("\n");
+  assert.match(text, /^2\t1\tREADME\.md$/m);
+  assert.match(text, /^3\t0\tsrc\/new\.py$/m);
+  assert.equal(result.details.files, 2);
+  assert.equal(result.details.remainingFiles, 3);
+  assert.ok(result.details.bytes > 0);
+  assert.equal(result.details.remainingBytes, 4096 - result.details.bytes);
+  assert.equal(result.details.writeCapBytes, 1024);
+  assert.match(text, /3 more files/);
+  assert.match(text, new RegExp(`${4096 - result.details.bytes} more bytes`));
 }));

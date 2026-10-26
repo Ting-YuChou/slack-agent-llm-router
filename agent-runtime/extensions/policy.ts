@@ -2,8 +2,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { execFile } from "node:child_process";
 import path from "node:path";
+import { Type } from "typebox";
 
 import { filesOutsideScope } from "../dist/src/candidate-scope.js";
+import { DEFAULT_DIFF_LIMITS, DIFF_SUMMARY_TOOL, checkWrite, diffSummary, measureDiff, writeCap, type DiffUsage } from "../dist/src/diff-budget.js";
 import type { WriterContext } from "../dist/src/container-runtime.js";
 import { classifyBash, isApprovedSkillRead, isTestConfigPath, parsePorcelainZ, validateWorkspacePath } from "../dist/src/policy.js";
 import { codemodeMcpPrompt, type McpServerId } from "../dist/src/mcp-config.js";
@@ -139,6 +141,23 @@ export default function policyExtension(pi: ExtensionAPI) {
       event.systemPromptOptions.sections.scope = scopePrompt(scope);
     });
   }
+  // The host checks the final diff against these same limits; checking each write lets the agent fix course.
+  const diffLimits = scope?.diffLimits ?? DEFAULT_DIFF_LIMITS;
+  const maxWriteBytes = writeCap(diffLimits);
+  /** Bytes per path this session wrote; stands in for the worktree's diff only when git cannot measure it. */
+  const writtenBytes: DiffUsage = new Map();
+
+  pi.registerTool({
+    name: DIFF_SUMMARY_TOOL,
+    label: "Diff summary",
+    description: "Show your whole change against the baseline: added and deleted lines per path (shell changes and new files included) and how many more files and bytes the diff limits allow. Read-only; use it before you finish.",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _input, _signal, _onUpdate, ctx) {
+      const summary = await diffSummary(ctx.cwd, diffLimits);
+      if (!summary) return { content: [{ type: "text", text: "diff_summary could not read the worktree's Git state." }], details: {}, isError: true };
+      return { content: [{ type: "text", text: summary.text }], details: summary.details };
+    },
+  });
 
   pi.on("input", () => {
     turns = 0;
@@ -182,9 +201,16 @@ export default function policyExtension(pi: ExtensionAPI) {
       const edits = event.toolName === "edit" && Array.isArray(event.input.edits) ? event.input.edits : [];
       const written = event.toolName === "write" ? (typeof event.input.content === "string" ? Buffer.byteLength(event.input.content) : 0)
         : edits.reduce((total: number, edit: unknown) => total + (edit && typeof edit === "object" && typeof (edit as { newText?: unknown }).newText === "string" ? Buffer.byteLength((edit as { newText: string }).newText) : 0), 0);
-      if (written > 256 * 1024) {
+      if (written > maxWriteBytes) {
         decide(event.toolName, "block", "write_too_large");
-        return { block: true, reason: `Single ${event.toolName} exceeds 256 KiB` };
+        return { block: true, reason: `write_too_large: a single ${event.toolName} may carry at most ${maxWriteBytes} bytes; this one has ${written}` };
+      }
+      const usage = await measureDiff(ctx.cwd) ?? writtenBytes;
+      const projected = event.toolName === "write" ? written : (usage.get(target) ?? 0) + written;
+      const budget = checkWrite(usage, diffLimits, target, projected);
+      if (!budget.allowed) {
+        decide(event.toolName, "block", budget.reason);
+        return { block: true, reason: budget.message };
       }
       if (!writeApproved && WRITE_APPROVAL === "per_prompt") {
         const startedAt = Date.now();
@@ -198,6 +224,7 @@ export default function policyExtension(pi: ExtensionAPI) {
         writeApproved = true;
       } else decide(event.toolName, "allow", WRITE_APPROVAL === "none" ? "write_approval_off" : "write_approved_for_prompt");
       writtenPaths.add(target);
+      writtenBytes.set(target, projected);
       return undefined;
     }
 

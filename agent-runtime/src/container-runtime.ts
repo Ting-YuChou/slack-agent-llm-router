@@ -16,6 +16,7 @@ import { StartupTiming } from "./startup-timing.js";
 import { taskMode, type TaskMode } from "./task-mode.js";
 import { agentScheduler } from "./agent-scheduler.js";
 import type { DiffLimits } from "./worktree-manager.js";
+import { DIFF_SUMMARY_TOOL } from "./diff-budget.js";
 import { RESOURCE_LIMIT_FLAGS } from "./container-flags.js";
 import { CREDENTIAL_PLACEHOLDER, type RunCredentials } from "./run-credentials.js";
 import type { SealStatus } from "./session-seal.js";
@@ -77,6 +78,7 @@ export type WriteApprovalMode = "none" | "per_prompt";
 export interface WriterContext { allowedPaths: string[]; checks: string[]; rubric: string[]; diffLimits: { maxFiles: number; maxBytes: number; maxSingleFileBytes: number } }
 
 const exec = promisify(execFile);
+const POLICY_EXTENSION = "/opt/pi/extensions/policy.ts";
 
 /**
  * MCP configuration reaches the container as `--env NAME` resolved from the docker client's own
@@ -101,6 +103,8 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
   };
   const model = resolveAgentModel(options.modelRef);
   const tools = [...options.toolNames];
+  // The policy extension registers diff_summary; a writer that can change its worktree gets it.
+  if (!options.readOnlyWorkspace && tools.includes("write") && options.extensionPaths.includes(POLICY_EXTENSION) && !tools.includes(DIFF_SUMMARY_TOOL)) tools.push(DIFF_SUMMARY_TOOL);
   const hasCodemodeMcp = !options.directMcpOnly && (options.mcp?.servers.some((item) => MCP_SERVERS[item.server].codemodeTools.length > 0) ?? false);
   if ((options.classifier || hasCodemodeMcp) && !tools.includes("codemode")) tools.push("codemode");
   const directMcpTools = options.mcp?.servers.flatMap((item) =>

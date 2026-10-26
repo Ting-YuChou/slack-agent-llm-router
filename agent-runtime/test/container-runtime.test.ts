@@ -206,6 +206,21 @@ test("writer receives trusted-profile constraints; discussion mode drops them", 
   assert.doesNotMatch(buildAgentDockerArgs(base).join(" "), /PI_AGENT_WRITER_JSON/);
 });
 
+test("a writer under the policy extension gets diff_summary; readers and discussions do not", () => {
+  const base = {
+    name: "pi-session-1", image: "pi-agent@sha256:abc", network: "pi-model-only", worktreePath: "/w", gitMetadataPath: "/repo/.git",
+    sessionStatePath: "/s", gatewayUrl: "http://model-gateway:8080/v1", modelRef: "openai/gpt-5.6-luna",
+    extensionPaths: ["/opt/pi/extensions/policy.ts"], pluginPaths: [], skillPaths: [], toolNames: ["read", "write", "edit", "bash"],
+  };
+  const tools = (options: Parameters<typeof buildAgentDockerArgs>[0]) => { const args = buildAgentDockerArgs(options); return args[args.indexOf("--tools") + 1]; };
+  assert.equal(tools(base), "read,write,edit,bash,diff_summary");
+  assert.equal(tools({ ...base, toolNames: ["read", "write", "diff_summary"] }), "read,write,diff_summary");
+  assert.equal(tools({ ...base, extensionPaths: [] }), "read,write,edit,bash", "the tool lives in the policy extension");
+  assert.equal(tools({ ...base, toolNames: ["read", "grep"] }), "read,grep");
+  assert.equal(tools({ ...base, readOnlyWorkspace: true }), "read,write,edit,bash");
+  assert.equal(tools({ ...base, taskMode: "discuss" }), "read,grep,find,ls");
+});
+
 test("gateway credentials are neither on argv nor in the docker client's environment; MCP config travels in its environment", () => {
   const options = {
     name: "pi-session-1", image: "pi-agent@sha256:abc", network: "pi-model-only", worktreePath: "/w", gitMetadataPath: "/repo/.git",
