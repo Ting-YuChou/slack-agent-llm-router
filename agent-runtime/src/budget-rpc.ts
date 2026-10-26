@@ -6,6 +6,13 @@ export function deriveBudgetRpcSecret(signingSecret: string): string {
   return Buffer.from(hkdfSync("sha256", signingSecret, "slack-pi-budget-rpc-v1", "budget-rpc", 32)).toString("base64url");
 }
 
+/** Why budget admission refused: the budget said no (spent, stopped or never opened), or it could not be asked or could not price the request. */
+export type BudgetRefusal = "exhausted" | "unavailable";
+const EXHAUSTED = new Set(["budget_required", "workflow_budget_exhausted", "discovery_budget_exhausted"]);
+export function budgetRefusal(error: unknown): BudgetRefusal {
+  return error instanceof Error && EXHAUSTED.has(error.message) ? "exhausted" : "unavailable";
+}
+
 export interface BudgetAdmissionLedger {
   reserve(workflow: string, id: string, amount: number, execution?: string): void | Promise<void>;
   settle(id: string, amount: number | null): void | Promise<void>;
@@ -22,7 +29,11 @@ export class BudgetRpcClient implements BudgetAdmissionLedger {
   }
   private async post(action: string, body: object): Promise<unknown> {
     const response = await fetch(`${this.base.replace(/\/$/,'')}/internal/budget/${action}`,{ method: 'POST',headers: { authorization: `Bearer ${this.secret}`,'content-type': 'application/json' },body: JSON.stringify(body),signal: AbortSignal.timeout(2000) });
-    if (!response.ok) throw new Error('workflow_budget_unavailable_or_exhausted');
+    if (!response.ok) {
+      // Only the host's 429 names an exhausted budget; a refused bearer, an unhealthy runtime or a failing store left it unasked.
+      const refusal = response.status === 429 ? (await response.json().catch(() => undefined) as { error?: { cause?: unknown } } | undefined)?.error?.cause : undefined;
+      throw new Error(refusal === 'exhausted' ? 'workflow_budget_exhausted' : 'workflow_budget_unavailable');
+    }
     return (await response.json() as { result?: unknown }).result;
   }
   async reserve(workflow: string, id: string, amount: number, execution?: string) { await this.post('reserve',{ workflow,id,amount,execution }); }

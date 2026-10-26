@@ -26,7 +26,7 @@ import { repositoryFromRemote, parseGitHubRepositories } from "./github-reposito
 import { issueClassifierGatewayToken, issueGatewayToken } from "./gateway-token.js";
 import { allServerTools, enabledMcpServers, MCP_SERVERS, parseMcpMode, parseMcpServers, type McpServerId, type McpRunServer } from "./mcp-config.js";
 import { deriveMcpServerSecret, issueMcpToken } from "./mcp-token.js";
-import { deriveBudgetRpcSecret } from "./budget-rpc.js";
+import { budgetRefusal, deriveBudgetRpcSecret } from "./budget-rpc.js";
 import { IdempotencyCache, IdempotencyKeyReusedError } from "./idempotency.js";
 import { diskQuotaFromEnv, sessionQuotaFromEnv } from "./disk-usage.js";
 import { engineVulnerable, parseNetworkAttachments, RunNetworks } from "./run-network.js";
@@ -122,7 +122,7 @@ export function createAgentHttpServer(options: ServerOptions) {
           else if (url.pathname === '/internal/budget/active') { sendJson(response,200,{ result: options.executionActive ? options.executionActive(id(body.execution)) : ledger.active(id(body.execution)) }); return; }
           else { sendError(response,404,'not_found','Unknown budget operation'); return; }
           sendJson(response,200,{});
-        } catch { sendError(response,429,'budget_unavailable_or_exhausted','Budget admission refused'); }
+        } catch (error) { sendJson(response,429,{ error: { code: 'budget_unavailable_or_exhausted',message: 'Budget admission refused',cause: budgetRefusal(error) } }); }
         return;
       }
       if (request.method === "GET" && url.pathname === "/health") {
@@ -524,7 +524,7 @@ export async function createProductionServer() {
       }).catch(() => console.error(JSON.stringify({event:"agent_capture_state_persist_failed",run_id:run.run_id})));
       if (observed.size > 2000) observed.delete(observed.keys().next().value!);
       if (!["running", "awaiting_approval"].includes(run.status)) tracing?.log(run.run_id, "agent.run.finished", {status:run.status, capture_complete:summary.capture_complete ?? false});
-      if (!["running", "awaiting_approval"].includes(run.status) && !ciRuntime?.ci.has(run.run_id)) tracing?.endRun(run.run_id, run.status);
+      if (!["running", "awaiting_approval"].includes(run.status) && !ciRuntime?.ci.has(run.run_id)) tracing?.endRun(run.run_id, run.status, run.error);
     },
     worktrees,
     stateStore,

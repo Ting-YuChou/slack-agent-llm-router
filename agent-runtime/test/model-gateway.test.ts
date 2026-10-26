@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
+
+import { SpanStatusCode } from "@opentelemetry/api";
+import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 
 import { JEV_CLASSIFIER_MODEL, resolveAgentModel } from "../src/agent-model.js";
-import { issueClassifierGatewayToken, issueGatewayToken } from "../src/gateway-token.js";
+import type { BudgetAdmissionLedger } from "../src/budget-rpc.js";
+import { issueClassifierGatewayToken, issueGatewayToken, type ClassifierGatewayClaims, type GatewayClaims } from "../src/gateway-token.js";
 import { createModelGateway, validateAgentModelRequest } from "../src/model-gateway.js";
 import { CREDENTIAL_PLACEHOLDER } from "../src/run-credentials.js";
+import { AgentTracing } from "../src/tracing.js";
 
 test("gateway validates each request against the token-bound model and reasoning effort", () => {
   const openai = resolveAgentModel("openai/gpt-5.6-luna");
@@ -499,5 +504,97 @@ test("the container's credential placeholder never reaches a provider", async ()
   } finally {
     gateway.close();
     await once(gateway, "close");
+  }
+});
+
+type GatewayOptions = Partial<Parameters<typeof createModelGateway>[0]>;
+const luna = resolveAgentModel("openai/gpt-5.6-luna");
+const JEV_REF = `${JEV_CLASSIFIER_MODEL.provider}/${JEV_CLASSIFIER_MODEL.id}`;
+const JEV_QUESTION = { model: JEV_CLASSIFIER_MODEL.id, state: { text: "x" }, questions: { kind: { type: "choice", instructions: "Classify.", criteria: { bug: "b", feature: "f" } } } };
+
+async function gatewayAt(t: TestContext, options: GatewayOptions): Promise<string> {
+  const gateway = createModelGateway({ signingSecret: "signing-secret", providerApiKeys: { openai: "real-openai", openrouter: "real-openrouter" },
+    fetchFn: async () => new Response("{}", { status: 200 }), ...options });
+  gateway.listen(0, "127.0.0.1");
+  await once(gateway, "listening");
+  t.after(async () => { gateway.close(); await once(gateway, "close"); });
+  return `http://127.0.0.1:${(gateway.address() as AddressInfo).port}`;
+}
+function agentRequest(base: string, claims: Partial<GatewayClaims> = {}): Promise<Response> {
+  const token = issueGatewayToken({ runId: "r", provider: luna.provider, model: luna.id, api: luna.api, reasoningEffort: "max", expiresAt: Date.now() + 60_000, ...claims }, "signing-secret");
+  return fetch(`${base}${luna.gatewayPath}`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ model: luna.id, reasoning: { effort: "max" }, input: "x" }) });
+}
+function classifierRequest(base: string, claims: Partial<ClassifierGatewayClaims> = {}): Promise<Response> {
+  const token = issueClassifierGatewayToken({ kind: "classifier", runId: "c", provider: "openrouter", model: JEV_CLASSIFIER_MODEL.id, api: JEV_CLASSIFIER_MODEL.api, maxCalls: 5, expiresAt: Date.now() + 60_000, ...claims }, "signing-secret");
+  return fetch(`${base}${JEV_CLASSIFIER_MODEL.gatewayPath}`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(JEV_QUESTION) });
+}
+/** A budget store that refuses every reservation with `error`; `active` answers the classifier's revocation check. */
+function refusingLedger(error?: Error, active = true): BudgetAdmissionLedger {
+  return { reserve: async () => { if (error) throw error; }, settle: async () => {}, firstModel: async () => undefined, active: async () => active };
+}
+/** Sends `count` requests that hold their provider stream open until `release`. */
+async function holdStreams(t: TestContext, extra: GatewayOptions, count: number) {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let started = 0;
+  let allStarted!: () => void;
+  const streaming = new Promise<void>((resolve) => { allStarted = resolve; });
+  const base = await gatewayAt(t, { ...extra, fetchFn: async () => { if (++started === count) allStarted(); await held; return new Response("{}", { status: 200 }); } });
+  const open = Array.from({ length: count }, () => agentRequest(base));
+  await streaming;
+  return { base, finish: async () => { release(); await Promise.all((await Promise.all(open)).map((response) => response.text())); } };
+}
+async function admitted(response: Response): Promise<void> {
+  assert.equal(response.status, 200);
+  await response.text();
+}
+
+/** Every way the gateway answers 429, the request that provokes it, and the one cause it must name. */
+const REFUSALS: Array<{ name: string; code: string; cause: string; refuse(t: TestContext, extra: GatewayOptions): Promise<Response> }> = [
+  { name: "an agent request over an exhausted budget", code: "workflow_budget_unavailable_or_exhausted", cause: "exhausted",
+    refuse: async (t, extra) => agentRequest(await gatewayAt(t, { ...extra, budgetLedger: refusingLedger(new Error("workflow_budget_exhausted")) }), { workflowRunId: "wf" }) },
+  { name: "an agent request over an exhausted discovery stage", code: "workflow_budget_unavailable_or_exhausted", cause: "exhausted",
+    refuse: async (t, extra) => agentRequest(await gatewayAt(t, { ...extra, budgetLedger: refusingLedger(new Error("discovery_budget_exhausted")) }), { workflowRunId: "wf" }) },
+  { name: "an agent token bound to no budget", code: "workflow_budget_unavailable_or_exhausted", cause: "exhausted",
+    refuse: async (t, extra) => agentRequest(await gatewayAt(t, { ...extra, budgetLedger: refusingLedger() })) },
+  { name: "an agent request the budget store cannot answer", code: "workflow_budget_unavailable_or_exhausted", cause: "unavailable",
+    refuse: async (t, extra) => agentRequest(await gatewayAt(t, { ...extra, budgetLedger: refusingLedger(new TypeError("fetch failed")) }), { workflowRunId: "wf" }) },
+  { name: "an agent request past the token's request cap", code: "too_many_requests", cause: "request_cap",
+    refuse: async (t, extra) => { const base = await gatewayAt(t, { ...extra, maxRequestsPerToken: 1 }); await admitted(await agentRequest(base)); return agentRequest(base); } },
+  { name: "a fifth concurrent stream", code: "too_many_streams", cause: "too_many_streams",
+    refuse: async (t, extra) => { const streams = await holdStreams(t, extra, 4); const refused = await agentRequest(streams.base); await streams.finish(); return refused; } },
+  { name: "a classifier token whose run has ended", code: "token_revoked", cause: "exhausted",
+    refuse: async (t, extra) => classifierRequest(await gatewayAt(t, { ...extra, budgetLedger: refusingLedger(undefined, false) })) },
+  { name: "a classifier token past its call cap", code: "classifier_call_budget_exhausted", cause: "request_cap",
+    refuse: async (t, extra) => { const base = await gatewayAt(t, extra); await admitted(await classifierRequest(base, { maxCalls: 1 })); return classifierRequest(base, { maxCalls: 1 }); } },
+  { name: "a workflow classifier request over an exhausted budget", code: "workflow_budget_unavailable_or_exhausted", cause: "exhausted",
+    refuse: async (t, extra) => classifierRequest(await gatewayAt(t, { ...extra, prices: { [JEV_REF]: { input: 1, output: 1 } }, budgetLedger: refusingLedger(new Error("workflow_budget_exhausted")) }), { workflowRunId: "wf" }) },
+  { name: "a workflow classifier request the gateway cannot price", code: "workflow_budget_unavailable_or_exhausted", cause: "unavailable",
+    refuse: async (t, extra) => classifierRequest(await gatewayAt(t, { ...extra, prices: {}, budgetLedger: refusingLedger() }), { workflowRunId: "wf" }) },
+];
+
+test("every gateway 429 names one cause beside its unchanged code", { timeout: 10_000 }, async (t) => {
+  for (const refusal of REFUSALS) {
+    const response = await refusal.refuse(t, {});
+    assert.equal(response.status, 429, refusal.name);
+    const { error } = await response.json() as { error: { code: string; cause?: string } };
+    assert.deepEqual({ code: error.code, cause: error.cause }, { code: refusal.code, cause: refusal.cause }, refusal.name);
+  }
+});
+
+test("every gateway 429 leaves a failed request span carrying its cause_code", { timeout: 10_000 }, async (t) => {
+  for (const refusal of REFUSALS) {
+    const exporter = new InMemorySpanExporter();
+    const tracing = new AgentTracing([new SimpleSpanProcessor(exporter)]);
+    const response = await refusal.refuse(t, { tracing });
+    assert.equal(response.status, 429, refusal.name);
+    await response.text();
+    const refused = exporter.getFinishedSpans().filter((span) => span.attributes["http.response.status_code"] === 429);
+    assert.equal(refused.length, 1, refusal.name);
+    assert.equal(refused[0].name, "gen_ai.request", refusal.name);
+    assert.equal(refused[0].attributes["agent.error.cause_code"], refusal.cause, refusal.name);
+    assert.equal(refused[0].attributes["agent.error.code"], refusal.code, refusal.name);
+    assert.equal(refused[0].status.code, SpanStatusCode.ERROR, refusal.name);
+    await tracing.close();
   }
 });

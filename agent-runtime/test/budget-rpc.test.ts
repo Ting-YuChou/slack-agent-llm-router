@@ -47,3 +47,27 @@ test('the gateway sends the derived bearer and the runtime refuses the raw signi
     await assert.rejects(new budgetRpcModule.BudgetRpcClient(base, master).reserve('w','raw',.1), 'a leaked signing secret is not a budget credential');
   } finally { await new Promise<void>(resolve => server.close(() => resolve())); ledger.close(); rmSync(root,{ recursive: true,force: true }); }
 });
+
+test('the budget RPC tells a budget that refused from one it could not ask', async () => {
+  const { budgetRefusal, BudgetRpcClient } = budgetRpcModule;
+  const root = mkdtempSync(path.join(os.tmpdir(),'budget-rpc-')); const ledger = new BudgetLedger(path.join(root,'db'));
+  let healthy = true;
+  // The host store itself failing (a disk error, say) is not an exhausted budget.
+  const store = { reserve: (workflow: string, id: string, amount: number, execution?: string) => { if (workflow === 'broken') throw new Error('disk I/O error'); ledger.reserve(workflow,id,amount,execution); } };
+  const server = createAgentHttpServer({ token: 'runtime',orchestrator: {} as any,health: () => ({}),acceptRuns: () => healthy,budgetLedger: store,budgetSecret: 'gateway' } as any);
+  const refusal = (attempt: Promise<void>) => attempt.then(() => assert.fail('the reservation was admitted'), budgetRefusal);
+  try {
+    await new Promise<void>(resolve => server.listen(0,'127.0.0.1',resolve)); const address = server.address() as any; const base = `http://127.0.0.1:${address.port}`;
+    const rpc = new BudgetRpcClient(base,'gateway'); ledger.open('w',1); ledger.open('stopped',1); ledger.stop('stopped');
+    assert.equal(await refusal(rpc.reserve('w','over',2)), 'exhausted', 'over the limit');
+    assert.equal(await refusal(rpc.reserve('stopped','late',.1)), 'exhausted', 'a stopped budget');
+    assert.equal(await refusal(rpc.reserve('never-opened','x',.1)), 'exhausted', 'a budget never opened');
+    assert.equal(await refusal(rpc.reserve('broken','x',.1)), 'unavailable', 'the host store failed');
+    assert.equal(await refusal(new BudgetRpcClient(base,'runtime').reserve('w','x',.1)), 'unavailable', 'a refused bearer');
+    healthy = false;
+    assert.equal(await refusal(rpc.reserve('w','x',.1)), 'unavailable', 'an unhealthy runtime');
+    assert.equal(await refusal(new BudgetRpcClient('http://127.0.0.1:1','gateway').reserve('w','x',.1)), 'unavailable', 'an unreachable host');
+    assert.equal(budgetRefusal(new Error('budget_required')), 'exhausted', 'a token bound to no budget has nothing to spend');
+    assert.equal(budgetRefusal(new Error('workflow_budget_setup_missing')), 'unavailable', 'a model the gateway cannot price');
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); ledger.close(); rmSync(root,{ recursive: true,force: true }); }
+});

@@ -26,3 +26,13 @@ test("non-Error throws never leak arbitrary text", () => {
   assert.equal(failure.code, "quality_gate_unavailable");
   assert.doesNotMatch(failure.message, /secret/);
 });
+
+test("a known cause wrapped inside another error still rides along on quality_gate_unavailable", () => {
+  const docker = Object.assign(new Error("spawn docker ENOENT"), { code: "ENOENT" });
+  const wrapped = classifyGateError(new Error("Verification could not start", { cause: docker }));
+  assert.equal(wrapped.code, "quality_gate_unavailable");
+  assert.equal(wrapped.cause_code, "docker_unavailable");
+  assert.match(wrapped.message, /Verification could not start/);
+  const harness = classifyGateError(new Error("Candidate snapshot failed", { cause: new HarnessError("snapshot_too_large", "Candidate snapshot too large") }));
+  assert.equal(harness.cause_code, "snapshot_too_large");
+});

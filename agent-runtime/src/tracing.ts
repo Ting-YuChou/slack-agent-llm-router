@@ -163,7 +163,8 @@ export class AgentTracing {
     root?.setAttributes(attributes);
     root?.setStatus({ code: SpanStatusCode.ERROR });
   }
-  endRun(runId: string, status: string): void {
+  /** `error` is the run's public failure: its code and, when the harness knows it, the cause behind it. */
+  endRun(runId: string, status: string, error?: { code: string; cause_code?: string }): void {
     const run = this.runs.get(runId);
     if (!run)
       return;
@@ -172,6 +173,8 @@ export class AgentTracing {
       span.end();
     }
     run.root.setAttribute("agent.status", status);
+    if (error)
+      run.root.setAttributes({ "agent.error.code": error.code, ...(error.cause_code ? { "agent.error.cause_code": error.cause_code } : {}) });
     if (["failed", "timed_out", "interrupted"].includes(status))
       run.root.setStatus({ code: SpanStatusCode.ERROR });
     run.root.end();

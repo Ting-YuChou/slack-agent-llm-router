@@ -1,4 +1,4 @@
-import { BudgetRpcClient, deriveBudgetRpcSecret, type BudgetAdmissionLedger } from "./budget-rpc.js";
+import { BudgetRpcClient, budgetRefusal, deriveBudgetRpcSecret, type BudgetAdmissionLedger, type BudgetRefusal } from "./budget-rpc.js";
 import { BudgetLedger } from "./budget-ledger.js";
 import { admitBudget, type ModelPrice } from "./gateway-budget.js";
 import { allowedAnthropicBeta, sanitizeAgentRequest } from "./gateway-request-policy.js";
@@ -27,6 +27,8 @@ const MAX_STREAMS_PER_TOKEN = 4;
 const MAX_REQUESTS_PER_TOKEN = 500;
 
 export type ProviderApiKeys = Partial<Record<AgentProvider | "openrouter", string>>;
+/** Why the gateway answered 429, beside the `code` clients already match; only a budget refusal varies, with what the budget said. */
+export type RefusalCause = BudgetRefusal | "too_many_streams" | "request_cap";
 
 export function createModelGateway(options: {
   budgetLedger?: BudgetAdmissionLedger;
@@ -92,13 +94,12 @@ export function createModelGateway(options: {
         let active: boolean;
         try { active = await options.budgetLedger.active(claims.runId); }
         catch { sendJson(response, 503, { error: { code: "revocation_unavailable", message: "Whether this run is still active could not be confirmed" } }); return; }
-        if (!active) { sendJson(response, 429, { error: { code: "token_revoked", message: "This run has ended; its classifier token is revoked" } }); return; }
+        // A workflow-bound token of an ended run is refused as an exhausted budget; this one is no different.
+        if (!active) { refuse(response, options.tracing, claims, "token_revoked", "This run has ended; its classifier token is revoked", "exhausted"); return; }
       }
       const budget = classifierCalls.get(claims.runId) ?? { count: 0, expiresAt: claims.expiresAt };
       if (budget.count >= claims.maxCalls) {
-        sendJson(response, 429, {
-          error: { code: "classifier_call_budget_exhausted", message: "Classifier call budget exhausted" },
-        });
+        refuse(response, options.tracing, claims, "classifier_call_budget_exhausted", "Classifier call budget exhausted", "request_cap");
         return;
       }
       classifierCalls.set(claims.runId, { count: budget.count + 1, expiresAt: claims.expiresAt });
@@ -106,7 +107,7 @@ export function createModelGateway(options: {
       // Classifier tokens are bounded by maxCalls; only workflow-bound ones are also metered.
       if (!claims.workflowRunId) admission = { body: rawBody, data: () => {}, finish: () => {} };
       else try { admission = await admitBudget(options.budgetLedger, options.prices ?? {}, claims.workflowRunId, `${claims.provider}/${claims.model}`, rawBody, claims.runId); rawBody = admission.body; }
-      catch { sendJson(response, 429, { error: { code: "workflow_budget_unavailable_or_exhausted" } }); return; }
+      catch (error) { refuse(response, options.tracing, claims, "workflow_budget_unavailable_or_exhausted", "Model budget unavailable or exhausted", budgetRefusal(error)); return; }
       const requestStarted = performance.now();
       const sent = await Promise.resolve(options.budgetLedger?.firstModel(claims.runId)).catch(() => undefined);
     if (sent !== undefined) options.tracing?.firstModel(claims.runId, claims.traceparent, sent);
@@ -174,13 +175,13 @@ export function createModelGateway(options: {
     for (const [runId, entry] of requestCounts) if (entry.expiresAt < now) requestCounts.delete(runId);
     const requests = requestCounts.get(claims.runId) ?? { count: 0, expiresAt: claims.expiresAt };
     if (requests.count >= (options.maxRequestsPerToken ?? MAX_REQUESTS_PER_TOKEN)) {
-      sendJson(response, 429, { error: { code: "too_many_requests", message: "This run has made too many model requests" } });
+      refuse(response, options.tracing, claims, "too_many_requests", "This run has made too many model requests", "request_cap");
       return;
     }
     requestCounts.set(claims.runId, { count: requests.count + 1, expiresAt: claims.expiresAt });
     const active = activeStreams.get(claims.runId) ?? 0;
     if (active >= MAX_STREAMS_PER_TOKEN) {
-      sendJson(response, 429, { error: { code: "too_many_streams", message: "Too many concurrent model requests for this run" } });
+      refuse(response, options.tracing, claims, "too_many_streams", "Too many concurrent model requests for this run", "too_many_streams");
       return;
     }
     // Claim the slot before any await: checking, awaiting budget admission, then incrementing let
@@ -195,7 +196,7 @@ export function createModelGateway(options: {
     if (!options.budgetLedger) admission = { body: rawBody, data: () => {}, finish: () => {} };
     else {
       try { admission = await admitBudget(options.budgetLedger, options.prices ?? {}, claims.workflowRunId, `${claims.provider}/${claims.model}`, rawBody, claims.runId, claims.outputTokenLimit); rawBody = admission.body; }
-      catch { releaseSlot(); sendJson(response, 429, { error: { code: "workflow_budget_unavailable_or_exhausted", message: "Model budget unavailable or exhausted" } }); return; }
+      catch (error) { releaseSlot(); refuse(response, options.tracing, claims, "workflow_budget_unavailable_or_exhausted", "Model budget unavailable or exhausted", budgetRefusal(error)); return; }
     }
     const requestStarted = performance.now();
     const sent = await Promise.resolve(options.budgetLedger?.firstModel(claims.runId)).catch(() => undefined);
@@ -352,6 +353,15 @@ async function readBody(request: IncomingMessage): Promise<Buffer> {
 function sendJson(response: ServerResponse, status: number, payload: unknown): void {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
   response.end(JSON.stringify(payload));
+}
+
+/** A refused request never reaches a provider, so its request span is opened and closed here with the reason. */
+function refuse(response: ServerResponse, tracing: AgentTracing | undefined, claims: { runId: string; traceparent?: string; provider: string; model: string }, code: string, message: string, cause: RefusalCause): void {
+  const span = tracing?.gateway(claims.runId, claims.traceparent, claims.provider, claims.model);
+  span?.setAttributes({ "http.response.status_code": 429, "agent.error.code": code, "agent.error.cause_code": cause });
+  span?.setStatus({ code: SpanStatusCode.ERROR });
+  span?.end();
+  sendJson(response, 429, { error: { code, message, cause } });
 }
 
 /** Every agent request must be metered; a gateway without a budget store would pass requests through unbounded. */
