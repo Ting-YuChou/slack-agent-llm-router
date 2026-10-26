@@ -63,8 +63,11 @@ export interface AgentContainerOptions {
   reuse?: boolean;
   /** A paused writer older than this is stopped instead of resumed (its MCP tokens date from its start). */
   reuseMaxAgeMs?: number;
-  /** Marks the session open before a container starts, seals it when it stops, and checks it before `--continue`. */
-  sessionSeal?: { open(): Promise<void>; seal(): Promise<void>; verify(): Promise<SealStatus> };
+  /**
+   * Marks the session open before a container starts, seals it when it stops, and checks it before `--continue`.
+   * `required` refuses a session with no seal at all; only one saved before seals were required may lack it.
+   */
+  sessionSeal?: { required?: boolean; open(): Promise<void>; seal(): Promise<void>; verify(): Promise<SealStatus> };
 }
 
 export interface ChecksContext { checks: string[]; defaultChecks: string[]; maxCalls: number }
@@ -228,6 +231,8 @@ export class DockerPiProcess implements AgentProcess {
     this.hasSession = options.continueSession ?? false;
   }
 
+  get sessionStatePath(): string { return this.options.sessionStatePath; }
+
   /** The turn and tool-call limits a run on this route is started with. */
   limitsFor(route: RouteDecision): AgentLimits | undefined {
     return this.options.routeLimits ? limitsForRoute(route, this.options.routeLimits) : this.options.limits;
@@ -366,9 +371,10 @@ export class DockerPiProcess implements AgentProcess {
       if (controller.signal.aborted) { release(); return; }
       this.queueMs = Date.now() - queuedAt;
       this.releasePermit = release; this.tracing?.lifecycle(runId, "queue", "end");
-      if (!await this.sessionIntact()) {
+      const refused = await this.sessionRefusal();
+      if (refused) {
         this.releasePermit?.(); this.releasePermit = undefined;
-        this.onEvent({ type: "error", code: "session_integrity_failed", message: "The agent session was modified after it was saved; it cannot be continued" });
+        this.onEvent({ type: "error", code: "session_integrity_failed", message: refused });
         return;
       }
       // Without the mark, a runtime that dies while this container runs leaves the session reading as tampered.
@@ -378,15 +384,24 @@ export class DockerPiProcess implements AgentProcess {
     })().catch(() => { if (!controller.signal.aborted) this.onEvent({ type: "error", code: "container_admission_failed", message: "Agent could not acquire/start an execution slot" }); });
   }
 
-  /** A session Pi will `--continue` must still be the one sealed when its last container stopped. */
-  private async sessionIntact(): Promise<boolean> {
-    if (!this.hasSession || !this.options.sessionSeal) return true;
+  /** Why Pi must not `--continue` the session, if so: it must still be the one sealed when its last container stopped. */
+  private async sessionRefusal(): Promise<string | undefined> {
+    const modified = "The agent session was modified after it was saved; it cannot be continued";
+    if (!this.hasSession || !this.options.sessionSeal) return undefined;
     try {
       const status = await this.options.sessionSeal.verify();
-      if (status === "unsealed") console.error(JSON.stringify({ event: "agent_session_unsealed", session_id: this.sessionId }));
+      if (status === "unsealed") {
+        // A session created since seals became required had one from its first stop: it was lost or removed.
+        if (this.options.sessionSeal.required) {
+          console.error(JSON.stringify({ event: "agent_session_seal_missing", session_id: this.sessionId }));
+          return "The agent session has no seal to verify it against; it cannot be continued";
+        }
+        console.error(JSON.stringify({ event: "agent_session_unsealed", session_id: this.sessionId }));
+        return undefined;
+      }
       // Still open: its last container's stop was never sealed and startup could not seal it either.
-      return status === "valid" || status === "unsealed";
-    } catch { return false; }
+      return status === "valid" ? undefined : modified;
+    } catch { return modified; }
   }
 
   /** Configures the ready container's model for this execution and sends the prompt. */
