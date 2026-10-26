@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import time
 import uuid
@@ -31,6 +32,7 @@ from src.agent_runtime import (
     AgentRuntimeTimeout,
     AgentRuntimeUnauthorized,
     AgentRuntimeUnavailable,
+    is_transient_error,
 )
 from slack.agent_bootstrap import (
     AgentBootstrapBuilder,
@@ -255,6 +257,10 @@ AGENT_FOLLOWUP_FLAG_PATTERN = re.compile(
 
 AGENT_RUNTIME_CREDENTIALS_TEXT = (
     "Agent mode is misconfigured: the runtime rejected the bot's credentials."
+)
+AGENT_STATUS_DELAYED_TEXT = (
+    "⏳ Agent status is delayed: the Agent runtime is not answering. "
+    "I'll keep checking until the run's deadline."
 )
 AGENT_START_ERROR_TEXT = {
     "session_busy": "This Agent session already has a run in progress; wait for it or use `agent stop`.",
@@ -2734,6 +2740,20 @@ class SlackBot:
             self.agent_config.get("progress_interval_seconds", 10)
         )
         self.agent_progress_clock: Callable[[], float] = time.monotonic
+        # How long a monitor keeps reattaching to a run it cannot reach: the
+        # runtime's own deadline (PI_AGENT_DEADLINE_MS) bounds the run anyway.
+        self.agent_run_deadline_seconds = float(
+            self.agent_config.get("run_deadline_seconds", 900)
+        )
+        self.agent_monitor_reattach_seconds = float(
+            self.agent_config.get("monitor_reattach_seconds", 5)
+        )
+        self.agent_monitor_reattach_max_seconds = float(
+            self.agent_config.get("monitor_reattach_max_seconds", 60)
+        )
+        self.agent_monitor_clock: Callable[[], float] = time.monotonic
+        self.agent_monitor_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+        self.agent_monitor_random: Callable[[], float] = random.random
         self.agent_max_active_runs_per_user = max(
             1, int(self.agent_config.get("max_active_runs_per_user", 1))
         )
@@ -4261,6 +4281,11 @@ class SlackBot:
         if runtime is None or self.web_client is None:
             return
         await self._persist_agent_run(tracked)
+        # The runtime pauses a run's deadline while it waits for approval, so
+        # each approval restarts the window the monitor keeps reattaching in.
+        deadline = self.agent_monitor_clock() + self.agent_run_deadline_seconds
+        failures = 0
+        delay_posted = False
         while True:
             try:
                 run = await runtime.wait_for_update(
@@ -4278,15 +4303,42 @@ class SlackBot:
                     )
                     await self._forget_agent_run(tracked)
                     return
-                logger.warning("Agent run monitor failed for %s", tracked["run_id"])
+                remaining = deadline - self.agent_monitor_clock()
+                if is_transient_error(exc) and remaining > 0:
+                    logger.warning(
+                        "Agent runtime unreachable for run %s; reattaching: %s",
+                        tracked["run_id"],
+                        exc,
+                    )
+                    if not delay_posted:
+                        delay_posted = True
+                        await self.web_client.chat_postMessage(
+                            channel=tracked["channel_id"],
+                            thread_ts=tracked["thread_ts"],
+                            text=AGENT_STATUS_DELAYED_TEXT,
+                        )
+                    ceiling = min(
+                        self.agent_monitor_reattach_max_seconds,
+                        self.agent_monitor_reattach_seconds * 2**failures,
+                    )
+                    failures += 1
+                    await self.agent_monitor_sleep(
+                        min(remaining, self.agent_monitor_random() * ceiling)
+                    )
+                    continue
+                logger.warning(
+                    "Agent run monitor failed for %s: %s", tracked["run_id"], exc
+                )
                 await self.web_client.chat_postMessage(
                     channel=tracked["channel_id"],
                     thread_ts=tracked["thread_ts"],
                     text="Agent status could not be retrieved; Chat mode was not used as fallback.",
                 )
                 return
+            failures = 0
             await self._close_agent_approval_cards(tracked, run)
             if run.get("status") == "awaiting_approval":
+                deadline = self.agent_monitor_clock() + self.agent_run_deadline_seconds
                 await self._update_agent_progress(tracked, run)
                 await self._post_agent_approval(tracked, run)
                 await asyncio.sleep(self.agent_monitor_poll_seconds)

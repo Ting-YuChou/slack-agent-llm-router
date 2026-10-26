@@ -11,17 +11,23 @@ from src.agent_runtime import (
     AgentRuntimeClient,
     AgentRuntimeConflict,
     AgentRuntimeError,
+    AgentRuntimeForbidden,
     AgentRuntimeTimeout,
     AgentRuntimeUnauthorized,
     AgentRuntimeUnavailable,
 )
 
 
-def client(handler, monkeypatch):
+def client(handler, monkeypatch, config=None, **options):
     monkeypatch.setenv("AGENT_RUNTIME_TOKEN", "runtime-token")
     return AgentRuntimeClient(
-        {"base_url": "http://agent.test:3001", "token_env": "AGENT_RUNTIME_TOKEN"},
+        {
+            "base_url": "http://agent.test:3001",
+            "token_env": "AGENT_RUNTIME_TOKEN",
+            **(config or {}),
+        },
         transport=httpx.MockTransport(handler),
+        **options,
     )
 
 
@@ -260,6 +266,256 @@ async def test_stable_error_mapping(monkeypatch, status, code, expected):
     with pytest.raises(expected):
         await runtime.create_session("T", "C", "1", "U", "task")
     await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "code", "expected"),
+    [
+        (401, "unauthorized", AgentRuntimeUnauthorized),
+        (401, "approval_forbidden", AgentRuntimeForbidden),
+        (403, "patch_forbidden", AgentRuntimeForbidden),
+        (409, "session_busy", AgentRuntimeConflict),
+        (429, "runtime_busy", AgentRuntimeBusy),
+        (504, "run_timeout", AgentRuntimeTimeout),
+        (400, "invalid_request", AgentRuntimeError),
+    ],
+)
+async def test_errors_carry_the_server_message_and_code(
+    monkeypatch, status, code, expected
+):
+    message = "Only the run owner can decide approvals"
+    runtime = client(
+        lambda _request: httpx.Response(
+            status, json={"error": {"code": code, "message": message}}
+        ),
+        monkeypatch,
+    )
+    try:
+        with pytest.raises(expected) as raised:
+            await runtime.cancel("R", "U")
+    finally:
+        await runtime.close()
+    assert raised.value.server_message == message
+    assert message in str(raised.value)
+    assert (raised.value.status, raised.value.code) == (status, code)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [b"not json", b'{"error": {"code": "boom", "message": 7}}', b"[]"],
+)
+async def test_errors_without_a_server_message_keep_the_status_text(monkeypatch, body):
+    runtime = client(lambda _request: httpx.Response(400, content=body), monkeypatch)
+    try:
+        with pytest.raises(AgentRuntimeError) as raised:
+            await runtime.cancel("R", "U")
+    finally:
+        await runtime.close()
+    assert raised.value.server_message is None
+    assert str(raised.value) == "Agent runtime rejected the request with status 400"
+
+
+@pytest.mark.asyncio
+async def test_a_long_server_message_is_bounded(monkeypatch):
+    runtime = client(
+        lambda _request: httpx.Response(
+            400, json={"error": {"code": "invalid_request", "message": "x" * 5000}}
+        ),
+        monkeypatch,
+    )
+    try:
+        with pytest.raises(AgentRuntimeError) as raised:
+            await runtime.cancel("R", "U")
+    finally:
+        await runtime.close()
+    assert raised.value.server_message is not None
+    assert len(raised.value.server_message) <= 500
+    assert len(str(raised.value)) <= 600
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [
+        (401, "approval_forbidden"),
+        (401, "repair_forbidden"),
+        (401, "feedback_forbidden"),
+        (401, "session_forbidden"),
+        (403, "patch_forbidden"),
+    ],
+)
+async def test_forbidden_codes_are_a_kind_of_unauthorized(monkeypatch, status, code):
+    runtime = client(
+        lambda _request: httpx.Response(
+            status, json={"error": {"code": code, "message": "not the owner"}}
+        ),
+        monkeypatch,
+    )
+    try:
+        with pytest.raises(AgentRuntimeForbidden) as raised:
+            await runtime.decide("R", "A", "U", "approve")
+    finally:
+        await runtime.close()
+    # Existing `except AgentRuntimeUnauthorized` clauses still catch it.
+    assert isinstance(raised.value, AgentRuntimeUnauthorized)
+    assert raised.value.code == code
+
+
+@pytest.mark.asyncio
+async def test_a_bad_runtime_token_is_unauthorized_but_not_forbidden(monkeypatch):
+    runtime = client(
+        lambda _request: httpx.Response(
+            401, json={"error": {"code": "unauthorized", "message": "bad token"}}
+        ),
+        monkeypatch,
+    )
+    try:
+        with pytest.raises(AgentRuntimeUnauthorized) as raised:
+            await runtime.cancel("R", "U")
+    finally:
+        await runtime.close()
+    assert not isinstance(raised.value, AgentRuntimeForbidden)
+    assert raised.value.server_message == "bad token"
+
+
+def _retrying_client(handler, monkeypatch, *, jitter=1.0, **config):
+    """A client whose retry sleeps are recorded instead of slept."""
+    sleeps = []
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    runtime = client(handler, monkeypatch, config, sleep=sleep, random=lambda: jitter)
+    return runtime, sleeps
+
+
+READS = {
+    "lookup": (
+        lambda runtime: runtime.lookup_session("T", "C", "1"),
+        {"found": True, "session": {"session_id": "S"}},
+        {"session_id": "S"},
+    ),
+    "get_run": (
+        lambda runtime: runtime.get_run("R"),
+        {"run_id": "R", "session_id": "S", "status": "running"},
+        {"run_id": "R", "session_id": "S", "status": "running"},
+    ),
+    "tasks": (
+        lambda runtime: runtime.tasks("R"),
+        [{"task_id": "t1"}],
+        [{"task_id": "t1"}],
+    ),
+    "ci_repairs": (
+        lambda runtime: runtime.ci_repairs(),
+        [{"run_id": "ci"}],
+        [{"run_id": "ci"}],
+    ),
+}
+
+
+def _transient_failure(kind, request):
+    if kind == "connect":
+        raise httpx.ConnectError("refused", request=request)
+    if kind == "timeout":
+        raise httpx.ReadTimeout("slow", request=request)
+    return httpx.Response(kind, json={"error": {"code": "down", "message": "down"}})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read", sorted(READS))
+@pytest.mark.parametrize("failure", [500, 502, 503, 429, "connect", "timeout"])
+async def test_idempotent_reads_retry_transient_errors(monkeypatch, read, failure):
+    call, payload, expected = READS[read]
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return _transient_failure(failure, request)
+        return httpx.Response(200, json=payload)
+
+    runtime, sleeps = _retrying_client(handler, monkeypatch)
+    try:
+        result = await call(runtime)
+    finally:
+        await runtime.close()
+    assert result == expected
+    assert calls["n"] == 3
+    assert sleeps == [0.5, 1.0]
+
+
+@pytest.mark.asyncio
+async def test_read_retries_are_bounded_and_use_capped_full_jitter(monkeypatch):
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(
+            503, json={"error": {"code": "runtime_unhealthy", "message": "busy"}}
+        )
+
+    runtime, sleeps = _retrying_client(
+        handler,
+        monkeypatch,
+        jitter=0.5,
+        read_retry_attempts=6,
+        read_retry_base_seconds=0.5,
+        read_retry_max_seconds=2,
+    )
+    try:
+        with pytest.raises(AgentRuntimeError) as raised:
+            await runtime.get_run("R")
+    finally:
+        await runtime.close()
+    assert calls["n"] == 6
+    # Full jitter: a uniform share of the capped exponential delay.
+    assert sleeps == [0.25, 0.5, 1.0, 1.0, 1.0]
+    assert (raised.value.status, raised.value.code) == (503, "runtime_unhealthy")
+    assert raised.value.server_message == "busy"
+
+
+@pytest.mark.asyncio
+async def test_only_transient_errors_on_reads_are_retried(monkeypatch):
+    requests = []
+    replies = {
+        "/v1/runs/missing": [httpx.Response(404, json={"error": {"code": "x"}})],
+        "/v1/runs/denied": [httpx.Response(401, json={"error": {"code": "x"}})],
+        "/v1/runs/R/cancel": [httpx.Response(503)],
+        "/v1/runs/flaky": [
+            httpx.Response(503),
+            httpx.Response(
+                200, json={"run_id": "flaky", "session_id": "S", "status": "running"}
+            ),
+        ],
+    }
+
+    def handler(request):
+        requests.append(request.url.path)
+        return replies[request.url.path].pop(0)
+
+    runtime, sleeps = _retrying_client(handler, monkeypatch)
+    try:
+        with pytest.raises(AgentRuntimeError):
+            await runtime.get_run("missing")
+        with pytest.raises(AgentRuntimeUnauthorized):
+            await runtime.get_run("denied")
+        # A write is never sent twice by the read retry.
+        with pytest.raises(AgentRuntimeError):
+            await runtime.cancel("R", "U")
+        run = await runtime.get_run("flaky")
+    finally:
+        await runtime.close()
+    assert run["run_id"] == "flaky"
+    assert requests == [
+        "/v1/runs/missing",
+        "/v1/runs/denied",
+        "/v1/runs/R/cancel",
+        "/v1/runs/flaky",
+        "/v1/runs/flaky",
+    ]
+    assert sleeps == [0.5]
 
 
 @pytest.mark.asyncio
