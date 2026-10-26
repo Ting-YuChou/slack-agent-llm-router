@@ -1,0 +1,33 @@
+{
+  "id": "run-checks-only-bug",
+  "description": "The visible tests pass on the fixture; the bug (refunds render as '$-4.50') shows only in the acceptance check, whose argv the writer never sees. run_checks is available, so passing needs a writer that runs it, learns the failing assertion, and fixes the bug before final verification: requires_run_checks wants at least one run_checks call and a first attempt that passed both gates. Contrast hidden-rule-repair, which refuses run_checks to force a repair.",
+  "task_mode": "implement",
+  "workflow_mode": "single",
+  "expect": "pass",
+  "requires_run_checks": true,
+  "prompt": "The acceptance check fails on main although tests/price.test.cjs passes, and nobody wrote down why. You cannot see that check's command: run it with the run_checks tool to find out what fails, then fix the bug in src/price.cjs. Do not change the tests.",
+  "routing_text": "Find and fix why the acceptance check fails for the price formatter.",
+  "profile": {
+    "rubric": [
+      "The acceptance check passes",
+      "Existing tests are not weakened or changed"
+    ],
+    "allowedPaths": ["src/"],
+    "baselinePaths": ["tests/"],
+    "writerChecks": {"defaultChecks": ["unit", "acceptance"], "maxCalls": 3},
+    "checks": [
+      {"name": "unit", "argv": ["node", "--test", "tests/price.test.cjs"], "cwd": ".", "timeoutMs": 30000},
+      {
+        "name": "acceptance",
+        "argv": [
+          "node",
+          "-e",
+          "const assert=require('node:assert/strict');const {formatPrice}=require('./src/price.cjs');assert.equal(formatPrice(1999),'$19.99');assert.equal(formatPrice(-450),'-$4.50','house style: a refund puts the minus sign before the currency symbol, so formatPrice(-450) must be \"-$4.50\"');"
+        ],
+        "cwd": ".",
+        "timeoutMs": 30000
+      }
+    ]
+  },
+  "oracle": {"argv": ["node", "--test", ".eval-oracle/price-oracle.test.cjs"]}
+}

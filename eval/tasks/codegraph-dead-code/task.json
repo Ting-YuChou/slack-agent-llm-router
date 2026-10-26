@@ -1,0 +1,21 @@
+{
+  "id": "codegraph-dead-code",
+  "description": "Delete the dead code reachable from nowhere but other dead code. formatCents is still called, by legacyReceipt, which nothing calls, so a text search keeps it; only the call graph shows it dead. The run gets the codegraph MCP server and passes only if codegraph answered at least one call and the hidden oracle accepts the result.",
+  "task_mode": "implement",
+  "workflow_mode": "single",
+  "expect": "pass",
+  "mcp_servers": ["codegraph"],
+  "prompt": "checkout() in src/index.js is this package's only public entry point. Delete the dead code under src/: every function that checkout() can never reach, directly or through other functions, including helpers that only dead code still calls. Use the CodeGraph MCP tools (for example find_dead_code and analyze_code_relationships) to map the call graph first, confirm each target with the read tool, and keep checkout()'s behaviour and tests unchanged.",
+  "routing_text": "Remove code unreachable from checkout() using the call graph.",
+  "profile": {
+    "rubric": [
+      "Every function unreachable from checkout() is deleted, including transitively dead helpers",
+      "Everything checkout() reaches is kept and its behaviour is unchanged",
+      "Existing tests are unchanged"
+    ],
+    "allowedPaths": ["src/"],
+    "baselinePaths": ["tests/"],
+    "checks": [{"name": "unit", "argv": ["node", "--test", "tests/checkout.test.js"], "cwd": ".", "timeoutMs": 30000}]
+  },
+  "oracle": {"argv": ["node", "--test", ".eval-oracle/checkout-oracle.test.js"]}
+}

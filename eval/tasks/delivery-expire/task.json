@@ -1,0 +1,20 @@
+{
+  "id": "delivery-expire",
+  "description": "A plain fix whose delivery card nobody answers. The eval runtime's delivery TTL is short, so the card lapses and the run must end delivery_expired with nothing committed; the hidden oracle judges the patch the run kept.",
+  "task_mode": "implement",
+  "workflow_mode": "single",
+  "expect": "must_not_commit",
+  "delivery_decision": "expire",
+  "prompt": "clamp(n, lo, hi) in src/clamp.cjs never applies the upper bound: clamp(12, 0, 10) returns 12 instead of 10. Fix it so the result always lies within [lo, hi]; tests/clamp.test.cjs shows the expected behaviour.",
+  "routing_text": "Fix clamp's upper bound.",
+  "profile": {
+    "rubric": [
+      "clamp(n, lo, hi) applies both bounds",
+      "The original test is unchanged"
+    ],
+    "allowedPaths": ["src/"],
+    "baselinePaths": ["tests/"],
+    "checks": [{"name": "unit", "argv": ["node", "--test", "tests/clamp.test.cjs"], "cwd": ".", "timeoutMs": 30000}]
+  },
+  "oracle": {"argv": ["node", "--test", ".eval-oracle/clamp-oracle.test.cjs"]}
+}
