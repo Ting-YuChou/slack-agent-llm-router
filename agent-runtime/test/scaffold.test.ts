@@ -18,7 +18,9 @@ test("runtime pins the Pi 1.0.1 package set", () => {
   assert.equal(packageJson.dependencies["@earendil-works/pi-coding-agent"], "1.0.1");
   assert.equal(packageJson.dependencies["brace-expansion"], "5.0.12");
   assert.equal(packageJson.dependencies.typebox, "1.3.27");
-  assert.equal(packageJson.dependencies.undici, "8.11.2");
+  assert.equal(packageJson.dependencies.undici, "8.12.3");
+  // pi-coding-agent pins its own undici; the override keeps that copy on the patched direct pin.
+  assert.equal(packageJson.overrides.undici, "$undici");
   assert.equal(packageJson.scripts["patch-vendored-deps"], undefined);
 });
 
