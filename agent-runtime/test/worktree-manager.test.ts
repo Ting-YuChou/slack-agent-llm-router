@@ -197,3 +197,43 @@ test("applyPatch reapplies a rolled-back session's archived patch and refuses pa
   assert.equal(await git(created.path, "rev-parse", "HEAD"), created.baselineCommit);
   await assert.rejects(manager.applyPatch(repo, file));
 });
+
+test("readFileAtCommit reads a file as of a commit, whatever the worktree holds now", async () => {
+  const { readFileAtCommit } = await import("../src/worktree-manager.js");
+  const { repo } = await fixture();
+  await writeFile(path.join(repo, "AGENTS.md"), "baseline rules\n");
+  await git(repo, "add", "AGENTS.md");
+  await git(repo, "commit", "-m", "rules");
+  const commit = await git(repo, "rev-parse", "HEAD");
+  await writeFile(path.join(repo, "AGENTS.md"), "edited rules\n");
+  await git(repo, "commit", "-am", "edit rules");
+  await writeFile(path.join(repo, "AGENTS.md"), "uncommitted rules\n");
+
+  const read = await readFileAtCommit(repo, commit, "AGENTS.md", 1024);
+  assert.equal(read?.head.toString("utf8"), "baseline rules\n");
+  assert.equal(read?.bytes, 15);
+  assert.equal(await readFileAtCommit(repo, commit, "missing.md", 1024), undefined);
+  assert.equal(await readFileAtCommit(repo, "HEAD", "AGENTS.md", 1024).then(value => value?.head.toString("utf8")), "edited rules\n");
+  await assert.rejects(readFileAtCommit(repo, "0".repeat(40), "AGENTS.md", 1024), "an unknown commit is an error, not a missing file");
+});
+
+test("readFileAtCommit reads only the head of a large file and skips anything that is not a regular file", async () => {
+  const { readFileAtCommit } = await import("../src/worktree-manager.js");
+  const { mkdir, symlink } = await import("node:fs/promises");
+  const { repo } = await fixture();
+  const large = "x".repeat(3 * 1024 * 1024);
+  await writeFile(path.join(repo, "AGENTS.md"), large);
+  await symlink("tracked.txt", path.join(repo, "LINK.md"));
+  await mkdir(path.join(repo, "DIR.md"));
+  await writeFile(path.join(repo, "DIR.md", "inner.txt"), "inner\n");
+  await git(repo, "add", ".");
+  await git(repo, "commit", "-m", "large");
+  const commit = await git(repo, "rev-parse", "HEAD");
+
+  const read = await readFileAtCommit(repo, commit, "AGENTS.md", 100);
+  assert.equal(read?.bytes, large.length);
+  assert.equal(read?.head.length, 100);
+  assert.equal(await readFileAtCommit(repo, commit, "LINK.md", 100), undefined, "a symlink's target text is not the file");
+  assert.equal(await readFileAtCommit(repo, commit, "DIR.md", 100), undefined);
+  assert.equal(await readFileAtCommit(repo, commit, "DIR.md/inner.txt", 100).then(value => value?.head.toString("utf8")), "inner\n");
+});

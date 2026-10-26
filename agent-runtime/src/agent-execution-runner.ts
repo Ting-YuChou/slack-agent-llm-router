@@ -4,7 +4,7 @@ import { DockerPiProcess, type AgentContainerOptions } from './container-runtime
 import { HarnessError } from './error-taxonomy.js';
 import type { PublicRunEvent } from './pi-rpc.js';
 import { collectSubmission } from './submission-collector.js';
-import { validateInvestigation, validatePlan, type InvestigationRequest, type InvestigationTask } from './structured-workflow.js';
+import { renderRepoGuidance, validateInvestigation, validatePlan, type InvestigationRequest, type InvestigationTask } from './structured-workflow.js';
 import type { AgentTelemetry } from './telemetry.js';
 import type { AgentTracing } from './tracing.js';
 import type { RouteDecision } from './jev-router.js';
@@ -57,6 +57,7 @@ export class AgentExecutionRunner {
     }
     const route: RouteDecision = { modelRef: config.modelRef, effort: config.reasoningEffort!, source: node.role };
     const tool = node.role === 'planner' ? 'submit_plan' : 'submit_investigation';
+    const guidance = renderRepoGuidance(input.guidance);
     const validate = (args: unknown) => node.role === 'planner'
       ? validatePlan(args, request.results.filter(item => item.role !== 'planner') as InvestigationTask[], node.wave === 1)
       : validateInvestigation(args, node);
@@ -70,6 +71,7 @@ export class AgentExecutionRunner {
           process.prompt(id, renderPrompt(node.role === 'planner' ? 'planner' : 'investigator', {
             ...(node.role === 'planner' ? {} : { role: node.role }),
             context: JSON.stringify({ requirement: input.requirement, baseline: input.baseline, snapshot_root: input.snapshot.path, task: node, prior_results: request.results.map(({ id, role, result }) => ({ id, role, result })) }),
+            guidance: guidance && `\n${guidance}`,
           }), route);
         },
         toolName: tool, validate, timeoutMs: node.role === 'planner' ? 120_000 : 180_000, signal, usage: spent => { cost += spent; },
