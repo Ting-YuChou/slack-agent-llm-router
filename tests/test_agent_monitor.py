@@ -2,12 +2,17 @@
 
 import asyncio
 import json
+import time
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
 
+from slack.agent_bootstrap import AgentBootstrapContext
+from slack.agent_feedback import AgentFeedbackNonce
+from slack.agent_shortcut import AgentShortcutNonce, AgentShortcutSubmission
 from slack.bot_real import RedisSlackStateStore, SlackBot, SlackMessageHandler
 from src.agent_runtime import (
     AgentRuntimeClient,
@@ -1064,6 +1069,267 @@ async def test_started_message_becomes_the_durable_status_message(tmp_path):
     await restored._restore_state()
     assert restored.agent_runs["R1"]["status_ts"] == "100.1"
     assert restored.agent_runs["R1"]["status_text"] == started
+
+
+def thread_start_bot(tmp_path):
+    """A bot whose runtime accepts starts and resumes of run R1 in thread 100.1."""
+    accepted = {"session_id": "S1", "run_id": "R1", "status": "starting"}
+    runtime = SimpleNamespace(
+        create_session=AsyncMock(return_value=accepted),
+        resume=AsyncMock(return_value=accepted),
+    )
+    bot = file_bot(tmp_path, agent_runtime=runtime)
+    bot.web_client = SimpleNamespace(
+        chat_postMessage=AsyncMock(return_value={"ts": "300.1"}),
+        chat_update=AsyncMock(),
+        chat_postEphemeral=AsyncMock(),
+    )
+    bot._start_agent_monitor = Mock()
+    return bot
+
+
+async def assert_durable_status_message(tmp_path, bot, status_ts):
+    tracked = bot.agent_runs["R1"]
+    assert tracked["status_ts"] == status_ts
+    assert "`R1`" in tracked["status_text"]
+    bot._start_agent_monitor.assert_called_once_with(tracked)
+    # The monitor persists the run first; it is mocked out here.
+    await bot._persist_agent_run(tracked)
+    restored = file_bot(tmp_path)
+    await restored._restore_state()
+    assert restored.agent_runs["R1"]["status_ts"] == status_ts
+    assert restored.agent_runs["R1"]["status_text"] == tracked["status_text"]
+    return restored
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        "also add a regression test",
+        "!llm agent fix the tests",
+        "/llm agent fix the tests",
+        "!llm agent resume R1",
+    ],
+)
+async def test_a_run_started_inside_a_thread_posts_its_own_status_message(
+    tmp_path, text
+):
+    bot = thread_start_bot(tmp_path)
+    if not text.startswith(("!llm", "/llm")):
+        track(bot, "R0", thread_ts="100.1")["result_posted"] = True
+
+    await bot._process_message(
+        {
+            "text": text,
+            "user": "U1",
+            "channel": "C1",
+            "thread_ts": "100.1",
+            "ts": "200.1",
+            "_team_id": "T1",
+        }
+    )
+
+    # The status message is the run's only reply; nothing else is posted.
+    post = bot.web_client.chat_postMessage.await_args
+    bot.web_client.chat_postMessage.assert_awaited_once()
+    assert (post.kwargs["channel"], post.kwargs["thread_ts"]) == ("C1", "100.1")
+    assert bot.agent_runs["R1"]["status_text"] == post.kwargs["text"]
+    if "agent fix" in text:
+        # A private channel's context stays out, and the status message says so.
+        assert "without prior Slack thread context" in post.kwargs["text"]
+    restored = await assert_durable_status_message(tmp_path, bot, "300.1")
+    # Handling the message still counted against the owner's query quota.
+    assert len(restored.user_manager.rate_limits["U1"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_needs_changes_followup_posts_its_own_status_message(tmp_path):
+    bot = thread_start_bot(tmp_path)
+    bot.agent_runtime_client.feedback = AsyncMock()
+    bot.agent_feedback_nonces["N1"] = AgentFeedbackNonce(
+        run_id="R0",
+        team_id="T1",
+        channel_id="C1",
+        thread_ts="100.1",
+        owner_user_id="U1",
+        feedback_id="click-1",
+        expires_at=time.time() + 60,
+    )
+
+    await bot._handle_agent_feedback_submission(
+        {
+            "user": {"id": "U1"},
+            "view": {
+                "private_metadata": "N1",
+                "state": {
+                    "values": {
+                        "feedback_comment": {"comment": {"value": "rerun the suite"}},
+                        "feedback_continue": {
+                            "continue": {"selected_options": [{"value": "continue"}]}
+                        },
+                    }
+                },
+            },
+        }
+    )
+
+    post = bot.web_client.chat_postMessage.await_args
+    bot.web_client.chat_postMessage.assert_awaited_once()
+    assert (post.kwargs["channel"], post.kwargs["thread_ts"]) == ("C1", "100.1")
+    assert bot.agent_runs["R1"]["status_text"] == post.kwargs["text"]
+    await assert_durable_status_message(tmp_path, bot, "300.1")
+
+
+@pytest.mark.asyncio
+async def test_a_shortcut_run_keeps_its_loading_message_as_the_status_message(
+    tmp_path,
+):
+    bot = thread_start_bot(tmp_path)
+    bot.agent_bootstrap_builder = SimpleNamespace(
+        build=AsyncMock(
+            return_value=AgentBootstrapContext(
+                prompt="bootstrap prompt", message_count=3, resource_count=2
+            )
+        )
+    )
+    nonce = AgentShortcutNonce(
+        team_id="T1",
+        channel_id="C1",
+        thread_ts="100.1",
+        selected_message_ts="100.2",
+        owner_user_id="U1",
+        expires_at=time.time() + 60,
+    )
+    submission = AgentShortcutSubmission(
+        task="fix the tests", model=None, include_context=True
+    )
+
+    await bot._bootstrap_agent_submission(nonce, "N1", submission, "U1", "250.1")
+
+    # The shortcut's own "loading" message becomes the status message.
+    bot.web_client.chat_postMessage.assert_not_awaited()
+    update = bot.web_client.chat_update.await_args
+    assert (update.kwargs["channel"], update.kwargs["ts"]) == ("C1", "250.1")
+    assert bot.agent_runs["R1"]["status_text"] == update.kwargs["text"]
+    assert "Loaded 3 prior Slack messages" in update.kwargs["text"]
+    await assert_durable_status_message(tmp_path, bot, "250.1")
+
+
+@pytest.mark.asyncio
+async def test_a_thread_started_run_has_exactly_one_status_message(tmp_path):
+    async def wait_for_update(run_id, on_progress=None, **kwargs):
+        await on_progress(progress_state(run_id, "running", 1, 1, 0.01))
+        await on_progress(progress_state(run_id, "running", 2, 1, 0.01))
+        return progress_state(run_id, "completed", 2, 2, 0.02)
+
+    bot = thread_start_bot(tmp_path)
+    bot.agent_runtime_client.wait_for_update = wait_for_update
+    del bot._start_agent_monitor
+    track(bot, "R0", thread_ts="100.1")["result_posted"] = True
+
+    response = await SlackMessageHandler(bot).handle_message(
+        {
+            "text": "also add a regression test",
+            "user": "U1",
+            "channel": "C1",
+            "thread_ts": "100.1",
+            "ts": "200.1",
+            "_team_id": "T1",
+        },
+        bot.web_client,
+    )
+    await drain(bot)
+
+    assert response == ""
+    status, result = posted_texts(bot)
+    assert "`R1`" in status
+    assert "*completed*" in result
+    updates = [call.kwargs for call in bot.web_client.chat_update.await_args_list]
+    assert updates and all(update["ts"] == "300.1" for update in updates)
+    assert "Phase: *completed*" in updates[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_start_keeps_the_runs_status_message(tmp_path):
+    bot = thread_start_bot(tmp_path)
+    track(bot, "R0", thread_ts="100.1")["result_posted"] = True
+    followup = {
+        "text": "also add a regression test",
+        "user": "U1",
+        "channel": "C1",
+        "thread_ts": "100.1",
+        "ts": "200.1",
+        "_team_id": "T1",
+    }
+
+    # The runtime answers a redelivered request's key with the same run.
+    first = await SlackMessageHandler(bot).handle_message(followup, bot.web_client)
+    second = await SlackMessageHandler(bot).handle_message(followup, bot.web_client)
+
+    assert (first, second) == ("", "")
+    bot.web_client.chat_postMessage.assert_awaited_once()
+    assert bot.agent_runs["R1"]["status_ts"] == "300.1"
+
+
+def epoch(iso):
+    return datetime.fromisoformat(iso).timestamp()
+
+
+@pytest.mark.asyncio
+async def test_progress_shows_the_time_elapsed_since_the_run_started(tmp_path):
+    created_at = "2026-10-26T03:00:00.000Z"
+    now = [epoch("2026-10-26T03:02:05+00:00")]
+
+    async def wait_for_update(run_id, on_progress=None, **kwargs):
+        await on_progress(
+            progress_state(run_id, "running", 1, 1, 0.01) | {"created_at": created_at}
+        )
+        now[0] = epoch("2026-10-26T04:02:30+00:00")
+        return run_state(run_id, "completed", created_at=created_at)
+
+    bot = file_bot(
+        tmp_path, agent_runtime=SimpleNamespace(wait_for_update=wait_for_update)
+    )
+    bot.web_client = SimpleNamespace(
+        chat_postMessage=AsyncMock(), chat_update=AsyncMock()
+    )
+    bot.agent_progress_clock = lambda: now[0]
+    tracked = track(bot)
+    tracked["status_ts"] = "1.0"
+
+    await bot._monitor_agent_run(tracked)
+
+    texts = [call.kwargs["text"] for call in bot.web_client.chat_update.await_args_list]
+    assert "Elapsed: 2m 05s" in texts[0]
+    assert "Elapsed: 1h 02m" in texts[-1]
+
+
+@pytest.mark.asyncio
+async def test_progress_times_a_run_without_timestamps_from_when_it_was_tracked(
+    tmp_path,
+):
+    now = [1000.0]
+
+    async def wait_for_update(run_id, on_progress=None, **kwargs):
+        now[0] = 1045.0
+        await on_progress(progress_state(run_id, "running", 1, 1, 0.01))
+        return run_state(run_id, "completed")
+
+    bot = file_bot(
+        tmp_path, agent_runtime=SimpleNamespace(wait_for_update=wait_for_update)
+    )
+    bot.web_client = SimpleNamespace(
+        chat_postMessage=AsyncMock(), chat_update=AsyncMock()
+    )
+    bot.agent_progress_clock = lambda: now[0]
+    tracked = track(bot)
+    tracked["status_ts"] = "1.0"
+
+    await bot._monitor_agent_run(tracked)
+
+    texts = [call.kwargs["text"] for call in bot.web_client.chat_update.await_args_list]
+    assert "Elapsed: 45s" in texts[0]
 
 
 def delivery_state(run_id, approval_id):

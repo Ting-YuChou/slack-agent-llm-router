@@ -513,12 +513,14 @@ the OpenAI key can call Sol before that trial.
 
 Each new coding prompt counts as one Slack query; internal model turns and tools
 do not. Each user may run one Agent prompt at a time by default
-(`agent.max_active_runs_per_user`). For a run started by a new `/llm agent`
-message, or by **Resume from patch**, Slack keeps that run's status message up
-to date (phase, turns, tool calls, and cost, at most every 10 seconds). Runs
-started inside an existing thread (follow-up replies, **Needs changes**, and the
-**Run Pi Agent** shortcut) post only their approvals and result. Approval and result messages
-mention the owner.
+(`agent.max_active_runs_per_user`). Every Agent run has a status message that
+Slack keeps up to date, at most every 10 seconds: phase, turns, tool calls,
+cost, and the time elapsed since the run started. A new `/llm agent` thread
+uses its first message, and the **Run Pi Agent** shortcut reuses its "loading"
+message. Other runs (follow-up replies, an `@`-mention or `!llm agent`
+message, **Needs changes**, `agent resume`, and **Resume from patch**) post one
+as a reply in the run's thread. Status messages keep updating after a bot
+restart. Approval and result messages mention the owner.
 
 When the writer finishes, Slack posts a **Deliver / Discard** card with the
 changed files and diff stat. It expires after 30 minutes by default
