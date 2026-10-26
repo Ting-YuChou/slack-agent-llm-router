@@ -417,7 +417,71 @@ def _attempt_metrics(records):
         metrics["repair_success_rate"] = sum(
             1 for attempts in repaired if _gates_passed(attempts[-1])
         ) / len(repaired)
+        # @k: a repaired run whose gates passed within its first k repairs.
+        for k in range(1, max(len(attempts) for attempts in repaired)):
+            metrics[f"repair_success_rate@{k}"] = sum(
+                1
+                for attempts in repaired
+                if any(_gates_passed(attempt) for attempt in attempts[1 : k + 1])
+            ) / len(repaired)
     return metrics
+
+
+def _cost_by_role(records):
+    """Total and per-run mean spend of each role, over the runs that report it."""
+    reported = [
+        record["cost_by_role"]
+        for record in records
+        if isinstance(record.get("cost_by_role"), dict)
+    ]
+    if not reported:
+        return {}
+    totals = {}
+    for roles in reported:
+        for role, cost in roles.items():
+            if _number(cost) is not None and cost >= 0:
+                totals[role] = totals.get(role, 0.0) + cost
+    return {
+        "cost_by_role": {
+            "runs": len(reported),
+            "total_usd": totals,
+            "mean_usd": {role: total / len(reported) for role, total in totals.items()},
+        }
+    }
+
+
+def _accepted_cost(records):
+    """Every run's cost charged to the changes the oracle accepted and the run delivered."""
+    accepted = sum(1 for record in records if record["passed"] and record.get("commit"))
+    metrics = {"accepted_changes": accepted}
+    if accepted:
+        spent = sum(_number(record.get("cost_usd")) or 0.0 for record in records)
+        metrics["cost_per_accepted_change_usd"] = spent / accepted
+    return metrics
+
+
+def _tool_error_rate(records):
+    """Errors over finished calls of each writer tool, summed over the runs."""
+    counts = {}
+    for record in records:
+        summary = record.get("tool_summary")
+        for tool, entry in (summary if isinstance(summary, dict) else {}).items():
+            if not isinstance(entry, dict):
+                continue
+            calls, errors = _number(entry.get("calls")), _number(entry.get("errors"))
+            if calls is None or errors is None or not 0 <= errors <= calls or not calls:
+                continue
+            total = counts.setdefault(tool, {"calls": 0, "errors": 0})
+            total["calls"] += calls
+            total["errors"] += errors
+    if not counts:
+        return {}
+    return {
+        "tool_error_rate": {
+            tool: {**total, "rate": total["errors"] / total["calls"]}
+            for tool, total in counts.items()
+        }
+    }
 
 
 def _harness_medians(records):
@@ -487,6 +551,9 @@ def aggregate(records):
         ),
         **_attempt_metrics(records),
         **_harness_medians(records),
+        **_accepted_cost(records),
+        **_cost_by_role(records),
+        **_tool_error_rate(records),
         "tasks": tasks,
     }
 
@@ -752,6 +819,8 @@ class LiveRunner:
             "writer_checks_calls": state.get("writer_checks_calls"),
             "policy_summary": state.get("policy_summary"),
             "harness_metrics": state.get("harness_metrics"),
+            "cost_by_role": state.get("cost_by_role"),
+            "tool_summary": state.get("tool_summary"),
             "attempts": run_attempts(state),
             "degraded_investigations": run_degrades(state),
             "mcp_summary": state.get("mcp_summary"),
@@ -794,6 +863,8 @@ def execute(task, attempt, runner):
         "writer_checks_calls": outcome.get("writer_checks_calls"),
         "policy_summary": outcome.get("policy_summary"),
         "harness_metrics": outcome.get("harness_metrics"),
+        "cost_by_role": outcome.get("cost_by_role"),
+        "tool_summary": outcome.get("tool_summary"),
         "attempts": outcome.get("attempts"),
         "degraded_investigations": outcome.get("degraded_investigations"),
         "mcp_summary": outcome.get("mcp_summary"),

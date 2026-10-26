@@ -30,7 +30,8 @@ export function createQualityServices(options: {
   priorActive: Map<string, number>; repoPath: string; worktreeRoot: string; verificationBases: Map<string, string>;
   profile: VerificationProfile; checksum: string; root: string; image: string; network: string; gatewayUrl: string;
   token: (id: string, route: RouteDecision, role: "grader" | "investigator") => string; ledger: BudgetLedger; mapping: Map<string, string>; telemetry?: AgentTelemetry; tracing?: AgentTracing;
-  phase: (run: string, phase: string, cost?: number) => Promise<void>;
+  /** `role` names who spent `cost` (planner, an investigator role, grader). */
+  phase: (run: string, phase: string, cost?: number, role?: string) => Promise<void>;
   githubMcp?: { gatewayUrl: string; token(id: string, owner: string): string };
   grader?: GraderConfig;
   /** Test seams; production leaves them unset and runs Docker. */
@@ -77,7 +78,7 @@ export function createQualityServices(options: {
   }
   const runner = new AgentExecutionRunner({ ...options, stateRoot: path.join(options.root,'investigations'), execution,
     token: (id,route) => options.token(id,route,"investigator"), prompt: id => options.ledger.prompt(id),
-    cost: (id,cost) => options.phase(id,'investigating',cost), createProcess: options.createExecutionProcess,
+    cost: (id,cost,role) => options.phase(id,'investigating',cost,role), createProcess: options.createExecutionProcess,
   });
   const coordinator = new WorkflowCoordinator({ store: options.control, concurrency: profile.structuredWorkflow?.concurrency ?? 2, degradeUnknown: profile.structuredWorkflow?.degradeUnknown ?? false,
     execute: request => runner.run(request),
@@ -131,7 +132,7 @@ export function createQualityServices(options: {
         token: (id, route) => options.token(id, route, "grader"), route: grader.route, timeoutMs: grader.timeoutMs,
         constraints: { allowedPaths: profile.allowedPaths, diffLimits: DEFAULT_DIFF_LIMITS },
         execution: (id, parent, phase, cost, queueMs) => execution(id, parent, "grader", input.attempt, phase, cost, queueMs),
-        cost: cost => options.phase(input.run_id, "grading", cost), createProcess: options.createGraderProcess,
+        cost: cost => options.phase(input.run_id, "grading", cost, "grader"), createProcess: options.createGraderProcess,
       });
       graders.set(input.run_id, runner);
       await options.phase(input.run_id, "grading"); tracing?.lifecycle(input.run_id, "grading", "start");

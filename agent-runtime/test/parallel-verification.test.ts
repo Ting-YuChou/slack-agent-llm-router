@@ -66,6 +66,13 @@ test("static checks run first in each mode", async () => {
   assert.throws(() => validateProfile({ ...base, checks: [{ ...spec("x"), kind: "slow" }] }), /kind/);
 });
 
+test("each check records its kind; an undeclared kind runs and is recorded as a test", async () => {
+  const profile = validateProfile({ ...base, checks: [spec("tests", "test"), spec("lint", "static"), spec("smoke")] });
+  const container = scripted((_mode, check) => check === "smoke" ? lost : ok);
+  const result = await withCandidate(candidate => new DockerVerifier(profile, { runContainer: container.run, removeContainer, scheduler: new VerifierScheduler(1) }).verify(candidate, new AbortController().signal, ["candidate"]));
+  assert.deepEqual(result.checks.map(check => `${check.name}=${check.kind}`), ["candidate:lint=static", "candidate:tests=test", "candidate:smoke=test"]);
+});
+
 test("the scheduler is shared: two verifiers never exceed the host limit", async () => {
   const profile = validateProfile({ ...base, checks: [spec("a"), spec("b")] });
   const container = scripted(() => ok);

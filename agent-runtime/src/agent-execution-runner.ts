@@ -35,7 +35,8 @@ export class AgentExecutionRunner {
   constructor(private readonly options: { image: string; network: string; gatewayUrl: string; stateRoot: string; telemetry?: AgentTelemetry; tracing?: AgentTracing;
     token(id: string, route: RouteDecision): string; prompt?(id: string): void;
     execution(id: string, parent: string, role: string, attempt: number, phase: 'start' | 'end', cost?: number, queueMs?: number): Promise<void>;
-    cost(parent: string, cost: number): Promise<void>;
+    /** `role` is the node's (planner, code_explorer, ...), so the run can attribute the spend. */
+    cost(parent: string, cost: number, role: string): Promise<void>;
     githubMcp?: { gatewayUrl: string; token(id: string, owner: string): string };
     createProcess?: InvestigationProcessFactory;
   }) {}
@@ -90,7 +91,7 @@ export class AgentExecutionRunner {
       node.attempt_queue_ms = queueMs; node.queue_ms = (node.queue_ms ?? 0) + queueMs;
       this.active.delete(key);
       await this.options.execution(id, input.run_id, node.role, node.attempt, 'end', cost, queueMs);
-      await this.options.cost(input.run_id, cost);
+      await this.options.cost(input.run_id, cost, node.role);
     }
   }
 }

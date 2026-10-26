@@ -126,6 +126,16 @@ test("per_mode is the default isolation: one container per mode, results from it
   assert.equal(result.checks.find(check => check.name === "candidate:test")?.passed, 5);
 });
 
+test("per_mode: each check records its kind, including the unknown one the runner never reached", async () => {
+  const kinded = [{ ...checks[0], kind: "static" as const }, { ...checks[1], kind: "test" as const }];
+  const done = await verifyWith(modeContainer(() => lines(record(1, "lint"), record(2, "test"))).run, kinded);
+  assert.deepEqual(done.checks.filter(check => check.name.startsWith("candidate:")).map(check => `${check.name}=${check.kind}`), ["candidate:lint=static", "candidate:test=test"]);
+  const missing = await verifyWith(modeContainer(() => lines(record(1, "lint"))).run, kinded);
+  assert.equal(missing.checks.find(check => check.name === "candidate:test")?.kind, "test");
+  const forged = await verifyWith(modeContainer(() => lines(record(1, "lint"), record(1, "lint"))).run, kinded);
+  assert.equal(forged.checks.find(check => check.name === "candidate:lint")?.kind, "static");
+});
+
 test("per_mode: forged, duplicated or missing records make the mode unknown", async () => {
   const forged = await verifyWith(modeContainer(mode => mode === "candidate" ? lines(record(1, "lint"), record(2, "test"), record(2, "test")) : lines(record(1, "lint"), record(2, "test"))).run);
   assert.equal(forged.status, "unknown");

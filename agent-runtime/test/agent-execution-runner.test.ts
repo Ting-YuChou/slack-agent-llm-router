@@ -22,7 +22,7 @@ const usage: Step = { event: { type: "usage", cost_usd: 0.5 } as PublicRunEvent 
 const valid = { status: "succeeded", findings: [{ path: "src/a.ts", line: 3, reason: "returns early" }], evidence: ["src/a.ts:3"], unresolved: [], suggested_tasks: [] };
 
 function setup(steps: Step[]) {
-  const calls = { closed: 0, ends: [] as Array<{ cost?: number; queueMs?: number }>, costs: [] as number[] };
+  const calls = { closed: 0, ends: [] as Array<{ cost?: number; queueMs?: number }>, costs: [] as number[], roles: [] as Array<string | undefined> };
   const createProcess: InvestigationProcessFactory = (_options, onEvent, onRecord) => ({
     prompt: () => { setImmediate(() => { for (const step of steps) { if (step.record) onRecord(step.record); if (step.event) onEvent(step.event); } }); },
     close: async () => { calls.closed += 1; },
@@ -30,7 +30,7 @@ function setup(steps: Step[]) {
   });
   const runner = new AgentExecutionRunner({ image: "img", network: "net", gatewayUrl: "http://gw", stateRoot, token: () => "t", createProcess,
     execution: async (_id, _parent, _role, _attempt, phase, cost, queueMs) => { if (phase === "end") calls.ends.push({ cost, queueMs }); },
-    cost: async (_parent, cost) => { calls.costs.push(cost); } });
+    cost: async (_parent, cost, role) => { calls.costs.push(cost); calls.roles.push(role); } });
   const node = { id: "explore", role: "code_explorer", purpose: "find it", expected_output: "findings", paths: ["src"], dependencies: [], workflow: "run-1", wave: 1, state: "running", attempt: 1, execution: "exec-0001", queued_at: 0 } as WorkflowNode;
   const request: InvestigationRequest = { input: { run_id: "run-1", owner: "o", requirement: "fix", baseline: "base", snapshot: { hash: "h", path: stateRoot }, fingerprint: "f" }, node, results: [], signal: new AbortController().signal };
   return { runner, request, calls };
@@ -43,6 +43,12 @@ test("an injected process's valid investigation is returned and its costs record
   assert.deepEqual(calls.ends, [{ cost: 0.5, queueMs: 7 }]);
   assert.deepEqual(calls.costs, [0.5]);
   assert.equal(request.node.attempt_queue_ms, 7);
+});
+
+test("an execution's cost is reported under its node's role", async () => {
+  const { runner, request, calls } = setup([usage, ...submit(valid), settled]);
+  await runner.run(request);
+  assert.deepEqual(calls.roles, ["code_explorer"]);
 });
 
 test("an invalid investigation keeps its validation error", async () => {
