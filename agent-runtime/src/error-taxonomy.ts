@@ -80,7 +80,7 @@ export function classifyGateError(error: unknown): RunFailure {
   if (error instanceof DiffLimitError) return { code: "diff_limit_exceeded", message: `${detail}; split the change or reduce its size` };
   if (detail === "workflow_budget_exhausted") return { code: "workflow_budget_exhausted", message: "Workflow cost or time budget was exhausted before verification finished" };
   const failure: RunFailure = { code: "quality_gate_unavailable", message: `Required verification could not complete (${detail})` };
-  const cause = causeOf(error);
+  const cause = failureCause(error);
   if (cause) failure.cause_code = cause;
   return failure;
 }

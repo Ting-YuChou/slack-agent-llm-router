@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import type * as Tracing from "../src/tracing.js";
+import type { RunFailure } from "../src/error-taxonomy.js";
 async function tracingModule(): Promise<typeof Tracing> { const m = await import("../src/tracing.js").catch(() => null); assert.ok(m, "OTEL tracing module exists"); return m; }
 test('resumed workflows retain the persisted trace identity across runtime instances', async () => {
   const { AgentTracing } = await tracingModule();
@@ -137,4 +138,26 @@ test("gateway shutdown closes active streams before flushing telemetry", async (
   const tracing = { async close() { assert.equal(closedStreams, true); flushed = true; } };
   await closeModelGateway(server as any, tracing as any, 5);
   assert.equal(flushed, true);
+});
+
+test("a failed run's span carries its error code and, when known, the cause behind it", async () => {
+  const { AgentTracing } = await tracingModule();
+  const exporter = new InMemorySpanExporter();
+  const tracing = new AgentTracing([new SimpleSpanProcessor(exporter)]);
+  const runSpan = (id: string) => exporter.getFinishedSpans().find(span => span.name === "agent.run" && span.attributes["agent.run_id"] === id)!;
+  try {
+    const known: RunFailure = { code: "quality_gate_unavailable", message: "Required verification could not complete (Docker is unavailable for verification)", cause_code: "docker_unavailable" };
+    const unclassified: RunFailure = { code: "quality_gate_unavailable", message: "Required verification could not complete (something odd)" };
+    tracing.startRun("gate", "s");
+    tracing.endRun("gate", "failed", known);
+    tracing.startRun("unclassified", "s");
+    tracing.endRun("unclassified", "failed", unclassified);
+    tracing.startRun("clean", "s");
+    tracing.endRun("clean", "completed");
+    assert.equal(runSpan("gate").attributes["agent.error.code"], "quality_gate_unavailable");
+    assert.equal(runSpan("gate").attributes["agent.error.cause_code"], "docker_unavailable");
+    assert.equal(runSpan("unclassified").attributes["agent.error.code"], "quality_gate_unavailable");
+    assert.equal(runSpan("unclassified").attributes["agent.error.cause_code"], undefined);
+    assert.equal(runSpan("clean").attributes["agent.error.code"], undefined);
+  } finally { await tracing.close(); }
 });
