@@ -64,12 +64,17 @@ test("the generator rejects malformed placeholders", async () => {
 test("telemetry names the prompt version and the prompts each role runs with", () => {
   const refs = (...ids: Parameters<typeof promptRef>[0][]) => ({ prompts_version: PROMPTS_VERSION, prompts: ids.map(promptRef) });
   assert.deepEqual(promptTelemetry("grader"), refs("grader", "grader-scope"));
-  assert.deepEqual(promptTelemetry("planner"), refs("planner"));
-  for (const role of ["code_explorer", "ci_investigator", "test_analyst"]) assert.deepEqual(promptTelemetry(role), refs("investigator"));
+  assert.deepEqual(promptTelemetry("planner"), refs("planner", "repo-guidance"));
+  for (const role of ["code_explorer", "ci_investigator", "test_analyst"]) assert.deepEqual(promptTelemetry(role), refs("investigator", "repo-guidance"));
   assert.deepEqual(promptTelemetry("discussion"), refs("discussion"));
   const writer = promptTelemetry("implementation").prompts;
   for (const id of ["policy-scope", "checks", "repair", "scope-repair", "budget-notice", "budget-final"] as const) assert.ok(writer.includes(promptRef(id)), id);
   assert.deepEqual(promptTelemetry("no-such-role"), { prompts_version: PROMPTS_VERSION, prompts: [] });
+});
+
+test("AGENTS.md guidance goes to the planner and investigators, never to the grader or the writer", () => {
+  for (const role of ["planner", "code_explorer", "ci_investigator", "test_analyst"]) assert.ok(ROLE_PROMPTS[role]!.includes("repo-guidance"), role);
+  for (const role of ["grader", "implementation", "discussion"]) assert.ok(!ROLE_PROMPTS[role]!.includes("repo-guidance"), role);
 });
 
 test("the writer prompt set includes the diff-limit repair prompt", () => {
@@ -86,7 +91,7 @@ test("every prompt rendered in the runtime or shipped under prompts/ belongs to 
       for (const literal of call[1]!.matchAll(/["']([a-z][a-z0-9-]*)["']/g)) rendered.add(literal[1]!);
     }
   }
-  for (const id of ["diff-limit-repair", "planner", "investigator", "policy-scope"]) assert.ok(rendered.has(id), `scan missed ${id}`);
+  for (const id of ["diff-limit-repair", "planner", "investigator", "policy-scope", "repo-guidance"]) assert.ok(rendered.has(id), `scan missed ${id}`);
   for (const id of rendered) assert.ok((PROMPT_IDS as string[]).includes(id), `${id} is not a prompt id`);
   const shipped = readdirSync(path.join(root, "prompts")).filter(name => name.endsWith(".md")).map(name => name.slice(0, -3));
   const assigned = new Set<string>(Object.values(ROLE_PROMPTS).flat());

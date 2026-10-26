@@ -1,4 +1,5 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { once } from "node:events";
 import { mkdir, realpath, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -242,6 +243,30 @@ export class WorktreeManager {
     });
     return result.stdout;
   }
+}
+
+/**
+ * The first `maxBytes` of `file` and its full size as `commit` recorded it, so later edits in the
+ * worktree never change what is read. Undefined when the commit holds no regular file at that path
+ * (a symlink, directory or submodule counts as none); an unknown commit is an error.
+ */
+export async function readFileAtCommit(cwd: string, commit: string, file: string, maxBytes: number): Promise<{ head: Buffer; bytes: number } | undefined> {
+  const listing = await exec("git", ["ls-tree", "-l", "-z", "--full-tree", `${commit}^{commit}`, "--", file], { cwd, encoding: "utf8", env: hardenedGitEnv() });
+  const entry = /^(?:100644|100755) blob ([0-9a-f]+) +(\d+)\t/.exec(listing.stdout.split("\0")[0] ?? "");
+  if (!entry) return undefined;
+  const child = spawn("git", ["cat-file", "blob", entry[1]!], { cwd, env: hardenedGitEnv(), stdio: ["ignore", "pipe", "ignore"] });
+  const closed = once(child, "close");
+  const chunks: Buffer[] = [];
+  let length = 0;
+  for await (const chunk of child.stdout as AsyncIterable<Buffer>) {
+    chunks.push(chunk);
+    length += chunk.length;
+    if (length >= maxBytes) break;
+  }
+  if (length >= maxBytes) child.kill();
+  const [code] = await closed as [number | null];
+  if (length < maxBytes && code !== 0) throw new WorktreeError(`Could not read ${file} at ${commit}`);
+  return { head: Buffer.concat(chunks).subarray(0, maxBytes), bytes: Number(entry[2]) };
 }
 
 /** Container mount for a session's Git metadata: its mirror, or the shared metadata a legacy session's worktree points at. */

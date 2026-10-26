@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import type { Candidate } from './quality-gate.js';
 import type { ControlStore } from './ci-control.js';
@@ -11,7 +11,7 @@ export interface InvestigationTask { id: string; role: InvestigationRole; purpos
 export interface InvestigationResult { status: 'succeeded' | 'unknown'; findings: Array<{ path: string; line: number; reason: string }>; evidence: string[]; unresolved: string[]; suggested_tasks: string[] }
 export interface InvestigationPlan { tasks: InvestigationTask[]; summary?: string }
 export interface WorkflowNode extends Omit<InvestigationTask, 'role'> { role: InvestigationRole | 'planner'; workflow: string; wave: number; fixed_dependencies?: string[]; state: 'pending' | 'running' | 'succeeded' | 'unresolved' | 'unknown' | 'interrupted'; degraded_cause?: CauseCode; attempt: number; execution?: string; result?: InvestigationResult | InvestigationPlan; queued_at: number; started_at?: number; ended_at?: number; duration_ms?: number; queue_ms?: number; agent_work_ms?: number; attempt_queue_ms?: number }
-export interface DiscoveryInput { run_id: string; owner: string; requirement: string; baseline: string; snapshot: Candidate; fingerprint: string; initial_active_ms?: number }
+export interface DiscoveryInput { run_id: string; owner: string; requirement: string; baseline: string; snapshot: Candidate; fingerprint: string; initial_active_ms?: number; guidance?: RepoGuidance }
 /** A required investigation that degraded to an unresolved gap instead of failing the run. */
 export interface InvestigationDegraded { type: 'investigation_degraded'; node_id: string; role: InvestigationRole; wave: number; attempt: number; cause: CauseCode }
 export interface DiscoveryHooks { degraded?(event: InvestigationDegraded): void }
@@ -110,6 +110,33 @@ export function renderImplementationBrief(brief: ImplementationBrief): string {
     if (!longest) return text;
     lists[longest].pop(); omitted[longest]++;
   }
+}
+export const REPO_GUIDANCE_MAX_BYTES = 8192;
+/** The repository's AGENTS.md as the baseline commit recorded it: at most REPO_GUIDANCE_MAX_BYTES of it, and its full size. */
+export interface RepoGuidance { text: string; bytes: number; truncated: boolean }
+
+/**
+ * Keeps the whole characters of `head` that fit the cap. Read REPO_GUIDANCE_MAX_BYTES + 4 bytes of the
+ * file: a character cut at the end of the read then starts past the cap and is never kept half-decoded.
+ */
+export function repoGuidance(head: Buffer, bytes: number): RepoGuidance {
+  let text = '', size = 0, cut = head.length < bytes;
+  for (const char of head.toString('utf8')) {
+    // Invalid bytes decode to the three-byte U+FFFD, so measure what is kept, not what was read.
+    const width = Buffer.byteLength(char);
+    if (size + width > REPO_GUIDANCE_MAX_BYTES) { cut = true; break; }
+    text += char; size += width;
+  }
+  return { text, bytes, truncated: cut };
+}
+
+/** The planner and investigator section for AGENTS.md, fenced like other untrusted text; empty when there is none. */
+export function renderRepoGuidance(guidance: RepoGuidance | undefined): string {
+  if (!guidance?.text.trim()) return '';
+  let boundary: string;
+  do boundary = `UNTRUSTED-${randomBytes(12).toString('hex')}`; while (guidance.text.includes(boundary));
+  const truncated = guidance.truncated ? ` It is truncated to fit ${REPO_GUIDANCE_MAX_BYTES} bytes; the whole file is ${guidance.bytes} bytes.` : '';
+  return renderPrompt('repo-guidance', { boundary, body: guidance.text, truncated });
 }
 const degradeCause = (error: unknown): CauseCode => failureCause(error) ?? 'investigation_execution_failed';
 
