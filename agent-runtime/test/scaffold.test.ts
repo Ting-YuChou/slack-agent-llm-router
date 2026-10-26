@@ -18,8 +18,20 @@ test("runtime pins the Pi 1.0.1 package set", () => {
   assert.equal(packageJson.dependencies["@earendil-works/pi-coding-agent"], "1.0.1");
   assert.equal(packageJson.dependencies["brace-expansion"], "5.0.12");
   assert.equal(packageJson.dependencies.typebox, "1.3.27");
-  assert.equal(packageJson.dependencies.undici, "8.11.2");
+  assert.equal(packageJson.dependencies.undici, "8.12.3");
   assert.equal(packageJson.scripts["patch-vendored-deps"], undefined);
+});
+
+test("every undici copy resolves to the patched direct pin", () => {
+  // pi-coding-agent 1.0.1 pins undici 8.10.2, which a high advisory covers; the override lifts it.
+  const packageJson = JSON.parse(readFileSync(fileURLToPath(new URL("../../package.json", import.meta.url)), "utf8"));
+  const lock = JSON.parse(readFileSync(fileURLToPath(new URL("../../package-lock.json", import.meta.url)), "utf8"));
+  const copies = Object.entries(lock.packages as Record<string, { version: string }>)
+    .filter(([at]) => at === "node_modules/undici" || at.endsWith("/node_modules/undici"))
+    .map(([at, entry]) => [at, entry.version]);
+
+  assert.equal(packageJson.overrides.undici, "$undici");
+  assert.deepEqual(copies, [["node_modules/undici", "8.12.3"]]);
 });
 
 test("runtime ships explicit policy extension, plugin and skill locks, and container image", () => {
