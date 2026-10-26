@@ -4,9 +4,22 @@ import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import { LoggerProvider, BatchLogRecordProcessor } from "@opentelemetry/sdk-logs";
 import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-http";
 import { resourceFromAttributes } from "@opentelemetry/resources";
+import { POLICY_ENTRY, parsePolicyDecision } from "./policy-decision.js";
+import type { RouteDecision } from "./jev-router.js";
 export function validTraceparent(value: unknown): value is string {
   return typeof value === "string" && /^00-(?!0{32})[a-f0-9]{32}-(?!0{16})[a-f0-9]{16}-0[01]$/.test(value);
 }
+/** Harness decisions that explain a run on its trace: the phase it entered, a repair it started, a limit it hit. */
+export type TraceSignal =
+  | { type: "phase"; phase: string }
+  | { type: "repair"; attempt: number; reason: string }
+  | { type: "limit"; kind: string; code: string; action: "fail" | "repair" };
+
+/** What the run span says about how the run was routed and how its writer ended. */
+export interface RunDescription { model?: string; reasoning_effort?: string; routing?: RouteDecision; execution_outcome?: string }
+
+const FAILED = ["failed", "timed_out", "interrupted"];
+
 export class AgentTracing {
   static fromEnvironment(serviceName = "pi-agent-runtime"): AgentTracing | undefined {
     if (process.env.PI_AGENT_OTEL_ENABLED !== "true")
@@ -25,6 +38,10 @@ export class AgentTracing {
   private readonly runs = new Map<string, {
     root: Span;
     children: Map<string, Span>;
+    /** The open phase and repair spans; each ends when the next one starts or with the run. */
+    phase?: Span;
+    repair?: Span;
+    repairs?: number;
   }>();
   constructor(processors?: SpanProcessor[], serviceName = "pi-agent-runtime") {
     this.provider = new BasicTracerProvider({
@@ -46,12 +63,44 @@ export class AgentTracing {
     }
     this.runs.set(runId, { root: this.tracer.startSpan("agent.run", { attributes: { "agent.run_id": runId, "agent.session_id": sessionId, ...(parentRunId ? { "agent.workflow_run_id": parentRunId } : {}) } }, context), children: new Map() });
   }
-  describeRun(runId: string, model?: string, effort?: string): void {
+  describeRun(runId: string, run: RunDescription): void {
     const root = this.runs.get(runId)?.root;
-    if (model)
-      root?.setAttribute("gen_ai.request.model", model);
-    if (effort)
-      root?.setAttribute("gen_ai.request.reasoning_effort", effort);
+    if (!root)
+      return;
+    if (run.model)
+      root.setAttribute("gen_ai.request.model", run.model);
+    if (run.reasoning_effort)
+      root.setAttribute("gen_ai.request.reasoning_effort", run.reasoning_effort);
+    const route = run.routing;
+    if (route) {
+      root.setAttribute("agent.route.source", route.source);
+      if (route.label)
+        root.setAttribute("agent.route.label", route.label);
+      if (route.probability !== undefined)
+        root.setAttribute("agent.route.probability", route.probability);
+    }
+    if (run.execution_outcome)
+      root.setAttribute("agent.outcome", run.execution_outcome);
+  }
+  /** Phases and repair attempts become child spans of the run; limit hits become events on it. */
+  signal(runId: string, signal: TraceSignal): void {
+    const run = this.runs.get(runId);
+    if (!run)
+      return;
+    const child = (name: string, attributes: Record<string, string | number>) =>
+      this.tracer.startSpan(name, { attributes: { "agent.run_id": runId, ...attributes } }, trace.setSpan(ROOT_CONTEXT, run.root));
+    if (signal.type === "phase") {
+      run.phase?.end();
+      run.phase = child("agent.phase", { "agent.phase": signal.phase });
+    }
+    else if (signal.type === "repair") {
+      run.repair?.end();
+      run.repair = child("agent.repair", { "agent.repair.attempt": signal.attempt, "agent.repair.reason": signal.reason });
+      run.repairs = (run.repairs ?? 0) + 1;
+      run.root.setAttributes({ "agent.repair.reason": signal.reason, "agent.repair.count": run.repairs });
+    }
+    else
+      run.root.addEvent("agent.limit", { "agent.limit.kind": signal.kind, "agent.limit.code": signal.code, "agent.limit.action": signal.action });
   }
   traceparent(runId: string): string | undefined {
     const span = this.runs.get(runId)?.root.spanContext();
@@ -88,6 +137,10 @@ export class AgentTracing {
     let name: string | undefined;
     let start = false;
     let end = false;
+    if (type === "entry_appended") {
+      this.policyEvent(run.root, record.entry);
+      return;
+    }
     if (type === "tool_execution_start" || type === "tool_execution_end") {
       key = `tool:${record.toolCallId}`;
       name = "agent.tool";
@@ -136,6 +189,21 @@ export class AgentTracing {
       }
     }
   }
+  /** A policy extension's decision entry, checked like the host checks it before counting. */
+  private policyEvent(root: Span, entry: unknown): void {
+    if (!entry || typeof entry !== "object")
+      return;
+    const { type, customType, data } = entry as Record<string, unknown>;
+    if (type !== "custom" || customType !== POLICY_ENTRY)
+      return;
+    const decision = parsePolicyDecision(data);
+    if (!decision)
+      return;
+    const attributes: Record<string, string | number | boolean> = {};
+    for (const [key, value] of Object.entries(decision))
+      attributes[`agent.policy.${key}`] = value;
+    root.addEvent("agent.policy_decision", attributes);
+  }
   approval(runId: string, id: string, approved: boolean): void {
     const children = this.runs.get(runId)?.children;
     const span = children?.get(`approval:${id}`);
@@ -172,10 +240,16 @@ export class AgentTracing {
       span.setAttribute("capture.incomplete", true);
       span.end();
     }
+    const failed = FAILED.includes(status);
+    for (const span of [run.phase, run.repair]) {
+      if (failed)
+        span?.setStatus({ code: SpanStatusCode.ERROR });
+      span?.end();
+    }
     run.root.setAttribute("agent.status", status);
     if (error)
       run.root.setAttributes({ "agent.error.code": error.code, ...(error.cause_code ? { "agent.error.cause_code": error.cause_code } : {}) });
-    if (["failed", "timed_out", "interrupted"].includes(status))
+    if (failed)
       run.root.setStatus({ code: SpanStatusCode.ERROR });
     run.root.end();
     this.runs.delete(runId);

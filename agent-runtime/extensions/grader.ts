@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
 import { validateSnapshotRead } from "../dist/src/policy.js";
+import { appendPolicyDecision } from "../dist/src/policy-decision.js";
 import { Type } from "typebox";
 import { validateGrade } from "../dist/src/quality-gate.js";
 import { verifyGradeEvidence } from "../dist/src/grade-evidence.js";
@@ -10,18 +11,19 @@ export default function grader(pi: ExtensionAPI) {
   const root = process.env.PI_AGENT_WORKTREE!;
   let submitted = false;
   let calls = 0;
+  const block = (tool: string, code: string, reason: string) => { appendPolicyDecision(pi, { tool, decision: "block", reason: code }); return { block: true, reason }; };
   pi.on("tool_call", async (event, ctx) => {
     // The verdict itself never counts against the read budget.
     if (event.toolName === "submit_grade" && !submitted) return;
-    if (++calls > 40) { ctx.abort(); return { block: true, reason: "Grader tool limit" }; }
+    if (++calls > 40) { ctx.abort(); return block(event.toolName, "tool_limit", "Grader tool limit"); }
 
-    if (!["read", "grep", "find", "ls", "submit_grade"].includes(event.toolName)) return { block: true, reason: "Grader is read-only" };
-    if (submitted) return { block: true, reason: "Grade already submitted" };
+    if (!["read", "grep", "find", "ls", "submit_grade"].includes(event.toolName)) return block(event.toolName, "read_only", "Grader is read-only");
+    if (submitted) return block(event.toolName, "already_submitted", "Grade already submitted");
     if (event.toolName !== "submit_grade") {
       const input = event.input as Record<string, unknown>;
       // The session cwd is outside the snapshot: relative and path-less reads target the snapshot root.
       const resolved = input.path = path.resolve(root, typeof input.path === "string" ? input.path : ".");
-      if (!(await validateSnapshotRead(root,root,resolved)).allowed) return { block: true, reason: "Only candidate snapshot is readable" };
+      if (!(await validateSnapshotRead(root,root,resolved)).allowed) return block(event.toolName, "outside_snapshot", "Only candidate snapshot is readable");
     }
   });
   pi.registerTool({

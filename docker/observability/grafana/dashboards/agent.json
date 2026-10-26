@@ -603,6 +603,29 @@
           "format": 1
         }
       ]
+    },
+    {
+      "id": 26,
+      "title": "Policy decisions by tool and reason",
+      "type": "table",
+      "gridPos": {
+        "x": 12,
+        "y": 104,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "agent-clickhouse"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "sql",
+          "rawSql": "SELECT tool, decision, reason, count() AS decisions, uniqExact(run_id) AS runs, countIf(approved = 1) AS owner_approved, countIf(approved = 0) AS owner_rejected_or_expired, round(avgOrNull(latency_ms)) AS avg_latency_ms, quantileOrNull(0.95)(latency_ms) AS p95_latency_ms FROM agent_policy_decisions_latest WHERE $__timeFilter(collected_at) AND (${run_id:sqlstring}='' OR run_id=${run_id:sqlstring}) GROUP BY tool, decision, reason ORDER BY decisions DESC",
+          "format": 1
+        }
+      ]
     }
   ]
 }
