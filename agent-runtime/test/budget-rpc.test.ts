@@ -71,3 +71,19 @@ test('the budget RPC tells a budget that refused from one it could not ask', asy
     assert.equal(budgetRefusal(new Error('workflow_budget_setup_missing')), 'unavailable', 'a model the gateway cannot price');
   } finally { await new Promise<void>(resolve => server.close(() => resolve())); ledger.close(); rmSync(root,{ recursive: true,force: true }); }
 });
+
+test('the gateway reports a truncated response to the host with its execution and a known role only', async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(),'budget-rpc-')); const ledger = new BudgetLedger(path.join(root,'db'));
+  const reports: Array<[string, string | undefined]> = [];
+  const server = createAgentHttpServer({ token: 'runtime',orchestrator: {} as any,health: () => ({}),budgetLedger: ledger,budgetSecret: 'gateway',truncated: (execution: string, role?: string) => { reports.push([execution, role]); } } as any);
+  try {
+    await new Promise<void>(resolve => server.listen(0,'127.0.0.1',resolve)); const base = `http://127.0.0.1:${(server.address() as any).port}`;
+    const rpc = new budgetRpcModule.BudgetRpcClient(base,'gateway');
+    await rpc.truncated('exec-1','writer');
+    await rpc.truncated('exec-2');
+    await rpc.truncated('exec-3','admin' as any);
+    assert.deepEqual(reports, [['exec-1','writer'],['exec-2',undefined],['exec-3',undefined]]);
+    await assert.rejects(new budgetRpcModule.BudgetRpcClient(base,'runtime').truncated('exec-4','writer'));
+    assert.equal(reports.length, 3, 'a caller without the budget bearer records nothing');
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); ledger.close(); rmSync(root,{ recursive: true,force: true }); }
+});

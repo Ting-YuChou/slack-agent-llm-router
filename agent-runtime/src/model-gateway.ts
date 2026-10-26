@@ -2,6 +2,7 @@ import { BudgetRpcClient, budgetRefusal, deriveBudgetRpcSecret, type BudgetAdmis
 import { BudgetLedger } from "./budget-ledger.js";
 import { admitBudget, type ModelPrice } from "./gateway-budget.js";
 import { allowedAnthropicBeta, sanitizeAgentRequest } from "./gateway-request-policy.js";
+import { OUTPUT_TOKEN_CEILING } from "./run-budget.js";
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { guardedHandler } from "./http-handler.js";
 import { pipeline } from "node:stream/promises";
@@ -195,7 +196,7 @@ export function createModelGateway(options: {
     // Tests and local tools may run without a budget store; the gateway process itself refuses to start without one.
     if (!options.budgetLedger) admission = { body: rawBody, data: () => {}, finish: () => {} };
     else {
-      try { admission = await admitBudget(options.budgetLedger, options.prices ?? {}, claims.workflowRunId, `${claims.provider}/${claims.model}`, rawBody, claims.runId, claims.outputTokenLimit); rawBody = admission.body; }
+      try { admission = await admitBudget(options.budgetLedger, options.prices ?? {}, claims.workflowRunId, `${claims.provider}/${claims.model}`, rawBody, claims.runId, claims.outputTokenLimit === undefined ? undefined : Math.min(OUTPUT_TOKEN_CEILING, claims.outputTokenLimit)); rawBody = admission.body; }
       catch (error) { releaseSlot(); refuse(response, options.tracing, claims, "workflow_budget_unavailable_or_exhausted", "Model budget unavailable or exhausted", budgetRefusal(error)); return; }
     }
     const requestStarted = performance.now();
@@ -224,7 +225,11 @@ export function createModelGateway(options: {
     } finally {
       releaseSlot();
       const finished = await admission.finish();
-      if (finished?.truncated) span?.setAttribute("gen_ai.response.truncated", true);
+      if (finished?.truncated) {
+        span?.setAttribute("gen_ai.response.truncated", true);
+        // Measured, not acted on: the host counts it on the run; a host that cannot be told loses only the count.
+        await Promise.resolve(options.budgetLedger?.truncated?.(claims.runId, claims.role)).catch(() => undefined);
+      }
       disconnect.close(); span?.end();
     }
   }));

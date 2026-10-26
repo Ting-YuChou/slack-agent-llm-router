@@ -14,6 +14,10 @@ export interface HarnessMetrics {
   startup_s: number | null;
   /** Dispatch-to-prompt time summed over repair attempts; what reusing a container would save. */
   repair_startup_s: number | null;
+  /** Model responses the provider cut off at the output-token cap, as the gateway saw them. */
+  truncated_requests: number;
+  /** truncated_requests per gateway role; `unknown` for tokens issued without one. */
+  truncated_requests_by_role: Record<string, number>;
 }
 
 const ratio = (used: number, max: number | undefined) => max ? Math.round((used / max) * 1000) / 1000 : null;
@@ -46,5 +50,7 @@ export function computeHarnessMetrics(run: RunRecord, now = Date.now()): Harness
     time_to_first_edit_s: run.first_edit_at ? seconds(Date.parse(run.first_edit_at) - created) : null,
     startup_s: firstStartupMs === undefined ? null : seconds(firstStartupMs),
     repair_startup_s: attempts.length > 1 ? seconds(attempts.slice(1).reduce((sum, attempt) => sum + (attempt.startup?.dispatch_to_prompt_ms ?? 0), 0)) : null,
+    truncated_requests: Object.values(run.truncated_requests ?? {}).reduce((sum, count) => sum + count, 0),
+    truncated_requests_by_role: { ...run.truncated_requests },
   };
 }

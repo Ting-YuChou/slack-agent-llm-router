@@ -6,12 +6,42 @@ import { test } from "node:test";
 
 import { resolveAgentModel } from "../src/agent-model.js";
 import { BudgetLedger } from "../src/budget-ledger.js";
-import { budgetIdFor, outputTokenLimitFor, parseDefaultRunBudget, priceFor, releaseRunBudget, runBudgetStatus } from "../src/run-budget.js";
+import { budgetIdFor, OUTPUT_TOKEN_CEILING, outputTokenLimitFor, parseDefaultRunBudget, priceFor, releaseRunBudget, runBudgetStatus } from "../src/run-budget.js";
+import { validateProfile } from "../src/verification.js";
 
 test("each harness role has its own output-token cap", () => {
   assert.equal(outputTokenLimitFor("writer"), 32768);
   assert.equal(outputTokenLimitFor("grader"), 16384);
   assert.equal(outputTokenLimitFor("investigator"), 8192);
+});
+
+const profile = { id: "p", repository: "o/r", image: `sha256:${"0".repeat(64)}`, rubric: ["ok"], allowedPaths: ["src"], checks: [{ name: "t", argv: ["true"], cwd: ".", timeoutMs: 1000 }] };
+
+test("a profile without limits keeps every role's built-in output cap", () => {
+  const validated = validateProfile(profile);
+  assert.equal(validated.limits, undefined);
+  for (const role of ["writer", "grader", "investigator"] as const) assert.equal(outputTokenLimitFor(role, validated.limits), outputTokenLimitFor(role));
+});
+
+test("a profile's limits.outputTokens sets the cap of the roles it names, up to the ceiling", () => {
+  const validated = validateProfile({ ...profile, limits: { outputTokens: { writer: 16384, grader: OUTPUT_TOKEN_CEILING } } });
+  assert.deepEqual(validated.limits, { outputTokens: { writer: 16384, grader: OUTPUT_TOKEN_CEILING } });
+  assert.equal(outputTokenLimitFor("writer", validated.limits), 16384);
+  assert.equal(outputTokenLimitFor("grader", validated.limits), OUTPUT_TOKEN_CEILING);
+  assert.equal(outputTokenLimitFor("investigator", validated.limits), 8192, "an unnamed role keeps its built-in cap");
+});
+
+test("a profile output cap above the ceiling, or otherwise malformed, is rejected", () => {
+  assert.equal(OUTPUT_TOKEN_CEILING, 32768);
+  for (const limits of [
+    { outputTokens: { writer: OUTPUT_TOKEN_CEILING + 1 } }, { outputTokens: { grader: 1_000_000 } }, { outputTokens: { writer: 1023 } },
+    { outputTokens: { writer: 2048.5 } }, { outputTokens: { writer: "4096" } }, { outputTokens: { planner: 4096 } }, { outputTokens: 4096 },
+    { outputTokens: null }, { outputTokens: [] }, { maxTurns: 10 }, null, [], 1,
+  ]) assert.throws(() => validateProfile({ ...profile, limits }), /Invalid profile limits/, JSON.stringify(limits));
+});
+
+test("an output cap never exceeds the ceiling, even from an unvalidated profile", () => {
+  assert.equal(outputTokenLimitFor("writer", { outputTokens: { writer: 1_000_000 } }), OUTPUT_TOKEN_CEILING);
 });
 
 test("workflow executions spend their parent's budget; other runs get a default budget of their own", () => {
