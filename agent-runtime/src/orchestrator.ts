@@ -149,6 +149,10 @@ export interface RunRecord {
   routing?: RouteDecision;
   limits?: AgentLimits;
   estimated_cost_usd?: number;
+  /** estimated_cost_usd split by who spent it: router, writer, repair, grader, planner, investigator roles. */
+  cost_by_role?: Record<string, number>;
+  /** Finished writer tool calls and how many of them errored, per tool name. */
+  tool_summary?: Record<string, ToolCounts>;
   mcp_server?: string;
   mcp_tool?: string;
   mcp_repository?: string;
@@ -188,6 +192,21 @@ export interface RunRecord {
   error?: RunFailure;
   /** Host path of the archived patch of an undelivered run; never leaves the host (see publicRun). */
   patch_artifact?: string;
+}
+
+export interface ToolCounts { calls: number; errors: number }
+
+/** Adds model spend to the run's total and to the role that spent it. */
+function addCost(run: RunRecord, role: string, usd: number): void {
+  run.estimated_cost_usd = (run.estimated_cost_usd ?? 0) + usd;
+  if (usd > 0) { const roles = run.cost_by_role ??= {}; roles[role] = (roles[role] ?? 0) + usd; }
+}
+
+/** Tool names come from the model, so each is defined as an own key: `__proto__` must not reach the prototype. */
+function countTool(summary: Record<string, ToolCounts>, tool: string, error: boolean): void {
+  const counts = Object.hasOwn(summary, tool) ? summary[tool] : { calls: 0, errors: 0 };
+  counts.calls += 1; counts.errors += error ? 1 : 0;
+  Object.defineProperty(summary, tool, { value: counts, enumerable: true, writable: true, configurable: true });
 }
 
 /** The run as clients (HTTP, Slack, telemetry) see it: host artifact paths become a flag. */
@@ -789,6 +808,7 @@ export class CodingAgentOrchestrator {
       reasoning_effort: route.effort,
       routing: route,
       estimated_cost_usd: route.jevCostUsd ?? 0,
+      ...(route.jevCostUsd ? { cost_by_role: { router: route.jevCostUsd } } : {}),
       created_at: requestedAt,
       updated_at: requestedAt,
       tool_count: 0,
@@ -925,10 +945,10 @@ export class CodingAgentOrchestrator {
     return { run_id: runId, session_id: session.id, status: 'starting' as const };
   }
 
-  async qualityPhase(runId: string, phase: string, cost = 0): Promise<void> {
+  async qualityPhase(runId: string, phase: string, cost = 0, role = phase): Promise<void> {
     const run = this.runs.get(runId); const workflow = this.workflows.get(runId);
     if (!run || !workflow || isTerminal(run.status)) return;
-    workflow.budget.report(cost); run.estimated_cost_usd = (run.estimated_cost_usd ?? 0) + cost;
+    workflow.budget.report(cost); addCost(run, role, cost);
     this.setPhase(run, phase); await this.persistState(); workflow.budget.check();
   }
 
@@ -1021,7 +1041,7 @@ export class CodingAgentOrchestrator {
     }
     if (event.type === "usage") {
       const state = this.workflows.get(run.run_id); state?.budget.report(event.cost_usd);
-      run.estimated_cost_usd = (run.estimated_cost_usd ?? 0) + event.cost_usd;
+      addCost(run, state && state.attempt > 1 ? "repair" : "writer", event.cost_usd);
       this.persistSoon();
       if (state && state.budget.estimatedUsd > state.budget.limitUsd) this.background(this.failRun(session, run, { code: "workflow_budget_exhausted", message: "Model budget exhausted" }));
       return;
@@ -1069,6 +1089,7 @@ export class CodingAgentOrchestrator {
     }
     if (event.type === "tool") {
       if (event.phase === "start") run.tool_count += 1;
+      if (event.phase === "end") countTool(run.tool_summary ??= {}, event.tool, event.is_error === true);
       if (event.phase === "start" && (event.tool === "write" || event.tool === "edit")) run.first_edit_at ??= new Date().toISOString();
       const mcpMatch = /^mcp__([^_]+)__(.+)$/.exec(event.tool);
       const mcpServer = mcpMatch?.[1];

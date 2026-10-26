@@ -343,6 +343,75 @@ class AgentAnalyticsTests(unittest.TestCase):
         ids = [panel["id"] for panel in dashboard["panels"]]
         self.assertEqual(len(ids), len(set(ids)))
 
+    def test_verification_rows_record_the_kinds_of_failed_candidate_checks(self):
+        module = self.module()
+
+        def failed_kinds(checks):
+            rows = module.project(
+                {
+                    "event_id": "v",
+                    "run_id": "r",
+                    "session_id": "s",
+                    "kind": "verification",
+                    "payload": {"candidate_hash": "h", "attempt": 1, "checks": checks},
+                }
+            )
+            module.validate_projections(rows)
+            return rows["agent_verifications"][0]["failed_kinds"]
+
+        self.assertEqual(
+            failed_kinds(
+                [
+                    {"name": "baseline:lint", "kind": "static", "status": "failed"},
+                    {"name": "candidate:lint", "kind": "static", "status": "passed"},
+                    {"name": "candidate:pytest", "kind": "test", "status": "failed"},
+                    {"name": "candidate:mypy", "kind": "static", "status": "unknown"},
+                    {"name": "candidate:old", "status": "failed"},
+                    {"name": "allowed_paths", "status": "failed"},
+                ]
+            ),
+            "static,test,unknown",
+        )
+        self.assertEqual(
+            failed_kinds(
+                [{"name": "candidate:pytest", "kind": "test", "status": "passed"}]
+            ),
+            "",
+        )
+        self.assertEqual(failed_kinds(None), "")
+        self.assertEqual(failed_kinds(["not a check"]), "")
+        self.assertIn(
+            "ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS failed_kinds String",
+            module.schema_sql(),
+        )
+
+    def test_o2_views_expose_check_kinds_tool_errors_role_costs_and_accepted_cost(self):
+        module = self.module()
+        sql = module.schema_sql()
+
+        def view(name):
+            return next(
+                s for s in sql if s.startswith(f"CREATE OR REPLACE VIEW {name} AS")
+            )
+
+        checks = view("agent_verification_checks")
+        self.assertIn("FROM agent_verifications_latest", checks)
+        self.assertIn("candidate_hash, attempt", checks)
+        for column in ("check_name", "check_kind", "check_status"):
+            self.assertIn(f"AS {column}", checks)
+        tools = view("agent_tool_error_rates")
+        self.assertIn("FROM agent_tool_calls_latest", tools)
+        self.assertIn("phase = 'end'", tools)
+        self.assertIn("AS error_rate", tools)
+        roles = view("agent_run_cost_by_role")
+        self.assertIn("'cost_by_role'", roles)
+        self.assertIn("AS cost_usd", roles)
+        accepted = view("agent_cost_per_accepted_change")
+        self.assertIn("agent_harness_metrics", accepted)
+        self.assertIn("agent_feedback_current", accepted)
+        self.assertIn("AS cost_per_accepted_change_usd", accepted)
+        self.assertLess(sql.index(view("agent_harness_metrics")), sql.index(accepted))
+
     def test_policy_decisions_project_without_command_text(self):
         module = self.module()
         payload = {

@@ -1052,6 +1052,124 @@ def test_aggregate_reports_harness_signals_as_informational_medians():
     assert "tool_util_p50" not in bare
 
 
+def test_execute_records_cost_by_role_and_tool_summary_from_the_run():
+    roles = {"router": 0.001, "writer": 0.03, "grader": 0.01, "repair": 0.02}
+    tools = {"bash": {"calls": 4, "errors": 1}}
+    record = agent_eval.execute(
+        _task("pass"),
+        0,
+        lambda task, attempt: _outcome(cost_by_role=roles, tool_summary=tools),
+    )
+
+    assert record["cost_by_role"] == roles
+    assert record["tool_summary"] == tools
+    bare = agent_eval.execute(_task("pass"), 0, lambda task, attempt: _outcome())
+    assert bare["cost_by_role"] is None
+    assert bare["tool_summary"] is None
+
+
+def test_aggregate_splits_cost_by_role_over_the_runs_that_carry_it():
+    summary = agent_eval.aggregate(
+        [
+            _record(cost_by_role={"writer": 0.25, "grader": 0.125}),
+            _record(cost_by_role={"writer": 0.75, "repair": 0.5}),
+            _record(cost_by_role=None),
+            _record(cost_by_role={"writer": "lots", "router": -1}),
+        ]
+    )
+
+    assert summary["cost_by_role"] == {
+        "runs": 3,
+        "total_usd": {"writer": 1.0, "grader": 0.125, "repair": 0.5},
+        "mean_usd": {"writer": 1.0 / 3, "grader": 0.125 / 3, "repair": 0.5 / 3},
+    }
+    assert "cost_by_role" not in agent_eval.CONTRACT_METRICS
+
+
+def test_cost_per_accepted_change_charges_every_run_to_the_delivered_passes():
+    summary = agent_eval.aggregate(
+        [
+            _record(commit="c1", cost_usd=0.25),
+            _record(commit="c2", cost_usd=0.5),
+            _record(passed=False, commit="c3", cost_usd=0.5),
+            # Passed without a change (must_not_commit, no_diff): no accepted change.
+            _record(commit=None, cost_usd=0.25),
+            _record(passed=False, commit=None, cost_usd=None),
+        ]
+    )
+
+    assert summary["accepted_changes"] == 2
+    assert summary["cost_per_accepted_change_usd"] == 0.75
+    none = agent_eval.aggregate([_record(commit=None), _record(passed=False)])
+    assert "cost_per_accepted_change_usd" not in none
+    assert none["accepted_changes"] == 0
+
+
+def test_aggregate_reports_each_tools_error_rate_over_finished_calls():
+    summary = agent_eval.aggregate(
+        [
+            _record(tool_summary={"bash": {"calls": 3, "errors": 1}}),
+            _record(
+                tool_summary={
+                    "bash": {"calls": 1, "errors": 1},
+                    "edit": {"calls": 4, "errors": 0},
+                    "broken": {"calls": "x"},
+                    "never": {"calls": 0, "errors": 0},
+                    "negative": {"calls": -2, "errors": -1},
+                    "impossible": {"calls": 1, "errors": 2},
+                    "loose": "x",
+                }
+            ),
+            _record(tool_summary=None),
+        ]
+    )
+
+    assert summary["tool_error_rate"] == {
+        "bash": {"calls": 4, "errors": 2, "rate": 0.5},
+        "edit": {"calls": 4, "errors": 0, "rate": 0.0},
+    }
+    assert "tool_error_rate" not in agent_eval.aggregate([_record()])
+
+
+def test_repair_success_rate_at_k_counts_repairs_that_passed_within_k():
+    ok = {"verification": "passed", "grader": "passed"}
+    bad = {"verification": "failed", "grader": "not_run"}
+    summary = agent_eval.aggregate(
+        [
+            _record(attempts=[ok]),
+            _record(attempts=[bad, ok]),
+            _record(attempts=[bad, bad, ok]),
+            _record(passed=False, attempts=[bad, bad, bad]),
+            _record(passed=False, attempts=[bad]),
+        ]
+    )
+
+    assert summary["repair_success_rate@1"] == pytest.approx(1 / 3)
+    assert summary["repair_success_rate@2"] == pytest.approx(2 / 3)
+    assert "repair_success_rate@3" not in summary
+    assert summary["repair_success_rate"] == pytest.approx(2 / 3)
+    assert not any(
+        metric.startswith("repair") for metric in agent_eval.CONTRACT_METRICS
+    )
+    assert "repair_success_rate@1" not in agent_eval.aggregate([_record(attempts=[ok])])
+
+
+def test_phase_4_records_without_role_costs_or_tool_counts_still_aggregate():
+    phase4 = (
+        agent_eval.PROJECT
+        / "eval/results/openai_gpt-5.6-luna__f65c994c6d56__6f0b0c2d246d.json"
+    )
+    result = json.loads(phase4.read_text())
+    summary = agent_eval.aggregate(result["records"])
+
+    assert summary["cost_usd_p50"] == result["summary"]["cost_usd_p50"]
+    assert "cost_by_role" not in summary
+    assert "tool_error_rate" not in summary
+    assert summary["accepted_changes"] == sum(
+        1 for record in result["records"] if record["passed"] and record["commit"]
+    )
+
+
 def test_evaluate_contract_honours_baseline_tolerance_override():
     baseline = _baseline()
     baseline["tolerance"] = {"pass_at_1": 0.0}

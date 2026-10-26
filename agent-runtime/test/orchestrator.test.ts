@@ -205,6 +205,48 @@ test('owner can resume an interrupted read-only workflow without resetting its e
   await orchestrator.cancel('R','U');
 });
 
+test("model spend is recorded per role and sums to the run's estimated cost", async () => {
+  let evaluations = 0;
+  const route = { modelRef: "openai/gpt-5.6-luna", effort: "low", source: "jev", label: "simple", jevCostUsd: 0.0625 };
+  const { orchestrator, process } = fixture({ route: async () => route }, {
+    evaluate: async () => (++evaluations === 1
+      ? { action: "repair", repair_prompt: "fix regression", verification: { status: "failed", checks: [] }, candidate: { hash: "a", path: "/x" } }
+      : { action: "pass", verification: { status: "passed", checks: [] }, grade: { status: "passed" }, candidate: { hash: "b", path: "/x" } }),
+    assertUnchanged: async () => {}, execution: () => {},
+  });
+  const r = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "cost-roles", user_id: "U", prompt: "fix", routing_text: "fix" } as any);
+  await prompted(process);
+  process.emit({ type: "usage", cost_usd: 0.25 });
+  await orchestrator.qualityPhase(r.run_id, "grading", 0.125, "grader");
+  await orchestrator.qualityPhase(r.run_id, "verifying");
+  process.emit(SETTLED); await waitFor(() => process.prompts.length, count => count > 1, () => "the repair was never prompted");
+  process.emit({ type: "usage", cost_usd: 0.5 });
+  process.emit(SETTLED); await waitFor(() => orchestrator.getRun(r.run_id).status, status => status === "completed", status => `run is ${status}`);
+  const run = orchestrator.getRun(r.run_id);
+  assert.deepEqual(run.cost_by_role, { router: 0.0625, writer: 0.25, grader: 0.125, repair: 0.5 });
+  assert.equal(run.estimated_cost_usd, 0.9375);
+});
+
+test("each finished tool call is counted per tool, with its errors", async () => {
+  const { orchestrator, process } = fixture();
+  const r = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "tool-errors", user_id: "U", prompt: "fix" });
+  const call = (id: string, tool: string, is_error?: boolean) => {
+    process.emit({ type: "tool", phase: "start", tool_call_id: id, tool });
+    process.emit({ type: "tool", phase: "end", tool_call_id: id, tool, ...(is_error === undefined ? {} : { is_error }) });
+  };
+  call("1", "bash", true); call("2", "bash", false); call("3", "edit"); call("4", "mcp__codegraph__search", true);
+  call("5", "__proto__", true);
+  process.emit({ type: "tool", phase: "start", tool_call_id: "6", tool: "read" });
+  process.emit(SETTLED); await terminalRun(orchestrator, r.run_id);
+  const summary = orchestrator.getRun(r.run_id).tool_summary!;
+  assert.deepEqual(Object.keys(summary), ["bash", "edit", "mcp__codegraph__search", "__proto__"]);
+  assert.deepEqual([summary.bash, summary.edit, summary.mcp__codegraph__search], [{ calls: 2, errors: 1 }, { calls: 1, errors: 0 }, { calls: 1, errors: 1 }]);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(summary, "__proto__")?.value, { calls: 1, errors: 1 });
+  assert.equal(Object.getPrototypeOf(summary), Object.prototype);
+  assert.equal(({} as Record<string, unknown>).calls, undefined);
+  assert.deepEqual(JSON.parse(JSON.stringify(orchestrator.getRun(r.run_id))).tool_summary.__proto__, { calls: 1, errors: 1 });
+});
+
 test("automatic session selects Sol for a complex run and Luna for its follow-up", async () => {
   const decisions = [
     { modelRef: "openai/gpt-5.6-sol", effort: "high", source: "jev", label: "complex" },

@@ -476,7 +476,7 @@ export async function createProductionServer() {
       const token = issueMcpToken({ version: 2, run: id, session: id, slackUser: owner, server: 'github', tools: [...MCP_SERVERS.github.directTools], mode: 'read_only', scope: { repository: mcpRepository! }, maxCalls: 4, expiry: Date.now() + 5 * 60_000 },deriveMcpServerSecret(mcpSigningSecret,'github'));
       telemetry?.addSecret(token,id); return token;
     } } : undefined,
-    phase: (id, phase, cost) => orchestrator.qualityPhase(id, phase, cost),
+    phase: (id, phase, cost, role) => orchestrator.qualityPhase(id, phase, cost, role),
     grader,
     token: (id, route, role) => {
       const model = resolveAgentModel(route.modelRef);

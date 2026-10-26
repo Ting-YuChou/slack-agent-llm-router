@@ -284,7 +284,8 @@ CREATE TABLE IF NOT EXISTS agent_verifications (
   payload_json String CODEC(ZSTD(3)),
   candidate_hash String,
   attempt UInt32,
-  status String
+  status String,
+  failed_kinds String
 ) ENGINE=ReplacingMergeTree(version) PARTITION BY toYYYYMM(collected_at) ORDER BY event_id TTL toDateTime(collected_at) + INTERVAL 90 DAY;
 
 ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS sequence UInt64;
@@ -316,6 +317,8 @@ ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS candidate_hash String;
 ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS attempt UInt32;
 
 ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS status String;
+
+ALTER TABLE agent_verifications ADD COLUMN IF NOT EXISTS failed_kinds String;
 
 CREATE OR REPLACE VIEW agent_verifications_latest AS SELECT * FROM agent_verifications FINAL;
 
@@ -947,6 +950,32 @@ SELECT run_id, status, model, collected_at,
   JSONExtract(payload_json,'harness_metrics','startup_s','Nullable(Float64)') AS startup_s,
   JSONExtract(payload_json,'harness_metrics','repair_startup_s','Nullable(Float64)') AS repair_startup_s
 FROM agent_runs_latest WHERE JSONHas(payload_json,'harness_metrics');
+
+CREATE OR REPLACE VIEW agent_verification_checks AS
+SELECT run_id, event_id, candidate_hash, attempt, status AS verification_status, collected_at,
+  JSONExtractString(check_json,'name') AS check_name,
+  JSONExtractString(check_json,'kind') AS check_kind,
+  JSONExtractString(check_json,'status') AS check_status
+FROM agent_verifications_latest
+ARRAY JOIN JSONExtractArrayRaw(payload_json,'checks') AS check_json;
+
+CREATE OR REPLACE VIEW agent_tool_error_rates AS
+SELECT tool, count() AS calls, countIf(is_error = 1) AS errors, errors / calls AS error_rate
+FROM agent_tool_calls_latest WHERE phase = 'end' GROUP BY tool;
+
+CREATE OR REPLACE VIEW agent_run_cost_by_role AS
+SELECT run_id, model, collected_at, role_cost.1 AS role, role_cost.2 AS cost_usd
+FROM agent_runs_latest
+ARRAY JOIN JSONExtractKeysAndValues(payload_json,'cost_by_role','Float64') AS role_cost;
+
+CREATE OR REPLACE VIEW agent_cost_per_accepted_change AS
+SELECT toStartOfDay(h.collected_at) AS day, count() AS runs, sum(h.cost_usd) AS total_cost_usd,
+  countIf(f.accepted = 1) AS accepted_changes,
+  if(accepted_changes > 0, total_cost_usd / accepted_changes, NULL) AS cost_per_accepted_change_usd
+FROM agent_harness_metrics h LEFT JOIN
+  (SELECT run_id, max(verdict = 'accepted') AS accepted FROM agent_feedback_current GROUP BY run_id) f
+  ON h.run_id = f.run_id
+GROUP BY day;
 
 CREATE OR REPLACE VIEW agent_workflow_execution_durations AS
 SELECT workflow_run_id, execution_id, any(role) AS role,

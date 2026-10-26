@@ -86,6 +86,8 @@ TABLES = {
         "candidate_hash": "String",
         "attempt": "UInt32",
         "status": "String",
+        # Sorted, comma-joined kinds (static, test) of the candidate checks that did not pass.
+        "failed_kinds": "String",
     },
     "agent_grades": {
         "candidate_hash": "String",
@@ -248,6 +250,39 @@ SELECT run_id, status, model, collected_at,
   JSONExtract(payload_json,'harness_metrics','repair_startup_s','Nullable(Float64)') AS repair_startup_s
 FROM agent_runs_latest WHERE JSONHas(payload_json,'harness_metrics')"""
     )
+    # O2: one row per verification check, so failure categories group by kind.
+    statements.append(
+        """CREATE OR REPLACE VIEW agent_verification_checks AS
+SELECT run_id, event_id, candidate_hash, attempt, status AS verification_status, collected_at,
+  JSONExtractString(check_json,'name') AS check_name,
+  JSONExtractString(check_json,'kind') AS check_kind,
+  JSONExtractString(check_json,'status') AS check_status
+FROM agent_verifications_latest
+ARRAY JOIN JSONExtractArrayRaw(payload_json,'checks') AS check_json"""
+    )
+    statements.append(
+        """CREATE OR REPLACE VIEW agent_tool_error_rates AS
+SELECT tool, count() AS calls, countIf(is_error = 1) AS errors, errors / calls AS error_rate
+FROM agent_tool_calls_latest WHERE phase = 'end' GROUP BY tool"""
+    )
+    # Runs carry cost_by_role (agent-runtime/src/orchestrator.ts): the run's spend per role.
+    statements.append(
+        """CREATE OR REPLACE VIEW agent_run_cost_by_role AS
+SELECT run_id, model, collected_at, role_cost.1 AS role, role_cost.2 AS cost_usd
+FROM agent_runs_latest
+ARRAY JOIN JSONExtractKeysAndValues(payload_json,'cost_by_role','Float64') AS role_cost"""
+    )
+    # Every terminal run's cost, charged to the changes their owners accepted.
+    statements.append(
+        """CREATE OR REPLACE VIEW agent_cost_per_accepted_change AS
+SELECT toStartOfDay(h.collected_at) AS day, count() AS runs, sum(h.cost_usd) AS total_cost_usd,
+  countIf(f.accepted = 1) AS accepted_changes,
+  if(accepted_changes > 0, total_cost_usd / accepted_changes, NULL) AS cost_per_accepted_change_usd
+FROM agent_harness_metrics h LEFT JOIN
+  (SELECT run_id, max(verdict = 'accepted') AS accepted FROM agent_feedback_current GROUP BY run_id) f
+  ON h.run_id = f.run_id
+GROUP BY day"""
+    )
     statements.append(
         """CREATE OR REPLACE VIEW agent_workflow_execution_durations AS
 SELECT workflow_run_id, execution_id, any(role) AS role,
@@ -285,6 +320,18 @@ def _number(value):
         and value >= 0
         else None
     )
+
+
+def failed_check_kinds(checks):
+    """Kinds of the candidate's checks that did not pass; baseline failures predate it."""
+    kinds = {
+        check.get("kind") if isinstance(check.get("kind"), str) else "unknown"
+        for check in (checks if isinstance(checks, list) else [])
+        if isinstance(check, dict)
+        and check.get("status") != "passed"
+        and not str(check.get("name", "")).startswith("baseline:")
+    }
+    return ",".join(sorted(kinds))
 
 
 def validate_projections(projections):
@@ -366,6 +413,8 @@ def project(envelope, resolved_payload=None):
                 },
             }
         ]
+        if kind == "verification":
+            rows[table][0]["failed_kinds"] = failed_check_kinds(payload.get("checks"))
     elif kind == "content":
         rows = {
             "agent_content_chunks": [

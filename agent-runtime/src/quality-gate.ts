@@ -9,6 +9,8 @@ import { promptTelemetry, renderPrompt } from "./prompts.js";
 export type CheckStatus = "passed" | "failed" | "unknown";
 export interface VerificationCheck {
   name: string; status: CheckStatus; exit_code: number | null; duration_ms?: number; passed?: number | null; failed?: number | null; artifact?: string;
+  /** The profile check's kind, for failure categories in analytics. */
+  kind?: "static" | "test";
   /** Parsed diagnostics, repository-relative. */
   failures?: CheckFailure[];
   /** Redacted, bounded log tail; never a host path. */

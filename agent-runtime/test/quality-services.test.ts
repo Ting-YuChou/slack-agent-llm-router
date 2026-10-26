@@ -111,6 +111,38 @@ test("discovery runs planner and investigator through an injected execution proc
   assert.match(brief, /a is exported here/);
 });
 
+test("planner, investigator and grader spend reaches the run under each one's role", async () => {
+  const { root, repo, baseline } = fixture();
+  const spent: Array<[string, number, string | undefined]> = [];
+  const usage = (cost_usd: number): Step => ({ event: { type: "usage", cost_usd } as PublicRunEvent });
+  const { services: quality } = services(root, repo, {
+    phase: async (_run, phase, cost, role) => { if (cost) spent.push([phase, cost, role]); },
+    createExecutionProcess: (_options, onEvent, onRecord) => ({
+      prompt: (_id, prompt) => {
+        const role = /You are a restricted (\w+)/.exec(prompt)?.[1] ?? "unknown";
+        const wave = Number(/"wave":(\d+)/.exec(prompt)?.[1] ?? 1);
+        const steps = role === "planner"
+          ? submit("submit_plan", { tasks: wave === 1 ? [{ id: "explore", role: "code_explorer", purpose: "find a", expected_output: "location", paths: ["src"], dependencies: [] }] : [] })
+          : submit("submit_investigation", { status: "succeeded", findings: [{ path: "src/a.js", line: 1, reason: "a is exported here" }], evidence: ["src/a.js:1"], unresolved: [], suggested_tasks: [] });
+        play([usage(role === "planner" ? 0.25 : 0.0625), ...steps, settled], onEvent, onRecord);
+      },
+      close: async () => {},
+    }),
+    createVerifier: () => ({ verify: async () => ({ status: "passed", checks: [] }), stop: async () => {} }),
+    createGraderProcess: (_options, onEvent, onRecord) => ({
+      prompt: (_id, prompt) => {
+        const hash = /"candidate_hash":"([^"]+)"/.exec(prompt)?.[1];
+        play([usage(0.125), ...submit("submit_grade", { status: "passed", candidate_hash: hash, criteria: [{ id: "correct", passed: true, evidence: "src/a.js:1 exports 2" }], findings: [] }), settled], onEvent, onRecord);
+      },
+      close: async () => {},
+    }),
+  });
+  quality.prepare?.("run-roles", "structured");
+  await quality.discover!({ run_id: "run-roles", worktree: repo, baseline, requirement: "make a 2", attempt: 1, owner: "U1", initial_active_ms: 0, signal: new AbortController().signal });
+  await quality.evaluate({ run_id: "run-roles", worktree: repo, baseline, requirement: "make a 2", attempt: 1, signal: new AbortController().signal });
+  assert.deepEqual(spent, [["investigating", 0.25, "planner"], ["investigating", 0.0625, "code_explorer"], ["investigating", 0.25, "planner"], ["grading", 0.125, "grader"]]);
+});
+
 test("profile fixers run before the snapshot and their files reach the candidate", async () => {
   const { root, repo, baseline } = fixture();
   const fixed = { ...profile, fixers: [{ name: "fmt", argv: ["fmt"], cwd: ".", timeoutMs: 1000 }] };

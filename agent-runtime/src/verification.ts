@@ -180,6 +180,9 @@ export function orderChecks(checks: VerificationCheckSpec[]): VerificationCheckS
   return [...checks.filter(check => check.kind === "static"), ...checks.filter(check => check.kind !== "static")];
 }
 
+/** An undeclared kind runs with the tests (see orderChecks), so it is recorded as one. */
+const checkKind = (check: VerificationCheckSpec) => check.kind ?? "test";
+
 export function combineStatus(checks: VerificationCheck[]): CheckStatus {
   return checks.some(c => c.status === "unknown") ? "unknown" : checks.every(c => c.status === "passed") ? "passed" : "failed";
 }
@@ -244,11 +247,11 @@ export class DockerVerifier {
       const artifact = path.join(path.dirname(candidate.path), `${mode}-${checkFileName(check.name)}.log`);
       await writeFile(artifact, String(redact(output)), { mode: 0o600 });
       const exit = record.exit !== null && [125, 126, 127].includes(record.exit) ? null : record.exit;
-      results.push({ name: `${mode}:${check.name}`, status: exit === 0 ? "passed" : exit === null ? "unknown" : "failed", exit_code: exit, duration_ms: record.duration_ms, ...parseVerificationCounts(output), artifact,
+      results.push({ name: `${mode}:${check.name}`, kind: checkKind(check), status: exit === 0 ? "passed" : exit === null ? "unknown" : "failed", exit_code: exit, duration_ms: record.duration_ms, ...parseVerificationCounts(output), artifact,
         ...(exit === 0 ? {} : { failures: await checkFailures(check, output, out), excerpt: excerpt(output) }),
         ...(record.timed_out ? { timed_out: true, cause: "check_timeout" } : exit === null ? { cause: record.cause ?? "check_runner_failed" } : {}) });
     }
-    const unknown = (check: VerificationCheckSpec, cause: string, timedOut = false): VerificationCheck => ({ name: `${mode}:${check.name}`, status: "unknown", exit_code: null, cause, ...(timedOut ? { timed_out: true } : {}) });
+    const unknown = (check: VerificationCheckSpec, cause: string, timedOut = false): VerificationCheck => ({ name: `${mode}:${check.name}`, kind: checkKind(check), status: "unknown", exit_code: null, cause, ...(timedOut ? { timed_out: true } : {}) });
     // A forged or duplicated record means the latest accepted one cannot be trusted either.
     if (violation) results.splice(Math.max(0, results.length - 1), 1, unknown(checks[Math.max(0, results.length - 1)], violation));
     else if (results.length < checks.length && results.at(-1)?.status !== "unknown") results.push(unknown(checks[results.length], result.timedOut ? "mode_timeout" : "runner_incomplete", result.timedOut));
@@ -271,7 +274,7 @@ export class DockerVerifier {
     const { output, exit, timedOut } = result;
     const artifact = path.join(path.dirname(candidate.path), `${mode}-${checkFileName(check.name)}.log`);
     await writeFile(artifact, String(redact(output)), { mode: 0o600 });
-    return { name: `${mode}:${check.name}`, status: exit === 0 ? "passed" : exit === null ? "unknown" : "failed", exit_code: exit, duration_ms: performance.now() - started, ...parseVerificationCounts(output), artifact,
+    return { name: `${mode}:${check.name}`, kind: checkKind(check), status: exit === 0 ? "passed" : exit === null ? "unknown" : "failed", exit_code: exit, duration_ms: performance.now() - started, ...parseVerificationCounts(output), artifact,
       ...(exit === 0 ? {} : { failures: await checkFailures(check, output, out), excerpt: excerpt(output) }),
       ...(timedOut ? { timed_out: true, cause: "check_timeout" } : exit === null ? { cause: "check_runner_failed" } : {}) };
   }
