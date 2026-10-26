@@ -98,6 +98,136 @@ jobs:
       - name: Compile source tree
         run: python -m compileall src tests slack
 
+  # The opt-in Python integration tests (AGENT_OBSERVABILITY_INTEGRATION=1): the real SQLite outbox to Kafka to
+  # ClickHouse path, and the ClickHouse MCP reader confined to the agent_mcp views. Kafka and ClickHouse match
+  # docker-compose.yml; every image is pinned by digest. The passwords are throwaway values for these containers.
+  agent-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      kafka:
+        image: confluentinc/cp-kafka:7.8.7@sha256:2b5c4a369c1b8d1a3257d7415bbbfd320ce522448725282373051981f4bae56c
+        ports:
+          - 9092:9092
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+          CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+        options: >-
+          --health-cmd "cub kafka-ready -b localhost:9092 1 20"
+          --health-interval 5s
+          --health-timeout 30s
+          --health-retries 20
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8.14.39@sha256:1ffa82edee000a42c09313bd9f1293d94c570aee74babc1b3ca9983a35fa597b
+        ports:
+          - 8123:8123
+        env:
+          CLICKHOUSE_USER: llm_router
+          CLICKHOUSE_PASSWORD: ci-clickhouse-writer
+          # agent-mcp-views.sql creates the view definer user and grants it the raw tables.
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+          # Read by agent-mcp-users.xml, which a step below installs.
+          AGENT_MCP_CLICKHOUSE_PASSWORD: ci-agent-mcp-reader
+        options: >-
+          --health-cmd "wget -qO- http://localhost:8123/ping"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      AGENT_OBSERVABILITY_INTEGRATION: "1"
+      AGENT_TEST_KAFKA_BROKERS: localhost:9092
+      AGENT_TEST_CLICKHOUSE_HOST: localhost
+      AGENT_TEST_CLICKHOUSE_PORT: "8123"
+      AGENT_TEST_CLICKHOUSE_USER: llm_router
+      AGENT_TEST_CLICKHOUSE_PASSWORD: ci-clickhouse-writer
+      AGENT_MCP_CLICKHOUSE_PASSWORD: ci-agent-mcp-reader
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements-ci.txt
+            requirements-dev.txt
+
+      # The Kafka and ClickHouse clients come from requirements-dev.txt, which also pins the ML stack this job skips.
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-ci.txt $(grep -E '^(aiokafka|clickhouse-connect)==' requirements-dev.txt)
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.0"
+          cache: npm
+          cache-dependency-path: agent-runtime/package-lock.json
+
+      # The outbox test publishes through the built agent-runtime/dist/src/telemetry.js.
+      - name: Build agent-runtime
+        run: npm ci --ignore-scripts && npm run build
+        working-directory: agent-runtime
+
+      # docker-compose.agent-mcp.yaml mounts this file; a service container starts before checkout, so copy it in.
+      - name: Install the MCP reader user in ClickHouse
+        run: |
+          docker cp docker/observability/agent-mcp-users.xml "${{ job.services.clickhouse.id }}:/etc/clickhouse-server/users.d/agent-mcp.xml"
+          docker restart "${{ job.services.clickhouse.id }}"
+          for _ in $(seq 60); do curl -fsS http://localhost:8123/ping >/dev/null 2>&1 && break; sleep 1; done
+          curl -fsS -u "agent_mcp_reader:$AGENT_MCP_CLICKHOUSE_PASSWORD" http://localhost:8123/ --data-binary "SELECT 1"
+
+      - name: Create the agent Kafka topics
+        run: |
+          for topic in agent.events.v1 agent.content.v1 agent.dlq.v1; do
+            docker exec "${{ job.services.kafka.id }}" kafka-topics --bootstrap-server localhost:9092 --create --if-not-exists --topic "$topic" --partitions 1 --replication-factor 1
+          done
+
+      - name: Migrate the agent analytics schema
+        run: python -m src.agent_analytics --migrate-only
+        env:
+          CLICKHOUSE_HOST: localhost
+          CLICKHOUSE_USER: llm_router
+          CLICKHOUSE_PASSWORD: ci-clickhouse-writer
+
+      # otel_traces comes from the collector's ClickHouse exporter, so run the real collector config until it exists.
+      - name: Create otel_traces with the OTEL collector
+        run: |
+          docker run --detach --name otel-collector --network "${{ job.services.clickhouse.network }}" --user 0:0 \
+            --env CLICKHOUSE_USER=llm_router --env CLICKHOUSE_PASSWORD=ci-clickhouse-writer --tmpfs /var/lib/otelcol \
+            --volume "$PWD/docker/observability/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro" \
+            otel/opentelemetry-collector-contrib:0.127.0@sha256:e94cfd92357aa21f4101dda3c0c01f90e6f24115ba91b263c4d09fed7911ae68 \
+            --config=/etc/otelcol-contrib/config.yaml
+          exists() { curl -fsS -u "llm_router:ci-clickhouse-writer" http://localhost:8123/ --data-binary "EXISTS TABLE default.otel_traces"; }
+          for _ in $(seq 60); do [[ "$(exists)" == 1 ]] && break; sleep 1; done
+          [[ "$(exists)" == 1 ]] || { docker logs otel-collector >&2; exit 1; }
+          docker rm --force otel-collector
+
+      - name: Create the agent_mcp views
+        run: docker exec -i "${{ job.services.clickhouse.id }}" clickhouse-client --user llm_router --password ci-clickhouse-writer --multiquery < docker/observability/agent-mcp-views.sql
+
+      - name: Run the integration tests
+        run: |
+          python -m pytest tests/test_agent_observability_integration.py tests/test_agent_mcp_reader_integration.py -v -rs | tee agent-integration.log
+          # A missing flag, variable or service would skip these tests silently; this job exists to run them.
+          if grep -qE "[0-9]+ skipped" agent-integration.log; then echo "Integration tests were skipped" >&2; exit 1; fi
+
   agent-runtime:
     runs-on: ubuntu-latest
     timeout-minutes: 15

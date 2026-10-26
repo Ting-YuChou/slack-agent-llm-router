@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { PiRpcBridge, RpcJsonlDecoder } from "../src/pi-rpc.js";
 import { issueGatewayToken, issueClassifierGatewayToken } from "../src/gateway-token.js";
 import { issueMcpToken } from "../src/mcp-token.js";
+import type * as Telemetry from "../src/telemetry.js";
 test("internal RPC capture retains all official and future usage fields without exposing thinking publicly", () => {
   const records: unknown[] = [];
   const publicEvents: unknown[] = [];
@@ -27,12 +28,13 @@ test("capture failure does not interrupt Pi", () => {
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-async function telemetryModule(): Promise<any> {
-  const location = "../src/telemetry.js";
-  const module = await import(location).catch(() => null);
+async function telemetryModule(): Promise<typeof Telemetry> {
+  const module = await import("../src/telemetry.js").catch(() => null);
   assert.ok(module, "durable telemetry module exists");
   return module;
 }
+/** The outbox rows these tests write carry only the envelope fields the store and publisher read. */
+const outboxRow = (row: Partial<Telemetry.AgentEnvelope>) => row as Telemetry.AgentEnvelope;
 test("outbox reopens unacknowledged data, uses stable ids, and chunks large content", async () => {
   const { TelemetryStore, contentRecords } = await telemetryModule();
   const root = await mkdtemp(path.join(tmpdir(), "agent-outbox-"));
@@ -42,7 +44,7 @@ test("outbox reopens unacknowledged data, uses stable ids, and chunks large cont
     const records = contentRecords({ run_id: "r", session_id: "s", event_id: "e" }, "dialogue", "中".repeat(200000));
     assert.ok(records.length > 1);
     for (const record of records) {
-      assert.ok(Buffer.from(record.payload.data, "base64").length <= 262144);
+      assert.ok(Buffer.from((record.payload as { data: string }).data, "base64").length <= 262144);
       store.append(record);
     }
     store.close();
@@ -80,12 +82,12 @@ test("feedback replay after ACK does not replace a later human correction", asyn
   try {
     const file = path.join(root, 'outbox.sqlite');
     let store = new TelemetryStore(file);
-    store.append({ event_id: 'click-a', kind: 'feedback', topic: 'agent.events.v1', run_id: 'r', payload: { verdict: 'accepted' } });
+    store.append(outboxRow({ event_id: 'click-a', kind: 'feedback', topic: 'agent.events.v1', run_id: 'r', payload: { verdict: 'accepted' } }));
     store.ack(['click-a']);
     store.close();
     store = new TelemetryStore(file);
-    store.append({ event_id: 'click-b', kind: 'feedback', topic: 'agent.events.v1', run_id: 'r', payload: { verdict: 'needs_changes' } });
-    store.append({ event_id: 'click-a', kind: 'feedback', topic: 'agent.events.v1', run_id: 'r', payload: { verdict: 'accepted' } });
+    store.append(outboxRow({ event_id: 'click-b', kind: 'feedback', topic: 'agent.events.v1', run_id: 'r', payload: { verdict: 'needs_changes' } }));
+    store.append(outboxRow({ event_id: 'click-a', kind: 'feedback', topic: 'agent.events.v1', run_id: 'r', payload: { verdict: 'accepted' } }));
     assert.equal(store.pending().length, 1);
     assert.equal(store.pending()[0].event_id, 'click-b');
     store.close();
@@ -133,7 +135,7 @@ test("capacity rejects new batches atomically and still accepts pending replay i
   const { TelemetryStore } = await telemetryModule();
   const root = await mkdtemp(path.join(tmpdir(), 'agent-capacity-'));
   try {
-    const row = { event_id: 'a', run_id: 'r', kind: 'rpc', topic: 'agent.events.v1', payload: 'x'.repeat(100) };
+    const row = outboxRow({ event_id: 'a', run_id: 'r', kind: 'rpc', topic: 'agent.events.v1', payload: 'x'.repeat(100) });
     const bytes = Buffer.byteLength(JSON.stringify(row));
     const store = new TelemetryStore(path.join(root, 'outbox.sqlite'), bytes + 10);
     store.append(row);
@@ -160,7 +162,7 @@ test("Kafka ACK uncertainty retains durable events and replays the same event id
   const root = await mkdtemp(path.join(tmpdir(), 'agent-ack-'));
   try {
     const store = new TelemetryStore(path.join(root, 'outbox.sqlite'));
-    const event = { event_id: 'same-id', run_id: 'r', topic: 'agent.events.v1', kind: 'rpc', payload: { future: 9 } };
+    const event = outboxRow({ event_id: 'same-id', run_id: 'r', topic: 'agent.events.v1', kind: 'rpc', payload: { future: 9 } });
     store.append(event);
     const delivered: string[] = [];
     let fail = true;
@@ -190,7 +192,7 @@ test("Kafka publishing keeps each produce request below the broker message budge
   try {
     const store = new TelemetryStore(path.join(root, 'outbox.sqlite'));
     for (let i = 0; i < 3; i++)
-      store.append({ event_id: `large-${i}`, run_id: 'r', topic: 'agent.content.v1', kind: 'content', payload: 'x'.repeat(350_000) });
+      store.append(outboxRow({ event_id: `large-${i}`, run_id: 'r', topic: 'agent.content.v1', kind: 'content', payload: 'x'.repeat(350_000) }));
     const sizes: number[] = [];
     await publishOutbox(store, { send: async (request: { messages: Array<{ value: string }> }) => {
       sizes.push(request.messages.reduce((total: number, message: { value: string }) => total + Buffer.byteLength(message.value), 0));
@@ -222,7 +224,7 @@ test("deep JSON serialization failures return incomplete rather than reject", as
 test("streamed credential assignments redact unknown values across arbitrary chunks", async () => {
   const {BinaryRedactor,redact} = await telemetryModule();
   const text = 'OPENAI_API_KEY="' + 's'.repeat(1000) + '"\nDATABASE_PASSWORD=db-secret\nGITHUB_TOKEN=gh-secret\nusage=42\n';
-  assert.doesNotMatch(redact(text), /db-secret|gh-secret|ssssssss/);
+  assert.doesNotMatch(redact(text) as string, /db-secret|gh-secret|ssssssss/);
   for (const size of [1,17,300,10000]) {
     const redactor = new BinaryRedactor([]);
     const chunks: Buffer[] = [];
@@ -250,7 +252,7 @@ test("terminal cleanup releases issued secrets and per-run state", async () => {
 test("streamed Basic authorization is masked and malformed quotes retain following lines", async () => {
   const {BinaryRedactor,redact} = await telemetryModule();
   const input = 'Authorization: Basic abcdef\nDATABASE_PASSWORD=my secret password\nOPENAI_API_KEY="short-secret\nOPENAI_API_KEY="'+'s'.repeat(1000)+'\nimportant test output\n';
-  assert.doesNotMatch(redact(input),/abcdef|ssssssss|short-secret|my secret password/);
+  assert.doesNotMatch(redact(input) as string,/abcdef|ssssssss|short-secret|my secret password/);
   for(const size of [1,2,7,256,4096]) {
     const redactor = new BinaryRedactor([]);
     const output: Buffer[] = [];
@@ -265,7 +267,7 @@ test("streamed Basic authorization is masked and malformed quotes retain followi
 test("opaque JSON and escaped quoted credentials cannot bypass streaming redaction", async () => {
   const {BinaryRedactor,redact} = await telemetryModule();
   const input = '{"OPENAI_API_KEY":"abc\\"LEAKME"}\nOPENAI_API_KEY="abc\\"LEAKME"\nDATABASE_PASSWORD=[REDACTED]LEAKME\nnext line\n';
-  assert.doesNotMatch(redact(input),/LEAKME/);
+  assert.doesNotMatch(redact(input) as string,/LEAKME/);
   for (const size of [1,7,256,4096]) {
     const redactor = new BinaryRedactor([]);
     const chunks: Buffer[] = [];
@@ -281,7 +283,7 @@ test("AWS and private-key credentials are masked in objects and opaque streams",
   const {redact,BinaryRedactor} = await telemetryModule();
   assert.deepEqual(redact({AWS_SECRET_ACCESS_KEY:"LEAKME",SSH_PRIVATE_KEY:"LEAKME",DJANGO_SECRET_KEY:"LEAKME"}),{AWS_SECRET_ACCESS_KEY:"[REDACTED]",SSH_PRIVATE_KEY:"[REDACTED]",DJANGO_SECRET_KEY:"[REDACTED]"});
   const input = 'DJANGO_SECRET_KEY=LEAKME\nAWS_SECRET_ACCESS_KEY=LEAKME\n-----BEGIN PRIVATE KEY-----\n'+'LEAKME'.repeat(100)+'\n-----END PRIVATE KEY-----\nnext line\n';
-  assert.doesNotMatch(redact(input),/LEAKME/);
+  assert.doesNotMatch(redact(input) as string,/LEAKME/);
   for (const size of [1,7,256,4096]) {
     const redactor = new BinaryRedactor([]);
     const chunks: Buffer[] = [];

@@ -3,7 +3,7 @@ import { test } from "node:test";
 
 import type { PublicRunEvent } from "../src/pi-rpc.js";
 import { CodingAgentOrchestrator } from "../src/orchestrator.js";
-import { waitFor } from "./support/scenario.js";
+import { waitFor } from "./support/wait.js";
 
 const BASELINE = "a".repeat(40);
 

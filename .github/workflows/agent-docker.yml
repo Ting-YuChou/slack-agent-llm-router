@@ -67,8 +67,9 @@ jobs:
           load: true
           cache-from: type=gha,scope=verification
           cache-to: type=gha,scope=verification,mode=max
+      # The same digest as FAKE_GATEWAY_IMAGE in agent-runtime/test/support/docker-images.ts.
       - name: Pull the fake gateway base image
-        run: docker pull node:22.22.0-bookworm-slim
+        run: docker pull node:22.22.0-bookworm-slim@sha256:dd9d21971ec4395903fa6143c2b9267d048ae01ca6d3ea96f16cb30df6187d94
       - name: Run Docker suites
         working-directory: agent-runtime
         run: |

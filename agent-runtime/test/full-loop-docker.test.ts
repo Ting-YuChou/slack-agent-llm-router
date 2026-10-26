@@ -17,8 +17,8 @@ import { validateProfile } from "../src/verification.js";
 import { createQualityServices } from "../src/workflow-runtime.js";
 import { WorktreeManager, writerGitDir } from "../src/worktree-manager.js";
 import { fakeGatewayScript, scriptedTurns, waitForContainerHealthz, type TurnScript } from "./support/fake-provider.js";
-import { AGENT_TEST_IMAGE } from "./support/docker-images.js";
-import { waitFor } from "./support/scenario.js";
+import { AGENT_TEST_IMAGE, FAKE_GATEWAY_IMAGE } from "./support/docker-images.js";
+import { waitFor } from "./support/wait.js";
 
 /**
  * The whole loop with nothing scripted below the model: real Pi and policy extension in the agent image, the
@@ -90,7 +90,7 @@ async function runLoop(name: string, turns: TurnScript[], grade: "passed" | "unk
   try {
     await sh("docker", ["network", "create", "--internal", network]);
     await sh("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway",
-      "node:22.22.0-bookworm-slim", "node", "-e", fakeGatewayScript(scriptedTurns(turns))]);
+      FAKE_GATEWAY_IMAGE, "node", "-e", fakeGatewayScript(scriptedTurns(turns))]);
     await waitForContainerHealthz(gateway);
     orchestrator = new CodingAgentOrchestrator({
       worktrees,

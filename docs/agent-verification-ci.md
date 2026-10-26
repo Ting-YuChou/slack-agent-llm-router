@@ -116,12 +116,12 @@ Each JSONL line has `draft_id` (sha256 of the run id), `reason`, `reason_categor
 
 ## Validation and operating limits
 
-Local suites cover timing boundaries, candidate hashes, fresh grader settings, bounded repairs, no commit on unknown results, owner approvals, durable inbox replay, budget reservations and recovery after PR creation times out. Node tests are included in GitHub CI. Tests that explicitly require Docker or Kafka remain opt-in.
+Local suites cover timing boundaries, candidate hashes, fresh grader settings, bounded repairs, no commit on unknown results, owner approvals, durable inbox replay, budget reservations and recovery after PR creation times out. Node tests are included in GitHub CI. Tests that need Docker, Kafka or ClickHouse are opt-in locally; CI runs the Docker suites in `agent-docker.yml` and the Kafka/ClickHouse integration tests in the `agent-integration` job of `tests.yml`.
 
 ### Local validation on 2026-10-14
 
-- `cd agent-runtime && npm test`: 192 tests, 189 passed, three live Pi integration tests skipped, zero failures. This also builds the runtime and extensions.
-- Python agent analytics/runtime and Slack suites: 123 passed, using a dedicated temporary Redis Unix socket. That Redis was stopped and its temporary directory removed after the run.
+- `cd agent-runtime && npm test`: zero failures; only the opt-in live Pi integration tests were skipped. This also builds the runtime and extensions.
+- Python agent analytics/runtime and Slack suites passed, using a dedicated temporary Redis Unix socket. That Redis was stopped and its temporary directory removed after the run.
 - Scoped Black/flake8, configured mypy, an additional check of `src/agent_runtime.py`, shell syntax and `git diff --check` passed.
 - HTTP tests use actual loopback listeners, SQLite control state and the CI coordinator. They check signed delivery persistence and deduplication, owner/context rejection, distinct single-use approvals, and publication retry retaining the verified commit. External GitHub and execution responses are simulated; these tests do not exercise a real Pi repair.
 - Timing regression tests verify publication duration, both owner waits, tool approval waits after reproduction, late expiry observation and frozen terminal totals. Session retention also checks recently appended contexts inside old directories.

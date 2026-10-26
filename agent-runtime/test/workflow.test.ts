@@ -6,7 +6,7 @@ import * as startupTimingModule from "../src/startup-timing.js";
 import * as qualityGateModule from "../src/quality-gate.js";
 import * as graderModule from "../src/grader.js";
 test('verification counts preserve Node TAP and pytest results without inventing counts for typecheck', async () => {
-  const module: any = await import('../src/verification.js');
+  const module = await import('../src/verification.js');
   assert.equal(typeof module.parseVerificationCounts,'function');
   assert.deepEqual(module.parseVerificationCounts('# tests 6\n# pass 5\n# fail 1\n'),{ passed: 5,failed: 1 });
   assert.deepEqual(module.parseVerificationCounts('7 passed, 1 failed in 0.03s'),{ passed: 7,failed: 1 });

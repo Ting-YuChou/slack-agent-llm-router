@@ -28,7 +28,7 @@ test('structured plans reject cycles, privilege escalation, escaping paths and t
 });
 
 test('snapshot readers allow absolute paths inside their mount and reject outside paths and broader scopes', async () => {
-  const policy: any = await import('../src/policy.js'); assert.equal(typeof policy.validateSnapshotRead,'function');
+  const policy = await import('../src/policy.js'); assert.equal(typeof policy.validateSnapshotRead,'function');
   const { mkdirSync,writeFileSync } = await import('node:fs');
   const root = mkdtempSync(path.join(os.tmpdir(),'snapshot-read-'));
   try {

@@ -1,15 +1,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
-async function tracingModule(): Promise<any> { const name = "../src/tracing.js"; const m = await import(name).catch(() => null); assert.ok(m, "OTEL tracing module exists"); return m; }
+import type * as Tracing from "../src/tracing.js";
+async function tracingModule(): Promise<typeof Tracing> { const m = await import("../src/tracing.js").catch(() => null); assert.ok(m, "OTEL tracing module exists"); return m; }
 test('resumed workflows retain the persisted trace identity across runtime instances', async () => {
   const { AgentTracing } = await tracingModule();
   const first = new AgentTracing([new SimpleSpanProcessor(new InMemorySpanExporter())]);
   const next = new AgentTracing([new SimpleSpanProcessor(new InMemorySpanExporter())]);
   try {
-    first.startRun('r','s'); const parent = first.traceparent('r'); first.endRun('r','interrupted');
+    first.startRun('r','s'); const parent = first.traceparent('r')!; first.endRun('r','interrupted');
     next.startRun('r','s',undefined,parent);
-    assert.equal(next.traceparent('r').split('-')[1],parent.split('-')[1]);
+    assert.equal(next.traceparent('r')!.split('-')[1],parent.split('-')[1]);
     next.endRun('r','completed');
   } finally { await first.close(); await next.close(); }
 });
@@ -23,7 +24,7 @@ test("tools pair by call id, gateway parent is signed run context, unfinished to
   tracing.rpc("r", { type: "tool_execution_start", toolCallId: "a", toolName: "bash" });
   tracing.rpc("r", { type: "tool_execution_start", toolCallId: "b", toolName: "read" });
   tracing.rpc("r", { type: "tool_execution_end", toolCallId: "b", isError: false });
-  const parent = tracing.traceparent("r");
+  const parent = tracing.traceparent("r")!;
   assert.match(parent, /^00-[a-f0-9]{32}-[a-f0-9]{16}-01$/);
   const gateway = tracing.gateway("r", parent, "openai", "model");
   gateway.end();

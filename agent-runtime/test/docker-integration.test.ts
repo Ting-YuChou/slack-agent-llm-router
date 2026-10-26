@@ -11,7 +11,7 @@ import type { PublicRunEvent } from "../src/pi-rpc.js";
 import { WorktreeManager } from "../src/worktree-manager.js";
 import { deriveSessionSealKey, SessionSeal } from "../src/session-seal.js";
 import { fakeGatewayScript, scriptedTurns, waitForContainerHealthz } from "./support/fake-provider.js";
-import { AGENT_TEST_IMAGE } from "./support/docker-images.js";
+import { AGENT_TEST_IMAGE, FAKE_GATEWAY_IMAGE } from "./support/docker-images.js";
 
 const exec = promisify(execFile);
 const enabled = process.env.PI_AGENT_DOCKER_INTEGRATION === "1";
@@ -53,7 +53,7 @@ test("real Pi preserves its session while switching from Luna max to Sol high", 
   let piProcess: DockerPiProcess | undefined;
   try {
     await command("docker", ["network", "create", "--internal", network]);
-    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", "node:22.22.0-bookworm-slim", "node", "-e", gatewayScript]);
+    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", FAKE_GATEWAY_IMAGE, "node", "-e", gatewayScript]);
     await waitForContainerHealthz(gateway);
     const events: PublicRunEvent[] = [];
     let resolveSettled!: () => void;
@@ -145,7 +145,7 @@ test("Pi 1.0.1 resumes a session persisted by Pi 0.83", { skip: !enabled, timeou
   let piProcess: DockerPiProcess | undefined;
   try {
     await command("docker", ["network", "create", "--internal", network]);
-    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", "node:22.22.0-bookworm-slim", "node", "-e", gatewayScript]);
+    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", FAKE_GATEWAY_IMAGE, "node", "-e", gatewayScript]);
     await waitForContainerHealthz(gateway);
     const events: PublicRunEvent[] = [];
     let resolveSettled!: () => void;
@@ -239,8 +239,8 @@ test("Pi builtin MCP uses only the trusted GitHub registration and ignores proje
   let piProcess: DockerPiProcess | undefined;
   try {
     await command("docker", ["network", "create", "--internal", network]);
-    await command("docker", ["run", "--detach", "--rm", "--name", modelGateway, "--network", network, "--network-alias", "model-gateway", "node:22.22.0-bookworm-slim", "node", "-e", fakeModelScript]);
-    await command("docker", ["run", "--detach", "--rm", "--name", mcpGateway, "--network", network, "--network-alias", "mcp-gateway", "node:22.22.0-bookworm-slim", "node", "-e", fakeMcpScript]);
+    await command("docker", ["run", "--detach", "--rm", "--name", modelGateway, "--network", network, "--network-alias", "model-gateway", FAKE_GATEWAY_IMAGE, "node", "-e", fakeModelScript]);
+    await command("docker", ["run", "--detach", "--rm", "--name", mcpGateway, "--network", network, "--network-alias", "mcp-gateway", FAKE_GATEWAY_IMAGE, "node", "-e", fakeMcpScript]);
     await waitForContainerHealthz(modelGateway);
     await waitForContainerHealthz(mcpGateway, 8090);
     const events: PublicRunEvent[] = [];
@@ -302,7 +302,7 @@ test("real Pi requests pass the gateway allowlist and bash children cannot read 
   let piProcess: DockerPiProcess | undefined;
   try {
     await command("docker", ["network", "create", "--internal", network]);
-    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", "--mount", `type=bind,src=${recordDir},dst=/record`, "node:22.22.0-bookworm-slim", "node", "-e", gatewayScript]);
+    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", "--mount", `type=bind,src=${recordDir},dst=/record`, FAKE_GATEWAY_IMAGE, "node", "-e", gatewayScript]);
     await waitForContainerHealthz(gateway);
     const events: PublicRunEvent[] = [];
     let resolveSettled!: () => void;
@@ -412,7 +412,7 @@ test("session networks reach only their gateways: no external DNS, no egress, no
   const suffix = Math.random().toString(16).slice(2, 10);
   const gateway = `run-net-gateway-${suffix}`;
   const shared = `run-net-shared-${suffix}`;
-  const image = "node:22.22.0-bookworm-slim";
+  const image = FAKE_GATEWAY_IMAGE;
   const networks = new RunNetworks({ attachments: [{ container: gateway, alias: "model-gateway" }] });
   const sessions = [`A-${suffix}`, `B-${suffix}`];
   const containers = sessions.map(id => `run-net-${id}`);
@@ -463,7 +463,7 @@ test("a reused writer is frozen between attempts and its repair starts in the sa
   let piProcess: DockerPiProcess | undefined;
   try {
     await command("docker", ["network", "create", "--internal", network]);
-    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", "--mount", `type=bind,src=${recordDir},dst=/record`, "node:22.22.0-bookworm-slim", "node", "-e", gatewayScript]);
+    await command("docker", ["run", "--detach", "--rm", "--name", gateway, "--network", network, "--network-alias", "model-gateway", "--mount", `type=bind,src=${recordDir},dst=/record`, FAKE_GATEWAY_IMAGE, "node", "-e", gatewayScript]);
     await waitForContainerHealthz(gateway);
     const events: PublicRunEvent[] = [];
     let resolveSettled!: () => void;
@@ -531,8 +531,8 @@ test("a reused writer keeps its MCP tools across the pause: the repair reads thr
   let piProcess: DockerPiProcess | undefined;
   try {
     await command("docker", ["network", "create", "--internal", network]);
-    await command("docker", ["run", "--detach", "--rm", "--name", modelGateway, "--network", network, "--network-alias", "model-gateway", "node:22.22.0-bookworm-slim", "node", "-e", fakeModelScript]);
-    await command("docker", ["run", "--detach", "--rm", "--name", mcpGateway, "--network", network, "--network-alias", "mcp-gateway", "node:22.22.0-bookworm-slim", "node", "-e", fakeMcpScript]);
+    await command("docker", ["run", "--detach", "--rm", "--name", modelGateway, "--network", network, "--network-alias", "model-gateway", FAKE_GATEWAY_IMAGE, "node", "-e", fakeModelScript]);
+    await command("docker", ["run", "--detach", "--rm", "--name", mcpGateway, "--network", network, "--network-alias", "mcp-gateway", FAKE_GATEWAY_IMAGE, "node", "-e", fakeMcpScript]);
     await waitForContainerHealthz(modelGateway);
     await waitForContainerHealthz(mcpGateway, 8090);
     const events: PublicRunEvent[] = [];

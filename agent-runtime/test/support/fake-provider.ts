@@ -4,7 +4,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { promisify } from "node:util";
 
-import { waitFor } from "./scenario.js";
+import { waitFor } from "./wait.js";
 
 const exec = promisify(execFile);
 

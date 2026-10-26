@@ -9,7 +9,7 @@ import { ControlStore } from "../src/ci-control.js";
 import { CiRepairs, type RepairTarget } from "../src/ci-repair.js";
 import { createCiWebhook } from "../src/ci-webhook.js";
 import { createAgentHttpServer } from "../src/server.js";
-import { waitFor } from "./support/scenario.js";
+import { waitFor } from "./support/wait.js";
 
 async function listen(server: Server) {
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
