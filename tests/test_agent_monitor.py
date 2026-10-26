@@ -5,10 +5,12 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
 from slack.bot_real import RedisSlackStateStore, SlackBot, SlackMessageHandler
 from src.agent_runtime import (
+    AgentRuntimeClient,
     AgentRuntimeConflict,
     AgentRuntimeError,
     AgentRuntimeUnauthorized,
@@ -1120,3 +1122,163 @@ async def test_status_message_shows_a_run_waiting_for_approval(tmp_path):
     texts = [call.kwargs["text"] for call in bot.web_client.chat_update.await_args_list]
     assert "Phase: *awaiting_delivery* · Tools: 3 · Turns: 2" in texts[0]
     assert "Phase: *rejected*" in texts[-1]
+
+
+# The runtime's answer when a redelivered Slack request carries its first key
+# but a different body (for example a new thread context).
+REUSED_KEY = AgentRuntimeError(
+    "Agent runtime rejected the request with status 422",
+    status=422,
+    code="idempotency_key_reused",
+    server_message="Idempotency-Key was already used for a different request",
+)
+ACTIVE_SESSION = {
+    "session_id": "S1",
+    "run_id": "R2",
+    "owner_user_id": "U1",
+    "active": True,
+}
+
+
+def redelivery_bot(tmp_path, session):
+    """A bot whose runtime already started a run for the request it receives."""
+    runtime = SimpleNamespace(
+        create_session=AsyncMock(side_effect=REUSED_KEY),
+        lookup_session=AsyncMock(return_value=session),
+        get_run=AsyncMock(return_value=run_state("R2", "running", task_mode="discuss")),
+    )
+    bot = file_bot(tmp_path, agent_runtime=runtime)
+    bot._start_agent_monitor = Mock()
+    return bot, runtime
+
+
+def redeliver_followup(bot):
+    return SlackMessageHandler(bot).handle_message(
+        {
+            "text": "also add a regression test",
+            "user": "U1",
+            "channel": "C1",
+            "thread_ts": "100.1",
+            "ts": "200.6",
+            "_team_id": "T1",
+        },
+        SimpleNamespace(),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["start", "followup"])
+async def test_a_redelivered_request_adopts_the_run_its_first_delivery_started(
+    tmp_path, delivery
+):
+    bot, runtime = redelivery_bot(tmp_path, ACTIVE_SESSION)
+    if delivery == "start":
+        response = await SlackMessageHandler(bot)._start_agent_prompt(
+            "fix it",
+            "U1",
+            "C1",
+            None,
+            team_id="T1",
+            thread_ts="100.1",
+            request_id="200.5",
+        )
+    else:
+        track(bot, "R1", thread_ts="100.1")["result_posted"] = True
+        response = await redeliver_followup(bot)
+
+    runtime.create_session.assert_awaited_once()
+    runtime.lookup_session.assert_awaited_once_with("T1", "C1", "100.1")
+    tracked = bot.agent_runs["R2"]
+    assert (tracked["session_id"], tracked["thread_ts"]) == ("S1", "100.1")
+    assert (tracked["owner_user_id"], tracked["mode"]) == ("U1", "discuss")
+    assert bot.agent_threads["C1:100.1"] is tracked
+    bot._start_agent_monitor.assert_called_once_with(tracked)
+    assert "`R2` is already running" in response
+    assert "could not start" not in response
+
+
+@pytest.mark.asyncio
+async def test_a_redelivery_keeps_the_slack_state_of_a_run_already_followed(
+    tmp_path,
+):
+    bot, _runtime = redelivery_bot(tmp_path, ACTIVE_SESSION)
+    tracked = track(bot, "R2", thread_ts="100.1", session_id="S1")
+    tracked.update(
+        status_ts="100.1", status_text="🛠️ started", posted_approval_ids=["A1"]
+    )
+
+    response = await redeliver_followup(bot)
+
+    assert bot.agent_runs["R2"] is tracked
+    assert tracked["status_ts"] == "100.1"
+    assert tracked["posted_approval_ids"] == ["A1"]
+    bot._start_agent_monitor.assert_called_once_with(tracked)
+    assert "`R2` is already running" in response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lookup", ["missing", "unavailable"])
+async def test_a_redelivery_the_runtime_cannot_match_is_not_a_generic_failure(
+    tmp_path, lookup
+):
+    bot, runtime = redelivery_bot(tmp_path, None)
+    if lookup == "unavailable":
+        runtime.lookup_session.side_effect = AgentRuntimeUnavailable("down")
+
+    response = await SlackMessageHandler(bot)._start_agent_prompt(
+        "fix it", "U1", "C1", None, team_id="T1", thread_ts="100.1", request_id="200.5"
+    )
+
+    assert "already received this request" in response
+    assert "no second run was started" in response
+    assert "could not start" not in response
+    assert not bot.agent_runs
+    bot._start_agent_monitor.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_start_whose_answer_timed_out_ends_as_one_monitored_run(
+    tmp_path, monkeypatch
+):
+    runs = {}
+    keys = []
+
+    def runtime_server(request):
+        """The runtime's idempotency contract: one run per key and body."""
+        key = request.headers["idempotency-key"]
+        keys.append(key)
+        if key not in runs:
+            runs[key] = {"session_id": "S1", "run_id": "R1", "status": "starting"}
+            # The run was accepted, but the answer never reached the bot.
+            raise httpx.ReadTimeout("slow", request=request)
+        return httpx.Response(202, json=runs[key])
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setenv("AGENT_RUNTIME_TOKEN", "runtime-token")
+    runtime = AgentRuntimeClient(
+        {"base_url": "http://agent.test:3001"},
+        transport=httpx.MockTransport(runtime_server),
+        sleep=no_sleep,
+    )
+    bot = file_bot(tmp_path, agent_runtime=runtime)
+    bot._start_agent_monitor = Mock()
+    try:
+        response = await SlackMessageHandler(bot)._start_agent_prompt(
+            "fix it",
+            "U1",
+            "C1",
+            None,
+            team_id="T1",
+            thread_ts="100.1",
+            request_id="200.5",
+        )
+    finally:
+        await runtime.close()
+
+    assert len(runs) == 1, "the retry started no second run"
+    assert len(keys) == 2 and keys[0] == keys[1]
+    assert set(bot.agent_runs) == {"R1"}
+    bot._start_agent_monitor.assert_called_once_with(bot.agent_runs["R1"])
+    assert "`R1` started" in response

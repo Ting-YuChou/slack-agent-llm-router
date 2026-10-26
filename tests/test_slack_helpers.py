@@ -3163,6 +3163,84 @@ async def test_agent_start_sends_a_key_derived_from_the_triggering_message():
     assert "200.5" not in keys[0], "the key does not echo Slack identifiers"
 
 
+def _agent_control_bot(method):
+    accepted = {"run_id": "R", "session_id": "S", "status": "starting"}
+    if method in {"repair_ci", "retry_publication"}:
+        accepted["status"] = "awaiting_approval"
+    runtime = SimpleNamespace(**{method: AsyncMock(return_value=accepted)})
+    bot = SlackBot(
+        {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+    )
+    bot._start_agent_monitor = lambda tracked: None
+    bot.agent_user_runs["U1"] = {
+        "run_id": "R",
+        "session_id": "S",
+        "channel_id": "C1",
+        "thread_ts": "100.1",
+        "owner_user_id": "U1",
+    }
+    return bot, getattr(runtime, method)
+
+
+AGENT_CONTROL_COMMANDS = [
+    (["stop"], "cancel"),
+    (["resume", "R"], "resume"),
+    (["repair-ci", "7"], "repair_ci"),
+    (["publish-repair", "R"], "retry_publication"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("args,method", AGENT_CONTROL_COMMANDS)
+async def test_agent_control_keys_are_derived_from_the_triggering_message(args, method):
+    bot, request = _agent_control_bot(method)
+    handler = SlackMessageHandler(bot)
+
+    for message_ts in ("200.5", "200.5", "200.6"):
+        await handler._handle_agent_command(
+            list(args),
+            "U1",
+            "C1",
+            SimpleNamespace(),
+            team_id="T1",
+            thread_ts="100.1",
+            message_ts=message_ts,
+        )
+
+    keys = [call.kwargs.get("idempotency_key") for call in request.await_args_list]
+    assert keys[0] == _agent_idempotency_key("T1", "C1", "200.5", "U1", method)
+    assert keys[1] == keys[0], "a redelivered message reuses its key"
+    assert keys[2] == _agent_idempotency_key("T1", "C1", "200.6", "U1", method)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("args,method", AGENT_CONTROL_COMMANDS)
+async def test_slash_agent_control_keys_are_derived_from_the_command_trigger(
+    args, method
+):
+    bot, request = _agent_control_bot(method)
+    bot.web_client = SimpleNamespace(
+        chat_postEphemeral=AsyncMock(),
+        chat_postMessage=AsyncMock(return_value={"ts": "300.1"}),
+    )
+
+    for trigger_id in ("trigger-1", "trigger-1", "trigger-2"):
+        await bot._handle_slash_command(
+            {
+                "text": " ".join(["agent", *args]),
+                "user_id": "U1",
+                "channel_id": "C1",
+                "team_id": "T1",
+                "trigger_id": trigger_id,
+            }
+        )
+
+    keys = [call.kwargs.get("idempotency_key") for call in request.await_args_list]
+    assert keys[0] and keys[1] == keys[0], "a redelivered command reuses its key"
+    assert keys[2] and keys[2] != keys[0]
+    assert "trigger-1" not in keys[0], "the key does not echo Slack identifiers"
+
+
 async def _drain_background_tasks(bot):
     while bot.background_tasks:
         await asyncio.gather(*list(bot.background_tasks))

@@ -105,6 +105,23 @@ def _agent_idempotency_key(
     return "slack-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:40]
 
 
+def _agent_idempotency_kwargs(
+    team_id: Optional[str],
+    channel_id: str,
+    request_id: Optional[str],
+    user_id: str,
+    op: str,
+) -> Dict[str, str]:
+    """The runtime call's `idempotency_key`, when the Slack request has an id."""
+    if not request_id:
+        return {}
+    return {
+        "idempotency_key": _agent_idempotency_key(
+            team_id, channel_id, request_id, user_id, op
+        )
+    }
+
+
 # Next step shown after a failed run's reason, keyed by error code or cause_code.
 AGENT_ERROR_HINTS = {
     "scope_violation": (
@@ -1292,6 +1309,7 @@ class SlackMessageHandler:
         team_id: Optional[str] = None,
         command_surface: str = "message",
         message_ts: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> str:
         """Handle bot commands, falling back to a free-form query when appropriate."""
         parts = command_text.split()
@@ -1343,6 +1361,7 @@ class SlackMessageHandler:
                     team_id=team_id,
                     thread_ts=thread_ts,
                     message_ts=message_ts,
+                    request_id=request_id,
                     background_start=command_surface == "slash",
                 )
             return await self.commands[command](args, user_id, channel_id, client)
@@ -1425,6 +1444,7 @@ class SlackMessageHandler:
         team_id: Optional[str] = None,
         thread_ts: Optional[str] = None,
         message_ts: Optional[str] = None,
+        request_id: Optional[str] = None,
         background_start: bool = False,
     ) -> str:
         """Start or control a stateful Pi coding-agent thread.
@@ -1432,6 +1452,9 @@ class SlackMessageHandler:
         With `background_start`, a new task is acknowledged at once and its
         bootstrap and `create_session` run in a background task, so a slow
         start never holds a Slack worker.
+
+        `request_id` (the triggering message's ts by default) keys each runtime
+        call, so a redelivered message or slash command reuses its first key.
         """
         if not args:
             return "Usage: `/llm agent <task>`"
@@ -1439,6 +1462,12 @@ class SlackMessageHandler:
         runtime = getattr(self.bot, "agent_runtime_client", None)
         if runtime is None:
             return "Agent mode is currently disabled."
+        request_id = request_id or message_ts
+
+        def keyed(op: str) -> Dict[str, str]:
+            return _agent_idempotency_kwargs(
+                team_id, channel_id, request_id, user_id, op
+            )
 
         action = args[0].lower()
         if action in {"status", "stop", "close"} and len(args) == 1:
@@ -1457,7 +1486,7 @@ class SlackMessageHandler:
                     run = await runtime.get_run(tracked["run_id"])
                     return self._format_agent_status(run)
                 if action == "stop":
-                    await runtime.cancel(tracked["run_id"], user_id)
+                    await runtime.cancel(tracked["run_id"], user_id, **keyed("cancel"))
                     return f"Agent run `{tracked['run_id']}` is stopping."
                 await runtime.close_session(tracked["session_id"], user_id)
                 await self.bot._forget_agent_run(tracked)
@@ -1473,7 +1502,7 @@ class SlackMessageHandler:
 
         if action == "resume" and len(args) == 2:
             try:
-                result = await runtime.resume(args[1], user_id)
+                result = await runtime.resume(args[1], user_id, **keyed("resume"))
             except AgentRuntimeError:
                 return "Workflow cannot resume. Check ownership, baseline, artifacts and whether writing already started."
             if not thread_ts:
@@ -1500,17 +1529,16 @@ class SlackMessageHandler:
             if len(ci_args) != 2:
                 return "Usage: `/llm agent repair-ci <PR_URL|RUN_ID>` or `/llm agent publish-repair <RUN_ID>`"
             try:
-                request_repair = (
-                    runtime.repair_ci
-                    if action == "repair-ci"
-                    else runtime.retry_publication
+                repair_op = (
+                    "repair_ci" if action == "repair-ci" else "retry_publication"
                 )
-                result = await request_repair(
+                result = await getattr(runtime, repair_op)(
                     ci_args[1],
                     user_id,
                     team_id=team_id or "unknown-team",
                     channel_id=channel_id,
                     **({"workflow_mode": "structured"} if ci_workflow else {}),
+                    **keyed(repair_op),
                 )
             except AgentRuntimeError:
                 return "CI repair could not start. Check repository profile, owner mapping, failed workflow and GitHub App configuration."
@@ -1577,6 +1605,7 @@ class SlackMessageHandler:
             team_id=team_id,
             thread_ts=thread_ts,
             message_ts=message_ts,
+            request_id=request_id,
             model=model,
             include_thread_context=include_thread_context,
             workflow_mode=selected_workflow,
@@ -1616,6 +1645,7 @@ class SlackMessageHandler:
         team_id: Optional[str],
         thread_ts: Optional[str],
         message_ts: Optional[str],
+        request_id: Optional[str],
         model: Optional[str],
         include_thread_context: bool,
         workflow_mode: Optional[str],
@@ -1655,7 +1685,7 @@ class SlackMessageHandler:
             thread_ts=thread_ts,
             model=model,
             routing_text=task,
-            request_id=message_ts,
+            request_id=request_id,
             **({"workflow_mode": workflow_mode} if workflow_mode else {}),
             **({"task_mode": task_mode} if task_mode else {}),
         )
@@ -1802,16 +1832,21 @@ class SlackMessageHandler:
                 + " Chat mode was not used as fallback."
             )
         except AgentRuntimeError as exc:
-            known = AGENT_START_ERROR_TEXT.get(exc.code or "")
-            if known is None and isinstance(exc, AgentRuntimeConflict):
-                known = "This Agent thread cannot accept that request (for example, a different model)."
-            if known is None:
-                logger.warning(
-                    "Agent runtime could not complete the Slack task (code=%s)",
-                    exc.code,
+            if exc.code == "idempotency_key_reused":
+                message = await self._follow_redelivered_start(
+                    team_id or "unknown-team", channel_id, root_ts
                 )
-                known = "Agent mode could not start this task."
-            message = f"{known} Chat mode was not used as fallback."
+            else:
+                known = AGENT_START_ERROR_TEXT.get(exc.code or "")
+                if known is None and isinstance(exc, AgentRuntimeConflict):
+                    known = "This Agent thread cannot accept that request (for example, a different model)."
+                if known is None:
+                    logger.warning(
+                        "Agent runtime could not complete the Slack task (code=%s)",
+                        exc.code,
+                    )
+                    known = "Agent mode could not start this task."
+                message = f"{known} Chat mode was not used as fallback."
         else:
             tracked = self.bot._track_agent_run(
                 result,
@@ -1853,6 +1888,23 @@ class SlackMessageHandler:
             )
             return ""
         return message
+
+    async def _follow_redelivered_start(
+        self, team_id: str, channel_id: str, thread_ts: str
+    ) -> str:
+        """Follow the run a redelivered Slack request already started.
+
+        The runtime refuses the request's key because its body changed (for
+        example a newer thread context), so the thread's session names the run
+        the first delivery started.
+        """
+        tracked = await self.bot._adopt_agent_session(team_id, channel_id, thread_ts)
+        if tracked and tracked.get("run_id") and not tracked.get("result_posted"):
+            return (
+                f"🛠️ Agent run `{tracked['run_id']}` is already running for this "
+                "request; its progress and approvals will appear in this thread."
+            )
+        return "Agent mode already received this request, so no second run was started."
 
     @staticmethod
     def _format_agent_response(
@@ -3120,18 +3172,35 @@ class SlackBot:
         return "discuss"
 
     async def _restore_agent_thread(self, event: Dict[str, Any]):
+        await self._adopt_agent_session(
+            self._extract_team_id(event) or "unknown-team",
+            event.get("channel"),
+            event.get("thread_ts"),
+        )
+
+    async def _adopt_agent_session(
+        self, team_id: str, channel_id: Optional[str], thread_ts: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Track the runtime's open session for a thread and watch its active run.
+
+        Returns the tracked record, or None when the runtime has no open session
+        for the thread or cannot be asked. A run this bot already follows keeps
+        its Slack-side state.
+        """
         runtime = self.agent_runtime_client
         if runtime is None or not hasattr(runtime, "lookup_session"):
-            return
-        channel_id = event.get("channel")
-        thread_ts = event.get("thread_ts")
-        team_id = self._extract_team_id(event) or "unknown-team"
+            return None
         try:
             session = await runtime.lookup_session(team_id, channel_id, thread_ts)
         except AgentRuntimeError:
-            return
+            return None
         if not session:
-            return
+            return None
+        known = self.agent_runs.get(session.get("run_id") or "")
+        if known is not None:
+            if session.get("active"):
+                self._start_agent_monitor(known)
+            return known
         mode = await self._restored_agent_mode(session)
         if session.get("run_id"):
             tracked = self._track_agent_run(
@@ -3148,7 +3217,7 @@ class SlackBot:
                 # Without Slack-side state we cannot tell whether the result
                 # was posted; never repost it on a later restart.
                 tracked["result_posted"] = True
-            return
+            return tracked
         tracked = {
             "session_id": session["session_id"],
             "run_id": None,
@@ -3161,6 +3230,7 @@ class SlackBot:
         self.agent_threads[self._thread_key(channel_id, thread_ts)] = tracked
         self.agent_user_runs[session["owner_user_id"]] = tracked
         self._mark_thread_active(channel_id, thread_ts)
+        return tracked
 
     async def _handle_mention_event(self, event: Dict[str, Any]):
         """Handle app mentions"""
@@ -3215,6 +3285,7 @@ class SlackBot:
                     await self._persist_user_state(user_id)
                 return
 
+        trigger_id = command.get("trigger_id")
         response_text = await self.message_handler._handle_command(
             command_text,
             user_id,
@@ -3223,6 +3294,8 @@ class SlackBot:
             self.web_client,
             team_id=team_id,
             command_surface="slash",
+            # Slack resends a slash command with the same trigger_id.
+            request_id=f"slash:{trigger_id}" if trigger_id else None,
         )
 
         if response_text:
