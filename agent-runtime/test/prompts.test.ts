@@ -4,7 +4,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 
-import { PROMPT_IDS, PROMPTS_VERSION, promptRef, promptTelemetry, renderPrompt, type PromptVars } from "../src/prompts.js";
+import { PROMPT_IDS, PROMPTS_VERSION, ROLE_PROMPTS, promptRef, promptTelemetry, renderPrompt, type PromptVars } from "../src/prompts.js";
 
 const root = path.resolve(import.meta.dirname, "../..");
 const goldenDir = path.join(root, "test/golden/prompts");
@@ -70,4 +70,26 @@ test("telemetry names the prompt version and the prompts each role runs with", (
   const writer = promptTelemetry("implementation").prompts;
   for (const id of ["policy-scope", "checks", "repair", "scope-repair", "budget-notice", "budget-final"] as const) assert.ok(writer.includes(promptRef(id)), id);
   assert.deepEqual(promptTelemetry("no-such-role"), { prompts_version: PROMPTS_VERSION, prompts: [] });
+});
+
+test("the writer prompt set includes the diff-limit repair prompt", () => {
+  assert.ok(ROLE_PROMPTS.implementation!.includes("diff-limit-repair"));
+  assert.ok(promptTelemetry("implementation").prompts.includes(promptRef("diff-limit-repair")));
+});
+
+test("every prompt rendered in the runtime or shipped under prompts/ belongs to some role", () => {
+  const sources = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap(entry =>
+    entry.isDirectory() ? sources(path.join(dir, entry.name)) : entry.name.endsWith(".ts") ? [path.join(dir, entry.name)] : []);
+  const rendered = new Set<string>();
+  for (const file of [...sources(path.join(root, "src")), ...sources(path.join(root, "extensions"))]) {
+    for (const call of readFileSync(file, "utf8").matchAll(/renderPrompt\(([^,)]*)/g)) {
+      for (const literal of call[1]!.matchAll(/["']([a-z][a-z0-9-]*)["']/g)) rendered.add(literal[1]!);
+    }
+  }
+  for (const id of ["diff-limit-repair", "planner", "investigator", "policy-scope"]) assert.ok(rendered.has(id), `scan missed ${id}`);
+  for (const id of rendered) assert.ok((PROMPT_IDS as string[]).includes(id), `${id} is not a prompt id`);
+  const shipped = readdirSync(path.join(root, "prompts")).filter(name => name.endsWith(".md")).map(name => name.slice(0, -3));
+  const assigned = new Set<string>(Object.values(ROLE_PROMPTS).flat());
+  const unassigned = [...new Set([...rendered, ...shipped])].filter(id => !assigned.has(id)).sort();
+  assert.deepEqual(unassigned, []);
 });

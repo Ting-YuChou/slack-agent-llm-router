@@ -25,8 +25,8 @@ function prompt(id: PromptId): { body: string; vars: readonly string[]; hash: st
   return PROMPTS[id];
 }
 
-const WRITER_PROMPTS: readonly PromptId[] = ["policy-scope", "checks", "jev-classifier", "budget-notice", "budget-final", "repair", "scope-repair", "ci-repair", "investigation-results"];
-const ROLE_PROMPTS: Readonly<Record<string, readonly PromptId[]>> = {
+const WRITER_PROMPTS: readonly PromptId[] = ["policy-scope", "checks", "jev-classifier", "budget-notice", "budget-final", "repair", "scope-repair", "diff-limit-repair", "ci-repair", "investigation-results"];
+export const ROLE_PROMPTS: Readonly<Record<string, readonly PromptId[]>> = {
   implementation: WRITER_PROMPTS, discussion: ["discussion"], grader: ["grader", "grader-scope"], planner: ["planner"],
   code_explorer: ["investigator"], ci_investigator: ["investigator"], test_analyst: ["investigator"],
 };
