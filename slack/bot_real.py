@@ -1868,7 +1868,11 @@ class SlackMessageHandler:
                     + (
                         "Read-only discussion: no edits, verification or commit."
                         if effective_task_mode == "discuss"
-                        else "Read-only exploration is automatic; edits and risky shell commands require approval here."
+                        else (
+                            "Edits in this worktree run automatically; risky shell "
+                            "commands need approval here, and nothing is committed "
+                            "until the owner approves the final diff."
+                        )
                     )
                 )
                 await client.chat_update(

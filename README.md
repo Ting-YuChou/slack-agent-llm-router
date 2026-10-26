@@ -345,7 +345,7 @@ extension (including the policy), plugin and Skill it loads and one digest of it
 sources. Locking refuses an image built from a different tree than the checkout, and the
 runtime refuses to start when the image's manifest differs from the lock.
 At startup the runtime also compares the sources the image was built from (`src`,
-`prompts`, `extensions`, `plugins`, `skills`) with this checkout. An image built
+`prompts`, `extensions`, `plugins`, `skills`, `skills.lock.json`) with this checkout. An image built
 before a code change is refused with the stale files listed and
 `rebuild and relock it: make demo-agent-images`; rerun the target after every
 `agent-runtime` change. `scripts/run_slack_demo.sh` points the runtime at those copies and
@@ -467,7 +467,8 @@ Try these two paths:
 - `/llm agent 找出一個測試缺口並修正` — starts a stateful Pi coding agent in
   a dedicated branch, host worktree, and hardened container. Read-only tools and
   edits inside that worktree run automatically; non-allowlisted shell commands
-  need an owner-only Slack approval. Nothing is committed until the owner
+  need an owner-only Slack approval, and so do allowlisted test commands once
+  the run has changed test configuration. Nothing is committed until the owner
   approves the final diff (see below).
 - `/llm agent --discuss <question>` — read-only discussion of the project, with no
   verification or commit. `--implement` asks for changes explicitly, and
@@ -491,8 +492,10 @@ Try these two paths:
   read-only until a reply passes `--implement`.
 - `/llm agent status`, `/llm agent stop`, and `/llm agent close` inspect or
   control your latest session without consuming query quota.
-- `/llm agent resume <run_id>` resumes a structured workflow that stopped before
-  its writer started. `/llm agent repair-ci <PR_URL|RUN_ID>` and
+- `/llm agent resume <run_id>` resumes an interrupted structured workflow (or
+  structured CI repair) that stopped before its writer started. Run it in the
+  run's thread to get its approvals and result there; from anywhere else, check
+  on it with `/llm agent status`. `/llm agent repair-ci <PR_URL|RUN_ID>` and
   `/llm agent publish-repair <RUN_ID>` drive owner-approved CI repairs (see the
   [verification and CI repair guide](docs/agent-verification-ci.md)).
 
@@ -510,14 +513,19 @@ the OpenAI key can call Sol before that trial.
 
 Each new coding prompt counts as one Slack query; internal model turns and tools
 do not. Each user may run one Agent prompt at a time by default
-(`agent.max_active_runs_per_user`). While a run works, Slack keeps one status
-message in the thread up to date (phase, turns, tool calls, and cost, at most
-every 10 seconds) and mentions the owner on approval and result messages.
+(`agent.max_active_runs_per_user`). For a run started by a new `/llm agent`
+message, or by **Resume from patch**, Slack keeps that run's status message up
+to date (phase, turns, tool calls, and cost, at most every 10 seconds). Runs
+started inside an existing thread (follow-up replies, **Needs changes**, and the
+**Run Pi Agent** shortcut) post only their approvals and result. Approval and result messages
+mention the owner.
 
 When the writer finishes, Slack posts a **Deliver / Discard** card with the
 changed files and diff stat. It expires after 30 minutes by default
-(`PI_AGENT_DELIVERY_TTL_MS`) and survives a runtime restart; delivery fails if
-the worktree changed after the card was posted. **Deliver** commits on the
+(`PI_AGENT_DELIVERY_TTL_MS`) and survives a runtime restart as long as its
+session does; a card that expired while the runtime was down, or whose session
+was closed or expired, fails with the patch kept. Delivery also fails if the
+worktree changed after the card was posted. **Deliver** commits on the
 `pi-agent/...` branch and Slack shows the commit and cherry-pick command. The
 runtime never pushes, merges, or modifies the current checkout. Discarded,
 cancelled, failed, and timed-out prompts roll their isolated worktree back to the
@@ -764,7 +772,9 @@ npm --prefix agent-runtime run lint
 ```
 
 Docker-backed suites are opt-in with `PI_AGENT_DOCKER_INTEGRATION=1`; point
-`PI_AGENT_TEST_AGENT_IMAGE` at an image built from the current tree. See
+`PI_AGENT_TEST_AGENT_IMAGE` at an image built from the current tree, and
+`PI_AGENT_VERIFICATION_TEST_IMAGE` at a verification image, or the tests that
+need one are skipped. See
 [AGENTS.md](AGENTS.md) for the full command list and the live-eval budget rules.
 
 ## Notes And Limitations
