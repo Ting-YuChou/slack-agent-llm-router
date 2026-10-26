@@ -32,6 +32,7 @@ from src.agent_runtime import (
     AgentRuntimeTimeout,
     AgentRuntimeUnauthorized,
     AgentRuntimeUnavailable,
+    configured_model_refs,
     is_transient_error,
 )
 from slack.agent_bootstrap import (
@@ -2244,18 +2245,23 @@ class SlackMessageHandler:
                     "• `/llm agent <task>` - Start a stateful Pi coding agent with the default model",
                     "• `/llm agent --discuss <question>` - Discuss the project with read-only tools; no verification or commit",
                     "• `/llm agent --implement <task>` - Implement changes with the configured verification gates",
-                    "• `/llm agent --model anthropic/claude-sonnet-4-6 <task>` - Select an Agent model",
+                    "• `/llm agent --workflow <task>` - Run the structured investigation before the writer",
+                    "• `/llm agent --model <provider/model> <task>` - Select an Agent model (`--model=<provider/model>` also works)",
                     "• Use the message shortcut *Run Pi Agent* to start from an existing Slack thread",
                     "• `/llm agent --no-thread-context <task>` - Start without loading prior thread messages",
-                    "• Agent models: `openai/gpt-5.6-luna`, `openai/gpt-5.6-sol`, `anthropic/claude-sonnet-4-6`, `opencode-go/deepseek-v4-pro`",
+                    f"• {await self._agent_models_text()}",
                     "• `/llm agent /skill:test-gap <task>` - Run the approved test-gap workflow",
                     "• `/llm agent status|stop|close` - Inspect or control your latest Agent session",
+                    "• `/llm agent resume <RUN_ID>` - Resume an interrupted structured workflow",
+                    "• `/llm agent repair-ci [--workflow] <PR_URL|RUN_ID>` - Investigate a failed CI run and propose a repair for approval",
+                    "• `/llm agent publish-repair <RUN_ID>` - Ask again to publish a CI repair whose publication failed",
+                    "• Reply in an Agent thread to continue it; start the reply with `--discuss`, `--implement` or `--workflow` to choose its mode",
                 ]
             )
         lines.extend(
             [
-                "• `/llm remember <text>` - Save an explicit long-term memory",
-                "• `/llm memories [query]` - List or search your memories",
+                "• `/llm remember [--global] <text>` - Save an explicit long-term memory (`--global` for every channel)",
+                "• `/llm memories [--all] [--global] [query]` - List or search your memories",
                 "• `/llm forget <memory_id|all>` - Delete saved memories",
                 "",
                 "*Examples:*",
@@ -2276,6 +2282,21 @@ class SlackMessageHandler:
             ]
         )
         return "\n".join(lines)
+
+    async def _agent_models_text(self) -> str:
+        """Name the Agent models a fresh runtime health check reports.
+
+        A cached allowlist may be stale, so without an answer say so instead.
+        """
+        runtime = getattr(self.bot, "agent_runtime_client", None)
+        health_details = getattr(runtime, "health_details", None)
+        details = await health_details() if callable(health_details) else None
+        if not isinstance(details, dict):
+            return "Agent models are unavailable: the Agent runtime did not answer its health check."
+        models = configured_model_refs(details)
+        if not models:
+            return "Agent models: none are configured on the Agent runtime."
+        return "Agent models: " + ", ".join(f"`{model}`" for model in models)
 
     async def _handle_settings_command(
         self, args: List[str], user_id: str, channel_id: str, client: AsyncWebClient
@@ -2388,13 +2409,7 @@ class SlackMessageHandler:
                         if details and details.get("status") == "healthy"
                         else "🔴 Unavailable"
                     )
-                    configured = [
-                        str(model.get("ref"))
-                        for model in (details or {}).get("models", [])
-                        if isinstance(model, dict)
-                        and model.get("configured")
-                        and model.get("ref")
-                    ]
+                    configured = configured_model_refs(details)
                     if configured:
                         agent_models = f"\n*Agent Models:* {', '.join(f'`{model}`' for model in configured)}"
                 else:
@@ -2455,6 +2470,9 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 """.strip()
                     + "\n\n"
                 )
+
+            if getattr(self.bot, "agent_runtime_client", None) is not None:
+                models_text += f"*{await self._agent_models_text()}*\n\n"
 
             models_text += """
 *Auto-Routing:* The bot automatically selects the best model for your query based on:
