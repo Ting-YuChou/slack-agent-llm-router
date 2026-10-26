@@ -1076,7 +1076,7 @@ export class CodingAgentOrchestrator {
       return;
     }
     if (event.type === "error") {
-      this.background(this.failRun(session, run, { code: event.code, message: event.message }));
+      this.background(this.failRun(session, run, { code: event.code, message: event.message, ...(event.stderr_tail ? { stderr_tail: event.stderr_tail } : {}) }));
       return;
     }
     if (event.type === "settled") {

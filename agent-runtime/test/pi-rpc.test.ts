@@ -200,3 +200,21 @@ test("a bare agent_settled never reads as a completed run", () => {
   assert.equal(settled?.type, "settled");
   assert.notEqual(settled?.outcome, "completed");
 });
+
+test("an extension error names the extension and event Pi reports, with the error's first line", () => {
+  assert.deepEqual(sanitizeRpcEvent({
+    type: "extension_error", extensionPath: "/opt/pi/extensions/policy.ts", event: "tool_call",
+    error: "Cannot read properties of undefined (reading 'command')\n    at classify (/opt/pi/extensions/policy.ts:41:7)",
+    stack: "TypeError: Cannot read properties of undefined (reading 'command')\n    at classify (/opt/pi/extensions/policy.ts:41:7)",
+  }), { type: "error", code: "extension_error", message: "policy.ts:tool_call: Cannot read properties of undefined (reading 'command')" });
+  // The line is redacted and bounded like a provider error message.
+  const leaked = sanitizeRpcEvent({
+    type: "extension_error", extensionPath: "/opt/pi/extensions/model-gateway.ts", event: "before_provider_request",
+    error: `gateway refused Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature ${"x".repeat(2_000)}`,
+  }) as { message: string };
+  assert.match(leaked.message, /^model-gateway\.ts:before_provider_request: gateway refused Bearer \[REDACTED\] x+$/);
+  assert.doesNotMatch(leaked.message, /eyJ/);
+  assert.ok(leaked.message.length <= 600);
+  // Pi always names both; a record missing them still says which part is unknown.
+  assert.deepEqual(sanitizeRpcEvent({ type: "extension_error" }), { type: "error", code: "extension_error", message: "unknown:unknown: A trusted extension failed" });
+});

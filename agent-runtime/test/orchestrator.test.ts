@@ -1284,3 +1284,20 @@ test("a patch that does not apply cleanly is refused with 409 and leaves the ses
   const next = await orchestrator.prompt(accepted.session_id, "try again", "U");
   assert.equal(next.status, "starting");
 });
+
+test("a crashed container's stderr tail is kept on the failed run; an error without one adds nothing", async () => {
+  const { orchestrator, process } = fixture();
+  const crashed = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "stderr-tail", user_id: "U", prompt: "fix" });
+  const stderr_tail = "provider refused [REDACTED]\nError: worker crashed\n";
+  process.emit({ type: "error", code: "container_exited", message: "Agent container exited unexpectedly", stderr_tail });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(orchestrator.getRun(crashed.run_id).status, "failed");
+  assert.deepEqual(orchestrator.getRun(crashed.run_id).error, { code: "container_exited", message: "Agent container exited unexpectedly", stderr_tail });
+  assert.equal((publicRun(orchestrator.getRun(crashed.run_id)).error as { stderr_tail?: string }).stderr_tail, stderr_tail);
+
+  const other = fixture();
+  const rejected = await other.orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "no-stderr-tail", user_id: "U", prompt: "fix" });
+  other.process.emit({ type: "error", code: "prompt_rejected", message: "Pi rejected the prompt before it started" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(other.orchestrator.getRun(rejected.run_id).error, { code: "prompt_rejected", message: "Pi rejected the prompt before it started" });
+});

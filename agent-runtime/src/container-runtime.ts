@@ -9,7 +9,7 @@ import type { RouteDecision } from "./jev-router.js";
 import { limitsForRoute, type AgentLimitConfig, type AgentLimits } from "./agent-limits.js";
 import type { AgentTracing } from "./tracing.js";
 import { PiRunCapture } from "./pi-capture.js";
-import type { AgentTelemetry } from "./telemetry.js";
+import { redact, type AgentTelemetry } from "./telemetry.js";
 import type { McpRunConfig, McpServerId } from "./mcp-config.js";
 import { MCP_SERVERS, namespacedMcpToolNames } from "./mcp-config.js";
 import { StartupTiming } from "./startup-timing.js";
@@ -19,6 +19,7 @@ import type { DiffLimits } from "./worktree-manager.js";
 import { RESOURCE_LIMIT_FLAGS } from "./container-flags.js";
 import { CREDENTIAL_PLACEHOLDER, type RunCredentials } from "./run-credentials.js";
 import type { SealStatus } from "./session-seal.js";
+import { StderrTail } from "./stderr-tail.js";
 
 export interface AgentContainerOptions {
   taskMode?: TaskMode;
@@ -195,6 +196,10 @@ export class DockerPiProcess implements AgentProcess {
   private containerKey?: string;
   private containerStartedAt = 0;
   private credentials?: RunCredentials;
+  /** Every token the current container was handed, so its stderr tail can mask them. */
+  private stderrSecrets: string[] = [];
+  /** The bridge whose container exited on its own: that exit reports the failure, with its stderr. */
+  private crashed?: PiRpcBridge;
   private sealedChild?: ChildProcessWithoutNullStreams;
   private readonly options: Omit<AgentContainerOptions, "classifier" | "mcp"> & { mcp?: Omit<McpRunConfig, "token"> };
   private readonly tokenForRun: (runId: string, route: RouteDecision) => string;
@@ -262,6 +267,8 @@ export class DockerPiProcess implements AgentProcess {
       } } : {}),
       continueSession: this.hasSession,
     };
+    const secrets = this.stderrSecrets = [...Object.values(this.credentials),
+      ...(containerOptions.mcp?.servers.flatMap(item => "token" in item ? [item.token] : []) ?? [])];
     const child = spawn("docker", buildAgentDockerArgs(containerOptions), {
       stdio: ["pipe", "pipe", "pipe"],
       env: buildAgentSpawnEnv(containerOptions, process.env),
@@ -323,12 +330,27 @@ export class DockerPiProcess implements AgentProcess {
       bridge.failPending();
       this.onEvent({ type: "error", code: "container_start_failed", message: "Agent container could not start" });
     });
+    const stderr = new StderrTail();
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
     child.on("exit", (code) => {
       bridge.failPending();
       if (this.child === child) { this.activeContainerName = undefined; this.paused = false; }
-      if (!this.closing && code !== 0) this.onEvent({ type: "error", code: "container_exited", message: "Agent container exited unexpectedly" });
+      if (this.closing || code === 0) return;
+      this.crashed = bridge;
+      const current = this.activeRunId ?? runId;
+      // Its last stderr may still be unread at exit; 'close' follows once stdio has ended.
+      child.once("close", () => {
+        const tail = stderr.text(text => this.redactStderr(text, secrets));
+        this.tracing?.fail(current, { "agent.error.code": "container_exited", ...(code === null ? {} : { "agent.container.exit_code": code }), ...(tail ? { "agent.container.stderr_tail": tail } : {}) });
+        this.onEvent({ type: "error", code: "container_exited", message: "Agent container exited unexpectedly", ...(tail ? { stderr_tail: tail } : {}) });
+      });
     });
-    child.stderr.resume();
+  }
+
+  /** Masks the tokens this container was handed, then what telemetry masks everywhere. */
+  private redactStderr(text: string, secrets: string[]): string {
+    const masked = String(redact(text, secrets));
+    return this.telemetry?.redactText(masked) ?? masked;
   }
 
   prompt(runId: string, prompt: string, route?: RouteDecision, requestedTask?: TaskMode): void {
@@ -375,7 +397,8 @@ export class DockerPiProcess implements AgentProcess {
       await capture?.beforePrompt(bridge);
       if (this.bridge !== bridge || this.closing) throw new RpcProtocolError("Pi configuration was interrupted");
     })).catch(() => {
-      if (this.bridge !== bridge || this.closing) return;
+      // A container that died reports that itself, with its stderr, once the stream has ended.
+      if (this.bridge !== bridge || this.closing || this.crashed === bridge) return;
       this.onEvent({ type: "error", code: "pi_configuration_failed", message: "Pi model configuration could not be verified" });
       this.stopActiveContainer().catch(() => {
         if (this.bridge === bridge) this.onEvent({ type: "error", code: "container_stop_failed", message: "Agent container could not be confirmed stopped" });
@@ -428,6 +451,7 @@ export class DockerPiProcess implements AgentProcess {
     startup.cliSpawned(); startup.containerRunning(); startup.rpcReady();
     this.activeRunId = runId; this.startup = startup; this.queueMs = 0; this.reused = true;
     this.credentials = this.credentialsFor(runId, route, task);
+    this.stderrSecrets.push(...Object.values(this.credentials));
     this.capture = this.telemetry ? new PiRunCapture(this.telemetry, runId, this.sessionId, this.options.sessionStatePath, name) : undefined;
     this.readiness = Promise.resolve();
     this.dispatch(runId, prompt, route);

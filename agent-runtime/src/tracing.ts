@@ -157,6 +157,12 @@ export class AgentTracing {
     }
     return this.tracer.startSpan("gen_ai.request", { attributes: { "agent.run_id": runId, "gen_ai.provider.name": provider, "gen_ai.request.model": model } }, context);
   }
+  /** Marks a run's span failed (a workflow attempt's own span, keyed by its execution) with what explains it. */
+  fail(runId: string, attributes: Record<string, string | number>): void {
+    const root = this.runs.get(runId)?.root;
+    root?.setAttributes(attributes);
+    root?.setStatus({ code: SpanStatusCode.ERROR });
+  }
   endRun(runId: string, status: string): void {
     const run = this.runs.get(runId);
     if (!run)
