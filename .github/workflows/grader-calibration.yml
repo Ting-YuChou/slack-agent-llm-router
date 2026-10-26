@@ -19,6 +19,14 @@ on:
         description: Stop grading once this much model spend is reached
         required: true
         default: "2"
+      samples:
+        description: Grader samples per grade, 1 or 3 (blank uses eval/grader-baseline.json's sampling)
+        required: false
+        default: ""
+      aggregate:
+        description: How samples combine, unanimous or majority (blank uses eval/grader-baseline.json's sampling)
+        required: false
+        default: ""
       update_baseline:
         description: Write the metrics to eval/grader-baseline.json instead of comparing
         type: boolean
@@ -85,10 +93,14 @@ jobs:
           MODEL: ${{ inputs.model }}
           REPEATS: ${{ inputs.repeats }}
           MAX_COST_USD: ${{ inputs.max_cost_usd }}
+          SAMPLES: ${{ inputs.samples }}
+          AGGREGATE: ${{ inputs.aggregate }}
           UPDATE_BASELINE: ${{ inputs.update_baseline }}
         run: |
           set -o pipefail
           args=(--live-openai --grader-model "$MODEL" --repeats "$REPEATS" --max-cost-usd "$MAX_COST_USD" --out eval/results/grader-calibration.jsonl)
+          if [ -n "$SAMPLES" ]; then args+=(--samples "$SAMPLES"); fi
+          if [ -n "$AGGREGATE" ]; then args+=(--aggregate "$AGGREGATE"); fi
           if [ "$UPDATE_BASELINE" = "true" ]; then args+=(--update-baseline); fi
           python scripts/grader_calibration.py "${args[@]}" | tee eval/results/grader-calibration-summary.json
 

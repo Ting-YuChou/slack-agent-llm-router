@@ -92,6 +92,33 @@ def test_grader_calibration_is_a_manual_budgeted_live_run():
     assert "eval/grader-baseline.json" in upload["with"]["path"]
 
 
+def test_grader_calibration_sampling_defaults_to_the_baseline():
+    inputs = _workflow("grader-calibration.yml")[True]["workflow_dispatch"]["inputs"]
+    # Blank inputs leave the sampling to eval/grader-baseline.json.
+    assert inputs["samples"]["default"] == ""
+    assert inputs["aggregate"]["default"] == ""
+    text = _run_text(_workflow("grader-calibration.yml")["jobs"]["calibrate"])
+    assert '--samples "$SAMPLES"' in text
+    assert '--aggregate "$AGGREGATE"' in text
+
+
+def test_agent_eval_picks_a_suite_and_holds_runs_to_its_baseline_overrides():
+    workflow = _workflow("agent-eval.yml")
+    inputs = workflow[True]["workflow_dispatch"]["inputs"]
+    assert inputs["suite"]["type"] == "choice"
+    assert inputs["suite"]["options"] == ["tasks", "repair"]
+    assert inputs["suite"]["default"] == "tasks"
+    job = workflow["jobs"]["eval"]
+    text = _run_text(job)
+    assert '--suite "$SUITE"' in text
+    assert "--strict-overrides" in text
+    step = next(s for s in job["steps"] if "scripts/agent_eval.py" in s.get("run", ""))
+    assert step["env"]["SUITE"] == "${{ inputs.suite }}"
+    upload = next(s for s in job["steps"] if "upload-artifact" in s.get("uses", ""))
+    for baseline in ("eval/baseline.json", "eval/repair-baseline.json"):
+        assert baseline in upload["with"]["path"]
+
+
 def test_npm_audit_gate_runs_in_ci_not_in_image_builds():
     # An audit inside `docker build` needs the registry and fails rebuilds of an
     # unchanged tree whenever a new advisory lands, so the gate lives in CI.

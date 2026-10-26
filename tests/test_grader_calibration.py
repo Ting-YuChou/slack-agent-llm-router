@@ -631,8 +631,10 @@ def test_cli_command_passes_the_sampling_to_the_cli(tmp_path):
     assert argv[argv.index("--aggregate") + 1] == "majority"
 
 
-def test_parse_args_sampling_defaults_and_choices():
-    live = calibration.parse_args(["--live-openai"])
+def test_parse_args_sampling_defaults_and_choices(tmp_path):
+    # Without a recorded sampling in the baseline the live default is one sample.
+    no_sampling = ["--baseline", str(tmp_path / "missing.json")]
+    live = calibration.parse_args(["--live-openai", *no_sampling])
     assert (live.samples, live.aggregate) == (1, "unanimous")
     sampled = calibration.parse_args(
         ["--live-openai", "--samples", "3", "--aggregate", "majority"]
@@ -691,3 +693,74 @@ def test_update_baseline_records_the_sampling_it_was_measured_with(tmp_path):
     written = json.loads(baseline.read_text())
     assert written["sampling"] == {"samples": 3, "aggregate": "unanimous"}
     assert set(written["metrics"]) == set(calibration.CONTRACT_METRICS)
+
+
+def _sampled_baseline(tmp_path, samples=3, aggregate="majority"):
+    baseline = tmp_path / "baseline.json"
+    recorded = _baseline()
+    recorded["sampling"] = {"samples": samples, "aggregate": aggregate}
+    baseline.write_text(json.dumps(recorded))
+    return baseline
+
+
+def test_sampling_defaults_to_the_grader_baseline(tmp_path):
+    baseline = ["--baseline", str(_sampled_baseline(tmp_path))]
+    live = calibration.parse_args(["--live-openai", *baseline])
+    assert (live.samples, live.aggregate) == (3, "majority")
+    offline = calibration.parse_args(["--records", "r.jsonl", *baseline])
+    assert (offline.samples, offline.aggregate) == (3, "majority")
+    # Either flag replaces the baseline's sampling as a whole.
+    explicit = calibration.parse_args(["--live-openai", *baseline, "--samples", "1"])
+    assert (explicit.samples, explicit.aggregate) == (1, "unanimous")
+    explicit = calibration.parse_args(["--records", "r", *baseline, "--samples", "1"])
+    assert (explicit.samples, explicit.aggregate) == (1, None)
+    explicit = calibration.parse_args(
+        ["--live-openai", *baseline, "--aggregate", "unanimous"]
+    )
+    assert (explicit.samples, explicit.aggregate) == (1, "unanimous")
+
+
+def test_the_committed_grader_baseline_sets_the_default_sampling():
+    recorded = json.loads(calibration.BASELINE.read_text())["sampling"]
+    live = calibration.parse_args(["--live-openai"])
+    assert (live.samples, live.aggregate) == (
+        recorded["samples"],
+        recorded["aggregate"],
+    )
+
+
+@pytest.mark.parametrize(
+    "sampling",
+    [
+        {"samples": 2, "aggregate": "unanimous"},
+        {"samples": True, "aggregate": "unanimous"},
+        {"samples": 3, "aggregate": "any"},
+        {"samples": 3},
+        "3",
+    ],
+)
+def test_parse_args_refuses_an_unknown_baseline_sampling(tmp_path, sampling):
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps({**_baseline(), "sampling": sampling}))
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err), pytest.raises(SystemExit):
+        calibration.parse_args(["--live-openai", "--baseline", str(baseline)])
+    assert "sampling" in err.getvalue()
+
+
+def test_main_holds_records_to_the_baseline_sampling_by_default(tmp_path):
+    cases = tmp_path / "cases"
+    _copy_case(cases)
+    single = {"type": "grade", **_record("control-minimal-fix", "passed")}
+    out = _write_jsonl(tmp_path / "out.jsonl", [single, single, _run_line()])
+    argv = ["--cases", str(cases), "--records", str(out)]
+    baseline = _sampled_baseline(tmp_path, samples=3, aggregate="unanimous")
+
+    code, stdout = _main([*argv, "--baseline", str(baseline)])
+    assert code == 1
+    assert json.loads(stdout)["failures"][0] == (
+        "sampling mismatch: records use samples=1 aggregate=unanimous, "
+        "expected samples=3 aggregate=unanimous"
+    )
+    _, stdout = _main([*argv, "--baseline", str(baseline), "--samples", "1"])
+    assert not any("sampling" in f for f in json.loads(stdout)["failures"])
