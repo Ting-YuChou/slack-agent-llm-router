@@ -20,6 +20,11 @@ export interface PersistedSession {
   activeRunId?: string;
   /** Set for CI-repair sessions, which gate delivery through their own publish approval. */
   skipDelivery?: boolean;
+  /**
+   * Set on every session created since seals became required: its `--continue` is refused without a seal.
+   * A session without it was saved before then (legacy) and may still continue unsealed.
+   */
+  sealRequired?: boolean;
 }
 
 export interface RuntimeState {

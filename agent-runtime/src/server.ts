@@ -28,7 +28,7 @@ import { allServerTools, enabledMcpServers, MCP_SERVERS, parseMcpMode, parseMcpS
 import { deriveMcpServerSecret, issueMcpToken } from "./mcp-token.js";
 import { deriveBudgetRpcSecret } from "./budget-rpc.js";
 import { IdempotencyCache, IdempotencyKeyReusedError } from "./idempotency.js";
-import { diskQuotaFromEnv } from "./disk-usage.js";
+import { diskQuotaFromEnv, sessionQuotaFromEnv } from "./disk-usage.js";
 import { engineVulnerable, parseNetworkAttachments, RunNetworks } from "./run-network.js";
 import {
   CodingAgentOrchestrator,
@@ -493,6 +493,7 @@ export async function createProductionServer() {
   const orchestrator: CodingAgentOrchestrator = new CodingAgentOrchestrator({
     quality,
     diskQuota: diskQuotaFromEnv(process.env),
+    sessionQuota: sessionQuotaFromEnv(process.env),
     requireVerification: process.env.PI_AGENT_REQUIRE_VERIFICATION === "1",
     archivePatch: async input => (await archivePatch({
       worktree: input.worktree, baseline: input.baseline, file: undeliveredPatchPath(runtimeRoot, input.run_id),
@@ -560,7 +561,7 @@ export async function createProductionServer() {
           // Runs that skip delivery approval keep per-write prompts, so no run loses both gates.
           writeApproval: session.skipDelivery ? "per_prompt" : approval.writeApproval,
           ...writerReuseOptions(trustedProfile?.profile, mcpServerIds),
-          sessionSeal: { open: () => sessionSeals.open(session.id), seal: () => sessionSeals.seal(session.id, sessionStatePath), verify: () => sessionSeals.verify(session.id, sessionStatePath) },
+          sessionSeal: { required: session.sealRequired === true, open: () => sessionSeals.open(session.id), seal: () => sessionSeals.seal(session.id, sessionStatePath), verify: () => sessionSeals.verify(session.id, sessionStatePath) },
           user: containerUser,
           ...(mcpServerIds.length > 0 ? {
             mcp: {

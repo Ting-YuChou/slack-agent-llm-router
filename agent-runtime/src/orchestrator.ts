@@ -220,6 +220,8 @@ export interface AgentProcess {
   /** Stops a writer kept for reuse; called before a run's change is committed or handed to approval. */
   release?(): Promise<void>;
   close(): Promise<void>;
+  /** The host directory Pi keeps the session in; measured against the session quota while a run is active. */
+  readonly sessionStatePath?: string;
 }
 
 interface Worktrees {
@@ -248,6 +250,8 @@ interface SessionRecord {
   process: AgentProcess;
   /** Trusted callers (CI repair) gate delivery themselves. */
   skipDelivery?: boolean;
+  /** Its `--continue` needs a seal; absent only on sessions restored from before seals were required. */
+  sealRequired?: boolean;
   activeRunId?: string;
   closed: boolean;
   lastActivity: number;
@@ -255,7 +259,7 @@ interface SessionRecord {
 
 export class CodingAgentOrchestrator {
   private readonly worktrees: Worktrees;
-  private readonly startProcess: (session: { id: string; ownerUserId: string; worktreePath: string; gitDir?: string; modelRef: string; restored?: boolean; skipDelivery?: boolean }, onEvent: (event: PublicRunEvent) => void) => Promise<AgentProcess>;
+  private readonly startProcess: (session: { id: string; ownerUserId: string; worktreePath: string; gitDir?: string; modelRef: string; restored?: boolean; skipDelivery?: boolean; sealRequired?: boolean }, onEvent: (event: PublicRunEvent) => void) => Promise<AgentProcess>;
   private readonly maxActiveSessions: number;
   private readonly deadlineMs: number;
   private readonly availableModelRefs: Set<string>;
@@ -268,8 +272,9 @@ export class CodingAgentOrchestrator {
   private readonly threadSessions = new Map<string, string>();
   private readonly runs = new Map<string, RunRecord>();
   private readonly deadlines = new Map<string, ReturnType<typeof setTimeout>>();
-  private readonly diskWatches = new Map<string, ReturnType<typeof setInterval>>();
+  private readonly diskWatches = new Map<string, Array<ReturnType<typeof setInterval>>>();
   private readonly diskQuota?: DiskQuota;
+  private readonly sessionQuota?: DiskQuota;
   private readonly terminalClaims = new Set<string>();
   private readonly pendingThreadKeys = new Set<string>();
   private readonly pendingSessionIds = new Set<string>();
@@ -323,6 +328,8 @@ export class CodingAgentOrchestrator {
     deliveryApproval?: DeliveryApprovalOptions;
     /** Measures each active run's worktree; a run over the quota fails as disk_quota_exceeded. */
     diskQuota?: DiskQuota;
+    /** Measures each active run's Pi session directory; a run over the quota fails as session_quota_exceeded. */
+    sessionQuota?: DiskQuota;
     /** Keeps pending delivery approvals across restarts; without it a restart fails them as delivery_interrupted. */
     approvalLedger?: ApprovalLedger;
     /** How long terminal runs stay readable after their last update; defaults to RUN_RETENTION_MS. */
@@ -335,6 +342,7 @@ export class CodingAgentOrchestrator {
     this.maxActiveSessions = options.maxActiveSessions ?? 2;
     this.deadlineMs = options.deadlineMs ?? 15 * 60_000;
     this.diskQuota = options.diskQuota;
+    this.sessionQuota = options.sessionQuota;
     this.availableModelRefs = new Set(options.availableModelRefs ?? listAgentModels().map((model) => model.ref));
     this.stateStore = options.stateStore;
     this.router = options.router;
@@ -390,7 +398,7 @@ export class CodingAgentOrchestrator {
       let session!: SessionRecord;
       const modelRef = saved.modelRef ?? resolveAgentModel().ref;
       const process = await this.startProcess(
-        { id: saved.id, ownerUserId: saved.ownerUserId, worktreePath: saved.worktreePath, ...(saved.gitDir ? { gitDir: saved.gitDir } : {}), modelRef, restored: true, ...(saved.skipDelivery ? { skipDelivery: true } : {}) },
+        { id: saved.id, ownerUserId: saved.ownerUserId, worktreePath: saved.worktreePath, ...(saved.gitDir ? { gitDir: saved.gitDir } : {}), modelRef, restored: true, ...(saved.skipDelivery ? { skipDelivery: true } : {}), ...(saved.sealRequired ? { sealRequired: true } : {}) },
         (event) => this.handleProcessEvent(session.id, event),
       );
       session = { ...saved, modelRef, autoRouting: saved.autoRouting === true, process };
@@ -487,7 +495,7 @@ export class CodingAgentOrchestrator {
       let process: AgentProcess;
       try {
         process = await this.startProcess(
-          { id: sessionId, ownerUserId: input.user_id, worktreePath: worktree.path, ...(worktree.gitDir ? { gitDir: worktree.gitDir } : {}), modelRef: route.modelRef, ...(trusted.delivery === "skip" ? { skipDelivery: true } : {}) },
+          { id: sessionId, ownerUserId: input.user_id, worktreePath: worktree.path, ...(worktree.gitDir ? { gitDir: worktree.gitDir } : {}), modelRef: route.modelRef, ...(trusted.delivery === "skip" ? { skipDelivery: true } : {}), sealRequired: true },
           (event) => this.handleProcessEvent(session.id, event),
         );
       } catch (error) {
@@ -506,6 +514,7 @@ export class CodingAgentOrchestrator {
         baselineCommit: worktree.baselineCommit,
         process,
         ...(trusted.delivery === "skip" ? { skipDelivery: true } : {}),
+        sealRequired: true,
         closed: false,
         lastActivity: Date.now(),
       };
@@ -924,26 +933,39 @@ export class CodingAgentOrchestrator {
     this.deadlines.set(runId, deadline);
   }
 
-  /** The writable worktree has no filesystem quota, so the host measures it while the run is active. */
+  /**
+   * Neither the writable worktree nor Pi's session directory has a filesystem quota, so the host measures
+   * both while the run is active. A discussion's worktree is mounted read-only; its session is not.
+   */
   private watchDisk(session: SessionRecord, run: RunRecord): void {
-    const quota = this.diskQuota;
-    if (!quota || run.task_mode === "discuss" || this.diskWatches.has(run.run_id)) return;
+    if (this.diskWatches.has(run.run_id)) return;
+    const watches: Array<ReturnType<typeof setInterval>> = [];
+    const worktreeQuota = this.diskQuota, sessionQuota = this.sessionQuota, sessionPath = session.process.sessionStatePath;
+    if (worktreeQuota && run.task_mode !== "discuss") {
+      watches.push(this.watchDirectory(session, run, worktreeQuota, session.worktreePath, { code: "disk_quota_exceeded", message: `The worktree grew past its ${Math.round(worktreeQuota.bytes / 1024 ** 2)} MiB quota; changes were not delivered` }));
+    }
+    if (sessionQuota && sessionPath) {
+      watches.push(this.watchDirectory(session, run, sessionQuota, sessionPath, { code: "session_quota_exceeded", message: `The agent session grew past its ${Math.round(sessionQuota.bytes / 1024 ** 2)} MiB quota; changes were not delivered` }));
+    }
+    if (watches.length) this.diskWatches.set(run.run_id, watches);
+  }
+
+  private watchDirectory(session: SessionRecord, run: RunRecord, quota: DiskQuota, directory: string, failure: RunFailure): ReturnType<typeof setInterval> {
     let measuring = false;
     const watch = setInterval(() => {
       if (measuring) return;
       measuring = true;
-      quota.usage(session.worktreePath).then(bytes => {
+      quota.usage(directory).then(bytes => {
         if (bytes <= quota.bytes || isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return;
-        return this.failRun(session, run, { code: "disk_quota_exceeded", message: `The worktree grew past its ${Math.round(quota.bytes / 1024 ** 2)} MiB quota; changes were not delivered` });
+        return this.failRun(session, run, failure);
       }, () => undefined).finally(() => { measuring = false; });
     }, quota.intervalMs);
     watch.unref();
-    this.diskWatches.set(run.run_id, watch);
+    return watch;
   }
 
   private stopDiskWatch(runId: string): void {
-    const watch = this.diskWatches.get(runId);
-    if (watch) clearInterval(watch);
+    for (const watch of this.diskWatches.get(runId) ?? []) clearInterval(watch);
     this.diskWatches.delete(runId);
   }
 
@@ -1589,6 +1611,7 @@ export class CodingAgentOrchestrator {
         baselineCommit: session.baselineCommit,
         activeRunId: session.activeRunId,
         ...(session.skipDelivery ? { skipDelivery: true } : {}),
+        ...(session.sealRequired ? { sealRequired: true } : {}),
         closed: session.closed,
         lastActivity: session.lastActivity,
       })),

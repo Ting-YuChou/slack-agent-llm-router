@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import { RuntimeStateStore } from "../src/runtime-state.js";
+import { CodingAgentOrchestrator } from "../src/orchestrator.js";
+import { RuntimeStateStore, type RuntimeState } from "../src/runtime-state.js";
 
 test("runtime metadata is atomically persisted and active runs become interrupted on load", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "pi-state-"));
@@ -77,5 +78,41 @@ test("the control state file is written as compact JSON", async () => {
     const text = await readFile(file, "utf8");
     assert.equal(text, JSON.stringify(state));
     assert.doesNotMatch(text, /\n/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("new sessions persist sealRequired and restore with it; a session saved before the marker restores as legacy", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi-state-seal-"));
+  try {
+    const file = path.join(root, "state.json");
+    const started: Array<{ id: string; restored?: boolean; sealRequired?: boolean }> = [];
+    const orchestrator = () => new CodingAgentOrchestrator({
+      worktrees: {
+        create: async () => ({ path: "/w/new", branch: "b", baselineCommit: "a".repeat(40) }),
+        inspectDiff: async () => ({ files: [], bytes: 0, stat: "" }),
+        commit: async () => "b".repeat(40),
+        rollback: async () => undefined,
+        remove: async () => undefined,
+      },
+      startProcess: async ({ id, restored, sealRequired }) => {
+        started.push({ id, ...(restored ? { restored } : {}), ...(sealRequired !== undefined ? { sealRequired } : {}) });
+        return { prompt() {}, decide() {}, respondUi() {}, async abort() {}, async close() {} };
+      },
+      stateStore: new RuntimeStateStore(file),
+    });
+    const accepted = await orchestrator().createSession({ team_id: "T", channel_id: "C", thread_ts: "sealed", user_id: "U", prompt: "fix" });
+    assert.deepEqual(started, [{ id: accepted.session_id, sealRequired: true }], "a new session's container must find its seal");
+    const saved = JSON.parse(await readFile(file, "utf8")) as RuntimeState;
+    assert.equal(saved.sessions.find((session) => session.id === accepted.session_id)?.sealRequired, true);
+
+    // The same state as a runtime from before the marker wrote it: its session has no sealRequired field.
+    const legacy = { id: "legacy", key: "T:C:legacy", ownerUserId: "U", worktreePath: "/w/legacy", branch: "b", baselineCommit: "a".repeat(40), closed: false, lastActivity: Date.now() };
+    await writeFile(file, JSON.stringify({ ...saved, sessions: [...saved.sessions, legacy] }));
+    started.length = 0;
+    await orchestrator().restore();
+    assert.deepEqual(started, [{ id: accepted.session_id, restored: true, sealRequired: true }, { id: "legacy", restored: true }]);
+    const restored = (JSON.parse(await readFile(file, "utf8")) as RuntimeState).sessions;
+    assert.equal(restored.find((session) => session.id === accepted.session_id)?.sealRequired, true);
+    assert.equal("sealRequired" in restored.find((session) => session.id === "legacy")!, false, "a legacy session stays legacy");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
