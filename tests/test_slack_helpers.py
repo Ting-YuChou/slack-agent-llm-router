@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock
 
+import httpx
 import pytest
 
 
@@ -23,7 +24,7 @@ from src.agent_runtime import (
     AgentRuntimeUnauthorized,
 )
 from src.memory import HashEmbeddingProvider, InMemoryMemoryStore, MemoryManager
-from slack.agent_bootstrap import AgentBootstrapContext
+from slack.agent_bootstrap import AgentBootstrapBuilder, AgentBootstrapContext
 from slack.agent_shortcut import build_agent_shortcut_modal
 from slack.bot_real import (
     AGENT_ERROR_HINTS,
@@ -515,6 +516,48 @@ class TestSlackMessageHandler:
             "thread_ts": "100.1",
             "_team_id": "T1",
         }
+
+    @pytest.mark.asyncio
+    async def test_agent_thread_followup_sends_its_attachments_to_the_agent(self):
+        bot, runtime = self._followup_bot()
+
+        async def http_handler(request):
+            assert request.headers["Authorization"] == "Bearer xoxb-test"
+            return httpx.Response(200, text="Traceback: line 42")
+
+        bot.agent_bootstrap_builder = AgentBootstrapBuilder(
+            {},
+            bot_token="xoxb-test",
+            http_transport=httpx.MockTransport(http_handler),
+        )
+        handler = SlackMessageHandler(bot)
+        event = {
+            **self._followup_event("--discuss why does this fail?"),
+            "files": [
+                {
+                    "id": "F1",
+                    "name": "trace.log",
+                    "mimetype": "text/plain",
+                    "size": 18,
+                    "url_private_download": (
+                        "https://files.slack.com/files-pri/T/F1/trace.log"
+                    ),
+                }
+            ],
+        }
+
+        response = await handler.handle_message(event, SimpleNamespace())
+
+        assert "R2" in response
+        prompt = runtime.create_session.await_args.args[4]
+        assert "Traceback: line 42" in prompt
+        assert '<untrusted_reference_context source="slack_message_files">' in prompt
+        assert prompt.rstrip().endswith(
+            '<current_task owner_user_id="U1">\nwhy does this fail?\n</current_task>'
+        )
+        kwargs = runtime.create_session.await_args.kwargs
+        assert kwargs["routing_text"] == "why does this fail?"
+        assert kwargs["task_mode"] == "discuss"
 
     @pytest.mark.asyncio
     async def test_agent_thread_followup_parses_leading_mode_flags(self):
@@ -3509,6 +3552,47 @@ async def test_modal_agent_start_acks_then_bootstraps_in_the_background():
     runtime.create_session.assert_awaited_once()
     assert runtime.create_session.await_args.args[4] == "bootstrap prompt"
     assert "R1" in bot.web_client.chat_update.await_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_modal_agent_start_marks_the_selected_message_in_context():
+    runtime = SimpleNamespace(
+        create_session=AsyncMock(
+            return_value={"session_id": "S1", "run_id": "R1", "status": "starting"}
+        )
+    )
+    bot = SlackBot(
+        {"channels": [], "agent_context": {"enabled": True}},
+        SimpleNamespace(),
+        services={"agent_runtime": runtime},
+    )
+    bot._monitor_agent_run = AsyncMock()
+    bot.web_client = _public_channel_client(
+        chat_postMessage=AsyncMock(return_value={"ts": "status-1"}),
+        chat_update=AsyncMock(),
+    )
+    bot.agent_bootstrap_builder = SimpleNamespace(
+        build=AsyncMock(
+            return_value=AgentBootstrapContext(prompt="bootstrap prompt", partial=True)
+        )
+    )
+    nonce = await _open_agent_shortcut(bot)
+
+    await bot._handle_agent_view_submission(
+        _shortcut_submission(
+            nonce,
+            "Implement the todo",
+            agent_context={"include": {"selected_options": [{"value": "include"}]}},
+        )
+    )
+    await _drain_background_tasks(bot)
+
+    build = bot.agent_bootstrap_builder.build.await_args
+    assert build.kwargs["thread_ts"] == "100.1"
+    assert build.kwargs["selected_ts"] == "100.2"
+    assert runtime.create_session.await_args.args[4] == "bootstrap prompt"
+    status = bot.web_client.chat_update.await_args.kwargs["text"]
+    assert "partial" in status.lower()
 
 
 def _watch_until(bot, finished, run_id="R1"):

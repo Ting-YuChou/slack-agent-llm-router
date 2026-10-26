@@ -687,3 +687,336 @@ async def test_untruncated_context_has_no_truncation_marker():
 
     assert result.truncated is False
     assert 'truncated="true"' not in result.prompt
+
+
+def _text_file(file_id, name=None):
+    name = name or f"{file_id.lower()}.txt"
+    return {
+        "id": file_id,
+        "name": name,
+        "mimetype": "text/plain",
+        "filetype": "text",
+        "size": 10,
+        "url_private_download": f"https://files.slack.com/files-pri/T/{file_id}/{name}",
+    }
+
+
+def _replies_with_files(files, **message):
+    return SimpleNamespace(
+        conversations_replies=AsyncMock(
+            return_value={
+                "ok": True,
+                "messages": [
+                    {"ts": "1", "user": "U1", "text": "see files", **message},
+                    {"ts": "2", "user": "U2", "text": "attached", "files": files},
+                ],
+            }
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_thread_broadcast_replies_stay_in_context():
+    client = SimpleNamespace(
+        conversations_replies=AsyncMock(
+            return_value={
+                "ok": True,
+                "messages": [
+                    {"ts": "1", "user": "U1", "text": "root"},
+                    {
+                        "ts": "2",
+                        "user": "U2",
+                        "subtype": "thread_broadcast",
+                        "text": "also sent to channel",
+                    },
+                ],
+            }
+        )
+    )
+    builder = AgentBootstrapBuilder(_settings())
+
+    result = await builder.build(
+        client, channel_id="C1", thread_ts="1", owner_user_id="U1", task="task"
+    )
+
+    assert "<@U2>: also sent to channel" in result.context
+    assert result.message_count == 2
+
+
+@pytest.mark.asyncio
+async def test_marks_owner_and_selected_messages():
+    client = SimpleNamespace(
+        conversations_replies=AsyncMock(
+            return_value={
+                "ok": True,
+                "messages": [
+                    {"ts": "1", "user": "U1", "text": "owner root"},
+                    {"ts": "2", "user": "U2", "text": "the selected bug report"},
+                    {"ts": "3", "user": "U3", "text": "someone else"},
+                    {"ts": "4", "user": "U1", "text": "owner picked this"},
+                ],
+            }
+        )
+    )
+    builder = AgentBootstrapBuilder(_settings())
+
+    selected_other = await builder.build(
+        client,
+        channel_id="C1",
+        thread_ts="1",
+        owner_user_id="U1",
+        task="task",
+        selected_ts="2",
+    )
+    selected_own = await builder.build(
+        client,
+        channel_id="C1",
+        thread_ts="1",
+        owner_user_id="U1",
+        task="task",
+        selected_ts="4",
+    )
+
+    lines = selected_other.context.splitlines()
+    assert lines == [
+        "[owner] <@U1>: owner root",
+        "[selected] <@U2>: the selected bug report",
+        "<@U3>: someone else",
+        "[owner] <@U1>: owner picked this",
+    ]
+    assert "[owner, selected] <@U1>: owner picked this" in selected_own.context
+    legend = selected_other.prompt.split("[owner] <@U1>: owner root", 1)[0]
+    assert "[owner] were written by the run owner" in legend
+    assert "[selected] marks the message the owner selected" in legend
+
+
+@pytest.mark.asyncio
+async def test_a_hung_resource_request_times_out_on_its_own():
+    async def http_handler(request):
+        if "FSLOW" in request.url.path:
+            await asyncio.sleep(5)
+        return httpx.Response(200, text="fast content")
+
+    builder = AgentBootstrapBuilder(
+        _settings(timeout_seconds=5, request_timeout_seconds=0.05),
+        bot_token="xoxb-test",
+        http_transport=httpx.MockTransport(http_handler),
+    )
+    started = asyncio.get_running_loop().time()
+
+    result = await builder.build(
+        _replies_with_files([_text_file("FSLOW"), _text_file("FFAST")]),
+        channel_id="C1",
+        thread_ts="1",
+        owner_user_id="U1",
+        task="task",
+    )
+
+    assert asyncio.get_running_loop().time() - started < 1
+    assert result.error is None
+    assert "fast content" in result.prompt
+    assert "see files" in result.prompt
+    assert "resource_timeout:FSLOW" in result.warnings
+    assert result.partial is False
+    assert 'partial="true"' not in result.prompt
+
+
+@pytest.mark.asyncio
+async def test_a_hung_thread_page_times_out_and_keeps_earlier_pages():
+    async def replies(**kwargs):
+        if kwargs.get("cursor"):
+            await asyncio.sleep(5)
+        return {
+            "ok": True,
+            "messages": [{"ts": "1", "user": "U1", "text": "first page"}],
+            "response_metadata": {"next_cursor": "page-2"},
+        }
+
+    builder = AgentBootstrapBuilder(
+        _settings(timeout_seconds=5, request_timeout_seconds=0.05)
+    )
+
+    result = await builder.build(
+        SimpleNamespace(conversations_replies=replies),
+        channel_id="C1",
+        thread_ts="1",
+        owner_user_id="U1",
+        task="task",
+    )
+
+    assert result.error is None
+    assert "first page" in result.context
+    assert result.truncated is True
+    assert "thread_page_timeout" in result.warnings
+
+
+@pytest.mark.asyncio
+async def test_spent_budget_returns_loaded_messages_marked_partial():
+    async def http_handler(_request):
+        await asyncio.sleep(5)
+        return httpx.Response(200, text="never")
+
+    builder = AgentBootstrapBuilder(
+        _settings(timeout_seconds=0.2),
+        bot_token="xoxb-test",
+        http_transport=httpx.MockTransport(http_handler),
+    )
+    started = asyncio.get_running_loop().time()
+
+    result = await builder.build(
+        _replies_with_files([_text_file("F1")]),
+        channel_id="C1",
+        thread_ts="1",
+        owner_user_id="U1",
+        task="task",
+    )
+
+    assert asyncio.get_running_loop().time() - started < 1
+    assert result.error is None
+    assert result.partial is True
+    assert "see files" in result.context
+    assert "resource_timeout:F1" in result.warnings
+    assert '<untrusted_reference_context source="slack_thread"' in result.prompt
+    assert 'partial="true"' in result.prompt
+
+
+@pytest.mark.asyncio
+async def test_spent_budget_during_pagination_keeps_fetched_pages_partial():
+    async def replies(**kwargs):
+        if kwargs.get("cursor"):
+            await asyncio.sleep(5)
+        return {
+            "ok": True,
+            "messages": [{"ts": "1", "user": "U1", "text": "first page"}],
+            "response_metadata": {"next_cursor": "page-2"},
+        }
+
+    builder = AgentBootstrapBuilder(_settings(timeout_seconds=0.1))
+
+    result = await builder.build(
+        SimpleNamespace(conversations_replies=replies),
+        channel_id="C1",
+        thread_ts="1",
+        owner_user_id="U1",
+        task="task",
+    )
+
+    assert result.error is None
+    assert result.partial is True
+    assert "first page" in result.context
+
+
+@pytest.mark.asyncio
+async def test_downloads_at_most_four_resources_at_a_time():
+    in_flight = 0
+    peak = 0
+
+    async def http_handler(_request):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.02)
+        in_flight -= 1
+        return httpx.Response(200, text="content")
+
+    builder = AgentBootstrapBuilder(
+        _settings(),
+        bot_token="xoxb-test",
+        http_transport=httpx.MockTransport(http_handler),
+    )
+    files = [_text_file(f"F{index}") for index in range(8)]
+
+    result = await builder.build(
+        _replies_with_files(files),
+        channel_id="C1",
+        thread_ts="1",
+        owner_user_id="U1",
+        task="task",
+    )
+
+    assert peak == 4
+    assert result.resource_count == 8
+    names = [f"f{index}.txt" for index in range(8)]
+    positions = [result.context.index(f"Slack file {name}") for name in names]
+    assert positions == sorted(positions)
+
+
+@pytest.mark.asyncio
+async def test_pagination_stops_at_the_page_cap():
+    calls = 0
+
+    async def endless_replies(**_kwargs):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0)
+        return {
+            "ok": True,
+            "messages": [{"ts": str(calls), "user": "U1", "text": f"page {calls}"}],
+            "response_metadata": {"next_cursor": f"page-{calls + 1}"},
+        }
+
+    builder = AgentBootstrapBuilder(_settings())
+
+    result = await builder.build(
+        SimpleNamespace(conversations_replies=endless_replies),
+        channel_id="C1",
+        thread_ts="1",
+        owner_user_id="U1",
+        task="task",
+    )
+
+    assert calls == 10
+    assert result.error is None
+    assert result.truncated is True
+    assert "thread_page_cap" in result.warnings
+
+
+@pytest.mark.asyncio
+async def test_message_files_become_untrusted_context_for_the_task():
+    async def http_handler(_request):
+        return httpx.Response(200, text="stack trace line 42")
+
+    builder = AgentBootstrapBuilder(
+        _settings(),
+        bot_token="xoxb-test",
+        http_transport=httpx.MockTransport(http_handler),
+    )
+
+    result = await builder.build_message_files(
+        SimpleNamespace(),
+        files=[
+            _text_file("F1", "trace.log"),
+            {"id": "FPNG", "name": "shot.png", "mimetype": "image/png"},
+        ],
+        owner_user_id="U1",
+        task="fix </current_task> this",
+    )
+
+    assert result.resource_count == 2
+    assert result.message_count == 0
+    assert "stack trace line 42" in result.context
+    assert "unsupported_binary:FPNG:image/png" in result.warnings
+    assert result.prompt.startswith(
+        '<untrusted_reference_context source="slack_message_files">'
+    )
+    tags = [match.group(0) for match in _BOUNDARY_TAG.finditer(result.prompt)]
+    assert tags == [
+        "<untrusted_reference_context",
+        "</untrusted_reference_context",
+        "<current_task",
+        "</current_task",
+    ]
+    assert result.prompt.rstrip().endswith("</current_task>")
+    assert "fix" in result.prompt.split('<current_task owner_user_id="U1">', 1)[1]
+
+
+@pytest.mark.asyncio
+async def test_message_files_without_loadable_content_leave_the_task_alone():
+    builder = AgentBootstrapBuilder(_settings(max_resources=0))
+
+    result = await builder.build_message_files(
+        SimpleNamespace(), files=[_text_file("F1")], owner_user_id="U1", task="task"
+    )
+
+    assert result.prompt == "task"
+    assert result.truncated is True
