@@ -12,6 +12,7 @@ from src.agent_runtime import (
     AgentRuntimeConflict,
     AgentRuntimeError,
     AgentRuntimeUnauthorized,
+    AgentRuntimeUnavailable,
 )
 
 
@@ -257,6 +258,124 @@ async def test_monitor_posts_each_approval_once_and_keeps_watching(tmp_path):
     await restored._restore_state()
     assert restored.agent_runs["R1"]["posted_approval_ids"] == ["A1", "A2"]
     assert restored.agent_runs["R1"]["result_posted"] is True
+
+
+def degraded_bot(tmp_path, runtime, *, deadline=900.0):
+    """A bot whose monitor backoff runs on a fake clock; returns its sleeps."""
+    bot = file_bot(tmp_path, agent_runtime=runtime)
+    bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+    bot.agent_monitor_poll_seconds = 0
+    bot.agent_run_deadline_seconds = deadline
+    now = [0.0]
+    sleeps = []
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    bot.agent_monitor_sleep = sleep
+    bot.agent_monitor_clock = lambda: now[0]
+    bot.agent_monitor_random = lambda: 1.0
+    return bot, sleeps
+
+
+def delay_notices(bot):
+    return [text for text in posted_texts(bot) if "status is delayed" in text]
+
+
+@pytest.mark.asyncio
+async def test_monitor_reattaches_after_the_client_gives_up_and_posts_one_notice(
+    tmp_path,
+):
+    down = AgentRuntimeError("down", status=503, code="runtime_unhealthy")
+    runtime = scripted_runtime(
+        {
+            "R1": [
+                down,
+                AgentRuntimeUnavailable("unreachable"),
+                down,
+                run_state("R1", "completed", answer="done"),
+            ]
+        }
+    )
+    bot, sleeps = degraded_bot(tmp_path, runtime)
+    tracked = track(bot)
+
+    await bot._monitor_agent_run(tracked)
+
+    assert runtime.calls == ["R1"] * 4
+    assert len(delay_notices(bot)) == 1
+    assert not any("could not be retrieved" in text for text in posted_texts(bot))
+    assert tracked["result_posted"] is True
+    # Backoff between reattaches grows, with full jitter (random() == 1 here).
+    assert len(sleeps) == 3
+    assert sleeps == sorted(sleeps)
+    assert sleeps[0] > 0
+
+
+@pytest.mark.asyncio
+async def test_monitor_stops_reattaching_at_the_run_deadline(tmp_path):
+    runtime = scripted_runtime({"R1": [AgentRuntimeError("down", status=502)]})
+    bot, sleeps = degraded_bot(tmp_path, runtime, deadline=600.0)
+    tracked = track(bot)
+
+    await bot._monitor_agent_run(tracked)
+
+    texts = posted_texts(bot)
+    assert len(delay_notices(bot)) == 1
+    assert sum("could not be retrieved" in text for text in texts) == 1
+    assert len(runtime.calls) > 2
+    assert sum(sleeps) <= 600
+    # The run is not forgotten: a restart reconciles it again.
+    assert bot.agent_runs["R1"]["result_posted"] is False
+
+
+@pytest.mark.asyncio
+async def test_monitor_does_not_reattach_after_a_non_transient_error(tmp_path):
+    runtime = scripted_runtime(
+        {
+            "R1": [
+                AgentRuntimeError("down", status=503),
+                AgentRuntimeUnauthorized("bad token", status=401, code="unauthorized"),
+                run_state("R1", "completed"),
+            ]
+        }
+    )
+    bot, sleeps = degraded_bot(tmp_path, runtime)
+
+    await bot._monitor_agent_run(track(bot))
+
+    assert runtime.calls == ["R1", "R1"]
+    assert len(delay_notices(bot)) == 1
+    assert sum("could not be retrieved" in t for t in posted_texts(bot)) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_approval_wait_pushes_the_monitor_deadline_out(tmp_path):
+    down = AgentRuntimeError("down", status=503)
+    runtime = scripted_runtime(
+        {
+            "R1": [
+                down,
+                down,
+                approval_state("R1", "A1"),
+                down,
+                down,
+                run_state("R1", "completed"),
+            ]
+        }
+    )
+    bot, sleeps = degraded_bot(tmp_path, runtime, deadline=60.0)
+    bot.agent_monitor_reattach_seconds = 20.0
+    bot.agent_monitor_reattach_max_seconds = 20.0
+    tracked = track(bot)
+
+    await bot._monitor_agent_run(tracked)
+
+    # 80 seconds of backoff in all, but never more than 60 without contact.
+    assert sum(sleeps) == 80
+    assert tracked["result_posted"] is True
+    assert len(delay_notices(bot)) == 1
 
 
 @pytest.mark.asyncio

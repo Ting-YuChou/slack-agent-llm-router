@@ -3,12 +3,18 @@
 import asyncio
 import json
 import os
+import random as _random
 import time
 import uuid
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar
 from urllib.parse import quote
 
 import httpx
+
+T = TypeVar("T")
+
+# The runtime's `error.message` is meant for clients; keep a runaway one bounded.
+SERVER_MESSAGE_LIMIT = 500
 
 
 class AgentRuntimeError(RuntimeError):
@@ -18,10 +24,12 @@ class AgentRuntimeError(RuntimeError):
         *,
         status: Optional[int] = None,
         code: Optional[str] = None,
+        server_message: Optional[str] = None,
     ):
-        super().__init__(message)
+        super().__init__(f"{message}: {server_message}" if server_message else message)
         self.status = status
         self.code = code
+        self.server_message = server_message
 
 
 class AgentRuntimeTimeout(AgentRuntimeError):
@@ -44,8 +52,24 @@ class AgentRuntimeUnauthorized(AgentRuntimeError):
     pass
 
 
+class AgentRuntimeForbidden(AgentRuntimeUnauthorized):
+    """A valid token for a user who may not act on this run (`*_forbidden`).
+
+    The runtime answers most of these with 401, so they are told apart by code.
+    """
+
+
 class AgentRuntimeInvalidResponse(AgentRuntimeError):
     pass
+
+
+def is_transient_error(exc: AgentRuntimeError) -> bool:
+    """Connection errors, timeouts, 429 and 5xx: the same call may succeed later."""
+    if isinstance(
+        exc, (AgentRuntimeTimeout, AgentRuntimeUnavailable, AgentRuntimeBusy)
+    ):
+        return True
+    return exc.status is not None and exc.status >= 500
 
 
 class AgentRuntimeClient:
@@ -68,6 +92,8 @@ class AgentRuntimeClient:
         config: Dict[str, Any],
         *,
         transport: Optional[httpx.AsyncBaseTransport] = None,
+        sleep: Optional[Callable[[float], Awaitable[None]]] = None,
+        random: Optional[Callable[[], float]] = None,
     ):
         base_url = str(config.get("base_url", "http://127.0.0.1:3001")).rstrip("/")
         connect_timeout = float(config.get("connect_timeout_seconds", 2))
@@ -81,6 +107,11 @@ class AgentRuntimeClient:
         self._monotonic = time.monotonic
         self._health_timeout_seconds = min(connect_timeout, 2.0)
         self._control_timeout = httpx.Timeout(control_timeout, connect=connect_timeout)
+        self._retry_attempts = max(1, int(config.get("read_retry_attempts", 3)))
+        self._retry_base_seconds = float(config.get("read_retry_base_seconds", 0.5))
+        self._retry_max_seconds = float(config.get("read_retry_max_seconds", 4))
+        self._sleep = sleep or (lambda seconds: asyncio.sleep(seconds))
+        self._random = random or _random.random
         self._client = httpx.AsyncClient(
             base_url=base_url,
             timeout=httpx.Timeout(request_timeout, connect=connect_timeout),
@@ -154,7 +185,9 @@ class AgentRuntimeClient:
         return self._validate_accepted(result)
 
     async def ci_repairs(self) -> List[Dict[str, Any]]:
-        result = await self._request("GET", "/v1/ci-repairs", control=True)
+        result = await self.retry_transient(
+            lambda: self._request("GET", "/v1/ci-repairs", control=True)
+        )
         if not isinstance(result, list):
             raise AgentRuntimeInvalidResponse("Invalid CI repair list")
         return result
@@ -200,18 +233,22 @@ class AgentRuntimeClient:
     async def lookup_session(
         self, team_id: str, channel_id: str, thread_ts: str
     ) -> Optional[Dict[str, Any]]:
-        response = await self._send(
-            "GET",
-            "/v1/sessions/lookup",
-            params={
-                "team_id": team_id,
-                "channel_id": channel_id,
-                "thread_ts": thread_ts,
-            },
-            timeout=self._control_timeout,
-        )
-        if response.status_code != 200:
-            self._raise_for_error(response)
+        async def send() -> httpx.Response:
+            response = await self._send(
+                "GET",
+                "/v1/sessions/lookup",
+                params={
+                    "team_id": team_id,
+                    "channel_id": channel_id,
+                    "thread_ts": thread_ts,
+                },
+                timeout=self._control_timeout,
+            )
+            if response.status_code != 200:
+                self._raise_for_error(response)
+            return response
+
+        response = await self.retry_transient(send)
         try:
             payload = response.json()
         except ValueError as exc:
@@ -301,12 +338,17 @@ class AgentRuntimeClient:
         return self._validate_accepted(result)
 
     async def tasks(self, run_id: str) -> List[Dict[str, Any]]:
-        result = await self._request("GET", f"/v1/runs/{run_id}/tasks", control=True)
+        result = await self.retry_transient(
+            lambda: self._request("GET", f"/v1/runs/{run_id}/tasks", control=True)
+        )
         if not isinstance(result, list):
             raise AgentRuntimeInvalidResponse("Invalid workflow tasks")
         return result
 
     async def get_run(self, run_id: str) -> Dict[str, Any]:
+        return await self.retry_transient(lambda: self._read_run(run_id))
+
+    async def _read_run(self, run_id: str) -> Dict[str, Any]:
         result = await self._request("GET", f"/v1/runs/{run_id}", control=True)
         if not isinstance(result, dict):
             raise AgentRuntimeInvalidResponse(
@@ -441,7 +483,7 @@ class AgentRuntimeClient:
                     and self._monotonic() - read_at >= refresh_seconds
                 )
                 if run is None or on_progress is None or stale:
-                    run = await self.get_run(run_id)
+                    run = await self._read_run(run_id)
                     read_at = self._monotonic()
                     # The runtime keeps the newest events; cursors are absolute.
                     cursor = len(run.get("events") or []) + int(
@@ -502,11 +544,33 @@ class AgentRuntimeClient:
 
     @staticmethod
     def _is_transient(exc: AgentRuntimeError) -> bool:
-        if isinstance(
-            exc, (AgentRuntimeTimeout, AgentRuntimeUnavailable, AgentRuntimeBusy)
-        ):
-            return True
-        return exc.status is not None and exc.status >= 500
+        return is_transient_error(exc)
+
+    async def retry_transient(
+        self,
+        operation: Callable[[], Awaitable[T]],
+        *,
+        attempts: Optional[int] = None,
+    ) -> T:
+        """Run an idempotent call again after a transient error, with full jitter.
+
+        Each retry sleeps a uniform share of the capped exponential delay, so
+        Slack handlers retrying at once spread out. Other errors raise at once.
+        """
+        attempts = self._retry_attempts if attempts is None else max(1, attempts)
+        failures = 0
+        while True:
+            try:
+                return await operation()
+            except AgentRuntimeError as exc:
+                failures += 1
+                if failures >= attempts or not is_transient_error(exc):
+                    raise
+            ceiling = min(
+                self._retry_max_seconds,
+                self._retry_base_seconds * 2 ** (failures - 1),
+            )
+            await self._sleep(self._random() * ceiling)
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -584,8 +648,21 @@ class AgentRuntimeClient:
             payload = {}
         error = payload.get("error", {}) if isinstance(payload, dict) else {}
         code = error.get("code") if isinstance(error, dict) else None
+        message = error.get("message") if isinstance(error, dict) else None
         status = response.status_code
-        details = {"status": status, "code": code}
+        details: Dict[str, Any] = {
+            "status": status,
+            "code": code,
+            "server_message": (
+                message[:SERVER_MESSAGE_LIMIT]
+                if isinstance(message, str) and message
+                else None
+            ),
+        }
+        if isinstance(code, str) and code.endswith("_forbidden"):
+            raise AgentRuntimeForbidden(
+                "Agent runtime refused the action for this user", **details
+            )
         if status == 401:
             raise AgentRuntimeUnauthorized(
                 "Agent runtime authentication failed", **details
