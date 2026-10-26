@@ -22,7 +22,9 @@ CLI against its model gateway (spending real model budget) and scores it.
 ``--samples``/``--aggregate`` grade each repeat the way a profile's ``grader``
 sampling does, so every record is one aggregated verdict and the summary's
 rates, ``cost_usd`` and ``cost_per_grade`` measure that sampling. With
-``--records`` they are what the records must have been graded with.
+``--records`` they are what the records must have been graded with. When
+neither is given they default to the ``sampling`` the baseline was recorded
+with, so a run is measured the way its baseline was.
 """
 
 import argparse
@@ -561,15 +563,26 @@ def parse_args(argv=None):
         "--samples",
         type=int,
         choices=SAMPLES,
-        help="grader samples per grade (live default 1)",
+        help="grader samples per grade (default the baseline's, else live 1)",
     )
     parser.add_argument(
         "--aggregate",
         choices=AGGREGATES,
-        help="how samples combine (live default unanimous)",
+        help="how samples combine (default the baseline's, else live unanimous)",
     )
     parser.add_argument("--out", type=pathlib.Path, default=RESULTS)
     args = parser.parse_args(argv)
+    if args.samples is None and args.aggregate is None:
+        sampling = _read_baseline(args.baseline).get("sampling")
+        if sampling is not None:
+            if (
+                not isinstance(sampling, dict)
+                or type(sampling.get("samples")) is not int
+                or sampling["samples"] not in SAMPLES
+                or sampling.get("aggregate") not in AGGREGATES
+            ):
+                parser.error(f"{args.baseline}: unknown grader sampling {sampling!r}")
+            args.samples, args.aggregate = sampling["samples"], sampling["aggregate"]
     if not args.live_openai:
         if args.repeats is not None or args.max_cost_usd is not None:
             parser.error("--repeats/--max-cost-usd grade live: pass --live-openai")

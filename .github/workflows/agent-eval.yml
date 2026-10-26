@@ -3,9 +3,19 @@ name: Agent eval
 # Live coding-agent eval with hidden oracles. It spends real model budget, so
 # it only runs on manual dispatch. The offline unit tests for the runner live
 # in tests/test_agent_eval.py and run in the regular CI pytest job.
+#
+# Each run uses the profile overrides recorded in its suite's baseline, and
+# --strict-overrides fails it if they ever differ, so results stay comparable.
 on:
   workflow_dispatch:
     inputs:
+      suite:
+        description: Task set; tasks (eval/tasks vs eval/baseline.json) or repair (eval/repair-tasks vs eval/repair-baseline.json)
+        type: choice
+        options:
+          - tasks
+          - repair
+        default: tasks
       repeats:
         description: Runs per task (pass@1 is averaged over repeats)
         required: true
@@ -15,11 +25,11 @@ on:
         required: true
         default: "2"
       tasks:
-        description: Space-separated task ids (blank runs every task in eval/tasks)
+        description: Space-separated task ids (blank runs every task in the suite)
         required: false
         default: ""
       update_baseline:
-        description: Write the metrics to eval/baseline.json instead of comparing
+        description: Write the metrics to the suite's baseline instead of comparing
         type: boolean
         default: false
       runner:
@@ -77,12 +87,13 @@ jobs:
 
       - name: Run eval
         env:
+          SUITE: ${{ inputs.suite }}
           REPEATS: ${{ inputs.repeats }}
           MAX_COST_USD: ${{ inputs.max_cost_usd }}
           TASKS: ${{ inputs.tasks }}
           UPDATE_BASELINE: ${{ inputs.update_baseline }}
         run: |
-          args=(--live-openai --repeats "$REPEATS" --max-cost-usd "$MAX_COST_USD")
+          args=(--live-openai --suite "$SUITE" --strict-overrides --repeats "$REPEATS" --max-cost-usd "$MAX_COST_USD")
           for task in $TASKS; do args+=(--task "$task"); done
           if [ "$UPDATE_BASELINE" = "true" ]; then args+=(--update-baseline); fi
           python scripts/agent_eval.py "${args[@]}"
@@ -99,4 +110,5 @@ jobs:
           path: |
             eval/results/*.json
             eval/baseline.json
+            eval/repair-baseline.json
           if-no-files-found: warn

@@ -9,7 +9,13 @@ Results are written to ``eval/results/<model>__<prompt_version>__<checksum>.json
 and compared against ``eval/baseline.json``; any regression beyond tolerance,
 any metric above its optional baseline ceiling, or any missing metric fails the
 run (exit 1). ``--recompute-summary`` re-derives the summary of a committed
-results file without a live run.
+results file without a live run. ``--suite repair`` runs ``eval/repair-tasks``
+against ``eval/repair-baseline.json`` instead.
+
+Without an override flag a run uses the ``profile_overrides`` its baseline was
+recorded with, so the two stay comparable; ``--no-baseline-overrides`` runs the
+tasks' own profiles. A run whose overrides differ from the baseline's is warned
+about, or failed with ``--strict-overrides``.
 """
 
 import argparse
@@ -37,6 +43,13 @@ EXPECTATIONS = ("pass", "must_not_commit", "scope_violation", "no_diff")
 TASK_MODES = ("implement", "discuss")
 WORKFLOW_MODES = ("single", "structured")
 ORACLE_DIR = ".eval-oracle"
+# suite -> (tasks directory, baseline), relative to the project.
+SUITES = {
+    "tasks": ("eval/tasks", "eval/baseline.json"),
+    "repair": ("eval/repair-tasks", "eval/repair-baseline.json"),
+}
+GRADER_SAMPLES = (1, 3)
+GRADER_AGGREGATES = ("unanimous", "majority")
 # metric -> (direction, default tolerance). "higher" and "lower_abs" use an
 # absolute tolerance; "lower" a relative one (useless against a 0 reference).
 CONTRACT_METRICS = {
@@ -670,7 +683,13 @@ def parse_args(argv=None, require_live=True):
         help="Explicitly allow model calls using OPENAI_API_KEY from .env.demo",
     )
     parser.add_argument(
-        "--tasks-dir", type=pathlib.Path, default=PROJECT / "eval/tasks"
+        "--suite",
+        choices=SUITES,
+        default="tasks",
+        help="Task set to run and the baseline it is held to (default tasks)",
+    )
+    parser.add_argument(
+        "--tasks-dir", type=pathlib.Path, help="Defaults to the suite's tasks"
     )
     parser.add_argument(
         "--task", action="append", help="Only run this task id (repeatable)"
@@ -687,7 +706,7 @@ def parse_args(argv=None, require_live=True):
         "--results-dir", type=pathlib.Path, default=PROJECT / "eval/results"
     )
     parser.add_argument(
-        "--baseline", type=pathlib.Path, default=PROJECT / "eval/baseline.json"
+        "--baseline", type=pathlib.Path, help="Defaults to the suite's baseline"
     )
     parser.add_argument("--model", default=None, help="Defaults to the runtime's model")
     parser.add_argument(
@@ -708,13 +727,25 @@ def parse_args(argv=None, require_live=True):
     parser.add_argument(
         "--grader-samples",
         type=int,
-        choices=(1, 3),
+        choices=GRADER_SAMPLES,
         help="Grade every task with this many grader samples (profile grader.samples)",
     )
     parser.add_argument(
         "--grader-aggregate",
-        choices=("unanimous", "majority"),
+        choices=GRADER_AGGREGATES,
         help="How the samples combine (default unanimous); needs --grader-samples",
+    )
+    parser.add_argument(
+        "--no-baseline-overrides",
+        action="store_true",
+        help="Without override flags, run the tasks' own profiles rather than the "
+        "profile_overrides the baseline was recorded with",
+    )
+    parser.add_argument(
+        "--strict-overrides",
+        action="store_true",
+        help="Fail, rather than warn, when the run's profile overrides differ from "
+        "the baseline's",
     )
     parser.add_argument(
         "--recompute-summary",
@@ -723,6 +754,9 @@ def parse_args(argv=None, require_live=True):
         help="Recompute the summary of a results file from its records; no live run",
     )
     args = parser.parse_args(argv)
+    tasks_dir, baseline = SUITES[args.suite]
+    args.tasks_dir = args.tasks_dir or PROJECT / tasks_dir
+    args.baseline = args.baseline or PROJECT / baseline
     if args.recompute_summary:
         return args
     if require_live and not args.live_openai:
@@ -746,6 +780,31 @@ def profile_overrides(args):
             "samples": args.grader_samples,
             "aggregate": args.grader_aggregate or "unanimous",
         }
+    return overrides
+
+
+def baseline_overrides(baseline):
+    """The baseline's ``profile_overrides``; ``ValueError`` unless the flags can set them."""
+    overrides = baseline.get("profile_overrides") or {}
+    flags = argparse.Namespace(
+        writer_reuse=False, grader_samples=None, grader_aggregate=None
+    )
+    if isinstance(overrides, dict):
+        flags.writer_reuse = overrides.get("writerReuse") is True
+        grader = overrides.get("grader")
+        if (
+            isinstance(grader, dict)
+            and type(grader.get("samples")) is int
+            and grader["samples"] in GRADER_SAMPLES
+            and grader.get("aggregate") in GRADER_AGGREGATES
+        ):
+            flags.grader_samples = grader["samples"]
+            flags.grader_aggregate = grader["aggregate"]
+    if profile_overrides(flags) != overrides:
+        raise ValueError(
+            f"profile_overrides {json.dumps(overrides, sort_keys=True)} "
+            "are not ones the override flags can set"
+        )
     return overrides
 
 
@@ -777,13 +836,16 @@ def _finish(args, result, results_path):
     recorded = _read_baseline(args.baseline)
     if recorded and not args.update_baseline:
         if (recorded.get("profile_overrides") or {}) != overrides:
-            print(
-                "warning: the baseline was recorded with profile overrides "
+            mismatch = (
+                "the baseline was recorded with profile overrides "
                 f"{json.dumps(recorded.get('profile_overrides') or {}, sort_keys=True)} "
                 f"but this run used {json.dumps(overrides, sort_keys=True)}; "
-                "cost and wall time are not comparable",
-                file=sys.stderr,
+                "cost and wall time are not comparable"
             )
+            if args.strict_overrides:
+                failures.append("profile_overrides: " + mismatch)
+            else:
+                print("warning: " + mismatch, file=sys.stderr)
     results_path.parent.mkdir(parents=True, exist_ok=True)
     results_path.write_text(json.dumps(result, indent=2) + "\n")
     if args.update_baseline and not failures:
@@ -839,6 +901,18 @@ def main(argv=None, runner=None):
         print(f"invalid eval task: {error}", file=sys.stderr)
         return 2
     overrides = profile_overrides(args)
+    if not overrides and not args.no_baseline_overrides:
+        try:
+            overrides = baseline_overrides(_read_baseline(args.baseline))
+        except ValueError as error:
+            print(f"invalid eval baseline {args.baseline}: {error}", file=sys.stderr)
+            return 2
+        if overrides:
+            print(
+                "using the baseline's profile overrides "
+                + json.dumps(overrides, sort_keys=True),
+                file=sys.stderr,
+            )
     # Applied before the checksum, so an overridden run is keyed (and filed) apart from a plain one.
     tasks = [{**task, "profile": {**task["profile"], **overrides}} for task in tasks]
     if runner is None:

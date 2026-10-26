@@ -997,7 +997,10 @@ def test_baseline_records_its_profile_overrides_and_a_mismatch_is_warned(tmp_pat
         "grader": {"samples": 3, "aggregate": "unanimous"},
     }
     assert "not comparable" not in stderr_of(overridden)
-    assert "not comparable" in stderr_of(_eval_args(tmp_path))
+    # A plain run now adopts the baseline's overrides, so opt out to mismatch.
+    assert "not comparable" in stderr_of(
+        _eval_args(tmp_path, "--no-baseline-overrides")
+    )
 
 
 def test_eval_profile_overrides_are_validated():
@@ -1011,6 +1014,201 @@ def test_eval_profile_overrides_are_validated():
             agent_eval.parse_args(["--live-openai", *bad])
     with pytest.raises(SystemExit):
         agent_eval.parse_args(["--live-openai", "--grader-aggregate", "majority"])
+
+
+RECORDED_OVERRIDES = {
+    "writerReuse": True,
+    "grader": {"samples": 3, "aggregate": "majority"},
+}
+
+
+def _write_overridden_baseline(tmp_path, overrides=RECORDED_OVERRIDES):
+    _write_baseline(tmp_path)
+    path = tmp_path / "baseline.json"
+    baseline = json.loads(path.read_text())
+    baseline["profile_overrides"] = overrides
+    path.write_text(json.dumps(baseline))
+
+
+def _run_eval(argv, runner):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = agent_eval.main(argv, runner=runner)
+    return code, json.loads(out.getvalue()), err.getvalue()
+
+
+def _profile_spy():
+    stub = _stub_runner()
+
+    def runner(task, attempt):
+        runner.profiles.append(task["profile"])
+        return stub(task, attempt)
+
+    runner.profiles = []
+    return runner
+
+
+def test_eval_defaults_to_the_profile_overrides_recorded_in_the_baseline(tmp_path):
+    _write_task(tmp_path / "tasks")
+    _write_overridden_baseline(tmp_path)
+    runner = _profile_spy()
+
+    code, report, stderr = _run_eval(_eval_args(tmp_path), runner)
+
+    assert code == 0
+    assert runner.profiles[0]["writerReuse"] is True
+    assert runner.profiles[0]["grader"] == {"samples": 3, "aggregate": "majority"}
+    assert "not comparable" not in stderr
+    [result_file] = (tmp_path / "results").glob("*.json")
+    assert json.loads(result_file.read_text())["profile_overrides"] == (
+        RECORDED_OVERRIDES
+    )
+    assert report["key"] == json.loads(result_file.read_text())["key"]
+
+    # Any override flag replaces the baseline's overrides as a whole.
+    runner = _profile_spy()
+    code, _, stderr = _run_eval(_eval_args(tmp_path, "--grader-samples", "1"), runner)
+    assert code == 0
+    assert "writerReuse" not in runner.profiles[0]
+    assert runner.profiles[0]["grader"] == {"samples": 1, "aggregate": "unanimous"}
+    assert "not comparable" in stderr
+
+
+def test_eval_can_opt_out_of_the_baseline_overrides(tmp_path):
+    _write_task(tmp_path / "tasks")
+    _write_overridden_baseline(tmp_path)
+    runner = _profile_spy()
+
+    code, _, stderr = _run_eval(_eval_args(tmp_path, "--no-baseline-overrides"), runner)
+
+    assert code == 0
+    assert "writerReuse" not in runner.profiles[0]
+    assert "grader" not in runner.profiles[0]
+    assert "not comparable" in stderr
+
+
+def test_update_baseline_keeps_the_recorded_overrides_without_flags(tmp_path):
+    _write_task(tmp_path / "tasks")
+    _write_overridden_baseline(tmp_path)
+
+    code, _, _ = _run_eval(_eval_args(tmp_path, "--update-baseline"), _stub_runner())
+
+    assert code == 0
+    baseline = json.loads((tmp_path / "baseline.json").read_text())
+    assert baseline["profile_overrides"] == RECORDED_OVERRIDES
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"writerReuse": False},
+        {"writerReuse": "yes"},
+        {"grader": {"samples": 2, "aggregate": "unanimous"}},
+        {"grader": {"samples": True, "aggregate": "unanimous"}},
+        {"grader": {"samples": 3}},
+        {"grader": {"samples": 3, "aggregate": "any"}},
+        {"maxTurns": 3},
+        ["writerReuse"],
+    ],
+)
+def test_eval_refuses_baseline_overrides_the_flags_cannot_set(tmp_path, overrides):
+    _write_task(tmp_path / "tasks")
+    _write_overridden_baseline(tmp_path, overrides)
+    runner = _stub_runner()
+    err = io.StringIO()
+
+    with contextlib.redirect_stderr(err):
+        code = agent_eval.main(_eval_args(tmp_path), runner=runner)
+
+    assert code == 2
+    assert runner.calls == []
+    assert "profile_overrides" in err.getvalue()
+
+
+def test_strict_overrides_fails_a_run_that_does_not_match_the_baseline(tmp_path):
+    _write_task(tmp_path / "tasks")
+    _write_overridden_baseline(tmp_path)
+    strict = _eval_args(tmp_path, "--strict-overrides")
+
+    code, report, _ = _run_eval([*strict, "--no-baseline-overrides"], _stub_runner())
+
+    assert code == 1
+    [failure] = report["contract_failures"]
+    assert failure.startswith("profile_overrides: ")
+    assert "not comparable" in failure
+    [result_file] = (tmp_path / "results").glob("*.json")
+    assert json.loads(result_file.read_text())["contract_failures"] == [failure]
+
+    code, report, _ = _run_eval(strict, _stub_runner())
+    assert code == 0
+    assert report["contract_failures"] == []
+
+
+def test_strict_overrides_holds_a_recomputed_result_to_the_baseline(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(agent_eval, "LiveRunner", _no_live_runner)
+    results = _recompute_copy(tmp_path)
+    baseline_path = tmp_path / "baseline.json"
+    args = ["--recompute-summary", str(results), "--baseline", str(baseline_path)]
+    assert agent_eval.main(args + ["--update-baseline"]) == 0
+    assert agent_eval.main(args + ["--strict-overrides"]) == 0
+    baseline = json.loads(baseline_path.read_text())
+    baseline["profile_overrides"] = {"writerReuse": True}
+    baseline_path.write_text(json.dumps(baseline))
+
+    with contextlib.redirect_stderr(io.StringIO()):
+        assert agent_eval.main(args) == 0
+        assert agent_eval.main(args + ["--strict-overrides"]) == 1
+    [failure] = json.loads(results.read_text())["contract_failures"]
+    assert failure.startswith("profile_overrides: ")
+
+
+@pytest.mark.parametrize(
+    "suite, tasks_dir, baseline",
+    [
+        ("tasks", "eval/tasks", "eval/baseline.json"),
+        ("repair", "eval/repair-tasks", "eval/repair-baseline.json"),
+    ],
+)
+def test_eval_suite_picks_the_tasks_and_their_baseline(suite, tasks_dir, baseline):
+    args = agent_eval.parse_args(["--live-openai", "--suite", suite])
+    assert args.tasks_dir == agent_eval.PROJECT / tasks_dir
+    assert args.baseline == agent_eval.PROJECT / baseline
+    assert args.tasks_dir.is_dir() and args.baseline.is_file()
+    recompute = agent_eval.parse_args(
+        ["--recompute-summary", "r.json", "--suite", suite]
+    )
+    assert recompute.baseline == agent_eval.PROJECT / baseline
+    default = agent_eval.parse_args(["--live-openai"])
+    assert (default.tasks_dir, default.baseline) == (
+        agent_eval.PROJECT / "eval/tasks",
+        agent_eval.PROJECT / "eval/baseline.json",
+    )
+
+
+def test_eval_suite_paths_yield_to_explicit_ones(tmp_path):
+    args = agent_eval.parse_args(
+        [
+            "--live-openai",
+            "--suite",
+            "repair",
+            "--tasks-dir",
+            str(tmp_path),
+            "--baseline",
+            str(tmp_path / "b.json"),
+        ]
+    )
+    assert (args.tasks_dir, args.baseline) == (tmp_path, tmp_path / "b.json")
+    with contextlib.redirect_stderr(io.StringIO()), pytest.raises(SystemExit):
+        agent_eval.parse_args(["--live-openai", "--suite", "other"])
+
+
+def test_the_repair_suite_runs_only_repair_tasks():
+    args = agent_eval.parse_args(["--live-openai", "--suite", "repair"])
+    tasks = agent_eval.load_tasks(args.tasks_dir)
+    assert "hidden-rule-repair" in [task["id"] for task in tasks]
+    assert all(task["requires_repair"] for task in tasks)
 
 
 def test_eval_main_exits_one_when_a_run_regresses(tmp_path):
