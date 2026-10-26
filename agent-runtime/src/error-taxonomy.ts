@@ -69,7 +69,9 @@ function causeOf(error: unknown): CauseCode | undefined {
 
 export interface RunFailure { code: string; message: string; cause_code?: CauseCode;
   /** The worktree could not be rolled back after this failure; it needs an operator. */
-  rollback_failed?: true }
+  rollback_failed?: true;
+  /** The redacted last ≤16 KiB of the agent container's stderr, when the container itself failed. */
+  stderr_tail?: string }
 
 /** Maps an exception escaping the quality gate to the run's public error. */
 export function classifyGateError(error: unknown): RunFailure {

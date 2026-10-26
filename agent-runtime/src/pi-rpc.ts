@@ -16,7 +16,8 @@ export type PublicRunEvent =
   | { type: "answer_delta"; text: string }
   | { type: "answer"; text: string }
   | { type: "settled"; outcome: RunOutcome; limit?: LimitKind; stop_reason?: string; error_message?: string }
-  | { type: "error"; code: string; message: string }
+  /** `stderr_tail`: the redacted end of the agent container's stderr, when the container itself failed. */
+  | { type: "error"; code: string; message: string; stderr_tail?: string }
   | ({ type: "policy_decision" } & PolicyDecision)
   | { type: "startup"; startup: AttemptStartup }
   | { type: "container_reuse_failed" };
@@ -112,9 +113,16 @@ export function sanitizeRpcEvent(record: Record<string, unknown>): PublicRunEven
   // The bridge classifies settles from the last assistant message; on its own a settle proves nothing.
   if (type === "agent_settled") return { type: "settled", outcome: "error", stop_reason: "no_response" };
   if (type === "extension_error") {
-    return { type: "error", code: "extension_error", message: "A trusted extension failed" };
+    return { type: "error", code: "extension_error", message: extensionErrorMessage(record) };
   }
   return null;
+}
+
+/** `policy.ts:tool_call: <first line>`: the extension and event Pi names, and how the handler failed. */
+function extensionErrorMessage(record: Record<string, unknown>): string {
+  const extension = safeString(record.extensionPath).split("/").pop() || "unknown";
+  const line = safeString(record.error).split(/\r?\n/, 1)[0].trim() || "A trusted extension failed";
+  return `${extension}:${safeString(record.event) || "unknown"}: ${String(redact(line)).slice(0, 500)}`;
 }
 
 function byteSize(value: unknown): number {
