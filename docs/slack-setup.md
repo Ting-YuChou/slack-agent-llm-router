@@ -326,7 +326,8 @@ Phase: *implementation* · Tools: 3 · Turns: 2 · Cost: $0.012 · Elapsed: 2m 0
 
 - 進度大約每 10 秒更新一次，run 結束時一定會寫入最後狀態。
 - `Elapsed` 是從 run 開始到現在經過的時間。
-- 在 thread 裡啟動的 run，會在 thread 裡回覆一則狀態訊息（例如 `Pi coding agent started run …`），一樣會更新進度。包含：追加指示、用 @LLM Router Demo 或 `!llm agent` 啟動、Needs changes 的續跑，以及 `agent resume`。
+- 在 thread 裡啟動的 run，會在 thread 裡回覆一則狀態訊息（例如 `Pi coding agent started run …`），一樣會更新進度。包含：追加指示、用 @LLM Router Demo 或 `!llm agent` 啟動，以及 Needs changes 的續跑。
+- `agent resume <run_id>` 不管在哪裡執行，都會在 run 原本的 thread 回覆 `Workflow … resumed.`，之後的進度、核准和結果也都在那裡。bot 找不到那個 thread 時，會在你執行指令的頻道另開一則訊息當作新的 thread。
 - 「Run Pi Agent」shortcut 會把那則 `loading the Slack thread snapshot…` 訊息改寫成狀態訊息，不會另外再貼一則。
 - 按 **Resume from patch** 之後，thread 裡那則 `resumed from the kept patch` 訊息也會這樣更新。
 

@@ -13,8 +13,14 @@ import pytest
 from slack.agent_bootstrap import AgentBootstrapContext
 from slack.agent_feedback import AgentFeedbackNonce
 from slack.agent_shortcut import AgentShortcutNonce, AgentShortcutSubmission
-from slack.bot_real import RedisSlackStateStore, SlackBot, SlackMessageHandler
+from slack.bot_real import (
+    RedisSlackStateStore,
+    SlackBot,
+    SlackMessageHandler,
+    SlackWorkItem,
+)
 from src.agent_runtime import (
+    AgentRuntimeBusy,
     AgentRuntimeClient,
     AgentRuntimeConflict,
     AgentRuntimeError,
@@ -1548,3 +1554,364 @@ async def test_a_start_whose_answer_timed_out_ends_as_one_monitored_run(
     assert set(bot.agent_runs) == {"R1"}
     bot._start_agent_monitor.assert_called_once_with(bot.agent_runs["R1"])
     assert "`R1` started" in response
+
+
+def thread_message(text, ts, event_type="message", channel="C1", thread_ts="100.1"):
+    return {
+        "type": event_type,
+        "text": text,
+        "user": "U1",
+        "channel": channel,
+        "thread_ts": thread_ts,
+        "ts": ts,
+        "_team_id": "T1",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event,outcome",
+    [
+        (thread_message("also add a regression test", "200.1"), "started"),
+        (thread_message("also add a regression test", "200.1"), "busy"),
+        (thread_message("!llm agent fix the tests", "200.1"), "started"),
+        (
+            thread_message("<@UBOT> !llm agent fix the tests", "200.1", "app_mention"),
+            "busy",
+        ),
+    ],
+)
+async def test_an_agent_start_from_a_message_never_holds_a_slack_worker(
+    tmp_path, event, outcome
+):
+    bot = thread_start_bot(tmp_path)
+    bot.bot_user_id = "UBOT"
+    bot._work_concurrency = 1
+    track(bot, "R0", thread_ts="100.1")["result_posted"] = True
+    accepted = bot.agent_runtime_client.create_session.return_value
+    gate = asyncio.Event()
+
+    async def slow_create(*_args, **_kwargs):
+        await gate.wait()
+        if outcome == "busy":
+            raise AgentRuntimeBusy("busy")
+        return accepted
+
+    bot.agent_runtime_client.create_session = AsyncMock(side_effect=slow_create)
+    bot._start_work_workers()
+    try:
+        await bot._enqueue_work(
+            SlackWorkItem(kind="event", payload=dict(event), name="slack_event")
+        )
+        # The only worker is free again while create_session still waits.
+        await asyncio.wait_for(bot._work_queue.join(), timeout=1)
+        bot.web_client.chat_postMessage.assert_not_awaited()
+        assert "R1" not in bot.agent_runs
+    finally:
+        gate.set()
+        await bot._stop_work_workers()
+    await drain(bot)
+
+    bot.agent_runtime_client.create_session.assert_awaited_once()
+    # The start's status message, or its error, is the one reply in the thread.
+    bot.web_client.chat_postMessage.assert_awaited_once()
+    post = bot.web_client.chat_postMessage.await_args.kwargs
+    assert (post["channel"], post["thread_ts"]) == ("C1", "100.1")
+    if outcome == "busy":
+        assert "Agent mode is busy" in post["text"]
+        assert "R1" not in bot.agent_runs
+    else:
+        assert bot.agent_runs["R1"]["status_text"] == post["text"]
+
+
+async def chat_query(bot, ts):
+    await bot._process_message(
+        {"text": "what is a monad?", "user": "U1", "channel": "C1", "ts": ts}
+    )
+
+
+async def slash_agent_start(bot, trigger_id):
+    await bot._handle_slash_command(
+        {
+            "text": "agent fix the tests",
+            "user_id": "U1",
+            "channel_id": "C1",
+            "team_id": "T1",
+            "trigger_id": trigger_id,
+        }
+    )
+    await drain(bot)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("burst", ["chat", "agent"])
+async def test_a_burst_of_one_request_kind_never_blocks_the_other(tmp_path, burst):
+    bot = thread_start_bot(tmp_path)
+    run_ids = iter(["R1", "R2", "R3"])
+    bot.agent_runtime_client.create_session = AsyncMock(
+        side_effect=lambda *_args, **_kwargs: {
+            "session_id": "S1",
+            "run_id": next(run_ids),
+            "status": "starting",
+        }
+    )
+    bot.message_handler._handle_query = AsyncMock(return_value="chat answer")
+    # The configured limits apply to each bucket unchanged.
+    bot.rate_limiting = {"requests_per_hour": 100, "burst_requests": 2}
+    track(bot, "R0", thread_ts="100.1")["result_posted"] = True
+
+    async def agent_followup(ts):
+        await bot._process_message(thread_message("also add a regression test", ts))
+
+    if burst == "chat":
+        for ts in ("1.1", "1.2", "1.3"):
+            await chat_query(bot, ts)
+        await agent_followup("200.1")
+        await slash_agent_start(bot, "trigger-1")
+    else:
+        await agent_followup("200.1")
+        await slash_agent_start(bot, "trigger-1")
+        await agent_followup("200.2")
+        for ts in ("1.1", "1.2"):
+            await chat_query(bot, ts)
+
+    assert bot.message_handler._handle_query.await_count == 2
+    assert bot.agent_runtime_client.create_session.await_count == 2
+    refusals = [text for text in posted_texts(bot) if "Rate Limit Exceeded" in text]
+    assert len(refusals) == 1
+    # Each request that went through counts as one Slack query.
+    assert len(bot.user_manager.rate_limits["U1"]) == 4
+
+
+RATE_LIMITS = {"requests_per_hour": 100, "burst_requests": 1}
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_buckets_survive_a_restart_through_file_state(tmp_path):
+    first = file_bot(tmp_path)
+    assert first.user_manager.check_rate_limit("U1", RATE_LIMITS, bucket="agent")
+    await first._persist_user_state("U1")
+
+    restored = file_bot(tmp_path)
+    await restored._restore_state()
+
+    # The Agent request is still counted, in its own bucket only.
+    assert not restored.user_manager.check_rate_limit("U1", RATE_LIMITS, bucket="agent")
+    assert restored.user_manager.check_rate_limit("U1", RATE_LIMITS)
+
+
+@pytest.mark.asyncio
+async def test_a_state_file_from_before_the_buckets_counts_as_chat(tmp_path):
+    (tmp_path / "state.json").write_text(
+        json.dumps({"rate_limits": {"U1": [time.time()]}})
+    )
+    bot = file_bot(tmp_path)
+    await bot._restore_state()
+
+    assert not bot.user_manager.check_rate_limit("U1", RATE_LIMITS)
+    assert bot.user_manager.check_rate_limit("U1", RATE_LIMITS, bucket="agent")
+
+
+def redis_bot(redis, **services):
+    bot = SlackBot(
+        {
+            "channels": [],
+            "state": {"backend": "redis", "redis": {"key_prefix": "p"}},
+        },
+        SimpleNamespace(),
+        services=services,
+    )
+    bot.state_store.client = redis
+    return bot
+
+
+@pytest.mark.asyncio
+async def test_redis_state_merges_agent_requests_with_the_old_shape():
+    redis = FakeRedis()
+    # A bot from before the buckets saved one chat query as a bare timestamp.
+    await redis_bot(redis).state_store.persist_user_state("U1", {}, [time.time()])
+    first = redis_bot(redis)
+    await first._restore_state()
+    assert first.user_manager.check_rate_limit("U1", RATE_LIMITS, bucket="agent")
+    await first._persist_user_state("U1")
+
+    restored = redis_bot(redis)
+    await restored._restore_state()
+
+    assert len(restored.user_manager.rate_limits["U1"]) == 2
+    assert not restored.user_manager.check_rate_limit("U1", RATE_LIMITS)
+    assert not restored.user_manager.check_rate_limit("U1", RATE_LIMITS, bucket="agent")
+
+
+@pytest.mark.asyncio
+async def test_a_users_earlier_session_stays_tracked_when_another_starts(tmp_path):
+    runtime = SimpleNamespace(
+        get_run=AsyncMock(side_effect=lambda run_id: run_state(run_id, "running")),
+        close_session=AsyncMock(),
+    )
+    bot = file_bot(tmp_path, agent_runtime=runtime)
+    track(bot, "R1", session_id="S1", thread_ts="1.0")
+    track(bot, "R2", session_id="S2", thread_ts="2.0")
+    handler = SlackMessageHandler(bot)
+
+    def control(action):
+        return handler._handle_agent_command(
+            [action], "U1", "C9", SimpleNamespace(), team_id="T1"
+        )
+
+    # Outside any Agent thread, the controls act on the latest session.
+    await control("status")
+    runtime.get_run.assert_awaited_with("R2")
+    await control("close")
+    runtime.close_session.assert_awaited_once_with("S2", "U1")
+
+    await control("status")
+    runtime.get_run.assert_awaited_with("R1")
+    await control("close")
+    runtime.close_session.assert_awaited_with("S1", "U1")
+    assert await control("status") == "No active Agent session was found for you."
+
+
+@pytest.mark.asyncio
+async def test_every_restored_session_of_a_user_stays_tracked(tmp_path):
+    first = file_bot(tmp_path)
+    for run_id, session_id, thread_ts in (("R1", "S1", "1.0"), ("R2", "S2", "2.0")):
+        tracked = track(first, run_id, session_id=session_id, thread_ts=thread_ts)
+        await first._persist_agent_run(tracked)
+
+    restored = file_bot(tmp_path)
+    await restored._restore_state()
+    latest = restored._agent_run_for("U1", None, None)
+    restored._forget_agent_session(latest)
+
+    earlier = restored._agent_run_for("U1", None, None)
+    assert {latest["run_id"], earlier["run_id"]} == {"R1", "R2"}
+
+
+def test_the_single_slot_shape_of_a_users_runs_still_resolves(tmp_path):
+    bot = file_bot(tmp_path)
+    earlier = {
+        "run_id": "R1",
+        "session_id": "S1",
+        "channel_id": "C1",
+        "thread_ts": "1.0",
+        "owner_user_id": "U1",
+    }
+    # One record per user, the shape this map held before.
+    bot.agent_user_runs["U1"] = earlier
+    assert bot._agent_run_for("U1", None, None) is earlier
+
+    later = track(bot, "R2", session_id="S2", thread_ts="2.0")
+    assert bot._agent_run_for("U1", None, None) is later
+    bot._forget_agent_session(later)
+    assert bot._agent_run_for("U1", None, None) is earlier
+
+
+RESUME_RECORD = {
+    "run_id": "R1",
+    "session_id": "S1",
+    "team_id": "T1",
+    "channel_id": "C1",
+    "thread_ts": "100.1",
+    "owner_user_id": "U1",
+    "mode": "implement",
+    "posted_approval_ids": ["A1"],
+    "result_posted": True,
+}
+RESUMED = "🛠️ Workflow `R1` resumed."
+
+
+def resume_bot(tmp_path, backend="file"):
+    runtime = SimpleNamespace(
+        resume=AsyncMock(
+            return_value={"session_id": "S1", "run_id": "R1", "status": "starting"}
+        )
+    )
+    if backend == "redis":
+        bot = redis_bot(FakeRedis(), agent_runtime=runtime)
+    else:
+        bot = file_bot(tmp_path, agent_runtime=runtime)
+    bot.web_client = SimpleNamespace(
+        chat_postMessage=AsyncMock(return_value={"ts": "300.1"}),
+        chat_update=AsyncMock(),
+        chat_postEphemeral=AsyncMock(),
+    )
+    bot._start_agent_monitor = Mock()
+    return bot
+
+
+async def slash_resume(bot):
+    await bot._handle_slash_command(
+        {
+            "text": "agent resume R1",
+            "user_id": "U1",
+            "channel_id": "C9",
+            "team_id": "T1",
+            "trigger_id": "trigger-1",
+        }
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source,surface",
+    [
+        ("tracked", "slash"),
+        ("session", "slash"),
+        ("persisted", "slash"),
+        ("tracked", "other_thread"),
+    ],
+)
+async def test_resume_follows_the_run_into_its_own_thread(tmp_path, source, surface):
+    bot = resume_bot(tmp_path, "redis" if source == "persisted" else "file")
+    if source == "tracked":
+        track(bot, "R1", thread_ts="100.1")["result_posted"] = True
+    elif source == "session":
+        # Only an earlier run of the same session is still tracked.
+        track(bot, "R0", thread_ts="100.1")["result_posted"] = True
+    else:
+        # Another bot process tracked it; only the shared state knows its thread.
+        await bot.state_store.persist_agent_run_state("R1", RESUME_RECORD)
+
+    if surface == "slash":
+        await slash_resume(bot)
+        reply = bot.web_client.chat_postEphemeral.await_args.kwargs["text"]
+    else:
+        await bot._process_message(
+            thread_message(
+                "!llm agent resume R1", "500.2", channel="C9", thread_ts="500.1"
+            )
+        )
+        replied = bot.web_client.chat_postMessage.await_args_list[1].kwargs
+        assert (replied["channel"], replied["thread_ts"]) == ("C9", "500.1")
+        reply = replied["text"]
+
+    status = bot.web_client.chat_postMessage.await_args_list[0].kwargs
+    assert status == {"channel": "C1", "thread_ts": "100.1", "text": RESUMED}
+    tracked = bot.agent_runs["R1"]
+    assert (tracked["channel_id"], tracked["thread_ts"]) == ("C1", "100.1")
+    assert (tracked["status_ts"], tracked["mode"]) == ("300.1", "implement")
+    bot._start_agent_monitor.assert_called_once_with(tracked)
+    if source == "persisted":
+        # Approvals the other process already posted are not posted again.
+        assert tracked["posted_approval_ids"] == ["A1"]
+    # Whoever asked is told where the run went on.
+    assert "`R1`" in reply and "<#C1>" in reply
+
+
+@pytest.mark.asyncio
+async def test_slash_resume_of_a_run_without_a_known_thread_opens_one_here(tmp_path):
+    bot = resume_bot(tmp_path)
+
+    await slash_resume(bot)
+
+    root = bot.web_client.chat_postMessage.await_args.kwargs
+    assert root["channel"] == "C9" and "thread_ts" not in root
+    bot.web_client.chat_update.assert_awaited_once_with(
+        channel="C9", ts="300.1", text=RESUMED
+    )
+    tracked = bot.agent_runs["R1"]
+    assert (tracked["channel_id"], tracked["thread_ts"]) == ("C9", "300.1")
+    assert tracked["status_ts"] == "300.1"
+    bot._start_agent_monitor.assert_called_once_with(tracked)
+    bot.web_client.chat_postEphemeral.assert_not_awaited()

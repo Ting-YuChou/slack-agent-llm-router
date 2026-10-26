@@ -14,7 +14,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Awaitable, Callable, Dict, List, Optional, Any, Set
+from typing import Awaitable, Callable, Dict, List, Optional, Any, Set, Tuple
 from dataclasses import dataclass
 
 from slack_sdk.web.async_client import AsyncWebClient
@@ -411,6 +411,26 @@ def _agent_task_echo(task: str) -> str:
     return f"\nYour task was:\n```{task}```"
 
 
+def _is_complete_agent_run_record(record: Any) -> bool:
+    """Whether a persisted run record names its run, session, thread and owner."""
+    return isinstance(record, dict) and all(
+        record.get(field)
+        for field in (
+            "run_id",
+            "session_id",
+            "channel_id",
+            "thread_ts",
+            "owner_user_id",
+        )
+    )
+
+
+def _is_agent_command_text(command_text: str) -> bool:
+    """Whether an `/llm` or `!llm` payload is an `agent` command."""
+    parts = command_text.split(maxsplit=1)
+    return bool(parts) and parts[0].lower() == "agent"
+
+
 def _agent_auth_error_text(exc: AgentRuntimeError, owner_text: str) -> str:
     """Tell a bad bot token (`unauthorized`) apart from a non-owner (`*_forbidden`)."""
     if exc.code == "unauthorized":
@@ -602,7 +622,7 @@ class RedisSlackStateStore(SlackStateStore):
         self,
         user_id: str,
         user_payload: Dict[str, Any],
-        rate_limit_payload: List[float],
+        rate_limit_payload: List[Any],
     ):
         """Persist one user's preferences/tier and rate-limit counters."""
         if not self.client:
@@ -712,6 +732,18 @@ class RedisSlackStateStore(SlackStateStore):
             await self._sadd(self.agent_runs_index_key, run_id)
         except Exception as exc:
             logger.warning("Failed to persist Slack agent run to Redis: %s", exc)
+
+    async def load_agent_run_state(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """One persisted Pi agent run, which another bot process may track."""
+        if not self.client:
+            return None
+
+        try:
+            payload = await self._get_json(self._agent_run_key(run_id))
+        except Exception as exc:
+            logger.warning("Failed to load Slack agent run from Redis: %s", exc)
+            return None
+        return payload if isinstance(payload, dict) else None
 
     async def delete_agent_run_state(self, run_id: str):
         """Stop tracking one Pi agent run across restarts."""
@@ -830,22 +862,22 @@ class RedisSlackStateStore(SlackStateStore):
         return incoming_payload
 
     async def _merge_rate_limits(
-        self, user_id: str, incoming_payload: List[float]
-    ) -> List[float]:
+        self, user_id: str, incoming_payload: List[Any]
+    ) -> List[Any]:
         current_payload = await self._get_json(self._rate_limit_key(user_id))
-        merged_values = []
+        merged_values: List[Any] = []
 
         if isinstance(current_payload, list):
-            merged_values.extend(float(value) for value in current_payload)
+            merged_values.extend(current_payload)
         if incoming_payload:
-            merged_values.extend(float(value) for value in incoming_payload)
+            merged_values.extend(incoming_payload)
 
         if not merged_values:
             return []
 
         cutoff = time.time() - 3600
-        deduped = sorted({value for value in merged_values if value > cutoff})
-        return deduped
+        deduped = sorted(set(_rate_limit_entries(merged_values, cutoff)))
+        return [_rate_limit_entry(*entry) for entry in deduped]
 
     def _is_payload_newer(
         self,
@@ -955,6 +987,34 @@ class SlackFetchedContext:
     error: Optional[str] = None
 
 
+RATE_LIMIT_CHAT = "chat"
+RATE_LIMIT_AGENT = "agent"
+
+
+def _rate_limit_entry(at: float, bucket: str) -> Any:
+    """One counted request; a chat request stays a bare timestamp.
+
+    That is the shape saved before Agent requests had a bucket of their own.
+    """
+    return at if bucket == RATE_LIMIT_CHAT else {"at": at, "bucket": bucket}
+
+
+def _read_rate_limit_entry(entry: Any) -> Optional[Tuple[float, str]]:
+    """The (timestamp, bucket) of a counted request; None when malformed."""
+    try:
+        if isinstance(entry, dict):
+            return float(entry["at"]), str(entry.get("bucket") or RATE_LIMIT_CHAT)
+        return float(entry), RATE_LIMIT_CHAT
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _rate_limit_entries(values: Any, since: float) -> List[Tuple[float, str]]:
+    """The well-formed counted requests after `since`."""
+    entries = (_read_rate_limit_entry(value) for value in values or [])
+    return [entry for entry in entries if entry is not None and entry[0] > since]
+
+
 class UserManager:
     """Manages user data and preferences"""
 
@@ -985,41 +1045,53 @@ class UserManager:
         except ValueError:
             return UserTier.FREE
 
-    def check_rate_limit(self, user_id: str, config: Dict[str, Any]) -> bool:
-        """Check if user is within rate limits"""
+    def check_rate_limit(
+        self, user_id: str, config: Dict[str, Any], bucket: str = RATE_LIMIT_CHAT
+    ) -> bool:
+        """Check if user is within rate limits.
+
+        Chat queries and Agent requests fill separate buckets with the same
+        limits, so a burst of one never blocks the other. Each request still
+        counts as one Slack query in the user's list.
+        """
         current_time = time.time()
         hour_window = current_time - 3600  # 1 hour window
 
-        if user_id not in self.rate_limits:
-            self.rate_limits[user_id] = []
-
         # Clean old requests
-        self.rate_limits[user_id] = [
-            req_time for req_time in self.rate_limits[user_id] if req_time > hour_window
-        ]
+        entries = _rate_limit_entries(self.rate_limits.get(user_id), hour_window)
+        self.rate_limits[user_id] = [_rate_limit_entry(*entry) for entry in entries]
+        bucket_requests = [at for at, kind in entries if kind == bucket]
 
         # Check limits
         requests_per_hour = config.get("requests_per_hour", 100)
         burst_requests = config.get("burst_requests", 5)
 
         # Check hourly limit
-        if len(self.rate_limits[user_id]) >= requests_per_hour:
+        if len(bucket_requests) >= requests_per_hour:
             return False
 
         # Check burst limit (last 5 minutes)
         burst_window = current_time - 300  # 5 minutes
         recent_requests = [
-            req_time
-            for req_time in self.rate_limits[user_id]
-            if req_time > burst_window
+            req_time for req_time in bucket_requests if req_time > burst_window
         ]
 
         if len(recent_requests) >= burst_requests:
             return False
 
         # Add current request
-        self.rate_limits[user_id].append(current_time)
+        self.rate_limits[user_id].append(_rate_limit_entry(current_time, bucket))
         return True
+
+    def requests_since(
+        self, user_id: str, since: float, bucket: str = RATE_LIMIT_CHAT
+    ) -> List[float]:
+        """Times of the user's counted requests in one bucket after `since`."""
+        return [
+            at
+            for at, kind in _rate_limit_entries(self.rate_limits.get(user_id), since)
+            if kind == bucket
+        ]
 
     def get_user_preferences(self, user_id: str) -> Dict[str, Any]:
         """Get user preferences"""
@@ -1565,18 +1637,37 @@ class SlackMessageHandler:
                 result = await runtime.resume(args[1], user_id, **keyed("resume"))
             except AgentRuntimeError:
                 return "Workflow cannot resume. Check ownership, baseline, artifacts and whether writing already started."
-            if not thread_ts:
+            resumed = f"🛠️ Workflow `{result['run_id']}` resumed."
+            # The run goes on in its own thread wherever this came from; a
+            # slash command carries no thread at all.
+            home = await self.bot._agent_run_home(result, user_id) or {}
+            run_channel = home.get("channel_id") or channel_id
+            run_thread = home.get("thread_ts") or thread_ts
+            status_ts = None
+            if not run_thread and hasattr(client, "chat_postMessage"):
+                # Nothing names its thread, so like a CI repair it opens one here.
+                started = await client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"🛠️ Resuming workflow `{result['run_id']}`…",
+                )
+                run_thread = status_ts = started.get("ts")
+            if not run_thread:
                 return f"Workflow `{result['run_id']}` resumed. Use `agent status` to inspect it."
             tracked = self.bot._track_agent_run(
                 result,
-                team_id=team_id or "unknown-team",
-                channel_id=channel_id,
-                thread_ts=thread_ts,
+                team_id=home.get("team_id") or team_id or "unknown-team",
+                channel_id=run_channel,
+                thread_ts=run_thread,
                 owner_user_id=user_id,
+                mode=home.get("mode"),
             )
-            resumed = f"🛠️ Workflow `{result['run_id']}` resumed."
-            shown = await _show_agent_status(client, tracked, resumed)
+            shown = await _show_agent_status(client, tracked, resumed, status_ts)
             self.bot._start_agent_monitor(tracked)
+            if (run_channel, run_thread) != (channel_id, thread_ts) and not status_ts:
+                return (
+                    f"{resumed} Its progress, approvals and result appear in its "
+                    f"thread in <#{run_channel}>."
+                )
             return "" if shown else resumed
 
         if action in {"repair-ci", "publish-repair"}:
@@ -2857,7 +2948,8 @@ class SlackBot:
         self.active_thread_timeout = self.conversation_manager.session_timeout
         self.agent_threads: Dict[str, Dict[str, Any]] = {}
         self.agent_runs: Dict[str, Dict[str, Any]] = {}
-        self.agent_user_runs: Dict[str, Dict[str, Any]] = {}
+        # Each owner's tracked sessions, one per thread, the latest last.
+        self.agent_user_runs: Dict[str, List[Dict[str, Any]]] = {}
         self.agent_monitoring: Set[str] = set()
         # Ordered so the oldest claims are evicted first.
         self.posted_ci_jobs: Dict[str, None] = {}
@@ -3309,7 +3401,7 @@ class SlackBot:
             "mode": mode,
         }
         self.agent_threads[self._thread_key(channel_id, thread_ts)] = tracked
-        self.agent_user_runs[session["owner_user_id"]] = tracked
+        self._remember_agent_session(tracked)
         self._mark_thread_active(channel_id, thread_ts)
         return tracked
 
@@ -3355,8 +3447,9 @@ class SlackBot:
         if callable(message_handler_consumes_query_quota):
             consumes_query_quota = message_handler_consumes_query_quota(command_text)
         if consumes_query_quota:
-            rate_limit_config = self._get_rate_limit_config_for_user(user_id)
-            if not self.user_manager.check_rate_limit(user_id, rate_limit_config):
+            if not self._within_rate_limit(
+                user_id, agent=_is_agent_command_text(command_text)
+            ):
                 await self._post_command_response(
                     channel_id,
                     user_id,
@@ -3402,8 +3495,9 @@ class SlackBot:
             user_prefs = self.user_manager.get_user_preferences(user_id)
 
             if self._is_query_event(event):
-                rate_limit_config = self._get_rate_limit_config_for_user(user_id)
-                if not self.user_manager.check_rate_limit(user_id, rate_limit_config):
+                if not self._within_rate_limit(
+                    user_id, agent=self._is_agent_request(event)
+                ):
                     await self._send_rate_limit_message(channel_id, user_id)
                     if user_state_changed:
                         await self._persist_user_state(user_id)
@@ -3821,12 +3915,8 @@ class SlackBot:
 
     async def get_user_stats(self, user_id: str) -> Dict[str, Any]:
         """Get user statistics"""
-        rate_limit_window = time.time() - 3600
-        recent_requests = [
-            request_time
-            for request_time in self.user_manager.rate_limits.get(user_id, [])
-            if request_time > rate_limit_window
-        ]
+        # The quota shown is the chat bucket's; Agent requests have their own.
+        recent_requests = self.user_manager.requests_since(user_id, time.time() - 3600)
         rate_limit_config = self._get_rate_limit_config_for_user(user_id)
         remaining_requests = max(
             0,
@@ -4124,11 +4214,27 @@ class SlackBot:
     def _register_agent_run(self, tracked: Dict[str, Any]) -> None:
         channel_id = tracked["channel_id"]
         thread_ts = tracked["thread_ts"]
-        owner_user_id = tracked["owner_user_id"]
         self.agent_threads[self._thread_key(channel_id, thread_ts)] = tracked
         self.agent_runs[tracked["run_id"]] = tracked
-        self.agent_user_runs[owner_user_id] = tracked
+        self._remember_agent_session(tracked)
         self._mark_thread_active(channel_id, thread_ts)
+
+    def _agent_sessions_of(self, user_id: str) -> List[Dict[str, Any]]:
+        """The owner's tracked sessions, one per thread, the latest last."""
+        sessions = self.agent_user_runs.get(user_id)
+        if isinstance(sessions, dict):
+            # One record per owner, the shape this map held before it kept them all.
+            sessions = self.agent_user_runs[user_id] = [sessions]
+        return sessions or []
+
+    def _remember_agent_session(self, tracked: Dict[str, Any]) -> None:
+        """Make a run its owner's latest session, replacing its thread's older one."""
+        thread = (tracked.get("channel_id"), tracked.get("thread_ts"))
+        self.agent_user_runs[tracked["owner_user_id"]] = [
+            other
+            for other in self._agent_sessions_of(tracked["owner_user_id"])
+            if (other.get("channel_id"), other.get("thread_ts")) != thread
+        ] + [tracked]
 
     @staticmethod
     def _agent_run_record(tracked: Dict[str, Any]) -> Dict[str, Any]:
@@ -4188,6 +4294,33 @@ class SlackBot:
 
         await self._persist_state()
 
+    async def _agent_run_home(
+        self, accepted: Dict[str, Any], owner_user_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """A Slack record placing a run: its own, or one of its session's.
+
+        A session lives in one thread. The runtime keeps no Slack thread for a
+        run, so tracked state answers, then the shared Redis state another bot
+        process may have written; a record found there is tracked from now on,
+        so its posted approvals are not posted again.
+        """
+        known = self.agent_runs.get(accepted["run_id"])
+        if known is None:
+            known = next(
+                (
+                    tracked
+                    for tracked in reversed(self._agent_sessions_of(owner_user_id))
+                    if tracked.get("session_id") == accepted.get("session_id")
+                ),
+                None,
+            )
+        if known is None and self._uses_granular_redis_state():
+            record = await self.state_store.load_agent_run_state(accepted["run_id"])
+            if _is_complete_agent_run_record(record):
+                known = self._agent_run_record(record)
+                self._register_agent_run(known)
+        return known
+
     def _agent_run_for(
         self,
         user_id: str,
@@ -4198,7 +4331,8 @@ class SlackBot:
             tracked = self.agent_threads.get(self._thread_key(channel_id, thread_ts))
             if tracked and tracked.get("owner_user_id") == user_id:
                 return tracked
-        return self.agent_user_runs.get(user_id)
+        sessions = self._agent_sessions_of(user_id)
+        return sessions[-1] if sessions else None
 
     def _agent_cap_message(
         self,
@@ -4284,8 +4418,16 @@ class SlackBot:
             ),
             None,
         )
-        if self.agent_user_runs.get(tracked.get("owner_user_id")) is tracked:
-            self.agent_user_runs.pop(tracked.get("owner_user_id"), None)
+        owner_user_id = tracked.get("owner_user_id") or ""
+        sessions = [
+            other
+            for other in self._agent_sessions_of(owner_user_id)
+            if other is not tracked
+        ]
+        if sessions:
+            self.agent_user_runs[owner_user_id] = sessions
+        else:
+            self.agent_user_runs.pop(owner_user_id, None)
 
     @staticmethod
     def _agent_approval_blocks(approval: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -4931,8 +5073,7 @@ class SlackBot:
         if not (submission.continue_session and submission.comment):
             return
 
-        rate_limit_config = self._get_rate_limit_config_for_user(user_id)
-        if not self.user_manager.check_rate_limit(user_id, rate_limit_config):
+        if not self._within_rate_limit(user_id, agent=True):
             await self._post_command_response(
                 nonce.channel_id, user_id, self._build_rate_limit_message(user_id)
             )
@@ -5089,8 +5230,7 @@ class SlackBot:
             )
             return
 
-        rate_limit_config = self._get_rate_limit_config_for_user(user_id)
-        if not self.user_manager.check_rate_limit(user_id, rate_limit_config):
+        if not self._within_rate_limit(user_id, agent=True):
             await self._post_command_response(
                 nonce.channel_id, user_id, self._build_rate_limit_message(user_id)
             )
@@ -5533,6 +5673,29 @@ class SlackBot:
         """Return whether a Slack event should consume query quota."""
         return self._is_query_text(event.get("text", "")) or bool(event.get("files"))
 
+    def _is_agent_request(self, event: Dict[str, Any]) -> bool:
+        """Whether a user's message goes to Agent mode rather than chat.
+
+        That is an `agent` command, or any other message in an Agent thread,
+        which continues its session.
+        """
+        if event.get("subtype") or event.get("bot_id"):
+            return False
+        text = event.get("text") or ""
+        if self.bot_user_id:
+            text = text.replace(f"<@{self.bot_user_id}>", "")
+        text = text.strip()
+        extract_command_text = getattr(
+            self.message_handler, "extract_prefixed_command_text", None
+        )
+        if callable(extract_command_text):
+            command_text = extract_command_text(text)
+            if command_text is not None:
+                return _is_agent_command_text(command_text)
+        return bool(text or event.get("files")) and self._is_agent_thread(
+            event.get("channel"), event.get("thread_ts")
+        )
+
     def _synchronize_user_tier(self, user_id: Optional[str]) -> bool:
         """Apply configured user-tier defaults/overrides to the in-memory state."""
         return self.user_manager.ensure_user_record(user_id or "")
@@ -5556,6 +5719,14 @@ class SlackBot:
         """Resolve rate-limit settings for the user's current tier."""
         return self._get_rate_limit_config_for_tier(
             self.user_manager.get_user_tier(user_id)
+        )
+
+    def _within_rate_limit(self, user_id: str, *, agent: bool) -> bool:
+        """Count one request in the user's chat or Agent bucket, unless it is full."""
+        return self.user_manager.check_rate_limit(
+            user_id,
+            self._get_rate_limit_config_for_user(user_id),
+            **({"bucket": RATE_LIMIT_AGENT} if agent else {}),
         )
 
     def _format_tier_limit_summary(self) -> str:
@@ -5682,6 +5853,12 @@ class SlackBot:
                     await self._handle_agent_interactive(item.payload)
                 elif item.kind == "agent_view":
                     await self._handle_agent_view_submission(item.payload)
+                elif self._is_agent_request(item.payload):
+                    # Bootstrap and create_session can take minutes, like a
+                    # slash start's; the thread gets the status or the error.
+                    self._spawn_background_task(
+                        self._handle_event(item.payload), "pi_agent_start"
+                    )
                 else:
                     await self._handle_event(item.payload)
             except asyncio.CancelledError:
@@ -6103,7 +6280,10 @@ class SlackBot:
 
         self.user_manager.users = dict(snapshot.get("users", {}))
         self.user_manager.rate_limits = {
-            user_id: [float(value) for value in values]
+            user_id: [
+                _rate_limit_entry(*entry)
+                for entry in _rate_limit_entries(values, float("-inf"))
+            ]
             for user_id, values in snapshot.get("rate_limits", {}).items()
         }
         self.conversation_manager.conversations = {
@@ -6118,16 +6298,7 @@ class SlackBot:
             str(run_id) for run_id in snapshot.get("posted_ci_jobs", [])
         )
         for record in snapshot.get("agent_runs", {}).values():
-            if not isinstance(record, dict) or not all(
-                record.get(field)
-                for field in (
-                    "run_id",
-                    "session_id",
-                    "channel_id",
-                    "thread_ts",
-                    "owner_user_id",
-                )
-            ):
+            if not _is_complete_agent_run_record(record):
                 continue
             self._register_agent_run(self._agent_run_record(record))
 
