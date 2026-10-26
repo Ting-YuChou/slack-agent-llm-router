@@ -114,6 +114,34 @@ python scripts/export_agent_feedback.py --input rows.json -   # offline, to stdo
 
 Each JSONL line has `draft_id` (sha256 of the run id), `reason`, `reason_category`, `comment`, `prompt`, `changed_files`, `grader_status`, `verification_status`, `prompts_version` and `created_at`. User, Slack channel/thread and run ids are never written, and comment, prompt and paths pass through the eval redaction patterns. Review each draft by hand before turning it into `eval/tasks/<id>/` with a fixture and oracle.
 
+A draft becomes an eval task in four steps:
+
+1. **Export** the drafts as above and pick one.
+2. **Write the task by hand.** A draft holds no repository and no expected behaviour, so write these yourself:
+   - a minimal fixture that reproduces the problem;
+   - a hidden oracle that checks what the owner asked for;
+   - a reference fix, as files laid over the fixture;
+   - a spec: a JSON object with `prompt`, `profile` and `oracle.argv`. It may also set `description`, `task_mode`, `workflow_mode`, `expect` and the run-signal fields, which follow the same rules as in `eval/tasks/*/task.json`.
+
+   Nothing from the draft becomes the prompt, the profile or the oracle.
+3. **Promote** with `scripts/promote_feedback_task.py`. Run it with `--dry-run` first to see the `task.json` and file list without writing anything:
+
+   ```sh
+   python scripts/promote_feedback_task.py drafts.jsonl --draft-id 4e65d3 \
+     --name cart-total-qty --spec spec.json --fixture fixture/ \
+     --oracle oracle/ --solution fix/ --dry-run
+   ```
+
+   It writes `eval/tasks/<name>/`, or `eval/repair-tasks/<name>/` with `--suite repair`, only when all of these hold:
+   - `--oracle` is given;
+   - no task of that name exists in either suite;
+   - the task loads with `agent_eval.load_task`;
+   - `requires_repair` matches the suite;
+   - the oracle fails on the unmodified fixture and passes with the fix. These two oracle runs happen locally, not in the verification image.
+
+   The draft's comment and request appear only in the description, each quoted as one bounded line, with Slack ids, tokens and control characters removed.
+4. **Commit and evaluate.** Commit the task. A main-suite task also goes into the task map in `test_repository_eval_tasks_are_valid_and_match_the_plan`. The next live eval of that suite runs the task and records it in `eval/results/`. The baseline takes it in only through `--update-baseline`. A live eval spends model budget, so run one only when asked.
+
 ## Validation and operating limits
 
 Local suites cover timing boundaries, candidate hashes, fresh grader settings, bounded repairs, no commit on unknown results, owner approvals, durable inbox replay, budget reservations and recovery after PR creation times out. Node tests are included in GitHub CI. Tests that need Docker, Kafka or ClickHouse are opt-in locally; CI runs the Docker suites in `agent-docker.yml` and the Kafka/ClickHouse integration tests in the `agent-integration` job of `tests.yml`.
