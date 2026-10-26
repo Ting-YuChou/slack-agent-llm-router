@@ -318,15 +318,17 @@ PYTHON=.venv/bin/python make demo-slack
 
 ### 進度狀態訊息
 
-在頻道裡直接用 `/llm agent <task>` 啟動時，bot 會先貼一則 `Pi coding agent is preparing an isolated worktree…`，這則訊息就是 agent thread 的開頭。run 開始後，它會改寫成 `Pi coding agent started run …`，加上模式說明和一行進度：
+每個 run 都有一則進度狀態訊息，bot 會持續改寫它。在頻道裡直接用 `/llm agent <task>` 啟動時，bot 會先貼一則 `Pi coding agent is preparing an isolated worktree…`，這則訊息就是 agent thread 的開頭。run 開始後，它會改寫成 `Pi coding agent started run …`，加上模式說明和一行進度：
 
 ```text
-Phase: *implementation* · Tools: 3 · Turns: 2 · Cost: $0.012 · Last tool: `read`
+Phase: *implementation* · Tools: 3 · Turns: 2 · Cost: $0.012 · Elapsed: 2m 05s · Last tool: `read`
 ```
 
 - 進度大約每 10 秒更新一次，run 結束時一定會寫入最後狀態。
+- `Elapsed` 是從 run 開始到現在經過的時間。
+- 在 thread 裡啟動的 run，會在 thread 裡回覆一則狀態訊息（例如 `Pi coding agent started run …`），一樣會更新進度。包含：追加指示、用 @LLM Router Demo 或 `!llm agent` 啟動、Needs changes 的續跑，以及 `agent resume`。
+- 「Run Pi Agent」shortcut 會把那則 `loading the Slack thread snapshot…` 訊息改寫成狀態訊息，不會另外再貼一則。
 - 按 **Resume from patch** 之後，thread 裡那則 `resumed from the kept patch` 訊息也會這樣更新。
-- **其他啟動方式沒有進度訊息**，只會在 thread 裡貼出交付卡片和結果。包含：在 thread 裡的追加指示、用 @LLM Router Demo 啟動、「Run Pi Agent」shortcut，以及 Needs changes 的續跑。
 
 ### 交付卡片（Deliver / Discard）
 

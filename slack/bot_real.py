@@ -12,7 +12,7 @@ import random
 import re
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Dict, List, Optional, Any, Set
 from dataclasses import dataclass
@@ -258,6 +258,66 @@ def _format_agent_status_line(result: Dict[str, Any]) -> str:
     if result.get("patch_retained") is True:
         line = f"{line}\nThe undelivered patch was kept on the runtime host."
     return line
+
+
+def _agent_run_started_at(run: Dict[str, Any]) -> Optional[float]:
+    """The run's start in epoch seconds, from the runtime's `created_at`."""
+    value = run.get("created_at")
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        started = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return started.timestamp()
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+async def _show_agent_status(
+    client: Any,
+    tracked: Dict[str, Any],
+    text: str,
+    status_ts: Optional[str] = None,
+) -> bool:
+    """Make a Slack message the run's status message, which its monitor keeps current.
+
+    Rewrites the message at `status_ts` when given, otherwise posts a reply in
+    the run's thread. Returns False when Slack did not take the message.
+    """
+    try:
+        if status_ts:
+            if not hasattr(client, "chat_update"):
+                return False
+            await client.chat_update(
+                channel=tracked["channel_id"], ts=status_ts, text=text
+            )
+        else:
+            if not hasattr(client, "chat_postMessage"):
+                return False
+            posted = await client.chat_postMessage(
+                channel=tracked["channel_id"], thread_ts=tracked["thread_ts"], text=text
+            )
+            status_ts = posted.get("ts") if hasattr(posted, "get") else None
+    except Exception:
+        logger.warning("Agent status message could not be posted", exc_info=True)
+        return False
+    if not isinstance(status_ts, str) or not status_ts:
+        return False
+    tracked["status_ts"] = status_ts
+    tracked["status_text"] = text
+    return True
 
 
 def _format_grader_finding(finding: Dict[str, Any]) -> str:
@@ -1514,8 +1574,10 @@ class SlackMessageHandler:
                 thread_ts=thread_ts,
                 owner_user_id=user_id,
             )
+            resumed = f"🛠️ Workflow `{result['run_id']}` resumed."
+            shown = await _show_agent_status(client, tracked, resumed)
             self.bot._start_agent_monitor(tracked)
-            return f"Workflow `{result['run_id']}` resumed."
+            return "" if shown else resumed
 
         if action in {"repair-ci", "publish-repair"}:
             ci_args = list(args)
@@ -1676,6 +1738,11 @@ class SlackMessageHandler:
                 except AgentBootstrapFetchError as exc:
                     return f"Agent mode did not start because Slack thread context could not be loaded: `{exc}`."
 
+        note = (
+            f"Agent started without prior Slack thread context: `{bootstrap.error}`."
+            if bootstrap.error
+            else ""
+        )
         response = await self._start_agent_prompt(
             bootstrap.prompt,
             user_id,
@@ -1688,12 +1755,10 @@ class SlackMessageHandler:
             request_id=request_id,
             **({"workflow_mode": workflow_mode} if workflow_mode else {}),
             **({"task_mode": task_mode} if task_mode else {}),
+            **({"status_note": note} if note else {}),
         )
-        if bootstrap.error:
-            response += (
-                "\nAgent started without prior Slack thread context: "
-                f"`{bootstrap.error}`."
-            )
+        if note and response:
+            response += f"\n{note}"
         return response
 
     async def _start_agent_prompt(
@@ -1710,8 +1775,16 @@ class SlackMessageHandler:
         workflow_mode: Optional[str] = None,
         task_mode: Optional[str] = None,
         request_id: Optional[str] = None,
+        status_ts: Optional[str] = None,
+        status_note: str = "",
     ) -> str:
-        """Start a run unless the owner already has their maximum of active runs."""
+        """Start a run unless the owner already has their maximum of active runs.
+
+        The run's status message is the message at `status_ts` when given, the
+        new root message of a run started outside a thread, or else a new reply
+        in the thread; `status_note` is added to it. Returns "" once the status
+        message shows the start, otherwise the reply for the caller to post.
+        """
         cap_message = getattr(self.bot, "_agent_cap_message", None)
         reserve = getattr(self.bot, "_reserve_agent_start", None)
         if not callable(cap_message) or not callable(reserve):
@@ -1736,6 +1809,8 @@ class SlackMessageHandler:
                 workflow_mode=workflow_mode,
                 task_mode=task_mode,
                 request_id=request_id,
+                status_ts=status_ts,
+                status_note=status_note,
             )
         finally:
             if reservation is not None:
@@ -1755,6 +1830,8 @@ class SlackMessageHandler:
         workflow_mode: Optional[str] = None,
         task_mode: Optional[str] = None,
         request_id: Optional[str] = None,
+        status_ts: Optional[str] = None,
+        status_note: str = "",
     ) -> str:
         runtime = getattr(self.bot, "agent_runtime_client", None)
         if runtime is None:
@@ -1856,33 +1933,32 @@ class SlackMessageHandler:
                 owner_user_id=user_id,
                 mode=effective_task_mode,
             )
-            if (
-                root_message_ts
-                and client is not None
-                and hasattr(client, "chat_update")
-            ):
-                started_text = (
-                    f"🛠️ Pi coding agent started run `{result['run_id']}`"
-                    f"{f' with `{model}`' if model else ''}.\n"
-                    f"{mode_summary}\n"
-                    + (
-                        "Read-only discussion: no edits, verification or commit."
-                        if effective_task_mode == "discuss"
-                        else (
-                            "Edits in this worktree run automatically; risky shell "
-                            "commands need approval here, and nothing is committed "
-                            "until the owner approves the final diff."
-                        )
+            started_text = (
+                f"🛠️ Pi coding agent started run `{result['run_id']}`"
+                f"{f' with `{model}`' if model else ''}.\n"
+                f"{mode_summary}\n"
+                + (
+                    "Read-only discussion: no edits, verification or commit."
+                    if effective_task_mode == "discuss"
+                    else (
+                        "Edits in this worktree run automatically; risky shell "
+                        "commands need approval here, and nothing is committed "
+                        "until the owner approves the final diff."
                     )
                 )
-                await client.chat_update(
-                    channel=channel_id, ts=root_message_ts, text=started_text
+                + (f"\n{status_note}" if status_note else "")
+            )
+            target_ts = root_message_ts or status_ts
+            if tracked.get("status_ts") and not target_ts:
+                # The runtime replayed a start it already accepted: same run,
+                # same status message.
+                shown = True
+            else:
+                shown = await _show_agent_status(
+                    client, tracked, started_text, target_ts
                 )
-                # The monitor keeps this message current with the run's progress.
-                tracked["status_ts"] = root_message_ts
-                tracked["status_text"] = started_text
             self.bot._start_agent_monitor(tracked)
-            if root_message_ts:
+            if shown or root_message_ts:
                 return ""
             return f"🛠️ Agent run `{result['run_id']}` started.\n{mode_summary}"
 
@@ -2795,7 +2871,8 @@ class SlackBot:
         self.agent_progress_interval_seconds = float(
             self.agent_config.get("progress_interval_seconds", 10)
         )
-        self.agent_progress_clock: Callable[[], float] = time.monotonic
+        # Wall-clock seconds, so elapsed time compares with the run's created_at.
+        self.agent_progress_clock: Callable[[], float] = time.time
         # How long a monitor keeps reattaching to a run it cannot reach: the
         # runtime's own deadline (PI_AGENT_DEADLINE_MS) bounds the run anyway.
         self.agent_run_deadline_seconds = float(
@@ -3341,6 +3418,9 @@ class SlackBot:
                 event, self.web_client
             )
 
+            state_changed = False
+            active_thread_key = None
+            agent_thread_ts = event.get("thread_ts") or event.get("ts")
             if response_text:
                 # Determine if we should reply in thread
                 thread_ts = None
@@ -3374,32 +3454,32 @@ class SlackBot:
                         channel=channel_id, text=response_text, thread_ts=thread_ts
                     )
 
-                state_changed = False
-                active_thread_key = None
                 if thread_ts:
                     self._mark_thread_active(channel_id, thread_ts)
                     state_changed = True
                     active_thread_key = self._thread_key(channel_id, thread_ts)
+            elif self._is_agent_thread(channel_id, agent_thread_ts):
+                # The handler posted the reply itself: an Agent run's status message.
+                state_changed = True
+                active_thread_key = self._thread_key(channel_id, agent_thread_ts)
 
-                query_event = self._is_query_event(event)
-                if query_event or user_state_changed:
-                    state_changed = True
+            query_event = self._is_query_event(event)
+            if query_event or user_state_changed:
+                state_changed = True
 
-                if state_changed:
-                    conversation_key = None
-                    if query_event:
-                        conversation_key = self._conversation_context_key(
-                            user_id=user_id,
-                            channel_id=channel_id,
-                            thread_ts=event.get("thread_ts") or event.get("ts"),
-                        )
-                    await self._persist_message_state(
-                        user_id=user_id
-                        if (query_event or user_state_changed)
-                        else None,
-                        conversation_key=conversation_key,
-                        active_thread_key=active_thread_key,
+            if state_changed:
+                conversation_key = None
+                if query_event:
+                    conversation_key = self._conversation_context_key(
+                        user_id=user_id,
+                        channel_id=channel_id,
+                        thread_ts=event.get("thread_ts") or event.get("ts"),
                     )
+                await self._persist_message_state(
+                    user_id=user_id if (query_event or user_state_changed) else None,
+                    conversation_key=conversation_key,
+                    active_thread_key=active_thread_key,
+                )
 
         except Exception as e:
             logger.error(f"Error processing message: {e}")
@@ -4030,9 +4110,14 @@ class SlackBot:
             "mode": mode,
             "posted_approval_ids": list(previous.get("posted_approval_ids", [])),
             "result_posted": False,
+            # Times the progress line when the runtime reports no created_at.
+            "tracked_at": self.agent_progress_clock(),
         }
         if previous.get("approval_cards"):
             tracked["approval_cards"] = dict(previous["approval_cards"])
+        for field in ("status_ts", "status_text"):
+            if previous.get(field):
+                tracked[field] = previous[field]
         self._register_agent_run(tracked)
         return tracked
 
@@ -4428,7 +4513,7 @@ class SlackBot:
             return
 
     @staticmethod
-    def _agent_progress_line(run: Dict[str, Any]) -> str:
+    def _agent_progress_line(run: Dict[str, Any], elapsed: float) -> str:
         try:
             cost = float(run.get("estimated_cost_usd") or 0)
         except (TypeError, ValueError):
@@ -4438,6 +4523,7 @@ class SlackBot:
             f" · Tools: {int(run.get('tool_count') or 0)}"
             f" · Turns: {int(run.get('turn_count') or 0)}"
             f" · Cost: ${cost:.3f}"
+            f" · Elapsed: {_format_elapsed(elapsed)}"
         )
         if run.get("last_tool"):
             line += f" · Last tool: `{str(run['last_tool'])[:80]}`"
@@ -4462,7 +4548,11 @@ class SlackBot:
             tracked.get("status_text")
             or f"🛠️ Pi coding agent run `{run.get('run_id')}`."
         )
-        text = f"{header}\n{self._agent_progress_line(run)}"
+        started = _agent_run_started_at(run)
+        if started is None:
+            # A run restored after a bot restart is timed from its first update.
+            started = tracked.setdefault("tracked_at", now)
+        text = f"{header}\n{self._agent_progress_line(run, now - started)}"
         if text == tracked.get("progress_text"):
             return
         try:
@@ -5072,19 +5162,6 @@ class SlackBot:
                     )
                 return
 
-        response = await self.message_handler._start_agent_prompt(
-            bootstrap.prompt,
-            user_id,
-            nonce.channel_id,
-            self.web_client,
-            team_id=nonce.team_id,
-            thread_ts=nonce.thread_ts,
-            model=submission.model,
-            routing_text=submission.task,
-            request_id=f"shortcut:{nonce_value}",
-            task_mode=submission.task_mode,
-            workflow_mode=submission.workflow_mode,
-        )
         details = []
         if submission.include_context:
             details.append(
@@ -5104,12 +5181,27 @@ class SlackBot:
                     + "`."
                 )
             details.append("Loaded context was sent to the selected model provider.")
-        final_status = "\n".join(part for part in (response, *details) if part)
-        if status_ts:
+        # The loading message becomes the run's status message once it starts.
+        response = await self.message_handler._start_agent_prompt(
+            bootstrap.prompt,
+            user_id,
+            nonce.channel_id,
+            self.web_client,
+            team_id=nonce.team_id,
+            thread_ts=nonce.thread_ts,
+            model=submission.model,
+            routing_text=submission.task,
+            request_id=f"shortcut:{nonce_value}",
+            task_mode=submission.task_mode,
+            workflow_mode=submission.workflow_mode,
+            status_ts=status_ts,
+            status_note="\n".join(details),
+        )
+        if response and status_ts:
             await self.web_client.chat_update(
                 channel=nonce.channel_id,
                 ts=status_ts,
-                text=final_status,
+                text="\n".join(part for part in (response, *details) if part),
             )
 
     async def _handle_agent_interactive(self, payload: Dict[str, Any]):
@@ -5326,14 +5418,7 @@ class SlackBot:
             f"🛠️ Pi coding agent resumed from the kept patch of run `{run_id}` "
             f"as run `{accepted['run_id']}`."
         )
-        posted = await self.web_client.chat_postMessage(
-            channel=channel_id, thread_ts=thread_ts, text=text
-        )
-        status_ts = posted.get("ts") if hasattr(posted, "get") else None
-        if status_ts:
-            # The monitor keeps this message current with the run's progress.
-            resumed["status_ts"] = status_ts
-            resumed["status_text"] = text
+        await _show_agent_status(self.web_client, resumed, text)
         self._start_agent_monitor(resumed)
 
     @staticmethod
