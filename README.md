@@ -540,7 +540,9 @@ previous successful commit; when a patch was kept first, the result offers
 worktree with that patch applied). Agent failures never silently fall back to
 Chat mode. With `agent.feedback_enabled` (on in the demo config), every result
 also has **Accept result** and **Needs changes**; the latter asks for a reason
-and can continue the session with your comment.
+and can continue the session with your comment. Feedback is stored through
+telemetry, so the buttons are hidden while the runtime reports telemetry as
+disabled (`PI_AGENT_TELEMETRY_ENABLED=false`, as in the minimal demo).
 
 The demo bot keeps its Slack state in `.pi-agent-runtime/slack_state.json`
 (`slack.state_backend: file`), so a bot restart resumes monitoring runs it was

@@ -702,3 +702,95 @@ async def test_resume_from_patch_refusals_are_explained(code, expected):
     bot._start_agent_monitor.assert_not_called()
     assert "r2" not in bot.agent_runs
     assert expected in bot.web_client.chat_postEphemeral.await_args.kwargs["text"]
+
+
+def test_client_reports_feedback_capture_from_cached_health():
+    runtime = AgentRuntimeClient({})
+    assert runtime.cached_feedback_capture() is None
+    runtime._health_cache = {"status": "healthy", "telemetry": {"status": "disabled"}}
+    assert runtime.cached_feedback_capture() is False
+    runtime._health_cache = {"status": "healthy", "telemetry": {"depth": 0}}
+    assert runtime.cached_feedback_capture() is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture", [False, None])
+async def test_feedback_buttons_follow_runtime_feedback_capture(capture):
+    bot = _result_bot(feedback_enabled=True)
+    bot.agent_runtime_client = SimpleNamespace(
+        cached_feedback_capture=Mock(return_value=capture)
+    )
+    await SlackBot._post_agent_result(
+        bot,
+        {"run_id": "r", "channel_id": "c", "thread_ts": "t"},
+        {"run_id": "r", "status": "completed", "answer": "done"},
+    )
+    blocks = bot.web_client.chat_postMessage.await_args.kwargs["blocks"]
+    action_ids = [
+        element["action_id"]
+        for block in blocks
+        if block["type"] == "actions"
+        for element in block["elements"]
+    ]
+    if capture is False:
+        assert "pi_agent_accept_result" not in action_ids
+    else:
+        assert action_ids == ["pi_agent_accept_result", "pi_agent_needs_changes"]
+
+
+@pytest.mark.asyncio
+async def test_feedback_click_explains_that_capture_is_off():
+    runtime = SimpleNamespace(
+        feedback=AsyncMock(
+            side_effect=AgentRuntimeError(status=503, code="feedback_unavailable")
+        )
+    )
+    bot = SimpleNamespace(
+        agent_runtime_client=runtime,
+        web_client=SimpleNamespace(chat_postEphemeral=AsyncMock()),
+    )
+    await SlackBot._handle_agent_interactive(
+        bot,
+        {
+            "user": {"id": "owner"},
+            "channel": {"id": "channel"},
+            "actions": [
+                {
+                    "action_id": "pi_agent_accept_result",
+                    "value": json.dumps({"run_id": "r"}),
+                    "action_ts": "101.1",
+                }
+            ],
+        },
+    )
+    text = bot.web_client.chat_postEphemeral.await_args.kwargs["text"]
+    assert "telemetry" in text
+    assert "try again" not in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        AgentRuntimeError(status=503, code="feedback_unavailable"),
+        AgentRuntimeError(status=500, code="internal_error"),
+    ],
+)
+async def test_checked_continue_starts_the_run_even_when_feedback_is_not_recorded(
+    error,
+):
+    runtime = SimpleNamespace(feedback=AsyncMock(side_effect=error))
+    bot = _feedback_bot(runtime)
+    bot.message_handler._start_agent_prompt = AsyncMock(
+        return_value="🛠️ Agent run `r2` started."
+    )
+    view = (await _open_feedback_modal(bot))["view"]
+
+    await bot._handle_agent_view_submission(
+        _feedback_submission(view, continue_session=True)
+    )
+
+    assert "not" in bot.web_client.chat_postEphemeral.await_args.kwargs["text"]
+    call = bot.message_handler._start_agent_prompt.await_args
+    assert call.args == ("rerun the failing suite", "owner", "C1", bot.web_client)
+    assert call.kwargs["thread_ts"] == "100.1"

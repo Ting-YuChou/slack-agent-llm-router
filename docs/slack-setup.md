@@ -216,7 +216,9 @@ PI_AGENT_DELIVERY_TTL_MS=1800000
 
 ### 結果回饋按鈕
 
-`config/config.demo.yaml` 已經設定 `agent.feedback_enabled: true`，所以每個 agent 結果下方都會有 **Accept result** 和 **Needs changes**，見第 10 節。不想要的話改成 `false`。
+`config/config.demo.yaml` 已經設定 `agent.feedback_enabled: true`，見第 10 節。不想要的話改成 `false`。
+
+回饋要靠 telemetry 才存得下來。最小設定把 `PI_AGENT_TELEMETRY_ENABLED` 設成 `false`，runtime 就無法記錄回饋，所以 bot 不會在結果下方顯示 **Accept result** 和 **Needs changes**。要用這兩個按鈕，先啟動 observability 環境，再把 `PI_AGENT_TELEMETRY_ENABLED` 設成 `true`，見第 12 節。
 
 ---
 
@@ -287,7 +289,7 @@ PYTHON=.venv/bin/python make demo-slack
 | 9 | 在第 8 項按 **Download patch** | thread 裡出現 `pi-agent-<run id>.patch` 檔案，內容已遮掉秘密 |
 | 10 | 在第 8 項按 **Resume from patch** | thread 裡出現 `Pi coding agent resumed from the kept patch of run …`，這則訊息會持續更新進度。完成後又是一張交付卡片 |
 | 11 | 第 10 項還在跑時，在頻道輸入 `/llm agent 另一個任務` | 被拒絕：`You already have an active Agent run …`，見第 10 節「每人一個 run」 |
-| 12 | 在任一結果按 **Needs changes** | 跳出 modal。送出後看到 `Result feedback recorded.`。勾選「Continue this session with this comment」並填寫內容，會在同一個 thread 開始新的 run |
+| 12 | （需要 telemetry，最小設定看不到這個按鈕）在任一結果按 **Needs changes** | 跳出 modal。送出後看到 `Result feedback recorded.`。勾選「Continue this session with this comment」並填寫內容，會在同一個 thread 開始新的 run |
 | 13 | 請另一個人在 agent thread 裡回覆 | 對方會看到 `Only the user who started this Agent session can send coding prompts in this thread.` |
 | 14 | 對任一則訊息按「⋯」→ **Run Pi Agent** | 跳出 modal，可以輸入任務，選模型、模式（Implement / Discuss）、structured workflow，以及要不要帶入這個 thread 的內容 |
 | 15 | `/llm agent status`、`/llm agent stop`、`/llm agent close` | 顯示、停止你最近的 run，或關閉它的 session。關閉時 branch 和 commit 都會保留 |
@@ -355,7 +357,7 @@ implement 模式的 run 改完檔之後，不會直接 commit，而是在 thread
 
 每個 run 結束時，bot 會在 thread 裡貼出結果。結果下方可能有兩排按鈕：
 
-**Accept result** / **Needs changes**（`agent.feedback_enabled`，demo 預設開啟）
+**Accept result** / **Needs changes**（`agent.feedback_enabled`，demo 預設開啟；runtime 要開 telemetry 才會顯示）
 
 - 只有 run 的擁有者可以送出回饋，送出後會看到 `Result feedback recorded.`。
 - **Accept result** 直接記錄「接受」。
@@ -427,6 +429,7 @@ demo 設定 `slack.state_backend: file`，bot 會把狀態寫進 `.pi-agent-runt
 | 看不到「Run Pi Agent」shortcut | 改過 manifest 之後沒有 **Reinstall to Workspace** |
 | `This Agent form expired before it was submitted.` | 「Run Pi Agent」表單開啟超過 5 分鐘才送出。重新執行 shortcut，訊息裡會附上你剛才寫的任務 |
 | 按 **Download patch** 後看到 `The patch could not be uploaded to Slack.` | app 沒有 `files:write`。照第 2 步更新 manifest，並 **Reinstall to Workspace** |
+| 結果下方沒有 **Accept result** / **Needs changes**，或按了之後看到 `Result feedback was not recorded: … telemetry …` | runtime 沒開 telemetry，回饋存不下來。見第 7 步的「結果回饋按鈕」。勾選續跑的 Needs changes 仍然會開新的 run |
 | `You already have an active Agent run …` | 你已經有一個進行中的 run，包含還在等 Deliver / Discard 的。等它結束、按掉交付卡片，或用 `/llm agent stop` 停掉 |
 | 交付卡片 30 分鐘後失效 | 這是預期行為，錯誤碼是 `delivery_expired`。patch 會保留，可以 **Download patch** 或 **Resume from patch**。用 `PI_AGENT_DELIVERY_TTL_MS` 調整時限 |
 | 在 agent thread 裡回覆，bot 沒反應 | thread 閒置超過 2 小時後，直接回覆不會被處理。在 thread 裡 @LLM Router Demo 再說一次 |

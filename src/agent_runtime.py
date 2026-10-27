@@ -157,6 +157,16 @@ class AgentRuntimeClient:
         """Return the last healthy model allowlist without blocking a Slack trigger."""
         return configured_model_refs(self._health_cache)
 
+    def cached_feedback_capture(self) -> Optional[bool]:
+        """Whether the runtime can store result feedback; None before any health."""
+        if self._health_cache is None:
+            return None
+        # Feedback goes through telemetry, which reports a disabled status when off.
+        telemetry = self._health_cache.get("telemetry")
+        return not (
+            isinstance(telemetry, dict) and telemetry.get("status") == "disabled"
+        )
+
     async def health(self) -> bool:
         payload = await self.health_details()
         return payload is not None and payload.get("status") == "healthy"

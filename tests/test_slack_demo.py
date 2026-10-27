@@ -832,3 +832,32 @@ async def test_setup_guide_lists_every_agent_subcommand_in_the_help():
     assert [
         option for option in subcommands if f"/llm agent {option}" not in guide
     ] == []
+
+
+@pytest.mark.asyncio
+async def test_channel_allowlist_lookup_only_asks_for_public_channels():
+    # The demo app has channels:read but no groups:read; asking for private
+    # channels fails with missing_scope and leaves the allowlist unresolved.
+    bot = SlackBot({"channels": ["ai-testing"]}, inference_engine=SimpleNamespace())
+    bot.web_client = SimpleNamespace(
+        conversations_list=AsyncMock(
+            return_value={
+                "channels": [{"id": "C123", "name": "ai-testing"}],
+                "response_metadata": {},
+            }
+        )
+    )
+
+    await bot._resolve_allowed_channels()
+
+    assert bot.web_client.conversations_list.await_args.kwargs["types"] == (
+        "public_channel"
+    )
+    assert bot.allowed_channel_ids == {"C123"}
+    assert bot.allowed_channel_names == set()
+
+
+def test_setup_guide_says_result_feedback_needs_telemetry():
+    guide = SETUP_GUIDE.read_text(encoding="utf-8")
+    feedback = guide.split("### 結果回饋按鈕", 1)[1].split("\n## ", 1)[0]
+    assert "PI_AGENT_TELEMETRY_ENABLED" in feedback
