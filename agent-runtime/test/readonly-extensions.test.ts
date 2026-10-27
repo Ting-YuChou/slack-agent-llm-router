@@ -12,7 +12,7 @@ async function loadExtension(name: string, env: Record<string, string>) {
   const previous = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
   Object.assign(process.env, env);
   try {
-    const extension = await import(`${pathToFileURL(path.resolve(import.meta.dirname, `../../extensions/${name}.ts`)).href}?${Math.random()}`);
+    const extension = await import(pathToFileURL(path.resolve(import.meta.dirname, `../../extensions/${name}.ts`)).href);
     const handlers = new Map<string, (...args: any[]) => any>();
     extension.default({ on: (event: string, handler: (...args: any[]) => any) => handlers.set(event, handler), registerTool: () => undefined });
     const ctx = { cwd: SESSION_CWD, abort: () => undefined };
@@ -69,7 +69,7 @@ test('grader submit_grade rejects evidence the snapshot does not contain', async
   process.env.PI_AGENT_WORKTREE = root;
   process.env.PI_AGENT_GRADER_JSON = JSON.stringify({ candidate_hash: 'h', rubric: ['correct'] });
   try {
-    const extension = await import(`${pathToFileURL(path.resolve(import.meta.dirname, '../../extensions/grader.ts')).href}?${Math.random()}`);
+    const extension = await import(pathToFileURL(path.resolve(import.meta.dirname, '../../extensions/grader.ts')).href);
     extension.default({ on: () => undefined, registerTool: (tool: any) => tools.set(tool.name, tool) });
   } finally {
     if (previous.w === undefined) delete process.env.PI_AGENT_WORKTREE; else process.env.PI_AGENT_WORKTREE = previous.w;
@@ -111,7 +111,7 @@ test('workflow agent keeps the submit tool reachable after the read budget is sp
   process.env.PI_AGENT_WORKFLOW_JSON = JSON.stringify({ role: 'code_explorer', paths: ['src'] });
   const handlers = new Map<string, (...args: any[]) => any>();
   try {
-    const extension = await import(`${pathToFileURL(path.resolve(import.meta.dirname, '../../extensions/workflow-agent.ts')).href}?${Math.random()}`);
+    const extension = await import(pathToFileURL(path.resolve(import.meta.dirname, '../../extensions/workflow-agent.ts')).href);
     extension.default({ on: (event: string, handler: (...args: any[]) => any) => handlers.set(event, handler), registerTool: () => undefined });
   } finally {
     if (previous.w === undefined) delete process.env.PI_AGENT_WORKTREE; else process.env.PI_AGENT_WORKTREE = previous.w;

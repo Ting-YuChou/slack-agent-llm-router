@@ -16,7 +16,7 @@ test("bash children never inherit gateway, provider or MCP credentials", async (
 });
 
 test("the extension replaces the built-in bash tool with one that scrubs its environment", async () => {
-  const { default: extension } = await import(`${extensionUrl}?${Math.random()}`);
+  const { default: extension } = await import(extensionUrl);
   const tools: Array<{ name: string; execute: unknown }> = [];
   extension({ registerTool: (tool: { name: string; execute: unknown }) => tools.push(tool), on: () => undefined });
   assert.deepEqual(tools.map((tool) => tool.name), ["bash"]);

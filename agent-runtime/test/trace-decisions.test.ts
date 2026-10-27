@@ -21,7 +21,7 @@ async function loadReadOnly(name: string, env: Record<string, string>) {
   const previous = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
   Object.assign(process.env, env);
   try {
-    const extension = await import(`${pathToFileURL(path.resolve(import.meta.dirname, `../../extensions/${name}.ts`)).href}?${Math.random()}`);
+    const extension = await import(pathToFileURL(path.resolve(import.meta.dirname, `../../extensions/${name}.ts`)).href);
     const handlers = new Map<string, (...args: any[]) => any>();
     const entries: Array<{ customType: string; data: any }> = [];
     extension.default({
@@ -94,7 +94,7 @@ test("a read-only extension whose entry cannot be appended still blocks", () => 
   process.env.PI_AGENT_WORKTREE = root;
   const handlers = new Map<string, (...args: any[]) => any>();
   try {
-    const extension = await import(`${pathToFileURL(path.resolve(import.meta.dirname, "../../extensions/discussion.ts")).href}?${Math.random()}`);
+    const extension = await import(pathToFileURL(path.resolve(import.meta.dirname, "../../extensions/discussion.ts")).href);
     extension.default({ on: (event: string, handler: (...args: any[]) => any) => handlers.set(event, handler), appendEntry: () => { throw new Error("session closed"); } });
   } finally {
     if (previous === undefined) delete process.env.PI_AGENT_WORKTREE; else process.env.PI_AGENT_WORKTREE = previous;

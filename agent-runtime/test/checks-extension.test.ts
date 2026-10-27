@@ -14,7 +14,7 @@ async function loadChecks(env: string | undefined) {
   const previous = process.env.PI_AGENT_CHECKS_JSON;
   if (env === undefined) delete process.env.PI_AGENT_CHECKS_JSON; else process.env.PI_AGENT_CHECKS_JSON = env;
   try {
-    const module = await import(`${pathToFileURL(path.resolve(import.meta.dirname, "../../extensions/checks.ts")).href}?${Math.random()}`);
+    const module = await import(pathToFileURL(path.resolve(import.meta.dirname, "../../extensions/checks.ts")).href);
     const tools: any[] = []; const handlers = new Map<string, (...args: any[]) => any>();
     module.default({ registerTool: (tool: unknown) => tools.push(tool), on: (event: string, handler: (...args: any[]) => any) => handlers.set(event, handler) });
     return { module, tool: tools[0], handlers };
