@@ -307,12 +307,15 @@ PYTHON=.venv/bin/python make demo-slack
 | `/llm agent --discuss <question>` | 唯讀討論：只用唯讀工具，不驗證，也不 commit |
 | `/llm agent --implement <task>` | 明確指定 implement 模式，會改檔，交付前要你核准 |
 | `/llm agent --workflow <task>` | Structured workflow：先分批調查再實作。需要啟用 structured workflow 的 trusted verification profile，最小 demo 沒有，所以會回覆 `Agent mode could not start this task.`。見 [docs/agent-structured-workflow.md](agent-structured-workflow.md) |
-| `/llm agent --model openai/gpt-5.6-sol <task>` | 指定模型。可用的模型列在 `/llm help`，provider 也要有設定 key |
+| `/llm agent --model openai/gpt-5.6-sol <task>` | 指定模型。`/llm help` 和 `/llm models` 會列出 runtime health 回報已設定的模型；runtime 沒回應時會直接說查不到，不顯示舊的清單 |
 | `/llm agent --no-thread-context <task>` | 在 thread 裡啟動時，不帶入之前的 thread 訊息 |
 | `/llm agent /skill:test-gap <task>` | 執行核准過的 `test-gap` skill |
 | `/llm agent status` | 顯示你最近一個 run 的狀態和模型 |
 | `/llm agent stop` | 停止你最近的 run |
 | `/llm agent close` | 關閉你最近的 session，branch 和 commit 會保留 |
+| `/llm agent resume <RUN_ID>` | 繼續一個在 writer 開始前中斷的 structured workflow |
+| `/llm agent repair-ci [--workflow] <PR_URL\|RUN_ID>` | 調查失敗的 CI，提出修正等你核准。見 [docs/agent-verification-ci.md](agent-verification-ci.md) |
+| `/llm agent publish-repair <RUN_ID>` | CI 修正發布失敗時，重新要一次發布核准（不會重跑 Pi） |
 
 `--discuss`、`--implement`、`--workflow`、`--model`、`--no-thread-context` 可以一起用，但 `--discuss` 和 `--implement` 只能選一個。
 

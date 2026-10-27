@@ -1,8 +1,12 @@
+import ast
 import asyncio
 import dataclasses
+import inspect
 import os
+import re
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock
 
@@ -28,6 +32,7 @@ from slack.agent_bootstrap import AgentBootstrapBuilder, AgentBootstrapContext
 from slack.agent_shortcut import build_agent_shortcut_modal
 from slack.bot_real import (
     AGENT_ERROR_HINTS,
+    AGENT_FOLLOWUP_FLAG_PATTERN,
     ConversationContext,
     ConversationManager,
     FileSlackStateStore,
@@ -46,6 +51,33 @@ from src.utils.schema import (
     ToolPolicy,
     UserTier,
 )
+
+
+def _parsed_literals(method):
+    """Return the `--flags` and first-argument actions a command handler parses."""
+    module = ast.parse(Path(inspect.getsourcefile(method)).read_text())
+    first_line = inspect.getsourcelines(method)[1]
+    function = next(
+        node
+        for node in ast.walk(module)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == method.__name__
+        and first_line in (node.lineno, *(d.lineno for d in node.decorator_list))
+    )
+    flags, actions = set(), set()
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Compare):
+            continue
+        constants = {
+            item.value
+            for operand in (node.left, *node.comparators)
+            for item in ast.walk(operand)
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        }
+        flags |= {value for value in constants if value.startswith("--")}
+        if isinstance(node.left, ast.Name) and node.left.id == "action":
+            actions |= constants
+    return flags, actions
 
 
 class FailingEmbeddingProvider:
@@ -792,6 +824,91 @@ class TestSlackMessageHandler:
 
         assert "/llm agent" not in help_text
         assert "Run Pi Agent" not in help_text
+
+    @pytest.mark.asyncio
+    async def test_help_lists_every_command_subcommand_and_flag_the_bot_parses(self):
+        runtime = SimpleNamespace(health_details=AsyncMock(return_value=None))
+        handler = SlackMessageHandler(SimpleNamespace(agent_runtime_client=runtime))
+
+        help_text = await handler._handle_help_command([], "u1", "c1", None)
+
+        usages = {}
+        for name, rest in re.findall(r"`/llm ([\w-]+)([^`]*)`", help_text):
+            usages.setdefault(name, set()).update(
+                token for token in re.split(r"[\s|\[\]]+", rest) if token
+            )
+        missing = []
+        for name, method in handler.commands.items():
+            if name not in usages:
+                missing.append(name)
+                continue
+            flags, actions = _parsed_literals(method)
+            missing.extend(
+                f"{name} {token}"
+                for token in sorted(flags | actions)
+                if token not in usages[name]
+            )
+        assert missing == []
+        # The derivation sees the subcommands G12 found missing from the help.
+        assert {"resume", "repair-ci", "publish-repair"} <= _parsed_literals(
+            handler._handle_agent_command
+        )[1]
+        reply_line = next(
+            line for line in help_text.splitlines() if "Agent thread" in line
+        )
+        assert [
+            flag
+            for flag in re.findall(r"--[\w-]+", AGENT_FOLLOWUP_FLAG_PATTERN.pattern)
+            if f"`{flag}`" not in reply_line
+        ] == []
+
+    @pytest.mark.asyncio
+    async def test_help_and_models_list_agent_models_from_runtime_health(self):
+        runtime = SimpleNamespace(
+            health_details=AsyncMock(
+                return_value={
+                    "status": "healthy",
+                    "models": [
+                        {"ref": "acme/model-x", "configured": True},
+                        {"ref": "openai/gpt-5.6-sol", "configured": False},
+                    ],
+                }
+            )
+        )
+        bot = SimpleNamespace(
+            agent_runtime_client=runtime,
+            get_available_models=AsyncMock(return_value=[]),
+        )
+        handler = SlackMessageHandler(bot)
+
+        help_text = await handler._handle_help_command([], "u1", "c1", None)
+        models_text = await handler._handle_models_command([], "u1", "c1", None)
+
+        for text in (help_text, models_text):
+            assert "`acme/model-x`" in text
+            assert "gpt-5.6-sol" not in text
+            assert "gpt-5.6-luna" not in text
+            assert "claude-sonnet-4-6" not in text
+
+    @pytest.mark.asyncio
+    async def test_help_and_models_say_agent_models_are_unknown_without_health(self):
+        runtime = SimpleNamespace(
+            health_details=AsyncMock(return_value=None),
+            cached_configured_models=lambda: ["openai/gpt-5.6-luna"],
+        )
+        bot = SimpleNamespace(
+            agent_runtime_client=runtime,
+            get_available_models=AsyncMock(return_value=[]),
+        )
+        handler = SlackMessageHandler(bot)
+
+        help_text = await handler._handle_help_command([], "u1", "c1", None)
+        models_text = await handler._handle_models_command([], "u1", "c1", None)
+
+        for text in (help_text, models_text):
+            assert "Agent models are unavailable" in text
+            # A stale cached allowlist is never shown as current.
+            assert "gpt-5.6-luna" not in text
 
     @pytest.mark.asyncio
     async def test_manual_agent_command_explains_that_runtime_is_disabled(self):

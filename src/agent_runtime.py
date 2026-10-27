@@ -6,7 +6,7 @@ import os
 import random as _random
 import time
 import uuid
-from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, TypeVar
 from urllib.parse import quote
 
 import httpx
@@ -63,6 +63,16 @@ class AgentRuntimeInvalidResponse(AgentRuntimeError):
     pass
 
 
+def configured_model_refs(health: Optional[Dict[str, Any]]) -> List[str]:
+    """Return the model refs a runtime health payload marks as configured."""
+    models = (health or {}).get("models", [])
+    return [
+        str(model["ref"])
+        for model in models
+        if isinstance(model, dict) and model.get("configured") and model.get("ref")
+    ]
+
+
 def is_transient_error(exc: AgentRuntimeError) -> bool:
     """Connection errors, timeouts, 429 and 5xx: the same call may succeed later."""
     if isinstance(
@@ -91,6 +101,9 @@ class AgentRuntimeClient:
     MAX_RETRY_BACKOFF_SECONDS = 30.0
     # Events after which the cheap event log no longer describes the run.
     RUN_CHANGE_EVENT_TYPES = {"status", "phase", "approval", "approval_decision"}
+    # Plain chat threads have no session; ask the runtime about each at most
+    # once a minute.
+    LOOKUP_MISS_TTL_SECONDS = 60.0
 
     def __init__(
         self,
@@ -109,6 +122,8 @@ class AgentRuntimeClient:
         token_env = str(config.get("token_env", "AGENT_RUNTIME_TOKEN"))
         self._token = os.getenv(token_env, "")
         self._health_cache: Optional[Dict[str, Any]] = None
+        # (team, channel, thread) -> monotonic time its "no session" expires.
+        self._lookup_misses: Dict[Tuple[str, str, str], float] = {}
         self._monotonic = time.monotonic
         self._health_timeout_seconds = min(connect_timeout, 2.0)
         self._control_timeout = httpx.Timeout(control_timeout, connect=connect_timeout)
@@ -140,12 +155,7 @@ class AgentRuntimeClient:
 
     def cached_configured_models(self) -> List[str]:
         """Return the last healthy model allowlist without blocking a Slack trigger."""
-        models = (self._health_cache or {}).get("models", [])
-        return [
-            str(model["ref"])
-            for model in models
-            if isinstance(model, dict) and model.get("configured") and model.get("ref")
-        ]
+        return configured_model_refs(self._health_cache)
 
     async def health(self) -> bool:
         payload = await self.health_details()
@@ -181,19 +191,24 @@ class AgentRuntimeClient:
         if routing_text is not None:
             payload["routing_text"] = routing_text
         key = idempotency_key or uuid.uuid4().hex
-        # A timed-out start may still have been accepted. Asking once more with
-        # the same key and body returns that run instead of starting another.
-        result = await self.retry_transient(
-            lambda: self._request(
-                "POST",
-                "/v1/sessions",
-                json=payload,
-                expected_status=202,
-                idempotency_key=key,
-            ),
-            attempts=2,
-            retryable=_is_client_timeout,
-        )
+        try:
+            # A timed-out start may still have been accepted. Asking once more
+            # with the same key and body returns that run instead of starting
+            # another.
+            result = await self.retry_transient(
+                lambda: self._request(
+                    "POST",
+                    "/v1/sessions",
+                    json=payload,
+                    expected_status=202,
+                    idempotency_key=key,
+                ),
+                attempts=2,
+                retryable=_is_client_timeout,
+            )
+        finally:
+            # Even a failed start may have opened a session in the thread.
+            self._lookup_misses.pop((team_id, channel_id, thread_ts), None)
         return self._validate_accepted(result)
 
     async def ci_repairs(self) -> List[Dict[str, Any]]:
@@ -254,6 +269,16 @@ class AgentRuntimeClient:
     async def lookup_session(
         self, team_id: str, channel_id: str, thread_ts: str
     ) -> Optional[Dict[str, Any]]:
+        """Return the thread's open session, or None.
+
+        A miss is remembered for `LOOKUP_MISS_TTL_SECONDS` per thread, and an
+        Agent start through this client in that thread forgets it.
+        """
+        miss_key = (team_id, channel_id, thread_ts)
+        now = self._monotonic()
+        if self._lookup_misses.get(miss_key, now) > now:
+            return None
+
         async def send() -> httpx.Response:
             response = await self._send(
                 "GET",
@@ -281,7 +306,22 @@ class AgentRuntimeClient:
                 "Agent runtime returned invalid lookup data"
             )
         session = payload.get("session")
-        return session if payload["found"] and isinstance(session, dict) else None
+        if payload["found"] and isinstance(session, dict):
+            self._lookup_misses.pop(miss_key, None)
+            return session
+        self._remember_lookup_miss(miss_key)
+        return None
+
+    def _remember_lookup_miss(self, key: Tuple[str, str, str]) -> None:
+        now = self._monotonic()
+        # Expired misses go first, so the cache holds only the last minute's
+        # threads.
+        self._lookup_misses = {
+            item: expires_at
+            for item, expires_at in self._lookup_misses.items()
+            if expires_at > now
+        }
+        self._lookup_misses[key] = now + self.LOOKUP_MISS_TTL_SECONDS
 
     async def prompt(
         self,

@@ -556,6 +556,76 @@ async def test_lookup_restores_thread_session_after_slack_restart(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_lookup_miss_is_cached_per_thread_until_ttl_or_agent_start(
+    monkeypatch,
+):
+    lookups = []
+    found = set()
+
+    def handler(request):
+        if request.url.path == "/v1/sessions":
+            body = json.loads(request.content)
+            found.add(body["thread_ts"])
+            return httpx.Response(
+                202, json={"session_id": "S1", "run_id": "R1", "status": "starting"}
+            )
+        thread_ts = request.url.params["thread_ts"]
+        lookups.append(thread_ts)
+        if thread_ts in found:
+            return httpx.Response(
+                200,
+                json={"found": True, "session": {"session_id": "S1"}},
+            )
+        return httpx.Response(200, json={"found": False})
+
+    runtime = client(handler, monkeypatch)
+    now = {"t": 1000.0}
+    runtime._monotonic = lambda: now["t"]
+
+    assert await runtime.lookup_session("T", "C", "1") is None
+    assert await runtime.lookup_session("T", "C", "1") is None
+    assert await runtime.lookup_session("T", "C", "2") is None
+    assert lookups == ["1", "2"]
+
+    now["t"] += 59.9
+    assert await runtime.lookup_session("T", "C", "1") is None
+    assert lookups == ["1", "2"]
+    now["t"] += 0.1
+    assert await runtime.lookup_session("T", "C", "1") is None
+    assert lookups == ["1", "2", "1"]
+
+    # A real start in the thread clears its miss at once.
+    await runtime.create_session("T", "C", "2", "U", "task")
+    assert await runtime.lookup_session("T", "C", "2") == {"session_id": "S1"}
+    # A found session is never cached.
+    assert await runtime.lookup_session("T", "C", "2") == {"session_id": "S1"}
+    assert lookups == ["1", "2", "1", "2", "2"]
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_lookup_is_not_cached_as_a_miss(monkeypatch):
+    responses = iter(
+        [
+            httpx.Response(401, json={"error": "unauthorized"}),
+            httpx.Response(200, json={"found": False}),
+        ]
+    )
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        return next(responses)
+
+    runtime = client(handler, monkeypatch)
+    with pytest.raises(AgentRuntimeUnauthorized):
+        await runtime.lookup_session("T", "C", "1")
+    assert await runtime.lookup_session("T", "C", "1") is None
+    assert len(calls) == 2
+    await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_ci_repair_accepts_initial_owner_approval_without_starting_a_writer(
     monkeypatch,
 ):
