@@ -510,6 +510,7 @@ export async function createProductionServer() {
       tracing?.lifecycle(id, name, phase, failed);
       if (name === "preparation" && failed) tracing?.endRun(id, "failed");
     },
+    observeTrace: (runId, signal) => tracing?.signal(runId, signal),
     observePolicy: (runId, sessionId, decision) => {
       telemetry?.record(runId, sessionId, "policy_decision", decision).catch(() => console.error(JSON.stringify({ event: "agent_policy_telemetry_failed", run_id: runId })));
     },
@@ -520,7 +521,7 @@ export async function createProductionServer() {
       if (observed.get(run.run_id) === signature) return;
       if (!observed.has(run.run_id) && ["running", "awaiting_approval"].includes(run.status)) tracing?.startRun(run.run_id, run.session_id);
       observed.set(run.run_id, signature);
-      tracing?.describeRun(run.run_id,run.model,run.reasoning_effort);
+      tracing?.describeRun(run.run_id, run);
       telemetry?.record(run.run_id, run.session_id, "run", {...summary, traceparent: tracing?.traceparent(run.run_id)}).then(async written => {
         if (["running", "awaiting_approval"].includes(run.status)) return;
         await settleCaptureWrite(run.run_id, written, telemetry, (id, reason) => orchestrator.markCaptureIncomplete(id, reason));

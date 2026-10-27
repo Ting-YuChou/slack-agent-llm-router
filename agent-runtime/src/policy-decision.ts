@@ -42,6 +42,11 @@ export function policyDecisionEntry(input: { tool: string; decision: PolicyVerdi
   return entry;
 }
 
+/** Appends a decision entry for the host; failing to record it never changes the decision. */
+export function appendPolicyDecision(pi: { appendEntry(customType: string, data: unknown): void }, input: Parameters<typeof policyDecisionEntry>[0]): void {
+  try { pi.appendEntry(POLICY_ENTRY, policyDecisionEntry(input)); } catch { /* monitoring must not change a decision */ }
+}
+
 /** Host-side check of an entry from the container: anything malformed or unexpected is dropped, never trusted. */
 export function parsePolicyDecision(data: unknown): PolicyDecision | undefined {
   if (!data || typeof data !== "object" || Array.isArray(data)) return undefined;

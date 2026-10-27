@@ -19,6 +19,7 @@ import { computeHarnessMetrics, type HarnessMetrics } from "./harness-metrics.js
 import { summarizePolicy, type PolicyDecision, type PolicySummary } from "./policy-decision.js";
 import { redact } from "./telemetry.js";
 import { DEFAULT_DIFF_LIMITS, DiffLimitError } from "./worktree-manager.js";
+import type { TraceSignal } from "./tracing.js";
 import { PatchApplyError } from "./patch-archive.js";
 import { MIN_CHECKS_WINDOW_MS, rejected, type WriterChecksRequest, type WriterChecksResponse } from "./writer-checks.js";
 import { SHORT_TIME_SHARE } from "./budget-notice.js";
@@ -328,6 +329,8 @@ export class CodingAgentOrchestrator {
   private readonly observeRun?: (run: RunRecord) => void;
   private readonly observePolicy?: (runId: string, sessionId: string, decision: PolicyDecision) => void;
   private readonly observeLifecycle?: (runId: string, name: string, phase: "start" | "end", failed?: boolean, sessionId?: string) => void;
+  /** Phases, repairs and limit hits, for the run's trace. */
+  private readonly observeTrace?: (runId: string, signal: TraceSignal) => void;
   private readonly budgetStatus?: (runId: string) => { used_usd: number; limit_usd: number } | undefined;
 
   constructor(options: {
@@ -335,6 +338,7 @@ export class CodingAgentOrchestrator {
     observeRun?: (run: RunRecord) => void;
     observePolicy?: CodingAgentOrchestrator["observePolicy"];
     observeLifecycle?: CodingAgentOrchestrator["observeLifecycle"];
+    observeTrace?: CodingAgentOrchestrator["observeTrace"];
     worktrees: Worktrees;
     startProcess: CodingAgentOrchestrator["startProcess"];
     maxActiveSessions?: number;
@@ -363,7 +367,7 @@ export class CodingAgentOrchestrator {
     budgetStatus?: CodingAgentOrchestrator["budgetStatus"];
   }) {
     this.captureState = options.captureState;
-    this.observeRun = options.observeRun; this.observePolicy = options.observePolicy; this.observeLifecycle = options.observeLifecycle;
+    this.observeRun = options.observeRun; this.observePolicy = options.observePolicy; this.observeLifecycle = options.observeLifecycle; this.observeTrace = options.observeTrace;
     this.worktrees = options.worktrees;
     this.startProcess = options.startProcess;
     this.maxActiveSessions = options.maxActiveSessions ?? 2;
@@ -1246,6 +1250,8 @@ export class CodingAgentOrchestrator {
         catch (error) {
           if (!(error instanceof DiffLimitError) || workflow.attempt > (this.quality.maxRepairs ?? 0)) throw error;
           workflow.attempt++; workflow.executionId = randomUUID(); workflow.checking = false;
+          this.notifyTrace(run.run_id, { type: "limit", kind: "diff_budget", code: "diff_limit_exceeded", action: "repair" });
+          this.notifyTrace(run.run_id, { type: "repair", attempt: workflow.attempt, reason: "diff_limit" });
           this.setPhase(run, "repairing"); await this.persistState();
           await this.startExecution(session, run, workflow, renderPrompt("diff-limit-repair", { requirement: workflow.requirement, limit: error.message.slice(0, 200) })); return;
         }
@@ -1260,6 +1266,7 @@ export class CodingAgentOrchestrator {
           ...(result.candidate.fixes?.length ? { fixes: result.candidate.fixes } : {}), ...(result.candidate.fixer_cause ? { fixer_cause: result.candidate.fixer_cause } : {}) });
         if (result.action === "repair") {
           workflow.attempt++; workflow.executionId = randomUUID(); workflow.checking = false;
+          this.notifyTrace(run.run_id, { type: "repair", attempt: workflow.attempt, reason: repairReason(result) });
           this.setPhase(run, "repairing"); await this.persistState();
           await this.startExecution(session, run, workflow, result.repair_prompt!); return;
         }
@@ -1456,6 +1463,7 @@ export class CodingAgentOrchestrator {
       return;
     }
     run.error = { ...failure };
+    this.traceLimit(run.run_id, failure.code);
     this.updateRun(run, "failed");
     this.finishActiveRun(session, run.run_id);
     await this.safeRollback(session, run);
@@ -1469,6 +1477,7 @@ export class CodingAgentOrchestrator {
       return;
     }
     run.error = { code: "run_timeout", message: "Agent prompt exceeded its deadline" };
+    this.traceLimit(run.run_id, run.error.code);
     this.updateRun(run, "timed_out");
     this.finishActiveRun(session, run.run_id);
     await this.safeRollback(session, run);
@@ -1556,6 +1565,7 @@ export class CodingAgentOrchestrator {
     if (run.phase === phase) return;
     run.phase = phase;
     this.pushEvent(run, { type: "phase", phase });
+    this.notifyTrace(run.run_id, { type: "phase", phase });
   }
 
   private updateRun(run: RunRecord, status: RunStatus): void {
@@ -1603,6 +1613,16 @@ export class CodingAgentOrchestrator {
 
   private notifyLifecycle(runId: string, name: string, phase: "start" | "end", failed = false, sessionId?: string): void {
     try { this.observeLifecycle?.(runId, name, phase, failed, sessionId); } catch { /* monitoring must not fail work */ }
+  }
+
+  private notifyTrace(runId: string, signal: TraceSignal): void {
+    try { this.observeTrace?.(runId, signal); } catch { /* monitoring must not fail work */ }
+  }
+
+  /** A run that failed because it hit one of the harness's limits says which, on its trace. */
+  private traceLimit(runId: string, code: string): void {
+    const kind = LIMIT_KINDS[code];
+    if (kind) this.notifyTrace(runId, { type: "limit", kind, code, action: "fail" });
   }
 
   private notifyRun(run: RunRecord): void {
@@ -1716,6 +1736,24 @@ function boundSubject(text: string): string | undefined {
   const max = COMMIT_SUBJECT_MAX - COMMIT_SUBJECT_PREFIX.length;
   const chars = Array.from(line);
   return chars.length <= max ? line : `${chars.slice(0, max - 1).join("").trimEnd()}…`;
+}
+
+/** Failure codes that mean the run hit a harness limit, by the limit's kind. */
+const LIMIT_KINDS: Record<string, string> = {
+  workflow_budget_exhausted: "budget",
+  diff_limit_exceeded: "diff_budget",
+  disk_quota_exceeded: "disk_quota",
+  session_quota_exceeded: "session_quota",
+  agent_turn_limit: "turns",
+  agent_tool_limit: "tool_calls",
+  agent_output_truncated: "output_tokens",
+  run_timeout: "deadline",
+};
+
+/** Why the gate sent a candidate back: out-of-scope edits, failed checks, or a grader asking for changes. */
+function repairReason(result: GateResult): string {
+  if (result.failure?.code === "scope_violation") return "scope_violation";
+  return result.verification.status === "passed" ? "grader_needs_changes" : "verification_failed";
 }
 
 /** Non-completed executions are never delivered; each outcome gets its own actionable code. */

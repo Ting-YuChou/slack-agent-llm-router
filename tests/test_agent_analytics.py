@@ -120,6 +120,24 @@ class AgentAnalyticsTests(unittest.TestCase):
         ids = [panel["id"] for panel in dashboard["panels"]]
         self.assertEqual(len(ids), len(set(ids)))
 
+    def test_agent_dashboard_charts_policy_decisions_by_reason(self):
+        dashboard = json.loads(
+            Path("docker/observability/grafana/dashboards/agent.json").read_text()
+        )
+        queries = [
+            target["rawSql"]
+            for panel in dashboard["panels"]
+            for target in panel.get("targets", [])
+            if "agent_policy_decisions" in target.get("rawSql", "")
+        ]
+        self.assertEqual(len(queries), 1)
+        for column in ["tool", "decision", "reason", "approved", "latency_ms"]:
+            self.assertIn(column, queries[0])
+        # Like the other run-scoped panels, the run picker narrows it.
+        self.assertIn("${run_id:sqlstring}", queries[0])
+        ids = [panel["id"] for panel in dashboard["panels"]]
+        self.assertEqual(len(ids), len(set(ids)))
+
     def test_structured_nodes_revisions_and_dependencies_are_queryable_metadata(self):
         module = self.module()
         for kind, table, payload in [
