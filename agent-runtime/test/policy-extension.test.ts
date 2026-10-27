@@ -480,3 +480,17 @@ test("diff_summary reports numstat against the baseline, bash changes included, 
   assert.match(text, /3 more files/);
   assert.match(text, new RegExp(`${4096 - result.details.bytes} more bytes`));
 }));
+
+test("approval titles name the file or the command being approved", () => withRepo(async (cwd) => {
+  const titles: string[] = [];
+  const ctx = { cwd, abort: () => undefined, ui: { confirm: async (title: string) => { titles.push(title); return true; } } };
+  const write = await loadPolicy({});
+  await write.fire("input", {}, ctx);
+  await write.fire("tool_call", { toolName: "edit", input: { path: "./src/app.py", edits: [{ oldText: "a", newText: "b" }] } }, ctx);
+  const shell = await loadPolicy({});
+  await shell.fire("input", {}, ctx);
+  await shell.fire("tool_call", { toolName: "bash", input: { command: `make   repair\n${"x".repeat(300)}` } }, ctx);
+  assert.equal(titles[0], "Allow workspace edit: src/app.py?");
+  assert.match(titles[1]!, /^Allow shell command: make repair x+…\?$/);
+  assert.ok(titles[1]!.length <= 160, titles[1]);
+}));

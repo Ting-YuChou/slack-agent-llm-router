@@ -71,6 +71,12 @@ function previewWrite(tool: string, input: Record<string, unknown>): string {
   return `${filePath}\n\n${summary.slice(0, 3_500)}`;
 }
 
+/** One line of a command for an approval title; the dialog body still shows all of it. */
+function commandTitle(command: string): string {
+  const line = command.replace(/\s+/g, " ").trim();
+  return line.length > 120 ? `${line.slice(0, 120)}…` : line;
+}
+
 /** Changed files in the worktree; undefined when git cannot say, which callers treat as tainted. */
 function changedFiles(cwd: string): Promise<string[] | undefined> {
   return new Promise((resolve) => {
@@ -215,7 +221,7 @@ export default function policyExtension(pi: ExtensionAPI) {
       if (!writeApproved && WRITE_APPROVAL === "per_prompt") {
         const startedAt = Date.now();
         const approved = await ctx.ui.confirm(
-          `Allow workspace ${event.toolName}?`,
+          `Allow workspace ${event.toolName}: ${target}?`,
           previewWrite(event.toolName, event.input),
           { timeout: APPROVAL_TIMEOUT_MS },
         );
@@ -241,7 +247,7 @@ export default function policyExtension(pi: ExtensionAPI) {
       if (decision.decision === "allow_after_write_approval" && (writeApproved || WRITE_APPROVAL === "none") && !taint) { decide("bash", "allow", decision.reason, { command }); return undefined; }
       const startedAt = Date.now();
       const approved = await ctx.ui.confirm(
-        "Allow shell command?",
+        `Allow shell command: ${commandTitle(command)}?`,
         `${taint ? `Needs approval because ${taint}.\n\n` : ""}${command.slice(0, 4_000)}`,
         { timeout: APPROVAL_TIMEOUT_MS },
       );

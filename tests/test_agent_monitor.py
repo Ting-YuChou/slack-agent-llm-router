@@ -1915,3 +1915,134 @@ async def test_slash_resume_of_a_run_without_a_known_thread_opens_one_here(tmp_p
     assert tracked["status_ts"] == "300.1"
     bot._start_agent_monitor.assert_called_once_with(tracked)
     bot.web_client.chat_postEphemeral.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ci_repair_approval_card_names_the_ci_job_it_repairs(tmp_path):
+    target = {
+        "repository": "acme/app",
+        "pr": 42,
+        "workflow": "Tests",
+        "run": 9001,
+        "attempt": 1,
+        "failed_jobs": ["pytest"],
+    }
+    runtime = scripted_runtime(
+        {
+            "R1": [
+                run_state(
+                    "R1",
+                    "awaiting_approval",
+                    target=target,
+                    events=[
+                        {
+                            "type": "approval",
+                            "approval_id": "A1",
+                            "title": "Allow shell command: make repair?",
+                            "detail": "make repair",
+                        }
+                    ],
+                ),
+                run_state("R1", "completed", target=target),
+            ]
+        }
+    )
+    bot = file_bot(tmp_path, agent_runtime=runtime)
+    bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+    bot.agent_monitor_poll_seconds = 0
+    tracked = track(bot, mode="ci_repair")
+
+    await bot._monitor_agent_run(tracked)
+
+    card = bot.web_client.chat_postMessage.await_args_list[0].kwargs
+    sections = [b["text"]["text"] for b in card["blocks"] if b["type"] == "section"]
+    assert "Allow shell command: make repair?" in sections[0]
+    assert "*Tests*" in sections[1] and "`pytest`" in sections[1]
+    assert "actions/runs/9001" in sections[1]
+
+
+def routed(label, probability, task_mode="implement", source="jev"):
+    return {
+        "task_mode": task_mode,
+        "routing": {
+            "source": source,
+            "label": label,
+            "probability": probability,
+            "modelRef": "openai/gpt-5.6-luna",
+        },
+    }
+
+
+async def progress_texts(tmp_path, extra):
+    async def wait_for_update(run_id, on_progress=None, **kwargs):
+        await on_progress(progress_state(run_id, "running", 1, 1, 0.01) | extra)
+        return run_state(run_id, "completed", **extra)
+
+    bot = file_bot(
+        tmp_path, agent_runtime=SimpleNamespace(wait_for_update=wait_for_update)
+    )
+    bot.web_client = SimpleNamespace(
+        chat_postMessage=AsyncMock(), chat_update=AsyncMock()
+    )
+    tracked = track(bot)
+    tracked["status_ts"] = "1.0"
+    tracked["status_text"] = "🛠️ Pi coding agent started run `R1`."
+    await bot._monitor_agent_run(tracked)
+    return [call.kwargs["text"] for call in bot.web_client.chat_update.await_args_list]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("probability", [0.9, 0.97])
+async def test_a_confidently_read_only_implement_run_suggests_discuss(
+    tmp_path, probability
+):
+    texts = await progress_texts(tmp_path, routed("read_only", probability))
+
+    assert texts
+    for text in texts:
+        assert text.startswith("🛠️ Pi coding agent started run `R1`.\n")
+        assert "`--discuss`" in text
+        assert f"p={probability:.2f}" in text
+        assert "Phase: *" in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra",
+    [
+        routed("read_only", 0.89),
+        routed("small_patch", 0.99),
+        routed("read_only", 0.99, source="shadow"),
+        routed("read_only", 0.99, task_mode="discuss"),
+        routed("read_only", "0.99"),
+        {"task_mode": "implement"},
+        {},
+    ],
+)
+async def test_no_discuss_hint_without_a_confident_read_only_route(tmp_path, extra):
+    texts = await progress_texts(tmp_path, extra)
+
+    assert texts
+    assert not any("--discuss" in text for text in texts)
+
+
+@pytest.mark.asyncio
+async def test_approval_notification_text_cannot_ping_through_a_path(tmp_path):
+    event = {"type": "approval", "approval_id": "A1", "title": "Edit <!here>?"}
+    runtime = scripted_runtime(
+        {
+            "R1": [
+                run_state("R1", "awaiting_approval", events=[event]),
+                run_state("R1", "completed"),
+            ]
+        }
+    )
+    bot = file_bot(tmp_path, agent_runtime=runtime)
+    bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+    bot.agent_monitor_poll_seconds = 0
+
+    await bot._monitor_agent_run(track(bot))
+
+    text = posted_texts(bot)[0]
+    assert text.startswith("Approval required: Edit &lt;!here&gt;?")
+    assert "<!here>" not in text
