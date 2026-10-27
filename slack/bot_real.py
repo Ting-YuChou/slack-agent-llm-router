@@ -495,6 +495,20 @@ def _agent_auth_error_text(exc: AgentRuntimeError, owner_text: str) -> str:
     return owner_text
 
 
+AGENT_FEEDBACK_RETRY_TEXT = "Result feedback could not be recorded. Please try again."
+AGENT_FEEDBACK_UNAVAILABLE_TEXT = (
+    "Result feedback was not recorded: this Agent runtime stores feedback "
+    "through telemetry, which is turned off (PI_AGENT_TELEMETRY_ENABLED)."
+)
+
+
+def _agent_feedback_error_text(exc: AgentRuntimeError) -> str:
+    """Retrying cannot help when the runtime has no feedback capture at all."""
+    if exc.code == "feedback_unavailable":
+        return AGENT_FEEDBACK_UNAVAILABLE_TEXT
+    return AGENT_FEEDBACK_RETRY_TEXT
+
+
 @dataclass(frozen=True)
 class AgentFollowupFlags:
     text: str
@@ -4198,7 +4212,7 @@ class SlackBot:
             while True:
                 response = await self.web_client.conversations_list(
                     limit=1000,
-                    types="public_channel,private_channel",
+                    types="public_channel",
                     cursor=cursor,
                 )
                 for channel in response.get("channels", []):
@@ -5056,8 +5070,15 @@ class SlackBot:
             for offset in range(0, len(chunks), AGENT_RESULT_BLOCKS_PER_MESSAGE)
         ]
         actions: List[Dict[str, Any]] = []
-        if run.get("status") in AGENT_TERMINAL_STATUSES and self.agent_config.get(
-            "feedback_enabled", False
+        # Hide the buttons only when the runtime says it cannot store feedback.
+        cached_capture = getattr(
+            getattr(self, "agent_runtime_client", None), "cached_feedback_capture", None
+        )
+        feedback_capture = cached_capture() if callable(cached_capture) else None
+        if (
+            run.get("status") in AGENT_TERMINAL_STATUSES
+            and self.agent_config.get("feedback_enabled", False)
+            and feedback_capture is not False
         ):
             value = json.dumps(
                 {
@@ -5206,6 +5227,7 @@ class SlackBot:
                 reason_category=submission.reason_category,
                 comment=submission.comment or None,
             )
+            message = "Result feedback recorded."
         except AgentRuntimeUnauthorized as exc:
             await self.web_client.chat_postEphemeral(
                 channel=nonce.channel_id,
@@ -5215,15 +5237,12 @@ class SlackBot:
                 ),
             )
             return
-        except AgentRuntimeError:
-            await self.web_client.chat_postEphemeral(
-                channel=nonce.channel_id,
-                user=user_id,
-                text="Result feedback could not be recorded. Please try again.",
-            )
-            return
+        except AgentRuntimeError as exc:
+            # The owner's requested follow-up does not depend on the label
+            # being stored, so a lost label must not also lose the next run.
+            message = _agent_feedback_error_text(exc)
         await self.web_client.chat_postEphemeral(
-            channel=nonce.channel_id, user=user_id, text="Result feedback recorded."
+            channel=nonce.channel_id, user=user_id, text=message
         )
         if not (submission.continue_session and submission.comment):
             return
@@ -5541,8 +5560,10 @@ class SlackBot:
                 message = _agent_auth_error_text(
                     exc, "Only the Agent run owner can submit result feedback."
                 )
-            except (AgentRuntimeError, KeyError, TypeError, ValueError):
-                message = "Result feedback could not be recorded. Please try again."
+            except AgentRuntimeError as exc:
+                message = _agent_feedback_error_text(exc)
+            except (KeyError, TypeError, ValueError):
+                message = AGENT_FEEDBACK_RETRY_TEXT
             await self.web_client.chat_postEphemeral(
                 channel=channel_id, user=user_id, text=message
             )
