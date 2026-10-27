@@ -88,6 +88,9 @@ SLACK_SECTION_TEXT_LIMIT = 3000
 AGENT_DELIVERY_CARD_LIMIT = 3000
 AGENT_DELIVERY_MAX_FILES = 15
 AGENT_DELIVERY_FILES_TEXT_LIMIT = AGENT_DELIVERY_CARD_LIMIT // 2
+# Jev acts on a route label only at this confidence; the discuss hint uses the same.
+AGENT_DISCUSS_HINT_PROBABILITY = 0.9
+GITHUB_REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 AGENT_TERMINAL_STATUSES = {
     "completed",
     "rejected",
@@ -319,6 +322,59 @@ async def _show_agent_status(
     tracked["status_ts"] = status_ts
     tracked["status_text"] = text
     return True
+
+
+def _escape_mrkdwn(text: str) -> str:
+    """Escape what Slack reads as links, mentions and entities."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _int_field(value: Any) -> Optional[int]:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _ci_repair_line(target: Dict[str, Any]) -> str:
+    """Name the CI workflow, run, PR and failed jobs a repair approval is for."""
+    workflow = _escape_mrkdwn(
+        str(target.get("workflow") or "CI")[:100].replace("*", "")
+    )
+    repository = str(target.get("repository") or "")
+    linkable = bool(GITHUB_REPOSITORY_PATTERN.match(repository))
+    line = f"🔧 Repairing CI workflow *{workflow}*"
+    run = _int_field(target.get("run"))
+    if run is not None:
+        line += (
+            f" <https://github.com/{repository}/actions/runs/{run}|run {run}>"
+            if linkable
+            else f" run {run}"
+        )
+    attempt = _int_field(target.get("attempt"))
+    if attempt is not None:
+        line += f" (attempt {attempt})"
+    pr = _int_field(target.get("pr"))
+    if pr is not None:
+        line += (
+            f" on <https://github.com/{repository}/pull/{pr}|PR #{pr}>"
+            if linkable
+            else f" on PR #{pr}"
+        )
+    jobs = [
+        f"`{_escape_mrkdwn(str(job)[:100].replace('`', chr(39)))}`"
+        for job in target.get("failed_jobs") or []
+    ]
+    if not jobs:
+        return f"{line}\nFailed jobs: _not reported_"
+    # Keep room for the "and N more" marker so the section stays within its limit.
+    budget = SLACK_SECTION_TEXT_LIMIT - len(line) - 40
+    shown: List[str] = []
+    for job in jobs[:10]:
+        if sum(len(item) + 2 for item in shown) + len(job) > budget:
+            break
+        shown.append(job)
+    listed = ", ".join(shown)
+    if len(jobs) > len(shown):
+        listed += f" _…and {len(jobs) - len(shown)} more_"
+    return f"{line}\nFailed jobs: {listed}"
 
 
 def _format_grader_finding(finding: Dict[str, Any]) -> str:
@@ -4477,9 +4533,15 @@ class SlackBot:
             self.agent_user_runs.pop(owner_user_id, None)
 
     @staticmethod
-    def _agent_approval_blocks(approval: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Build approval card blocks that each stay within Slack's section limit."""
-        title = str(approval.get("title") or "Approval required")[:200]
+    def _agent_approval_blocks(
+        approval: Dict[str, Any], ci: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """Build approval card blocks that each stay within Slack's section limit.
+
+        `ci` is a CI repair's target; the card then names the job it repairs.
+        """
+        # Titles name agent-chosen paths and commands, which must not ping or link.
+        title = _escape_mrkdwn(str(approval.get("title") or "Approval required")[:200])
         # Keep embedded fences from closing the code block early.
         detail = str(approval.get("detail") or "").replace("```", "`\u200b``")
         fence = "```"
@@ -4506,8 +4568,19 @@ class SlackBot:
             except ValueError:
                 pass
 
+        repairing = (
+            [
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": _ci_repair_line(ci)},
+                }
+            ]
+            if isinstance(ci, dict)
+            else []
+        )
         return [
             {"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*"}},
+            *repairing,
             {"type": "section", "text": {"type": "mrkdwn", "text": text}},
             {
                 "type": "context",
@@ -4718,6 +4791,37 @@ class SlackBot:
             line += f" · Last tool: `{str(run['last_tool'])[:80]}`"
         return line
 
+    @staticmethod
+    def _ci_repair_target(run: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The CI run a repair job answers to; only CI repair runs carry one."""
+        target = run.get("target")
+        return target if isinstance(target, dict) else None
+
+    @staticmethod
+    def _agent_discuss_hint(run: Dict[str, Any]) -> Optional[str]:
+        """Suggest --discuss when Jev is confident an implement run is read-only.
+
+        Only a hint: the run keeps its task mode, permissions and approvals.
+        """
+        routing = run.get("routing")
+        if run.get("task_mode") != "implement" or not isinstance(routing, dict):
+            return None
+        probability = routing.get("probability")
+        if (
+            # Shadow routing is observed, never acted on.
+            routing.get("source") != "jev"
+            or routing.get("label") != "read_only"
+            or isinstance(probability, bool)
+            or not isinstance(probability, (int, float))
+            or probability < AGENT_DISCUSS_HINT_PROBABILITY
+        ):
+            return None
+        return (
+            f"💡 This request looks read-only (route `read_only`, p={probability:.2f})."
+            " `--discuss` may fit better: it uses read-only tools, with no"
+            " verification or commit. This run continues as an implement run."
+        )
+
     async def _update_agent_progress(
         self, tracked: Dict[str, Any], run: Dict[str, Any], *, force: bool = False
     ) -> None:
@@ -4742,6 +4846,9 @@ class SlackBot:
             # A run restored after a bot restart is timed from its first update.
             started = tracked.setdefault("tracked_at", now)
         text = f"{header}\n{self._agent_progress_line(run, now - started)}"
+        hint = self._agent_discuss_hint(run)
+        if hint:
+            text = f"{text}\n{hint}"
         if text == tracked.get("progress_text"):
             return
         try:
@@ -4784,12 +4891,13 @@ class SlackBot:
         card = (
             self._agent_delivery_blocks(approval)
             if kind == "delivery"
-            else self._agent_approval_blocks(approval)
+            else self._agent_approval_blocks(approval, self._ci_repair_target(run))
         )
         text = (
             "Ready to deliver: review the changes"
             if kind == "delivery"
-            else f"Approval required: {approval.get('title', 'Agent action')}"
+            else "Approval required: "
+            + _escape_mrkdwn(str(approval.get("title") or "Agent action"))
         )
         owner = tracked.get("owner_user_id")
         if owner:
@@ -4924,7 +5032,7 @@ class SlackBot:
             blocks = (
                 self._agent_delivery_blocks(approval)
                 if approval.get("kind") == "delivery"
-                else self._agent_approval_blocks(approval)
+                else self._agent_approval_blocks(approval, self._ci_repair_target(run))
                 if approval
                 else []
             )

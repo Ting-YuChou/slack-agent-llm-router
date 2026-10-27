@@ -2996,6 +2996,69 @@ def test_agent_approval_blocks_neutralize_fences_and_missing_expiry():
     assert "expires soon" in blocks[-1]["elements"][0]["text"]
 
 
+CI_TARGET = {
+    "repository": "acme/app",
+    "pr": 42,
+    "head": "abc123",
+    "branch": "feature",
+    "workflow": "Tests",
+    "run": 9001,
+    "attempt": 2,
+    "failed_jobs": ["pytest (3.12)", "lint"],
+    "diagnostic": "secret-looking log text",
+}
+
+
+def test_ci_repair_approval_card_names_the_ci_job_it_repairs():
+    blocks = SlackBot._agent_approval_blocks(
+        {
+            "title": "Allow workspace edit: src/app.py?",
+            "detail": "src/app.py\n\n- a\n+ b",
+        },
+        ci=CI_TARGET,
+    )
+    sections = _section_texts(blocks)
+    assert sections[0] == "*Allow workspace edit: src/app.py?*"
+    ci_line = sections[1]
+    assert "*Tests*" in ci_line
+    assert "<https://github.com/acme/app/actions/runs/9001|run 9001>" in ci_line
+    assert "attempt 2" in ci_line
+    assert "<https://github.com/acme/app/pull/42|PR #42>" in ci_line
+    assert "`pytest (3.12)`, `lint`" in ci_line
+    assert "secret-looking" not in "".join(sections)
+    assert sections[2].startswith("```src/app.py")
+    assert all(len(text) <= 3000 for text in sections)
+
+
+def test_ci_repair_card_escapes_and_bounds_what_github_reported():
+    blocks = SlackBot._agent_approval_blocks(
+        {"title": "Allow workspace write: <!channel>&x?", "detail": "x"},
+        ci={
+            "repository": "acme/app",
+            "workflow": "<!here> CI",
+            "run": "not-a-number",
+            "pr": None,
+            "failed_jobs": ["`odd` <job>"] + [f"job-{i}" for i in range(40)],
+        },
+    )
+    sections = _section_texts(blocks)
+    assert sections[0] == "*Allow workspace write: &lt;!channel&gt;&amp;x?*"
+    ci_line = sections[1]
+    assert "<!here>" not in ci_line and "&lt;!here&gt; CI" in ci_line
+    assert "actions/runs" not in ci_line and "pull/" not in ci_line
+    assert "'odd' &lt;job&gt;" in ci_line
+    assert "…and 31 more" in ci_line
+    assert len(ci_line) <= 3000
+
+
+def test_ci_repair_card_says_when_github_named_no_failed_job():
+    blocks = SlackBot._agent_approval_blocks(
+        {"title": "Allow shell command: make test?", "detail": "make test"},
+        ci={"repository": "acme/app", "workflow": "CI", "run": 7},
+    )
+    assert "Failed jobs: _not reported_" in _section_texts(blocks)[1]
+
+
 @pytest.mark.asyncio
 async def test_monitor_posts_oversized_approval_card_with_valid_blocks():
     runtime = SimpleNamespace(

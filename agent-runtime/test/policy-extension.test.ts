@@ -112,12 +112,13 @@ async function withRepo(run: (cwd: string) => Promise<void>) {
 
 function confirmingCtx(cwd: string) {
   const prompts: string[] = [];
-  return { prompts, ctx: { cwd, abort: () => undefined, ui: { confirm: async (_title: string, body: string) => { prompts.push(body); return true; } } } };
+  const titles: string[] = [];
+  return { prompts, titles, ctx: { cwd, abort: () => undefined, ui: { confirm: async (title: string, body: string) => { titles.push(title); prompts.push(body); return true; } } } };
 }
 
 test("configured commands run without a prompt only while no test configuration has changed", () => withRepo((cwd) => withSafeCommands(["pytest"], async () => {
   const policy = await loadPolicy({});
-  const { prompts, ctx } = confirmingCtx(cwd);
+  const { prompts, titles, ctx } = confirmingCtx(cwd);
   await policy.fire("input", {}, ctx);
   assert.equal(await policy.fire("tool_call", { toolName: "write", input: { path: "src/a.py", content: "x" } }, ctx), undefined);
   assert.equal(prompts.length, 1);
@@ -128,6 +129,14 @@ test("configured commands run without a prompt only while no test configuration 
   assert.equal(await policy.fire("tool_call", { toolName: "bash", input: { command: "pytest -q" } }, ctx), undefined);
   assert.equal(prompts.length, 2);
   assert.match(prompts[1]!, /test configuration changed: conftest\.py/);
+
+  // The card title names what is approved; the body keeps the full command.
+  await policy.fire("tool_call", { toolName: "bash", input: { command: `make   repair\n${"x".repeat(300)}` } }, ctx);
+  assert.equal(titles[0], "Allow workspace write: src/a.py?");
+  assert.equal(titles[1], "Allow shell command: pytest -q?");
+  assert.match(titles[2]!, /^Allow shell command: make repair x+…\?$/);
+  assert.ok(titles[2]!.length <= 160, titles[2]);
+  assert.match(prompts[2]!, /x{300}$/);
 })));
 
 test("a test configuration write in this session taints configured commands", () => withRepo((cwd) => withSafeCommands(["pytest"], async () => {

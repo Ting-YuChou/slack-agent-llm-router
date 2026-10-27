@@ -215,7 +215,7 @@ export default function policyExtension(pi: ExtensionAPI) {
       if (!writeApproved && WRITE_APPROVAL === "per_prompt") {
         const startedAt = Date.now();
         const approved = await ctx.ui.confirm(
-          `Allow workspace ${event.toolName}?`,
+          `Allow workspace ${event.toolName}: ${target}?`,
           previewWrite(event.toolName, event.input),
           { timeout: APPROVAL_TIMEOUT_MS },
         );
@@ -240,8 +240,10 @@ export default function policyExtension(pi: ExtensionAPI) {
       const taint = decision.decision === "allow_after_write_approval" ? await testConfigTaint(ctx.cwd, writtenPaths) : undefined;
       if (decision.decision === "allow_after_write_approval" && (writeApproved || WRITE_APPROVAL === "none") && !taint) { decide("bash", "allow", decision.reason, { command }); return undefined; }
       const startedAt = Date.now();
+      // The title names the command on one line; the dialog body still shows all of it.
+      const line = command.replace(/\s+/g, " ").trim();
       const approved = await ctx.ui.confirm(
-        "Allow shell command?",
+        `Allow shell command: ${line.length > 120 ? `${line.slice(0, 120)}…` : line}?`,
         `${taint ? `Needs approval because ${taint}.\n\n` : ""}${command.slice(0, 4_000)}`,
         { timeout: APPROVAL_TIMEOUT_MS },
       );
