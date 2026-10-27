@@ -1,4 +1,5 @@
 import { hkdfSync } from "node:crypto";
+import type { GatewayRole } from "./gateway-token.js";
 
 /** The budget RPC bearer: its own key, so a leaked bearer cannot sign gateway tokens. */
 export function deriveBudgetRpcSecret(signingSecret: string): string {
@@ -19,6 +20,8 @@ export interface BudgetAdmissionLedger {
   firstModel(execution: string, now?: number): number | undefined | Promise<number | undefined>;
   /** Whether the execution's run is still active; a gateway refuses the tokens of ended runs. */
   active?(execution: string): boolean | Promise<boolean>;
+  /** A response of this execution was cut off at its output-token cap; the host records it on the execution's run. */
+  truncated?(execution: string, role?: GatewayRole): void | Promise<void>;
 }
 
 /** SQLite has one owner on the host. Docker gateways never open its WAL files. */
@@ -39,5 +42,6 @@ export class BudgetRpcClient implements BudgetAdmissionLedger {
   async reserve(workflow: string, id: string, amount: number, execution?: string) { await this.post('reserve',{ workflow,id,amount,execution }); }
   async settle(id: string, amount: number | null) { await this.post('settle',{ id,amount }); }
   async active(execution: string): Promise<boolean> { return await this.post('active',{ execution }) === true; }
+  async truncated(execution: string, role?: GatewayRole) { await this.post('truncated',{ execution,role }); }
   async firstModel(execution: string, now = Date.now()) { const value = await this.post('first-model',{ execution,now }); return typeof value === 'number' ? value : undefined; }
 }

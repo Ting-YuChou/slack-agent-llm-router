@@ -6,8 +6,18 @@ import type { GatewayRole } from "./gateway-token.js";
 /** Reasoning tokens count against the output cap, so writers need far more room than reviewers. */
 export const OUTPUT_TOKEN_LIMITS: Record<GatewayRole, number> = { writer: 32_768, grader: 16_384, investigator: 8_192 };
 
-export function outputTokenLimitFor(role: GatewayRole): number {
-  return OUTPUT_TOKEN_LIMITS[role];
+export function isGatewayRole(value: unknown): value is GatewayRole {
+  return typeof value === "string" && Object.hasOwn(OUTPUT_TOKEN_LIMITS, value);
+}
+
+/** No role's output cap goes past this, whatever a profile asks; a larger one also reserves more of the run's budget per request. */
+export const OUTPUT_TOKEN_CEILING = 32_768;
+
+/** A verification profile's `limits`: per-role output caps that replace the built-in ones. */
+export interface ProfileLimits { outputTokens?: Partial<Record<GatewayRole, number>> }
+
+export function outputTokenLimitFor(role: GatewayRole, limits?: ProfileLimits): number {
+  return Math.min(OUTPUT_TOKEN_CEILING, limits?.outputTokens?.[role] ?? OUTPUT_TOKEN_LIMITS[role]);
 }
 
 /** Workflow executions spend their parent's budget; any other run is metered under a default budget of its own. */

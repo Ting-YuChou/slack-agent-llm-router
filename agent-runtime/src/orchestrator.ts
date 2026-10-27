@@ -153,6 +153,8 @@ export interface RunRecord {
   cost_by_role?: Record<string, number>;
   /** Finished writer tool calls and how many of them errored, per tool name. */
   tool_summary?: Record<string, ToolCounts>;
+  /** Model responses cut off at their output-token cap, per gateway role (`unknown` without one). */
+  truncated_requests?: Record<string, number>;
   mcp_server?: string;
   mcp_tool?: string;
   mcp_repository?: string;
@@ -950,6 +952,18 @@ export class CodingAgentOrchestrator {
     if (!run || !workflow || isTerminal(run.status)) return;
     workflow.budget.report(cost); addCost(run, role, cost);
     this.setPhase(run, phase); await this.persistState(); workflow.budget.check();
+  }
+
+  /** The gateway saw a response of one of this run's executions cut off at its output cap; it may arrive after the run ended. */
+  async recordTruncation(runId: string, role: string | undefined, executionId: string): Promise<void> {
+    const run = this.runs.get(runId);
+    if (!run) return;
+    const key = role ?? "unknown";
+    const counts = run.truncated_requests ??= {};
+    counts[key] = (counts[key] ?? 0) + 1;
+    this.pushEvent(run, { type: "model_output_truncated", role: key, execution_id: executionId });
+    if (isTerminal(run.status)) run.harness_metrics = computeHarnessMetrics(run);
+    await this.persistState();
   }
 
   private armDeadline(session: SessionRecord, run: RunRecord, ms: number): void {

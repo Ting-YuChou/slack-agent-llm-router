@@ -15,8 +15,14 @@ test("a no-profile run reports utilization and timing but no attempt verdicts", 
   assert.deepEqual(metrics, {
     outcome: "completed", turn_util: 0.25, tool_util: 0.25, attempts: 0, first_attempt_pass: null, repair_success: null,
     writer_checks_calls: 0, approvals: 0, policy_blocks: 0, fixed_files: 0, cost_usd: null, wall_s: 120, active_s: null, human_wait_s: null, time_to_first_edit_s: 30,
-    startup_s: null, repair_startup_s: null,
+    startup_s: null, repair_startup_s: null, truncated_requests: 0, truncated_requests_by_role: {},
   });
+});
+
+test("model responses cut off by their output cap are counted in total and per role", () => {
+  const metrics = computeHarnessMetrics(run({ truncated_requests: { writer: 2, grader: 1, unknown: 1 } }), now);
+  assert.equal(metrics.truncated_requests, 4);
+  assert.deepEqual(metrics.truncated_requests_by_role, { writer: 2, grader: 1, unknown: 1 });
 });
 
 test("a run repaired once and then delivered counts as a repair success, not a first-attempt pass", () => {

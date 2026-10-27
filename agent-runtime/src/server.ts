@@ -17,13 +17,13 @@ import { approvalSettings } from "./approval-mode.js";
 import { parseAgentLimitConfig } from "./agent-limits.js";
 
 export { parseAgentLimits } from "./agent-limits.js";
-import { budgetIdFor, executionActive, outputTokenLimitFor, parseDefaultRunBudget, releaseRunBudget, runBudgetStatus } from "./run-budget.js";
+import { budgetIdFor, executionActive, isGatewayRole, outputTokenLimitFor, parseDefaultRunBudget, releaseRunBudget, runBudgetStatus } from "./run-budget.js";
 import { deriveMcpRevocationSecret } from "./execution-status.js";
 import { deriveSessionSealKey, SessionSeal } from "./session-seal.js";
 import { AGENT_MODEL_ID, AGENT_REASONING_EFFORT, listAgentModels, resolveAgentModel } from "./agent-model.js";
 import { JevRouter, type JevMode } from "./jev-router.js";
 import { repositoryFromRemote, parseGitHubRepositories } from "./github-repository.js";
-import { issueClassifierGatewayToken, issueGatewayToken } from "./gateway-token.js";
+import { issueClassifierGatewayToken, issueGatewayToken, type GatewayRole } from "./gateway-token.js";
 import { allServerTools, enabledMcpServers, MCP_SERVERS, parseMcpMode, parseMcpServers, type McpServerId, type McpRunServer } from "./mcp-config.js";
 import { deriveMcpServerSecret, issueMcpToken } from "./mcp-token.js";
 import { budgetRefusal, deriveBudgetRpcSecret } from "./budget-rpc.js";
@@ -67,6 +67,8 @@ interface ServerOptions {
   budgetSecret?: string;
   /** Whether an execution's run is still active, for the gateways' revocation checks. */
   executionActive?: (execution: string) => boolean;
+  /** The model gateway saw a response of this execution cut off at its output cap. */
+  truncated?: (execution: string, role?: GatewayRole) => void | Promise<void>;
   /** Bearers MCP gateways present to ask for execution status (deriveMcpRevocationSecret). */
   mcpRevocationSecrets?: string[];
   orchestrator: CodingAgentOrchestrator;
@@ -119,6 +121,7 @@ export function createAgentHttpServer(options: ServerOptions) {
           if (url.pathname === '/internal/budget/reserve') ledger.reserve(id(body.workflow),id(body.id),Number(body.amount),body.execution === undefined ? undefined : id(body.execution));
           else if (url.pathname === '/internal/budget/settle') ledger.settle(id(body.id),body.amount === null ? null : Number(body.amount));
           else if (url.pathname === '/internal/budget/first-model') { sendJson(response,200,{ result: ledger.firstModel(id(body.execution)) }); return; }
+          else if (url.pathname === '/internal/budget/truncated') await options.truncated?.(id(body.execution),isGatewayRole(body.role) ? body.role : undefined);
           else if (url.pathname === '/internal/budget/active') { sendJson(response,200,{ result: options.executionActive ? options.executionActive(id(body.execution)) : ledger.active(id(body.execution)) }); return; }
           else { sendError(response,404,'not_found','Unknown budget operation'); return; }
           sendJson(response,200,{});
@@ -480,7 +483,7 @@ export async function createProductionServer() {
     grader,
     token: (id, route, role) => {
       const model = resolveAgentModel(route.modelRef);
-      const token = issueGatewayToken({ runId: id, workflowRunId: executionParents.get(id), role, outputTokenLimit: outputTokenLimitFor(role), provider: model.provider, model: model.id, api: model.api, reasoningEffort: route.effort, expiresAt: executionExpiry(id), traceparent: tracing?.traceparent(id) }, gatewaySecret);
+      const token = issueGatewayToken({ runId: id, workflowRunId: executionParents.get(id), role, outputTokenLimit: outputTokenLimitFor(role, trustedProfile.profile.limits), provider: model.provider, model: model.id, api: model.api, reasoningEffort: route.effort, expiresAt: executionExpiry(id), traceparent: tracing?.traceparent(id) }, gatewaySecret);
       telemetry?.addSecret(token, id); return token;
     },
   }) : undefined;
@@ -580,7 +583,7 @@ export async function createProductionServer() {
             runId,
             workflowRunId: budgetIdFor(runId, executionParents, budgetLedger, defaultRunBudgetUsd, id => workflowControl?.get<{ parent?: string }>("execution", id)?.parent),
             role: "writer",
-            outputTokenLimit: outputTokenLimitFor("writer"),
+            outputTokenLimit: outputTokenLimitFor("writer", trustedProfile?.profile.limits),
             provider: selectedModel.provider,
             model: selectedModel.id,
             api: selectedModel.api,
@@ -652,6 +655,8 @@ export async function createProductionServer() {
     budgetLedger, budgetSecret: deriveBudgetRpcSecret(gatewaySecret),
     // Gateways refuse the tokens of a run whose budget is stopped (releaseRunBudget at its end).
     executionActive: (execution) => executionActive(execution, executionParents, budgetLedger, id => workflowControl?.get<{ parent?: string }>("execution", id)?.parent),
+    // A workflow execution's truncation counts on its parent run, like its cost.
+    truncated: (execution, role) => orchestrator.recordTruncation(executionParents.get(execution) ?? workflowControl?.get<{ parent?: string }>("execution", execution)?.parent ?? execution, role, execution),
     mcpRevocationSecrets: mcpSigningSecret ? mcpServerIds.filter((id) => id !== "codegraph").map((id) => deriveMcpRevocationSecret(deriveMcpServerSecret(mcpSigningSecret, id))) : [],
     ci: ciRuntime?.ci,
     feedback: telemetry ? (run, payload, id) => telemetry.record(run.run_id, run.session_id, "feedback", payload, id) : undefined,

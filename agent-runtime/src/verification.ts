@@ -13,6 +13,7 @@ import type { FixerSpec } from "./fixers.js";
 import type { Candidate, CheckStatus, GraderSampling, VerificationCheck, VerificationResult } from "./quality-gate.js";
 import { RESOURCE_LIMIT_FLAGS } from "./container-flags.js";
 import { hardenedGitEnv } from "./worktree-manager.js";
+import { isGatewayRole, OUTPUT_TOKEN_CEILING, type ProfileLimits } from "./run-budget.js";
 const exec = promisify(execFile);
 /** One trusted check. `{report}` in argv becomes the check's report path under /out. */
 export interface VerificationCheckSpec { name: string; ciJob?: string; argv: string[]; cwd: string; timeoutMs: number; report?: { format: "junit" }; kind?: "static" | "test" }
@@ -33,6 +34,8 @@ export interface VerificationProfile {
   grader?: GraderSampling;
   /** Keep the writer's container paused between a settled attempt and its repair instead of starting a new one. */
   writerReuse?: boolean;
+  /** Per-role output-token caps (writer, grader, investigator), each at most OUTPUT_TOKEN_CEILING; unnamed roles keep their built-in cap. */
+  limits?: ProfileLimits;
 }
 export const REPORT_TOKEN = "{report}";
 /** File-safe check name used for /out/<check>.report and /out/<check>.log. */
@@ -57,6 +60,7 @@ export function validateProfile(raw: unknown): VerificationProfile {
   }
   if (p.isolation !== undefined && !["per_mode", "per_check"].includes(p.isolation)) throw new Error("Invalid verification isolation");
   if (p.writerReuse !== undefined && typeof p.writerReuse !== "boolean") throw new Error("Invalid writer reuse");
+  if (p.limits !== undefined && !validLimits(p.limits)) throw new Error(`Invalid profile limits: outputTokens takes writer, grader or investigator caps, each an integer from 1024 to ${OUTPUT_TOKEN_CEILING}`);
   if (p.fixers !== undefined && (!Array.isArray(p.fixers) || p.fixers.length > 5 || p.fixers.some(f => !f || typeof f.name !== "string" || !/^[\w.-]{1,64}$/.test(f.name) || !Array.isArray(f.argv) || !f.argv.length || f.argv.some(x => typeof x !== "string" || x.includes("\0") || x.includes(REPORT_TOKEN)) || typeof f.cwd !== "string" || !safeRelative(f.cwd) || !Number.isInteger(f.timeoutMs) || f.timeoutMs <= 0 || f.timeoutMs > 300_000) || new Set(p.fixers.map(f => f.name)).size !== p.fixers.length)) throw new Error("Invalid fixers");
   if (p.checks.some(c => c.kind !== undefined && !["static", "test"].includes(c.kind))) throw new Error("Invalid check kind");
   if (p.checks.some(c => (c.report !== undefined && (!c.report || c.report.format !== "junit")) || (c.report === undefined && c.argv.some(x => x.includes(REPORT_TOKEN))))) throw new Error("Invalid check report");
@@ -74,6 +78,14 @@ export function validateProfile(raw: unknown): VerificationProfile {
     p.structuredWorkflow = config;
   }
   return { ...p, isolation: p.isolation ?? "per_mode", writerChecks: { defaultChecks: p.writerChecks?.defaultChecks ?? p.checks.map(c => c.name), maxCalls: p.writerChecks?.maxCalls ?? 4, ...(p.writerChecks?.reserveMs !== undefined ? { reserveMs: p.writerChecks.reserveMs } : {}) }, baselinePaths: p.baselinePaths ?? ["tests/", "agent-runtime/test/"], maxRepairs: Math.min(2, Math.max(0, p.maxRepairs ?? 2)), maxCostUsd: p.maxCostUsd ?? 1, activeTimeoutMs: p.activeTimeoutMs ?? 900_000, grader: { samples: p.grader?.samples ?? 1, aggregate: p.grader?.aggregate ?? "unanimous" }, writerReuse: p.writerReuse ?? false };
+}
+const isPlainObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+/** Above the ceiling is refused, never clamped: a profile asking for more than the harness allows is a mistake to fix. */
+function validLimits(limits: unknown): boolean {
+  if (!isPlainObject(limits) || Object.keys(limits).some(key => key !== "outputTokens")) return false;
+  const caps = limits.outputTokens;
+  if (caps === undefined) return true;
+  return isPlainObject(caps) && Object.entries(caps).every(([role, cap]) => isGatewayRole(role) && Number.isInteger(cap) && (cap as number) >= 1024 && (cap as number) <= OUTPUT_TOKEN_CEILING);
 }
 export async function loadProfile(file: string, repo: string, worktreeRoot: string) {
   const resolved = await realpath(file);

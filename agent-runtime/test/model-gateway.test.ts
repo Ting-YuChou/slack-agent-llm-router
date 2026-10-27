@@ -598,3 +598,44 @@ test("every gateway 429 leaves a failed request span carrying its cause_code", {
     await tracing.close();
   }
 });
+
+const INCOMPLETE = 'data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":5,"output_tokens":9}}}\n\n';
+const COMPLETED = 'data: {"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":9}}}\n\n';
+/** A budget store that admits everything and records what the gateway reports as truncated. */
+function truncationLedger(reports: Array<[string, string | undefined]>): BudgetAdmissionLedger {
+  return { reserve: async () => {}, settle: async () => {}, firstModel: async () => undefined, truncated: async (execution, role) => { reports.push([execution, role]); } };
+}
+
+test("a response cut off by its output cap is reported to the host with the token's role", async (t) => {
+  const reports: Array<[string, string | undefined]> = [];
+  const exporter = new InMemorySpanExporter();
+  const tracing = new AgentTracing([new SimpleSpanProcessor(exporter)]);
+  t.after(() => tracing.close());
+  let body = INCOMPLETE;
+  const base = await gatewayAt(t, { tracing, prices: { "openai/gpt-5.6-luna": { input: 1, output: 1 } }, budgetLedger: truncationLedger(reports), fetchFn: async () => new Response(body, { status: 200 }) });
+  await admitted(await agentRequest(base, { runId: "exec-w", workflowRunId: "wf", role: "writer", outputTokenLimit: 32768 }));
+  await admitted(await agentRequest(base, { runId: "exec-legacy", workflowRunId: "wf" }));
+  body = COMPLETED;
+  await admitted(await agentRequest(base, { runId: "exec-g", workflowRunId: "wf", role: "grader", outputTokenLimit: 16384 }));
+  // The report is sent once the response has ended, so wait for the gateway's request spans to close.
+  for (let i = 0; i < 50 && exporter.getFinishedSpans().length < 3; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(reports, [["exec-w", "writer"], ["exec-legacy", undefined]], "a complete response is not reported; a role-less token reports no role");
+  assert.equal(exporter.getFinishedSpans().filter((span) => span.attributes["gen_ai.response.truncated"] === true).length, 2);
+});
+
+test("a host that cannot record a truncation does not fail the request", async (t) => {
+  const ledger: BudgetAdmissionLedger = { ...truncationLedger([]), truncated: async () => { throw new Error("workflow_budget_unavailable"); } };
+  const base = await gatewayAt(t, { prices: { "openai/gpt-5.6-luna": { input: 1, output: 1 } }, budgetLedger: ledger, fetchFn: async () => new Response(INCOMPLETE, { status: 200 }) });
+  const response = await agentRequest(base, { workflowRunId: "wf", role: "writer", outputTokenLimit: 32768 });
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), INCOMPLETE);
+});
+
+test("the gateway applies a token's output cap and never sends one above the ceiling", async (t) => {
+  const bodies: Array<Record<string, unknown>> = [];
+  const base = await gatewayAt(t, { prices: { "openai/gpt-5.6-luna": { input: 1, output: 1 } }, budgetLedger: truncationLedger([]),
+    fetchFn: async (_input, init) => { bodies.push(JSON.parse(String(init?.body))); return new Response(COMPLETED, { status: 200 }); } });
+  await admitted(await agentRequest(base, { workflowRunId: "wf", role: "writer", outputTokenLimit: 12000 }));
+  await admitted(await agentRequest(base, { workflowRunId: "wf", role: "writer", outputTokenLimit: 100_000 }));
+  assert.deepEqual(bodies.map((body) => body.max_output_tokens), [12000, 32768]);
+});
