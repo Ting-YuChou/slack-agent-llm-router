@@ -6,12 +6,12 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-/** Loads the writer policy extension with a fake Pi API; MAX_* limits are read at import time. */
+/** Activates the writer policy extension with a fake Pi API; the extension reads its env at activation. */
 export async function loadPolicy(env: Record<string, string>) {
   const previous = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
   Object.assign(process.env, env);
   try {
-    const extension = await import(`${pathToFileURL(path.resolve(import.meta.dirname, "../../extensions/policy.ts")).href}?${Math.random()}`);
+    const extension = await import(pathToFileURL(path.resolve(import.meta.dirname, "../../extensions/policy.ts")).href);
     const handlers = new Map<string, Array<(...args: any[]) => any>>();
     const log: string[] = [];
     const entries: Array<{ customType: string; data: unknown }> = [];
@@ -57,6 +57,25 @@ test("turn limit records which limit was hit before aborting", () => withWorkspa
   await policy.fire("turn_start", {}, ctx);
   assert.deepEqual(policy.log, ["entry:pi_agent_limit", "abort"]);
   assert.deepEqual(policy.entries[0], { customType: "pi_agent_limit", data: { kind: "turns", limit: 1 } });
+}));
+
+test("each activation of the one module instance reads its own limits and approval mode", () => withWorkspace(async (cwd) => {
+  const strict = await loadPolicy({ PI_AGENT_MAX_TURNS: "1" });
+  const delivery = await loadPolicy({ PI_AGENT_MAX_TURNS: "3", PI_AGENT_WRITE_APPROVAL: "none" });
+  const aborts: string[] = [];
+  for (const [name, policy] of [["strict", strict], ["delivery", delivery]] as const) {
+    const ctx = { cwd, abort: () => aborts.push(name) };
+    await policy.fire("input", {}, ctx);
+    for (let turn = 0; turn < 2; turn++) await policy.fire("turn_start", {}, ctx);
+  }
+  assert.deepEqual(aborts, ["strict"]);
+  assert.deepEqual(strict.entries[0], { customType: "pi_agent_limit", data: { kind: "turns", limit: 1 } });
+  let confirms = 0;
+  const ctx = { cwd, abort: () => undefined, ui: { confirm: async () => { confirms++; return true; } } };
+  assert.equal(await delivery.fire("tool_call", { toolName: "write", input: { path: "a.txt", content: "x" } }, ctx), undefined);
+  assert.equal(confirms, 0);
+  assert.equal(await strict.fire("tool_call", { toolName: "write", input: { path: "a.txt", content: "x" } }, ctx), undefined);
+  assert.equal(confirms, 1);
 }));
 
 const writerContext = { allowedPaths: ["src"], checks: ["pytest", "tsc"], rubric: ["tests_cover_change"], diffLimits: { maxFiles: 50, maxBytes: 1048576, maxSingleFileBytes: 262144 } };

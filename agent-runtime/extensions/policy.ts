@@ -13,13 +13,8 @@ import { renderPrompt } from "../dist/src/prompts.js";
 import { BUDGET_STATUS_DIALOG, activeTimeNotice, usdBudgetNotice } from "../dist/src/budget-notice.js";
 import { POLICY_ENTRY, policyDecisionEntry, type PolicyVerdict } from "../dist/src/policy-decision.js";
 
-const MAX_TURNS = Number(process.env.PI_AGENT_MAX_TURNS ?? "20");
-const MAX_TOOL_CALLS = Number(process.env.PI_AGENT_MAX_TOOL_CALLS ?? "40");
 const APPROVAL_TIMEOUT_MS = 300_000;
 const BUDGET_STATUS_TIMEOUT_MS = 5_000;
-// Delivery-mode runs pass "none" (the owner approves the final diff instead). CI repair sessions skip that
-// card and keep per-write prompts. Anything but an explicit "none" prompts, so a typo never silently drops approval.
-const WRITE_APPROVAL = process.env.PI_AGENT_WRITE_APPROVAL === "none" ? "none" : "per_prompt";
 
 function safeCommands(): string[] {
   try {
@@ -110,6 +105,12 @@ function budgetMessage(stage: BudgetStage, used: number, max: number, unit: stri
 }
 
 export default function policyExtension(pi: ExtensionAPI) {
+  // Read when Pi activates the extension, so one module instance can serve differently configured sessions.
+  const MAX_TURNS = Number(process.env.PI_AGENT_MAX_TURNS ?? "20");
+  const MAX_TOOL_CALLS = Number(process.env.PI_AGENT_MAX_TOOL_CALLS ?? "40");
+  // Delivery-mode runs pass "none" (the owner approves the final diff instead). CI repair sessions skip that
+  // card and keep per-write prompts. Anything but an explicit "none" prompts, so a typo never silently drops approval.
+  const WRITE_APPROVAL = process.env.PI_AGENT_WRITE_APPROVAL === "none" ? "none" : "per_prompt";
   let turns = 0;
   let toolCalls = 0;
   let writeApproved = false;

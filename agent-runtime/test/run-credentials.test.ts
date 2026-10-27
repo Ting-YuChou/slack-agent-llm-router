@@ -23,7 +23,7 @@ async function loadGatewayExtension() {
   const previous = process.env.PI_MODEL_GATEWAY_URL;
   process.env.PI_MODEL_GATEWAY_URL = "http://model-gateway:8080";
   try {
-    const module = await import(`${pathToFileURL(path.resolve(import.meta.dirname, "../../extensions/model-gateway.ts")).href}?${Math.random()}`);
+    const module = await import(pathToFileURL(path.resolve(import.meta.dirname, "../../extensions/model-gateway.ts")).href);
     const handlers = new Map<string, (...args: any[]) => any>();
     module.default({ registerProvider: () => undefined, on: (event: string, handler: (...args: any[]) => any) => handlers.set(event, handler) });
     return handlers;
