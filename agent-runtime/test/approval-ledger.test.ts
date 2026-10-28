@@ -8,6 +8,7 @@ import { ApprovalLedger } from "../src/approval-ledger.js";
 import { CodingAgentOrchestrator } from "../src/orchestrator.js";
 import type { PublicRunEvent } from "../src/pi-rpc.js";
 import { RuntimeStateStore } from "../src/runtime-state.js";
+import { waitFor } from "./support/wait.js";
 
 const SETTLED = { type: "settled", outcome: "completed" } as const;
 const tick = () => new Promise(resolve => setImmediate(resolve));
@@ -131,17 +132,23 @@ test("a delivery whose approval expired during the restart fails as delivery_exp
   } finally { await env.cleanup(); }
 });
 
-test("a restored delivery re-arms its remaining expiry", async () => {
+test("a restored delivery re-arms its remaining expiry", async t => {
+  // Mocked clock and timers: on a slow runner the 150 ms approval used to lapse in real time before restore().
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: Date.parse("2026-10-01T00:00:00Z") });
   const env = await stateRoot();
   try {
     const pending = await pendingDelivery(env, 150);
+    t.mock.timers.tick(100); // The restart takes 100 ms of the approval's 150.
     const second = env.start(10_000);
     await second.orchestrator.restore();
     assert.equal(second.orchestrator.getRun(pending.runId).status, "awaiting_approval");
-    await new Promise(resolve => setTimeout(resolve, 250));
-    const run = second.orchestrator.getRun(pending.runId);
+    t.mock.timers.tick(250);
+    const run = await waitFor(() => second.orchestrator.getRun(pending.runId), current => current.status !== "awaiting_approval",
+      current => `the persisted expiry never fired; the run is still ${current.status}`);
     assert.equal(run.status, "failed", "the persisted expiry, not the new TTL, applies");
     assert.equal(run.error?.code, "delivery_expired");
+    // Drain the expiry's state write before cleanup removes the state root.
+    await (second.orchestrator as any).persistState();
   } finally { await env.cleanup(); }
 });
 
