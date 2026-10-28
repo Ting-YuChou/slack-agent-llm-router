@@ -5,7 +5,8 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { test } from "node:test";
-import { createSanitizedMirror } from "../src/codegraph-lazy-proxy.js";
+import { createSanitizedMirror, TOOL_CATALOG } from "../src/codegraph-lazy-proxy.js";
+import { MCP_SERVERS } from "../src/mcp-config.js";
 const exec = promisify(execFile);
 
 test("sanitized mirror includes current source and excludes secrets, binary, symlink and ignored files", async () => {
@@ -53,4 +54,18 @@ test("the CodeGraph child process keeps the image's baked-in tree-sitter parsers
   // HOME is the run's empty state root, so without this the parsers resolve to a cache the offline container cannot fill.
   const env = codegraphEnv({ PATH: "/usr/bin", TREE_SITTER_LANGUAGE_PACK_CACHE_DIR: "/usr/local/share/tree-sitter-language-pack" }, "/state", "/mirror");
   assert.equal(env.TREE_SITTER_LANGUAGE_PACK_CACHE_DIR, "/usr/local/share/tree-sitter-language-pack");
+});
+
+test("the CodeGraph catalog offers cgc's own arguments, except the repo_path and graph_name the proxy owns", () => {
+  assert.deepEqual(TOOL_CATALOG.map((tool) => tool.name), MCP_SERVERS.codegraph.codemodeTools);
+  const schema = (name: string) => TOOL_CATALOG.find((tool) => tool.name === name)!.inputSchema as { properties?: Record<string, any>; required?: string[] };
+  // Offered no arguments, the model guessed them: every analyze_code_relationships call failed and spent the call budget.
+  assert.deepEqual(schema("analyze_code_relationships").required, ["query_type", "target"]);
+  assert.ok(schema("analyze_code_relationships").properties?.query_type.enum.includes("find_callers"));
+  assert.deepEqual(schema("find_code").required, ["query"]);
+  assert.deepEqual(schema("calculate_cyclomatic_complexity").required, ["function_name"]);
+  for (const tool of TOOL_CATALOG) {
+    assert.ok(schema(tool.name).properties, tool.name);
+    assert.ok(!("repo_path" in schema(tool.name).properties!) && !("graph_name" in schema(tool.name).properties!), tool.name);
+  }
 });

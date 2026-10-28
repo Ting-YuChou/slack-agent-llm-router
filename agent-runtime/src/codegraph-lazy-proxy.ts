@@ -47,9 +47,52 @@ export async function createSanitizedMirror(worktree: string, stateRoot: string,
   return mirror;
 }
 
-const TOOL_CATALOG = MCP_SERVERS.codegraph.codemodeTools.map((name) => ({
-  name, description: `Read-only CodeGraph analysis: ${name}`, inputSchema: { type: "object", additionalProperties: true },
-}));
+interface CodeGraphTool { name: string; description: string; inputSchema: { type: "object"; properties: Record<string, object>; required?: string[] } }
+
+const RELATIONSHIP_QUERIES = ["find_callers", "find_callees", "find_all_callers", "find_all_callees", "find_importers", "who_modifies", "class_hierarchy", "overrides",
+  "dead_code", "call_chain", "module_deps", "variable_scope", "find_complexity", "find_functions_by_argument", "find_functions_by_decorator"];
+
+/**
+ * CodeGraphContext 0.6.13's own descriptions and input schemas, so the model knows each tool's required arguments. The proxy
+ * points repo_path at the run's mirror, which holds the only graph, so neither repo_path nor graph_name is offered.
+ * docker-integration.test.ts checks this against the cgc in the agent image.
+ */
+export const TOOL_CATALOG: CodeGraphTool[] = [
+  { name: "list_indexed_repositories", description: "List all indexed repositories.", inputSchema: { type: "object", properties: {} } },
+  { name: "get_repository_stats", description: "Get repository statistics.", inputSchema: { type: "object", properties: {} } },
+  {
+    name: "find_code", description: "Find relevant code snippets related to a keyword (e.g., function name, class name, or content).",
+    inputSchema: { type: "object", required: ["query"], properties: {
+      query: { type: "string", description: "Keyword or phrase to search for" },
+      fuzzy_search: { type: "boolean", description: "Whether to use fuzzy search", default: false },
+      edit_distance: { type: "number", description: "Edit distance for fuzzy search (between 0-2)", default: 2 },
+    } },
+  },
+  {
+    name: "analyze_code_relationships", description: "Analyze code relationships like 'who calls this function' or 'class hierarchy'.",
+    inputSchema: { type: "object", required: ["query_type", "target"], properties: {
+      query_type: { type: "string", enum: RELATIONSHIP_QUERIES },
+      target: { type: "string", description: "The primary query target (for example, a function name, class name, or 'start_func->end_func' for call chains). For find_functions_by_argument, use a parameter name or type." },
+      context: { type: "string", description: "Additional context parameter: acts as a file path for precise scoping or a numeric string (e.g., depth/limit) depending on the query type." },
+      depth: { type: "integer", description: "Optional traversal depth for transitive caller and callee queries (1-20)." },
+    } },
+  },
+  {
+    name: "find_dead_code", description: "Find potentially unused functions.",
+    inputSchema: { type: "object", properties: { exclude_decorated_with: { type: "array", items: { type: "string" }, default: [] } } },
+  },
+  {
+    name: "calculate_cyclomatic_complexity", description: "Calculate complexity of a function.",
+    inputSchema: { type: "object", required: ["function_name"], properties: {
+      function_name: { type: "string" },
+      path: { type: "string", description: "Optional file path to disambiguate the function." },
+    } },
+  },
+  {
+    name: "find_most_complex_functions", description: "Find most complex functions.",
+    inputSchema: { type: "object", properties: { limit: { type: "integer", default: 10 } } },
+  },
+];
 
 class CodeGraphProxy {
   private child?: ChildProcessWithoutNullStreams;
