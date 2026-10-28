@@ -6,6 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 
+import { TOOL_CATALOG } from "../src/codegraph-lazy-proxy.js";
 import { buildAgentDockerArgs, DockerPiProcess } from "../src/container-runtime.js";
 import { MCP_SERVERS } from "../src/mcp-config.js";
 import type { PublicRunEvent } from "../src/pi-rpc.js";
@@ -281,6 +282,17 @@ async function toolResults(sessionDir: string): Promise<string[]> {
     .map((entry) => (entry.message.content ?? []).map((block: { text?: string }) => block.text ?? "").join(""));
 }
 
+test("the CodeGraph proxy offers the image's own cgc tool schemas, minus the repo_path and graph_name it owns", { skip: !enabled, timeout: 60_000 }, async () => {
+  const script = "import json\nfrom codegraphcontext.tool_definitions import TOOLS\nprint(json.dumps(TOOLS))";
+  const tools = JSON.parse(await command("docker", ["run", "--rm", "--network", "none", "--entrypoint", "python3", AGENT_TEST_IMAGE, "-c", script]));
+  const expected = MCP_SERVERS.codegraph.codemodeTools.map((name) => {
+    const { properties, ...schema } = tools[name].inputSchema;
+    const offered = Object.fromEntries(Object.entries(properties).filter(([key]) => key !== "repo_path" && key !== "graph_name"));
+    return { name, description: tools[name].description, inputSchema: { ...schema, properties: offered } };
+  });
+  assert.deepEqual(TOOL_CATALOG, expected);
+});
+
 test("a writer's codemode script reaches CodeGraph and each nested call is a tool event", { skip: !enabled, timeout: 300_000 }, async () => {
   const suffix = Math.random().toString(16).slice(2, 10);
   const network = `pi-codegraph-${suffix}`;
@@ -302,7 +314,8 @@ test("a writer's codemode script reaches CodeGraph and each nested call is a too
   assert.notEqual(hostUid, 0, "integration test must run as a non-root host user");
 
   // CodeGraph's tools are codemode-only: a script is the one way to reach them.
-  const script = "text(JSON.stringify(await tools.mcp__codegraph__get_repository_stats({})).slice(0, 2000));";
+  const script = "text(JSON.stringify(await tools.mcp__codegraph__get_repository_stats({})).slice(0, 2000));\n" +
+    "text(await describeTool(\"mcp__codegraph__analyze_code_relationships\"));";
   const fakeModelScript = fakeGatewayScript(scriptedTurns([
     { kind: "function_call", name: "codemode", arguments: { code: script } },
     { kind: "text", text: "CodeGraph answered." },
@@ -335,6 +348,8 @@ test("a writer's codemode script reaches CodeGraph and each nested call is a too
     assert.ok(nested.every((event) => event.type === "tool" && event.is_error !== true), diagnostic);
     // An empty index answers too; the fixture's two functions must be in it.
     assert.match((await toolResults(sessionStatePath)).join("\n"), /\\"functions\\": 2\b/, diagnostic);
+    // The model learns a tool's arguments only from this declaration; guessed ones failed every call.
+    assert.match((await toolResults(sessionStatePath)).join("\n"), /query_type: "find_callers" \|[^;]*;\s+(?:\/\/[^\n]*\s+)?target: string;/, diagnostic);
     assert.ok(!events.some((event) => event.type === "error"), diagnostic);
   } finally {
     await piProcess?.close();

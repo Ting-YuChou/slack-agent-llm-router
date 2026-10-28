@@ -48,7 +48,9 @@ It expects the Agent observability profile and its internal network to be runnin
 
 ## CodeGraphContext
 
-The local proxy starts with a fixed seven-tool catalog. The first tool call copies current tracked and
+The local proxy starts with a fixed seven-tool catalog: CGC 0.6.13's own descriptions and input schemas,
+without `repo_path` and `graph_name`, which the proxy sets itself. A Docker test compares it with the CGC
+in the image, so a CGC upgrade must update it. The first tool call copies current tracked and
 non-ignored source files into a bounded run-scoped mirror, indexes that mirror, and starts CGC.
 The proxy runs CGC with a private HOME outside the worktree, `CGC_ALLOWED_ROOTS` set to the mirror,
 and a 384 MiB Kuzu buffer. Container termination removes the tmpfs mirror and index.
