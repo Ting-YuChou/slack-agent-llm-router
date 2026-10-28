@@ -28,7 +28,8 @@ export const MCP_SERVERS: Record<McpServerId, McpServerDefinition> = {
   codegraph: {
     transport: "stdio", command: "/usr/local/bin/codegraph-lazy-proxy", directTools: [],
     codemodeTools: ["list_indexed_repositories", "get_repository_stats", "find_code", "analyze_code_relationships", "find_dead_code", "calculate_cyclomatic_complexity", "find_most_complex_functions"],
-    timeout: 180, maxResultBytes: 524_288, maxCalls: 8,
+    // Models open with batches of 5 to 12 relationship queries.
+    timeout: 180, maxResultBytes: 524_288, maxCalls: 16,
   },
 };
 

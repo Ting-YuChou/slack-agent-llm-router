@@ -55,6 +55,9 @@ non-ignored source files into a bounded run-scoped mirror, indexes that mirror, 
 Calls that arrive before CGC is ready, including concurrent calls from one codemode script, wait for
 that one start; if indexing fails, they all fail and the next call starts again. The proxy runs CGC with a private HOME outside the worktree, `CGC_ALLOWED_ROOTS` set to the mirror,
 and a 384 MiB Kuzu buffer. Container termination removes the tmpfs mirror and index.
+CGC resolves a relative path against its own working directory, so the proxy rewrites a `path` or
+`context` argument that names a file in the worktree, relative or absolute, to that file in the
+mirror. A run gets 16 CodeGraph calls.
 
 The Agent container has no network, so CGC's tree-sitter parsers are baked into the image at build
 time (`TREE_SITTER_LANGUAGE_PACK_CACHE_DIR`): C, C++, C#, Go, Java, JavaScript, Kotlin, PHP, Python,

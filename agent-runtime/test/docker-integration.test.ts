@@ -302,7 +302,7 @@ test("a writer's codemode script reaches CodeGraph and each nested call is a too
   const sessionStatePath = await mkdtemp(path.join(tmpdir(), "pi-codegraph-state-"));
   await command("git", ["init", "-b", "main"], repo);
   await mkdir(path.join(repo, "src"));
-  await writeFile(path.join(repo, "src", "index.js"), "function live() { return 1; }\nfunction dead() { return 2; }\nmodule.exports = { live };\n");
+  await writeFile(path.join(repo, "src", "index.js"), "function live() { return helper(); }\nfunction helper() { return 2; }\nmodule.exports = { live };\n");
   await command("git", ["add", "."], repo);
   await command("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base"], repo);
   const worktrees = new WorktreeManager({ repoPath: repo, worktreeRoot, baseRef: "HEAD" });
@@ -317,6 +317,7 @@ test("a writer's codemode script reaches CodeGraph and each nested call is a too
   // which each indexed the mirror and started a cgc server on the one graph database until every call timed out.
   const script = "const [stats, dead] = await Promise.all([tools.mcp__codegraph__get_repository_stats({}), tools.mcp__codegraph__find_dead_code({})]);\n" +
     "text(JSON.stringify(stats).slice(0, 2000));\ntext(JSON.stringify(dead).slice(0, 2000));\n" +
+    "text(JSON.stringify(await tools.mcp__codegraph__analyze_code_relationships({ query_type: \"find_callees\", target: \"live\", context: \"src/index.js\" })).slice(0, 2000));\n" +
     "text(await describeTool(\"mcp__codegraph__analyze_code_relationships\"));";
   const fakeModelScript = fakeGatewayScript(scriptedTurns([
     { kind: "function_call", name: "codemode", arguments: { code: script } },
@@ -345,13 +346,15 @@ test("a writer's codemode script reaches CodeGraph and each nested call is a too
     piProcess.prompt("codegraph-run", "Map the call graph with CodeGraph.");
     await settled;
     const diagnostic = JSON.stringify({ events, results: await toolResults(sessionStatePath) });
-    for (const tool of ["mcp__codegraph__get_repository_stats", "mcp__codegraph__find_dead_code"]) {
+    for (const tool of ["mcp__codegraph__get_repository_stats", "mcp__codegraph__find_dead_code", "mcp__codegraph__analyze_code_relationships"]) {
       const nested = events.filter((event) => event.type === "tool" && event.tool === tool);
       assert.deepEqual(nested.map((event) => event.type === "tool" && event.phase), ["start", "end"], diagnostic);
       assert.ok(nested.every((event) => event.type === "tool" && event.is_error !== true), diagnostic);
     }
     // An empty index answers too; the fixture's two functions must be in it.
     assert.match((await toolResults(sessionStatePath)).join("\n"), /\\"functions\\": 2\b/, diagnostic);
+    // cgc resolved this relative context against its own working directory and found no callees.
+    assert.match((await toolResults(sessionStatePath)).join("\n"), /Function 'live' calls 1 other functions/, diagnostic);
     // The model learns a tool's arguments only from this declaration; guessed ones failed every call.
     assert.match((await toolResults(sessionStatePath)).join("\n"), /query_type: "find_callers" \|[^;]*;\s+(?:\/\/[^\n]*\s+)?target: string;/, diagnostic);
     assert.ok(!events.some((event) => event.type === "error"), diagnostic);
