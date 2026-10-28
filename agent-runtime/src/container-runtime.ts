@@ -107,8 +107,9 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
   if (!options.readOnlyWorkspace && tools.includes("write") && options.extensionPaths.includes(POLICY_EXTENSION) && !tools.includes(DIFF_SUMMARY_TOOL)) tools.push(DIFF_SUMMARY_TOOL);
   const hasCodemodeMcp = !options.directMcpOnly && (options.mcp?.servers.some((item) => MCP_SERVERS[item.server].codemodeTools.length > 0) ?? false);
   if ((options.classifier || hasCodemodeMcp) && !tools.includes("codemode")) tools.push("codemode");
-  const directMcpTools = options.mcp?.servers.flatMap((item) =>
-    namespacedMcpToolNames(item.server, MCP_SERVERS[item.server].directTools)) ?? [];
+  // Pi drops every tool --tools does not name, so codemode tools are named too; their codemode exposure keeps them off the model's tool list.
+  const mcpTools = options.mcp?.servers.flatMap((item) => namespacedMcpToolNames(item.server,
+    [...MCP_SERVERS[item.server].directTools, ...(hasCodemodeMcp ? MCP_SERVERS[item.server].codemodeTools : [])])) ?? [];
   const args = [
     "run", "--rm", "-i",
     "--name", options.name,
@@ -147,7 +148,7 @@ export function buildAgentDockerArgs(options: AgentContainerOptions): string[] {
     "--no-skills",
     "--no-prompt-templates",
     "--no-themes",
-    "--tools", [...tools, ...directMcpTools].join(","),
+    "--tools", [...tools, ...mcpTools].join(","),
   ];
   if (options.readOnlyWorkspace) args.push("--no-context-files");
   if (options.continueSession) args.push("--continue");

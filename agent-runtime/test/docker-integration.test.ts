@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 
 import { buildAgentDockerArgs, DockerPiProcess } from "../src/container-runtime.js";
+import { MCP_SERVERS } from "../src/mcp-config.js";
 import type { PublicRunEvent } from "../src/pi-rpc.js";
 import { WorktreeManager } from "../src/worktree-manager.js";
 import { deriveSessionSealKey, SessionSeal } from "../src/session-seal.js";
@@ -267,6 +268,75 @@ test("Pi builtin MCP uses only the trusted GitHub registration and ignores proje
     await piProcess?.close();
     await command("docker", ["stop", modelGateway]).catch(() => "");
     await command("docker", ["stop", mcpGateway]).catch(() => "");
+    await command("docker", ["network", "rm", network]).catch(() => "");
+    await worktrees.remove(isolated.path).catch(() => undefined);
+  }
+});
+
+/** The text of every tool result Pi saved in the session, for failure messages. */
+async function toolResults(sessionDir: string): Promise<string[]> {
+  const files = (await readdir(sessionDir, { recursive: true })).filter((file) => file.endsWith(".jsonl"));
+  const lines = (await Promise.all(files.map((file) => readFile(path.join(sessionDir, file), "utf8")))).join("\n").split("\n").filter(Boolean);
+  return lines.map((line) => JSON.parse(line)).filter((entry) => entry.message?.role === "toolResult")
+    .map((entry) => (entry.message.content ?? []).map((block: { text?: string }) => block.text ?? "").join(""));
+}
+
+test("a writer's codemode script reaches CodeGraph and each nested call is a tool event", { skip: !enabled, timeout: 300_000 }, async () => {
+  const suffix = Math.random().toString(16).slice(2, 10);
+  const network = `pi-codegraph-${suffix}`;
+  const modelGateway = `model-gateway-codegraph-${suffix}`;
+  const repo = await mkdtemp(path.join(tmpdir(), "pi-codegraph-repo-"));
+  const worktreeRoot = await mkdtemp(path.join(tmpdir(), "pi-codegraph-worktrees-"));
+  const sessionStatePath = await mkdtemp(path.join(tmpdir(), "pi-codegraph-state-"));
+  await command("git", ["init", "-b", "main"], repo);
+  await mkdir(path.join(repo, "src"));
+  await writeFile(path.join(repo, "src", "index.js"), "function live() { return 1; }\nfunction dead() { return 2; }\nmodule.exports = { live };\n");
+  await command("git", ["add", "."], repo);
+  await command("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base"], repo);
+  const worktrees = new WorktreeManager({ repoPath: repo, worktreeRoot, baseRef: "HEAD" });
+  const isolated = await worktrees.create(`codegraph-${suffix}`);
+  const hostUid = process.getuid?.();
+  const hostGid = process.getgid?.();
+  assert.notEqual(hostUid, undefined);
+  assert.notEqual(hostGid, undefined);
+  assert.notEqual(hostUid, 0, "integration test must run as a non-root host user");
+
+  // CodeGraph's tools are codemode-only: a script is the one way to reach them.
+  const script = "text(JSON.stringify(await tools.mcp__codegraph__get_repository_stats({})).slice(0, 2000));";
+  const fakeModelScript = fakeGatewayScript(scriptedTurns([
+    { kind: "function_call", name: "codemode", arguments: { code: script } },
+    { kind: "text", text: "CodeGraph answered." },
+  ]));
+
+  let piProcess: DockerPiProcess | undefined;
+  try {
+    await command("docker", ["network", "create", "--internal", network]);
+    await command("docker", ["run", "--detach", "--rm", "--name", modelGateway, "--network", network, "--network-alias", "model-gateway", FAKE_GATEWAY_IMAGE, "node", "-e", fakeModelScript]);
+    await waitForContainerHealthz(modelGateway);
+    const events: PublicRunEvent[] = [];
+    let resolveSettled!: () => void;
+    const settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
+    piProcess = new DockerPiProcess({
+      name: `pi-codegraph-${suffix}`, image: AGENT_TEST_IMAGE, network,
+      worktreePath: isolated.path, gitMetadataPath: isolated.gitDir, sessionStatePath,
+      gatewayUrl: "http://model-gateway:8080", modelRef: "openai/gpt-5.6-luna",
+      extensionPaths: ["/opt/pi/extensions/model-gateway.ts"], pluginPaths: [], skillPaths: [], toolNames: ["read"],
+      user: `${hostUid}:${hostGid}`,
+      mcp: { mode: "read_only", servers: [{ server: "codegraph", command: MCP_SERVERS.codegraph.command! }] },
+    }, () => "fake-model-token", (event) => {
+      events.push(event);
+      if (event.type === "settled" || event.type === "error") resolveSettled();
+    }, () => ({}));
+    piProcess.prompt("codegraph-run", "Map the call graph with CodeGraph.");
+    await settled;
+    const diagnostic = JSON.stringify({ events, results: await toolResults(sessionStatePath) });
+    const nested = events.filter((event) => event.type === "tool" && event.tool === "mcp__codegraph__get_repository_stats");
+    assert.deepEqual(nested.map((event) => event.type === "tool" && event.phase), ["start", "end"], diagnostic);
+    assert.ok(nested.every((event) => event.type === "tool" && event.is_error !== true), diagnostic);
+    assert.ok(!events.some((event) => event.type === "error"), diagnostic);
+  } finally {
+    await piProcess?.close();
+    await command("docker", ["stop", modelGateway]).catch(() => "");
     await command("docker", ["network", "rm", network]).catch(() => "");
     await worktrees.remove(isolated.path).catch(() => undefined);
   }

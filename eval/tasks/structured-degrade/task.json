@@ -1,10 +1,9 @@
 {
   "id": "structured-degrade",
-  "description": "A structured run where one investigation the prompt requires cannot be answered from the repository: the deployment manifest it asks about does not exist. With degradeUnknown on, that investigation must degrade to an unresolved gap instead of failing the run, and the writer must still commit a fix the hidden oracle accepts.",
+  "description": "A structured run where one investigation the prompt requires cannot be answered from the repository: the deployment manifest it asks about does not exist. The run must not fail on that gap, and the writer must still commit a fix the hidden oracle accepts. Live investigators report a missing file as a succeeded result with the question left unresolved, not as unknown, so whether an investigation degrades is up to the model; the degrade path itself is covered by the WorkflowCoordinator tests.",
   "task_mode": "implement",
   "workflow_mode": "structured",
   "expect": "pass",
-  "requires_degrade": true,
   "prompt": "backoff(attempt) in src/backoff.cjs must return 100 * 2^attempt milliseconds, capped at 5000: backoff(3) must be 800 and backoff(10) must be 5000, but they return 400 and 51200. Before writing, investigate two questions independently: (1) where the delay calculation in src/backoff.cjs goes wrong; (2) which production retry budget deploy/retry-policy.yaml sets for callers of backoff(). Answer each only from files in this repository, and report a question as unknown when the repository holds no evidence for it. Then fix src/backoff.cjs and keep tests/backoff.test.cjs unchanged.",
   "routing_text": "Fix the capped exponential backoff and look up its production retry budget.",
   "profile": {
