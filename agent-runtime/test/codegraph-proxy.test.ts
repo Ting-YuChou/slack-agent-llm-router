@@ -14,7 +14,8 @@ const proxyModule = fileURLToPath(new URL("../src/codegraph-lazy-proxy.js", impo
 
 /**
  * Runs the proxy over a one-file worktree with a fake cgc. The fake logs each index and server start, and any request its
- * server receives before the MCP handshake ends; its index takes 200 ms and its server answers initialize after 200 ms.
+ * server receives before the MCP handshake ends; its index takes 200 ms and its server answers initialize after 200 ms. Its
+ * server answers a call with the tool's name, then the arguments it received.
  */
 async function proxyWithFakeCgc(options: { failFirstIndex?: boolean } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "cgc-proxy-"));
@@ -33,7 +34,9 @@ if (process.argv[2] === "index") {
 } else {
   log("start");
   let buffer = ""; let initialized = false;
-  const answer = (message) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: message.params?.name ?? message.method }] } }) + "\\n");
+  const answer = (message) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { content: [
+    { type: "text", text: message.params?.name ?? message.method }, { type: "text", text: JSON.stringify(message.params?.arguments ?? {}) },
+  ] } }) + "\\n");
   process.stdin.on("data", (chunk) => {
     buffer += chunk;
     for (let index = buffer.indexOf("\\n"); index >= 0; index = buffer.indexOf("\\n")) {
@@ -58,9 +61,10 @@ if (process.argv[2] === "index") {
     }
   });
   return {
-    call: (name: string) => new Promise<any>((resolve) => {
+    worktree, mirror: path.join(root, "state", "mirror"),
+    call: (name: string, args: Record<string, unknown> = {}) => new Promise<any>((resolve) => {
       const id = nextId++; waiting.set(id, resolve);
-      child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: {} } }) + "\n");
+      child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }) + "\n");
     }),
     log: async () => (await readFile(log, "utf8")).split("\n").filter(Boolean),
     close: async () => {
@@ -154,5 +158,33 @@ test("a failed CodeGraph start fails every call waiting on it, and the next call
     const retried = await proxy.call("find_dead_code");
     assert.equal(retried.result?.content?.[0]?.text, "find_dead_code", JSON.stringify(retried));
     assert.deepEqual(await proxy.log(), ["index", "index", "start"]);
+  } finally { await proxy.close(); }
+});
+
+test("a path the model gives relative to the worktree or inside it reaches cgc as that file in the mirror", { timeout: 30_000 }, async () => {
+  const proxy = await proxyWithFakeCgc();
+  try {
+    const sent = async (name: string, args: Record<string, unknown>) => JSON.parse((await proxy.call(name, args)).result.content[1].text);
+    const file = path.join(proxy.mirror, "main.ts");
+    // cgc resolves a relative path against its own working directory, the state root: given context "src/index.js",
+    // find_callees answered that checkout calls nothing.
+    for (const context of ["main.ts", "./main.ts", path.join(proxy.worktree, "main.ts")]) {
+      assert.equal((await sent("analyze_code_relationships", { query_type: "find_callees", target: "answer", context })).context, file, context);
+    }
+    assert.equal((await sent("calculate_cyclomatic_complexity", { function_name: "answer", path: "main.ts" })).path, file);
+    // Anything else reaches cgc unchanged: a numeric context, a file the mirror lacks, and paths outside the mirror.
+    for (const context of ["5", "missing.ts", "../../worktree/main.ts", `${proxy.worktree}-old/main.ts`, "/etc/hosts"]) {
+      assert.equal((await sent("analyze_code_relationships", { query_type: "find_callers", target: "answer", context })).context, context, context);
+    }
+  } finally { await proxy.close(); }
+});
+
+test("a run gets 16 CodeGraph calls, and each call after them is refused", { timeout: 30_000 }, async () => {
+  const proxy = await proxyWithFakeCgc();
+  try {
+    // Models open with batches of 5 to 12 queries; at 8 calls, most of a run's relationship queries were refused.
+    const responses = await Promise.all(Array.from({ length: 17 }, () => proxy.call("find_dead_code")));
+    assert.equal(responses.filter((response) => response.result).length, 16);
+    assert.deepEqual(responses.filter((response) => response.error).map((response) => response.error.message), ["CodeGraph call budget is exhausted"]);
   } finally { await proxy.close(); }
 });

@@ -94,6 +94,17 @@ export const TOOL_CATALOG: CodeGraphTool[] = [
   },
 ];
 
+/**
+ * cgc knows the worktree only as the mirror, and resolves a relative path against its own working directory, the state root.
+ * A path relative to the worktree or inside it that names a mirror file becomes that file's mirror path; any other value,
+ * such as a numeric context, is left alone.
+ */
+async function mirrorPath(value: string, worktree: string, mirror: string): Promise<string> {
+  const resolved = path.resolve(mirror, path.isAbsolute(value) ? path.relative(worktree, value) : value);
+  if (!value || !resolved.startsWith(mirror + path.sep)) return value;
+  return lstat(resolved).then(() => resolved, () => value);
+}
+
 class CodeGraphProxy {
   private child?: ChildProcessWithoutNullStreams;
   private starting?: Promise<void>;
@@ -121,8 +132,8 @@ class CodeGraphProxy {
       if ("repo_path" in params.arguments || ["find_code", "analyze_code_relationships", "find_dead_code", "calculate_cyclomatic_complexity", "find_most_complex_functions", "get_repository_stats"].includes(params.name)) {
         params.arguments.repo_path = this.mirror;
       }
-      if (typeof params.arguments.path === "string" && params.arguments.path.startsWith(this.worktree)) {
-        params.arguments.path = this.mirror + params.arguments.path.slice(this.worktree.length);
+      for (const key of ["path", "context"]) {
+        if (typeof params.arguments[key] === "string") params.arguments[key] = await mirrorPath(params.arguments[key], this.worktree, this.mirror!);
       }
     }
     return this.request(message.method, params, message.id);
