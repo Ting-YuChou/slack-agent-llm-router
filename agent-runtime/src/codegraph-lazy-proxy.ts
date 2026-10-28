@@ -105,6 +105,13 @@ async function mirrorPath(value: string, worktree: string, mirror: string): Prom
   return lstat(resolved).then(() => resolved, () => value);
 }
 
+/**
+ * cgc 0.6.13 builds Cypher for these transitive queries that its Kuzu database rejects, with or without repo_path. The proxy
+ * refuses them before they reach cgc or spend a call, and names the one-level query to repeat instead.
+ * docker-integration.test.ts checks that the image's cgc still fails them.
+ */
+export const BROKEN_QUERIES = new Map([["find_all_callers", "find_callers"], ["find_all_callees", "find_callees"]]);
+
 class CodeGraphProxy {
   private child?: ChildProcessWithoutNullStreams;
   private starting?: Promise<void>;
@@ -123,6 +130,11 @@ class CodeGraphProxy {
     if (message.method === "tools/list") return { jsonrpc: "2.0", id: message.id, result: { tools: TOOL_CATALOG } };
     if (message.method !== "tools/call" || !TOOL_CATALOG.some((tool) => tool.name === message.params?.name)) {
       return { jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Tool is not allowed" } };
+    }
+    const queryType = message.params.name === "analyze_code_relationships" ? message.params.arguments?.query_type : undefined;
+    const instead = BROKEN_QUERIES.get(queryType);
+    if (instead) {
+      return { jsonrpc: "2.0", id: message.id, error: { code: -32602, message: `${queryType} fails in this CodeGraph version; call ${instead} instead, once per function, to follow the chain one level at a time` } };
     }
     if (this.calls >= MCP_SERVERS.codegraph.maxCalls) return { jsonrpc: "2.0", id: message.id, error: { code: -32001, message: "CodeGraph call budget is exhausted" } };
     this.calls += 1;

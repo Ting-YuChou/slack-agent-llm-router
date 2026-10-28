@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 
-import { TOOL_CATALOG } from "../src/codegraph-lazy-proxy.js";
+import { BROKEN_QUERIES, TOOL_CATALOG } from "../src/codegraph-lazy-proxy.js";
 import { buildAgentDockerArgs, DockerPiProcess } from "../src/container-runtime.js";
 import { MCP_SERVERS } from "../src/mcp-config.js";
 import type { PublicRunEvent } from "../src/pi-rpc.js";
@@ -291,6 +291,37 @@ test("the CodeGraph proxy offers the image's own cgc tool schemas, minus the rep
     return { name, description: tools[name].description, inputSchema: { ...schema, properties: offered } };
   });
   assert.deepEqual(TOOL_CATALOG, expected);
+});
+
+test("the image's cgc still fails the transitive queries the CodeGraph proxy refuses", { skip: !enabled, timeout: 120_000 }, async () => {
+  // Once a cgc upgrade answers them, the proxy should stop refusing them.
+  const script = [
+    "import json, os, subprocess",
+    "os.makedirs('/tmp/repo/src')",
+    "open('/tmp/repo/src/index.js', 'w').write('function live() { return helper(); }\\nfunction helper() { return 2; }\\nmodule.exports = { live };\\n')",
+    "subprocess.run(['cgc', 'index', '--no-progress', '/tmp/repo'], check=True, capture_output=True)",
+    "server = subprocess.Popen(['cgc', 'mcp', 'start'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)",
+    "def send(message): server.stdin.write(json.dumps(message) + '\\n'); server.stdin.flush()",
+    "def call(id, method, params):",
+    "    send({'jsonrpc': '2.0', 'id': id, 'method': method, 'params': params})",
+    "    for line in server.stdout:",
+    "        if line.startswith('{') and json.loads(line).get('id') == id: return json.loads(line)",
+    "    raise SystemExit('cgc exited')",
+    "call(1, 'initialize', {'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 'test', 'version': '1'}})",
+    "send({'jsonrpc': '2.0', 'method': 'notifications/initialized'})",
+    "answers = {}",
+    "for id, (query, target) in enumerate(json.loads(os.environ['QUERIES']), start=2):",
+    "    response = call(id, 'tools/call', {'name': 'analyze_code_relationships', 'arguments': {'query_type': query, 'target': target, 'repo_path': '/tmp/repo'}})",
+    "    answers[query] = json.loads(response['result']['content'][0]['text'])['results']",
+    "server.kill()",
+    "print(json.dumps(answers))",
+  ].join("\n");
+  const queries = [["find_callees", "live"], ...[...BROKEN_QUERIES.keys()].map((query) => [query, query.endsWith("callers") ? "helper" : "live"])];
+  const answers = JSON.parse(await command("docker", ["run", "--rm", "--network", "none", "--env", "HOME=/tmp/cgc-home", "--env", `QUERIES=${JSON.stringify(queries)}`,
+    "--entrypoint", "python3", AGENT_TEST_IMAGE, "-c", script]));
+  // The one-level query works on the same graph.
+  assert.match(answers.find_callees.summary, /calls 1 other functions/, JSON.stringify(answers));
+  for (const query of BROKEN_QUERIES.keys()) assert.match(answers[query].error ?? "", /exception/, JSON.stringify(answers));
 });
 
 test("a writer's codemode script reaches CodeGraph and each nested call is a tool event", { skip: !enabled, timeout: 300_000 }, async () => {

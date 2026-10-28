@@ -188,3 +188,17 @@ test("a run gets 16 CodeGraph calls, and each call after them is refused", { tim
     assert.deepEqual(responses.filter((response) => response.error).map((response) => response.error.message), ["CodeGraph call budget is exhausted"]);
   } finally { await proxy.close(); }
 });
+
+test("find_all_callers and find_all_callees are refused before cgc, without spending a call", { timeout: 30_000 }, async () => {
+  const proxy = await proxyWithFakeCgc();
+  try {
+    for (const [query_type, instead] of [["find_all_callers", "find_callers"], ["find_all_callees", "find_callees"]]) {
+      const response = await proxy.call("analyze_code_relationships", { query_type, target: "answer" });
+      assert.match(response.error?.message ?? "", new RegExp(`^${query_type} .*${instead}`), JSON.stringify(response));
+    }
+    // cgc never saw them: nothing was indexed or started, and the whole budget is left.
+    assert.deepEqual(await proxy.log(), []);
+    const responses = await Promise.all(Array.from({ length: MCP_SERVERS.codegraph.maxCalls }, () => proxy.call("find_dead_code")));
+    assert.ok(responses.every((response) => response.result), JSON.stringify(responses));
+  } finally { await proxy.close(); }
+});

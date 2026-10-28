@@ -57,7 +57,10 @@ that one start; if indexing fails, they all fail and the next call starts again.
 and a 384 MiB Kuzu buffer. Container termination removes the tmpfs mirror and index.
 CGC resolves a relative path against its own working directory, so the proxy rewrites a `path` or
 `context` argument that names a file in the worktree, relative or absolute, to that file in the
-mirror. A run gets 16 CodeGraph calls.
+mirror. A run gets 16 CodeGraph calls. CGC 0.6.13's `find_all_callers` and `find_all_callees`
+queries fail inside CGC, because Kuzu rejects the Cypher they generate. The proxy refuses them
+without spending a call, and tells the model to repeat `find_callers` or `find_callees` one level
+at a time. A Docker test checks that they still fail, so a CGC upgrade that fixes them shows up.
 
 The Agent container has no network, so CGC's tree-sitter parsers are baked into the image at build
 time (`TREE_SITTER_LANGUAGE_PACK_CACHE_DIR`): C, C++, C#, Go, Java, JavaScript, Kotlin, PHP, Python,
