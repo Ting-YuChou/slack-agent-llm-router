@@ -15,7 +15,9 @@ const SOURCE_FILE = /\.(?:[cm]?[jt]sx?|py|go|rs|java|kt|kts|rb|php|cs|cpp|cc|cxx
 export function codegraphEnv(env: NodeJS.ProcessEnv, stateRoot: string, mirror: string): NodeJS.ProcessEnv {
   // TREE_SITTER_LANGUAGE_PACK_CACHE_DIR points at the parsers baked into the image; the container cannot download them.
   const kept = Object.fromEntries(["PATH", "LANG", "LC_ALL", "TZ", "TREE_SITTER_LANGUAGE_PACK_CACHE_DIR"].flatMap((key) => env[key] ? [[key, env[key]]] : []));
-  return { ...kept, HOME: stateRoot, CGC_ALLOWED_ROOTS: mirror, CGC_EMBEDDED_BUFFER_POOL_MB: "384" };
+  // Left to choose, cgc runs FalkorDB Lite where it starts (x86_64) and KùzuDB elsewhere (arm64), and the two answer the same
+  // query differently. KùzuDB runs on both, inside cgc, with the buffer pool sized here.
+  return { ...kept, HOME: stateRoot, CGC_ALLOWED_ROOTS: mirror, CGC_RUNTIME_DB_TYPE: "kuzudb", CGC_EMBEDDED_BUFFER_POOL_MB: "384" };
 }
 
 export interface MirrorLimits { maxFiles: number; maxFileBytes: number; maxTotalBytes: number }
@@ -105,6 +107,13 @@ async function mirrorPath(value: string, worktree: string, mirror: string): Prom
   return lstat(resolved).then(() => resolved, () => value);
 }
 
+/**
+ * cgc 0.6.13 builds Cypher for these transitive queries that KùzuDB rejects, with or without repo_path. The proxy
+ * refuses them before they reach cgc or spend a call, and names the one-level query to repeat instead.
+ * docker-integration.test.ts checks that the image's cgc still fails them.
+ */
+export const BROKEN_QUERIES = new Map([["find_all_callers", "find_callers"], ["find_all_callees", "find_callees"]]);
+
 class CodeGraphProxy {
   private child?: ChildProcessWithoutNullStreams;
   private starting?: Promise<void>;
@@ -123,6 +132,11 @@ class CodeGraphProxy {
     if (message.method === "tools/list") return { jsonrpc: "2.0", id: message.id, result: { tools: TOOL_CATALOG } };
     if (message.method !== "tools/call" || !TOOL_CATALOG.some((tool) => tool.name === message.params?.name)) {
       return { jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Tool is not allowed" } };
+    }
+    const queryType = message.params.name === "analyze_code_relationships" ? message.params.arguments?.query_type : undefined;
+    const instead = BROKEN_QUERIES.get(queryType);
+    if (instead) {
+      return { jsonrpc: "2.0", id: message.id, error: { code: -32602, message: `${queryType} fails in this CodeGraph version; call ${instead} instead, once per function, to follow the chain one level at a time` } };
     }
     if (this.calls >= MCP_SERVERS.codegraph.maxCalls) return { jsonrpc: "2.0", id: message.id, error: { code: -32001, message: "CodeGraph call budget is exhausted" } };
     this.calls += 1;
