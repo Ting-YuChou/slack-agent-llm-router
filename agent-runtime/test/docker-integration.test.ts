@@ -369,8 +369,9 @@ test("a writer's codemode script reaches CodeGraph and each nested call is a too
       name: `pi-codegraph-${suffix}`, image: AGENT_TEST_IMAGE, network,
       worktreePath: isolated.path, gitMetadataPath: isolated.gitDir, sessionStatePath,
       gatewayUrl: "http://model-gateway:8080", modelRef: "openai/gpt-5.6-luna",
-      extensionPaths: ["/opt/pi/extensions/model-gateway.ts"], pluginPaths: [], skillPaths: [], toolNames: ["read"],
-      user: `${hostUid}:${hostGid}`,
+      // With one tool call allowed, the script spends it; its CodeGraph calls fall under the proxy's own budget.
+      extensionPaths: ["/opt/pi/extensions/policy.ts", "/opt/pi/extensions/model-gateway.ts"], pluginPaths: [], skillPaths: [], toolNames: ["read"],
+      user: `${hostUid}:${hostGid}`, limits: { maxTurns: 20, maxToolCalls: 1 },
       mcp: { mode: "read_only", servers: [{ server: "codegraph", command: MCP_SERVERS.codegraph.command! }] },
     }, () => "fake-model-token", (event) => {
       events.push(event);

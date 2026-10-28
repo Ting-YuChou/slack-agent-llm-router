@@ -8,7 +8,7 @@ import { filesOutsideScope } from "../dist/src/candidate-scope.js";
 import { DEFAULT_DIFF_LIMITS, DIFF_SUMMARY_TOOL, checkWrite, diffSummary, measureDiff, writeCap, type DiffUsage } from "../dist/src/diff-budget.js";
 import type { WriterContext } from "../dist/src/container-runtime.js";
 import { classifyBash, isApprovedSkillRead, isTestConfigPath, parsePorcelainZ, validateWorkspacePath } from "../dist/src/policy.js";
-import { codemodeMcpPrompt, type McpServerId } from "../dist/src/mcp-config.js";
+import { MCP_SERVERS, allServerTools, codemodeMcpPrompt, namespacedMcpToolNames, type McpServerId } from "../dist/src/mcp-config.js";
 import { renderPrompt } from "../dist/src/prompts.js";
 import { BUDGET_STATUS_DIALOG, activeTimeNotice, usdBudgetNotice } from "../dist/src/budget-notice.js";
 import { POLICY_ENTRY, policyDecisionEntry, type PolicyVerdict } from "../dist/src/policy-decision.js";
@@ -89,6 +89,15 @@ async function testConfigTaint(cwd: string, writtenPaths: Set<string>): Promise<
   return tainted ? `test configuration changed: ${tainted}` : undefined;
 }
 
+/** The run's MCP servers, from the registrations the host passes in. */
+function runMcpServers(value: string | undefined): McpServerId[] {
+  if (!value) return [];
+  let entries: unknown;
+  try { entries = JSON.parse(value); } catch { entries = undefined; }
+  if (!Array.isArray(entries)) throw new Error("PI_AGENT_MCP_SERVERS_JSON must be valid JSON");
+  return entries.flatMap((entry) => typeof entry?.server === "string" && Object.hasOwn(MCP_SERVERS, entry.server) ? [entry.server as McpServerId] : []);
+}
+
 type BudgetStage = "none" | "notice" | "final";
 
 /** Next stage reached: a notice at 75% of the budget, a final warning once two or fewer remain. */
@@ -113,6 +122,10 @@ export default function policyExtension(pi: ExtensionAPI) {
   const WRITE_APPROVAL = process.env.PI_AGENT_WRITE_APPROVAL === "none" ? "none" : "per_prompt";
   let turns = 0;
   let toolCalls = 0;
+  const mcpServers = runMcpServers(process.env.PI_AGENT_MCP_SERVERS_JSON);
+  const mcpToolServer = new Map(mcpServers.flatMap((server) => namespacedMcpToolNames(server, allServerTools(server)).map((name) => [name, server] as const)));
+  /** Nested MCP calls per server. A new input does not reset it: the CodeGraph proxy's budget lasts as long as the container. */
+  const nestedMcpCalls = new Map<McpServerId, number>();
   let writeApproved = false;
   const writtenPaths = new Set<string>();
   const budgetSent: Record<"turns" | "toolCalls" | "usd" | "time", BudgetStage> = { turns: "none", toolCalls: "none", usd: "none", time: "none" };
@@ -129,10 +142,7 @@ export default function policyExtension(pi: ExtensionAPI) {
   }
   if (process.env.PI_AGENT_MCP_SERVERS_JSON) {
     pi.on("before_agent_start", (event) => {
-      try {
-        const servers = JSON.parse(process.env.PI_AGENT_MCP_SERVERS_JSON ?? "[]") as Array<{ server?: McpServerId }>;
-        event.systemPromptOptions.sections.mcp_codemode = codemodeMcpPrompt(servers.flatMap((entry) => entry.server ? [entry.server] : []));
-      } catch { throw new Error("PI_AGENT_MCP_SERVERS_JSON must be valid JSON"); }
+      event.systemPromptOptions.sections.mcp_codemode = codemodeMcpPrompt(mcpServers);
     });
   }
 
@@ -177,8 +187,13 @@ export default function policyExtension(pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
-    toolCalls += 1;
-    if (toolCalls > MAX_TOOL_CALLS) {
+    // A codemode script's MCP calls are bounded by their server's own call budget (its gateway token or the
+    // CodeGraph proxy), so they count toward the run's limit only once that budget is spent. The script itself
+    // and its other nested calls still count.
+    const server = event.parentToolCallId ? mcpToolServer.get(event.toolName) : undefined;
+    const nested = server ? nestedMcpCalls.get(server) ?? 0 : 0;
+    if (server && nested < MCP_SERVERS[server].maxCalls) nestedMcpCalls.set(server, nested + 1);
+    else if (++toolCalls > MAX_TOOL_CALLS) {
       pi.appendEntry("pi_agent_limit", { kind: "tool_calls", limit: MAX_TOOL_CALLS });
       ctx.abort();
       return { block: true, reason: `Tool call limit of ${MAX_TOOL_CALLS} exceeded` };

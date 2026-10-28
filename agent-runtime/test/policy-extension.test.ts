@@ -48,6 +48,57 @@ test("tool-call limit records which limit was hit before aborting", () => withWo
   assert.deepEqual(policy.entries[0], { customType: "pi_agent_limit", data: { kind: "tool_calls", limit: 1 } });
 }));
 
+const CODEGRAPH_RUN = JSON.stringify([{ server: "codegraph", command: "/usr/local/bin/codegraph-lazy-proxy" }]);
+const nestedCall = (toolName: string, n: number, input: Record<string, unknown> = {}) => ({ toolName, toolCallId: `c/${n}`, parentToolCallId: "c", input });
+
+test("a codemode script's MCP calls count toward the tool-call limit only once their server's budget is spent", () => withWorkspace(async (cwd) => {
+  const policy = await loadPolicy({ PI_AGENT_MAX_TOOL_CALLS: "2", PI_AGENT_MCP_SERVERS_JSON: CODEGRAPH_RUN });
+  const ctx = { cwd, abort: () => policy.log.push("abort"), ui: { confirm: async () => true } };
+  await policy.fire("input", {}, ctx);
+  assert.equal(await policy.fire("tool_call", { toolName: "codemode", toolCallId: "c", input: { code: "" } }, ctx), undefined);
+  for (let n = 1; n <= 16; n++) {
+    assert.equal(await policy.fire("tool_call", nestedCall("mcp__codegraph__analyze_code_relationships", n), ctx), undefined, `nested call ${n}`);
+  }
+  assert.deepEqual(policy.log, []);
+  // CodeGraph's 16 calls are spent; the next one is the run's second tool call, and the one after that is over the limit.
+  assert.equal(await policy.fire("tool_call", nestedCall("mcp__codegraph__find_code", 17), ctx), undefined);
+  const blocked = await policy.fire("tool_call", nestedCall("mcp__codegraph__find_code", 18), ctx) as { block: boolean };
+  assert.equal(blocked.block, true);
+  assert.deepEqual(policy.log, ["entry:pi_agent_limit", "abort"]);
+  // CodeGraph's budget lasts as long as the container, so a new input does not renew the exemption.
+  policy.log.length = 0;
+  await policy.fire("input", {}, ctx);
+  assert.equal(await policy.fire("tool_call", nestedCall("mcp__codegraph__find_code", 19), ctx), undefined);
+  assert.equal(await policy.fire("tool_call", nestedCall("mcp__codegraph__find_code", 20), ctx), undefined);
+  assert.equal((await policy.fire("tool_call", nestedCall("mcp__codegraph__find_code", 21), ctx) as { block: boolean }).block, true);
+}));
+
+test("a codemode script's other calls, direct MCP calls and tools of servers the run lacks still count toward the tool-call limit", () => withWorkspace(async (cwd) => {
+  for (const call of [
+    nestedCall("ls", 1, { path: "." }),
+    { toolName: "mcp__codegraph__find_code", toolCallId: "d", input: {} },
+    nestedCall("mcp__github__list_issues", 1),
+    nestedCall("mcp__codegraph_extra__find_code", 1),
+  ]) {
+    const policy = await loadPolicy({ PI_AGENT_MAX_TOOL_CALLS: "1", PI_AGENT_MCP_SERVERS_JSON: CODEGRAPH_RUN });
+    const ctx = { cwd, abort: () => policy.log.push("abort"), ui: { confirm: async () => true } };
+    await policy.fire("input", {}, ctx);
+    assert.equal(await policy.fire("tool_call", call, ctx), undefined, call.toolName);
+    assert.equal((await policy.fire("tool_call", call, ctx) as { block: boolean }).block, true, call.toolName);
+    assert.deepEqual(policy.log, ["entry:pi_agent_limit", "abort"], call.toolName);
+  }
+}));
+
+test("the codemode prompt names the run's MCP servers, and malformed server JSON fails activation", async () => {
+  const policy = await loadPolicy({ PI_AGENT_MCP_SERVERS_JSON: CODEGRAPH_RUN });
+  const event = { systemPromptOptions: { sections: {} as Record<string, string> } };
+  await policy.fire("before_agent_start", event, {});
+  assert.match(event.systemPromptOptions.sections.mcp_codemode, /available through Codemode: codegraph\./);
+  for (const value of ["not json", "{}"]) {
+    await assert.rejects(loadPolicy({ PI_AGENT_MCP_SERVERS_JSON: value }), /PI_AGENT_MCP_SERVERS_JSON must be valid JSON/, value);
+  }
+});
+
 test("turn limit records which limit was hit before aborting", () => withWorkspace(async (cwd) => {
   const policy = await loadPolicy({ PI_AGENT_MAX_TURNS: "1" });
   const ctx = { cwd, abort: () => policy.log.push("abort") };
