@@ -47,3 +47,10 @@ test("the CodeGraph child process gets a minimal environment without run credent
   const env = codegraphEnv({ PATH: "/usr/bin", OPENAI_API_KEY: "t", PI_AGENT_MCP_SERVERS_JSON: "[]", GITHUB_TOKEN: "t", LANG: "C.UTF-8" }, "/state", "/mirror");
   assert.deepEqual(env, { PATH: "/usr/bin", LANG: "C.UTF-8", HOME: "/state", CGC_ALLOWED_ROOTS: "/mirror", CGC_EMBEDDED_BUFFER_POOL_MB: "384" });
 });
+
+test("the CodeGraph child process keeps the image's baked-in tree-sitter parsers", async () => {
+  const { codegraphEnv } = await import("../src/codegraph-lazy-proxy.js");
+  // HOME is the run's empty state root, so without this the parsers resolve to a cache the offline container cannot fill.
+  const env = codegraphEnv({ PATH: "/usr/bin", TREE_SITTER_LANGUAGE_PACK_CACHE_DIR: "/usr/local/share/tree-sitter-language-pack" }, "/state", "/mirror");
+  assert.equal(env.TREE_SITTER_LANGUAGE_PACK_CACHE_DIR, "/usr/local/share/tree-sitter-language-pack");
+});

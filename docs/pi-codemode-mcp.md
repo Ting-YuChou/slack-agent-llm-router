@@ -53,6 +53,12 @@ non-ignored source files into a bounded run-scoped mirror, indexes that mirror, 
 The proxy runs CGC with a private HOME outside the worktree, `CGC_ALLOWED_ROOTS` set to the mirror,
 and a 384 MiB Kuzu buffer. Container termination removes the tmpfs mirror and index.
 
+The Agent container has no network, so CGC's tree-sitter parsers are baked into the image at build
+time (`TREE_SITTER_LANGUAGE_PACK_CACHE_DIR`): C, C++, C#, Go, Java, JavaScript, Kotlin, PHP, Python,
+Ruby, Rust, Scala, Swift, TypeScript and TSX. Files in other languages are not indexed.
+`Dockerfile.agent` pins the parser bundle by sha256 per platform, so a `tree-sitter-language-pack`
+upgrade must update those pins.
+
 ## Rollout and teardown
 
 Enable in this order: GitHub, ClickHouse, Context7, CodeGraph. Observe the first 25 runs for each

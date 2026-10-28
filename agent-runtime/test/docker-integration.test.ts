@@ -333,6 +333,8 @@ test("a writer's codemode script reaches CodeGraph and each nested call is a too
     const nested = events.filter((event) => event.type === "tool" && event.tool === "mcp__codegraph__get_repository_stats");
     assert.deepEqual(nested.map((event) => event.type === "tool" && event.phase), ["start", "end"], diagnostic);
     assert.ok(nested.every((event) => event.type === "tool" && event.is_error !== true), diagnostic);
+    // An empty index answers too; the fixture's two functions must be in it.
+    assert.match((await toolResults(sessionStatePath)).join("\n"), /\\"functions\\": 2\b/, diagnostic);
     assert.ok(!events.some((event) => event.type === "error"), diagnostic);
   } finally {
     await piProcess?.close();

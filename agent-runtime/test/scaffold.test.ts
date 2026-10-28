@@ -50,6 +50,18 @@ test("agent image copies every TypeScript build configuration it invokes", () =>
   assert.match(dockerfile, /ENV PATH="\/opt\/pi\/node_modules\/\.bin:/);
 });
 
+test("agent image bakes in CodeGraph's tree-sitter parsers from a pinned bundle", () => {
+  const dockerfile = readFileSync(fileURLToPath(new URL("../../Dockerfile.agent", import.meta.url)), "utf8");
+  const [codegraphStage, runtimeStage] = dockerfile.split(/^FROM .*$/m).slice(1);
+  // The agent container has no network, so a parser fetched on first use never arrives and CodeGraph indexes nothing.
+  for (const stage of [codegraphStage, runtimeStage]) {
+    assert.match(stage, /^ENV TREE_SITTER_LANGUAGE_PACK_CACHE_DIR=\/usr\/local\/share\/tree-sitter-language-pack$/m);
+  }
+  assert.match(codegraphStage, /tree_sitter_language_pack as t; t\.download\(\[[^\]]*'javascript'[^\]]*'python'/);
+  for (const arch of ["x86_64", "aarch64"]) assert.match(codegraphStage, new RegExp(`${arch}\\) sum=[a-f0-9]{64} ;;`), arch);
+  assert.match(codegraphStage, /sha256sum -c -/);
+});
+
 test("demo image setup refreshes the deployment image lock", () => {
   const scriptPath = fileURLToPath(new URL("../../scripts/lock-image.mjs", import.meta.url));
   assert.equal(existsSync(scriptPath), true);
