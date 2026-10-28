@@ -111,7 +111,7 @@ test("sanitized mirror enforces total limits", async () => {
 test("the CodeGraph child process gets a minimal environment without run credentials", async () => {
   const { codegraphEnv } = await import("../src/codegraph-lazy-proxy.js");
   const env = codegraphEnv({ PATH: "/usr/bin", OPENAI_API_KEY: "t", PI_AGENT_MCP_SERVERS_JSON: "[]", GITHUB_TOKEN: "t", LANG: "C.UTF-8" }, "/state", "/mirror");
-  assert.deepEqual(env, { PATH: "/usr/bin", LANG: "C.UTF-8", HOME: "/state", CGC_ALLOWED_ROOTS: "/mirror", CGC_EMBEDDED_BUFFER_POOL_MB: "384" });
+  assert.deepEqual(env, { PATH: "/usr/bin", LANG: "C.UTF-8", HOME: "/state", CGC_ALLOWED_ROOTS: "/mirror", CGC_RUNTIME_DB_TYPE: "kuzudb", CGC_EMBEDDED_BUFFER_POOL_MB: "384" });
 });
 
 test("the CodeGraph child process keeps the image's baked-in tree-sitter parsers", async () => {
@@ -119,6 +119,13 @@ test("the CodeGraph child process keeps the image's baked-in tree-sitter parsers
   // HOME is the run's empty state root, so without this the parsers resolve to a cache the offline container cannot fill.
   const env = codegraphEnv({ PATH: "/usr/bin", TREE_SITTER_LANGUAGE_PACK_CACHE_DIR: "/usr/local/share/tree-sitter-language-pack" }, "/state", "/mirror");
   assert.equal(env.TREE_SITTER_LANGUAGE_PACK_CACHE_DIR, "/usr/local/share/tree-sitter-language-pack");
+});
+
+test("the CodeGraph child process pins cgc's graph database to KùzuDB", async () => {
+  const { codegraphEnv } = await import("../src/codegraph-lazy-proxy.js");
+  // Left to choose, cgc used FalkorDB Lite on x86_64 and KùzuDB on arm64, where FalkorDB Lite times out on start, and the two
+  // answer the same query differently. The proxy also sizes KùzuDB's buffer pool.
+  assert.equal(codegraphEnv({ PATH: "/usr/bin", CGC_RUNTIME_DB_TYPE: "falkordb" }, "/state", "/mirror").CGC_RUNTIME_DB_TYPE, "kuzudb");
 });
 
 test("the CodeGraph catalog offers cgc's own arguments, except the repo_path and graph_name the proxy owns", () => {

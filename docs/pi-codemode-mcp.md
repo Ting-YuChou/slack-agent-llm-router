@@ -55,10 +55,13 @@ non-ignored source files into a bounded run-scoped mirror, indexes that mirror, 
 Calls that arrive before CGC is ready, including concurrent calls from one codemode script, wait for
 that one start; if indexing fails, they all fail and the next call starts again. The proxy runs CGC with a private HOME outside the worktree, `CGC_ALLOWED_ROOTS` set to the mirror,
 and a 384 MiB Kuzu buffer. Container termination removes the tmpfs mirror and index.
+The proxy pins CGC's graph database to KùzuDB (`CGC_RUNTIME_DB_TYPE=kuzudb`). Left to choose, CGC
+uses FalkorDB Lite where it starts (x86_64) and KùzuDB elsewhere (arm64, where FalkorDB Lite times
+out on start), and the two answer some queries differently.
 CGC resolves a relative path against its own working directory, so the proxy rewrites a `path` or
 `context` argument that names a file in the worktree, relative or absolute, to that file in the
 mirror. A run gets 16 CodeGraph calls. CGC 0.6.13's `find_all_callers` and `find_all_callees`
-queries fail inside CGC, because Kuzu rejects the Cypher they generate. The proxy refuses them
+queries fail inside CGC, because KùzuDB rejects the Cypher they generate. The proxy refuses them
 without spending a call, and tells the model to repeat `find_callers` or `find_callees` one level
 at a time. A Docker test checks that they still fail, so a CGC upgrade that fixes them shows up.
 

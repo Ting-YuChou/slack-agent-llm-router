@@ -15,7 +15,9 @@ const SOURCE_FILE = /\.(?:[cm]?[jt]sx?|py|go|rs|java|kt|kts|rb|php|cs|cpp|cc|cxx
 export function codegraphEnv(env: NodeJS.ProcessEnv, stateRoot: string, mirror: string): NodeJS.ProcessEnv {
   // TREE_SITTER_LANGUAGE_PACK_CACHE_DIR points at the parsers baked into the image; the container cannot download them.
   const kept = Object.fromEntries(["PATH", "LANG", "LC_ALL", "TZ", "TREE_SITTER_LANGUAGE_PACK_CACHE_DIR"].flatMap((key) => env[key] ? [[key, env[key]]] : []));
-  return { ...kept, HOME: stateRoot, CGC_ALLOWED_ROOTS: mirror, CGC_EMBEDDED_BUFFER_POOL_MB: "384" };
+  // Left to choose, cgc runs FalkorDB Lite where it starts (x86_64) and KùzuDB elsewhere (arm64), and the two answer the same
+  // query differently. KùzuDB runs on both, inside cgc, with the buffer pool sized here.
+  return { ...kept, HOME: stateRoot, CGC_ALLOWED_ROOTS: mirror, CGC_RUNTIME_DB_TYPE: "kuzudb", CGC_EMBEDDED_BUFFER_POOL_MB: "384" };
 }
 
 export interface MirrorLimits { maxFiles: number; maxFileBytes: number; maxTotalBytes: number }
@@ -106,7 +108,7 @@ async function mirrorPath(value: string, worktree: string, mirror: string): Prom
 }
 
 /**
- * cgc 0.6.13 builds Cypher for these transitive queries that its Kuzu database rejects, with or without repo_path. The proxy
+ * cgc 0.6.13 builds Cypher for these transitive queries that KùzuDB rejects, with or without repo_path. The proxy
  * refuses them before they reach cgc or spend a call, and names the one-level query to repeat instead.
  * docker-integration.test.ts checks that the image's cgc still fails them.
  */

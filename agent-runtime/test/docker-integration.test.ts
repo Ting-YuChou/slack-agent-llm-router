@@ -6,7 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 
-import { BROKEN_QUERIES, TOOL_CATALOG } from "../src/codegraph-lazy-proxy.js";
+import { BROKEN_QUERIES, TOOL_CATALOG, codegraphEnv } from "../src/codegraph-lazy-proxy.js";
 import { buildAgentDockerArgs, DockerPiProcess } from "../src/container-runtime.js";
 import { MCP_SERVERS } from "../src/mcp-config.js";
 import type { PublicRunEvent } from "../src/pi-rpc.js";
@@ -317,7 +317,9 @@ test("the image's cgc still fails the transitive queries the CodeGraph proxy ref
     "print(json.dumps(answers))",
   ].join("\n");
   const queries = [["find_callees", "live"], ...[...BROKEN_QUERIES.keys()].map((query) => [query, query.endsWith("callers") ? "helper" : "live"])];
-  const answers = JSON.parse(await command("docker", ["run", "--rm", "--network", "none", "--env", "HOME=/tmp/cgc-home", "--env", `QUERIES=${JSON.stringify(queries)}`,
+  // cgc gets the proxy's environment: which graph database it uses decides whether these queries run.
+  const env = Object.entries(codegraphEnv({}, "/tmp/cgc-home", "/tmp/repo")).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
+  const answers = JSON.parse(await command("docker", ["run", "--rm", "--network", "none", ...env, "--env", `QUERIES=${JSON.stringify(queries)}`,
     "--entrypoint", "python3", AGENT_TEST_IMAGE, "-c", script]));
   // The one-level query works on the same graph.
   assert.match(answers.find_callees.summary, /calls 1 other functions/, JSON.stringify(answers));
