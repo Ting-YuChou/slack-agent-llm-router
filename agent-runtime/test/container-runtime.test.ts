@@ -221,6 +221,28 @@ test("a writer under the policy extension gets diff_summary; readers and discuss
   assert.equal(tools({ ...base, taskMode: "discuss" }), "read,grep,find,ls");
 });
 
+test("Pi drops tools --tools does not name, so codemode MCP tools are named there too; direct-only readers get none", () => {
+  const base = {
+    name: "pi-session-1", image: "pi-agent@sha256:abc", network: "pi-model-only", worktreePath: "/w", gitMetadataPath: "/repo/.git",
+    sessionStatePath: "/s", gatewayUrl: "http://model-gateway:8080", modelRef: "openai/gpt-5.6-luna",
+    extensionPaths: [], pluginPaths: [], skillPaths: [], toolNames: ["read"],
+  };
+  const tools = (options: Parameters<typeof buildAgentDockerArgs>[0]) => { const args = buildAgentDockerArgs(options); return args[args.indexOf("--tools") + 1]; };
+  const codegraph = { mode: "read_only" as const, servers: [{ server: "codegraph" as const, command: "/usr/local/bin/codegraph-lazy-proxy" }] };
+  assert.equal(tools({ ...base, mcp: codegraph }), [
+    "read", "codemode", "mcp__codegraph__list_indexed_repositories", "mcp__codegraph__get_repository_stats", "mcp__codegraph__find_code",
+    "mcp__codegraph__analyze_code_relationships", "mcp__codegraph__find_dead_code", "mcp__codegraph__calculate_cyclomatic_complexity",
+    "mcp__codegraph__find_most_complex_functions",
+  ].join(","));
+  const context7 = { mode: "read_only" as const, servers: [{ server: "context7" as const, gatewayUrl: "http://mcp-context7:8090/mcp", token: "" }] };
+  assert.equal(tools({ ...base, mcp: context7 }), "read,codemode,mcp__context7__resolve_library_id,mcp__context7__query_docs", "Pi turns - into _");
+  const github = { mode: "github_read_only" as const, servers: [{ server: "github" as const, gatewayUrl: "http://mcp-github:8090/mcp", token: "" }] };
+  const githubTools = tools({ ...base, mcp: github }).split(",");
+  assert.deepEqual(githubTools.slice(0, 6), ["read", "codemode", "mcp__github__get_file_contents", "mcp__github__search_code", "mcp__github__issue_read", "mcp__github__pull_request_read"]);
+  assert.ok(githubTools.includes("mcp__github__get_job_logs") && githubTools.includes("mcp__github__list_issues"), githubTools.join(","));
+  assert.equal(tools({ ...base, mcp: github, directMcpOnly: true }), "read,mcp__github__get_file_contents,mcp__github__search_code,mcp__github__issue_read,mcp__github__pull_request_read");
+});
+
 test("gateway credentials are neither on argv nor in the docker client's environment; MCP config travels in its environment", () => {
   const options = {
     name: "pi-session-1", image: "pi-agent@sha256:abc", network: "pi-model-only", worktreePath: "/w", gitMetadataPath: "/repo/.git",

@@ -2386,7 +2386,8 @@ needs_node = pytest.mark.skipif(shutil.which("node") is None, reason="needs node
 @needs_node
 def test_the_degrade_task_asks_about_evidence_the_repository_lacks(tmp_path):
     task, tree, checks = _coverage_tree(tmp_path, "structured-degrade")
-    assert task["workflow_mode"] == "structured" and task["requires_degrade"] is True
+    # Live investigators answer "not in the repository" as succeeded, so a degrade is not required.
+    assert task["workflow_mode"] == "structured" and "requires_degrade" not in task
     profile = agent_eval.build_profile(task, "image")
     assert profile["structuredWorkflow"]["degradeUnknown"] is True
     assert "deploy/retry-policy.yaml" in task["prompt"]
