@@ -96,6 +96,7 @@ export const TOOL_CATALOG: CodeGraphTool[] = [
 
 class CodeGraphProxy {
   private child?: ChildProcessWithoutNullStreams;
+  private starting?: Promise<void>;
   private buffer = "";
   private nextId = 10_000;
   private pending = new Map<number, (value: any) => void>();
@@ -127,8 +128,16 @@ class CodeGraphProxy {
     return this.request(message.method, params, message.id);
   }
 
+  /**
+   * Calls run concurrently, and the first ones all wait on one start: each start rebuilds the mirror and indexes it, and cgc
+   * servers sharing the graph database stall. A start that fails before spawning the server is tried again by the next call.
+   */
   private async prepare(): Promise<void> {
-    if (this.child) return;
+    if (!this.starting && !this.child) this.starting = this.start().finally(() => { this.starting = undefined; });
+    await this.starting;
+  }
+
+  private async start(): Promise<void> {
     const mirror = await createSanitizedMirror(this.worktree, this.stateRoot);
     this.mirror = mirror;
     const env = codegraphEnv(process.env, this.stateRoot, mirror);

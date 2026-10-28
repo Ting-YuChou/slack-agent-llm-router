@@ -313,8 +313,10 @@ test("a writer's codemode script reaches CodeGraph and each nested call is a too
   assert.notEqual(hostGid, undefined);
   assert.notEqual(hostUid, 0, "integration test must run as a non-root host user");
 
-  // CodeGraph's tools are codemode-only: a script is the one way to reach them.
-  const script = "text(JSON.stringify(await tools.mcp__codegraph__get_repository_stats({})).slice(0, 2000));\n" +
+  // CodeGraph's tools are codemode-only: a script is the one way to reach them. Models often open with concurrent calls,
+  // which each indexed the mirror and started a cgc server on the one graph database until every call timed out.
+  const script = "const [stats, dead] = await Promise.all([tools.mcp__codegraph__get_repository_stats({}), tools.mcp__codegraph__find_dead_code({})]);\n" +
+    "text(JSON.stringify(stats).slice(0, 2000));\ntext(JSON.stringify(dead).slice(0, 2000));\n" +
     "text(await describeTool(\"mcp__codegraph__analyze_code_relationships\"));";
   const fakeModelScript = fakeGatewayScript(scriptedTurns([
     { kind: "function_call", name: "codemode", arguments: { code: script } },
@@ -343,9 +345,11 @@ test("a writer's codemode script reaches CodeGraph and each nested call is a too
     piProcess.prompt("codegraph-run", "Map the call graph with CodeGraph.");
     await settled;
     const diagnostic = JSON.stringify({ events, results: await toolResults(sessionStatePath) });
-    const nested = events.filter((event) => event.type === "tool" && event.tool === "mcp__codegraph__get_repository_stats");
-    assert.deepEqual(nested.map((event) => event.type === "tool" && event.phase), ["start", "end"], diagnostic);
-    assert.ok(nested.every((event) => event.type === "tool" && event.is_error !== true), diagnostic);
+    for (const tool of ["mcp__codegraph__get_repository_stats", "mcp__codegraph__find_dead_code"]) {
+      const nested = events.filter((event) => event.type === "tool" && event.tool === tool);
+      assert.deepEqual(nested.map((event) => event.type === "tool" && event.phase), ["start", "end"], diagnostic);
+      assert.ok(nested.every((event) => event.type === "tool" && event.is_error !== true), diagnostic);
+    }
     // An empty index answers too; the fixture's two functions must be in it.
     assert.match((await toolResults(sessionStatePath)).join("\n"), /\\"functions\\": 2\b/, diagnostic);
     // The model learns a tool's arguments only from this declaration; guessed ones failed every call.
