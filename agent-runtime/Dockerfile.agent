@@ -4,6 +4,19 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY requirements-codegraph.lock /tmp/requirements-codegraph.lock
 RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements-codegraph.lock
+# tree-sitter-language-pack fetches parsers on first use, and the agent container has no network. Bake in the ones
+# CodeGraph parses, from the release bundle pinned here by sha256, readable but not writable by the agent user.
+ENV TREE_SITTER_LANGUAGE_PACK_CACHE_DIR=/usr/local/share/tree-sitter-language-pack
+RUN python -c "import tree_sitter_language_pack as t; t.download(['c', 'cpp', 'csharp', 'go', 'java', 'javascript', 'kotlin', 'php', 'python', 'ruby', 'rust', 'scala', 'swift', 'tsx', 'typescript'])" \
+    && cd "$TREE_SITTER_LANGUAGE_PACK_CACHE_DIR/tree-sitter-language-pack/v1.21.0" \
+    && case "$(uname -m)" in \
+         x86_64) sum=579428269cf83f853bf42f647296588bb3864eab07d739495909b0ae49e310b5 ;; \
+         aarch64) sum=fc5d338812c099a97a4c66273ef5293df384d7da42248b1c767675079cb257a2 ;; \
+         *) echo "no pinned tree-sitter parser bundle for $(uname -m)" >&2; exit 1 ;; \
+       esac \
+    && echo "$sum  bundles/linux-$(uname -m)-$sum.tar.zst" | sha256sum -c - \
+    && rm -rf bundles \
+    && chmod -R a+rX,go-w "$TREE_SITTER_LANGUAGE_PACK_CACHE_DIR"
 
 FROM node:22.22.0-bookworm-slim@sha256:dd9d21971ec4395903fa6143c2b9267d048ae01ca6d3ea96f16cb30df6187d94
 RUN apt-get update \
@@ -11,6 +24,7 @@ RUN apt-get update \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=codegraph /usr/local /usr/local
+ENV TREE_SITTER_LANGUAGE_PACK_CACHE_DIR=/usr/local/share/tree-sitter-language-pack
 
 WORKDIR /opt/pi
 ENV PATH="/opt/pi/node_modules/.bin:${PATH}"
