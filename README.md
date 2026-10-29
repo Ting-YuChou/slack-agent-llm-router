@@ -1,14 +1,24 @@
 # Slack Agent LLM Router
 
-Multi-model LLM router with a FastAPI API, Slack bot integration, Kafka/ClickHouse analytics, and local Docker Compose support.
+A Slack bot that routes chat across multiple LLMs and runs sandboxed coding agents. Each agent task gets an isolated git worktree and a locked-down container, passes automated checks and an AI grader, and is committed only after you approve the diff.
 
 ## What It Does
+
+### Coding agent
+
+- Start a task from Slack with `/llm agent <task>`, the "Run Pi Agent" message shortcut, or a reply in the agent's thread; each thread is one stateful Pi 1.0.1 session
+- Runs every task in its own git worktree and a container with a read-only root filesystem, no capabilities and no internet; model and MCP calls go through gateways that hold the real credentials and enforce per-run budgets
+- Checks each change with the profile's checks against both the candidate and the trusted baseline tests, then an AI grader that must cite file and line evidence; failures go back to the writer for up to two repairs
+- Commits only after you approve the exact diff in Slack, and never pushes: you get a `git cherry-pick` command, and a failed run keeps its patch so you can download it or resume from it
+- Picks the model and effort per task with Jev routing, and offers trusted read-only MCP access (GitHub, ClickHouse, Context7, CodeGraph) through Codemode
+- Supports opt-in [structured multi-agent investigation](docs/agent-structured-workflow.md) before a single verified writer, with bounded parallelism, shared budgets and read-only-stage resume
+- Can propose a fix when an allowlisted CI workflow fails on a PR, and publish it as a Draft PR once you approve
+
+### LLM router
 
 - Routes requests across `gpt-5`, `claude-sonnet-4-6`, and optional local `vLLM` models
 - Exposes a protected API for query routing and dashboard access
 - Supports Slack bot interactions through `app_mention`, slash commands, and active reply threads
-- Runs stateful Pi 1.0.1 coding agents in isolated worktrees, with Jev model routing and trusted read-only MCP access through Codemode
-- Supports opt-in [structured multi-agent investigation](docs/agent-structured-workflow.md) before a single verified writer, with bounded parallelism, shared budgets and read-only-stage resume
 - Can enrich current-info answers with Tavily-backed `web_search` results and structured sources
 - Persists analytics and request events through Kafka and ClickHouse when the pipeline is enabled
 - Supports Redis-backed cache and Slack state for multi-process durability
