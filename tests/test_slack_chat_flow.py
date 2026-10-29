@@ -2,12 +2,17 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 
-from slack.bot_real import SlackBot, SlackWorkItem, UserManager
-from src.utils.schema import Attachment, AttachmentType, UserTier
+from slack.bot_real import (
+    SLACK_EMPTY_ANSWER_MESSAGE,
+    SlackBot,
+    SlackWorkItem,
+    UserManager,
+)
+from src.utils.schema import Attachment, AttachmentType, ResponseSource, UserTier
 
 
 def chat_bot(process_query=None, **config):
@@ -597,6 +602,122 @@ async def test_an_unknown_error_code_falls_back_to_the_error_type():
     assert await reply_for_failure(error_code="new_code", error_type="timeout") == (
         timeout
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fields,wait",
+    [
+        ({"error_type": "rate_limited", "retry_after_seconds": 45}, "45 seconds"),
+        (
+            {
+                "error_code": "rate_limited",
+                "error_type": "provider_error",
+                "retry_after_seconds": 120,
+            },
+            "2 minutes",
+        ),
+    ],
+    ids=["by_type", "by_code"],
+)
+async def test_a_rate_limited_failure_says_when_to_retry(fields, wait):
+    text = await reply_for_failure(**fields)
+
+    assert "rate-limiting" in text
+    assert f"Please try again in {wait}." in text
+
+
+# S11: an answer that came back degraded says so
+
+
+async def answer_with(inference_response_factory, text, warnings, **fields):
+    response = inference_response_factory(
+        response_text=text, warnings=warnings, **fields
+    )
+    bot = chat_bot(AsyncMock(return_value=response))
+    await bot._process_message(top_level(ts="200.0"))
+    return bot, bot.web_client.chat_postMessage.await_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "warning,note",
+    [
+        (
+            "rag_unavailable",
+            "_Note: document search was unavailable, so this answer isn't "
+            "based on your documents._",
+        ),
+        ("rag_unavailable:timeout", "_Note: document search was unavailable"),
+        ("rag_degraded", "_Note: document search only partly worked"),
+        (
+            "web_search_unavailable",
+            "_Note: live web search was unavailable; recent information "
+            "couldn't be checked._",
+        ),
+        ("response_truncated", "_Note: the answer was cut off._"),
+        ("response_incomplete", "_Note: the answer may be incomplete._"),
+        ("response_filtered", "_Note: part of the answer was withheld"),
+        ("empty_response", "_Note: the model returned almost no text"),
+    ],
+)
+async def test_a_degraded_answer_is_posted_and_remembered_with_a_note(
+    inference_response_factory, warning, note
+):
+    bot, posted = await answer_with(
+        inference_response_factory, "a partial answer", [warning]
+    )
+
+    assert posted.startswith("a partial answer\n\n_Note: ")
+    assert note in posted
+    # The conversation stays honest: the next request sees the note too.
+    assert history(bot, "200.0")[-1] == {
+        "role": "assistant",
+        "content": posted,
+        "timestamp": ANY,
+    }
+
+
+@pytest.mark.asyncio
+async def test_each_note_appears_once_and_before_the_sources(
+    inference_response_factory,
+):
+    source = ResponseSource(title="News", url="https://example.com/n", rank=1)
+    _, posted = await answer_with(
+        inference_response_factory,
+        "an answer",
+        ["response_truncated", "web_search_unavailable", "response_truncated"],
+        sources=[source],
+    )
+
+    assert posted.count("_Note: the answer was cut off._") == 1
+    assert posted.count("_Note: live web search was unavailable") == 1
+    assert posted.index("_Note: ") < posted.index("Sources:")
+    assert "https://example.com/n" in posted
+
+
+@pytest.mark.asyncio
+async def test_unknown_warnings_add_no_note(inference_response_factory):
+    bot, posted = await answer_with(
+        inference_response_factory, "a full answer", ["cache_stale", "rag_hit"]
+    )
+
+    assert posted == "a full answer"
+    assert history(bot, "200.0")[-1]["content"] == "a full answer"
+
+
+@pytest.mark.asyncio
+async def test_an_empty_answer_still_says_why_it_came_back_empty(
+    inference_response_factory,
+):
+    bot, posted = await answer_with(
+        inference_response_factory, "", ["response_filtered", "empty_response"]
+    )
+
+    assert posted.startswith(SLACK_EMPTY_ANSWER_MESSAGE)
+    assert "_Note: part of the answer was withheld" in posted
+    assert "_Note: the model returned almost no text" not in posted
+    assert history(bot, "200.0") == []
 
 
 # S14: the tier comes from config on every request

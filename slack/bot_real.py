@@ -128,6 +128,30 @@ SLACK_INFERENCE_ERROR_MESSAGES = {
         "otherwise please try again later."
     ),
 }
+# A note appended to an answer that came back degraded, by response warning
+# (its part before any ":detail"). Other warnings add nothing.
+SLACK_RESPONSE_WARNING_NOTES = {
+    "rag_unavailable": (
+        "_Note: document search was unavailable, so this answer isn't based on "
+        "your documents._"
+    ),
+    "rag_degraded": (
+        "_Note: document search only partly worked, so this answer may miss "
+        "parts of your documents._"
+    ),
+    "web_search_unavailable": (
+        "_Note: live web search was unavailable; recent information couldn't "
+        "be checked._"
+    ),
+    "response_truncated": "_Note: the answer was cut off._",
+    "response_incomplete": "_Note: the answer may be incomplete._",
+    "response_filtered": (
+        "_Note: part of the answer was withheld by the model's content filter._"
+    ),
+    "empty_response": (
+        "_Note: the model returned almost no text, so the answer may be " "incomplete._"
+    ),
+}
 # The windows UserManager.check_rate_limit counts requests in.
 RATE_LIMIT_WINDOW_SECONDS = 3600
 RATE_LIMIT_BURST_WINDOW_SECONDS = 300
@@ -1189,6 +1213,29 @@ def _format_wait(seconds: float) -> str:
     return _plural(math.ceil(whole_seconds / 60), "minute")
 
 
+def _retry_wait(retry_after_seconds: Any) -> Optional[str]:
+    """`_format_wait` of a positive retry-after; None for anything else."""
+    if (
+        isinstance(retry_after_seconds, (int, float))
+        and not isinstance(retry_after_seconds, bool)
+        and retry_after_seconds > 0
+    ):
+        return _format_wait(retry_after_seconds)
+    return None
+
+
+def _response_warning_notes(warnings: Any, *, skip: Tuple[str, ...] = ()) -> str:
+    """The notes for a response's known warnings, each once, in a fixed order."""
+    if not isinstance(warnings, (list, tuple)):
+        return ""
+    known = {str(warning).split(":", 1)[0] for warning in warnings}
+    return "\n".join(
+        note
+        for warning, note in SLACK_RESPONSE_WARNING_NOTES.items()
+        if warning in known and warning not in skip
+    )
+
+
 # Admission reasons that are the user's own quota (src/admission.py), and how
 # to name it. Every other rejection is shared capacity: the router is busy.
 ADMISSION_QUOTA_REASONS = {
@@ -1207,10 +1254,7 @@ def _admission_rejection_text(decision: Any) -> str:
         # The queue wait ended on whatever turned the request away last.
         metadata = getattr(decision, "metadata", None) or {}
         reason = str(metadata.get("last_reason") or "")
-    retry_after = getattr(decision, "retry_after_seconds", None)
-    wait = None
-    if isinstance(retry_after, (int, float)) and retry_after > 0:
-        wait = _format_wait(retry_after)
+    wait = _retry_wait(getattr(decision, "retry_after_seconds", None))
     quota = ADMISSION_QUOTA_REASONS.get(reason)
     if quota:
         when = f"Please try again in {wait}." if wait else "Please try again later."
@@ -3034,8 +3078,10 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 return self._inference_error_message(
                     getattr(response, "error_type", None),
                     getattr(response, "error_code", None),
+                    retry_after_seconds=getattr(response, "retry_after_seconds", None),
                 )
 
+            warnings = getattr(response, "warnings", None)
             if not (getattr(response, "response_text", "") or "").strip():
                 # Nothing to post or remember: an empty turn would only
                 # mislead the next request's context.
@@ -3047,17 +3093,25 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                     getattr(response, "model_name", "unknown"),
                 )
                 SLACK_METRICS.errors.labels(error_type="empty_response").inc()
-                return SLACK_EMPTY_ANSWER_MESSAGE
+                notes = _response_warning_notes(warnings, skip=("empty_response",))
+                return "\n\n".join(filter(None, [SLACK_EMPTY_ANSWER_MESSAGE, notes]))
+
+            # A degraded answer says so, here and in history, so the
+            # conversation never treats a cut-off answer as complete.
+            answer = response.response_text
+            notes = _response_warning_notes(warnings)
+            if notes:
+                answer = f"{answer.rstrip()}\n\n{notes}"
 
             # Add to conversation history
             context.add_message("user", text)
-            context.add_message("assistant", response.response_text)
+            context.add_message("assistant", answer)
 
             # Update metrics
             SLACK_METRICS.messages_processed.labels(user_tier=user_tier.value).inc()
             SLACK_METRICS.response_time.observe(response.latency_ms / 1000)
 
-            return self._format_response_with_sources(response)
+            return self._format_response_with_sources(response, answer)
 
         except AdmissionRejectedError as e:
             logger.warning(
@@ -3073,7 +3127,11 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             return self._inference_error_message(None)
 
     def _inference_error_message(
-        self, error_type: Optional[str], error_code: Optional[str] = None
+        self,
+        error_type: Optional[str],
+        error_code: Optional[str] = None,
+        *,
+        retry_after_seconds: Any = None,
     ) -> str:
         """What a failed answer tells the user: by error code, else error type."""
         for messages, key in (
@@ -3081,6 +3139,13 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             (SLACK_INFERENCE_ERROR_MESSAGES, error_type),
         ):
             message = messages.get(key) if isinstance(key, str) else None
+            if message == _RATE_LIMITED_TEXT:
+                wait = _retry_wait(retry_after_seconds)
+                if wait:
+                    return (
+                        "⏳ The model provider is rate-limiting requests right "
+                        f"now. Please try again in {wait}."
+                    )
             if message:
                 return message
         error_builder = getattr(self.bot, "_build_user_safe_error_message", None)
@@ -3103,9 +3168,15 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         if slack_context.error:
             metadata["slack_context_error"] = slack_context.error
 
-    def _format_response_with_sources(self, response: Any) -> str:
-        """Append compact source links for web-search enriched answers."""
-        response_text = getattr(response, "response_text", "") or ""
+    def _format_response_with_sources(
+        self, response: Any, response_text: Optional[str] = None
+    ) -> str:
+        """Append compact source links for web-search enriched answers.
+
+        `response_text` replaces the response's own text, e.g. with notes added.
+        """
+        if response_text is None:
+            response_text = getattr(response, "response_text", "") or ""
         sources = list(getattr(response, "sources", []) or [])
         if not sources:
             return response_text
