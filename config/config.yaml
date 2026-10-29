@@ -134,6 +134,9 @@ router:
       allowed_tiers:
       - premium
       - enterprise
+      reasoning_effort: minimal
+      reasoning_effort_high: high
+      reasoning_output_headroom_tokens: 4096
       capabilities:
       - general
       - reasoning
