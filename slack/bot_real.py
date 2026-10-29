@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import (
     Any,
     Awaitable,
+    Deque,
     Callable,
     Dict,
     FrozenSet,
@@ -27,7 +28,8 @@ from typing import (
     Set,
     Tuple,
 )
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 
 from slack_sdk.http_retry.builtin_async_handlers import (
     AsyncRateLimitErrorRetryHandler,
@@ -84,6 +86,7 @@ from src.utils.schema import (
     ToolPolicy,
     UserTier,
 )
+from src.utils.bounded_state import BoundedTTLMap
 from src.utils.metrics import SLACK_METRICS
 
 logger = logging.getLogger(__name__)
@@ -98,6 +101,17 @@ SLACK_AGENT_RUN_TTL_SECONDS = 30 * 24 * 3600
 RATE_LIMIT_WINDOW_SECONDS = 3600
 POSTED_CI_JOBS_LIMIT = 1000
 HANDLED_MESSAGES_LIMIT = 1000
+# Slack files of one message downloaded at the same time (S6c).
+ATTACHMENT_DOWNLOAD_CONCURRENCY = 4
+# Threads whose Agent runtime lookup a message event skips (S7): chat threads
+# known not to be Agent threads, and threads whose lookup just failed.
+AGENT_LOOKUP_SKIPS_LIMIT = 10_000
+AGENT_LOOKUP_ERROR_TTL_SECONDS = 10.0
+# Channels outside a name allowlist, so conversations.info runs once per TTL.
+CHANNEL_ALLOWLIST_MISSES_LIMIT = 1000
+CHANNEL_ALLOWLIST_MISS_TTL_SECONDS = 300.0
+# A failed conversations.info call (a 429, a network error) is retried sooner.
+CHANNEL_ALLOWLIST_ERROR_TTL_SECONDS = 10.0
 UNVERIFIED_LABEL = "⚠️ 未驗證（沒有 verification profile）"
 MEMORY_SLASH_ONLY_MESSAGE = (
     "Memory commands are only available through Slack slash commands. "
@@ -777,6 +791,13 @@ class SlackWorkItem:
     kind: str
     payload: Dict[str, Any]
     name: str
+
+
+@dataclass
+class SlackThreadWork:
+    """Chat events parked behind the one a worker is answering in a thread."""
+
+    pending: Deque[SlackWorkItem] = field(default_factory=deque)
 
 
 class SlackStateStore:
@@ -3533,6 +3554,11 @@ class SlackBot:
         self.allowed_channels = config.get("channels", [])
         self.allowed_channel_ids: Set[str] = set()
         self.allowed_channel_names: Set[str] = set()
+        # Channel IDs conversations.info showed are outside the allowlist.
+        self._channel_allowlist_misses: BoundedTTLMap[str, bool] = BoundedTTLMap(
+            max_entries=CHANNEL_ALLOWLIST_MISSES_LIMIT,
+            ttl_seconds=CHANNEL_ALLOWLIST_MISS_TTL_SECONDS,
+        )
         self.rate_limiting = config.get("rate_limiting", {})
         self.context_settings = self._resolve_context_settings(
             config.get("context", {})
@@ -3558,6 +3584,13 @@ class SlackBot:
         self.active_threads: Dict[str, datetime] = {}
         self.active_thread_timeout = self.conversation_manager.session_timeout
         self.agent_threads: Dict[str, Dict[str, Any]] = {}
+        # "channel:thread_ts" -> "chat" or "error": a message event in such a
+        # thread does not ask the runtime whether it is an Agent thread. Local
+        # only, so after a restart each thread is looked up once again.
+        self._agent_lookup_skips: BoundedTTLMap[str, str] = BoundedTTLMap(
+            max_entries=AGENT_LOOKUP_SKIPS_LIMIT,
+            ttl_seconds=self.active_thread_timeout.total_seconds(),
+        )
         self.agent_runs: Dict[str, Dict[str, Any]] = {}
         # Each owner's tracked sessions, one per thread, the latest last.
         self.agent_user_runs: Dict[str, List[Dict[str, Any]]] = {}
@@ -3624,6 +3657,13 @@ class SlackBot:
         )
         self._work_workers: List[asyncio.Task] = []
         self._work_running = 0
+        # Threads a worker is answering, with the chat events parked behind
+        # the current one (S12). An entry lives only while its worker runs,
+        # so the map holds at most one entry per worker.
+        self._busy_threads: Dict[str, SlackThreadWork] = {}
+        # Parked events across all threads; with the work queue's items they
+        # stay within its capacity.
+        self._thread_pending = 0
         self._accepting_work = True
         self._socket_disconnect_lock = asyncio.Lock()
         self._socket_disconnected = False
@@ -3893,8 +3933,7 @@ class SlackBot:
             # thread still takes plain follow-ups, as it did before S13.
             if not self._is_active_thread(channel_id, thread_ts, refresh=False):
                 return
-            if not self._is_agent_thread(channel_id, thread_ts):
-                await self._restore_agent_thread(event)
+            await self._look_up_agent_thread(event)
             if self._is_agent_thread(channel_id, thread_ts):
                 return
         elif await self._reject_non_owner_agent_message(event):
@@ -3939,8 +3978,7 @@ class SlackBot:
         thread_ts = event.get("thread_ts")
         if not thread_ts:
             return False
-        if not self._is_agent_thread(channel_id, thread_ts):
-            await self._restore_agent_thread(event)
+        await self._look_up_agent_thread(event)
         tracked = self.agent_threads.get(self._thread_key(channel_id, thread_ts))
         if not tracked or tracked.get("owner_user_id") == event.get("user"):
             return False
@@ -3981,6 +4019,37 @@ class SlackBot:
                     return str(mode)
         return "discuss"
 
+    async def _look_up_agent_thread(self, event: Dict[str, Any]) -> None:
+        """Ask the runtime about a thread not known locally as an Agent thread.
+
+        A thread already known to be a chat thread, or whose lookup failed in
+        the last few seconds, is not asked about again (S7): a follow-up must
+        not wait on a runtime that is slow or down. A failed lookup counts as
+        "not an Agent thread".
+        """
+        channel_id = event.get("channel")
+        thread_ts = event.get("thread_ts")
+        if not channel_id or not thread_ts:
+            return
+        if self._is_agent_thread(channel_id, thread_ts):
+            return
+        key = self._thread_key(channel_id, thread_ts)
+        if key in self._agent_lookup_skips:
+            return
+        await self._restore_agent_thread(event)
+        if self._is_agent_thread(channel_id, thread_ts):
+            return
+        if key not in self._agent_lookup_skips:
+            # The runtime has no session for the thread: a chat thread.
+            self._agent_lookup_skips[key] = "chat"
+
+    def _remember_chat_thread(
+        self, channel_id: Optional[str], thread_ts: Optional[str]
+    ) -> None:
+        """Record a thread the bot started in chat, so no lookup is needed."""
+        if channel_id and thread_ts:
+            self._agent_lookup_skips[self._thread_key(channel_id, thread_ts)] = "chat"
+
     async def _restore_agent_thread(self, event: Dict[str, Any]):
         await self._adopt_agent_session(
             self._extract_team_id(event) or "unknown-team",
@@ -4003,6 +4072,12 @@ class SlackBot:
         try:
             session = await runtime.lookup_session(team_id, channel_id, thread_ts)
         except AgentRuntimeError:
+            if channel_id and thread_ts:
+                self._agent_lookup_skips.set(
+                    self._thread_key(channel_id, thread_ts),
+                    "error",
+                    ttl_seconds=AGENT_LOOKUP_ERROR_TTL_SECONDS,
+                )
             return None
         if not session:
             return None
@@ -4037,7 +4112,7 @@ class SlackBot:
             "owner_user_id": session["owner_user_id"],
             "mode": mode,
         }
-        self.agent_threads[self._thread_key(channel_id, thread_ts)] = tracked
+        self._set_agent_thread(channel_id, thread_ts, tracked)
         self._remember_agent_session(tracked)
         self._mark_thread_active(channel_id, thread_ts)
         return tracked
@@ -4052,6 +4127,10 @@ class SlackBot:
         if not self._claim_message(event):
             return
 
+        if not event.get("thread_ts") and not self._is_agent_request(event):
+            # The answer starts a new thread at this message; an Agent start
+            # here registers its thread locally, which is checked first.
+            self._remember_chat_thread(channel_id, event.get("ts"))
         self._strip_bot_mention(event)
         await self._process_message(event)
 
@@ -4920,6 +4999,7 @@ class SlackBot:
         """Resolve configured channel names to Slack channel IDs when possible."""
         self.allowed_channel_ids = set()
         self.allowed_channel_names = set()
+        self._channel_allowlist_misses.clear()
 
         unresolved_names = set()
         for channel in self.allowed_channels:
@@ -4980,6 +5060,7 @@ class SlackBot:
         if (
             channel_id
             and self.allowed_channel_names
+            and channel_id not in self._channel_allowlist_misses
             and self.web_client is not None
             and hasattr(self.web_client, "conversations_info")
         ):
@@ -4988,13 +5069,19 @@ class SlackBot:
                 resolved_name = self._normalize_channel_name(
                     response.get("channel", {}).get("name")
                 )
-                if resolved_name and resolved_name in self.allowed_channel_names:
-                    self.allowed_channel_ids.add(channel_id)
-                    return True
             except Exception as exc:
                 logger.warning(
                     f"Failed to resolve Slack channel info for allowlist check: {exc}"
                 )
+                self._channel_allowlist_misses.set(
+                    channel_id, True, ttl_seconds=CHANNEL_ALLOWLIST_ERROR_TTL_SECONDS
+                )
+                return False
+            if resolved_name and resolved_name in self.allowed_channel_names:
+                self.allowed_channel_ids.add(channel_id)
+                return True
+            # Outside the allowlist: ask Slack again only after the TTL.
+            self._channel_allowlist_misses[channel_id] = True
 
         return False
 
@@ -5056,10 +5143,18 @@ class SlackBot:
         self._register_agent_run(tracked)
         return tracked
 
+    def _set_agent_thread(
+        self, channel_id: str, thread_ts: str, tracked: Dict[str, Any]
+    ) -> None:
+        """Track a thread as an Agent thread; it is no longer a chat thread."""
+        key = self._thread_key(channel_id, thread_ts)
+        self.agent_threads[key] = tracked
+        self._agent_lookup_skips.pop(key, None)
+
     def _register_agent_run(self, tracked: Dict[str, Any]) -> None:
         channel_id = tracked["channel_id"]
         thread_ts = tracked["thread_ts"]
-        self.agent_threads[self._thread_key(channel_id, thread_ts)] = tracked
+        self._set_agent_thread(channel_id, thread_ts, tracked)
         self.agent_runs[tracked["run_id"]] = tracked
         self._remember_agent_session(tracked)
         self._mark_thread_active(channel_id, thread_ts)
@@ -6796,6 +6891,8 @@ class SlackBot:
             else self._work_queue
         )
         try:
+            if queue is self._work_queue and self._work_queue_full():
+                raise asyncio.QueueFull
             queue.put_nowait(item)
         except asyncio.QueueFull:
             SLACK_METRICS.work_rejected.labels(reason="capacity").inc()
@@ -6804,8 +6901,18 @@ class SlackBot:
         SLACK_METRICS.work_queue_depth.set(self._queued_work())
         return True
 
+    def _work_queue_full(self) -> bool:
+        """Queued and parked chat work share the work queue's capacity."""
+        return (
+            self._work_queue.qsize() + self._thread_pending >= self._work_queue.maxsize
+        )
+
     def _queued_work(self) -> int:
-        return self._work_queue.qsize() + self._priority_queue.qsize()
+        return (
+            self._work_queue.qsize()
+            + self._priority_queue.qsize()
+            + self._thread_pending
+        )
 
     async def _work_worker(self, index: int, queue: asyncio.Queue) -> None:
         while True:
@@ -6827,7 +6934,7 @@ class SlackBot:
                         self._handle_event(item.payload), "pi_agent_start"
                     )
                 else:
-                    await self._handle_event(item.payload)
+                    await self._handle_chat_work(item)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -6836,6 +6943,86 @@ class SlackBot:
                 self._work_running -= 1
                 SLACK_METRICS.work_running.set(self._work_running)
                 queue.task_done()
+
+    def _chat_thread_key(self, event: Dict[str, Any]) -> Optional[str]:
+        """The thread a chat event belongs to: its root's channel:ts."""
+        channel_id = event.get("channel")
+        thread_ts = event.get("thread_ts") or event.get("ts")
+        if not channel_id or not thread_ts:
+            return None
+        return self._thread_key(channel_id, thread_ts)
+
+    async def _drops_before_thread(self, event: Dict[str, Any]) -> bool:
+        """Cheap checks _handle_*_event would drop the event on anyway.
+
+        That is an ignored message, a message already claimed (Slack's
+        message and app_mention for one mention) or a channel the bot is not
+        enabled in. Such an event need not wait behind a busy thread.
+        """
+        if event.get("type") == "message" and self._is_ignored_message_event(event):
+            return True
+        channel_id = event.get("channel")
+        ts = event.get("ts")
+        if (
+            channel_id
+            and ts
+            and self._thread_key(channel_id, ts) in (self.handled_messages)
+        ):
+            return True
+        return not await self._is_channel_allowed(channel_id, event.get("channel_name"))
+
+    async def _handle_chat_work(self, item: SlackWorkItem) -> None:
+        """Answer one Slack thread one chat event at a time (S12).
+
+        A follow-up then sees the answer before it in the thread's history and
+        is posted after it. An event for a thread already being answered is
+        parked on that thread and the worker goes back to the queue; the
+        worker answering the thread takes the parked events in order before
+        it lets the thread go, so one thread never holds more than one worker.
+        """
+        key = self._chat_thread_key(item.payload)
+        if key is None:
+            await self._handle_event(item.payload)
+            return
+        if key in self._busy_threads:
+            if await self._drops_before_thread(item.payload):
+                return
+        # Read again after the await: the owner may have let the thread go
+        # meanwhile, and an event parked on its entry would never be answered.
+        busy = self._busy_threads.get(key)
+        if busy is not None:
+            if self._work_queue_full():
+                SLACK_METRICS.work_rejected.labels(reason="capacity").inc()
+                await self._reply_busy(item)
+                return
+            busy.pending.append(item)
+            self._thread_pending += 1
+            SLACK_METRICS.work_queue_depth.set(self._queued_work())
+            return
+        busy = self._busy_threads[key] = SlackThreadWork()
+        try:
+            current = item
+            while True:
+                try:
+                    await self._handle_event(current.payload)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Slack work item failed: %s", current.name)
+                if not busy.pending:
+                    break
+                current = busy.pending.popleft()
+                self._thread_pending -= 1
+                SLACK_METRICS.work_queue_depth.set(self._queued_work())
+        finally:
+            del self._busy_threads[key]
+            if busy.pending:
+                # Cancelled at shutdown with follow-ups still parked.
+                self._thread_pending -= len(busy.pending)
+                SLACK_METRICS.work_rejected.labels(reason="shutdown").inc(
+                    len(busy.pending)
+                )
+                busy.pending.clear()
 
     async def _reply_busy(self, item: SlackWorkItem) -> None:
         if not self._wants_busy_reply(item):
@@ -7061,13 +7248,23 @@ class SlackBot:
             int(self.attachment_settings.get("max_files", 10) or 10),
             10,
         )
+        # Download side by side, a few at a time; results keep Slack's order.
+        semaphore = asyncio.Semaphore(ATTACHMENT_DOWNLOAD_CONCURRENCY)
+
+        async def build(file_payload: Dict[str, Any]) -> Optional[Attachment]:
+            async with semaphore:
+                return await self._build_attachment_from_slack_file(file_payload)
+
+        results = await asyncio.gather(
+            *(build(file_payload) for file_payload in files[:max_files]),
+            return_exceptions=True,
+        )
         attachments = []
-
-        for file_payload in files[:max_files]:
-            attachment = await self._build_attachment_from_slack_file(file_payload)
-            if attachment is not None:
-                attachments.append(attachment)
-
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+            if result is not None:
+                attachments.append(result)
         return attachments
 
     async def _build_attachment_from_slack_file(

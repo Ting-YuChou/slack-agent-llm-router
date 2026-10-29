@@ -19,7 +19,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
+from src.utils.bounded_state import BoundedTTLMap
+
 logger = logging.getLogger(__name__)
+
+# How long search trusts a store's answer to "does this scope have memories".
+# remember/forget through the manager invalidate it at once; a write from
+# elsewhere shows up within this window.
+HAS_ITEMS_CACHE_TTL_SECONDS = 30.0
+HAS_ITEMS_CACHE_LIMIT = 10_000
 
 MEMORY_CONTEXT_HEADER = "Long-term user memory:"
 RECENT_CONTEXT_HEADER = "Recent conversation:"
@@ -225,6 +233,9 @@ class MemoryStore(Protocol):
     async def delete_all(self, scope: str) -> int:
         """Delete all memory items for one scope."""
 
+    async def has_items(self, scope: str) -> bool:
+        """Whether one scope has any memory items, so search can skip work."""
+
     async def keyword_search(
         self, scope: str, tokens: Sequence[str], filters: Dict[str, Any], limit: int
     ) -> List[MemorySearchResult]:
@@ -417,6 +428,9 @@ class InMemoryMemoryStore:
         count = len(self.items.get(scope, {}))
         self.items[scope] = {}
         return count
+
+    async def has_items(self, scope: str) -> bool:
+        return bool(self.items.get(scope))
 
     async def keyword_search(
         self, scope: str, tokens: Sequence[str], filters: Dict[str, Any], limit: int
@@ -647,6 +661,16 @@ class RedisStackMemoryStore:
                 count += 1
         await self.client.delete(self._user_index_key(scope))
         return count
+
+    async def has_items(self, scope: str) -> bool:
+        """SCARD on the scope's index set; True when Redis cannot answer."""
+        if not self.client:
+            return False
+        try:
+            return int(await self.client.scard(self._user_index_key(scope))) > 0
+        except Exception as exc:
+            logger.warning("Redis memory item count failed: %s", exc)
+            return True
 
     async def keyword_search(
         self, scope: str, tokens: Sequence[str], filters: Dict[str, Any], limit: int
@@ -883,6 +907,16 @@ class MemoryManager:
         self.importance_weight = float(
             self.search_config.get("importance_weight", 0.05)
         )
+        # Vector neighbours below this cosine similarity are dropped; a KNN
+        # search always returns neighbours, related or not. 0 turns it off.
+        self.min_score = float(self.search_config.get("min_score", 0.0))
+        self._has_items_cache: BoundedTTLMap[str, bool] = BoundedTTLMap(
+            max_entries=HAS_ITEMS_CACHE_LIMIT,
+            ttl_seconds=HAS_ITEMS_CACHE_TTL_SECONDS,
+        )
+        # Bumped on every write through the manager; a has_items answer read
+        # before a write is not cached after it.
+        self._has_items_generation = 0
         self.store = store or build_memory_store(self.config)
         self.embedding_provider = embedding_provider or build_embedding_provider(
             dict(self.config.get("embedding", {}) or {})
@@ -933,7 +967,10 @@ class MemoryManager:
             expires_at=expires_at,
             embedding=embedding,
         )
-        await self.store.add(item)
+        try:
+            await self.store.add(item)
+        finally:
+            self._invalidate_has_items(scope)
         return item
 
     async def list_memories(
@@ -950,30 +987,60 @@ class MemoryManager:
     async def forget(self, scope: str, memory_id: str) -> bool:
         if not self.enabled:
             return False
-        return await self.store.delete(scope, memory_id)
+        try:
+            return await self.store.delete(scope, memory_id)
+        finally:
+            self._invalidate_has_items(scope)
 
     async def forget_all(self, scope: str) -> int:
         if not self.enabled:
             return 0
-        return await self.store.delete_all(scope)
+        try:
+            return await self.store.delete_all(scope)
+        finally:
+            self._invalidate_has_items(scope)
+
+    async def _scope_has_items(self, scope: str) -> bool:
+        cached = self._has_items_cache.get(scope)
+        if cached is not None:
+            return cached
+        has_items = getattr(self.store, "has_items", None)
+        if not callable(has_items):
+            return True
+        generation = self._has_items_generation
+        result = bool(await has_items(scope))
+        if generation == self._has_items_generation:
+            self._has_items_cache[scope] = result
+        return result
+
+    def _invalidate_has_items(self, scope: str) -> None:
+        self._has_items_generation += 1
+        self._has_items_cache.pop(scope, None)
 
     async def search(
         self, scope: str, query: str, metadata: Optional[Dict[str, Any]] = None
     ) -> List[MemorySearchResult]:
         if not self.enabled:
             return []
+        if not await self._scope_has_items(scope):
+            # Nothing to find: skip the keyword search and the embedding call.
+            return []
         filters = self._search_filters(metadata)
         tokens = tokenize(query)
         candidate_limit = max(self.max_results * 3, self.max_results)
-        keyword_results = await self.store.keyword_search(
-            scope, tokens, filters, candidate_limit
+        # The embedding call can take seconds; the keyword search runs meanwhile.
+        keyword_results, embedding = await asyncio.gather(
+            self.store.keyword_search(scope, tokens, filters, candidate_limit),
+            self._safe_embed(query),
         )
-        embedding = await self._safe_embed(query)
         vector_results = []
         if embedding:
             vector_results = await self.store.vector_search(
                 scope, embedding, filters, candidate_limit
             )
+            vector_results = [
+                result for result in vector_results if result.score >= self.min_score
+            ]
         merged = self._merge_results(keyword_results, vector_results)
         return merged[: self.max_results]
 
