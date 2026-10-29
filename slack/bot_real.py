@@ -4,7 +4,6 @@ Enterprise-ready Slack bot with conversation continuity and advanced features
 """
 
 import asyncio
-import contextlib
 import hashlib
 import json
 import logging
@@ -18,8 +17,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import (
     Any,
-    AsyncIterator,
     Awaitable,
+    Deque,
     Callable,
     Dict,
     List,
@@ -27,7 +26,8 @@ from typing import (
     Set,
     Tuple,
 )
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 
 from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.socket_mode.aiohttp import (
@@ -649,6 +649,13 @@ class SlackWorkItem:
     kind: str
     payload: Dict[str, Any]
     name: str
+
+
+@dataclass
+class SlackThreadWork:
+    """Chat events parked behind the one a worker is answering in a thread."""
+
+    pending: Deque[SlackWorkItem] = field(default_factory=deque)
 
 
 class SlackStateStore:
@@ -3459,10 +3466,12 @@ class SlackBot:
         )
         self._work_workers: List[asyncio.Task] = []
         self._work_running = 0
-        # "channel:thread_ts" -> [lock, holders and waiters] (S12). An entry
-        # lives only while a chat item holds or waits for it, so the map is
-        # bounded by in-flight work and a held lock is never dropped.
-        self._thread_locks: Dict[str, List[Any]] = {}
+        # Threads a worker is answering, with the chat events parked behind
+        # the current one (S12). An entry lives only while its worker runs,
+        # so the map holds at most one entry per worker.
+        self._busy_threads: Dict[str, SlackThreadWork] = {}
+        # Parked events across all threads, bounded by the queue's capacity.
+        self._thread_pending = 0
         self._accepting_work = True
         self._socket_disconnect_lock = asyncio.Lock()
         self._socket_disconnected = False
@@ -6567,7 +6576,11 @@ class SlackBot:
         return True
 
     def _queued_work(self) -> int:
-        return self._work_queue.qsize() + self._priority_queue.qsize()
+        return (
+            self._work_queue.qsize()
+            + self._priority_queue.qsize()
+            + self._thread_pending
+        )
 
     async def _work_worker(self, index: int, queue: asyncio.Queue) -> None:
         while True:
@@ -6589,8 +6602,7 @@ class SlackBot:
                         self._handle_event(item.payload), "pi_agent_start"
                     )
                 else:
-                    async with self._thread_lock(item.payload):
-                        await self._handle_event(item.payload)
+                    await self._handle_chat_work(item)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -6600,31 +6612,82 @@ class SlackBot:
                 SLACK_METRICS.work_running.set(self._work_running)
                 queue.task_done()
 
-    @contextlib.asynccontextmanager
-    async def _thread_lock(self, event: Dict[str, Any]) -> AsyncIterator[None]:
-        """Serialize chat events of one Slack thread (S12).
-
-        A follow-up then sees the answer before it in the thread's history and
-        is posted after it. The key is the thread's root: its thread_ts, or
-        the message's own ts when it starts a thread.
-        """
+    def _chat_thread_key(self, event: Dict[str, Any]) -> Optional[str]:
+        """The thread a chat event belongs to: its root's channel:ts."""
         channel_id = event.get("channel")
         thread_ts = event.get("thread_ts") or event.get("ts")
         if not channel_id or not thread_ts:
-            yield
+            return None
+        return self._thread_key(channel_id, thread_ts)
+
+    async def _drops_before_thread(self, event: Dict[str, Any]) -> bool:
+        """Cheap checks _handle_*_event would drop the event on anyway.
+
+        That is an ignored message, a message already claimed (Slack's
+        message and app_mention for one mention) or a channel the bot is not
+        enabled in. Such an event need not wait behind a busy thread.
+        """
+        if event.get("type") == "message" and self._is_ignored_message_event(event):
+            return True
+        channel_id = event.get("channel")
+        ts = event.get("ts")
+        if (
+            channel_id
+            and ts
+            and self._thread_key(channel_id, ts) in (self.handled_messages)
+        ):
+            return True
+        return not await self._is_channel_allowed(channel_id, event.get("channel_name"))
+
+    async def _handle_chat_work(self, item: SlackWorkItem) -> None:
+        """Answer one Slack thread one chat event at a time (S12).
+
+        A follow-up then sees the answer before it in the thread's history and
+        is posted after it. An event for a thread already being answered is
+        parked on that thread and the worker goes back to the queue; the
+        worker answering the thread takes the parked events in order before
+        it lets the thread go, so one thread never holds more than one worker.
+        """
+        key = self._chat_thread_key(item.payload)
+        if key is None:
+            await self._handle_event(item.payload)
             return
-        key = self._thread_key(channel_id, thread_ts)
-        entry = self._thread_locks.get(key)
-        if entry is None:
-            entry = self._thread_locks[key] = [asyncio.Lock(), 0]
-        entry[1] += 1
+        busy = self._busy_threads.get(key)
+        if busy is not None:
+            if await self._drops_before_thread(item.payload):
+                return
+            if self._thread_pending >= self._work_queue.maxsize:
+                SLACK_METRICS.work_rejected.labels(reason="capacity").inc()
+                await self._reply_busy(item)
+                return
+            busy.pending.append(item)
+            self._thread_pending += 1
+            SLACK_METRICS.work_queue_depth.set(self._queued_work())
+            return
+        busy = self._busy_threads[key] = SlackThreadWork()
         try:
-            async with entry[0]:
-                yield
+            current = item
+            while True:
+                try:
+                    await self._handle_event(current.payload)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Slack work item failed: %s", current.name)
+                if not busy.pending:
+                    break
+                current = busy.pending.popleft()
+                self._thread_pending -= 1
+                SLACK_METRICS.work_queue_depth.set(self._queued_work())
         finally:
-            entry[1] -= 1
-            if entry[1] == 0 and self._thread_locks.get(key) is entry:
-                del self._thread_locks[key]
+            del self._busy_threads[key]
+            if busy.pending:
+                # Cancelled at shutdown with follow-ups still parked.
+                self._thread_pending -= len(busy.pending)
+                SLACK_METRICS.work_rejected.labels(reason="shutdown").inc(
+                    len(busy.pending)
+                )
+                busy.pending.clear()
 
     async def _reply_busy(self, item: SlackWorkItem) -> None:
         if not self._wants_busy_reply(item):

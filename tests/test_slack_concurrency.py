@@ -262,7 +262,7 @@ async def test_same_thread_messages_are_answered_in_order_with_history(
     assert posted == ["re: first question", "re: a follow-up"]
     second_request = bot.inference_engine.process_query.await_args_list[1].args[0]
     assert "re: first question" in (second_request.context or "")
-    assert not bot._thread_locks
+    assert not bot._busy_threads
 
 
 @pytest.mark.asyncio
@@ -320,11 +320,99 @@ async def test_agent_background_start_does_not_hold_the_thread_lock():
     try:
         await asyncio.wait_for(bot._work_queue.join(), timeout=1)
         await asyncio.wait_for(started.wait(), timeout=1)
-        assert not bot._thread_locks
+        assert not bot._busy_threads
     finally:
         release.set()
         await bot._stop_work_workers()
         await asyncio.gather(*bot.background_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_busy_thread_never_holds_more_than_one_worker(
+    inference_response_factory,
+):
+    release = asyncio.Event()
+    other_answered = asyncio.Event()
+
+    async def process_query(request):
+        if request.query == "slow 0":
+            await release.wait()
+        if request.query == "other thread":
+            other_answered.set()
+        return inference_response_factory(response_text=f"re: {request.query}")
+
+    bot = chat_bot(AsyncMock(side_effect=process_query), work_queue={"concurrency": 2})
+    bot._mark_thread_active("C1", "100.0")
+    bot._mark_thread_active("C1", "200.0")
+    # One user per message, so no rate limit gets in the way.
+    items = [
+        thread_reply(ts=f"10{index}.0", text=f"slow {index}", user=f"U{index}")
+        for index in range(5)
+    ] + [thread_reply(ts="201.0", thread_ts="200.0", text="other thread", user="U9")]
+    for payload in items:
+        assert await bot._enqueue_work(
+            SlackWorkItem(kind="event", payload=payload, name="message")
+        )
+
+    bot._start_work_workers()
+    try:
+        # Four follow-ups wait behind "slow 0", yet the other thread still
+        # gets the second worker.
+        await asyncio.wait_for(other_answered.wait(), timeout=1)
+        assert bot._work_running == 1
+        release.set()
+        await asyncio.wait_for(bot._work_queue.join(), timeout=2)
+    finally:
+        release.set()
+        await bot._stop_work_workers()
+
+    assert queries(bot) == [
+        "slow 0",
+        "other thread",
+        "slow 1",
+        "slow 2",
+        "slow 3",
+        "slow 4",
+    ]
+    assert not bot._busy_threads
+
+
+@pytest.mark.asyncio
+async def test_items_that_would_be_dropped_do_not_queue_behind_a_busy_thread(
+    inference_response_factory,
+):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def process_query(request):
+        started.set()
+        await release.wait()
+        return inference_response_factory(response_text=f"re: {request.query}")
+
+    bot = chat_bot(AsyncMock(side_effect=process_query))
+    bot._mark_thread_active("C1", "100.0")
+    first = thread_reply(ts="101.0", text="first")
+    assert await bot._enqueue_work(
+        SlackWorkItem(kind="event", payload=first, name="message")
+    )
+    bot._start_work_workers()
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        # The app_mention Slack sends for the same message, already claimed.
+        duplicate = dict(first, type="app_mention")
+        assert await bot._enqueue_work(
+            SlackWorkItem(kind="event", payload=duplicate, name="mention")
+        )
+        await asyncio.sleep(0.05)
+        assert bot._work_queue.qsize() == 0
+        assert bot._queued_work() == 0
+        assert not bot._busy_threads["C1:100.0"].pending
+    finally:
+        release.set()
+        await asyncio.wait_for(bot._work_queue.join(), timeout=2)
+        await bot._stop_work_workers()
+
+    assert queries(bot) == ["first"]
 
 
 @pytest.mark.asyncio
