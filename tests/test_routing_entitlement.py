@@ -608,3 +608,28 @@ def test_vllm_model_fallback_accepts_decisions_without_features():
     assert engine._vllm_model_fallback_allowed(
         engine._vllm_model_fallback_config(), request, decision, context
     )
+
+
+@pytest.mark.asyncio
+async def test_client_complexity_metadata_still_blocks_vllm_fallback():
+    # The router reads "hello there" as simple; the client says complex. Any
+    # source saying complex keeps the weaker local fallback closed.
+    router = _stub_router(ModelRouter(LOCAL_VLLM_ROUTER_CONFIG), token_count=64)
+    engine = InferenceEngine(VLLM_MODEL_FALLBACK_CONFIG, router)
+    request = _request(
+        "premium",
+        query="hello there",
+        max_tokens=256,
+        metadata={"query_complexity": "complex"},
+    )
+    decision = await router.route_query(request)
+    assert decision.selected_model == "qwen3.6-27b-fast"
+    assert decision.features.query_complexity == "simple"
+    context = engine._build_local_fallback_context(request, decision)
+
+    assert (
+        engine._vllm_model_fallback_allowed(
+            engine._vllm_model_fallback_config(), request, decision, context
+        )
+        is False
+    )
