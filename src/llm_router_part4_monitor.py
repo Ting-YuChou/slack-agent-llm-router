@@ -422,7 +422,7 @@ class AlertManager:
             "description": rule.description,
             "threshold": rule.threshold,
             "current_value": self._get_current_value(rule, metrics),
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "trigger_count": rule.trigger_count,
         }
 

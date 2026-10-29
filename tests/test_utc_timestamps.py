@@ -12,6 +12,7 @@ from src.llm_router_part3_pipeline import (
 )
 from src.llm_router_part4_monitor import (
     AlertManager,
+    AlertRule,
     MetricsCollector,
     _parse_event_timestamp,
 )
@@ -326,4 +327,24 @@ async def test_external_alert_fallback_timestamp_is_utc(taipei_tz):
 
     await manager.record_external_alert({"alert_type": "anomaly_detected"})
 
+    _assert_true_utc(datetime.fromisoformat(manager.alert_history[-1]["timestamp"]))
+
+
+@pytest.mark.asyncio
+async def test_triggered_alert_timestamp_is_utc(taipei_tz):
+    manager = AlertManager({})
+    manager.alert_rules = [
+        AlertRule(
+            name="high_error_rate",
+            condition="error_rate > threshold",
+            threshold=0.05,
+            duration=3600,
+            severity="critical",
+            description="Error rate too high",
+        )
+    ]
+
+    await manager.check_alerts({"error_rate": 0.2})
+
+    assert manager.alert_history[-1]["rule_name"] == "high_error_rate"
     _assert_true_utc(datetime.fromisoformat(manager.alert_history[-1]["timestamp"]))
