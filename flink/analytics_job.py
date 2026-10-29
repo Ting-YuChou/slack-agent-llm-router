@@ -116,6 +116,7 @@ from flink.logic import (
     build_model_metrics_window_event,
     build_routing_policy_state_event_from_aggregate,
     completion_event_timestamp_ms,
+    counts_toward_provider_health,
     detect_metric_anomalies,
     detect_model_routing_guardrails,
     detect_provider_routing_guardrails,
@@ -1075,7 +1076,26 @@ def create_flink_job(config: Dict[str, Any]):
     provider_guardrail_thresholds = dict(
         analytics_config.get("provider_guardrails", {}) or {}
     )
-    provider_guardrail_stream = metrics_stream.key_by(
+    # Provider guardrails get their own metrics windows over events that say
+    # something about the provider; user_or_policy and internal failures would
+    # otherwise count as provider errors. Model metrics above still count them.
+    provider_health_metrics_stream = (
+        valid_completions_stream.filter(counts_toward_provider_health)
+        .key_by(
+            lambda event: _model_provider_stream_key(
+                event.get("selected_model", "unknown"),
+                event.get("provider", "unknown"),
+            )
+        )
+        .process(
+            ModelMetricsWindowAggregator(
+                window_size_seconds=window_size_seconds,
+                allowed_lateness_seconds=allowed_lateness_seconds,
+            ),
+            output_type=Types.PICKLED_BYTE_ARRAY(),
+        )
+    )
+    provider_guardrail_stream = provider_health_metrics_stream.key_by(
         lambda event: event.get("provider", "unknown")
     ).process(
         ProviderRoutingGuardrailDetector(

@@ -883,6 +883,23 @@ def _increment_count(counts: Dict[str, int], key: str, amount: int = 1) -> None:
         counts.pop(key, None)
 
 
+PROVIDER_ATTRIBUTABLE_ERROR_TYPES = frozenset(
+    {"provider_error", "timeout", "rate_limited"}
+)
+
+
+def counts_toward_provider_health(event: Dict[str, Any]) -> bool:
+    """Return whether a completion event belongs in a provider's health signal.
+
+    Failures classified as user_or_policy or internal say nothing about the
+    provider. Events without error_type (successes and older producers) count.
+    """
+    error_type = event.get("error_type")
+    if not error_type:
+        return True
+    return str(error_type).lower() in PROVIDER_ATTRIBUTABLE_ERROR_TYPES
+
+
 def add_routing_policy_event(
     aggregate: Dict[str, Any],
     event: Dict[str, Any],
@@ -915,7 +932,7 @@ def add_routing_policy_event(
         target = "model_success_counts" if succeeded else "failed_model_counts"
         _increment_count(aggregate.setdefault(target, {}), selected_model)
     provider = str(event.get("provider", "") or "").lower()
-    if provider and not succeeded:
+    if provider and not succeeded and counts_toward_provider_health(event):
         _increment_count(aggregate.setdefault("failed_provider_counts", {}), provider)
 
     if arrival_sequence >= int(aggregate.get("latest_arrival_sequence", -1)):

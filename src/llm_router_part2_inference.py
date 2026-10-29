@@ -280,6 +280,47 @@ def _first_nested_usage_value(
     return default
 
 
+def _exception_status_code(exc: BaseException) -> Optional[int]:
+    """HTTP status from SDK errors (exc.status_code) or httpx (exc.response)."""
+    for candidate in (exc, getattr(exc, "response", None)):
+        status_code = getattr(candidate, "status_code", None)
+        if isinstance(status_code, int) and not isinstance(status_code, bool):
+            return status_code
+    return None
+
+
+def classify_inference_error(exc: BaseException) -> str:
+    """Bucket a failed inference so analytics only blame providers for their faults.
+
+    Matches SDK and httpx errors by attribute and class name, so it works without
+    importing the provider SDKs.
+    """
+    class_names = {cls.__name__ for cls in type(exc).__mro__}
+    if isinstance(exc, AdmissionRejectedError):
+        return "user_or_policy"
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or any(
+        "Timeout" in name for name in class_names
+    ):
+        return "timeout"
+    status_code = _exception_status_code(exc)
+    if status_code == 429:
+        return "rate_limited"
+    if status_code is not None and status_code >= 500:
+        return "provider_error"
+    if status_code is not None and 400 <= status_code < 500:
+        return "user_or_policy"
+    if isinstance(exc, ConnectionError) or class_names & {
+        "APIConnectionError",
+        "TransportError",
+    }:
+        return "provider_error"
+    if isinstance(exc, ValueError):
+        return "user_or_policy"
+    if isinstance(exc, RuntimeError):
+        return "provider_error"
+    return "internal"
+
+
 def _openai_cached_input_tokens(usage: Any) -> int:
     """Cached prompt tokens: the Responses API field first, then Chat Completions."""
     return _first_nested_usage_value(
@@ -2307,11 +2348,14 @@ class InferenceEngine:
             logger.exception(f"Inference failed for request {request_id}")
 
             # Return error response
+            failed_model = (
+                routing_decision.selected_model
+                if "routing_decision" in locals()
+                else "unknown"
+            )
             error_response = InferenceResponse(
                 response_text="Request processing failed",
-                model_name=routing_decision.selected_model
-                if "routing_decision" in locals()
-                else "unknown",
+                model_name=failed_model,
                 token_count_input=0,
                 token_count_output=0,
                 total_tokens=0,
@@ -2321,10 +2365,18 @@ class InferenceEngine:
                 provider="error",
                 cached=False,
                 error="inference_failed",
+                error_type=classify_inference_error(exc),
             )
+            # The caller keeps the "error" provider sentinel; analytics get the
+            # failed model's real provider so outages count against it.
+            failed_provider = self._configured_provider_name(failed_model)
             await self._publish_analytics_events(
                 request,
-                error_response,
+                (
+                    error_response.model_copy(update={"provider": failed_provider})
+                    if failed_provider
+                    else error_response
+                ),
                 routing_decision=routing_decision
                 if "routing_decision" in locals()
                 else None,
@@ -2853,6 +2905,17 @@ class InferenceEngine:
         chunk_size = max(chunk_size, 1)
         for index in range(0, len(response.response_text), chunk_size):
             yield response.response_text[index : index + chunk_size]
+
+    def _configured_provider_name(self, model_name: str) -> Optional[str]:
+        """Return the provider configured for a model, or None when unknown."""
+        try:
+            model_info = self.router.get_model_info(model_name)
+        except Exception:
+            logger.debug("Provider lookup failed for %s", model_name, exc_info=True)
+            return None
+        config = model_info.get("config") if isinstance(model_info, dict) else None
+        provider = config.get("provider") if isinstance(config, dict) else None
+        return provider if isinstance(provider, str) and provider else None
 
     def _get_provider_for_model(
         self, model_name: str
@@ -3545,7 +3608,7 @@ class InferenceEngine:
         self, model_name: str, response: InferenceResponse
     ):
         """Record provider-side prompt cache usage separately from Redis hits."""
-        if response.cached or response.provider == "error":
+        if response.cached or response.error:
             return
 
         cached_tokens = int(response.provider_cached_input_tokens or 0)

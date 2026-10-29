@@ -173,6 +173,9 @@ class InferenceResponse(BaseModel):
     provider_cache_creation_input_tokens: int = Field(default=0, ge=0)
     provider_cache_read_input_tokens: int = Field(default=0, ge=0)
     reasoning_tokens: int = Field(default=0, ge=0)
+    # Failure bucket for analytics: provider_error, timeout, rate_limited,
+    # user_or_policy or internal. None on success.
+    error_type: Optional[str] = None
 
     # Performance metrics
     latency_ms: int = Field(ge=0)

@@ -183,6 +183,7 @@ def build_inference_completed_event(
         "provider": inference_response.provider,
         "status": "error" if inference_response.error else "success",
         "error_message": inference_response.error or "",
+        "error_type": inference_response.error_type,
         "latency_ms": inference_response.latency_ms,
         "token_count_input": inference_response.token_count_input,
         "token_count_output": inference_response.token_count_output,
