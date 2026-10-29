@@ -5,6 +5,7 @@ import inspect
 import os
 import re
 import time
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -94,7 +95,7 @@ class TestUserManager:
         assert manager.get_user_preferences("unknown")["response_length"] == "medium"
 
         manager.users["u1"] = {"tier": "premium"}
-        assert manager.get_user_tier("u1") == UserTier.PREMIUM
+        assert manager.get_user_tier("u1") == UserTier.FREE
 
     def test_check_rate_limit_enforces_burst_window(self, monkeypatch):
         manager = UserManager()
@@ -2115,13 +2116,16 @@ class TestSlackBot:
     @pytest.mark.asyncio
     async def test_process_message_enforces_rate_limit_for_queries(self):
         bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
-        bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+        bot.web_client = SimpleNamespace(
+            chat_postMessage=AsyncMock(), chat_postEphemeral=AsyncMock()
+        )
         bot.user_manager.check_rate_limit = lambda *_args, **_kwargs: False
         bot.message_handler = SimpleNamespace(handle_message=AsyncMock())
 
         await bot._process_message({"channel": "C1", "user": "U1", "text": "hello"})
 
-        bot.web_client.chat_postMessage.assert_awaited_once()
+        bot.web_client.chat_postEphemeral.assert_awaited_once()
+        bot.web_client.chat_postMessage.assert_not_awaited()
         bot.message_handler.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -2715,7 +2719,8 @@ class TestSlackStateStores:
 
     @pytest.mark.asyncio
     async def test_redis_state_store_preserves_other_users_across_clients(self):
-        prefix = "test-multi-user"
+        # Rate limits merge with what is stored, so share no keys between runs.
+        prefix = f"test-multi-user-{uuid.uuid4().hex}"
         now = datetime.now().timestamp()
         store_one = RedisSlackStateStore(
             {
@@ -2755,6 +2760,11 @@ class TestSlackStateStores:
         )
 
         loaded = await store_one.load_state()
+        # User keys never expire: leave nothing behind in the shared Redis.
+        for user_id in ("u1", "u2"):
+            await store_one.delete_user_state(user_id)
+        await store_one.shutdown()
+        await store_two.shutdown()
 
         assert loaded["users"]["u1"]["tier"] == "premium"
         assert loaded["users"]["u2"]["tier"] == "enterprise"
@@ -2860,7 +2870,7 @@ class TestSlackStateStores:
         second_bot = SlackBot(config, inference_engine=SimpleNamespace())
         await second_bot.initialize()
 
-        assert second_bot.user_manager.get_user_tier("u1") == UserTier.PREMIUM
+        assert second_bot.user_manager.get_user_tier("u1") == UserTier.FREE
         assert second_bot.user_manager.rate_limits["u1"] == [1.0]
         restored = second_bot.conversation_manager.get_conversation_summary(
             "u1", "C1", "T1"

@@ -1677,8 +1677,13 @@ async def test_a_burst_of_one_request_kind_never_blocks_the_other(tmp_path, burs
 
     assert bot.message_handler._handle_query.await_count == 2
     assert bot.agent_runtime_client.create_session.await_count == 2
-    refusals = [text for text in posted_texts(bot) if "Rate Limit Exceeded" in text]
+    ephemeral_texts = [
+        call.kwargs["text"]
+        for call in bot.web_client.chat_postEphemeral.await_args_list
+    ]
+    refusals = [text for text in ephemeral_texts if "Rate Limit Exceeded" in text]
     assert len(refusals) == 1
+    assert not any("Rate Limit Exceeded" in text for text in posted_texts(bot))
     # Each request that went through counts as one Slack query.
     assert len(bot.user_manager.rate_limits["U1"]) == 4
 
