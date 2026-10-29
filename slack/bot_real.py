@@ -3096,6 +3096,9 @@ class SlackBot:
         # "channel:ts" of messages already handled, oldest first. Slack sends
         # both a message and an app_mention event for one mention.
         self.handled_messages: Dict[str, None] = {}
+        # "channel:ts" of messages already given a busy reply, so a mention's
+        # message and app_mention events get one between them.
+        self.busy_replied_messages: Dict[str, None] = {}
         self.agent_monitor_tasks: Dict[str, asyncio.Task] = {}
         self.agent_monitor_poll_seconds = float(
             self.agent_config.get("monitor_poll_seconds", 2)
@@ -3417,18 +3420,25 @@ class SlackBot:
         self._strip_bot_mention(event)
         await self._process_message(event)
 
-    def _claim_message(self, event: Dict[str, Any]) -> bool:
-        """True only the first time a Slack message is handled."""
+    def _claim_message(
+        self, event: Dict[str, Any], claimed: Optional[Dict[str, None]] = None
+    ) -> bool:
+        """True only the first time a Slack message is claimed.
+
+        Claims go in handled_messages unless another bounded set is given.
+        """
+        if claimed is None:
+            claimed = self.handled_messages
         channel_id = event.get("channel")
         ts = event.get("ts")
         if not channel_id or not ts:
             return True
         key = self._thread_key(channel_id, ts)
-        if key in self.handled_messages:
+        if key in claimed:
             return False
-        self.handled_messages[key] = None
-        while len(self.handled_messages) > HANDLED_MESSAGES_LIMIT:
-            self.handled_messages.pop(next(iter(self.handled_messages)))
+        claimed[key] = None
+        while len(claimed) > HANDLED_MESSAGES_LIMIT:
+            claimed.pop(next(iter(claimed)))
         return True
 
     def _strip_bot_mention(self, event: Dict[str, Any]) -> None:
@@ -6116,6 +6126,10 @@ class SlackBot:
 
     async def _reply_busy(self, item: SlackWorkItem) -> None:
         if not self._wants_busy_reply(item):
+            return
+        if item.kind == "event" and not self._claim_message(
+            item.payload, self.busy_replied_messages
+        ):
             return
 
         async def send_reply():

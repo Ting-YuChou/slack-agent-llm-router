@@ -3054,6 +3054,40 @@ async def test_slack_busy_reply_answers_only_people_waiting_on_the_bot(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("situation", ["queue_full", "draining"])
+@pytest.mark.parametrize("first", ["message", "app_mention"])
+async def test_slack_busy_reply_answers_a_mention_in_a_thread_once(situation, first):
+    bot = _busy_bot(situation)
+    bot.active_threads["C1:100.0"] = datetime.now()
+    socket_client = SimpleNamespace(send_socket_mode_response=AsyncMock())
+
+    async def deliver(event_type, ts):
+        # Slack sends a message and an app_mention event for one @bot post.
+        event = _message(user="U1", thread_ts="100.0", ts=ts, text="<@UBOT> hi")
+        event["type"] = event_type
+        await bot._handle_socket_mode_request(
+            socket_client,
+            SimpleNamespace(
+                envelope_id=f"E-{event_type}-{ts}",
+                type="events_api",
+                payload={"event": event},
+            ),
+        )
+
+    second = "app_mention" if first == "message" else "message"
+    await deliver(first, "101.0")
+    await deliver(second, "101.0")
+
+    bot.web_client.chat_postMessage.assert_awaited_once()
+    assert bot.web_client.chat_postMessage.await_args.kwargs["thread_ts"] == "100.0"
+
+    # Another post in the same thread still gets its own reply.
+    await deliver(first, "102.0")
+    await deliver(second, "102.0")
+    assert bot.web_client.chat_postMessage.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_slack_bot_and_own_messages_are_acked_but_never_queued():
     bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
     bot.bot_user_id = "UBOT"
