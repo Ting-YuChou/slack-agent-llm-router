@@ -87,6 +87,10 @@ DEFAULT_ROLLING_POLICY_CONFIG = {
 }
 
 
+# Event timestamps before 2000-01-01 are sequence numbers, not wall clock.
+_MIN_WALL_CLOCK_MS = 946_684_800_000
+
+
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
@@ -1400,11 +1404,20 @@ def build_routing_policy_state_event_from_aggregate(
             query_type_counts.items(), key=lambda item: (-item[1], item[0])
         )
     }
+    # emitted_at is when Flink emitted the state; latest_event_at is the
+    # newest completion it covers, which a replay leaves unchanged.
+    latest_event_ms = _safe_int(aggregate.get("latest_event_timestamp_ms"), -1)
+    latest_event_at = (
+        _isoformat(datetime.fromtimestamp(latest_event_ms / 1000.0, tz=timezone.utc))
+        if latest_event_ms >= _MIN_WALL_CLOCK_MS
+        else None
+    )
 
     return {
         "event_type": ROUTING_POLICY_STATE_EVENT,
         "event_version": EVENT_SCHEMA_VERSION,
         "emitted_at": _isoformat(timestamp),
+        "latest_event_at": latest_event_at,
         "scope_type": scope_type,
         "scope_key": scope_key,
         "user_id": user_id,

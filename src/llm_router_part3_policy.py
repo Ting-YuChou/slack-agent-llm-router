@@ -11,8 +11,10 @@ This layer keeps Kafka and Flink off the synchronous API path:
 import asyncio
 import json
 import logging
+import math
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from aiokafka import AIOKafkaConsumer
@@ -43,6 +45,69 @@ POLICY_CACHE_RECOVERY = Counter(
     "Routing policy cache Redis recovery attempts",
     ["outcome"],
 )
+POLICY_CACHE_STALE_WRITES = Counter(
+    "llm_router_policy_cache_stale_writes_total",
+    "Policy events not written: past their TTL, or older than the stored record",
+    ["namespace", "reason"],
+)
+
+# Compare-and-set on event time (A6). KEYS[1] is the record, KEYS[2] an
+# optional index set; ARGV is the payload, its TTL in seconds, its event time
+# in ms and the index member. A stored record with a later event_time_ms wins;
+# records without one (written before A6) are overwritten.
+CAS_SET_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+if current then
+  local ok, decoded = pcall(cjson.decode, current)
+  if ok and type(decoded) == 'table' then
+    local stored = tonumber(decoded['event_time_ms'])
+    if stored and stored > tonumber(ARGV[3]) then
+      return 0
+    end
+  end
+end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+if #KEYS > 1 then
+  redis.call('SADD', KEYS[2], ARGV[4])
+end
+return 1
+"""
+
+# Event times before 2000-01-01 are counters or defaults, not wall clock.
+_MIN_EVENT_TIME_MS = 946_684_800_000
+
+
+def _parse_event_time_ms(value: Any) -> Optional[int]:
+    """Epoch milliseconds from an epoch-ms number or an ISO-8601 string."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            return None
+        millis = int(value)
+    elif isinstance(value, str) and value.strip():
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        millis = int(parsed.timestamp() * 1000)
+    else:
+        return None
+    return millis if millis >= _MIN_EVENT_TIME_MS else None
+
+
+def policy_event_time_ms(event: Dict[str, Any], *fields: str) -> Optional[int]:
+    """The first usable event time among fields, in epoch milliseconds."""
+    for field in fields:
+        millis = _parse_event_time_ms(event.get(field))
+        if millis is not None:
+            return millis
+    return None
 
 
 class PolicyCacheUnavailableError(RuntimeError):
@@ -100,6 +165,7 @@ class RoutingPolicyCache:
         self._last_redis_error: Optional[str] = None
         self._recovery_lock = asyncio.Lock()
         self._time_func = time.monotonic
+        self._wall_time_func = time.time
         self._local_guardrail_index: Dict[str, set[str]] = {
             "model": set(),
             "provider": set(),
@@ -437,16 +503,96 @@ class RoutingPolicyCache:
             )
         return records, members
 
-    async def _set_json(self, cache_key: str, value: Dict[str, Any], ttl_seconds: int):
+    def _remaining_ttl_seconds(
+        self, ttl_seconds: int, event_time_ms: Optional[int]
+    ) -> int:
+        """The configured TTL less the event's age; <= 0 means already expired."""
+        if event_time_ms is None:
+            return ttl_seconds
+        age_seconds = max(0.0, self._wall_time_func() - event_time_ms / 1000.0)
+        return min(ttl_seconds, int(math.ceil(ttl_seconds - age_seconds)))
+
+    @staticmethod
+    def _namespace_of(cache_key: str, key_prefix: str) -> str:
+        remainder = cache_key[len(key_prefix) + 1 :]
+        return remainder.split(":", 1)[0] or "unknown"
+
+    async def _compare_and_set(
+        self,
+        cache_key: str,
+        value: Dict[str, Any],
+        ttl_seconds: int,
+        event_time_ms: int,
+        index_key: Optional[str] = None,
+        index_member: str = "",
+    ) -> bool:
+        """Write value unless Redis holds a record with a later event time."""
+        keys = [cache_key] + ([index_key] if index_key else [])
+        written = await self._run_redis_operation(
+            self.redis_client.eval(
+                CAS_SET_SCRIPT,
+                len(keys),
+                *keys,
+                json.dumps(value),
+                str(ttl_seconds),
+                str(event_time_ms),
+                index_member,
+            )
+        )
+        if int(written or 0) != 1:
+            POLICY_CACHE_STALE_WRITES.labels(
+                namespace=self._namespace_of(cache_key, self.key_prefix),
+                reason="older",
+            ).inc()
+            logger.debug(
+                "Skipped policy write for %s: a newer record is stored", cache_key
+            )
+            return False
+        return True
+
+    def _record_expired(self, cache_key: str) -> None:
+        POLICY_CACHE_STALE_WRITES.labels(
+            namespace=self._namespace_of(cache_key, self.key_prefix),
+            reason="expired",
+        ).inc()
+        logger.debug(
+            "Skipped policy write for %s: the event outlived its TTL", cache_key
+        )
+
+    async def _set_json(
+        self,
+        cache_key: str,
+        value: Dict[str, Any],
+        ttl_seconds: int,
+        event_time_ms: Optional[int] = None,
+    ):
+        """Write a policy record.
+
+        On Redis, an event time shortens the TTL by the event's age, drops an
+        expired event and never overwrites a record with a later event time
+        (A6). The L1-only path keeps the configured TTL.
+        """
         if not self._redis_enabled():
             self._local_set(cache_key, value, ttl_seconds)
             return
 
+        if event_time_ms is not None:
+            ttl_seconds = self._remaining_ttl_seconds(ttl_seconds, event_time_ms)
+            if ttl_seconds <= 0:
+                self._record_expired(cache_key)
+                return
+            value = {**value, "event_time_ms": event_time_ms}
+
         await self._require_redis()
         try:
-            await self._run_redis_operation(
-                self.redis_client.setex(cache_key, ttl_seconds, json.dumps(value))
-            )
+            if event_time_ms is None:
+                await self._run_redis_operation(
+                    self.redis_client.setex(cache_key, ttl_seconds, json.dumps(value))
+                )
+            elif not await self._compare_and_set(
+                cache_key, value, ttl_seconds, event_time_ms
+            ):
+                return
         except Exception as e:
             self._mark_redis_failure("write", e)
             logger.warning(f"Failed to write routing policy cache key {cache_key}: {e}")
@@ -604,6 +750,7 @@ class RoutingPolicyCache:
                 self._cache_key("request", request_id),
                 request_policy,
                 self.request_ttl_seconds,
+                event_time_ms=policy_event_time_ms(event, "emitted_at"),
             )
 
         # Request enrichment is late relative to the synchronous API path. Keep it
@@ -669,6 +816,7 @@ class RoutingPolicyCache:
                 self._cache_key("request", request_id),
                 request_policy,
                 self.request_ttl_seconds,
+                event_time_ms=policy_event_time_ms(event, "emitted_at"),
             )
 
         # Fast-lane hints are observability/request evidence. User or session
@@ -726,10 +874,13 @@ class RoutingPolicyCache:
         if scope_type == "user":
             cache_key = self._user_state_cache_key(scope_key)
             ttl_seconds = self.user_ttl_seconds
+        # Flink stamps emitted_at when it emits, so a replayed window looks
+        # new; latest_event_at is the newest completion the state covers.
         await self._set_json(
             cache_key,
             payload,
             ttl_seconds,
+            event_time_ms=policy_event_time_ms(event, "latest_event_at", "emitted_at"),
         )
 
     async def materialize_routing_guardrail(self, event: Dict[str, Any]):
@@ -766,14 +917,32 @@ class RoutingPolicyCache:
 
         cache_key = self._guardrail_cache_key(scope_type, scope_key)
         index_key = self._guardrail_index_key(scope_type)
+        # The window's end is when the guardrail's evidence is from.
+        event_time_ms = policy_event_time_ms(event, "window_end_ms", "emitted_at")
+        ttl_seconds = self._remaining_ttl_seconds(
+            self.guardrail_ttl_seconds, event_time_ms
+        )
+        if ttl_seconds <= 0:
+            self._record_expired(cache_key)
+            return
+        if event_time_ms is not None:
+            payload["event_time_ms"] = event_time_ms
         await self._require_redis()
         try:
-            transaction = self.redis_client.pipeline(transaction=True)
-            transaction.setex(
-                cache_key, self.guardrail_ttl_seconds, json.dumps(payload)
-            )
-            transaction.sadd(index_key, scope_key)
-            await self._run_redis_operation(transaction.execute())
+            if event_time_ms is None:
+                transaction = self.redis_client.pipeline(transaction=True)
+                transaction.setex(cache_key, ttl_seconds, json.dumps(payload))
+                transaction.sadd(index_key, scope_key)
+                await self._run_redis_operation(transaction.execute())
+            elif not await self._compare_and_set(
+                cache_key,
+                payload,
+                ttl_seconds,
+                event_time_ms,
+                index_key=index_key,
+                index_member=scope_key,
+            ):
+                return
         except Exception as e:
             self._mark_redis_failure("write", e)
             logger.warning(
@@ -781,7 +950,7 @@ class RoutingPolicyCache:
             )
             raise
 
-        self._local_set(cache_key, payload, self.guardrail_ttl_seconds)
+        self._local_set(cache_key, payload, ttl_seconds)
 
     async def get_active_guardrails(self) -> Dict[str, Any]:
         """Return active model/provider guardrails for router candidate filtering."""
