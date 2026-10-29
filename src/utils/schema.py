@@ -382,6 +382,10 @@ class ModelConfig(BaseModel):
     # None keeps the name rule (gpt-5* uses minimal and high, others send none).
     reasoning_effort: Optional[ReasoningEffort] = None
     reasoning_effort_high: Optional[ReasoningEffort] = None
+    # Output tokens added on top of the caller's max_tokens when the effort is
+    # above low, so reasoning does not eat the visible answer's budget. None
+    # keeps the name rule (4096 for gpt-5*, 0 otherwise).
+    reasoning_output_headroom_tokens: Optional[int] = Field(None, ge=0)
     # Whether the provider accepts a temperature. None keeps the name rule
     # (gpt-5* reasoning models only use their default sampling).
     supports_temperature: Optional[bool] = None

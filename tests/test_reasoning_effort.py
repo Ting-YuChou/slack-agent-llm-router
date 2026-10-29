@@ -66,12 +66,17 @@ def _kwargs(provider, request, model_name="gpt-5", decision=None):
 @pytest.mark.parametrize(
     "decision",
     [
-        _decision(requires_high_reasoning=True),
-        _decision(query_complexity="complex"),
         _decision(query_type=QueryType.REASONING),
         _decision(query_type=QueryType.MATH),
+        _decision(
+            query_type=QueryType.ANALYSIS,
+            query_complexity="complex",
+            requires_high_reasoning=True,
+        ),
+        _decision(query_type=QueryType.PLANNING, query_complexity="complex"),
+        _decision(query_type=QueryType.CODE_ANALYSIS, query_complexity="complex"),
     ],
-    ids=["requires_high_reasoning", "complex", "reasoning", "math"],
+    ids=["reasoning", "math", "analysis-complex", "planning-complex", "code-complex"],
 )
 def test_complex_reasoning_query_uses_high_effort_on_gpt5(decision):
     provider = OpenAIProvider({"api_key": "test-key"})
@@ -88,15 +93,139 @@ def test_complex_reasoning_query_uses_high_effort_on_gpt5(decision):
         None,
         _decision(),
         _decision(query_type=QueryType.CODE_GENERATION, query_complexity="simple"),
+        # requires_high_reasoning is set for every analysis query, and caller
+        # metadata can set it, so on its own it does not raise the effort.
+        _decision(requires_high_reasoning=True),
+        _decision(query_type=QueryType.ANALYSIS, requires_high_reasoning=True),
+        # A long thread makes any query complex; that alone is not reasoning.
+        _decision(query_complexity="complex", requires_high_reasoning=True),
+        _decision(query_type=QueryType.SUMMARIZATION, query_complexity="complex"),
     ],
-    ids=["no-routing", "general", "code-simple"],
+    ids=[
+        "no-routing",
+        "general",
+        "code-simple",
+        "flag-only",
+        "analysis-not-complex",
+        "general-complex",
+        "summary-complex",
+    ],
 )
 def test_general_query_keeps_minimal_effort_on_gpt5(decision):
     provider = OpenAIProvider({"api_key": "test-key"})
+    request = _request()
 
-    kwargs = _kwargs(provider, _request(), decision=decision)
+    kwargs = _kwargs(provider, request, decision=decision)
 
     assert kwargs["reasoning"] == {"effort": "minimal"}
+    assert kwargs["max_output_tokens"] == request.max_tokens
+
+
+def test_mock_decision_features_are_ignored():
+    request = _request()
+    decision = MagicMock()
+    decision.query_type = QueryType.GENERAL
+
+    remember_routing_features(request, decision)
+
+    assert request._routing_features is None
+    kwargs = OpenAIProvider({"api_key": "test-key"})._build_response_request_kwargs(
+        request, "gpt-5", "Prompt"
+    )
+    assert kwargs["reasoning"] == {"effort": "minimal"}
+
+
+@pytest.mark.asyncio
+async def test_caller_metadata_cannot_force_high_effort(router_config):
+    from src.llm_router_part1_router import ModelRouter
+
+    router = ModelRouter(router_config)
+    router.classifier.classify_query = lambda _query: (QueryType.GENERAL, 0.9)
+    request = QueryRequest(
+        query="What time zone is Taipei in?",
+        user_id="user-123",
+        user_tier=UserTier.ENTERPRISE,
+        metadata={"requires_high_reasoning": True},
+    )
+
+    decision = await router.route_query(request)
+    # The router still honours the caller's flag for model choice.
+    assert decision.features.requires_high_reasoning is True
+    remember_routing_features(request, decision)
+    kwargs = OpenAIProvider({"api_key": "test-key"})._build_response_request_kwargs(
+        request, "gpt-5", "Prompt"
+    )
+
+    assert kwargs["reasoning"] == {"effort": "minimal"}
+
+
+def test_high_effort_adds_reasoning_headroom_to_output_budget():
+    provider = OpenAIProvider({"api_key": "test-key"})
+    request = _request()
+
+    kwargs = _kwargs(provider, request, decision=_decision(query_type=QueryType.MATH))
+
+    assert kwargs["reasoning"] == {"effort": "high"}
+    assert kwargs["max_output_tokens"] == request.max_tokens + 4096
+
+
+@pytest.mark.parametrize(
+    ("overrides", "query_type", "expected_extra"),
+    [
+        ({"reasoning_output_headroom_tokens": 1000}, QueryType.MATH, 1000),
+        ({"reasoning_output_headroom_tokens": 0}, QueryType.MATH, 0),
+        ({"reasoning_effort_high": "low"}, QueryType.MATH, 0),
+        ({"reasoning_effort": "medium"}, QueryType.GENERAL, 4096),
+    ],
+    ids=["configured", "disabled", "low-effort", "medium-default"],
+)
+def test_reasoning_headroom_follows_model_config(overrides, query_type, expected_extra):
+    provider = OpenAIProvider(
+        {"api_key": "test-key"}, model_configs={"gpt-5": _model("gpt-5", **overrides)}
+    )
+    request = _request()
+
+    kwargs = _kwargs(provider, request, decision=_decision(query_type=query_type))
+
+    assert kwargs["max_output_tokens"] == request.max_tokens + expected_extra
+
+
+def test_reasoning_headroom_stays_within_model_output_limit():
+    provider = OpenAIProvider(
+        {"api_key": "test-key"},
+        model_configs={
+            "gpt-5": SimpleNamespace(
+                reasoning_effort=None,
+                reasoning_effort_high=None,
+                reasoning_output_headroom_tokens=None,
+                supports_temperature=None,
+                max_output_tokens=1000,
+            )
+        },
+    )
+
+    kwargs = _kwargs(
+        provider, _request(), decision=_decision(query_type=QueryType.MATH)
+    )
+
+    assert kwargs["max_output_tokens"] == 1000
+
+
+def test_response_cache_key_separates_high_and_default_effort():
+    from src.llm_router_part2_inference import ResponseCache
+
+    cache = ResponseCache({"enabled": True})
+    general_a, general_b, math = _request(), _request(), _request()
+    remember_routing_features(general_a, _decision())
+    remember_routing_features(general_b, _decision(query_complexity="simple"))
+    remember_routing_features(math, _decision(query_type=QueryType.MATH))
+
+    assert cache.generate_cache_key(general_a, "gpt-5") == cache.generate_cache_key(
+        general_b, "gpt-5"
+    )
+    assert cache.generate_cache_key(general_a, "gpt-5") != cache.generate_cache_key(
+        math, "gpt-5"
+    )
 
 
 def test_model_without_reasoning_support_gets_no_reasoning_kwarg():
@@ -165,7 +294,7 @@ def test_high_effort_falls_back_to_configured_default_effort():
         provider,
         _request(),
         model_name="o-custom",
-        decision=_decision(requires_high_reasoning=True),
+        decision=_decision(query_type=QueryType.REASONING),
     )
 
     assert kwargs["reasoning"] == {"effort": "medium"}
@@ -189,6 +318,7 @@ def test_config_files_set_gpt5_efforts():
         gpt5 = ModelConfig(name="gpt-5", **models["gpt-5"])
         assert gpt5.reasoning_effort == "minimal", path
         assert gpt5.reasoning_effort_high == "high", path
+        assert gpt5.reasoning_output_headroom_tokens == 4096, path
 
 
 @pytest.mark.asyncio
@@ -251,10 +381,11 @@ async def _run_process_query(decision):
 @pytest.mark.asyncio
 async def test_process_query_passes_routing_features_to_the_provider():
     response, kwargs, event_producer = await _run_process_query(
-        _decision(requires_high_reasoning=True)
+        _decision(query_type=QueryType.ANALYSIS, query_complexity="complex")
     )
 
     assert kwargs["reasoning"] == {"effort": "high"}
+    assert kwargs["max_output_tokens"] == _request().max_tokens + 4096
     assert response.reasoning_effort == "high"
     event = build_inference_completed_event(
         *event_producer.produce_inference_completed.await_args.args

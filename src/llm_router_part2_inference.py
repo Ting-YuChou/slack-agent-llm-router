@@ -49,6 +49,7 @@ from src.utils.schema import (
     InferenceResponse,
     QueryType,
     RagPolicy,
+    RoutingDecisionFeatures,
     ToolCall,
     ToolPolicy,
 )
@@ -1045,6 +1046,11 @@ class ResponseCache:
             "metadata": self._cacheable_metadata(request.metadata or {}),
             "attachments": attachment_signatures,
             "rag_images": rag_image_signatures,
+            # Which reasoning effort level the provider gets, so an answer
+            # made with the default effort is not served for a high one.
+            "reasoning_effort_level": (
+                "high" if _routed_as_complex_reasoning(request) else "default"
+            ),
         }
         if self.scope != "shared":
             key_payload["user_id"] = request.user_id
@@ -1078,40 +1084,53 @@ def _provider_http_timeout(read_seconds: float) -> httpx.Timeout:
     return httpx.Timeout(connect=3.0, read=read_seconds, write=10.0, pool=2.0)
 
 
-# Query types that get a model's high reasoning effort on their own. The other
-# types the router's features count as high reasoning (analysis, planning,
-# code_analysis) get it through requires_high_reasoning, set by the policy.
+# Query types that get a model's high reasoning effort on their own.
 _HIGH_EFFORT_QUERY_TYPES = frozenset({"reasoning", "math"})
+# Query types that get it only when the router also scored the request
+# complex. The router's requires_high_reasoning feature is not read: it is set
+# for every query of these types and callers can set it through metadata.
+_HIGH_EFFORT_WHEN_COMPLEX_QUERY_TYPES = frozenset(
+    {"analysis", "planning", "code_analysis"}
+)
+# Efforts whose reasoning fits in the caller's output budget; higher ones get
+# extra output tokens (headroom) so reasoning does not crowd out the answer.
+_LIGHT_REASONING_EFFORTS = frozenset({"none", "minimal", "low"})
+_DEFAULT_REASONING_OUTPUT_HEADROOM_TOKENS = 4096
 
 
 def remember_routing_features(request: QueryRequest, routing_decision: Any) -> None:
     """Keep the routing decision's features and query type on the request.
 
-    Decisions without features (test doubles, older callers) leave the
+    Decisions without real features (test doubles, older callers) leave the
     features unset, so providers use their default settings.
     """
     query_type = getattr(routing_decision, "query_type", None)
     query_type = getattr(query_type, "value", query_type)
-    request._routing_features = getattr(routing_decision, "features", None)
+    features = getattr(routing_decision, "features", None)
+    request._routing_features = (
+        features if isinstance(features, RoutingDecisionFeatures) else None
+    )
     request._routing_query_type = (
         str(query_type).lower() if isinstance(query_type, str) else None
     )
 
 
 def _routed_as_complex_reasoning(request: QueryRequest) -> bool:
-    """Whether the router read the request as needing deep reasoning.
+    """Whether the router's own classification calls for deep reasoning.
 
-    Matches the router's own test for reasoning-heavy candidates: the
-    requires_high_reasoning feature or a complex query, plus the reasoning and
-    math query types.
+    Uses only what the router derived from the request (query type and
+    complexity score), never caller-supplied metadata: reasoning and math
+    queries, and analysis, planning or code_analysis queries scored complex.
     """
-    features = getattr(request, "_routing_features", None)
-    if features is not None and (
-        bool(getattr(features, "requires_high_reasoning", False))
-        or getattr(features, "query_complexity", None) == "complex"
-    ):
+    query_type = getattr(request, "_routing_query_type", None)
+    if query_type in _HIGH_EFFORT_QUERY_TYPES:
         return True
-    return getattr(request, "_routing_query_type", None) in _HIGH_EFFORT_QUERY_TYPES
+    features = getattr(request, "_routing_features", None)
+    return (
+        query_type in _HIGH_EFFORT_WHEN_COMPLEX_QUERY_TYPES
+        and isinstance(features, RoutingDecisionFeatures)
+        and features.query_complexity == "complex"
+    )
 
 
 class BaseInferenceProvider(ABC):
@@ -1442,6 +1461,9 @@ class OpenAIProvider(BaseInferenceProvider):
         reasoning_effort = self._reasoning_effort(request, model_name)
         if reasoning_effort:
             request_kwargs["reasoning"] = {"effort": reasoning_effort}
+            request_kwargs["max_output_tokens"] = self._reasoning_output_budget(
+                request.max_tokens, model_name, reasoning_effort
+            )
         if self._supports_temperature(model_name):
             request_kwargs["temperature"] = request.temperature
 
@@ -1489,6 +1511,31 @@ class OpenAIProvider(BaseInferenceProvider):
             "high" if name_rule else None
         )
         return high_effort or default_effort
+
+    def _reasoning_output_budget(
+        self, answer_tokens: int, model_name: str, reasoning_effort: str
+    ) -> int:
+        """max_output_tokens for a reasoning call: the answer plus headroom.
+
+        Reasoning tokens count against max_output_tokens, so efforts above low
+        get the model's headroom on top of the caller's answer budget, capped
+        at the model's output limit when one is configured.
+        """
+        if reasoning_effort in _LIGHT_REASONING_EFFORTS:
+            return answer_tokens
+        model_config = self.model_configs.get(model_name)
+        headroom = getattr(model_config, "reasoning_output_headroom_tokens", None)
+        if headroom is None:
+            headroom = (
+                _DEFAULT_REASONING_OUTPUT_HEADROOM_TOKENS
+                if self._supports_reasoning_effort(model_name)
+                else 0
+            )
+        budget = answer_tokens + max(0, int(headroom))
+        output_limit = getattr(model_config, "max_output_tokens", None)
+        if isinstance(output_limit, int) and output_limit > 0:
+            budget = min(budget, max(output_limit, answer_tokens))
+        return budget
 
     def _build_prompt_cache_key(self, request: QueryRequest) -> Optional[str]:
         """Build a stable, non-PII key that helps OpenAI route similar prompts."""
