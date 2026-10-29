@@ -1036,9 +1036,28 @@ class ResponseCache:
         }
 
 
+class RequestStageDeadlineError(Exception):
+    """The request deadline passed in a step before any model was called.
+
+    Retrieval or web search used up the time, so no model or provider is to
+    blame: the attributes keep it out of provider health and map it to 504.
+    """
+
+    error_type = "internal"
+    error_code = "timeout"
+    http_status = 504
+
+
+def _provider_http_timeout(read_seconds: float) -> httpx.Timeout:
+    """Fail fast on connect and pool waits; allow the provider timeout per read."""
+    return httpx.Timeout(connect=3.0, read=read_seconds, write=10.0, pool=2.0)
+
+
 class BaseInferenceProvider(ABC):
     """Abstract base class for inference providers"""
 
+    # Provider timeout when the config sets none (a dumped config holds None).
+    DEFAULT_TIMEOUT_SECONDS = 60.0
     ATTACHMENT_PROMPT_CHAR_LIMIT = 12_000
     ATTACHMENT_PREVIEW_CHAR_LIMIT = 4_000
     TEXT_MIME_MARKERS = (
@@ -1055,6 +1074,13 @@ class BaseInferenceProvider(ABC):
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.client = None
+
+    def timeout_seconds(self) -> float:
+        """Longest a single provider call may take, in seconds."""
+        value = self.config.get("timeout") if isinstance(self.config, dict) else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            return float(self.DEFAULT_TIMEOUT_SECONDS)
+        return float(value)
 
     @abstractmethod
     async def initialize(self):
@@ -1231,7 +1257,7 @@ class OpenAIProvider(BaseInferenceProvider):
         self.client = openai.AsyncOpenAI(
             api_key=api_key,
             base_url=self.config.get("base_url", "https://api.openai.com/v1"),
-            timeout=self.config.get("timeout", 60),
+            timeout=_provider_http_timeout(self.timeout_seconds()),
             max_retries=0,
         )
         logger.info("OpenAI provider initialized")
@@ -1463,7 +1489,7 @@ class AnthropicProvider(BaseInferenceProvider):
         self.client = anthropic.AsyncAnthropic(
             api_key=api_key,
             base_url=self.config.get("base_url", "https://api.anthropic.com"),
-            timeout=self.config.get("timeout", 60),
+            timeout=_provider_http_timeout(self.timeout_seconds()),
             max_retries=0,
         )
         logger.info("Anthropic provider initialized")
@@ -1661,6 +1687,8 @@ class AnthropicProvider(BaseInferenceProvider):
 class vLLMProvider(BaseInferenceProvider):
     """vLLM self-hosted provider implementation"""
 
+    DEFAULT_TIMEOUT_SECONDS = 300.0  # Local inference may take longer.
+
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
         self.endpoints = self._build_endpoint_states(config)
@@ -1695,11 +1723,18 @@ class vLLMProvider(BaseInferenceProvider):
                 endpoint.last_error = "Endpoint disabled"
                 continue
 
+            # Connect fast, but let requests wait for a pooled connection and
+            # send their body as long as they may wait for a reply: one
+            # endpoint serves many concurrent generations.
+            timeout_seconds = self.timeout_seconds()
             endpoint.client = httpx.AsyncClient(
                 base_url=endpoint.base_url,
-                timeout=self.config.get(
-                    "timeout", 300
-                ),  # Longer timeout for local inference
+                timeout=httpx.Timeout(
+                    connect=3.0,
+                    read=timeout_seconds,
+                    write=timeout_seconds,
+                    pool=timeout_seconds,
+                ),
             )
             if self.http_client is None:
                 self.http_client = endpoint.client
@@ -2597,6 +2632,9 @@ class InferenceEngine:
                 "cost_usd": 0.0,
                 "latency_ms": int((time.time() - lookup_started_at) * 1000),
                 "timestamp": datetime.now(timezone.utc),
+                # The fallback that produced the cached answer is history.
+                "fallback_from_model": None,
+                "attempts": 0,
             }
         )
 
@@ -2613,6 +2651,13 @@ class InferenceEngine:
 
         # Log with the caller's request id so logs join the analytics events.
         request_id = request.request_id
+        # One deadline for the whole request: time spent on retrieval comes out
+        # of the model calls' share instead of extending the request.
+        execution_budget = (
+            self.scheduler.create_execution_budget()
+            if "scheduler" in self.config
+            else None
+        )
 
         try:
             # Step 1: Route query to appropriate model
@@ -2623,7 +2668,11 @@ class InferenceEngine:
             compressed_context = await self._compress_request_context_if_needed(request)
 
             # Step 3: Optionally enrich school-document requests with RAG context.
-            rag_result = await self._run_rag_if_needed(request, routing_decision)
+            rag_result = await self._within_request_deadline(
+                self._run_rag_if_needed(request, routing_decision),
+                execution_budget,
+                stage="rag",
+            )
             if rag_result and rag_result.required_no_hits:
                 response = self._build_required_rag_no_hit_response(
                     request,
@@ -2645,9 +2694,10 @@ class InferenceEngine:
             model_name = routing_decision.selected_model
 
             # Step 4: Optionally enrich current-info requests with web search.
-            web_search_result = await self._run_web_search_if_needed(
-                request,
-                routing_decision,
+            web_search_result = await self._within_request_deadline(
+                self._run_web_search_if_needed(request, routing_decision),
+                execution_budget,
+                stage="web_search",
             )
 
             # Step 5: Check full-response cache.
@@ -2669,11 +2719,7 @@ class InferenceEngine:
             ) = await self._generate_response_with_fallback(
                 request,
                 routing_decision,
-                execution_budget=(
-                    self.scheduler.create_execution_budget()
-                    if "scheduler" in self.config
-                    else None
-                ),
+                execution_budget=execution_budget,
             )
             response.compressed_context = compressed_context
             self._attach_rag_result(response, rag_result)
@@ -2716,11 +2762,14 @@ class InferenceEngine:
                     error_type=type(exc).__name__,
                 ).inc()
 
-            # Update router stats; a retrieval outage is not the model's fault.
+            # Update router stats; a retrieval outage or a deadline spent
+            # before any model call is not the model's fault.
             if (
                 "routing_decision" in locals()
                 and not getattr(exc, "_attempt_recorded", False)
-                and not isinstance(exc, RetrievalUnavailableError)
+                and not isinstance(
+                    exc, (RetrievalUnavailableError, RequestStageDeadlineError)
+                )
             ):
                 self.router.update_model_stats(
                     model_name=routing_decision.selected_model,
@@ -3426,6 +3475,29 @@ class InferenceEngine:
         provider_name = model_info["config"]["provider"]
         return self.providers.get(provider_name)
 
+    async def _within_request_deadline(
+        self,
+        awaitable: Awaitable[Any],
+        execution_budget: Optional[RequestExecutionBudget],
+        stage: str,
+    ) -> Any:
+        """Await a step before the model call, at most until the request deadline.
+
+        Raises RequestStageDeadlineError when the deadline cuts the step off.
+        """
+        if execution_budget is None:
+            return await awaitable
+        try:
+            return await asyncio.wait_for(
+                awaitable, timeout=execution_budget.remaining_seconds
+            )
+        except asyncio.TimeoutError as exc:
+            if execution_budget.remaining_seconds > 0.01:
+                raise  # The step's own timeout, not the request deadline.
+            raise RequestStageDeadlineError(
+                f"request deadline reached during {stage}"
+            ) from exc
+
     async def _generate_response_with_fallback(
         self,
         request: QueryRequest,
@@ -3474,136 +3546,123 @@ class InferenceEngine:
     ) -> Tuple[InferenceResponse, str, Any]:
         primary_model = routing_decision.selected_model
         primary_started_at = time.time()
+        # With a shared budget, a primary that has a fallback holds back part
+        # of the time and one attempt for it.
+        fallback_reserve_seconds = 0.0
+        reserve_attempts = 0
+        if execution_budget is not None and self._primary_has_fallback_route(
+            request, routing_decision
+        ):
+            fallback_reserve_seconds = execution_budget.fallback_reserve_seconds()
+            reserve_attempts = 1
+        started_calls: List[str] = []
 
         try:
             response = await self._execute_model_request(
-                request, primary_model, execution_budget=execution_budget
+                request,
+                primary_model,
+                execution_budget=execution_budget,
+                fallback_reserve_seconds=fallback_reserve_seconds,
+                reserve_attempts=reserve_attempts,
+                started_calls=started_calls,
             )
             return response, primary_model, routing_decision
         except AdmissionRejectedError as exc:
             primary_failures.append(exc)
             if not self.scheduler.allow_fallback_for_rejection(exc.decision):
                 raise
-            fallback_models = self._get_local_fallback_models(
+            # A circuit or capacity rejection: the model is unavailable.
+            return await self._run_fallback_models(
                 request,
                 routing_decision,
-                exclude_models=[primary_model],
+                execution_budget,
+                exc,
+                cross_provider=True,
+                started_calls=started_calls,
             )
-            if not fallback_models:
-                if getattr(request, "_rag_images", []):
-                    return await self._execute_text_only_after_vision_failure(
-                        request, routing_decision, execution_budget
-                    )
-                raise
-            logger.warning(
-                "Primary model %s was rejected by provider scheduler (%s); "
-                "attempting local fallback candidates %s",
-                primary_model,
-                exc.decision.reason,
-                fallback_models,
-            )
-            last_exception: Exception = exc
-            for fallback_model in fallback_models:
-                fallback_started_at = time.time()
-                response = await self._get_cached_inference_response(
-                    request,
-                    fallback_model,
-                )
-                if response:
-                    return (
-                        response,
-                        fallback_model,
-                        self._build_fallback_routing_decision(
-                            routing_decision,
-                            original_model=primary_model,
-                            fallback_model=fallback_model,
-                            from_cache=True,
-                        ),
-                    )
-                try:
-                    response = await self._execute_model_request(
-                        request, fallback_model, execution_budget=execution_budget
-                    )
-                    return (
-                        response,
-                        fallback_model,
-                        self._build_fallback_routing_decision(
-                            routing_decision,
-                            original_model=primary_model,
-                            fallback_model=fallback_model,
-                        ),
-                    )
-                except AdmissionRejectedError as fallback_rejection:
-                    if not self.scheduler.allow_fallback_for_rejection(
-                        fallback_rejection.decision
-                    ):
-                        raise
-                    last_exception = fallback_rejection
-                except Exception as fallback_exc:
-                    self._record_failed_attempt(
-                        fallback_model,
-                        fallback_exc,
-                        fallback_started_at,
-                    )
-                    last_exception = fallback_exc
-            if getattr(request, "_rag_images", []):
-                return await self._execute_text_only_after_vision_failure(
-                    request, routing_decision, execution_budget
-                )
-            raise last_exception
         except Exception as exc:
             primary_failures.append(exc)
             self._record_failed_attempt(primary_model, exc, primary_started_at)
-            fallback_models = self._get_local_fallback_models(
+            return await self._run_fallback_models(
                 request,
                 routing_decision,
-                exclude_models=[primary_model],
+                execution_budget,
+                exc,
+                cross_provider=self.scheduler.is_availability_failure(exc),
+                started_calls=started_calls,
             )
 
-            if not fallback_models:
-                if getattr(request, "_rag_images", []):
-                    return await self._execute_text_only_after_vision_failure(
-                        request, routing_decision, execution_budget
-                    )
-                raise
+    async def _run_fallback_models(
+        self,
+        request: QueryRequest,
+        routing_decision: Any,
+        execution_budget: Optional[RequestExecutionBudget],
+        primary_exc: Exception,
+        *,
+        cross_provider: bool,
+        started_calls: List[str],
+    ) -> Tuple[InferenceResponse, str, Any]:
+        """Try the fallbacks of a failed primary model, in order.
 
-            logger.warning(
-                "Primary model %s failed; attempting local fallback candidates %s",
-                primary_model,
-                fallback_models,
+        The configured chain (any provider) comes first, and only when the
+        primary was unavailable; local candidates keep their own triggers.
+        With no candidate the primary's exception is raised, else the last
+        fallback's. ``started_calls`` lists the models whose provider was
+        called for this request.
+        """
+        primary_model = routing_decision.selected_model
+        policy_context = await self._fallback_policy_context(request)
+        local_models = self._get_local_fallback_models(
+            request,
+            routing_decision,
+            exclude_models=[primary_model],
+            policy_context=policy_context,
+        )
+        chain_models = (
+            self._get_fallback_chain_models(
+                request, routing_decision, policy_context, exclude=[primary_model]
             )
+            if cross_provider and not getattr(request, "_rag_images", [])
+            else []
+        )
+        fallback_models = [
+            *chain_models,
+            *(model for model in local_models if model not in chain_models),
+        ]
 
-            last_exception = exc
-            for fallback_model in fallback_models:
-                fallback_started_at = time.time()
-                response = await self._get_cached_inference_response(
+        if not fallback_models:
+            if getattr(request, "_rag_images", []):
+                return await self._text_only_fallback(
                     request,
-                    fallback_model,
+                    routing_decision,
+                    execution_budget,
+                    started_calls=started_calls,
                 )
-                if response:
-                    return (
-                        response,
-                        fallback_model,
-                        self._build_fallback_routing_decision(
-                            routing_decision,
-                            original_model=primary_model,
-                            fallback_model=fallback_model,
-                            from_cache=True,
-                        ),
-                    )
+            raise primary_exc
 
+        logger.warning(
+            "Primary model %s failed (%s); attempting fallback candidates %s",
+            primary_model,
+            getattr(getattr(primary_exc, "decision", None), "reason", None)
+            or type(primary_exc).__name__,
+            fallback_models,
+        )
+
+        last_exception: Exception = primary_exc
+        for fallback_model in fallback_models:
+            fallback_started_at = time.time()
+            response = await self._get_cached_inference_response(
+                request,
+                fallback_model,
+            )
+            from_cache = bool(response)
+            if not response:
                 try:
                     response = await self._execute_model_request(
-                        request, fallback_model, execution_budget=execution_budget
-                    )
-                    return (
-                        response,
+                        request,
                         fallback_model,
-                        self._build_fallback_routing_decision(
-                            routing_decision,
-                            original_model=primary_model,
-                            fallback_model=fallback_model,
-                        ),
+                        execution_budget=execution_budget,
+                        started_calls=started_calls,
                     )
                 except AdmissionRejectedError as fallback_rejection:
                     if not self.scheduler.allow_fallback_for_rejection(
@@ -3611,19 +3670,142 @@ class InferenceEngine:
                     ):
                         raise
                     last_exception = fallback_rejection
+                    continue
                 except Exception as fallback_exc:
-                    self._record_failed_attempt(
-                        fallback_model,
-                        fallback_exc,
-                        fallback_started_at,
-                    )
+                    if fallback_model in started_calls:
+                        self._record_failed_attempt(
+                            fallback_model,
+                            fallback_exc,
+                            fallback_started_at,
+                        )
+                    else:
+                        # No attempt or time was left to call it: the model
+                        # did not fail, and the primary's failure is on record.
+                        setattr(fallback_exc, "_attempt_recorded", True)
                     last_exception = fallback_exc
+                    continue
+            response.fallback_from_model = primary_model
+            # Only models whose provider was called count: not those rejected
+            # at admission or by an open circuit, nor a fallback cache hit.
+            response.attempts = len(started_calls)
+            return (
+                response,
+                fallback_model,
+                self._build_fallback_routing_decision(
+                    routing_decision,
+                    original_model=primary_model,
+                    fallback_model=fallback_model,
+                    from_cache=from_cache,
+                    fallback_models=fallback_models,
+                ),
+            )
 
-            if getattr(request, "_rag_images", []):
-                return await self._execute_text_only_after_vision_failure(
-                    request, routing_decision, execution_budget
-                )
-            raise last_exception
+        if getattr(request, "_rag_images", []):
+            return await self._text_only_fallback(
+                request,
+                routing_decision,
+                execution_budget,
+                started_calls=started_calls,
+            )
+        raise last_exception
+
+    async def _text_only_fallback(
+        self,
+        request: QueryRequest,
+        routing_decision: Any,
+        execution_budget: Optional[RequestExecutionBudget],
+        *,
+        started_calls: List[str],
+    ) -> Tuple[InferenceResponse, str, Any]:
+        """The text-only retry of a failed vision request, marked as a fallback."""
+        primary_model = routing_decision.selected_model
+        result = await self._execute_text_only_after_vision_failure(
+            request, routing_decision, execution_budget
+        )
+        response, model_name, decision = result
+        response.attempts = len({*started_calls, model_name})
+        response.fallback_from_model = (
+            primary_model if model_name != primary_model else None
+        )
+        return response, model_name, decision
+
+    async def _fallback_policy_context(self, request: QueryRequest) -> Dict[str, Any]:
+        """The router's current guardrail and avoid lists for this request.
+
+        Read when a fallback is needed, so a model blocked since routing (or
+        while the primary was failing) is not picked.
+        """
+        load_policy = getattr(self.router, "_get_policy_context", None)
+        if not callable(load_policy):
+            return {}
+        try:
+            policy = load_policy(request)
+            if hasattr(policy, "__await__"):
+                policy = await policy
+        except Exception:
+            logger.warning(
+                "Routing policy unavailable for fallback selection", exc_info=True
+            )
+            return {}
+        if not isinstance(policy, dict):
+            return {}
+        return {
+            key: list(policy.get(key) or [])
+            for key in (
+                "blocked_models",
+                "blocked_providers",
+                "avoid_models",
+                "avoid_providers",
+            )
+        }
+
+    def _get_fallback_chain_models(
+        self,
+        request: QueryRequest,
+        routing_decision: Any,
+        policy_context: Dict[str, Any],
+        exclude: Sequence[str],
+    ) -> List[str]:
+        """The configured fallback chain for the routed model, filtered like routing.
+
+        Tier, context window and guardrails apply. Capability does not, the
+        same as for routing rules that name their models.
+        """
+        chains = dict((self.config.get("fallback") or {}).get("chains") or {})
+        candidates: List[str] = []
+        for model_name in self._normalize_fallback_model_list(
+            chains.get(routing_decision.selected_model)
+        ):
+            if model_name not in exclude and model_name not in candidates:
+                candidates.append(model_name)
+        if not candidates:
+            return []
+        context = self._build_local_fallback_context(
+            request, routing_decision, policy_context
+        )
+        eligible = set(
+            self.router._filter_models_for_context(
+                candidates, context, check_capability=False
+            )
+        )
+        return [
+            model_name
+            for model_name in candidates
+            if model_name in eligible
+            and self._get_provider_for_model(model_name) is not None
+        ]
+
+    def _tier_allows_model(self, model_name: str, request: QueryRequest) -> bool:
+        """Whether the user's tier may use a model, by the router's access rule."""
+        router = getattr(self, "router", None)
+        models = getattr(router, "models", None)
+        check_access = getattr(router, "_check_user_access", None)
+        if not isinstance(models, dict) or not callable(check_access):
+            return True  # A stub router has no access rules to apply.
+        model_config = models.get(model_name)
+        return model_config is not None and bool(
+            check_access(model_config, request.user_tier)
+        )
 
     async def _execute_text_only_after_vision_failure(
         self,
@@ -3641,11 +3823,25 @@ class InferenceEngine:
             warning,
         ]
         text_fallbacks = list(request.metadata.get("rag_text_fallback_models") or [])
-        model_name = str(
-            request.metadata.get("rag_original_model")
-            or (text_fallbacks[0] if text_fallbacks else None)
-            or routing_decision.selected_model
-        )
+        candidates = [
+            str(name)
+            for name in (
+                request.metadata.get("rag_original_model"),
+                *text_fallbacks,
+                routing_decision.selected_model,
+            )
+            if name
+        ]
+        # Request metadata can come from a caller: run only a model the user's
+        # tier is entitled to.
+        allowed = [
+            name
+            for name in dict.fromkeys(candidates)
+            if self._tier_allows_model(name, request)
+        ]
+        if not allowed:
+            raise ValueError("No text-only model is open to the user's tier")
+        model_name = allowed[0]
         response = await self._execute_model_request(
             request, model_name, execution_budget=execution_budget
         )
@@ -3671,6 +3867,7 @@ class InferenceEngine:
             request,
             routing_decision,
             exclude_models=[failed_model],
+            policy_context=await self._fallback_policy_context(request),
         )
         if candidates:
             fallback_decision = self._build_capability_routing_decision(
@@ -3683,13 +3880,46 @@ class InferenceEngine:
             request, routing_decision, execution_budget=None
         )
 
+    def _primary_has_fallback_route(
+        self, request: QueryRequest, routing_decision: Any
+    ) -> bool:
+        """Whether a failed primary would have a fallback to try."""
+        if getattr(request, "_rag_images", []):
+            # A failed vision call is retried as text only.
+            return True
+        exclude = [routing_decision.selected_model]
+        try:
+            # Guardrails are only read once the primary fails, so a fallback
+            # blocked by them still counts here.
+            return bool(
+                self._get_local_fallback_models(
+                    request, routing_decision, exclude_models=exclude
+                )
+            ) or bool(
+                self._get_fallback_chain_models(
+                    request, routing_decision, {}, exclude=exclude
+                )
+            )
+        except Exception:
+            logger.debug("Fallback route lookup failed", exc_info=True)
+            return False
+
     async def _execute_model_request(
         self,
         request: QueryRequest,
         model_name: str,
         execution_budget: Optional[RequestExecutionBudget] = None,
+        fallback_reserve_seconds: float = 0.0,
+        reserve_attempts: int = 0,
+        started_calls: Optional[List[str]] = None,
     ) -> InferenceResponse:
-        """Execute a request against a specific model."""
+        """Execute a request against a specific model.
+
+        ``fallback_reserve_seconds`` of the request deadline and
+        ``reserve_attempts`` of its shared attempts stay unused by this
+        model's retries, so a fallback can still run. The model is added to
+        ``started_calls`` once its provider is actually called.
+        """
         provider = self._get_provider_for_model(model_name)
         if not provider:
             raise ValueError(f"No provider available for model: {model_name}")
@@ -3700,6 +3930,17 @@ class InferenceEngine:
             or getattr(provider, "provider_name", None)
             or "unknown"
         )
+        attempt_timeout_seconds = (
+            provider.timeout_seconds()
+            if isinstance(provider, BaseInferenceProvider)
+            else None
+        )
+
+        async def call_provider() -> InferenceResponse:
+            if started_calls is not None and model_name not in started_calls:
+                started_calls.append(model_name)
+            return await provider.generate_response(request, model_name)
+
         return await self.single_flight.run(
             request,
             provider,
@@ -3711,8 +3952,11 @@ class InferenceEngine:
                 estimated_input_tokens=self._estimate_provider_admission_input_tokens(
                     request
                 ),
-                operation=lambda: provider.generate_response(request, model_name),
+                operation=call_provider,
                 execution_budget=execution_budget,
+                attempt_timeout_seconds=attempt_timeout_seconds,
+                fallback_reserve_seconds=fallback_reserve_seconds,
+                reserve_attempts=reserve_attempts,
             ),
         )
 
@@ -3780,8 +4024,13 @@ class InferenceEngine:
         request: QueryRequest,
         routing_decision: Any,
         exclude_models: Optional[List[str]] = None,
+        policy_context: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
-        """Return capability-safe fallback candidates for the current request."""
+        """Return capability-safe fallback candidates for the current request.
+
+        ``policy_context`` carries the router's guardrail blocks and avoid
+        lists; candidates they rule out are skipped.
+        """
         selected_model = routing_decision.selected_model
         selected_model_info = self.router.get_model_info(selected_model)
         if not selected_model_info:
@@ -3789,7 +4038,9 @@ class InferenceEngine:
 
         selected_provider = selected_model_info["config"]["provider"].lower()
         exclude = set(exclude_models or [])
-        context = self._build_local_fallback_context(request, routing_decision)
+        context = self._build_local_fallback_context(
+            request, routing_decision, policy_context
+        )
         if getattr(request, "_rag_images", []):
             policy_candidates = request.metadata.get("rag_vision_fallback_models")
             if policy_candidates is not None:
@@ -3798,10 +4049,17 @@ class InferenceEngine:
                     for model_name in policy_candidates
                     if model_name not in exclude
                     and self._get_provider_for_model(model_name) is not None
+                    and not self._ruled_out_by_policy(
+                        model_name, self._configured_provider_name(model_name), context
+                    )
                 ]
             ranked = []
             for model_name, model_config in getattr(self.router, "models", {}).items():
                 if model_name in exclude:
+                    continue
+                if self._ruled_out_by_policy(
+                    model_name, model_config.provider, context
+                ):
                     continue
                 if "vision" not in {
                     capability.lower() for capability in model_config.capabilities
@@ -3833,7 +4091,10 @@ class InferenceEngine:
         return self._rank_local_vllm_fallback_candidates(context, exclude)
 
     def _build_local_fallback_context(
-        self, request: QueryRequest, routing_decision: Any
+        self,
+        request: QueryRequest,
+        routing_decision: Any,
+        policy_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         query_type = getattr(routing_decision, "query_type", QueryType.GENERAL.value)
         if hasattr(query_type, "value"):
@@ -3842,7 +4103,11 @@ class InferenceEngine:
             query_type = str(query_type)
 
         token_count = getattr(routing_decision, "token_count", None)
-        if token_count is None:
+        if token_count is None or (
+            isinstance(token_count, (int, float)) and token_count <= 0
+        ):
+            # A routing error reports 0 tokens; estimate, so the context
+            # window check still means something.
             token_count = self._estimate_provider_admission_input_tokens(request)
 
         context = {
@@ -3854,7 +4119,30 @@ class InferenceEngine:
             "temperature": request.temperature,
             "has_attachments": bool(request.attachments),
         }
+        # Guardrail blocks and avoid lists, keyed as the router's context.
+        for key, values in (policy_context or {}).items():
+            context[key] = list(values or [])
         return context
+
+    @staticmethod
+    def _ruled_out_by_policy(
+        model_name: str, provider_name: Optional[str], context: Dict[str, Any]
+    ) -> bool:
+        """Whether the guardrail blocks or avoid lists in context exclude a model."""
+        blocked_models = {
+            *(context.get("blocked_models") or []),
+            *(context.get("avoid_models") or []),
+        }
+        if model_name in blocked_models:
+            return True
+        blocked_providers = {
+            str(provider).lower()
+            for provider in [
+                *(context.get("blocked_providers") or []),
+                *(context.get("avoid_providers") or []),
+            ]
+        }
+        return bool(provider_name) and str(provider_name).lower() in blocked_providers
 
     def _get_configured_vllm_model_fallbacks(
         self,
@@ -3998,6 +4286,8 @@ class InferenceEngine:
             return False
         if getattr(model_config, "provider", "").lower() != "vllm":
             return False
+        if self._ruled_out_by_policy(model_name, model_config.provider, context):
+            return False
         if context["token_count"] > model_config.max_tokens:
             return False
         if hasattr(self.router, "_has_capability") and not self.router._has_capability(
@@ -4020,26 +4310,27 @@ class InferenceEngine:
         original_model: str,
         fallback_model: str,
         from_cache: bool = False,
+        fallback_models: Optional[Sequence[str]] = None,
     ) -> Any:
         """Attach fallback metadata to the routing decision used for downstream events."""
         suffix = (
             f"{getattr(routing_decision, 'routing_reason', 'Selected model failed')}; "
-            f"local fallback from {original_model} to {fallback_model}"
+            f"fallback from {original_model} to {fallback_model}"
         )
         if from_cache:
             suffix += " (cached)"
+        update: Dict[str, Any] = {
+            "selected_model": fallback_model,
+            "routing_reason": suffix,
+        }
+        if fallback_models is not None:
+            update["fallback_models"] = list(fallback_models)
 
         if hasattr(routing_decision, "model_copy"):
-            return routing_decision.model_copy(
-                update={
-                    "selected_model": fallback_model,
-                    "routing_reason": suffix,
-                }
-            )
+            return routing_decision.model_copy(update=update)
 
         payload = dict(vars(routing_decision))
-        payload["selected_model"] = fallback_model
-        payload["routing_reason"] = suffix
+        payload.update(update)
         return SimpleNamespace(**payload)
 
     async def _publish_inference_completed_event(

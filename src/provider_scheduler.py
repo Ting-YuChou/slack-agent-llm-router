@@ -351,10 +351,29 @@ class RequestExecutionBudget:
     deadline_seconds: float = 60.0
     started_at: float = field(default_factory=time.monotonic)
     attempts_used: int = 0
+    # Share of the time left when model calls start that the primary model
+    # leaves for its fallback route (scheduler.fallback_reserve_ratio).
+    fallback_reserve_ratio: float = 0.0
 
     @property
     def remaining_seconds(self) -> float:
         return max(0.0, self.deadline_seconds - (time.monotonic() - self.started_at))
+
+    def fallback_reserve_seconds(self) -> float:
+        """Seconds to hold back for a fallback, fixed when model calls start."""
+        ratio = min(max(float(self.fallback_reserve_ratio or 0.0), 0.0), 1.0)
+        return self.remaining_seconds * ratio
+
+    def attempt_timeout_seconds(
+        self,
+        provider_timeout_seconds: Optional[float] = None,
+        reserve_seconds: float = 0.0,
+    ) -> float:
+        """Time one provider attempt may take: min(provider timeout, left - reserve)."""
+        window = self.remaining_seconds - max(0.0, reserve_seconds)
+        if provider_timeout_seconds is not None and provider_timeout_seconds > 0:
+            window = min(window, float(provider_timeout_seconds))
+        return max(0.0, window)
 
     def consume_attempt(self) -> bool:
         if self.remaining_seconds <= 0 or self.attempts_used >= self.max_attempts:
@@ -407,6 +426,14 @@ class ProviderCapacityScheduler:
         self.allow_fallback_on_provider_rejection = bool(
             self.config.get("allow_fallback_on_provider_rejection", True)
         )
+        reserve_ratio = self.config.get("fallback_reserve_ratio", 0.3)
+        self.fallback_reserve_ratio = min(
+            max(float(0.3 if reserve_ratio is None else reserve_ratio), 0.0), 0.95
+        )
+        min_window = self.config.get("min_attempt_window_seconds", 1.0)
+        self.min_attempt_window_seconds = max(
+            0.0, float(1.0 if min_window is None else min_window)
+        )
         self.key_prefix = str(self.config.get("key_prefix", "provider_scheduler"))
         self.admission_controller = admission_controller
         self.redis_client = redis_client
@@ -436,6 +463,7 @@ class ProviderCapacityScheduler:
             deadline_seconds=float(
                 self.config.get("request_deadline_seconds", 60) or 60
             ),
+            fallback_reserve_ratio=self.fallback_reserve_ratio,
         )
 
     async def run_provider_call(
@@ -447,8 +475,25 @@ class ProviderCapacityScheduler:
         estimated_input_tokens: int,
         operation: Callable[[], Awaitable[Any]],
         execution_budget: Optional[RequestExecutionBudget] = None,
+        attempt_timeout_seconds: Optional[float] = None,
+        fallback_reserve_seconds: float = 0.0,
+        reserve_attempts: int = 0,
     ) -> Any:
-        """Run a non-streaming provider call under scheduler control."""
+        """Run a non-streaming provider call under scheduler control.
+
+        Each attempt may take the provider timeout, but never more than the
+        request deadline minus ``fallback_reserve_seconds``: a hung primary
+        must leave its fallback time to answer. Retries also stop while
+        ``reserve_attempts`` of the request's shared attempts are left, so a
+        primary that keeps failing leaves its fallback an attempt. The first
+        attempt always runs.
+
+        An attempt (or retry) whose window would be shorter than
+        min_attempt_window_seconds (capped at the provider timeout) is not
+        started. A timeout counts against the circuit only when the attempt
+        had its whole provider timeout: one cut short by the deadline or the
+        reserve says nothing about the provider.
+        """
         if not self.enabled:
             self._record_decision(provider, model_name, "allowed", "disabled")
             if execution_budget is None:
@@ -457,7 +502,10 @@ class ProviderCapacityScheduler:
             if not execution_budget.consume_attempt():
                 execution_budget.ensure_available()
             return await asyncio.wait_for(
-                operation(), timeout=execution_budget.remaining_seconds
+                operation(),
+                timeout=execution_budget.attempt_timeout_seconds(
+                    attempt_timeout_seconds, fallback_reserve_seconds
+                ),
             )
 
         attempts = max(
@@ -471,15 +519,31 @@ class ProviderCapacityScheduler:
         )
         last_exc: Optional[Exception] = None
         local_attempt = 0
+        min_window = self._min_attempt_window(attempt_timeout_seconds)
+
+        def too_short(window: float) -> bool:
+            return window <= 0 or window < min_window
+
         while local_attempt < attempts:
             budget.ensure_available()
+            attempt_timeout = budget.attempt_timeout_seconds(
+                attempt_timeout_seconds, fallback_reserve_seconds
+            )
+            if too_short(attempt_timeout):
+                # Too little of the deadline is left (or the rest is held for
+                # the fallback) for a provider call to be worth starting.
+                raise asyncio.TimeoutError("request execution deadline exceeded")
+            window_cut_short = (
+                not attempt_timeout_seconds or attempt_timeout < attempt_timeout_seconds
+            )
             lease: Optional[SchedulerLease] = None
             response = None
+            operation_started = False
             try:
                 request_started_at_ms = int(self._time_func() * 1000)
 
                 async def run_attempt():
-                    nonlocal lease, local_attempt
+                    nonlocal lease, local_attempt, operation_started
                     lease = await self.acquire(
                         request=request,
                         model_name=model_name,
@@ -489,10 +553,11 @@ class ProviderCapacityScheduler:
                     if not budget.consume_attempt():
                         budget.ensure_available()
                     local_attempt += 1
+                    operation_started = True
                     return await operation()
 
                 response = await asyncio.wait_for(
-                    run_attempt(), timeout=budget.remaining_seconds
+                    run_attempt(), timeout=attempt_timeout
                 )
                 await self.record_success(
                     provider=provider,
@@ -507,7 +572,10 @@ class ProviderCapacityScheduler:
                 raise
             except Exception as exc:
                 last_exc = exc
-                if local_attempt > 0:
+                timed_out_early = window_cut_short and isinstance(
+                    exc, asyncio.TimeoutError
+                )
+                if operation_started and not timed_out_early:
                     await self.record_failure(
                         provider=provider,
                         model_name=model_name,
@@ -518,8 +586,23 @@ class ProviderCapacityScheduler:
                 if (
                     local_attempt >= attempts
                     or budget.attempts_used >= budget.max_attempts
+                    # The request's last attempts belong to the fallback.
+                    or budget.max_attempts - budget.attempts_used
+                    <= max(0, reserve_attempts)
                     or budget.remaining_seconds <= 0
                     or not self._is_retryable_exception(exc)
+                    # After the backoff, another try would get too short a
+                    # window or eat into the time held for the fallback.
+                    or (
+                        (fallback_reserve_seconds > 0 or min_window > 0)
+                        and too_short(
+                            budget.attempt_timeout_seconds(
+                                attempt_timeout_seconds,
+                                fallback_reserve_seconds
+                                + self._retry_backoff_seconds(local_attempt),
+                            )
+                        )
+                    )
                 ):
                     raise
                 if not await self._consume_retry_budget(provider, model_name):
@@ -645,6 +728,26 @@ class ProviderCapacityScheduler:
                 in SCHEDULER_FALLBACK_REASONS
             )
         return str(decision.reason) in SCHEDULER_FALLBACK_REASONS
+
+    def _min_attempt_window(self, provider_timeout_seconds: Optional[float]) -> float:
+        """Shortest window worth starting a provider attempt in.
+
+        Capped at the provider timeout. Without one (direct callers), there
+        is nothing to compare with and any window is used.
+        """
+        if not provider_timeout_seconds or provider_timeout_seconds <= 0:
+            return 0.0
+        return min(self.min_attempt_window_seconds, float(provider_timeout_seconds))
+
+    def is_availability_failure(self, exc: BaseException) -> bool:
+        """Whether exc says the model is unavailable, not that the request is bad.
+
+        Retryable errors (attempt timeouts included) and circuit or capacity
+        rejections qualify; 400/413/422 and ValueError never do.
+        """
+        if isinstance(exc, AdmissionRejectedError):
+            return self.allow_fallback_for_rejection(exc.decision)
+        return isinstance(exc, Exception) and self._is_retryable_exception(exc)
 
     async def record_success(
         self,
