@@ -32,11 +32,18 @@ MIXED_REALISTIC_QUERY = (
     "plan the rollout roadmap with milestones. "
 ) * 120
 
-CLASSIFIER_STRESS_QUERIES = {
+# Each keyword run lacks the pattern's final keyword (dense_keywords has no "do"
+# within 80 chars of a "code"), so every start backtracks through its gaps.
+ADVERSARIAL_QUERIES = {
     "why_is": "why is " * 7200,
     "how_can_we": "how can we " * 4600,
     "write": "write " * 8400,
     "what_does_this": "what does this " * 3400,
+    "dense_keywords": ("what " * 16 + "does " * 16 + "this " * 16 + "code " * 16) * 160,
+}
+
+CLASSIFIER_STRESS_QUERIES = {
+    **ADVERSARIAL_QUERIES,
     "mixed_realistic": MIXED_REALISTIC_QUERY,
 }
 
@@ -177,6 +184,28 @@ class TestQueryClassifier:
         elapsed = time.perf_counter() - started
 
         assert elapsed < 0.25
+
+    @pytest.mark.parametrize(
+        "query", list(ADVERSARIAL_QUERIES.values()), ids=list(ADVERSARIAL_QUERIES)
+    )
+    def test_classifier_patterns_are_fast_on_untruncated_input(self, query):
+        # Runs the regexes on the full input, bypassing the classifier's head and
+        # tail cut, so the patterns themselves must not backtrack catastrophically.
+        classifier = QueryClassifier()
+        query = query[:QUERY_MAX_CHARS]
+        patterns = [
+            pattern
+            for type_patterns in classifier._compiled_patterns.values()
+            for pattern in type_patterns
+        ]
+        assert len(query) == QUERY_MAX_CHARS
+
+        started = time.perf_counter()
+        for pattern in patterns:
+            pattern.findall(query)
+        elapsed = time.perf_counter() - started
+
+        assert elapsed < 1.0
 
     @pytest.mark.parametrize(
         ("query", "expected_type", "expected_confidence"), CLASSIFIER_SNAPSHOT
