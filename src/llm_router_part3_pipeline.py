@@ -5,6 +5,7 @@ Handles real-time data ingestion, processing, and storage to ClickHouse
 
 import asyncio
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -193,6 +194,85 @@ def request_source_and_surface(query_request: Any) -> Tuple[str, Optional[str]]:
     return source, surface
 
 
+def thread_key_hash(query_request: Any) -> Optional[str]:
+    """A Slack thread's key, hashed: requests of one thread share it."""
+    metadata = getattr(query_request, "metadata", None) or {}
+    slack = metadata.get("slack")
+    if not isinstance(slack, dict):
+        return None
+    channel_id = slack.get("channel_id")
+    thread_ts = slack.get("thread_ts")
+    if not channel_id or not thread_ts:
+        return None
+    key = f"slack:{slack.get('team_id') or ''}:{channel_id}:{thread_ts}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+
+
+def _uint_or_none(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return max(0, int(value))
+
+
+def build_chat_request_row(
+    data: Dict[str, Any], kafka_metadata: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """One chat_requests row from an inference.completed event.
+
+    An explicit field list: no query text, context or attachment names.
+    """
+    ts = _parse_datetime(data.get("request_timestamp") or data.get("emitted_at"))
+    completed_at = _parse_datetime(
+        data.get("completion_timestamp") or data.get("emitted_at")
+    )
+    emitted_at = _parse_datetime(data.get("emitted_at") or completed_at)
+    request_id = str(data.get("request_id") or data.get("query_id") or "")
+    if not request_id:
+        raise ValueError("inference.completed event has no request_id")
+    return {
+        "request_id": request_id,
+        "ts": ts,
+        "completed_at": completed_at,
+        # The latest completion of a request id wins on merge; a replay of
+        # the same event has the same version.
+        "version": int(emitted_at.timestamp() * 1000),
+        "user_id": str(data.get("user_id") or ""),
+        "tier": str(data.get("user_tier") or ""),
+        "source": str(data.get("source") or "api"),
+        "surface": str(data.get("surface") or ""),
+        "thread_key_hash": str(data.get("thread_key_hash") or ""),
+        "query_type": str(data.get("query_type") or ""),
+        "model": str(data.get("selected_model") or ""),
+        "provider": str(data.get("provider") or ""),
+        "status": str(data.get("status") or ""),
+        "error_type": str(data.get("error_type") or ""),
+        "error_code": str(data.get("error_code") or ""),
+        "finish_reason": str(data.get("finish_reason") or ""),
+        "fallback_from_model": str(data.get("fallback_from_model") or ""),
+        "attempts": _uint_or_none(data.get("attempts")) or 0,
+        "cached": bool(data.get("cached_response", False)),
+        "routing_strategy": str(data.get("routing_strategy") or ""),
+        "policy_source": str(data.get("policy_source") or ""),
+        "reasoning_effort": str(data.get("reasoning_effort") or ""),
+        "latency_ms": _uint_or_none(data.get("latency_ms")) or 0,
+        "routing_ms": _uint_or_none(data.get("routing_ms")),
+        "queue_wait_ms": _uint_or_none(data.get("queue_wait_ms")),
+        "ttft_ms": _uint_or_none(data.get("ttft_ms")),
+        "token_count_input": _uint_or_none(data.get("token_count_input")) or 0,
+        "token_count_output": _uint_or_none(data.get("token_count_output")) or 0,
+        "reasoning_tokens": _uint_or_none(data.get("reasoning_tokens")) or 0,
+        "provider_cached_input_tokens": (
+            _uint_or_none(data.get("provider_cached_input_tokens")) or 0
+        ),
+        "cost_usd": float(data.get("cost_usd") or 0.0),
+        "event_id": "",
+        "kafka_topic": "",
+        "kafka_partition": -1,
+        "kafka_offset": -1,
+        **(kafka_metadata or {}),
+    }
+
+
 def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
     """Build the pre-inference event emitted by the API request path."""
     attachments = [
@@ -274,6 +354,7 @@ def build_inference_completed_event(
         if domain
     ]
     source, surface = request_source_and_surface(query_request)
+    routing_ms = getattr(routing_decision, "routing_time_ms", None)
 
     return {
         "event_type": "inference.completed",
@@ -287,6 +368,7 @@ def build_inference_completed_event(
         "conversation_id": query_request.conversation_id,
         "source": source,
         "surface": surface,
+        "thread_key_hash": thread_key_hash(query_request),
         "request_timestamp": _isoformat_utc(query_request.timestamp),
         "completion_timestamp": _isoformat_utc(inference_response.timestamp),
         "query_text": redact_text(query_request.query),
@@ -300,6 +382,15 @@ def build_inference_completed_event(
         "finish_reason": inference_response.finish_reason,
         "provider_request_id": inference_response.provider_request_id,
         "latency_ms": inference_response.latency_ms,
+        # Where the time went: routing; the provider queue (not measured
+        # per request yet); time to first token (no streaming yet).
+        "routing_ms": (
+            int(routing_ms)
+            if isinstance(routing_ms, (int, float)) and not isinstance(routing_ms, bool)
+            else None
+        ),
+        "queue_wait_ms": None,
+        "ttft_ms": None,
         "token_count_input": inference_response.token_count_input,
         "token_count_output": inference_response.token_count_output,
         "total_tokens": inference_response.total_tokens,
@@ -1316,7 +1407,54 @@ class ClickHouseManager:
             database=self.database
         )
 
-        # Execute table creation
+        # One row per chat request (inference.completed): no query text, no
+        # context. The latest completion of a request id wins on merge.
+        chat_requests_sql = """
+        CREATE TABLE IF NOT EXISTS {database}.chat_requests (
+            request_id String,
+            ts DateTime64(3),
+            completed_at DateTime64(3),
+            version UInt64,
+            user_id String,
+            tier LowCardinality(String),
+            source LowCardinality(String),
+            surface LowCardinality(String),
+            thread_key_hash String,
+            query_type LowCardinality(String),
+            model LowCardinality(String),
+            provider LowCardinality(String),
+            status LowCardinality(String),
+            error_type LowCardinality(String),
+            error_code LowCardinality(String),
+            finish_reason LowCardinality(String),
+            fallback_from_model LowCardinality(String),
+            attempts UInt8,
+            cached Boolean,
+            routing_strategy LowCardinality(String),
+            policy_source LowCardinality(String),
+            reasoning_effort LowCardinality(String),
+            latency_ms UInt32,
+            routing_ms Nullable(UInt32),
+            queue_wait_ms Nullable(UInt32),
+            ttft_ms Nullable(UInt32),
+            token_count_input UInt32,
+            token_count_output UInt32,
+            reasoning_tokens UInt32,
+            provider_cached_input_tokens UInt32,
+            cost_usd Float64,
+            event_id String,
+            kafka_topic String DEFAULT '',
+            kafka_partition Int32 DEFAULT -1,
+            kafka_offset Int64 DEFAULT -1
+        ) ENGINE = ReplacingMergeTree(version)
+        PARTITION BY toYYYYMMDD(ts)
+        ORDER BY (toStartOfHour(ts), request_id)
+        TTL toDateTime(ts) + INTERVAL 90 DAY
+        """.format(
+            database=self.database
+        )
+
+        # Execute table creation; new tables go at the end.
         tables = [
             ("query_logs", query_logs_sql),
             ("system_metrics", metrics_sql),
@@ -1324,6 +1462,7 @@ class ClickHouseManager:
             ("user_analytics", user_analytics_sql),
             ("alert_events", alert_events_sql),
             ("routing_policy_state_events", routing_policy_state_sql),
+            ("chat_requests", chat_requests_sql),
         ]
 
         for table_name, sql in tables:
@@ -1461,6 +1600,20 @@ class ClickHouseManager:
             )
         except Exception as e:
             logger.error(f"Failed to batch insert alert events: {e}")
+            PIPELINE_METRICS.insertion_errors.inc()
+            raise
+
+    async def batch_insert_chat_requests(self, rows: List[Dict[str, Any]]):
+        """Batch insert chat_requests rows (see build_chat_request_row)."""
+        if not rows:
+            return
+        try:
+            await self._insert_dict_rows("chat_requests", rows)
+            PIPELINE_METRICS.records_inserted.labels(table="chat_requests").inc(
+                len(rows)
+            )
+        except Exception as e:
+            logger.error(f"Failed to batch insert chat requests: {e}")
             PIPELINE_METRICS.insertion_errors.inc()
             raise
 
@@ -1850,6 +2003,7 @@ class KafkaConsumerManager:
             "routing_guardrails",
             "routing_policy_state",
             "alerts",
+            "inference_completed",
         )
         self.batch_buffer_states = {
             topic_key: BatchBufferState() for topic_key in batched_topics
@@ -1930,6 +2084,7 @@ class KafkaConsumerManager:
                     "routing_guardrails",
                     "routing_policy_state",
                     "alerts",
+                    "inference_completed",
                 ]:
                     consumer = AIOKafkaConsumer(topic_name, **self.consumer_config)
                     await consumer.start()
@@ -2037,6 +2192,7 @@ class KafkaConsumerManager:
             "routing_guardrails": self._consume_routing_guardrails,
             "routing_policy_state": self._consume_routing_policy_state,
             "alerts": self._consume_alerts,
+            "inference_completed": self._consume_inference_completed,
         }
         handler = handlers.get(topic_key)
         if handler is None:
@@ -2501,6 +2657,34 @@ class KafkaConsumerManager:
             logger.error(f"Analytics model metrics consumer error: {e}")
             raise
 
+    async def _consume_inference_completed(self, consumer: AIOKafkaConsumer):
+        """Persist inference.completed events as chat_requests rows."""
+        try:
+            async for message in consumer:
+                try:
+                    data = self._decode_message_value(message)
+                    row = build_chat_request_row(
+                        data, kafka_metadata=self._kafka_event_metadata(message)
+                    )
+                    await self._append_batched_row("inference_completed", row, message)
+                    self._record_successful_consume(
+                        "inference_completed", consumer, message
+                    )
+                    PIPELINE_METRICS.messages_consumed.labels(
+                        topic="inference_completed"
+                    ).inc()
+                except Exception as e:
+                    await self._handle_processing_failure(
+                        "inference_completed",
+                        message,
+                        e,
+                        stage="consume",
+                        batched=True,
+                    )
+        except Exception as e:
+            logger.error(f"inference.completed consumer error: {e}")
+            raise
+
     async def _consume_alerts(self, consumer: AIOKafkaConsumer):
         """Consume Flink and platform alert events."""
         try:
@@ -2811,6 +2995,7 @@ class KafkaConsumerManager:
                 self.clickhouse.batch_insert_routing_policy_state,
             ),
             ("alerts", self.clickhouse.batch_insert_alert_events),
+            ("inference_completed", self.clickhouse.batch_insert_chat_requests),
         )
         semaphore = asyncio.Semaphore(self.max_concurrent_flushes)
 

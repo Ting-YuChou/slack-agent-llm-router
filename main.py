@@ -25,7 +25,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import click
 import uvicorn
@@ -114,6 +114,65 @@ def _with_request_id(result: Any, request_id: str) -> Any:
     return result
 
 
+class ChatIngress:
+    """The chat request path /route and Slack share.
+
+    It publishes requests.raw, runs inference, maps the answer to an HTTP
+    status and records the API metrics. Each caller keeps its own boundary
+    and admission: /route its guards, metadata allowlist and route admission,
+    Slack its per-user limiter.
+    """
+
+    def __init__(self, platform: "LLMRouterPlatform"):
+        self._platform = platform
+
+    async def process(self, query_request: QueryRequest) -> Tuple[Any, int, Dict]:
+        """requests.raw, inference and the status: (result, status, headers)."""
+        platform = self._platform
+        await platform._publish_request_raw_event(query_request)
+        result = await platform.services["inference"].process_query(query_request)
+        result = _with_request_id(result, query_request.request_id)
+        status_code, headers = route_response_status(result)
+        return result, status_code, headers
+
+    async def record(
+        self, *, endpoint: str, method: str, status_code: int, started_at: float
+    ) -> None:
+        await self._platform._record_api_metrics(
+            endpoint=endpoint,
+            method=method,
+            status_code=status_code,
+            duration_seconds=time.perf_counter() - started_at,
+            error_type="RouteError" if status_code >= 500 else None,
+        )
+
+    async def handle(
+        self, query_request: QueryRequest, *, endpoint: str, method: str
+    ) -> Any:
+        """process() and its metrics in one call, for in-process callers.
+
+        Exceptions propagate, counted as /route would answer them.
+        """
+        started_at = time.perf_counter()
+        status_code = 500
+        try:
+            result, status_code, _headers = await self.process(query_request)
+            return result
+        except AdmissionRejectedError as exc:
+            status_code = exc.decision.status_code
+            raise
+        finally:
+            await self.record(
+                endpoint=endpoint,
+                method=method,
+                status_code=status_code,
+                started_at=started_at,
+            )
+
+    def is_healthy(self) -> bool:
+        return True
+
+
 # Optional infrastructure is imported only when its feature is enabled. Keeping
 # these names patchable also supports the existing isolated service tests.
 KafkaIngestionPipeline = None
@@ -177,6 +236,8 @@ class LLMRouterPlatform:
         self.logger = logging.getLogger(__name__)
         self.config = self._load_config()
         self.services: Dict[str, Any] = {}
+        # Shared by /route and, through services["chat_ingress"], Slack.
+        self.chat_ingress = ChatIngress(self)
         self.processes: List[mp.Process] = []
         self.shutdown_event = asyncio.Event()
         self.force_shutdown_event = asyncio.Event()
@@ -440,6 +501,9 @@ class LLMRouterPlatform:
             await self.services["monitoring"].initialize()
 
         if self._service_enabled("slack"):
+            # Slack chat queries take the /route ingress (requests.raw,
+            # metrics, error mapping) but not its admission.
+            self.services["chat_ingress"] = self.chat_ingress
             self.services["slack_bot"] = SlackBot(
                 config=self.config.get("slack", {}),
                 agent_config=self.config.get("agent", {}),
@@ -2027,10 +2091,9 @@ class LLMRouterPlatform:
                     active_requests.labels(endpoint=endpoint).inc()
                     active_request_recorded = True
 
-                await self._publish_request_raw_event(query_data)
-                result = await self.services["inference"].process_query(query_data)
-                result = _with_request_id(result, query_data.request_id)
-                status_code, error_headers = route_response_status(result)
+                result, status_code, error_headers = await self.chat_ingress.process(
+                    query_data
+                )
                 return tagged(
                     JSONResponse(
                         status_code=status_code,
@@ -2059,12 +2122,11 @@ class LLMRouterPlatform:
                 if active_requests is not None and active_request_recorded:
                     active_requests.labels(endpoint=endpoint).dec()
                 await self._release_admission_reservation(route_reservation)
-                await self._record_api_metrics(
+                await self.chat_ingress.record(
                     endpoint=endpoint,
                     method=method,
                     status_code=status_code,
-                    duration_seconds=time.perf_counter() - start_time,
-                    error_type="RouteError" if status_code >= 500 else None,
+                    started_at=start_time,
                 )
 
         @app.post("/rag/uploads")

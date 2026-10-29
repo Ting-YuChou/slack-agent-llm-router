@@ -3494,8 +3494,17 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 metadata=query_metadata,
             )
 
-            # Process through inference engine
-            response = await self.bot.inference_engine.process_query(query_request)
+            # Process through the ingress /route shares (requests.raw, API
+            # metrics, error mapping); the per-user limiter already admitted it.
+            ingress = (getattr(self.bot, "services", None) or {}).get("chat_ingress")
+            if ingress is not None and callable(getattr(ingress, "handle", None)):
+                response = await ingress.handle(
+                    query_request,
+                    endpoint="slack",
+                    method=trace.surface or "message",
+                )
+            else:
+                response = await self.bot.inference_engine.process_query(query_request)
 
             if getattr(response, "error", None):
                 logger.error(
