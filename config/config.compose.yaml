@@ -122,6 +122,10 @@ router:
       max_tokens: 128000
       cost_per_token: 3.0e-05
       priority: 2
+      allowed_tiers:
+        - free
+        - premium
+        - enterprise
       capabilities:
         - general
         - reasoning
@@ -136,6 +140,8 @@ router:
       max_tokens: 1000000
       cost_per_token: 1.5e-05
       priority: 1
+      allowed_tiers:
+        - enterprise
       capabilities:
         - reasoning
         - writing

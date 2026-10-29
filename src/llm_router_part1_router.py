@@ -9,7 +9,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NoReturn, Optional, Tuple
 
 from src.routing_features import build_routing_features
 from src.utils.metrics import ROUTER_METRICS
@@ -35,6 +35,41 @@ CLASSIFIER_TAIL_CHARS = 2000
 # crosses dots in "utils.py" or "3.12"), but it spans at most 80 chars, so the
 # classifier patterns cannot backtrack catastrophically on long input.
 _GAP = r"[^\n]{0,80}"
+
+
+# Routing rejections. The router raises these instead of upgrading a user to a
+# model their tier may not use; callers map them to HTTP by these attributes.
+class ModelNotEntitledError(ValueError):
+    """No model the user's tier may use can serve the request."""
+
+    error_code = "model_not_entitled"
+    http_status = 403
+    error_type = "user_or_policy"
+
+    def __init__(self, message: str, *, user_tier: str):
+        super().__init__(message)
+        self.user_tier = user_tier
+
+
+class PromptTooLargeError(ValueError):
+    """The prompt exceeds the context window of every model the tier may use."""
+
+    error_code = "prompt_too_large"
+    http_status = 413
+    error_type = "user_or_policy"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        user_tier: str,
+        token_count: int,
+        max_context_tokens: int,
+    ):
+        super().__init__(message)
+        self.user_tier = user_tier
+        self.token_count = token_count
+        self.max_context_tokens = max_context_tokens
 
 
 @dataclass
@@ -511,6 +546,20 @@ class ModelRouter:
             except Exception as e:
                 logger.error(f"Failed to load model {model_name}: {e}")
 
+        # Config validation requires a model per tier, but credential gating or
+        # a bad model entry can still leave a tier without one.
+        uncovered_tiers = [
+            tier.value
+            for tier in UserTier
+            if not any(tier in model.entitled_tiers() for model in self.models.values())
+        ]
+        if uncovered_tiers:
+            logger.warning(
+                "No loaded model is open to tier(s) %s; their requests will be "
+                "rejected as model_not_entitled",
+                ", ".join(uncovered_tiers),
+            )
+
     def _load_routing_rules(self):
         """Load routing rules from configuration"""
         rules_config = self.config.get("routing_rules", [])
@@ -572,18 +621,61 @@ class ModelRouter:
 
             return decision
 
+        except (ModelNotEntitledError, PromptTooLargeError):
+            raise
         except Exception:
             logger.exception("Routing failed")
-            # Fallback to default model
-            return RoutingDecision(
-                selected_model=self.default_model,
-                query_type=QueryType.GENERAL,
-                token_count=0,
-                estimated_cost=0.0,
-                routing_reason="Fallback due to routing error",
-                routing_time_ms=int((time.time() - start_time) * 1000),
-                confidence=0.0,
+            return self._routing_error_decision(request, start_time)
+
+    def _routing_error_decision(
+        self, request: QueryRequest, start_time: float
+    ) -> RoutingDecision:
+        """Pick a model without classification or policy after a routing error.
+
+        Tier and context-window checks still apply, and the token count stays an
+        estimate so the inference fallback limits keep working.
+        """
+        context = {
+            "query_type": QueryType.GENERAL.value,
+            "token_count": self._fallback_token_estimate(request),
+            "user_tier": self._normalize_user_tier(request.user_tier),
+            "max_tokens": request.max_tokens,
+            "has_attachments": bool(request.attachments),
+        }
+        eligible = self._filter_models_for_context(
+            list(self.models), context, check_capability=False
+        )
+        if not eligible:
+            self._raise_no_eligible_model(context)
+        if self.default_model in eligible:
+            selected_model = self.default_model
+        else:
+            try:
+                selected_model = self._select_best_model(eligible, context)
+            except Exception:
+                logger.exception("Model scoring failed after a routing error")
+                selected_model = eligible[0]
+
+        return RoutingDecision(
+            selected_model=selected_model,
+            query_type=QueryType.GENERAL,
+            token_count=context["token_count"],
+            estimated_cost=0.0,
+            routing_reason="Fallback due to routing error",
+            routing_time_ms=int((time.time() - start_time) * 1000),
+            confidence=0.0,
+        )
+
+    def _fallback_token_estimate(self, request: QueryRequest) -> int:
+        """The routing token estimate, or a word count if that fails too."""
+        try:
+            return max(0, int(self._estimate_request_token_count(request)))
+        except Exception:
+            logger.exception("Token estimate failed after a routing error")
+            text = "\n\n".join(
+                part for part in (request.context, request.query) if part
             )
+            return max(1, int(len(text.split()) * 1.3), len(text) // 4)
 
     async def select_model_with_capability(
         self,
@@ -1197,21 +1289,74 @@ class ModelRouter:
 
     def _capability_based_routing(self, context: Dict[str, Any]) -> ModelSelection:
         """Route based on model capabilities and query requirements"""
-        suitable_models = self._filter_models_for_context(
-            list(self.models.keys()), context
+        eligible_models, capability_match = self._eligible_models(context)
+        best_model = self._select_best_model(eligible_models, context)
+        if capability_match:
+            return ModelSelection(
+                model_name=best_model,
+                confidence=0.8,
+                reason="Capability-based selection",
+            )
+        return ModelSelection(
+            model_name=best_model,
+            confidence=0.3,
+            reason=(
+                "No model has the capability for this query type; "
+                "best model available to the tier"
+            ),
         )
 
-        if not suitable_models:
-            return ModelSelection(
-                model_name=self.default_model,
-                confidence=0.3,
-                reason="No suitable models found, using default",
+    def _eligible_models(self, context: Dict[str, Any]) -> Tuple[List[str], bool]:
+        """Models this request may use, and whether they match its query type.
+
+        Models with the capability for the query type come first; if none has
+        it, any model the tier may use that fits the prompt. Never a model
+        outside the tier: with nothing eligible this raises ModelNotEntitledError
+        or PromptTooLargeError.
+        """
+        candidates = list(self.models)
+        capable_models = self._filter_models_for_context(candidates, context)
+        if capable_models:
+            return capable_models, True
+        fitting_models = self._filter_models_for_context(
+            candidates, context, check_capability=False
+        )
+        if fitting_models:
+            return fitting_models, False
+        self._raise_no_eligible_model(context)
+
+    def _raise_no_eligible_model(
+        self, context: Dict[str, Any], candidates: Optional[List[str]] = None
+    ) -> NoReturn:
+        """Raise the rejection that explains why no candidate passed the filters."""
+        tier = self._entitlement_tier(context.get("user_tier"))
+        candidate_names = list(self.models) if candidates is None else candidates
+        entitled_models = [
+            self.models[model_name]
+            for model_name in candidate_names
+            if model_name in self.models
+            and self._check_user_access(self.models[model_name], tier.value)
+        ]
+        if not entitled_models:
+            raise ModelNotEntitledError(
+                f"No model is available to the {tier.value} tier for this request",
+                user_tier=tier.value,
             )
 
-        # Select best model from suitable candidates
-        best_model = self._select_best_model(suitable_models, context)
-        return ModelSelection(
-            model_name=best_model, confidence=0.8, reason="Capability-based selection"
+        token_count = int(context.get("token_count", 0) or 0)
+        largest_window = max(model.max_tokens for model in entitled_models)
+        if token_count > largest_window:
+            raise PromptTooLargeError(
+                f"The prompt needs about {token_count} tokens; the largest model "
+                f"available to the {tier.value} tier accepts {largest_window}",
+                user_tier=tier.value,
+                token_count=token_count,
+                max_context_tokens=largest_window,
+            )
+        raise ModelNotEntitledError(
+            "Routing guardrails exclude every model available to the "
+            f"{tier.value} tier",
+            user_tier=tier.value,
         )
 
     def _filter_models_for_context(
@@ -1306,15 +1451,15 @@ class ModelRouter:
         return any(req_cap in model_capabilities for req_cap in required_capabilities)
 
     def _check_user_access(self, model_config: ModelConfig, user_tier: str) -> bool:
-        """Check if user tier has access to model"""
-        tier_priorities = {"free": 3, "premium": 2, "enterprise": 1}
+        """Check if user tier has access to model (allowed_tiers, else priority)."""
+        return self._entitlement_tier(user_tier) in model_config.entitled_tiers()
 
-        normalized_tier = self._normalize_user_tier(user_tier)
-        user_priority = tier_priorities.get(normalized_tier, 3)
-        model_priority = model_config.priority
-
-        # Lower priority number = higher priority access
-        return model_priority >= user_priority
+    def _entitlement_tier(self, user_tier: Any) -> UserTier:
+        """The tier whose entitlements apply; an unknown tier gets free access."""
+        try:
+            return UserTier(self._normalize_user_tier(user_tier))
+        except ValueError:
+            return UserTier.FREE
 
     def _normalize_user_tier(self, user_tier: Any) -> str:
         """Normalize request/user tier values for rule evaluation and access checks."""
@@ -1328,8 +1473,13 @@ class ModelRouter:
 
     def _select_best_model(self, candidates: List[str], context: Dict[str, Any]) -> str:
         """Select the best model from candidates based on multiple factors"""
-        if not candidates:
-            return self.default_model
+        # Only models the request may use; callers decide the capability check.
+        eligible = self._filter_models_for_context(
+            candidates, context, check_capability=False
+        )
+        if not eligible:
+            self._raise_no_eligible_model(context, candidates)
+        candidates = eligible
 
         scores = {}
         warn_models = set(context.get("warn_models", []) or [])
@@ -1447,14 +1597,8 @@ class ModelRouter:
         return bonus
 
     def _round_robin_routing(self, context: Dict[str, Any]) -> ModelSelection:
-        """Simple round-robin model selection"""
-        available_models = list(self.models.keys())
-        if not available_models:
-            return ModelSelection(
-                model_name=self.default_model,
-                confidence=0.5,
-                reason="No models available",
-            )
+        """Simple round-robin over the models this request may use"""
+        available_models, _capability_match = self._eligible_models(context)
 
         # Simple round-robin based on request count
         request_count = getattr(self, "_request_count", 0)
@@ -1466,14 +1610,8 @@ class ModelRouter:
         )
 
     def _weighted_routing(self, context: Dict[str, Any]) -> ModelSelection:
-        """Weighted random selection based on model priorities"""
-        available_models = list(self.models.keys())
-        if not available_models:
-            return ModelSelection(
-                model_name=self.default_model,
-                confidence=0.5,
-                reason="No models available",
-            )
+        """Weighted random selection, by priority, among models the request may use"""
+        available_models, _capability_match = self._eligible_models(context)
 
         # Calculate weights (inverse of priority)
         weights = []
@@ -1501,9 +1639,20 @@ class ModelRouter:
         )
 
     def _fallback_routing(self, context: Dict[str, Any]) -> ModelSelection:
-        """Fallback to default model"""
+        """Fallback to the default model, or the best model the request may use"""
+        if self._filter_models_for_context(
+            [self.default_model], context, check_capability=False
+        ):
+            return ModelSelection(
+                model_name=self.default_model,
+                confidence=0.4,
+                reason="Fallback routing",
+            )
+        eligible_models, _capability_match = self._eligible_models(context)
         return ModelSelection(
-            model_name=self.default_model, confidence=0.4, reason="Fallback routing"
+            model_name=self._select_best_model(eligible_models, context),
+            confidence=0.4,
+            reason="Fallback routing (default model not available to the tier)",
         )
 
     def _estimate_cost(
