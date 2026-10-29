@@ -153,6 +153,29 @@ async def test_the_bots_notices_are_not_replayed_as_answers(
 
 
 @pytest.mark.asyncio
+async def test_the_agent_handoff_placeholder_is_not_replayed(
+    inference_response_factory,
+):
+    bot = _bot(inference_response_factory)
+    client = _pages(
+        [
+            {
+                "ts": "1.0",
+                "user": "UBOT",
+                "bot_id": "B1",
+                "text": " _Passed to the Agent run in this thread._ ",
+            },
+            {"ts": "1.1", "user": "UBOT", "bot_id": "B1", "text": "answer"},
+        ]
+    )
+
+    request = await _ask(bot, client)
+
+    assert "Passed to the Agent run" not in request.context
+    assert "assistant (you): answer" in request.context
+
+
+@pytest.mark.asyncio
 async def test_the_last_answer_missing_from_the_thread_comes_from_the_summary(
     inference_response_factory,
 ):

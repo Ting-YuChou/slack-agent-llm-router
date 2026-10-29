@@ -192,6 +192,8 @@ SLACK_OWN_MESSAGE_SENDER = "assistant (you)"
 # part of a transcript: it says nothing, and one left behind when the update
 # failed would read as an answer.
 SLACK_THINKING_TEXT = "_Thinking…_"
+# What the placeholder becomes when the message went to an Agent run instead.
+SLACK_AGENT_HANDOFF_TEXT = "_Passed to the Agent run in this thread._"
 SLACK_GENERIC_ERROR_MESSAGE = (
     "❌ Sorry, I couldn't process that request right now. Please try again in a "
     "moment."
@@ -1348,6 +1350,7 @@ _SLACK_NOTICE_TEXTS = frozenset(
     _normalized_text(text)
     for text in (
         SLACK_THINKING_TEXT,
+        SLACK_AGENT_HANDOFF_TEXT,
         SLACK_BUSY_MESSAGE,
         SLACK_GENERIC_ERROR_MESSAGE,
         MEMORY_SLASH_ONLY_MESSAGE,
