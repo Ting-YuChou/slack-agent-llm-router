@@ -5,6 +5,7 @@ import inspect
 import os
 import re
 import time
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -2723,7 +2724,8 @@ class TestSlackStateStores:
 
     @pytest.mark.asyncio
     async def test_redis_state_store_preserves_other_users_across_clients(self):
-        prefix = "test-multi-user"
+        # Rate limits merge with what is stored, so share no keys between runs.
+        prefix = f"test-multi-user-{uuid.uuid4().hex}"
         now = datetime.now().timestamp()
         store_one = RedisSlackStateStore(
             {
@@ -2763,6 +2765,11 @@ class TestSlackStateStores:
         )
 
         loaded = await store_one.load_state()
+        # User keys never expire: leave nothing behind in the shared Redis.
+        for user_id in ("u1", "u2"):
+            await store_one.delete_user_state(user_id)
+        await store_one.shutdown()
+        await store_two.shutdown()
 
         assert loaded["users"]["u1"]["tier"] == "premium"
         assert loaded["users"]["u2"]["tier"] == "enterprise"
