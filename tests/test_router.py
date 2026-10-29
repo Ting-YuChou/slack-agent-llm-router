@@ -1,4 +1,5 @@
 import builtins
+import time
 
 import pytest
 
@@ -16,6 +17,114 @@ from src.utils.schema import (
     ToolPolicy,
     UserTier,
 )
+
+QUERY_MAX_CHARS = 50000
+
+# A long single-paragraph paste, as a user would send a transcript or report.
+MIXED_REALISTIC_QUERY = (
+    "Why is that the p99 latency spikes every night after the deploy? "
+    "How can we conclude it is the cache and not the database? "
+    "Write a Python function that parses the gateway logs and build a script "
+    "to compare the error trends per region. "
+    "What does this code do: def handler(event): return event['body']. "
+    "The latest release announced today includes a price update for the stock "
+    "dashboard. Summarize the key points, brainstorm some ideas, and help me "
+    "plan the rollout roadmap with milestones. "
+) * 120
+
+# Each keyword run lacks the pattern's final keyword (dense_keywords has no "do"
+# within 80 chars of a "code"), so every start backtracks through its gaps.
+ADVERSARIAL_QUERIES = {
+    "why_is": "why is " * 7200,
+    "how_can_we": "how can we " * 4600,
+    "write": "write " * 8400,
+    "what_does_this": "what does this " * 3400,
+    "dense_keywords": ("what " * 16 + "does " * 16 + "this " * 16 + "code " * 16) * 160,
+}
+
+CLASSIFIER_STRESS_QUERIES = {
+    **ADVERSARIAL_QUERIES,
+    "mixed_realistic": MIXED_REALISTIC_QUERY,
+}
+
+# (query, type, confidence) recorded from classify_query before the regex rewrite.
+CLASSIFIER_SNAPSHOT = [
+    (
+        "Write a Python function to sort a list",
+        QueryType.CODE_GENERATION,
+        0.5642857142857143,
+    ),
+    (
+        "Can you implement a binary search algorithm in Rust?",
+        QueryType.CODE_GENERATION,
+        0.20714285714285713,
+    ),
+    (
+        "Please review this code and fix the bug in my parser function",
+        QueryType.CODE_ANALYSIS,
+        0.43333333333333335,
+    ),
+    (
+        "What does this code do? def add(a, b): return a + b",
+        QueryType.CODE_GENERATION,
+        0.20714285714285713,
+    ),
+    (
+        "Analyze the sales data and compare the trends across regions",
+        QueryType.ANALYSIS,
+        0.5166666666666666,
+    ),
+    (
+        "Summarize the key points of this meeting transcript",
+        QueryType.SUMMARIZATION,
+        0.46,
+    ),
+    (
+        "Write a short story about a robot who learns to paint",
+        QueryType.CREATIVE_WRITING,
+        0.43333333333333335,
+    ),
+    (
+        "Compose a poem about autumn leaves",
+        QueryType.CREATIVE_WRITING,
+        0.43333333333333335,
+    ),
+    ("What are some good ideas for a team offsite?", QueryType.BRAINSTORMING, 0.38),
+    ("Help me think of names for my new coffee shop", QueryType.BRAINSTORMING, 0.23),
+    (
+        "How to plan a product launch roadmap with clear milestones",
+        QueryType.PLANNING,
+        0.7333333333333333,
+    ),
+    ("Solve the equation 3x + 5 = 20", QueryType.MATH, 0.43333333333333335),
+    ("Calculate the derivative of x^2 * sin(x)", QueryType.MATH, 0.36666666666666664),
+    (
+        "Why is that the case, and how can we conclude the argument is valid?",
+        QueryType.REASONING,
+        0.5166666666666666,
+    ),
+    (
+        "What is the latest news about the NVIDIA stock price today?",
+        QueryType.WEB_RESEARCH,
+        0.5466666666666666,
+    ),
+    ("最新的 AI 新聞是什麼？", QueryType.WEB_RESEARCH, 0.28444444444444444),
+    ("Hi there, how are you doing?", QueryType.GENERAL, 0.5),
+    ("Thanks, that was really helpful", QueryType.GENERAL, 0.5),
+    ("Translate this sentence into French", QueryType.GENERAL, 0.5),
+    # Keyword gaps that cross a dot inside a sentence.
+    (
+        "write a python 3.12 script to parse logs",
+        QueryType.CODE_GENERATION,
+        0.35714285714285715,
+    ),
+    (
+        "fix the bug in utils.py function",
+        QueryType.CODE_ANALYSIS,
+        0.36666666666666664,
+    ),
+    ("Write a node.js function", QueryType.CODE_GENERATION, 0.2642857142857143),
+]
 
 
 class TestQueryClassifier:
@@ -59,6 +168,74 @@ class TestQueryClassifier:
 
         assert query_type == QueryType.WEB_RESEARCH
         assert confidence > 0.1
+
+    @pytest.mark.parametrize(
+        "query",
+        list(CLASSIFIER_STRESS_QUERIES.values()),
+        ids=list(CLASSIFIER_STRESS_QUERIES),
+    )
+    def test_classify_query_is_fast_on_max_length_input(self, query):
+        classifier = QueryClassifier()
+        classifier._is_initialized = True
+        query = query[:QUERY_MAX_CHARS]
+
+        started = time.perf_counter()
+        classifier.classify_query(query)
+        elapsed = time.perf_counter() - started
+
+        assert elapsed < 0.25
+
+    @pytest.mark.parametrize(
+        "query", list(ADVERSARIAL_QUERIES.values()), ids=list(ADVERSARIAL_QUERIES)
+    )
+    def test_classifier_patterns_are_fast_on_untruncated_input(self, query):
+        # Runs the regexes on the full input, bypassing the classifier's head and
+        # tail cut, so the patterns themselves must not backtrack catastrophically.
+        classifier = QueryClassifier()
+        query = query[:QUERY_MAX_CHARS]
+        patterns = [
+            pattern
+            for type_patterns in classifier._compiled_patterns.values()
+            for pattern in type_patterns
+        ]
+        assert len(query) == QUERY_MAX_CHARS
+
+        started = time.perf_counter()
+        for pattern in patterns:
+            pattern.findall(query)
+        elapsed = time.perf_counter() - started
+
+        assert elapsed < 1.0
+
+    @pytest.mark.parametrize(
+        ("query", "expected_type", "expected_confidence"), CLASSIFIER_SNAPSHOT
+    )
+    def test_classify_query_matches_recorded_snapshot(
+        self, query, expected_type, expected_confidence
+    ):
+        classifier = QueryClassifier()
+        classifier._is_initialized = True
+
+        query_type, confidence = classifier.classify_query(query)
+
+        assert query_type == expected_type
+        assert confidence == pytest.approx(expected_confidence)
+
+    def test_classify_query_reads_request_after_long_paste(self):
+        classifier = QueryClassifier()
+        classifier._is_initialized = True
+        # 10,000 chars of pasted text, then the actual request.
+        long_paste = ("lorem ipsum dolor sit amet " * 371)[:9999] + "\n"
+        query = (
+            long_paste
+            + "summarize the key points and search the web for the latest news"
+        )
+
+        query_type, confidence = classifier.classify_query(query)
+
+        # Same result as origin/main, which classified the whole query.
+        assert query_type == QueryType.WEB_RESEARCH
+        assert confidence == pytest.approx(0.5688888888888889)
 
 
 class TestTokenCounter:
@@ -780,3 +957,207 @@ class TestModelRouter:
         decision = await router.route_query(request)
 
         assert decision.selected_model == "mistral-7b"
+
+
+class TestRuleBasedRoutingFilters:
+    """Rule candidates go through the same guardrail, tier and window filter."""
+
+    def _build_router(self, config, policy, token_count=128):
+        class PolicyCacheStub:
+            async def get_effective_policy(self, request_id, user_id):
+                return dict(policy)
+
+        router = ModelRouter(config, policy_cache=PolicyCacheStub())
+        router.classifier.classify_query = lambda _query: (
+            QueryType.CODE_GENERATION,
+            0.95,
+        )
+        router.token_counter.count_tokens = lambda _query, _model="default": token_count
+        # gpt-5 scores best, then qwen3.6-27b-fast, then mistral-7b.
+        router.model_stats["gpt-5"] = {"success_rate": 0.99, "avg_latency": 100}
+        router.model_stats["qwen3.6-27b-fast"] = {
+            "success_rate": 0.95,
+            "avg_latency": 1200,
+        }
+        router.model_stats["mistral-7b"] = {"success_rate": 0.80, "avg_latency": 1500}
+        return router
+
+    async def _route(self, router, user_tier=UserTier.PREMIUM):
+        request = QueryRequest(
+            query="Write a Python helper", user_id="u1", user_tier=user_tier
+        )
+        decision = await router.route_query(request)
+        context = await router._build_query_context(request)
+        eligible = router._filter_models_for_context(list(router.models), context)
+        return decision, eligible
+
+    def _build_enterprise_router(self, router_config, policy, query_type):
+        config = dict(router_config)
+        config["models"] = {
+            **router_config["models"],
+            # As shipped in config/config.yaml: no "general" or "coding".
+            "claude-sonnet-4-6": {
+                "provider": "anthropic",
+                "max_tokens": 1000000,
+                "cost_per_token": 0.000015,
+                "priority": 1,
+                "capabilities": [
+                    "reasoning",
+                    "writing",
+                    "analysis",
+                    "tool_use",
+                    "web_search",
+                    "vision",
+                ],
+                "api_key_env": "ANTHROPIC_API_KEY",
+            },
+        }
+        config["routing_rules"] = [
+            {
+                "condition": "user_tier == 'enterprise'",
+                "models": ["claude-sonnet-4-6", "gpt-5"],
+                "fallback": "claude-sonnet-4-6",
+            },
+            *router_config["routing_rules"],
+        ]
+        router = self._build_router(config, policy)
+        router.classifier.classify_query = lambda _query: (query_type, 0.95)
+        router.model_stats["claude-sonnet-4-6"] = {
+            "success_rate": 0.99,
+            "avg_latency": 100,
+        }
+        return router
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "query_type", [QueryType.GENERAL, QueryType.CODE_GENERATION]
+    )
+    async def test_enterprise_rule_selects_sonnet_without_capability_check(
+        self, router_config, query_type
+    ):
+        router = self._build_enterprise_router(router_config, {}, query_type)
+
+        decision, _eligible = await self._route(router, user_tier=UserTier.ENTERPRISE)
+
+        assert decision.selected_model == "claude-sonnet-4-6"
+        assert "user_tier == 'enterprise'" in decision.routing_reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "query_type", [QueryType.GENERAL, QueryType.CODE_GENERATION]
+    )
+    async def test_enterprise_rule_skips_blocked_sonnet(
+        self, router_config, query_type
+    ):
+        router = self._build_enterprise_router(
+            router_config, {"blocked_models": ["claude-sonnet-4-6"]}, query_type
+        )
+
+        decision, _eligible = await self._route(router, user_tier=UserTier.ENTERPRISE)
+
+        assert decision.selected_model != "claude-sonnet-4-6"
+
+    @pytest.mark.asyncio
+    async def test_rule_routing_skips_blocked_model(self, router_config):
+        router = self._build_router(router_config, {"blocked_models": ["gpt-5"]})
+
+        decision, eligible = await self._route(router)
+
+        assert decision.selected_model != "gpt-5"
+        assert decision.selected_model in eligible
+
+    @pytest.mark.asyncio
+    async def test_rule_routing_skips_blocked_provider(self, router_config):
+        router = self._build_router(router_config, {"blocked_providers": ["openai"]})
+
+        decision, eligible = await self._route(router)
+
+        assert router.models[decision.selected_model].provider != "openai"
+        assert decision.selected_model in eligible
+
+    @pytest.mark.asyncio
+    async def test_rule_routing_respects_free_tier_access(self, router_config):
+        router = self._build_router(router_config, {})
+
+        decision, eligible = await self._route(router, user_tier=UserTier.FREE)
+
+        assert router.models[decision.selected_model].priority >= 3
+        assert decision.selected_model in eligible
+
+    @pytest.mark.asyncio
+    async def test_rule_routing_respects_context_window(self, router_config):
+        router = self._build_router(router_config, {}, token_count=6000)
+        # mistral-7b (4096-token window) now outscores gpt-5 among rule models.
+        router.model_stats["mistral-7b"] = {"success_rate": 0.99, "avg_latency": 50}
+
+        decision, eligible = await self._route(router, user_tier=UserTier.FREE)
+
+        assert router.models[decision.selected_model].max_tokens >= 6000
+        assert decision.selected_model in eligible
+
+    @pytest.mark.asyncio
+    async def test_rule_routing_uses_fallback_when_rule_models_filtered(
+        self, router_config
+    ):
+        config = dict(router_config)
+        config["routing_rules"] = [
+            {
+                "condition": "query_type == 'code_generation'",
+                "models": ["gpt-5"],
+                "fallback": "mistral-7b",
+            }
+        ]
+        router = self._build_router(config, {"blocked_models": ["gpt-5"]})
+
+        decision, eligible = await self._route(router)
+
+        # Capability routing would pick qwen3.6-27b-fast; the rule fallback wins.
+        assert decision.selected_model == "mistral-7b"
+        assert "query_type == 'code_generation'" in decision.routing_reason
+        assert "fallback" in decision.routing_reason.lower()
+        assert decision.selected_model in eligible
+
+    @pytest.mark.asyncio
+    async def test_rule_routing_moves_to_next_rule_when_fallback_filtered(
+        self, router_config
+    ):
+        config = dict(router_config)
+        config["routing_rules"] = [
+            {
+                "condition": "query_type == 'code_generation'",
+                "models": ["gpt-5"],
+                "fallback": "gpt-5",
+            },
+            {
+                "condition": "query_type == 'code_generation' and token_count < 1000",
+                "models": ["mistral-7b"],
+                "fallback": "mistral-7b",
+            },
+        ]
+        router = self._build_router(config, {"blocked_models": ["gpt-5"]})
+
+        decision, eligible = await self._route(router)
+
+        assert decision.selected_model == "mistral-7b"
+        assert "token_count < 1000" in decision.routing_reason
+        assert decision.selected_model in eligible
+
+    @pytest.mark.asyncio
+    async def test_rule_routing_falls_through_to_capability_routing(
+        self, router_config
+    ):
+        config = dict(router_config)
+        config["routing_rules"] = [
+            {
+                "condition": "query_type == 'code_generation'",
+                "models": ["gpt-5"],
+                "fallback": "gpt-5",
+            }
+        ]
+        router = self._build_router(config, {"blocked_providers": ["openai"]})
+
+        decision, eligible = await self._route(router)
+
+        assert decision.selected_model != "gpt-5"
+        assert "Capability-based selection" in decision.routing_reason
+        assert decision.selected_model in eligible

@@ -26,6 +26,16 @@ from src.utils.schema import (
 
 logger = logging.getLogger(__name__)
 
+# QueryRequest.query allows 50,000 chars. A query longer than head + tail is
+# classified on its first and last chars only, so a request typed after a long
+# paste still counts.
+CLASSIFIER_HEAD_CHARS = 2000
+CLASSIFIER_TAIL_CHARS = 2000
+# Bounded gap between keywords: like the old ".*" it stops at a newline (and so
+# crosses dots in "utils.py" or "3.12"), but it spans at most 80 chars, so the
+# classifier patterns cannot backtrack catastrophically on long input.
+_GAP = r"[^\n]{0,80}"
+
 
 @dataclass
 class RoutingRule:
@@ -57,22 +67,26 @@ class QueryClassifier:
         self.model = None
         self.tfidf_vectorizer = None
         self.patterns = self._init_patterns()
+        self._compiled_patterns: Dict[QueryType, List[re.Pattern[str]]] = {
+            query_type: [re.compile(pattern) for pattern in patterns]
+            for query_type, patterns in self.patterns.items()
+        }
         self._is_initialized = False
 
     def _init_patterns(self) -> Dict[QueryType, List[str]]:
         """Initialize regex patterns for query classification"""
         return {
             QueryType.CODE_GENERATION: [
-                r"\b(write|create|generate|implement|build)\b.*\b(function|class|code|script|program)\b",
-                r"\b(python|javascript|java|cpp|rust|go)\b.*\b(code|function|script)\b",
+                rf"\b(write|create|generate|implement|build)\b{_GAP}\b(function|class|code|script|program)\b",
+                rf"\b(python|javascript|java|cpp|rust|go)\b{_GAP}\b(code|function|script)\b",
                 r"def\s+\w+|class\s+\w+|function\s+\w+",
                 r"\b(algorithm|implementation|coding)\b",
             ],
             QueryType.CODE_ANALYSIS: [
-                r"\b(analyze|review|debug|fix|optimize|refactor)\b.*\b(code|function|script)\b",
-                r"\b(bug|error|issue|problem)\b.*\b(code|function)\b",
+                rf"\b(analyze|review|debug|fix|optimize|refactor)\b{_GAP}\b(code|function|script)\b",
+                rf"\b(bug|error|issue|problem)\b{_GAP}\b(code|function)\b",
                 r"\b(complexity|performance|optimization)\b",
-                r"what.*does.*this.*code.*do",
+                rf"what{_GAP}does{_GAP}this{_GAP}code{_GAP}do",
             ],
             QueryType.ANALYSIS: [
                 r"\b(analyze|examination|study|research|investigate)\b",
@@ -89,19 +103,19 @@ class QueryClassifier:
             QueryType.CREATIVE_WRITING: [
                 r"\b(story|poem|essay|article|blog)\b",
                 r"\b(creative|imaginative|fictional)\b",
-                r"\b(write|compose|craft)\b.*\b(story|poem|article)\b",
+                rf"\b(write|compose|craft)\b{_GAP}\b(story|poem|article)\b",
                 r"\b(character|plot|narrative|dialogue)\b",
             ],
             QueryType.BRAINSTORMING: [
                 r"\b(brainstorm|ideas|suggestions|alternatives)\b",
                 r"\b(creative thinking|ideation|innovation)\b",
-                r"what are some.*ideas",
+                rf"what are some{_GAP}ideas",
                 r"help me think of",
             ],
             QueryType.PLANNING: [
                 r"\b(plan|strategy|roadmap|timeline|schedule)\b",
                 r"\b(project planning|strategic planning)\b",
-                r"how to.*plan",
+                rf"how to{_GAP}plan",
                 r"\b(steps|phases|milestones)\b",
             ],
             QueryType.MATH: [
@@ -113,12 +127,12 @@ class QueryClassifier:
             QueryType.REASONING: [
                 r"\b(reasoning|logic|logical|deduce|infer)\b",
                 r"\b(because|therefore|hence|thus)\b",
-                r"why.*is.*that|how.*can.*we.*conclude",
+                rf"why{_GAP}is{_GAP}that|how{_GAP}can{_GAP}we{_GAP}conclude",
                 r"\b(premise|conclusion|argument)\b",
             ],
             QueryType.WEB_RESEARCH: [
                 r"\b(latest|today|current|recent|news|breaking|now)\b",
-                r"\b(price|stock|release|launched|announced|update)\b.*\b(today|latest|current|recent|now|202[0-9])\b",
+                rf"\b(price|stock|release|launched|announced|update)\b{_GAP}\b(today|latest|current|recent|now|202[0-9])\b",
                 r"\b(search|look up|web|internet|online)\b",
                 r"\b(what happened|what is happening)\b",
                 r"(查詢網頁|搜尋|最新|現在|今天|新聞|即時)",
@@ -153,18 +167,19 @@ class QueryClassifier:
         if not self._is_initialized:
             asyncio.create_task(self.initialize())
 
+        text = self._classification_text(query)
+
         # Pattern-based classification
         pattern_scores = {}
-        for query_type, patterns in self.patterns.items():
+        for query_type, patterns in self._compiled_patterns.items():
             score = 0.0
             for pattern in patterns:
-                matches = len(re.findall(pattern, query.lower()))
-                score += matches
+                score += len(pattern.findall(text))
             if score > 0:
                 pattern_scores[query_type] = score / len(patterns)
 
         # Keyword-based scoring
-        keyword_scores = self._keyword_classification(query)
+        keyword_scores = self._keyword_classification(text)
 
         # Combine scores
         combined_scores = {}
@@ -183,6 +198,15 @@ class QueryClassifier:
                 return best_type, min(confidence, 1.0)
 
         return QueryType.GENERAL, 0.5
+
+    def _classification_text(self, query: str) -> str:
+        """Lowercased text to classify: the whole query, or its head and tail."""
+        if len(query) <= CLASSIFIER_HEAD_CHARS + CLASSIFIER_TAIL_CHARS:
+            return query.lower()
+        # The newline keeps a pattern gap or a word from spanning the cut.
+        head = query[:CLASSIFIER_HEAD_CHARS]
+        tail = query[-CLASSIFIER_TAIL_CHARS:]
+        return f"{head}\n{tail}".lower()
 
     def _keyword_classification(self, query: str) -> Dict[QueryType, float]:
         """Keyword-based classification"""
@@ -1013,18 +1037,31 @@ class ModelRouter:
         if policy_selection is not None:
             return policy_selection
 
-        # Apply rule-based routing first
+        # Apply rule-based routing first. Rule candidates and the rule fallback
+        # pass the same guardrail, tier and context-window filter as every other
+        # path; a rule with nothing eligible defers to the next rule. Rules name
+        # their models explicitly, so the capability check is not applied.
         for rule in self.routing_rules:
-            if rule.matches(context):
-                available_models = [m for m in rule.models if m in self.models]
-                if available_models:
-                    # Select best model from rule candidates
-                    best_model = self._select_best_model(available_models, context)
-                    return ModelSelection(
-                        model_name=best_model,
-                        confidence=0.9,
-                        reason=f"Rule-based selection: {rule.condition}",
-                    )
+            if not rule.matches(context):
+                continue
+            available_models = self._filter_models_for_context(
+                rule.models, context, check_capability=False
+            )
+            if available_models:
+                best_model = self._select_best_model(available_models, context)
+                return ModelSelection(
+                    model_name=best_model,
+                    confidence=0.9,
+                    reason=f"Rule-based selection: {rule.condition}",
+                )
+            if self._filter_models_for_context(
+                [rule.fallback], context, check_capability=False
+            ):
+                return ModelSelection(
+                    model_name=rule.fallback,
+                    confidence=0.9,
+                    reason=f"Rule-based selection (fallback): {rule.condition}",
+                )
 
         # Fallback to capability-based routing
         return self._capability_based_routing(context)
@@ -1178,9 +1215,19 @@ class ModelRouter:
         )
 
     def _filter_models_for_context(
-        self, candidate_models: List[str], context: Dict[str, Any]
+        self,
+        candidate_models: List[str],
+        context: Dict[str, Any],
+        *,
+        check_capability: bool = True,
     ) -> List[str]:
-        """Filter candidate models against capability, token, and tier constraints."""
+        """Filter candidate models against capability, token, and tier constraints.
+
+        Guardrails (avoid/blocked models and providers), the context window and
+        the user tier always apply. ``check_capability=False`` skips only the
+        query-type capability check, for routing rules that name models
+        explicitly.
+        """
         query_type = context["query_type"]
         token_count = context["token_count"]
         user_tier = context["user_tier"]
@@ -1205,7 +1252,7 @@ class ModelRouter:
             provider_name = model_config.provider.lower()
             if provider_name in avoid_providers or provider_name in blocked_providers:
                 continue
-            if not self._has_capability(model_config, query_type):
+            if check_capability and not self._has_capability(model_config, query_type):
                 continue
             if token_count > model_config.max_tokens:
                 continue
