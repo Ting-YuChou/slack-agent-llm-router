@@ -21,6 +21,7 @@ from aiokafka.structs import TopicPartition
 import clickhouse_connect
 from clickhouse_connect.driver import Client
 
+from src.prompt_assembly import PROMPT_CONTENT_METADATA_KEYS
 from src.redaction import context_summary, redact, redact_text
 from src.routing_features import estimate_query_tokens
 from src.utils.logger import setup_logging
@@ -210,7 +211,14 @@ def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
         else None,
         "session_id": query_request.session_id,
         "conversation_id": query_request.conversation_id,
-        "metadata": redact(query_request.metadata or {}),
+        # Prompt content assembled in process (Slack memory hits) stays out.
+        "metadata": redact(
+            {
+                key: value
+                for key, value in (query_request.metadata or {}).items()
+                if key not in PROMPT_CONTENT_METADATA_KEYS
+            }
+        ),
         "attachments": attachments,
         "attachments_count": len(attachments),
     }

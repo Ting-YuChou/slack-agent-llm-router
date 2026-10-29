@@ -38,6 +38,14 @@ from src.llm_router_part1_router import (
     ModelRouter,
     PromptTooLargeError,
 )
+from src.prompt_assembly import (
+    RAG_UNAVAILABLE_STATUSES,
+    SYSTEM_PROMPT,
+    PromptSections,
+    build_prompt_sections,
+    join_prompt_sections,
+    with_system_prompt,
+)
 from src.provider_scheduler import (
     REQUEST_SHAPED_STATUS_CODES,
     ProviderCapacityScheduler,
@@ -77,15 +85,6 @@ class _LazyRedisNamespace:
 
 
 redis = _LazyRedisNamespace()
-
-
-@dataclass
-class PromptSections:
-    """Provider prompt sections split by cache stability."""
-
-    static_cache_prefix: List[str]
-    dynamic_context: List[str]
-    query: str
 
 
 @dataclass
@@ -635,21 +634,6 @@ def _exception_provider_request_id(exc: BaseException) -> Optional[str]:
     return _header_value(headers, "x-request-id")
 
 
-# Prompt line for a live web search that failed, or that a REQUIRED tool
-# policy needed but that found nothing: no web context reached the model.
-WEB_SEARCH_UNAVAILABLE_NOTICE = (
-    "Live web search failed or returned no results for this request, so no "
-    "current web information is included. Say that you cannot verify the "
-    "latest information, and do not present older knowledge as current."
-)
-# Retrieval outcomes that mean nobody knows what the documents say.
-_RAG_UNAVAILABLE_STATUSES = ("timeout", "error")
-# Prompt line for rag_policy AUTO when document search timed out or failed.
-RAG_UNAVAILABLE_NOTICE = (
-    "Document search was unavailable for this request, so this answer is not "
-    "grounded in the knowledge base. If the question depends on those "
-    "documents, say so instead of guessing what they contain."
-)
 # inference.retrieval_budget_ratio when unset or invalid.
 _DEFAULT_RETRIEVAL_BUDGET_RATIO = 0.5
 # Least time a retrieval step leaves before the request deadline, so its own
@@ -1198,48 +1182,16 @@ class BaseInferenceProvider(ABC):
         pass
 
     def _build_prompt(self, request: QueryRequest) -> str:
-        """Build a provider prompt that includes context plus extracted attachment content."""
-        sections = self._build_prompt_sections(request)
-        prompt_sections = [
-            *sections.static_cache_prefix,
-            *sections.dynamic_context,
-            sections.query,
-        ]
-        return "\n\n".join(section for section in prompt_sections if section)
+        """Build the user prompt: context, retrieved data, attachments, query.
+
+        The system prompt is not part of it; each provider sends that in its
+        own system slot (see `src.prompt_assembly`).
+        """
+        return join_prompt_sections(self._build_prompt_sections(request))
 
     def _build_prompt_sections(self, request: QueryRequest) -> PromptSections:
         """Split prompt into stable cache prefix, dynamic context, and user query."""
-        static_cache_prefix = []
-        dynamic_context = []
-
-        response_style_instructions = (request.metadata or {}).get(
-            "response_style_instructions"
-        )
-        if response_style_instructions:
-            static_cache_prefix.append(
-                f"Response style instructions:\n{response_style_instructions}"
-            )
-
-        attachment_prompt = self._build_attachment_prompt(request)
-        if attachment_prompt:
-            dynamic_context.append(attachment_prompt)
-        if request.context:
-            dynamic_context.append(f"Context: {request.context}")
-        rag_context = (request.metadata or {}).get("rag_context")
-        if rag_context:
-            dynamic_context.append(str(rag_context))
-        if (request.metadata or {}).get("rag_unavailable") in _RAG_UNAVAILABLE_STATUSES:
-            dynamic_context.append(RAG_UNAVAILABLE_NOTICE)
-        web_search_context = (request.metadata or {}).get("web_search_context")
-        if web_search_context:
-            dynamic_context.append(str(web_search_context))
-        if (request.metadata or {}).get("web_search_unavailable") is True:
-            dynamic_context.append(WEB_SEARCH_UNAVAILABLE_NOTICE)
-        return PromptSections(
-            static_cache_prefix=static_cache_prefix,
-            dynamic_context=dynamic_context,
-            query=f"Query: {request.query}",
-        )
+        return build_prompt_sections(request, self._build_attachment_prompt(request))
 
     def _prompt_cache_config(self) -> Dict[str, Any]:
         """Return provider prompt-cache config without assuming it exists."""
@@ -1466,7 +1418,7 @@ class OpenAIProvider(BaseInferenceProvider):
         request_kwargs: Dict[str, Any] = {
             "model": model_name,
             "input": provider_input,
-            "instructions": None,
+            "instructions": SYSTEM_PROMPT,
             "max_output_tokens": request.max_tokens,
         }
         reasoning_effort = self._reasoning_effort(request, model_name)
@@ -1667,6 +1619,7 @@ class AnthropicProvider(BaseInferenceProvider):
                 model=model_name,
                 max_tokens=request.max_tokens,
                 temperature=request.temperature,
+                system=self._build_system(),
                 messages=messages,
             )
 
@@ -1718,6 +1671,7 @@ class AnthropicProvider(BaseInferenceProvider):
                 model=model_name,
                 max_tokens=request.max_tokens,
                 temperature=request.temperature,
+                system=self._build_system(),
                 messages=messages,
             ) as stream:
                 async for text in stream.text_stream:
@@ -1774,6 +1728,13 @@ class AnthropicProvider(BaseInferenceProvider):
             )
         content.append({"type": "text", "text": sections.query})
         return [{"role": "user", "content": content}]
+
+    def _build_system(self) -> List[Dict[str, Any]]:
+        """The stable system prompt, cached with the prefix when enabled."""
+        block: Dict[str, Any] = {"type": "text", "text": SYSTEM_PROMPT}
+        if self._prompt_cache_enabled():
+            block["cache_control"] = self._anthropic_cache_control()
+        return [block]
 
     def _anthropic_cache_control(self) -> Dict[str, str]:
         """Build Anthropic cache_control while only allowing supported TTLs."""
@@ -2142,6 +2103,14 @@ class vLLMProvider(BaseInferenceProvider):
                 "logprobs": None,
             },
         )
+
+    def _build_prompt(self, request: QueryRequest) -> str:
+        """Lead the one user message with the system prompt.
+
+        Some chat templates (Mistral's) reject a system role, so vLLM gets
+        no separate system message; completions mode uses the same text.
+        """
+        return with_system_prompt(super()._build_prompt(request))
 
     def _build_chat_messages(self, prompt: str) -> List[Dict[str, str]]:
         """Build OpenAI-compatible chat messages for vLLM chat templates."""
@@ -3191,7 +3160,7 @@ class InferenceEngine:
             min_score=min_score,
         )
         results = list(outcome.results)
-        rag_unavailable = outcome.status in _RAG_UNAVAILABLE_STATUSES
+        rag_unavailable = outcome.status in RAG_UNAVAILABLE_STATUSES
         latency_ms = int((time.time() - started_at) * 1000)
         tool_call = self.rag_service.tool_call_from_results(
             request.query,

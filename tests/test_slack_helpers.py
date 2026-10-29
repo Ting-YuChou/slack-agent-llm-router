@@ -1960,13 +1960,15 @@ class TestSlackAgentApprovals:
         )
         other_channel_request = inference_engine.process_query.await_args.args[0]
 
-        assert "Long-term user memory:" in hit_request.context
-        assert "Prefer Python examples" in hit_request.context
-        assert "Prefer concise answers everywhere" in hit_request.context
+        hit_memory = hit_request.metadata["memory_context"]
+        other_channel_memory = other_channel_request.metadata["memory_context"]
+        assert "Long-term user memory:" in hit_memory
+        assert "Prefer Python examples" in hit_memory
+        assert "Prefer concise answers everywhere" in hit_memory
         assert "memory_hit_count" not in hit_request.metadata
-        assert "Long-term user memory:" in other_channel_request.context
-        assert "Prefer Python examples" not in other_channel_request.context
-        assert "Prefer concise answers everywhere" in other_channel_request.context
+        assert "Long-term user memory:" in other_channel_memory
+        assert "Prefer Python examples" not in other_channel_memory
+        assert "Prefer concise answers everywhere" in other_channel_memory
 
     def test_extract_team_id_and_memory_scope(self):
         bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
