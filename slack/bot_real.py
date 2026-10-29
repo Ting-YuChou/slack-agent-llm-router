@@ -1670,8 +1670,17 @@ class SlackMessageHandler:
         team_id = self.bot._extract_team_id(event)
         attachments = list(event.get("_query_attachments", []) or [])
 
+        is_agent_thread = getattr(self.bot, "_is_agent_thread", lambda *_args: False)
+        in_agent_thread = bool(event.get("thread_ts")) and is_agent_thread(
+            channel_id, event.get("thread_ts")
+        )
+        # The chat path does not download an Agent thread's files.
+        agent_files = [
+            item for item in event.get("files") or [] if isinstance(item, dict)
+        ]
+
         # Check if it's a command
-        if not text and not attachments:
+        if not text and not attachments and not (in_agent_thread and agent_files):
             return await self._handle_help_command([], user_id, channel_id, client)
 
         command_text = self.extract_prefixed_command_text(text)
@@ -1689,11 +1698,12 @@ class SlackMessageHandler:
 
         if not text and attachments:
             text = self._build_attachment_only_query(attachments)
+        elif not text and in_agent_thread:
+            text = self._files_only_query(
+                [str(item.get("name") or "") for item in agent_files]
+            )
 
-        is_agent_thread = getattr(self.bot, "_is_agent_thread", lambda *_args: False)
-        if event.get("thread_ts") and is_agent_thread(
-            channel_id, event.get("thread_ts")
-        ):
+        if in_agent_thread:
             flags = self._parse_followup_agent_flags(text)
             if flags.error:
                 return flags.error
@@ -3352,7 +3362,11 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
 
     def _build_attachment_only_query(self, attachments: List[Attachment]) -> str:
         """Create a fallback query when a Slack message only contains files."""
-        attachment_names = ", ".join(attachment.name for attachment in attachments[:3])
+        return self._files_only_query([attachment.name for attachment in attachments])
+
+    @staticmethod
+    def _files_only_query(names: List[str]) -> str:
+        attachment_names = ", ".join(name for name in names[:3] if name)
         if attachment_names:
             return f"Analyze the attached Slack file(s): {attachment_names}"
         return "Analyze the attached Slack file(s)."
@@ -4038,9 +4052,11 @@ class SlackBot:
                     channel_id, reply_thread_ts
                 )
 
-            attachments = await self._extract_query_attachments(event)
-            if attachments:
-                event["_query_attachments"] = attachments
+            if not agent_request:
+                # An Agent request loads its own files, as untrusted context.
+                attachments = await self._extract_query_attachments(event)
+                if attachments:
+                    event["_query_attachments"] = attachments
 
             # Process message through handler
             response_text = await self.message_handler.handle_message(

@@ -538,3 +538,97 @@ def test_schema_accepts_the_footer_setting():
 
     assert SlackResponseSettingsConfig().answer_footer is True
     assert SlackResponseSettingsConfig(answer_footer=False).answer_footer is False
+
+
+# S6b: Agent requests download their own files
+
+
+def agent_thread_bot():
+    bot = delivery_bot()
+    bot.agent_threads[bot._thread_key("C1", "100.0")] = {
+        "channel_id": "C1",
+        "thread_ts": "100.0",
+        "owner_user_id": "U1",
+    }
+    bot._extract_query_attachments = AsyncMock(return_value=[])
+    bot.agent_bootstrap_builder = SimpleNamespace(
+        build_message_files=AsyncMock(
+            return_value=SimpleNamespace(
+                prompt="task with files",
+                resource_count=1,
+                truncated=False,
+                partial=False,
+                warnings=[],
+            )
+        )
+    )
+    bot.message_handler._start_agent_prompt = AsyncMock(return_value="started")
+    return bot
+
+
+def agent_followup(text):
+    return {
+        "type": "message",
+        "subtype": "file_share",
+        "channel": "C1",
+        "user": "U1",
+        "text": text,
+        "thread_ts": "100.0",
+        "ts": "101.0",
+        "files": [{"id": "F1", "name": "trace.log"}],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["look at this log", ""], ids=["text", "files-only"])
+async def test_agent_thread_files_are_not_downloaded_by_the_chat_path(text):
+    bot = agent_thread_bot()
+
+    await bot._process_message(agent_followup(text))
+
+    bot._extract_query_attachments.assert_not_awaited()
+    build = bot.agent_bootstrap_builder.build_message_files
+    build.assert_awaited_once()
+    assert build.await_args.kwargs["files"] == [{"id": "F1", "name": "trace.log"}]
+    start = bot.message_handler._start_agent_prompt
+    start.assert_awaited_once()
+    assert start.await_args.args[0] == "task with files"
+    if not text:
+        assert "trace.log" in build.await_args.kwargs["task"]
+
+
+@pytest.mark.asyncio
+async def test_agent_command_with_files_is_not_downloaded_by_the_chat_path(
+    monkeypatch,
+):
+    bot = delivery_bot()
+    bot._extract_query_attachments = AsyncMock(return_value=[])
+    handle_command = AsyncMock(return_value="agent started")
+    monkeypatch.setattr(bot.message_handler, "_handle_command", handle_command)
+
+    await bot._process_message(
+        top_level(
+            text="!llm agent fix the failing test",
+            subtype="file_share",
+            files=[{"id": "F1", "name": "trace.log"}],
+        )
+    )
+
+    bot._extract_query_attachments.assert_not_awaited()
+    handle_command.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_chat_files_are_still_downloaded(inference_response_factory):
+    bot = delivery_bot(answering(inference_response_factory, "it is a log"))
+    bot._extract_query_attachments = AsyncMock(return_value=[])
+
+    await bot._process_message(
+        top_level(
+            text="what is this?",
+            subtype="file_share",
+            files=[{"id": "F1", "name": "trace.log"}],
+        )
+    )
+
+    bot._extract_query_attachments.assert_awaited_once()
