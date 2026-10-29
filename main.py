@@ -46,6 +46,12 @@ from src.admission import (
     RedisAdmissionController,
 )
 from src.agent_runtime import AgentRuntimeClient
+from src.api_security import (
+    AttachmentRejected,
+    RequestBodyLimitMiddleware,
+    strip_server_only_metadata,
+    validate_external_attachments,
+)
 from src.llm_router_part1_router import ModelRouter
 from src.llm_router_part2_inference import InferenceEngine
 from src.rag.service import (
@@ -805,6 +811,35 @@ class LLMRouterPlatform:
         if decision.allowed:
             return None, decision.reservation
         return self._build_admission_response(decision), None
+
+    def _apply_route_boundary_guards(
+        self, query_data: QueryRequest
+    ) -> Optional[JSONResponse]:
+        """Sanitize an external /route request before admission and inference.
+
+        Only POST /route runs this: the Slack bot builds its requests (and
+        their server-side metadata) in-process.
+        """
+        removed = strip_server_only_metadata(query_data)
+        if removed:
+            self.logger.info(
+                "Dropped server-only metadata keys from external request %s: %s",
+                query_data.request_id,
+                ", ".join(removed),
+            )
+        max_attachment_bytes = int(
+            self._security_config().get("max_attachment_bytes") or 1024 * 1024
+        )
+        try:
+            validate_external_attachments(
+                query_data, max_attachment_bytes=max_attachment_bytes
+            )
+        except AttachmentRejected as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"error": exc.error, "message": exc.message},
+            )
+        return None
 
     async def _release_admission_reservation(
         self,
@@ -1813,6 +1848,19 @@ class LLMRouterPlatform:
                 },
             )
 
+        # Added last, so it is the outermost middleware: oversized bodies are
+        # rejected before authentication, admission or JSON parsing.
+        security_config = self._security_config()
+        app.add_middleware(
+            RequestBodyLimitMiddleware,
+            max_body_bytes=int(
+                security_config.get("max_request_body_bytes") or 2 * 1024 * 1024
+            ),
+            exempt_paths=list(
+                security_config.get("request_body_limit_exempt_paths") or []
+            ),
+        )
+
         @app.get("/")
         async def service_index():
             return {
@@ -1849,6 +1897,11 @@ class LLMRouterPlatform:
             active_requests = getattr(SYSTEM_METRICS, "active_requests", None)
 
             try:
+                boundary_response = self._apply_route_boundary_guards(query_data)
+                if boundary_response is not None:
+                    status_code = boundary_response.status_code
+                    return boundary_response
+
                 admission_response, route_reservation = await self._admit_route_request(
                     query_data
                 )

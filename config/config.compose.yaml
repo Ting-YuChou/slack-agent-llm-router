@@ -728,6 +728,13 @@ policy_cache:
     group_id: llm-router-policy-materializer
 
 security:
+  # Bodies above this get 413 before parsing; RAG ingestion paths keep their
+  # own document limits.
+  max_request_body_bytes: 2097152
+  request_body_limit_exempt_paths:
+    - /rag/documents
+    - /rag/batches
+  max_attachment_bytes: 1048576
   api_keys:
     enabled: true
     header_name: X-API-Key

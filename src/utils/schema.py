@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 import uuid
 
 from pydantic import (
@@ -60,12 +60,14 @@ class AttachmentType(str, Enum):
 
 
 class Attachment(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    name: str
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), max_length=128)
+    name: str = Field(..., max_length=1024)
     type: AttachmentType
+    # Declared size. POST /route rejects a mismatch with len(content); in-process
+    # callers build attachments directly, so the schema does not compare them.
     size_bytes: int
-    mime_type: str
-    url: Optional[str] = None
+    mime_type: str = Field(..., max_length=255)
+    url: Optional[str] = Field(None, max_length=4096)
     content: Optional[bytes] = None
 
     @field_validator("size_bytes")
@@ -113,16 +115,19 @@ class ToolCall(BaseModel):
     error: Optional[str] = None
 
 
+BoundedName = Annotated[str, Field(max_length=256)]
+
+
 class QueryRequest(BaseModel):
     _rag_images: List[Any] = PrivateAttr(default_factory=list)
 
     # Required fields
     query: str = Field(..., min_length=1, max_length=50000)
-    user_id: str = Field(..., min_length=1)
+    user_id: str = Field(..., min_length=1, max_length=256)
 
     # Core fields with proper types
     user_tier: UserTier = UserTier.FREE
-    request_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    request_id: str = Field(default_factory=lambda: str(uuid.uuid4()), max_length=128)
     timestamp: datetime = Field(default_factory=utc_now)
 
     # Optional context and settings
@@ -145,17 +150,17 @@ class QueryRequest(BaseModel):
 
     # Tool handling
     tool_policy: ToolPolicy = ToolPolicy.AUTO
-    allowed_tools: List[str] = Field(default_factory=list)
+    allowed_tools: List[BoundedName] = Field(default_factory=list, max_length=32)
     web_search_options: Optional[WebSearchOptions] = None
 
     # RAG handling
     rag_policy: RagPolicy = RagPolicy.AUTO
-    knowledge_base_ids: List[str] = Field(default_factory=list)
+    knowledge_base_ids: List[BoundedName] = Field(default_factory=list, max_length=32)
     rag_options: Optional["RagOptions"] = None
 
     # Additional metadata
-    session_id: Optional[str] = None
-    conversation_id: Optional[str] = None
+    session_id: Optional[str] = Field(None, max_length=256)
+    conversation_id: Optional[str] = Field(None, max_length=256)
     metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
     @field_validator("query")
@@ -988,6 +993,14 @@ class SecurityConfig(ConfigModel):
     api_keys: ApiKeysSecurityConfig = Field(default_factory=ApiKeysSecurityConfig)
     jwt: JwtSecurityConfig = Field(default_factory=JwtSecurityConfig)
     cors: CorsSecurityConfig = Field(default_factory=CorsSecurityConfig)
+    # Request bodies above this size get 413 before they are parsed.
+    max_request_body_bytes: int = Field(2 * 1024 * 1024, ge=1)
+    # Document ingestion endpoints enforce their own, larger limits.
+    request_body_limit_exempt_paths: List[str] = Field(
+        default_factory=lambda: ["/rag/documents", "/rag/batches"]
+    )
+    # POST /route rejects any attachment declared or sent above this size.
+    max_attachment_bytes: int = Field(1024 * 1024, ge=1)
 
 
 class DatabasePoolConfig(ConfigModel):
