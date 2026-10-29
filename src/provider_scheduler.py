@@ -424,6 +424,10 @@ class ProviderCapacityScheduler:
         self.fallback_reserve_ratio = min(
             max(float(0.3 if reserve_ratio is None else reserve_ratio), 0.0), 0.95
         )
+        min_window = self.config.get("min_attempt_window_seconds", 1.0)
+        self.min_attempt_window_seconds = max(
+            0.0, float(1.0 if min_window is None else min_window)
+        )
         self.key_prefix = str(self.config.get("key_prefix", "provider_scheduler"))
         self.admission_controller = admission_controller
         self.redis_client = redis_client
@@ -477,6 +481,12 @@ class ProviderCapacityScheduler:
         ``reserve_attempts`` of the request's shared attempts are left, so a
         primary that keeps failing leaves its fallback an attempt. The first
         attempt always runs.
+
+        An attempt (or retry) whose window would be shorter than
+        min_attempt_window_seconds (capped at the provider timeout) is not
+        started. A timeout counts against the circuit only when the attempt
+        had its whole provider timeout: one cut short by the deadline or the
+        reserve says nothing about the provider.
         """
         if not self.enabled:
             self._record_decision(provider, model_name, "allowed", "disabled")
@@ -503,14 +513,23 @@ class ProviderCapacityScheduler:
         )
         last_exc: Optional[Exception] = None
         local_attempt = 0
+        min_window = self._min_attempt_window(attempt_timeout_seconds)
+
+        def too_short(window: float) -> bool:
+            return window <= 0 or window < min_window
+
         while local_attempt < attempts:
             budget.ensure_available()
             attempt_timeout = budget.attempt_timeout_seconds(
                 attempt_timeout_seconds, fallback_reserve_seconds
             )
-            if attempt_timeout <= 0:
-                # What is left of the deadline belongs to the fallback route.
-                raise asyncio.TimeoutError("provider attempt window exhausted")
+            if too_short(attempt_timeout):
+                # Too little of the deadline is left (or the rest is held for
+                # the fallback) for a provider call to be worth starting.
+                raise asyncio.TimeoutError("request execution deadline exceeded")
+            window_cut_short = (
+                not attempt_timeout_seconds or attempt_timeout < attempt_timeout_seconds
+            )
             lease: Optional[SchedulerLease] = None
             response = None
             operation_started = False
@@ -544,28 +563,13 @@ class ProviderCapacityScheduler:
                     self._record_retry_metric(provider, model_name, "success")
                 return response
             except asyncio.CancelledError:
-                if operation_started and budget.remaining_seconds <= 0:
-                    # The request deadline cancelled a call still waiting on
-                    # the provider: a hang, the same as an attempt timeout.
-                    try:
-                        await self.record_failure(
-                            provider=provider,
-                            model_name=model_name,
-                            error=asyncio.TimeoutError(
-                                "request execution deadline exceeded"
-                            ),
-                            request_started_at_ms=request_started_at_ms,
-                            circuit_permit=lease.circuit_permit if lease else None,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Circuit failure transition failed after a provider hang",
-                            exc_info=True,
-                        )
                 raise
             except Exception as exc:
                 last_exc = exc
-                if operation_started:
+                timed_out_early = window_cut_short and isinstance(
+                    exc, asyncio.TimeoutError
+                )
+                if operation_started and not timed_out_early:
                     await self.record_failure(
                         provider=provider,
                         model_name=model_name,
@@ -581,13 +585,17 @@ class ProviderCapacityScheduler:
                     <= max(0, reserve_attempts)
                     or budget.remaining_seconds <= 0
                     or not self._is_retryable_exception(exc)
-                    # Another try would eat into the time held for the fallback.
+                    # After the backoff, another try would get too short a
+                    # window or eat into the time held for the fallback.
                     or (
-                        fallback_reserve_seconds > 0
-                        and budget.attempt_timeout_seconds(
-                            None, fallback_reserve_seconds
+                        (fallback_reserve_seconds > 0 or min_window > 0)
+                        and too_short(
+                            budget.attempt_timeout_seconds(
+                                attempt_timeout_seconds,
+                                fallback_reserve_seconds
+                                + self._retry_backoff_seconds(local_attempt),
+                            )
                         )
-                        <= self._retry_backoff_seconds(local_attempt)
                     )
                 ):
                     raise
@@ -714,6 +722,16 @@ class ProviderCapacityScheduler:
                 in SCHEDULER_FALLBACK_REASONS
             )
         return str(decision.reason) in SCHEDULER_FALLBACK_REASONS
+
+    def _min_attempt_window(self, provider_timeout_seconds: Optional[float]) -> float:
+        """Shortest window worth starting a provider attempt in.
+
+        Capped at the provider timeout. Without one (direct callers), there
+        is nothing to compare with and any window is used.
+        """
+        if not provider_timeout_seconds or provider_timeout_seconds <= 0:
+            return 0.0
+        return min(self.min_attempt_window_seconds, float(provider_timeout_seconds))
 
     def is_availability_failure(self, exc: BaseException) -> bool:
         """Whether exc says the model is unavailable, not that the request is bad.

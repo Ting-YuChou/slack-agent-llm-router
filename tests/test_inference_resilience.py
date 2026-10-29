@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from src.admission import AdmissionDecision
 from src.llm_router_part2_inference import (
     AnthropicProvider,
+    BaseInferenceProvider,
     InferenceEngine,
     OpenAIProvider,
     vLLMProvider,
@@ -82,6 +83,32 @@ class _Admission:
         return True
 
 
+class _TimedProvider(BaseInferenceProvider):
+    """A provider with a real provider timeout; delay=None hangs."""
+
+    def __init__(self, provider_name, delay, *, timeout=60):
+        super().__init__({"timeout": timeout})
+        self.provider_name = provider_name
+        self.delay = delay
+        self.calls = []
+
+    async def initialize(self):
+        return None
+
+    async def generate_response(self, request, model_name):
+        self.calls.append(model_name)
+        if self.delay is None:
+            await _hang()
+        await asyncio.sleep(self.delay)
+        return _response(model_name, self.provider_name)
+
+    async def stream_response(self, request, model_name):
+        yield ""
+
+    def get_health_status(self):
+        return {}
+
+
 _CIRCUIT = {
     "failure_mode": "open",
     "circuit_breaker": {"enabled": True, "failure_threshold": 1},
@@ -111,6 +138,7 @@ def _mock_engine(providers, *, scheduler, admission=None):
 
 def test_scheduler_config_reserves_thirty_percent_for_fallback_by_default():
     assert ProviderSchedulerConfig().fallback_reserve_ratio == 0.3
+    assert ProviderSchedulerConfig().min_attempt_window_seconds == 1.0
     with pytest.raises(ValidationError):
         ProviderSchedulerConfig(fallback_reserve_ratio=1.0)
 
@@ -207,14 +235,30 @@ async def test_hung_primary_leaves_time_for_fallback_within_deadline():
 
 
 @pytest.mark.asyncio
-async def test_hung_primary_attempt_counts_against_its_circuit():
+@pytest.mark.parametrize(
+    ("provider_timeout", "expected_failures"),
+    [
+        # The attempt had its whole provider timeout: a real hang.
+        pytest.param(0.05, 1, id="full-provider-timeout"),
+        # The fallback reserve cut the attempt short: says nothing about it.
+        pytest.param(60, 0, id="window-cut-by-reserve"),
+    ],
+)
+async def test_hung_primary_counts_against_its_circuit_only_after_a_full_timeout(
+    provider_timeout, expected_failures
+):
     engine = _mock_engine(
         {"gpt-5": "openai", "mistral-7b": "vllm"},
-        scheduler={"request_deadline_seconds": 0.3, **_CIRCUIT, **_RETRY},
+        scheduler={
+            "request_deadline_seconds": 0.3,
+            "min_attempt_window_seconds": 0,
+            **_CIRCUIT,
+            **_RETRY,
+        },
         admission=_Admission(),
     )
     engine.providers = {
-        "openai": SimpleNamespace(generate_response=_hang),
+        "openai": _TimedProvider("openai", None, timeout=provider_timeout),
         "vllm": SimpleNamespace(
             generate_response=AsyncMock(return_value=_response("mistral-7b", "vllm"))
         ),
@@ -230,7 +274,7 @@ async def test_hung_primary_attempt_counts_against_its_circuit():
     assert model_name == "mistral-7b"
     assert response.model_name == "mistral-7b"
     state = await engine.scheduler._read_circuit_state("openai", "gpt-5")
-    assert state["state"] == "open"
+    assert state.get("failure_count", 0) == expected_failures
     vllm_state = await engine.scheduler._read_circuit_state("vllm", "mistral-7b")
     assert vllm_state.get("failure_count", 0) == 0
 
@@ -306,13 +350,9 @@ class _ControlledBudget(RequestExecutionBudget):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("deadline_passed", "expected_state"),
-    [(True, "open"), (False, None)],
-    ids=["deadline", "caller-went-away"],
+    "deadline_passed", [True, False], ids=["deadline", "caller-went-away"]
 )
-async def test_deadline_cancellation_of_a_hung_call_counts_as_circuit_failure(
-    deadline_passed, expected_state
-):
+async def test_cancelled_call_is_not_a_circuit_failure(deadline_passed):
     scheduler = ProviderCapacityScheduler(_CIRCUIT, _Admission())
     budget = _ControlledBudget(max_attempts=1, deadline_seconds=5)
     started = asyncio.Event()
@@ -337,8 +377,121 @@ async def test_deadline_cancellation_of_a_hung_call_counts_as_circuit_failure(
     with pytest.raises(asyncio.CancelledError):
         await task
 
+    # A deadline that cancels a call cut its window short, like the reserve.
     state = await scheduler._read_circuit_state("openai", "gpt-5")
-    assert state.get("state") == expected_state
+    assert state.get("failure_count", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_timeout_of_a_window_cut_by_the_deadline_is_not_a_circuit_failure():
+    scheduler = ProviderCapacityScheduler(
+        {**_CIRCUIT, "min_attempt_window_seconds": 0}, _Admission()
+    )
+
+    with pytest.raises(asyncio.TimeoutError):
+        await scheduler.run_provider_call(
+            request=_request(),
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+            operation=_hang,
+            execution_budget=RequestExecutionBudget(
+                max_attempts=1, deadline_seconds=0.05
+            ),
+            attempt_timeout_seconds=5,
+        )
+
+    state = await scheduler._read_circuit_state("openai", "gpt-5")
+    assert state.get("failure_count", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_attempt_with_less_than_the_minimum_window_never_starts():
+    admission = _Admission()
+    scheduler = ProviderCapacityScheduler(
+        {**_CIRCUIT, "min_attempt_window_seconds": 1.0}, admission
+    )
+    operation = AsyncMock(side_effect=_hang)
+
+    started = time.monotonic()
+    with pytest.raises(asyncio.TimeoutError):
+        await scheduler.run_provider_call(
+            request=_request(),
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+            operation=operation,
+            execution_budget=RequestExecutionBudget(
+                max_attempts=3, deadline_seconds=0.5
+            ),
+            attempt_timeout_seconds=5,
+        )
+
+    assert time.monotonic() - started < 0.1
+    operation.assert_not_awaited()
+    assert admission.calls == []
+    state = await scheduler._read_circuit_state("openai", "gpt-5")
+    assert state.get("failure_count", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_retry_is_not_started_with_less_than_the_minimum_window_left():
+    scheduler = ProviderCapacityScheduler(
+        {
+            "min_attempt_window_seconds": 0.1,
+            "retry": {"max_attempts_per_request": 3, "initial_backoff_ms": 50},
+        },
+        _Admission(),
+    )
+    operation = AsyncMock(side_effect=_StatusError(503))
+
+    # After the 50 ms backoff only ~70 ms would be left for the retry.
+    with pytest.raises(_StatusError):
+        await scheduler.run_provider_call(
+            request=_request(),
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+            operation=operation,
+            execution_budget=RequestExecutionBudget(
+                max_attempts=3, deadline_seconds=0.12
+            ),
+            attempt_timeout_seconds=5,
+        )
+
+    assert operation.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_slow_rag_does_not_open_healthy_providers_circuits():
+    engine = _chain_engine(
+        _router(),
+        None,
+        scheduler=_shipped_scheduler(request_deadline_seconds=1.0),
+        admission=_Admission(),
+    )
+    openai_provider = _TimedProvider("openai", 0.1)
+    anthropic_provider = _TimedProvider("anthropic", 0.1)
+    engine.providers = {"openai": openai_provider, "anthropic": anthropic_provider}
+
+    async def slow_rag(*_args):
+        await asyncio.sleep(0.93)
+        return None
+
+    engine._run_rag_if_needed = slow_rag
+
+    response = await engine.process_query(_request(**_ENTERPRISE))
+
+    # ~70 ms were left: too little for either provider, so neither is called.
+    assert response.error == "inference_failed"
+    assert openai_provider.calls == []
+    assert anthropic_provider.calls == []
+    for provider, model in (
+        ("openai", "gpt-5"),
+        ("anthropic", "claude-sonnet-4-6"),
+    ):
+        state = await engine.scheduler._read_circuit_state(provider, model)
+        assert state.get("failure_count", 0) == 0, provider
 
 
 @pytest.mark.asyncio
@@ -846,6 +999,7 @@ def test_shipped_configs_chain_gpt5_and_claude_both_ways(config_name):
 
     assert config.inference.fallback.chains == _CHAINS
     assert config.inference.scheduler.fallback_reserve_ratio == 0.3
+    assert config.inference.scheduler.min_attempt_window_seconds == 1.0
     for model, chain in config.inference.fallback.chains.items():
         assert {model, *chain} <= set(config.router.models)
 

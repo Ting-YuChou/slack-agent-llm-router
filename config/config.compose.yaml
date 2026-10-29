@@ -223,6 +223,7 @@ inference:
     key_prefix: provider_scheduler
     request_deadline_seconds: 60
     fallback_reserve_ratio: 0.3
+    min_attempt_window_seconds: 1.0
     retry:
       max_attempts_per_request: 3
       initial_backoff_ms: 100
