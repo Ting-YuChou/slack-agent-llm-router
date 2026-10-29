@@ -149,8 +149,19 @@ SLACK_RESPONSE_WARNING_NOTES = {
         "_Note: part of the answer was withheld by the model's content filter._"
     ),
     "empty_response": (
-        "_Note: the model returned almost no text, so the answer may be " "incomplete._"
+        "_Note: the model returned almost no text, so the answer may be incomplete._"
     ),
+}
+# The same, as a plain-text label that leads the answer in history: the
+# conversation summary keeps only each message's first 200 characters.
+SLACK_RESPONSE_WARNING_LABELS = {
+    "rag_unavailable": "document search was unavailable",
+    "rag_degraded": "document search only partly worked",
+    "web_search_unavailable": "live web search was unavailable",
+    "response_truncated": "answer was cut off",
+    "response_incomplete": "answer may be incomplete",
+    "response_filtered": "part of the answer was withheld by the content filter",
+    "empty_response": "model returned almost no text",
 }
 # The windows UserManager.check_rate_limit counts requests in.
 RATE_LIMIT_WINDOW_SECONDS = 3600
@@ -1224,16 +1235,33 @@ def _retry_wait(retry_after_seconds: Any) -> Optional[str]:
     return None
 
 
-def _response_warning_notes(warnings: Any, *, skip: Tuple[str, ...] = ()) -> str:
-    """The notes for a response's known warnings, each once, in a fixed order."""
+def _known_response_warnings(warnings: Any, *, skip: Tuple[str, ...] = ()) -> List[str]:
+    """A response's warnings that have a note, each once, in a fixed order."""
     if not isinstance(warnings, (list, tuple)):
-        return ""
-    known = {str(warning).split(":", 1)[0] for warning in warnings}
+        return []
+    present = {str(warning).split(":", 1)[0] for warning in warnings}
+    return [
+        warning
+        for warning in SLACK_RESPONSE_WARNING_NOTES
+        if warning in present and warning not in skip
+    ]
+
+
+def _response_warning_notes(warnings: Any, *, skip: Tuple[str, ...] = ()) -> str:
+    """The Slack notes for a response's known warnings."""
     return "\n".join(
-        note
-        for warning, note in SLACK_RESPONSE_WARNING_NOTES.items()
-        if warning in known and warning not in skip
+        SLACK_RESPONSE_WARNING_NOTES[warning]
+        for warning in _known_response_warnings(warnings, skip=skip)
     )
+
+
+def _response_warning_label(warnings: Any) -> str:
+    """The plain-text history label for a response's known warnings."""
+    labels = [
+        SLACK_RESPONSE_WARNING_LABELS[warning]
+        for warning in _known_response_warnings(warnings)
+    ]
+    return f"[{'; '.join(labels)}]" if labels else ""
 
 
 # Admission reasons that are the user's own quota (src/admission.py), and how
@@ -3096,16 +3124,21 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 notes = _response_warning_notes(warnings, skip=("empty_response",))
                 return "\n\n".join(filter(None, [SLACK_EMPTY_ANSWER_MESSAGE, notes]))
 
-            # A degraded answer says so, here and in history, so the
-            # conversation never treats a cut-off answer as complete.
+            # A degraded answer says so, in Slack after it and in history
+            # before it, so the conversation never treats a cut-off answer
+            # as complete: the summary keeps each message's first 200 chars.
             answer = response.response_text
             notes = _response_warning_notes(warnings)
+            label = _response_warning_label(warnings)
             if notes:
                 answer = f"{answer.rstrip()}\n\n{notes}"
 
             # Add to conversation history
             context.add_message("user", text)
-            context.add_message("assistant", answer)
+            context.add_message(
+                "assistant",
+                f"{label} {response.response_text}" if label else answer,
+            )
 
             # Update metrics
             SLACK_METRICS.messages_processed.labels(user_tier=user_tier.value).inc()

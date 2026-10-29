@@ -641,28 +641,54 @@ async def answer_with(inference_response_factory, text, warnings, **fields):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "warning,note",
+    "warning,note,label",
     [
         (
             "rag_unavailable",
             "_Note: document search was unavailable, so this answer isn't "
             "based on your documents._",
+            "[document search was unavailable]",
         ),
-        ("rag_unavailable:timeout", "_Note: document search was unavailable"),
-        ("rag_degraded", "_Note: document search only partly worked"),
+        (
+            "rag_unavailable:timeout",
+            "_Note: document search was unavailable",
+            "[document search was unavailable]",
+        ),
+        (
+            "rag_degraded",
+            "_Note: document search only partly worked",
+            "[document search only partly worked]",
+        ),
         (
             "web_search_unavailable",
             "_Note: live web search was unavailable; recent information "
             "couldn't be checked._",
+            "[live web search was unavailable]",
         ),
-        ("response_truncated", "_Note: the answer was cut off._"),
-        ("response_incomplete", "_Note: the answer may be incomplete._"),
-        ("response_filtered", "_Note: part of the answer was withheld"),
-        ("empty_response", "_Note: the model returned almost no text"),
+        (
+            "response_truncated",
+            "_Note: the answer was cut off._",
+            "[answer was cut off]",
+        ),
+        (
+            "response_incomplete",
+            "_Note: the answer may be incomplete._",
+            "[answer may be incomplete]",
+        ),
+        (
+            "response_filtered",
+            "_Note: part of the answer was withheld",
+            "[part of the answer was withheld by the content filter]",
+        ),
+        (
+            "empty_response",
+            "_Note: the model returned almost no text",
+            "[model returned almost no text]",
+        ),
     ],
 )
 async def test_a_degraded_answer_is_posted_and_remembered_with_a_note(
-    inference_response_factory, warning, note
+    inference_response_factory, warning, note, label
 ):
     bot, posted = await answer_with(
         inference_response_factory, "a partial answer", [warning]
@@ -670,12 +696,34 @@ async def test_a_degraded_answer_is_posted_and_remembered_with_a_note(
 
     assert posted.startswith("a partial answer\n\n_Note: ")
     assert note in posted
-    # The conversation stays honest: the next request sees the note too.
+    # The conversation stays honest: history leads with a plain-text label,
+    # which survives the summary's cut to each message's first 200 chars.
     assert history(bot, "200.0")[-1] == {
         "role": "assistant",
-        "content": posted,
+        "content": f"{label} a partial answer",
         "timestamp": ANY,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("length", [600, 190], ids=["long", "short"])
+async def test_the_next_request_sees_that_the_last_answer_was_cut_off(
+    inference_response_factory, length
+):
+    cut_off = inference_response_factory(
+        response_text="x" * length, warnings=["response_truncated"]
+    )
+    bot = chat_bot(AsyncMock(side_effect=[cut_off, inference_response_factory()]))
+    await bot._process_message(top_level(ts="200.0"))
+    posted = bot.web_client.chat_postMessage.await_args.kwargs["text"]
+
+    await bot._process_message(thread_reply(ts="201.0", thread_ts="200.0"))
+
+    context = bot.inference_engine.process_query.await_args.args[0].context
+    assert "assistant: [answer was cut off] xxx" in context
+    assert "_Note" not in context
+    # Slack still shows the note after the answer.
+    assert posted.endswith("\n\n_Note: the answer was cut off._")
 
 
 @pytest.mark.asyncio
