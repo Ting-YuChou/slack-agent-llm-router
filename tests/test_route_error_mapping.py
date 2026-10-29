@@ -544,3 +544,61 @@ async def test_openai_sdk_rate_limit_keeps_429_and_retry_after(sample_query_requ
 
     assert response.error_code == "rate_limited"
     assert route_response_status(response) == (429, {"Retry-After": "3"})
+
+
+# Second-round review: Anthropic's billing exhaustion is a 400.
+
+_ANTHROPIC_LOW_CREDIT_BODY = {
+    "type": "error",
+    "error": {
+        "type": "invalid_request_error",
+        "message": "Your credit balance is too low to access the Anthropic API. "
+        "Please go to Plans & Billing to upgrade or purchase credits.",
+    },
+}
+
+
+def test_anthropic_low_credit_balance_is_provider_unavailable_fake():
+    exc = _ProviderStatusError(
+        400,
+        f"Error code: 400 - {_ANTHROPIC_LOW_CREDIT_BODY}",
+        headers={"retry-after": "20"},
+    )
+
+    assert inference_error_code(exc) == "provider_unavailable"
+    # The account is unusable, not the request: count it against the provider.
+    assert classify_inference_error(exc) == "provider_error"
+    assert inference_module._retry_after_seconds(exc) is None
+
+
+@pytest.mark.asyncio
+async def test_anthropic_sdk_low_credit_balance_answers_503(sample_query_request):
+    anthropic = pytest.importorskip("anthropic", minversion="0.69")
+    response = httpx.Response(
+        400,
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+        json=_ANTHROPIC_LOW_CREDIT_BODY,
+    )
+    exc = anthropic.BadRequestError(
+        f"Error code: 400 - {_ANTHROPIC_LOW_CREDIT_BODY}",
+        response=response,
+        body=_ANTHROPIC_LOW_CREDIT_BODY,
+    )
+    engine = _failing_engine(exc)
+
+    result = await engine.process_query(sample_query_request)
+
+    assert result.error_code == "provider_unavailable"
+    assert result.error_type == "provider_error"
+    assert route_response_status(result) == (503, {})
+
+
+def test_other_anthropic_400s_stay_request_errors():
+    exc = _ProviderStatusError(
+        400,
+        "Error code: 400 - {'type': 'error', 'error': {'type': "
+        "'invalid_request_error', 'message': 'messages: roles must alternate'}}",
+    )
+
+    assert inference_error_code(exc) is None
+    assert classify_inference_error(exc) == "user_or_policy"

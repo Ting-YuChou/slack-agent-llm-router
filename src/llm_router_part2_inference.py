@@ -312,8 +312,10 @@ _CONTEXT_LENGTH_MARKERS = (
     "longer than the maximum model length",
     "context window",
 )
-# OpenAI's 429 for an exhausted billing quota: retrying will not help.
+# An exhausted billing account: OpenAI's 429 code insufficient_quota and
+# Anthropic's 400 "credit balance is too low". Retrying will not help.
 _INSUFFICIENT_QUOTA_CODE = "insufficient_quota"
+_LOW_CREDIT_BALANCE_MARKER = "credit balance is too low"
 
 
 def _string_attribute(exc: BaseException, name: str) -> Optional[str]:
@@ -368,10 +370,11 @@ def _is_context_length_error(exc: BaseException) -> bool:
     return any(marker in text for marker in _CONTEXT_LENGTH_MARKERS)
 
 
-def _is_insufficient_quota(exc: BaseException) -> bool:
+def _is_billing_exhausted(exc: BaseException) -> bool:
     if getattr(exc, "code", None) == _INSUFFICIENT_QUOTA_CODE:
         return True
-    return _INSUFFICIENT_QUOTA_CODE in _provider_error_text(exc)
+    text = _provider_error_text(exc)
+    return _INSUFFICIENT_QUOTA_CODE in text or _LOW_CREDIT_BALANCE_MARKER in text
 
 
 def classify_inference_error(exc: BaseException) -> str:
@@ -399,6 +402,9 @@ def classify_inference_error(exc: BaseException) -> str:
         if status_code == 429:
             return "rate_limited"
         if status_code in REQUEST_SHAPED_STATUS_CODES:
+            # An exhausted account fails every request, whatever it says.
+            if _is_billing_exhausted(exc):
+                return "provider_error"
             return "user_or_policy"
         # 5xx, and 4xx such as 401/403 (revoked key) or 404 (retired model).
         return "provider_error"
@@ -440,10 +446,12 @@ def inference_error_code(exc: BaseException) -> Optional[str]:
             return "timeout"
         if status_code == 429:
             # An exhausted billing quota does not clear in seconds.
-            if _is_insufficient_quota(exc):
+            if _is_billing_exhausted(exc):
                 return "provider_unavailable"
             return "rate_limited"
         if status_code in REQUEST_SHAPED_STATUS_CODES:
+            if _is_billing_exhausted(exc):
+                return "provider_unavailable"
             if _is_context_length_error(exc):
                 return "context_length_exceeded"
             return "prompt_too_large" if status_code == 413 else None
@@ -493,7 +501,7 @@ def _retry_after_seconds(exc: BaseException) -> Optional[int]:
             return max(0, seconds)
         return None
     headers = getattr(getattr(exc, "response", None), "headers", None)
-    if headers is None or _is_insufficient_quota(exc):
+    if headers is None or _is_billing_exhausted(exc):
         # A quota error's Retry-After would only invite futile retries.
         return None
     try:
