@@ -21,6 +21,8 @@ from typing import (
     Deque,
     Callable,
     Dict,
+    FrozenSet,
+    Iterable,
     List,
     Optional,
     Set,
@@ -29,6 +31,9 @@ from typing import (
 from collections import deque
 from dataclasses import dataclass, field
 
+from slack_sdk.http_retry.builtin_async_handlers import (
+    AsyncRateLimitErrorRetryHandler,
+)
 from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.socket_mode.aiohttp import (
     SocketModeClient as AsyncSocketModeClient,
@@ -121,6 +126,9 @@ MEMORY_SLASH_ONLY_MESSAGE = (
     "Use `/llm remember`, `/llm memories`, or `/llm forget`."
 )
 SLACK_BUSY_MESSAGE = "The LLM Router is busy right now. Please retry in a moment."
+SLACK_SLASH_WORKING_TEXT = "Working on it…"
+# Commands that answer through the model, though they spend no query quota.
+MODEL_BACKED_COMMANDS = frozenset({"web", "fast"})
 SLACK_EMPTY_ANSWER_MESSAGE = (
     "🤔 The model returned an empty answer. Please try again or rephrase "
     "your question."
@@ -215,7 +223,7 @@ SLACK_OWN_MESSAGE_SENDER = "assistant (you)"
 # part of a transcript: it says nothing, and one left behind when the update
 # failed would read as an answer.
 SLACK_THINKING_TEXT = "_Thinking…_"
-# What the placeholder becomes when the message went to an Agent run instead.
+# A handoff notice the bot no longer posts; still kept out of transcripts.
 SLACK_AGENT_HANDOFF_TEXT = "_Passed to the Agent run in this thread._"
 SLACK_GENERIC_ERROR_MESSAGE = (
     "❌ Sorry, I couldn't process that request right now. Please try again in a "
@@ -591,6 +599,17 @@ def _split_agent_result(text: str, limit: int = AGENT_RESULT_BLOCK_CHARS) -> Lis
             text[:AGENT_RESULT_MAX_CHARS].rstrip()
             + f"\n\n_…answer truncated: {omitted:,} more characters were not posted._"
         )
+    return _split_fenced_text(text, limit)
+
+
+def _split_fenced_text(text: str, limit: int) -> List[str]:
+    """Split Markdown into chunks of at most `limit` characters.
+
+    Each chunk is as long as it can be, so no tiny fragments are left
+    between parts. A chunk breaks on a newline when one is near the limit,
+    else on a space, else mid-text; a code fence left open at a break is
+    closed and reopened so each chunk renders alone.
+    """
     chunks: List[str] = []
     remaining = text
     open_fence = False
@@ -599,17 +618,139 @@ def _split_agent_result(text: str, limit: int = AGENT_RESULT_BLOCK_CHARS) -> Lis
         if len(prefix) + len(remaining) <= limit:
             piece, remaining = remaining, ""
         else:
-            budget = limit - len(prefix) - len("\n```")
+            budget = max(limit - len(prefix) - len("\n```"), 1)
             cut = remaining.rfind("\n", 0, budget)
-            if cut < budget // 2:
+            space = remaining.rfind(" ", 0, budget)
+            if cut >= budget // 2:
+                piece, remaining = remaining[:cut], remaining[cut:]
+                # Inside code only the break's own newline goes (the fence
+                # markers stand in for it); blank code lines stay.
+                remaining = (
+                    remaining[1:]
+                    if _fence_is_open(prefix + piece)
+                    else remaining.lstrip("\n")
+                )
+            elif space >= budget // 2 and not _fence_is_open(
+                prefix + remaining[:space]
+            ):
+                # Prose breaks on a space, which the break replaces.
+                piece, remaining = remaining[:space], remaining[space + 1 :]
+            else:
+                # Code keeps every character: a hard cut, but never inside a
+                # run of backticks, which would flip every later fence.
                 cut = budget
-            piece, remaining = remaining[:cut], remaining[cut:].lstrip("\n")
+                while 0 < cut < len(remaining) and remaining[cut - 1 : cut + 1] == "``":
+                    cut -= 1
+                if cut == 0:
+                    cut = budget
+                piece, remaining = remaining[:cut], remaining[cut:]
+                if not _fence_is_open(prefix + piece):
+                    remaining = remaining.lstrip("\n")
+                elif remaining.startswith("\n"):
+                    remaining = remaining[1:]
         chunk = prefix + piece
-        open_fence = chunk.count("```") % 2 == 1
+        open_fence = _fence_is_open(chunk)
         if open_fence and remaining:
             chunk += "\n```"
+            closing_line, _, after = remaining.partition("\n")
+            if closing_line.startswith("```") and not closing_line[3:].strip():
+                # The break fell just before the fence's own closing line:
+                # that closes this chunk, so the next one is not reopened
+                # (which would render an empty code block).
+                open_fence = False
+                remaining = after.lstrip("\n")
         chunks.append(chunk)
     return chunks
+
+
+def _fence_is_open(text: str) -> bool:
+    return text.count("```") % 2 == 1
+
+
+SLACK_RATE_LIMIT_RETRIES = 2
+# Slack API errors that reject a message's blocks, not the message.
+SLACK_BLOCK_REJECTION_ERRORS = frozenset(
+    {"invalid_blocks", "invalid_blocks_format", "msg_blocks_too_long"}
+)
+
+
+def _is_block_rejection(exc: Exception) -> bool:
+    """Whether Slack refused a message for its blocks (a SlackApiError's code)."""
+    response = getattr(exc, "response", None)
+    getter = getattr(response, "get", None)
+    try:
+        error = getter("error") if callable(getter) else None
+    except Exception:
+        return False
+    return error in SLACK_BLOCK_REJECTION_ERRORS
+
+
+def _without_blocks(message: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in message.items() if key != "blocks"}
+
+
+# Slack's limit on the text of one `markdown` block.
+SLACK_MARKDOWN_BLOCK_CHARS = 12000
+
+
+class SlackAnswer(str):
+    """A model's answer text, carrying what the Slack footer shows about it."""
+
+    model_name: Optional[str]
+    latency_ms: Optional[float]
+    cached: bool
+    trailer_lines: FrozenSet[str]
+
+    def __new__(
+        cls,
+        text: str,
+        *,
+        model_name: Optional[str] = None,
+        latency_ms: Optional[float] = None,
+        cached: bool = False,
+        trailer_lines: Iterable[str] = (),
+    ) -> "SlackAnswer":
+        answer = super().__new__(cls, text)
+        answer.model_name = model_name
+        answer.latency_ms = latency_ms
+        answer.cached = cached
+        # The bot's own lines after the model's text: notes and sources.
+        answer.trailer_lines = frozenset(line for line in trailer_lines if line)
+        return answer
+
+    def markdown(self, part: str) -> str:
+        """`part` for a Markdown block, which joins single newlines.
+
+        Adjacent note and source lines get a blank line between them so
+        each stays on its own line; the model's own text is left alone.
+        """
+        lines = part.split("\n")
+        out = lines[:1]
+        for previous, line in zip(lines, lines[1:]):
+            if previous in self.trailer_lines and line in self.trailer_lines:
+                out.append("")
+            out.append(line)
+        return "\n".join(out)
+
+    def footer(self) -> Optional[str]:
+        """`model · 1.2 s · cached`; never the cost."""
+        fields = []
+        if self.model_name and self.model_name != "unknown":
+            fields.append(self.model_name)
+        if self.latency_ms is not None and self.latency_ms >= 0:
+            fields.append(f"{self.latency_ms / 1000:.1f} s")
+        if self.cached:
+            fields.append("cached")
+        return " · ".join(fields) or None
+
+
+def _add_rate_limit_retry(client: Any) -> None:
+    """Retry Slack 429s (honouring Retry-After) instead of failing the post."""
+    retry_handlers = getattr(client, "retry_handlers", None)
+    if isinstance(retry_handlers, list):
+        retry_handlers.append(
+            AsyncRateLimitErrorRetryHandler(max_retry_count=SLACK_RATE_LIMIT_RETRIES)
+        )
 
 
 def _agent_task_echo(task: str) -> str:
@@ -1721,6 +1862,17 @@ class SlackMessageHandler:
             return len(parts) < 2 or parts[1].lower() not in {"status", "stop", "close"}
         return command_name not in self.commands
 
+    def command_waits_on_model(self, command_text: str) -> bool:
+        """Whether a command waits on a model answer or an Agent start.
+
+        That is every quota-spending command plus `web` and `fast` with a
+        query, which are worth a progress indicator.
+        """
+        if self.command_consumes_query_quota(command_text):
+            return True
+        parts = (command_text or "").strip().split(maxsplit=1)
+        return len(parts) == 2 and parts[0].lower() in MODEL_BACKED_COMMANDS
+
     async def handle_message(
         self, event: Dict[str, Any], client: AsyncWebClient
     ) -> Optional[str]:
@@ -1734,8 +1886,23 @@ class SlackMessageHandler:
         team_id = self.bot._extract_team_id(event)
         attachments = list(event.get("_query_attachments", []) or [])
 
+        # The bot decides chat or Agent once per message, before it shows
+        # progress or downloads files; a thread that became an Agent thread
+        # since then does not change this message's lane.
+        decided_agent = event.get("_agent_request")
+        if not isinstance(decided_agent, bool):
+            is_agent_thread = getattr(
+                self.bot, "_is_agent_thread", lambda *_args: False
+            )
+            decided_agent = is_agent_thread(channel_id, event.get("thread_ts"))
+        in_agent_thread = bool(event.get("thread_ts")) and decided_agent
+        # The chat path does not download an Agent thread's files.
+        agent_files = [
+            item for item in event.get("files") or [] if isinstance(item, dict)
+        ]
+
         # Check if it's a command
-        if not text and not attachments:
+        if not text and not attachments and not (in_agent_thread and agent_files):
             return await self._handle_help_command([], user_id, channel_id, client)
 
         command_text = self.extract_prefixed_command_text(text)
@@ -1753,11 +1920,12 @@ class SlackMessageHandler:
 
         if not text and attachments:
             text = self._build_attachment_only_query(attachments)
+        elif not text and in_agent_thread:
+            text = self._files_only_query(
+                [str(item.get("name") or "") for item in agent_files]
+            )
 
-        is_agent_thread = getattr(self.bot, "_is_agent_thread", lambda *_args: False)
-        if event.get("thread_ts") and is_agent_thread(
-            channel_id, event.get("thread_ts")
-        ):
+        if in_agent_thread:
             flags = self._parse_followup_agent_flags(text)
             if flags.error:
                 return flags.error
@@ -3452,18 +3620,36 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         if response_text is None:
             response_text = getattr(response, "response_text", "") or ""
         sources = list(getattr(response, "sources", []) or [])
-        if not sources:
-            return response_text
-
-        lines = [response_text.rstrip(), "", "Sources:"]
-        for source in sources[:5]:
-            title = getattr(source, "title", "") or getattr(source, "url", "")
-            url = getattr(source, "url", "")
-            rank = getattr(source, "rank", len(lines))
-            if not url:
-                continue
-            lines.append(f"[{rank}] {title} - {url}")
-        return "\n".join(lines).strip()
+        if sources:
+            lines = [response_text.rstrip(), "", "Sources:"]
+            for source in sources[:5]:
+                title = getattr(source, "title", "") or getattr(source, "url", "")
+                url = getattr(source, "url", "")
+                rank = getattr(source, "rank", len(lines))
+                if not url:
+                    continue
+                lines.append(f"[{rank}] {title} - {url}")
+            response_text = "\n".join(lines).strip()
+        model_name = getattr(response, "model_name", None)
+        latency_ms = getattr(response, "latency_ms", None)
+        model_text = (getattr(response, "response_text", "") or "").rstrip()
+        trailer = (
+            response_text[len(model_text) :]
+            if model_text and response_text.startswith(model_text)
+            else ""
+        )
+        return SlackAnswer(
+            response_text,
+            trailer_lines=trailer.split("\n"),
+            model_name=model_name if isinstance(model_name, str) else None,
+            latency_ms=(
+                float(latency_ms)
+                if isinstance(latency_ms, (int, float))
+                and not isinstance(latency_ms, bool)
+                else None
+            ),
+            cached=getattr(response, "cached", False) is True,
+        )
 
     def _get_max_tokens_for_user(
         self, user_tier: UserTier, preferences: Dict[str, Any]
@@ -3486,7 +3672,11 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
 
     def _build_attachment_only_query(self, attachments: List[Attachment]) -> str:
         """Create a fallback query when a Slack message only contains files."""
-        attachment_names = ", ".join(attachment.name for attachment in attachments[:3])
+        return self._files_only_query([attachment.name for attachment in attachments])
+
+    @staticmethod
+    def _files_only_query(names: List[str]) -> str:
+        attachment_names = ", ".join(name for name in names[:3] if name)
         if attachment_names:
             return f"Analyze the attached Slack file(s): {attachment_names}"
         return "Analyze the attached Slack file(s)."
@@ -3674,6 +3864,7 @@ class SlackBot:
                 )
 
             self.web_client = AsyncWebClient(token=bot_token)
+            _add_rate_limit_retry(self.web_client)
             self.bot_token = bot_token
             self.socket_client = AsyncSocketModeClient(
                 app_token=app_token, web_client=self.web_client
@@ -3828,7 +4019,12 @@ class SlackBot:
     ):
         """Handle incoming socket mode requests"""
         try:
-            response = SocketModeResponse(envelope_id=req.envelope_id)
+            ack_payload = self._socket_ack_payload(req)
+            response = (
+                SocketModeResponse(envelope_id=req.envelope_id, payload=ack_payload)
+                if ack_payload
+                else SocketModeResponse(envelope_id=req.envelope_id)
+            )
             await client.send_socket_mode_response(response)
 
             if req.type == "events_api":
@@ -4190,12 +4386,14 @@ class SlackBot:
 
     async def _process_message(self, event: Dict[str, Any]):
         """Process incoming message"""
+        placeholder_ts: Optional[str] = None
         try:
             channel_id = event.get("channel")
             user_id = event.get("user")
             user_state_changed = self._synchronize_user_tier(user_id)
             user_prefs = self.user_manager.get_user_preferences(user_id)
             agent_request = self._is_agent_request(event)
+            event["_agent_request"] = agent_request
 
             if self._is_query_event(event):
                 if not self._within_rate_limit(user_id, agent=agent_request):
@@ -4218,9 +4416,16 @@ class SlackBot:
                 self._mark_thread_active(channel_id, reply_thread_ts)
                 active_thread_key = self._thread_key(channel_id, reply_thread_ts)
 
-            attachments = await self._extract_query_attachments(event)
-            if attachments:
-                event["_query_attachments"] = attachments
+            if not agent_request and self._waits_on_model(event):
+                placeholder_ts = await self._post_placeholder(
+                    channel_id, reply_thread_ts
+                )
+
+            if not agent_request:
+                # An Agent request loads its own files, as untrusted context.
+                attachments = await self._extract_query_attachments(event)
+                if attachments:
+                    event["_query_attachments"] = attachments
 
             # Process message through handler
             response_text = await self.message_handler.handle_message(
@@ -4236,29 +4441,47 @@ class SlackBot:
                 max_length = self.config.get("response_settings", {}).get(
                     "max_response_length", 2000
                 )
-                if len(response_text) > max_length:
-                    responses = self._split_response(response_text, max_length)
-
-                    for response_part in responses:
-                        await self.web_client.chat_postMessage(
-                            channel=channel_id,
-                            text=response_part,
-                            thread_ts=thread_ts,
-                        )
-                        await asyncio.sleep(0.5)  # Small delay between parts
-                else:
-                    await self.web_client.chat_postMessage(
-                        channel=channel_id, text=response_text, thread_ts=thread_ts
+                responses = (
+                    self._split_response(response_text, max_length)
+                    if len(response_text) > max_length
+                    else [response_text]
+                )
+                for index, response_part in enumerate(responses):
+                    message = self._answer_message(
+                        response_part,
+                        response_text,
+                        last=index == len(responses) - 1,
                     )
+                    if index == 0 and placeholder_ts:
+                        replaced = await self._replace_placeholder(
+                            channel_id, placeholder_ts, **message
+                        )
+                        # The answer owns the placeholder now: a later
+                        # failure must not overwrite it with the error.
+                        placeholder_ts = None
+                        if replaced:
+                            continue
+                    await self._post_reply(channel_id, thread_ts, **message)
 
                 if thread_ts:
                     self._mark_thread_active(channel_id, thread_ts)
                     state_changed = True
                     active_thread_key = self._thread_key(channel_id, thread_ts)
-            elif self._is_agent_thread(channel_id, agent_thread_ts):
-                # The handler posted the reply itself: an Agent run's status message.
-                state_changed = True
-                active_thread_key = self._thread_key(channel_id, agent_thread_ts)
+            else:
+                # No reply text. A placeholder is only posted on the chat lane
+                # (the lane handle_message is held to), so there it means no
+                # answer, never an Agent handoff.
+                if placeholder_ts and not await self._replace_placeholder(
+                    channel_id, placeholder_ts, text=SLACK_EMPTY_ANSWER_MESSAGE
+                ):
+                    await self._post_reply(
+                        channel_id, reply_thread_ts, text=SLACK_EMPTY_ANSWER_MESSAGE
+                    )
+                if self._is_agent_thread(channel_id, agent_thread_ts):
+                    # The handler posted the reply itself: an Agent run's
+                    # status message.
+                    state_changed = True
+                    active_thread_key = self._thread_key(channel_id, agent_thread_ts)
 
             query_event = self._is_query_event(event)
             if query_event or user_state_changed:
@@ -4280,10 +4503,147 @@ class SlackBot:
 
         except Exception as e:
             logger.error(f"Error processing message: {e}")
+            error_text = self._build_user_safe_error_message()
+            if placeholder_ts and await self._replace_placeholder(
+                event.get("channel"), placeholder_ts, text=error_text
+            ):
+                return
             await self.web_client.chat_postMessage(
                 channel=event.get("channel"),
-                text=self._build_user_safe_error_message(),
+                text=error_text,
                 thread_ts=event.get("thread_ts") or event.get("ts"),
+            )
+
+    def _answer_message(self, part: str, answer: str, *, last: bool) -> Dict[str, Any]:
+        """The message fields for one part of a reply.
+
+        A model's answer renders as a Markdown block, with the plain text
+        kept as the notification fallback, and its last part carries the
+        footer. Command replies and errors stay plain text.
+        """
+        message: Dict[str, Any] = {"text": part}
+        if (
+            not isinstance(answer, SlackAnswer)
+            or len(part) > SLACK_MARKDOWN_BLOCK_CHARS
+        ):
+            return message
+        markdown = answer.markdown(part)
+        if len(markdown) > SLACK_MARKDOWN_BLOCK_CHARS:
+            return message
+        blocks: List[Dict[str, Any]] = [{"type": "markdown", "text": markdown}]
+        footer = answer.footer() if last else None
+        if footer and self.config.get("response_settings", {}).get(
+            "answer_footer", True
+        ):
+            blocks.append(
+                {
+                    "type": "context",
+                    "elements": [{"type": "plain_text", "text": footer}],
+                }
+            )
+        message["blocks"] = blocks
+        return message
+
+    def _typing_indicator_enabled(self) -> bool:
+        return bool(
+            self.config.get("response_settings", {}).get("typing_indicator", True)
+        )
+
+    def _socket_ack_payload(self, req: Any) -> Optional[Dict[str, Any]]:
+        """Tell the user a model-backed slash command is underway."""
+        if getattr(req, "type", None) != "slash_commands":
+            return None
+        if not self._typing_indicator_enabled():
+            return None
+        payload = getattr(req, "payload", None) or {}
+        waits_on_model = getattr(self.message_handler, "command_waits_on_model", None)
+        if callable(waits_on_model) and not waits_on_model(
+            payload.get("text", "") or ""
+        ):
+            return None
+        return {"response_type": "ephemeral", "text": SLACK_SLASH_WORKING_TEXT}
+
+    def _waits_on_model(self, event: Dict[str, Any]) -> bool:
+        """Whether a message waits on a model answer, so progress is shown."""
+        if self._is_query_event(event):
+            return True
+        extract_command_text = getattr(
+            self.message_handler, "extract_prefixed_command_text", None
+        )
+        waits_on_model = getattr(self.message_handler, "command_waits_on_model", None)
+        if not (callable(extract_command_text) and callable(waits_on_model)):
+            return False
+        command_text = extract_command_text((event.get("text") or "").strip())
+        return command_text is not None and bool(waits_on_model(command_text))
+
+    async def _post_placeholder(
+        self, channel_id: Optional[str], thread_ts: Optional[str]
+    ) -> Optional[str]:
+        """Show progress where the answer will appear; its ts, or None.
+
+        Only a client that can update the placeholder gets one.
+        """
+        if not self._typing_indicator_enabled():
+            return None
+        if not callable(getattr(self.web_client, "chat_update", None)):
+            return None
+        try:
+            response = await self.web_client.chat_postMessage(
+                channel=channel_id, text=SLACK_THINKING_TEXT, thread_ts=thread_ts
+            )
+        except Exception as exc:
+            logger.warning("Could not post the Slack progress placeholder: %s", exc)
+            return None
+        try:
+            ts = response.get("ts") if response is not None else None
+        except Exception:
+            ts = None
+        return ts if isinstance(ts, str) and ts else None
+
+    async def _replace_placeholder(
+        self, channel_id: Optional[str], placeholder_ts: str, **message: Any
+    ) -> bool:
+        """Turn the placeholder into `message`; False when Slack refused.
+
+        An update refused for its blocks is tried once more as plain text.
+        Any other failure (a timeout, a 5xx) may have been applied, so it is
+        not resent here: the caller posts the message instead.
+        """
+        try:
+            await self.web_client.chat_update(
+                channel=channel_id, ts=placeholder_ts, **message
+            )
+            return True
+        except Exception as exc:
+            logger.warning("Could not update the Slack progress placeholder: %s", exc)
+            if "blocks" not in message or not _is_block_rejection(exc):
+                return False
+        try:
+            await self.web_client.chat_update(
+                channel=channel_id, ts=placeholder_ts, **_without_blocks(message)
+            )
+        except Exception as exc:
+            logger.warning("Could not update the Slack progress placeholder: %s", exc)
+            return False
+        return True
+
+    async def _post_reply(
+        self, channel_id: Optional[str], thread_ts: Optional[str], **message: Any
+    ) -> None:
+        """Post one reply message; as plain text if Slack refuses its blocks.
+
+        Only a block rejection is resent: any other failure may have posted.
+        """
+        try:
+            await self.web_client.chat_postMessage(
+                channel=channel_id, thread_ts=thread_ts, **message
+            )
+        except Exception as exc:
+            if "blocks" not in message or not _is_block_rejection(exc):
+                raise
+            logger.warning("Slack refused the answer's blocks; posting text: %s", exc)
+            await self.web_client.chat_postMessage(
+                channel=channel_id, thread_ts=thread_ts, **_without_blocks(message)
             )
 
     def _reply_thread_ts(
@@ -4301,56 +4661,18 @@ class SlackBot:
         return None
 
     def _split_response(self, text: str, max_length: int) -> List[str]:
-        """Split long response into multiple parts"""
+        """Split a long answer into Slack messages of at most `max_length`.
+
+        Code fences stay balanced in every part (see `_split_fenced_text`).
+        """
         if len(text) <= max_length:
             return [text]
-
-        def append_chunk(chunk: str):
-            chunk = chunk.strip()
-            if not chunk:
-                return
-
-            if len(chunk) <= max_length:
-                parts.append(chunk)
-                return
-
-            for start in range(0, len(chunk), max_length):
-                parts.append(chunk[start : start + max_length])
-
-        parts = []
-        current_part = ""
-
-        # Split by paragraphs first
-        paragraphs = text.split("\n\n")
-
-        for paragraph in paragraphs:
-            if len(current_part) + len(paragraph) + 2 <= max_length:
-                if current_part:
-                    current_part += "\n\n" + paragraph
-                else:
-                    current_part = paragraph
-            else:
-                if current_part:
-                    append_chunk(current_part)
-                    current_part = paragraph
-                else:
-                    # Paragraph is too long, split by sentences
-                    sentences = paragraph.split(". ")
-                    for sentence in sentences:
-                        if len(current_part) + len(sentence) + 2 <= max_length:
-                            if current_part:
-                                current_part += ". " + sentence
-                            else:
-                                current_part = sentence
-                        else:
-                            if current_part:
-                                append_chunk(current_part)
-                            current_part = sentence
-
-        if current_part:
-            append_chunk(current_part)
-
-        return parts
+        parts = [
+            part.strip("\n")
+            for part in _split_fenced_text(text, max_length)
+            if part.strip()
+        ]
+        return parts or [text[:max_length]]
 
     def _resolve_context_settings(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """Resolve Slack history context settings with backwards-compatible defaults."""

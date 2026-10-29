@@ -958,6 +958,8 @@ class MonitoringConfig(ConfigModel):
 class SlackResponseSettingsConfig(ConfigModel):
     max_response_length: int = Field(2000, ge=1)
     typing_indicator: bool = True
+    # A context line under each answer: model, latency and "cached".
+    answer_footer: bool = True
     thread_replies: bool = True
 
 
