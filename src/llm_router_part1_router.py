@@ -26,8 +26,11 @@ from src.utils.schema import (
 
 logger = logging.getLogger(__name__)
 
-# Only the head of a query is classified; QueryRequest.query allows 50,000 chars.
-CLASSIFIER_MAX_QUERY_CHARS = 2000
+# QueryRequest.query allows 50,000 chars. A query longer than head + tail is
+# classified on its first and last chars only, so a request typed after a long
+# paste still counts.
+CLASSIFIER_HEAD_CHARS = 2000
+CLASSIFIER_TAIL_CHARS = 2000
 # Bounded gap between keywords: stays inside one sentence and at most 80 chars,
 # so the classifier patterns cannot backtrack catastrophically on long input.
 _GAP = r"[^.?!\n]{0,80}"
@@ -163,7 +166,7 @@ class QueryClassifier:
         if not self._is_initialized:
             asyncio.create_task(self.initialize())
 
-        text = query[:CLASSIFIER_MAX_QUERY_CHARS].lower()
+        text = self._classification_text(query)
 
         # Pattern-based classification
         pattern_scores = {}
@@ -194,6 +197,15 @@ class QueryClassifier:
                 return best_type, min(confidence, 1.0)
 
         return QueryType.GENERAL, 0.5
+
+    def _classification_text(self, query: str) -> str:
+        """Lowercased text to classify: the whole query, or its head and tail."""
+        if len(query) <= CLASSIFIER_HEAD_CHARS + CLASSIFIER_TAIL_CHARS:
+            return query.lower()
+        # The newline keeps a pattern gap or a word from spanning the cut.
+        head = query[:CLASSIFIER_HEAD_CHARS]
+        tail = query[-CLASSIFIER_TAIL_CHARS:]
+        return f"{head}\n{tail}".lower()
 
     def _keyword_classification(self, query: str) -> Dict[QueryType, float]:
         """Keyword-based classification"""

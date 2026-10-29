@@ -180,6 +180,22 @@ class TestQueryClassifier:
         assert query_type == expected_type
         assert confidence == pytest.approx(expected_confidence)
 
+    def test_classify_query_reads_request_after_long_paste(self):
+        classifier = QueryClassifier()
+        classifier._is_initialized = True
+        # 10,000 chars of pasted text, then the actual request.
+        long_paste = ("lorem ipsum dolor sit amet " * 371)[:9999] + "\n"
+        query = (
+            long_paste
+            + "summarize the key points and search the web for the latest news"
+        )
+
+        query_type, confidence = classifier.classify_query(query)
+
+        # Same result as origin/main, which classified the whole query.
+        assert query_type == QueryType.WEB_RESEARCH
+        assert confidence == pytest.approx(0.5688888888888889)
+
 
 class TestTokenCounter:
     def test_disabled_tokenizer_uses_local_approximation_without_import(
