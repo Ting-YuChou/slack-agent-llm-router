@@ -201,6 +201,11 @@ class InferenceResponse(BaseModel):
     # System flags
     cached: bool = False
     compressed_context: bool = False
+    # Set when a fallback answered: the routed model whose failure it replaced.
+    fallback_from_model: Optional[str] = None
+    # Models tried for this answer, the one that gave it included; 0 when it
+    # came from the response cache without a fallback.
+    attempts: int = Field(default=1, ge=0)
 
     # Tool output
     sources: List[ResponseSource] = Field(default_factory=list)
@@ -663,6 +668,13 @@ class ProviderSchedulerConfig(ConfigModel):
         return normalized
 
 
+class InferenceFallbackConfig(ConfigModel):
+    # Models to try, in order, when a model is unavailable (retryable errors,
+    # circuit or capacity rejections, attempt timeouts). Each must still pass
+    # the user's tier, the context window and the routing guardrails.
+    chains: Dict[str, List[str]] = Field(default_factory=dict)
+
+
 class InferenceConfig(ConfigModel):
     vllm: ProviderEndpointConfig = Field(default_factory=ProviderEndpointConfig)
     openai: ProviderEndpointConfig = Field(default_factory=ProviderEndpointConfig)
@@ -672,6 +684,7 @@ class InferenceConfig(ConfigModel):
     batching: BatchingConfig = Field(default_factory=BatchingConfig)
     single_flight: SingleFlightConfig = Field(default_factory=SingleFlightConfig)
     scheduler: ProviderSchedulerConfig = Field(default_factory=ProviderSchedulerConfig)
+    fallback: InferenceFallbackConfig = Field(default_factory=InferenceFallbackConfig)
 
     @model_validator(mode="before")
     @classmethod

@@ -708,6 +708,16 @@ class ProviderCapacityScheduler:
             )
         return str(decision.reason) in SCHEDULER_FALLBACK_REASONS
 
+    def is_availability_failure(self, exc: BaseException) -> bool:
+        """Whether exc says the model is unavailable, not that the request is bad.
+
+        Retryable errors (attempt timeouts included) and circuit or capacity
+        rejections qualify; 400/413/422 and ValueError never do.
+        """
+        if isinstance(exc, AdmissionRejectedError):
+            return self.allow_fallback_for_rejection(exc.decision)
+        return isinstance(exc, Exception) and self._is_retryable_exception(exc)
+
     async def record_success(
         self,
         *,

@@ -269,6 +269,12 @@ inference:
       password_env: REDIS_PASSWORD
   single_flight:
     enabled: true
+  fallback:
+    chains:
+      gpt-5:
+      - claude-sonnet-4-6
+      claude-sonnet-4-6:
+      - gpt-5
   scheduler:
     enabled: true
     queue_enabled: true

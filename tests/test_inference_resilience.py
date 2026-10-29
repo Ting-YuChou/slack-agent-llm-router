@@ -2,11 +2,13 @@
 
 import asyncio
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from src.admission import AdmissionDecision
@@ -21,7 +23,15 @@ from src.provider_scheduler import (
     RequestExecutionBudget,
     SchedulerLease,
 )
-from src.utils.schema import InferenceResponse, ProviderSchedulerConfig, QueryRequest
+from src.utils.schema import (
+    InferenceConfig,
+    InferenceResponse,
+    PlatformConfig,
+    ProviderSchedulerConfig,
+    QueryRequest,
+    QueryType,
+    UserTier,
+)
 
 
 class _StatusError(Exception):
@@ -436,3 +446,335 @@ async def test_hung_retrieval_is_capped_by_the_request_deadline(stage):
     assert response.error == "inference_failed"
     assert elapsed < 0.35
     provider.assert_not_awaited()
+
+
+# --- I4: config-driven cross-provider fallback chains --------------------------
+
+_APIConnectionError = type("APIConnectionError", (Exception,), {})
+_CHAINS = {"gpt-5": ["claude-sonnet-4-6"], "claude-sonnet-4-6": ["gpt-5"]}
+_MODELS = {
+    "gpt-5": {
+        "provider": "openai",
+        "max_tokens": 128000,
+        "cost_per_token": 0.00003,
+        "priority": 2,
+        "capabilities": ["general", "reasoning", "coding", "analysis"],
+    },
+    "claude-sonnet-4-6": {
+        "provider": "anthropic",
+        "max_tokens": 200000,
+        "cost_per_token": 0.00003,
+        "priority": 1,
+        "capabilities": ["general", "reasoning", "coding", "analysis"],
+    },
+    "claude-haiku-4-5": {
+        "provider": "anthropic",
+        "max_tokens": 200000,
+        "cost_per_token": 0.00001,
+        "priority": 1,
+        "capabilities": ["general"],
+    },
+    "mistral-7b": {
+        "provider": "vllm",
+        "model_path": "/models/mistral",
+        "max_tokens": 4096,
+        "cost_per_token": 0.0,
+        "priority": 3,
+        "capabilities": ["general", "coding"],
+    },
+}
+_ENTERPRISE = {"user_tier": UserTier.ENTERPRISE}
+
+
+class _PolicyCache:
+    """Routing policy as Flink would materialize it: guardrail blocks."""
+
+    def __init__(self, **policy):
+        self.policy = policy
+
+    async def get_effective_policy(self, _request_id, _user_id, _session_id=None):
+        return dict(self.policy)
+
+
+class _RejectFirstAdmission(_Admission):
+    def __init__(self, reason):
+        super().__init__()
+        self.reason = reason
+
+    async def acquire_provider(self, **kwargs):
+        if not self.calls:
+            self.calls.append(kwargs)
+            return AdmissionDecision.reject(
+                status_code=429,
+                error="rate_limited",
+                reason=self.reason,
+                message="denied",
+                retry_after_seconds=1,
+            )
+        return await super().acquire_provider(**kwargs)
+
+
+def _router(models=("gpt-5", "claude-sonnet-4-6", "mistral-7b"), policy=None):
+    from src.llm_router_part1_router import ModelRouter
+
+    router = ModelRouter(
+        {
+            "default_model": "gpt-5",
+            "routing_strategy": "intelligent",
+            "models": {name: _MODELS[name] for name in models},
+            "routing_rules": [],
+        },
+        policy_cache=policy,
+    )
+    router.route_query = AsyncMock(
+        return_value=SimpleNamespace(
+            selected_model="gpt-5",
+            query_type=QueryType.GENERAL,
+            token_count=64,
+            routing_reason="Capability-based selection",
+        )
+    )
+    router.update_model_stats = MagicMock()
+    return router
+
+
+def _chain_engine(
+    router, primary_error, *, chains=_CHAINS, scheduler=None, admission=None
+):
+    config = {"fallback": {"chains": chains}}
+    if scheduler is not None:
+        config["scheduler"] = scheduler
+    engine = InferenceEngine(
+        config, router, event_producer=AsyncMock(), admission_controller=admission
+    )
+    primary = (
+        primary_error
+        if callable(primary_error)
+        else AsyncMock(side_effect=primary_error)
+    )
+    engine.providers = {
+        "openai": SimpleNamespace(generate_response=primary),
+        "anthropic": SimpleNamespace(
+            generate_response=AsyncMock(
+                side_effect=lambda _request, model: _response(model, "anthropic")
+            )
+        ),
+        "vllm": SimpleNamespace(
+            generate_response=AsyncMock(return_value=_response("mistral-7b", "vllm"))
+        ),
+    }
+    return engine
+
+
+def _published_event(engine, request):
+    from src.llm_router_part3_pipeline import build_inference_completed_event
+
+    producer = engine.event_producer.produce_inference_completed
+    producer.assert_awaited_once()
+    _request_arg, response, decision = producer.await_args.args
+    return build_inference_completed_event(request, response, decision)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "primary_error",
+    [
+        pytest.param(_StatusError(503), id="5xx"),
+        pytest.param(_StatusError(429), id="429"),
+        pytest.param(_APIConnectionError("connection reset"), id="connection"),
+    ],
+)
+async def test_unavailable_gpt5_is_answered_by_claude(primary_error):
+    engine = _chain_engine(_router(), primary_error)
+    request = _request(**_ENTERPRISE)
+
+    response = await engine.process_query(request)
+
+    assert response.error is None
+    assert response.model_name == "claude-sonnet-4-6"
+    assert response.fallback_from_model == "gpt-5"
+    assert response.attempts == 2
+    event = _published_event(engine, request)
+    assert event["selected_model"] == "claude-sonnet-4-6"
+    assert event["fallback_from_model"] == "gpt-5"
+    assert event["attempts"] == 2
+    assert event["fallback_models"] == ["claude-sonnet-4-6", "mistral-7b"]
+    engine.providers["vllm"].generate_response.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_circuit_open_gpt5_is_answered_by_claude():
+    engine = _chain_engine(
+        _router(),
+        _StatusError(500),
+        scheduler={"enabled": True},
+        admission=_RejectFirstAdmission("circuit_open"),
+    )
+
+    response = await engine.process_query(_request(**_ENTERPRISE))
+
+    assert response.model_name == "claude-sonnet-4-6"
+    assert response.fallback_from_model == "gpt-5"
+    engine.providers["openai"].generate_response.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hung_gpt5_attempt_is_answered_by_claude():
+    engine = _chain_engine(
+        _router(),
+        _hang,
+        scheduler={
+            "request_deadline_seconds": 0.5,
+            "fallback_reserve_ratio": 0.3,
+            **_RETRY,
+        },
+    )
+
+    started = time.monotonic()
+    response = await asyncio.wait_for(
+        engine.process_query(_request(**_ENTERPRISE)), timeout=3
+    )
+
+    assert time.monotonic() - started < 0.5
+    assert response.model_name == "claude-sonnet-4-6"
+    assert response.fallback_from_model == "gpt-5"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "primary_error",
+    [
+        pytest.param(_StatusError(400), id="400"),
+        pytest.param(_StatusError(413), id="413"),
+        pytest.param(_StatusError(422), id="422"),
+        pytest.param(ValueError("unsupported parameter"), id="value-error"),
+    ],
+)
+async def test_request_errors_never_cross_providers(primary_error):
+    engine = _chain_engine(_router(), primary_error)
+
+    response = await engine.process_query(_request(**_ENTERPRISE))
+
+    engine.providers["anthropic"].generate_response.assert_not_awaited()
+    # The local vLLM fallback keeps its existing triggers.
+    assert response.model_name == "mistral-7b"
+    assert response.fallback_from_model == "gpt-5"
+
+
+@pytest.mark.asyncio
+async def test_chain_fallback_does_not_upgrade_the_user_tier():
+    engine = _chain_engine(_router(("gpt-5", "claude-sonnet-4-6")), _StatusError(503))
+
+    response = await engine.process_query(_request(user_tier=UserTier.PREMIUM))
+
+    assert response.error == "inference_failed"
+    engine.providers["anthropic"].generate_response.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("policy", "expected_model"),
+    [
+        pytest.param(
+            {"blocked_models": ["claude-sonnet-4-6"]},
+            "claude-haiku-4-5",
+            id="blocked-model-skipped",
+        ),
+        pytest.param({"blocked_providers": ["anthropic"]}, None, id="blocked-provider"),
+    ],
+)
+async def test_chain_skips_models_blocked_by_guardrails(policy, expected_model):
+    router = _router(
+        ("gpt-5", "claude-sonnet-4-6", "claude-haiku-4-5"),
+        policy=_PolicyCache(**policy),
+    )
+    engine = _chain_engine(
+        router,
+        _StatusError(503),
+        chains={"gpt-5": ["claude-sonnet-4-6", "claude-haiku-4-5"]},
+    )
+
+    response = await engine.process_query(_request(**_ENTERPRISE))
+
+    calls = engine.providers["anthropic"].generate_response.await_args_list
+    expected_calls = [expected_model] if expected_model else []
+    assert [call.args[1] for call in calls] == expected_calls
+    if expected_model:
+        assert response.model_name == expected_model
+    else:
+        assert response.error == "inference_failed"
+
+
+@pytest.mark.asyncio
+async def test_vision_request_skips_the_chain_and_retries_as_text():
+    engine = _chain_engine(_router(), _StatusError(503))
+    request = _request(
+        **_ENTERPRISE,
+        metadata={
+            "rag_vision_fallback_models": [],
+            "rag_text_fallback_models": ["mistral-7b"],
+        },
+    )
+    request._rag_images = [object()]
+
+    response, model_name, _ = await engine._generate_response_with_fallback(
+        request, SimpleNamespace(selected_model="gpt-5", routing_reason="vision")
+    )
+
+    # Chains do not check capability, so they never take image requests.
+    engine.providers["anthropic"].generate_response.assert_not_awaited()
+    assert model_name == "mistral-7b"
+    assert response.fallback_from_model == "gpt-5"
+    assert response.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_primary_success_reports_one_attempt_and_no_fallback():
+    engine = _chain_engine(_router(), None)
+    engine.providers["openai"].generate_response = AsyncMock(
+        return_value=_response("gpt-5")
+    )
+    request = _request(**_ENTERPRISE)
+
+    response = await engine.process_query(request)
+
+    assert response.fallback_from_model is None
+    assert response.attempts == 1
+    event = _published_event(engine, request)
+    assert event["fallback_from_model"] is None
+    assert event["attempts"] == 1
+    assert event["fallback_models"] == []
+
+
+@pytest.mark.asyncio
+async def test_response_cache_hit_does_not_replay_an_old_fallback():
+    engine = _chain_engine(_router(), None)
+    cached = _response("claude-sonnet-4-6", "anthropic").model_dump(mode="json")
+    cached.update(fallback_from_model="gpt-5", attempts=2)
+    engine.cache.get_cached_response = AsyncMock(return_value=cached)
+
+    response = await engine._get_cached_inference_response(
+        _request(), "claude-sonnet-4-6"
+    )
+
+    assert response.cached is True
+    assert response.fallback_from_model is None
+    assert response.attempts == 0
+
+
+def test_inference_config_parses_fallback_chains():
+    config = InferenceConfig(fallback={"chains": {"gpt-5": ["claude-sonnet-4-6"]}})
+
+    assert config.fallback.chains == {"gpt-5": ["claude-sonnet-4-6"]}
+    assert InferenceConfig().fallback.chains == {}
+
+
+@pytest.mark.parametrize("config_name", ["config.yaml", "config.compose.yaml"])
+def test_shipped_configs_chain_gpt5_and_claude_both_ways(config_name):
+    path = Path(__file__).resolve().parents[1] / "config" / config_name
+    config = PlatformConfig.model_validate(yaml.safe_load(path.read_text()))
+
+    assert config.inference.fallback.chains == _CHAINS
+    assert config.inference.scheduler.fallback_reserve_ratio == 0.3
+    for model, chain in config.inference.fallback.chains.items():
+        assert {model, *chain} <= set(config.router.models)
