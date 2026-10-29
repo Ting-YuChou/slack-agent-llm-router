@@ -521,6 +521,90 @@ def _openai_cached_input_tokens(usage: Any) -> int:
     )
 
 
+# finish_reason values: "stop" for a complete answer, "length" when a token
+# limit cut it off, "content_filter" when the provider refused or filtered it.
+# Anything that is not a string (a mocked SDK object) counts as unknown: "stop".
+_OPENAI_INCOMPLETE_REASONS = {
+    "max_output_tokens": "length",
+    "content_filter": "content_filter",
+}
+_ANTHROPIC_STOP_REASONS = {
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "max_tokens": "length",
+    "model_context_window_exceeded": "length",
+    "refusal": "content_filter",
+    "tool_use": "tool_calls",
+}
+# Warnings for answers that are returned but must not be cached.
+_FINISH_REASON_WARNINGS = {
+    "length": "response_truncated",
+    "content_filter": "response_filtered",
+}
+
+
+def _field_value(container: Any, name: str) -> Any:
+    if isinstance(container, dict):
+        return container.get(name)
+    return getattr(container, name, None)
+
+
+def _openai_refused(response: Any) -> bool:
+    """Whether a Responses API answer contains a refusal content part."""
+    output = getattr(response, "output", None)
+    if not isinstance(output, (list, tuple)):
+        return False
+    for item in output:
+        content = _field_value(item, "content")
+        if not isinstance(content, (list, tuple)):
+            continue
+        if any(_field_value(part, "type") == "refusal" for part in content):
+            return True
+    return False
+
+
+def _openai_finish_reason(response: Any) -> str:
+    status = getattr(response, "status", None)
+    if not isinstance(status, str):
+        return "stop"
+    if status == "incomplete":
+        reason = _field_value(getattr(response, "incomplete_details", None), "reason")
+        if isinstance(reason, str):
+            return _OPENAI_INCOMPLETE_REASONS.get(reason, reason)
+        return "incomplete"
+    if status != "completed":
+        return status
+    return "content_filter" if _openai_refused(response) else "stop"
+
+
+def _anthropic_finish_reason(response: Any) -> str:
+    stop_reason = getattr(response, "stop_reason", None)
+    if not isinstance(stop_reason, str):
+        return "stop"
+    return _ANTHROPIC_STOP_REASONS.get(stop_reason, stop_reason)
+
+
+def _vllm_finish_reason(data: Any) -> str:
+    choices = data.get("choices") if isinstance(data, dict) else None
+    first_choice = choices[0] if isinstance(choices, list) and choices else None
+    reason = _field_value(first_choice, "finish_reason")
+    return reason if isinstance(reason, str) and reason else "stop"
+
+
+def _sdk_request_id(response: Any) -> Optional[str]:
+    """The SDK's ``_request_id``, taken from the provider's request-id header."""
+    return _string_attribute(response, "_request_id")
+
+
+def _exception_provider_request_id(exc: BaseException) -> Optional[str]:
+    """The provider's request id on a failed call: SDK errors, then httpx."""
+    request_id = _string_attribute(exc, "request_id")
+    if request_id:
+        return request_id
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    return _header_value(headers, "x-request-id")
+
+
 @dataclass
 class InferenceContext:
     """Context information for inference requests"""
@@ -1133,6 +1217,8 @@ class OpenAIProvider(BaseInferenceProvider):
                 cost_usd=self._calculate_cost(usage, model_name),
                 provider="openai",
                 cached=False,
+                finish_reason=_openai_finish_reason(response),
+                provider_request_id=_sdk_request_id(response),
             )
 
         except Exception as e:
@@ -1369,6 +1455,8 @@ class AnthropicProvider(BaseInferenceProvider):
                 cost_usd=self._calculate_cost(usage, model_name),
                 provider="anthropic",
                 cached=False,
+                finish_reason=_anthropic_finish_reason(response),
+                provider_request_id=_sdk_request_id(response),
             )
 
         except Exception as e:
@@ -1621,6 +1709,10 @@ class vLLMProvider(BaseInferenceProvider):
                     cost_usd=0.0,  # Self-hosted models have no API cost
                     provider="vllm",
                     cached=False,
+                    finish_reason=_vllm_finish_reason(data),
+                    provider_request_id=_header_value(
+                        getattr(response, "headers", None), "x-request-id"
+                    ),
                 )
 
             except Exception as e:
@@ -2528,12 +2620,20 @@ class InferenceEngine:
             self._attach_rag_result(response, rag_result)
             self._attach_web_search_result(response, web_search_result)
 
-            # Step 7: Cache response
-            if not response.cached and not self._response_cache_bypassed(request):
+            response_complete = self._flag_incomplete_response(request, response)
+
+            # Step 7: Cache response; truncated, filtered or empty answers are
+            # returned but not cached, so a retry can do better.
+            if (
+                response_complete
+                and not response.cached
+                and not self._response_cache_bypassed(request)
+            ):
                 cache_key = self.cache.generate_cache_key(request, model_name)
+                # A cache hit makes no provider call: no provider request id.
                 await self.cache.cache_response(
                     cache_key,
-                    response.model_dump(mode="json"),
+                    response.model_dump(mode="json", exclude={"provider_request_id"}),
                 )
 
             await self._finalize_successful_response(
@@ -2591,6 +2691,7 @@ class InferenceEngine:
                 error_type=classify_inference_error(primary_exc),
                 error_code=inference_error_code(primary_exc),
                 retry_after_seconds=_retry_after_seconds(primary_exc),
+                provider_request_id=_exception_provider_request_id(primary_exc),
             )
             # The caller keeps the "error" provider sentinel; analytics get the
             # failed model's real provider so outages count against it.
@@ -2607,6 +2708,32 @@ class InferenceEngine:
                 else None,
             )
             return error_response
+
+    def _flag_incomplete_response(
+        self, request: QueryRequest, response: InferenceResponse
+    ) -> bool:
+        """Warn about a truncated, filtered or empty answer; True if complete."""
+        warnings = []
+        finish_warning = _FINISH_REASON_WARNINGS.get(response.finish_reason)
+        if finish_warning:
+            warnings.append(finish_warning)
+        if not (response.response_text or "").strip():
+            warnings.append("empty_response")
+        complete = response.finish_reason == "stop" and not warnings
+        if not complete:
+            logger.warning(
+                "Model %s returned an incomplete answer for request %s "
+                "(finish_reason=%s, empty=%s)",
+                response.model_name,
+                request.request_id,
+                response.finish_reason,
+                "empty_response" in warnings,
+            )
+        response.warnings = [
+            *response.warnings,
+            *(warning for warning in warnings if warning not in response.warnings),
+        ]
+        return complete
 
     async def _finalize_successful_response(
         self,

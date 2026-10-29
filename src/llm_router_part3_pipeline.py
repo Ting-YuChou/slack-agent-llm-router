@@ -203,6 +203,8 @@ def build_inference_completed_event(
         "error_message": inference_response.error or "",
         "error_type": inference_response.error_type,
         "error_code": inference_response.error_code,
+        "finish_reason": inference_response.finish_reason,
+        "provider_request_id": inference_response.provider_request_id,
         "latency_ms": inference_response.latency_ms,
         "token_count_input": inference_response.token_count_input,
         "token_count_output": inference_response.token_count_output,

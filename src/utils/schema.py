@@ -221,6 +221,9 @@ class InferenceResponse(BaseModel):
     error: Optional[str] = None
     finish_reason: str = "stop"
     warnings: List[str] = Field(default_factory=list)
+    # The provider's id for the call (OpenAI x-request-id, Anthropic
+    # request-id, vLLM X-Request-Id) to quote in support tickets and logs.
+    provider_request_id: Optional[str] = None
 
     # Timestamps
     timestamp: datetime = Field(default_factory=utc_now)
