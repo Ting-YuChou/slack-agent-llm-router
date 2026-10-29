@@ -35,7 +35,11 @@ RUN groupadd --system llmrouter \
 WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
-COPY --chown=llmrouter:llmrouter . /app
+# Copy only what the app runs; API keys come from compose environment variables.
+COPY --chown=llmrouter:llmrouter main.py /app/main.py
+COPY --chown=llmrouter:llmrouter src /app/src
+COPY --chown=llmrouter:llmrouter slack /app/slack
+COPY --chown=llmrouter:llmrouter config /app/config
 
 RUN mkdir -p /app/logs /app/data /app/models \
     && chown -R llmrouter:llmrouter /app
