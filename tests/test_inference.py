@@ -149,6 +149,11 @@ _ReadTimeout = type(
         pytest.param(_APIConnectionError(), "provider_error", id="sdk-connection"),
         pytest.param(_ConnectError(), "provider_error", id="httpx-connect"),
         pytest.param(RuntimeError("overloaded"), "provider_error", id="runtime"),
+        pytest.param(
+            json.JSONDecodeError("Expecting value", "<html>", 0),
+            "provider_error",
+            id="json-decode",
+        ),
         pytest.param(asyncio.TimeoutError(), "timeout", id="asyncio-timeout"),
         pytest.param(TimeoutError(), "timeout", id="builtin-timeout"),
         pytest.param(_ReadTimeout(), "timeout", id="httpx-timeout"),

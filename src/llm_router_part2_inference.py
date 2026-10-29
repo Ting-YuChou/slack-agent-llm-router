@@ -314,6 +314,10 @@ def classify_inference_error(exc: BaseException) -> str:
         "TransportError",
     }:
         return "provider_error"
+    if isinstance(exc, json.JSONDecodeError):
+        # A provider answered with a body that is not JSON (an HTML error page,
+        # a truncated stream); JSONDecodeError is a ValueError, so check first.
+        return "provider_error"
     if isinstance(exc, ValueError):
         return "user_or_policy"
     if isinstance(exc, RuntimeError):
