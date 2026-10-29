@@ -968,10 +968,47 @@ class PolicyCacheConfig(ConfigModel):
     consumer: Dict[str, Any] = Field(default_factory=dict)
 
 
+class ApiKeyClientConfig(ConfigModel):
+    """An API key mapped to a client and what that client may ask for."""
+
+    client_id: str = Field(..., min_length=1, max_length=128)
+    # Exactly one key reference: an environment variable holding the key, or
+    # the hex SHA-256 of the key.
+    key_env: Optional[str] = Field(None, min_length=1)
+    sha256: Optional[str] = Field(None, pattern=r"^[0-9a-fA-F]{64}$")
+    # Highest user_tier the client may request; higher tiers are clamped.
+    max_tier: UserTier = UserTier.FREE
+    # Per-client request rate (0 disables it); burst defaults to rpm.
+    rpm: int = Field(60, ge=0)
+    burst: Optional[int] = Field(None, ge=1)
+    # Per-client concurrent /route requests (0 disables it).
+    active: int = Field(10, ge=0)
+    # Whether the client's priority and latency metadata are honoured.
+    allow_priority: bool = False
+
+    @model_validator(mode="after")
+    def validate_key_reference(self) -> "ApiKeyClientConfig":
+        if bool(self.key_env) == bool(self.sha256):
+            raise ValueError("set exactly one of key_env or sha256")
+        return self
+
+
 class ApiKeysSecurityConfig(ConfigModel):
     enabled: bool = False
     header_name: str = "X-API-Key"
+    # Keys listed here without a client entry authenticate as an unmapped
+    # principal: max_tier free, no priority, the unmapped_* limits below.
     env_var: str = "LLM_ROUTER_API_KEYS"
+    clients: List[ApiKeyClientConfig] = Field(default_factory=list)
+    unmapped_rpm: int = Field(60, ge=0)
+    unmapped_active: int = Field(10, ge=0)
+
+    @model_validator(mode="after")
+    def validate_unique_clients(self) -> "ApiKeysSecurityConfig":
+        client_ids = [client.client_id for client in self.clients]
+        if len(client_ids) != len(set(client_ids)):
+            raise ValueError("api_keys.clients client_id values must be unique")
+        return self
 
 
 class JwtSecurityConfig(ConfigModel):

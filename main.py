@@ -17,7 +17,6 @@ import json
 import logging
 import multiprocessing as mp
 import os
-import secrets
 import signal
 import sys
 import time
@@ -47,8 +46,12 @@ from src.admission import (
 )
 from src.agent_runtime import AgentRuntimeClient
 from src.api_security import (
+    ApiPrincipal,
     AttachmentRejected,
     RequestBodyLimitMiddleware,
+    api_key_clients_configured,
+    apply_principal_entitlements,
+    resolve_api_principal,
     strip_server_only_metadata,
     validate_external_attachments,
 )
@@ -241,7 +244,7 @@ class LLMRouterPlatform:
                 "CORS is configured with a wildcard origin; restrict allow_origins before production rollout."
             )
 
-        if self._api_key_auth_enabled() and not self._configured_api_keys():
+        if not self._api_key_auth_configured():
             self.logger.warning(
                 "API key authentication is enabled but no keys were loaded from %s.",
                 self._api_key_env_var_name(),
@@ -744,7 +747,11 @@ class LLMRouterPlatform:
 
     def _api_key_auth_configured(self) -> bool:
         """Return whether auth is either disabled or fully configured."""
-        return not self._api_key_auth_enabled() or bool(self._configured_api_keys())
+        return (
+            not self._api_key_auth_enabled()
+            or bool(self._configured_api_keys())
+            or api_key_clients_configured(self._api_keys_config())
+        )
 
     def _request_path_is_public(self, path: str) -> bool:
         """Return whether the request path is publicly accessible."""
@@ -763,15 +770,19 @@ class LLMRouterPlatform:
 
         return None
 
-    def _is_valid_api_key(self, provided_key: Optional[str]) -> bool:
-        """Return whether the provided API key matches a configured key."""
-        if not provided_key:
-            return False
+    def _resolve_api_principal(
+        self, provided_key: Optional[str]
+    ) -> Optional[ApiPrincipal]:
+        """Return the principal for a valid API key, or None.
 
-        for expected_key in self._configured_api_keys():
-            if secrets.compare_digest(provided_key, expected_key):
-                return True
-        return False
+        Keys under ``security.api_keys.clients`` carry their configured
+        entitlements; other accepted keys are clamped to the free tier.
+        """
+        return resolve_api_principal(
+            provided_key,
+            self._api_keys_config(),
+            self._configured_api_keys(),
+        )
 
     def _admission_identifier(self, request: Request) -> Optional[str]:
         """Build a stable non-secret identity for protected non-route admission."""
@@ -800,25 +811,29 @@ class LLMRouterPlatform:
         return self._build_admission_response(decision), None
 
     async def _admit_route_request(
-        self, query_data: QueryRequest
+        self, query_data: QueryRequest, principal: Optional[ApiPrincipal] = None
     ) -> tuple[Optional[JSONResponse], Optional[AdmissionReservation]]:
         """Apply full route-level admission after QueryRequest validation."""
         admission = self._get_admission_controller()
         if admission is None:
             return self._missing_admission_response("route"), None
 
-        decision = await admission.acquire_route(query_data)
+        if principal is None:
+            decision = await admission.acquire_route(query_data)
+        else:
+            decision = await admission.acquire_route(query_data, principal)
         if decision.allowed:
             return None, decision.reservation
         return self._build_admission_response(decision), None
 
     def _apply_route_boundary_guards(
-        self, query_data: QueryRequest
+        self, query_data: QueryRequest, principal: Optional[ApiPrincipal] = None
     ) -> Optional[JSONResponse]:
         """Sanitize an external /route request before admission and inference.
 
         Only POST /route runs this: the Slack bot builds its requests (and
-        their server-side metadata) in-process.
+        their server-side metadata) in-process. With API key auth, the tier,
+        priority and latency hints are clamped to the caller's principal.
         """
         removed = strip_server_only_metadata(query_data)
         if removed:
@@ -827,6 +842,15 @@ class LLMRouterPlatform:
                 query_data.request_id,
                 ", ".join(removed),
             )
+        if principal is not None:
+            changes = apply_principal_entitlements(query_data, principal)
+            if changes:
+                self.logger.info(
+                    "Clamped request %s to the entitlements of client %s: %s",
+                    query_data.request_id,
+                    principal.client_id,
+                    "; ".join(changes),
+                )
         max_attachment_bytes = int(
             self._security_config().get("max_attachment_bytes") or 1024 * 1024
         )
@@ -1829,7 +1853,9 @@ class LLMRouterPlatform:
                     },
                 )
 
-            if self._is_valid_api_key(self._extract_api_key(request)):
+            principal = self._resolve_api_principal(self._extract_api_key(request))
+            if principal is not None:
+                request.state.api_principal = principal
                 return await self._call_with_http_admission(request, call_next)
 
             security_logger.log_authentication_attempt(
@@ -1887,7 +1913,7 @@ class LLMRouterPlatform:
 
         # Model routing endpoint
         @app.post("/route")
-        async def route_query(query_data: QueryRequest):
+        async def route_query(query_data: QueryRequest, request: Request):
             endpoint = "/route"
             method = "POST"
             start_time = time.perf_counter()
@@ -1897,13 +1923,17 @@ class LLMRouterPlatform:
             active_requests = getattr(SYSTEM_METRICS, "active_requests", None)
 
             try:
-                boundary_response = self._apply_route_boundary_guards(query_data)
+                # Set by the auth middleware; None when API key auth is off.
+                principal = getattr(request.state, "api_principal", None)
+                boundary_response = self._apply_route_boundary_guards(
+                    query_data, principal
+                )
                 if boundary_response is not None:
                     status_code = boundary_response.status_code
                     return boundary_response
 
                 admission_response, route_reservation = await self._admit_route_request(
-                    query_data
+                    query_data, principal
                 )
                 if admission_response is not None:
                     status_code = admission_response.status_code

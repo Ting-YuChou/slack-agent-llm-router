@@ -538,13 +538,31 @@ class RedisAdmissionController:
             metadata=metadata,
         )
 
-    async def acquire_route(self, request: Any) -> AdmissionDecision:
-        """Acquire request-level admission after /route body validation."""
+    async def acquire_route(
+        self, request: Any, principal: Optional[Any] = None
+    ) -> AdmissionDecision:
+        """Acquire request-level admission after /route body validation.
+
+        ``principal`` is the authenticated API client (``client_id``, ``rpm``,
+        ``burst``, ``active``). It adds a per-client rate bucket and active
+        scope, and scopes the per-user bucket to ``client_id:user_id``.
+        """
         active_specs = self._global_active_specs()
         bucket_specs = self._global_request_bucket_specs()
+        metadata = {
+            "user_tier": self._tier_value(request.user_tier),
+            "request_id": str(getattr(request, "request_id", "")),
+        }
+        user_key = str(request.user_id)
+        if principal is not None:
+            client_id = str(principal.client_id)
+            active_specs.extend(self._principal_active_specs(principal))
+            bucket_specs.extend(self._principal_request_bucket_specs(principal))
+            user_key = f"{client_id}:{user_key}"
+            metadata["client_id"] = client_id
         bucket_specs.extend(
             self._user_and_tier_request_bucket_specs(
-                user_id=str(request.user_id),
+                user_id=user_key,
                 user_tier=self._tier_value(request.user_tier),
             )
         )
@@ -554,10 +572,7 @@ class RedisAdmissionController:
             bucket_specs=bucket_specs,
             token_specs=[],
             reserved_tokens=0,
-            metadata={
-                "user_tier": self._tier_value(request.user_tier),
-                "request_id": str(getattr(request, "request_id", "")),
-            },
+            metadata=metadata,
         )
 
     async def acquire_provider(
@@ -983,6 +998,10 @@ class RedisAdmissionController:
 
     @staticmethod
     def _is_waitable_denial(reason: str) -> bool:
+        # A client at its own active limit must not hold the shared queue head
+        # and block every other client behind it.
+        if reason == "principal_active_requests_exceeded":
+            return False
         return reason.endswith("_active_requests_exceeded") or reason in {
             "active_limit",
             "queue_wait",
@@ -1121,6 +1140,37 @@ class RedisAdmissionController:
                 scope="global",
             )
         ]
+
+    def _principal_active_specs(self, principal: Any) -> List[ActiveSpec]:
+        limit = int(getattr(principal, "active", 0) or 0)
+        if limit <= 0:
+            return []
+        return [
+            ActiveSpec(
+                key=self._key(
+                    "principal", self._hash_id(str(principal.client_id)), "active"
+                ),
+                limit=limit,
+                reason="principal_active_requests_exceeded",
+                scope="principal",
+            )
+        ]
+
+    def _principal_request_bucket_specs(self, principal: Any) -> List[BucketSpec]:
+        requests_per_minute = int(getattr(principal, "rpm", 0) or 0)
+        spec = self._request_bucket_spec(
+            key=self._key(
+                "bucket",
+                "requests",
+                "principal",
+                self._hash_id(str(principal.client_id)),
+            ),
+            requests_per_minute=requests_per_minute,
+            burst_size=int(getattr(principal, "burst", 0) or requests_per_minute),
+            reason="principal_request_rate_exceeded",
+            scope="principal",
+        )
+        return [spec] if spec else []
 
     def _model_provider_active_specs(
         self, *, model_name: str, provider: str
@@ -1371,6 +1421,8 @@ class RedisAdmissionController:
             return "provider_active_requests_exceeded"
         if ":model:" in redis_key:
             return "model_active_requests_exceeded"
+        if ":principal:" in redis_key:
+            return "principal_active_requests_exceeded"
         return "global_active_requests_exceeded"
 
     def _reservation_key(self, reservation_id: str) -> str:

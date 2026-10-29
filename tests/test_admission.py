@@ -1,5 +1,6 @@
 import asyncio
 import time
+from types import SimpleNamespace
 
 import pytest
 from redis.exceptions import MaxConnectionsError
@@ -904,3 +905,100 @@ async def test_release_gives_up_after_one_retry():
 
     assert released is False
     assert client.release_calls == 2
+
+
+def _principal(client_id, *, rpm=0, burst=0, active=0):
+    return SimpleNamespace(client_id=client_id, rpm=rpm, burst=burst, active=active)
+
+
+@pytest.mark.asyncio
+async def test_one_key_rotating_200_user_ids_hits_the_per_key_rate_limit():
+    controller = _controller(
+        {
+            "requests_per_minute": 1000,
+            "burst_size": 1000,
+            "per_user": {"requests_per_minute": 1, "burst_size": 1},
+        }
+    )
+    principal = _principal("partner", rpm=50, burst=50)
+
+    decisions = [
+        await controller.acquire_route(
+            QueryRequest(query="hi", user_id=f"user-{index}"), principal
+        )
+        for index in range(200)
+    ]
+
+    assert sum(decision.allowed for decision in decisions) == 50
+    assert {decision.reason for decision in decisions[50:]} == {
+        "principal_request_rate_exceeded"
+    }
+
+
+@pytest.mark.asyncio
+async def test_user_buckets_are_scoped_by_client():
+    controller = _controller({"per_user": {"requests_per_minute": 1, "burst_size": 1}})
+    request = QueryRequest(query="hi", user_id="u1")
+
+    first_a = await controller.acquire_route(request, _principal("client-a"))
+    first_b = await controller.acquire_route(request, _principal("client-b"))
+    second_a = await controller.acquire_route(request, _principal("client-a"))
+
+    assert first_a.allowed is True
+    assert first_b.allowed is True
+    assert second_a.allowed is False
+    assert second_a.reason == "user_request_rate_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_principal_active_limit_rejects_without_queueing():
+    clock = Clock()
+    redis_client = FakeRedis()
+    controller = _controller(
+        {
+            "queue": {"enabled": True, "timeout_ms": 1000, "poll_interval_ms": 5},
+            "global_limits": {"active_requests": 10},
+        },
+        clock=clock,
+        redis_client=redis_client,
+    )
+    partner = _principal("partner", active=1)
+    started = clock.now
+
+    first = await controller.acquire_route(
+        QueryRequest(query="a", user_id="u1"), partner
+    )
+    second = await controller.acquire_route(
+        QueryRequest(query="b", user_id="u2"), partner
+    )
+    other = await controller.acquire_route(
+        QueryRequest(query="c", user_id="u3"), _principal("other", active=1)
+    )
+
+    assert first.allowed is True
+    assert second.allowed is False
+    assert second.reason == "principal_active_requests_exceeded"
+    assert clock.now == started  # no queue wait behind its own limit
+    assert other.allowed is True
+    assert await controller.release(first.reservation) is True
+    third = await controller.acquire_route(
+        QueryRequest(query="d", user_id="u4"), partner
+    )
+    assert third.allowed is True
+
+
+@pytest.mark.asyncio
+async def test_route_admission_without_principal_keeps_unscoped_buckets():
+    redis_client = FakeRedis()
+    controller = _controller(
+        {"per_user": {"requests_per_minute": 10, "burst_size": 10}},
+        redis_client=redis_client,
+    )
+
+    decision = await controller.acquire_route(QueryRequest(query="hi", user_id="u1"))
+
+    assert decision.allowed is True
+    assert controller._key("bucket", "requests", "user", controller._hash_id("u1")) in (
+        redis_client.hashes
+    )
+    assert not any(":principal:" in key for key in redis_client.hashes)

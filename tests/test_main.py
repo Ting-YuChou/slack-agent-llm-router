@@ -1,5 +1,6 @@
 import base64
 import asyncio
+import hashlib
 import json
 import signal
 from pathlib import Path
@@ -12,7 +13,7 @@ from fastapi.testclient import TestClient
 
 import main
 from src.rag.service import RagService as RealRagService
-from src.utils.schema import InferenceResponse
+from src.utils.schema import InferenceResponse, UserTier
 
 
 def _write_config(tmp_path: Path, overrides=None) -> Path:
@@ -513,6 +514,38 @@ def _admission_platform(tmp_path, overrides=None):
     platform = main.LLMRouterPlatform(config_path=str(config_path))
     platform.services["inference"] = DummyInferenceEngine({}, DummyRouter({}))
     return platform
+
+
+class PrincipalAwareAdmissionController(DummyAdmissionController):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.principal_route_calls = []
+
+    async def acquire_route(self, request, principal=None):
+        self.principal_route_calls.append((request, principal))
+        return await super().acquire_route(request)
+
+
+def _principal_platform(tmp_path, *, clients):
+    """Platform with API key auth (mapped clients) and route admission enabled."""
+    platform = _admission_platform(
+        tmp_path,
+        overrides={
+            "security": {
+                "api_keys": {
+                    "enabled": True,
+                    "header_name": "X-API-Key",
+                    "env_var": "LLM_ROUTER_API_KEYS",
+                    "clients": clients,
+                },
+                "cors": {"enabled": False},
+            }
+        },
+    )
+    platform.services["router"] = DummyRouter({})
+    admission = PrincipalAwareAdmissionController()
+    platform.services["admission"] = admission
+    return platform, admission
 
 
 def _asgi_scope(method, path, body=b"", headers=None):
@@ -1477,6 +1510,176 @@ class TestApiApp:
 
         assert response.status_code == 200
         assert inference.processed_requests[0].attachments[0].content == b"a,b\n1,2\n"
+
+    def test_mapped_free_key_sending_enterprise_is_admitted_and_routed_as_free(
+        self, tmp_path, monkeypatch, patched_platform_deps
+    ):
+        monkeypatch.setenv("PARTNER_API_KEY", "partner-secret")
+        platform, admission = _principal_platform(
+            tmp_path,
+            clients=[
+                {
+                    "client_id": "partner",
+                    "key_env": "PARTNER_API_KEY",
+                    "max_tier": "free",
+                    "rpm": 100,
+                    "active": 5,
+                }
+            ],
+        )
+        inference = platform.services["inference"]
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/route",
+                json={
+                    "query": "hello",
+                    "user_id": "u1",
+                    "user_tier": "enterprise",
+                    "priority": 5,
+                    "metadata": {"requires_low_latency": True, "client_tag": "x"},
+                },
+                headers={"X-API-Key": "partner-secret"},
+            )
+
+        assert response.status_code == 200
+        admitted, principal = admission.principal_route_calls[0]
+        assert admitted.user_tier == UserTier.FREE
+        assert principal.client_id == "partner"
+        assert (principal.rpm, principal.active) == (100, 5)
+        routed = inference.processed_requests[0]
+        assert routed.user_tier == UserTier.FREE
+        assert routed.priority == 1
+        assert routed.metadata == {"client_tag": "x"}
+
+    def test_unmapped_key_is_clamped_to_free_without_priority(
+        self, tmp_path, monkeypatch, patched_platform_deps
+    ):
+        monkeypatch.setenv("LLM_ROUTER_API_KEYS", "legacy-key")
+        platform, admission = _principal_platform(tmp_path, clients=[])
+        inference = platform.services["inference"]
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/route",
+                json={
+                    "query": "hello",
+                    "user_id": "u1",
+                    "user_tier": "premium",
+                    "priority": 4,
+                    "metadata": {
+                        "requires_low_latency": True,
+                        "route_to_fast_lane": True,
+                        "latency_sla": "interactive",
+                        "client_tag": "x",
+                    },
+                },
+                headers={"Authorization": "Bearer legacy-key"},
+            )
+
+        assert response.status_code == 200
+        _admitted, principal = admission.principal_route_calls[0]
+        fingerprint = hashlib.sha256(b"legacy-key").hexdigest()[:12]
+        assert principal.client_id == f"key:{fingerprint}"
+        assert principal.max_tier == "free"
+        assert principal.allow_priority is False
+        routed = inference.processed_requests[0]
+        assert routed.user_tier == UserTier.FREE
+        assert routed.priority == 1
+        assert routed.metadata == {"client_tag": "x"}
+
+    def test_allow_priority_key_keeps_priority_and_urgency(
+        self, tmp_path, monkeypatch, patched_platform_deps
+    ):
+        monkeypatch.setenv("OPS_API_KEY", "ops-secret")
+        platform, admission = _principal_platform(
+            tmp_path,
+            clients=[
+                {
+                    "client_id": "ops",
+                    "key_env": "OPS_API_KEY",
+                    "max_tier": "enterprise",
+                    "allow_priority": True,
+                }
+            ],
+        )
+        inference = platform.services["inference"]
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/route",
+                json={
+                    "query": "hello",
+                    "user_id": "u1",
+                    "user_tier": "enterprise",
+                    "priority": 5,
+                    "metadata": {"requires_low_latency": True},
+                },
+                headers={"X-API-Key": "ops-secret"},
+            )
+
+        assert response.status_code == 200
+        routed = inference.processed_requests[0]
+        assert routed.user_tier == UserTier.ENTERPRISE
+        assert routed.priority == 5
+        assert routed.metadata == {"requires_low_latency": True}
+
+    def test_sha256_mapped_client_authenticates_without_anonymous_keys(
+        self, tmp_path, monkeypatch, patched_platform_deps
+    ):
+        monkeypatch.delenv("LLM_ROUTER_API_KEYS", raising=False)
+        platform, admission = _principal_platform(
+            tmp_path,
+            clients=[
+                {
+                    "client_id": "hashed",
+                    "sha256": hashlib.sha256(b"hashed-secret").hexdigest(),
+                    "max_tier": "premium",
+                }
+            ],
+        )
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            ready = client.get("/ready")
+            accepted = client.post(
+                "/route",
+                json={"query": "hello", "user_id": "u1", "user_tier": "premium"},
+                headers={"X-API-Key": "hashed-secret"},
+            )
+            rejected = client.post(
+                "/route",
+                json={"query": "hello", "user_id": "u1"},
+                headers={"X-API-Key": "wrong"},
+            )
+
+        assert ready.json()["security"]["api_keys_configured"] is True
+        assert accepted.status_code == 200
+        assert admission.principal_route_calls[0][1].client_id == "hashed"
+        assert admission.principal_route_calls[0][0].user_tier == UserTier.PREMIUM
+        assert rejected.status_code == 401
+
+    def test_route_without_api_auth_keeps_the_caller_tier(
+        self, tmp_path, patched_platform_deps
+    ):
+        platform = _admission_platform(tmp_path)
+        inference = platform.services["inference"]
+        admission = DummyAdmissionController()
+        platform.services["admission"] = admission
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/route",
+                json={"query": "hello", "user_id": "u1", "user_tier": "enterprise"},
+            )
+
+        assert response.status_code == 200
+        assert admission.route_calls[0].user_tier == UserTier.ENTERPRISE
+        assert inference.processed_requests[0].user_tier == UserTier.ENTERPRISE
 
     def test_route_scheduler_rejection_returns_429_with_retry_after(
         self, tmp_path, patched_platform_deps

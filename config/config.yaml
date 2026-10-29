@@ -847,7 +847,19 @@ security:
   api_keys:
     enabled: true
     header_name: X-API-Key
+    # Keys in this variable without a client entry below are clamped to the
+    # free tier, lose priority and latency hints, and get the unmapped_* limits.
     env_var: LLM_ROUTER_API_KEYS
+    unmapped_rpm: 60
+    unmapped_active: 10
+    # Map a key to a client to grant a higher tier or priority, e.g.
+    #   - client_id: partner-app
+    #     key_env: PARTNER_APP_API_KEY   # or sha256: <hex SHA-256 of the key>
+    #     max_tier: premium
+    #     rpm: 300
+    #     active: 20
+    #     allow_priority: false
+    clients: []
   jwt:
     enabled: false
     secret_key_env: JWT_SECRET_KEY
