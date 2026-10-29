@@ -1560,6 +1560,35 @@ class ModelRouter:
                 return decoded
         return None
 
+    def _policy_read_timeout_seconds(self) -> float:
+        """How long routing waits for the shared policy cache (R10)."""
+        timeout = getattr(self.policy_cache, "read_timeout_seconds", None)
+        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
+            return max(0.001, float(timeout))
+        cache_config = getattr(self.policy_cache, "config", None)
+        timeout_ms = 50
+        if isinstance(cache_config, dict):
+            try:
+                timeout_ms = int(cache_config.get("read_timeout_ms", 50))
+            except (TypeError, ValueError):
+                timeout_ms = 50
+        return max(0.001, timeout_ms / 1000.0)
+
+    def _policy_read_timed_out(self, request: QueryRequest) -> Dict[str, Any]:
+        """Route without the shared policy when its read misses the deadline."""
+        logger.warning(
+            "Routing policy read for request %s exceeded its deadline; "
+            "routing without it",
+            request.request_id,
+        )
+        record_timeout = getattr(self.policy_cache, "record_read_timeout", None)
+        if callable(record_timeout):
+            try:
+                record_timeout()
+            except Exception as e:
+                logger.debug("Failed to record a policy read timeout: %s", e)
+        return {"policy_source": "unavailable"}
+
     async def _get_policy_context(self, request: QueryRequest) -> Dict[str, Any]:
         """Load request/user-level routing hints from the shared policy cache."""
         metadata = request.metadata or {}
@@ -1616,15 +1645,25 @@ class ModelRouter:
 
         # A1 shadow mode counts a failed fetch as unavailable.
         policy_fetch_failed = False
+        policy_timeout = self._policy_read_timeout_seconds()
         try:
-            policy = await get_policy(
-                request.request_id,
-                request.user_id,
-                request.session_id,
+            policy = await asyncio.wait_for(
+                get_policy(
+                    request.request_id,
+                    request.user_id,
+                    request.session_id,
+                ),
+                policy_timeout,
             )
+        except asyncio.TimeoutError:
+            policy = self._policy_read_timed_out(request)
         except TypeError:
             try:
-                policy = await get_policy(request.request_id, request.user_id)
+                policy = await asyncio.wait_for(
+                    get_policy(request.request_id, request.user_id), policy_timeout
+                )
+            except asyncio.TimeoutError:
+                policy = self._policy_read_timed_out(request)
             except Exception as e:
                 logger.warning(
                     f"Failed to load routing policy for request {request.request_id}: {e}"

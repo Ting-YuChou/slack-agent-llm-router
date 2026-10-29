@@ -1175,6 +1175,12 @@ class PolicyCacheConfig(ConfigModel):
     local_cache_max_entries: int = Field(4096, ge=1)
     redis: Dict[str, Any] = Field(default_factory=dict)
     consumer: Dict[str, Any] = Field(default_factory=dict)
+    # Redis bounds and recovery (R10): routing waits read_timeout_ms for the
+    # policy, then routes without it; a failed Redis is pinged again after
+    # recovery_cooldown_ms.
+    read_timeout_ms: int = Field(50, ge=1)
+    read_timeout_failure_threshold: int = Field(5, ge=1)
+    recovery_cooldown_ms: int = Field(1000, ge=0)
 
 
 class ApiKeyClientConfig(ConfigModel):

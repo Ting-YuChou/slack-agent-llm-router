@@ -53,11 +53,30 @@ DEFAULT_MODEL_GUARDRAIL_CONFIG = {
     "cost_spike_ratio": 1.75,
 }
 
+# Shared by model and provider guardrails (A2). An avoid trigger needs
+# min_request_count samples in its window; a high latency avoids only when
+# the time per output token is also high (a long answer is not a slow
+# model), and only warns otherwise. The detectors block after
+# enter_bad_windows bad windows among the last enter_window_lookback, and
+# emit guardrail_action "clear" after exit_good_windows good ones in a row.
+DEFAULT_GUARDRAIL_GATING_CONFIG = {
+    "min_request_count": 5,
+    "high_latency_ms_per_output_token": 100,
+    "enter_bad_windows": 2,
+    "enter_window_lookback": 3,
+    "exit_good_windows": 2,
+    # Matches policy_cache.guardrail_ttl_seconds: an entered scope with no
+    # bad window for this long has lapsed in the cache and must enter again.
+    "active_ttl_seconds": 180,
+}
+DEFAULT_MODEL_GUARDRAIL_CONFIG.update(DEFAULT_GUARDRAIL_GATING_CONFIG)
+
 DEFAULT_PROVIDER_GUARDRAIL_CONFIG = {
     "high_error_rate": 0.20,
     "high_latency_ms": 6000,
     "regression_error_rate_floor": 0.10,
     "regression_latency_floor_ms": 4500,
+    **DEFAULT_GUARDRAIL_GATING_CONFIG,
 }
 
 DEFAULT_ROLLING_POLICY_CONFIG = {
@@ -85,6 +104,10 @@ DEFAULT_ROLLING_POLICY_CONFIG = {
     "failing_provider_min_share": 0.70,
     "fast_lane_hit_rate_threshold": 0.60,
 }
+
+
+# Event timestamps before 2000-01-01 are sequence numbers, not wall clock.
+_MIN_WALL_CLOCK_MS = 946_684_800_000
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -643,6 +666,50 @@ def detect_metric_anomalies(
     return alerts
 
 
+def metric_latency_sample_count(metric_event: Dict[str, Any]) -> int:
+    """Uncached requests behind a window's latency; older windows: all requests."""
+    samples = metric_event.get("latency_sample_count")
+    if samples is None:
+        samples = metric_event.get("request_count")
+    return max(0, _safe_int(samples, 0))
+
+
+def metric_provider_request_count(metric_event: Dict[str, Any]) -> int:
+    """Requests behind provider_failure_rate; older windows: all requests."""
+    requests = metric_event.get("provider_request_count")
+    if requests is None:
+        requests = metric_event.get("request_count")
+    return max(0, _safe_int(requests, 0))
+
+
+def metric_provider_latency_sample_count(metric_event: Dict[str, Any]) -> int:
+    """Uncached successes behind provider_avg_latency_ms.
+
+    Older windows fall back to the model latency samples.
+    """
+    samples = metric_event.get("provider_latency_sample_count")
+    if samples is None:
+        return metric_latency_sample_count(metric_event)
+    return max(0, _safe_int(samples, 0))
+
+
+def metric_ms_per_output_token(metric_event: Dict[str, Any]) -> float | None:
+    """Milliseconds per output token from the window's average throughput."""
+    tokens_per_second = _safe_float(metric_event.get("avg_tokens_per_second"), 0.0)
+    if tokens_per_second <= 0:
+        return None
+    return 1000.0 / tokens_per_second
+
+
+def _high_latency_action(metric_event: Dict[str, Any], config: Dict[str, Any]) -> str:
+    """Avoid only when each output token is slow too; otherwise warn."""
+    threshold = _safe_float(config.get("high_latency_ms_per_output_token"), 100)
+    ms_per_token = metric_ms_per_output_token(metric_event)
+    if ms_per_token is not None and ms_per_token >= threshold:
+        return "avoid"
+    return "warn"
+
+
 def detect_model_routing_guardrails(
     metric_event: Dict[str, Any],
     *,
@@ -664,7 +731,13 @@ def detect_model_routing_guardrails(
     has_uncached = metric_has_uncached_sample(metric_event)
     current_latency = float(metric_event.get("avg_latency_ms", 0.0) or 0.0)
     current_qps = float(metric_event.get("queries_per_second", 0.0) or 0.0)
-    current_error_rate = float(metric_event.get("error_rate", 0.0) or 0.0)
+    # Caller, policy and internal failures are not the model's (A2).
+    current_error_rate = metric_provider_failure_rate(metric_event)
+    min_request_count = max(1, _safe_int(config.get("min_request_count"), 5))
+    enough_requests = metric_provider_request_count(metric_event) >= min_request_count
+    enough_latency_samples = (
+        metric_latency_sample_count(metric_event) >= min_request_count
+    )
     current_cache_hit_rate = float(metric_event.get("cache_hit_rate", 0.0) or 0.0)
     request_count = max(0, int(metric_event.get("request_count", 0) or 0))
     current_cost_per_1k = metric_cost_per_1k_tokens(metric_event)
@@ -690,7 +763,7 @@ def detect_model_routing_guardrails(
     )
     cost_spike_ratio = _safe_float(config.get("cost_spike_ratio"), 1.75)
 
-    if current_error_rate >= high_error_rate_threshold:
+    if enough_requests and current_error_rate >= high_error_rate_threshold:
         guardrails.append(
             build_routing_guardrail_event(
                 metric_event,
@@ -705,7 +778,8 @@ def detect_model_routing_guardrails(
             )
         )
 
-    if has_uncached and current_latency >= high_latency_ms:
+    if has_uncached and enough_latency_samples and current_latency >= high_latency_ms:
+        action = _high_latency_action(metric_event, config)
         guardrails.append(
             build_routing_guardrail_event(
                 metric_event,
@@ -715,12 +789,13 @@ def detect_model_routing_guardrails(
                 description=(
                     f"Model latency {current_latency:.0f}ms exceeded the routing guardrail threshold"
                 ),
-                severity="error",
+                guardrail_action=action,
+                severity="error" if action == "avoid" else "warning",
                 timestamp=timestamp,
             )
         )
 
-    if len(error_rate_history) >= minimum_history:
+    if enough_requests and len(error_rate_history) >= minimum_history:
         avg_error_rate = sum(error_rate_history) / len(error_rate_history)
         if avg_error_rate >= 0 and current_error_rate > max(
             regression_error_floor, avg_error_rate * threshold_multiplier
@@ -739,7 +814,11 @@ def detect_model_routing_guardrails(
                 )
             )
 
-    if has_uncached and len(latency_history) >= minimum_history:
+    if (
+        has_uncached
+        and enough_latency_samples
+        and len(latency_history) >= minimum_history
+    ):
         avg_latency = sum(latency_history) / len(latency_history)
         if avg_latency > 0 and current_latency > max(
             regression_latency_floor_ms, avg_latency * threshold_multiplier
@@ -878,7 +957,11 @@ def detect_provider_routing_guardrails(
     config = _merged_config(DEFAULT_PROVIDER_GUARDRAIL_CONFIG, thresholds)
 
     provider = str(metric_event.get("provider", "unknown") or "unknown")
-    has_provider_latency = metric_has_provider_latency_sample(metric_event)
+    min_request_count = max(1, _safe_int(config.get("min_request_count"), 5))
+    has_provider_latency = metric_has_provider_latency_sample(metric_event) and (
+        metric_provider_latency_sample_count(metric_event) >= min_request_count
+    )
+    enough_requests = metric_provider_request_count(metric_event) >= min_request_count
     current_latency = metric_provider_avg_latency_ms(metric_event)
     current_error_rate = metric_provider_failure_rate(metric_event)
     high_error_rate_threshold = _safe_float(config.get("high_error_rate"), 0.20)
@@ -890,7 +973,7 @@ def detect_provider_routing_guardrails(
         config.get("regression_latency_floor_ms"), 4500
     )
 
-    if current_error_rate >= high_error_rate_threshold:
+    if enough_requests and current_error_rate >= high_error_rate_threshold:
         guardrails.append(
             build_routing_guardrail_event(
                 metric_event,
@@ -906,6 +989,7 @@ def detect_provider_routing_guardrails(
         )
 
     if has_provider_latency and current_latency >= high_latency_ms:
+        action = _high_latency_action(metric_event, config)
         guardrails.append(
             build_routing_guardrail_event(
                 metric_event,
@@ -915,12 +999,13 @@ def detect_provider_routing_guardrails(
                 description=(
                     f"Provider latency {current_latency:.0f}ms exceeded the routing guardrail threshold"
                 ),
-                severity="error",
+                guardrail_action=action,
+                severity="error" if action == "avoid" else "warning",
                 timestamp=timestamp,
             )
         )
 
-    if len(error_rate_history) >= minimum_history:
+    if enough_requests and len(error_rate_history) >= minimum_history:
         avg_error_rate = sum(error_rate_history) / len(error_rate_history)
         if avg_error_rate > 0 and current_error_rate > max(
             regression_error_floor, avg_error_rate * threshold_multiplier
@@ -959,6 +1044,358 @@ def detect_provider_routing_guardrails(
             )
 
     return guardrails
+
+
+def _gating_config(
+    defaults: Dict[str, Any], thresholds: Dict[str, Any] | None
+) -> Dict[str, int]:
+    config = _merged_config(defaults, thresholds)
+    lookback = max(1, _safe_int(config.get("enter_window_lookback"), 3))
+    return {
+        "enter_bad_windows": min(
+            lookback, max(1, _safe_int(config.get("enter_bad_windows"), 2))
+        ),
+        "enter_window_lookback": lookback,
+        "exit_good_windows": max(1, _safe_int(config.get("exit_good_windows"), 2)),
+        "active_ttl_ms": max(1, _safe_int(config.get("active_ttl_seconds"), 180))
+        * 1000,
+    }
+
+
+def _window_end_ms(metric_event: Dict[str, Any], window_start_ms: int) -> int:
+    end_ms = _safe_int(metric_event.get("window_end_ms"), 0)
+    if end_ms > window_start_ms:
+        return end_ms
+    size_seconds = _safe_int(metric_event.get("window_size_seconds"), 0)
+    return window_start_ms + max(0, size_seconds) * 1000
+
+
+def _hysteresis_clear_event(
+    metric_event: Dict[str, Any],
+    *,
+    scope_type: str,
+    scope_key: str,
+    trigger_type: str,
+    description: str,
+    timestamp: datetime | None,
+) -> Dict[str, Any]:
+    return build_routing_guardrail_event(
+        metric_event,
+        scope_type=scope_type,
+        scope_key=scope_key,
+        trigger_type=trigger_type,
+        description=description,
+        guardrail_action="clear",
+        severity="info",
+        timestamp=timestamp,
+    )
+
+
+def apply_guardrail_hysteresis(
+    state: Dict[str, Any],
+    guardrails: list[Dict[str, Any]],
+    *,
+    metric_event: Dict[str, Any],
+    scope_type: str,
+    scope_key: str,
+    thresholds: Dict[str, Any] | None = None,
+    defaults: Dict[str, Any] | None = None,
+    replace_window: bool = False,
+    timestamp: datetime | None = None,
+) -> list[Dict[str, Any]]:
+    """Gate one scope's guardrails on consecutive windows (A2).
+
+    state is the scope's JSON-safe hysteresis state, updated in place. A
+    window is bad when any guardrail in it would avoid. The scope enters
+    (emits avoid) once enter_bad_windows of the last enter_window_lookback
+    windows are bad; until then an avoid is downgraded to warn. While it is
+    in, avoids repeat once per bad window to keep the cache entry alive and
+    warns are held back so they cannot overwrite the avoid. After
+    exit_good_windows good windows in a row it emits one guardrail_action
+    "clear" for the trigger that entered.
+
+    Windows count only when consecutive in event time: a window that does
+    not start where the previous one ended starts the count again. An
+    entered scope that sees no bad window for active_ttl_seconds (the cache
+    TTL of its last avoid) has expired: it emits a clear and must pass the
+    enter gate again.
+
+    The same window may be evaluated again as more of it arrives: with
+    replace_window the newest verdict replaces the window's, and if that
+    turns the window that entered the scope healthy, the avoid is retracted
+    with a clear. Otherwise a window stays bad once it was. Earlier windows
+    arriving late are ignored.
+    """
+    gating = _gating_config(defaults or DEFAULT_GUARDRAIL_GATING_CONFIG, thresholds)
+    window_start_ms = _safe_int(metric_event.get("window_start_ms"), 0)
+    window_end_ms = _window_end_ms(metric_event, window_start_ms)
+    avoids = [g for g in guardrails if g.get("guardrail_action") == "avoid"]
+    warns = [g for g in guardrails if g.get("guardrail_action") != "avoid"]
+    bad = bool(avoids)
+    outputs: list[Dict[str, Any]] = []
+
+    windows: list[list[Any]] = []
+    for item in state.get("windows", []):
+        start = _safe_int(item[0], 0)
+        end = _safe_int(item[2], 0) if len(item) > 2 else 0
+        windows.append([start, bool(item[1]), end if end > start else start])
+    if windows and window_start_ms < windows[-1][0]:
+        return []
+
+    if state.get("active") and window_start_ms >= _safe_int(
+        state.get("active_until_ms"), 0
+    ):
+        # The cache entry has lapsed; the scope must enter again.
+        outputs.append(
+            _hysteresis_clear_event(
+                metric_event,
+                scope_type=scope_type,
+                scope_key=scope_key,
+                trigger_type=str(state.get("trigger_type") or "unknown"),
+                description=(
+                    f"{scope_type.capitalize()} {scope_key} guardrail expired "
+                    "without recent windows"
+                ),
+                timestamp=timestamp,
+            )
+        )
+        state["active"] = False
+        state["trigger_type"] = None
+        state["activated_window"] = None
+
+    retracted = False
+    if windows and windows[-1][0] == window_start_ms:
+        was_bad = windows[-1][1]
+        windows[-1][1] = bad if replace_window else (was_bad or bad)
+        retracted = (
+            replace_window
+            and was_bad
+            and not bad
+            and bool(state.get("active"))
+            and _safe_int(state.get("activated_window"), -1) == window_start_ms
+        )
+    else:
+        if windows and window_start_ms > windows[-1][2]:
+            # A gap in event time: earlier windows are not consecutive.
+            windows = []
+        windows.append([window_start_ms, bad, window_end_ms])
+        state["emitted"] = []
+    keep = max(gating["enter_window_lookback"], gating["exit_good_windows"])
+    windows = windows[-keep:]
+    state["windows"] = windows
+    emitted = set(state.get("emitted", []))
+
+    def emit(candidates: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+        fresh = []
+        for guardrail in candidates:
+            marker = (
+                f"{guardrail.get('trigger_type')}:{guardrail.get('guardrail_action')}"
+            )
+            if marker not in emitted:
+                emitted.add(marker)
+                fresh.append(guardrail)
+        return fresh
+
+    def refresh_active() -> None:
+        state["active_until_ms"] = window_end_ms + gating["active_ttl_ms"]
+
+    lookback = windows[-gating["enter_window_lookback"] :]
+    bad_count = sum(1 for window in lookback if window[1])
+    if retracted:
+        # The rest of the window that entered the scope arrived healthy.
+        outputs.append(
+            _hysteresis_clear_event(
+                metric_event,
+                scope_type=scope_type,
+                scope_key=scope_key,
+                trigger_type=str(state.get("trigger_type") or "unknown"),
+                description=(
+                    f"{scope_type.capitalize()} {scope_key} window was healthy "
+                    "once complete"
+                ),
+                timestamp=timestamp,
+            )
+        )
+        state["active"] = False
+        state["trigger_type"] = None
+        state["activated_window"] = None
+        emitted = set()
+    elif not state.get("active"):
+        if bad and bad_count >= gating["enter_bad_windows"]:
+            state["active"] = True
+            state["trigger_type"] = avoids[0].get("trigger_type")
+            state["activated_window"] = window_start_ms
+            refresh_active()
+            outputs.extend(emit(avoids))
+        else:
+            pending = [
+                {
+                    **guardrail,
+                    "guardrail_action": "warn",
+                    "severity": "warning",
+                    "hysteresis": "pending",
+                }
+                for guardrail in avoids
+            ]
+            outputs.extend(emit(warns + pending))
+    elif bad:
+        refresh_active()
+        outputs.extend(emit(avoids))
+    else:
+        good_streak = 0
+        for window in reversed(windows):
+            if window[1]:
+                break
+            good_streak += 1
+        if good_streak >= gating["exit_good_windows"]:
+            outputs.extend(
+                emit(
+                    [
+                        _hysteresis_clear_event(
+                            metric_event,
+                            scope_type=scope_type,
+                            scope_key=scope_key,
+                            trigger_type=str(state.get("trigger_type") or "unknown"),
+                            description=(
+                                f"{scope_type.capitalize()} {scope_key} recovered "
+                                f"after {good_streak} healthy windows"
+                            ),
+                            timestamp=timestamp,
+                        )
+                    ]
+                )
+            )
+            state["active"] = False
+            state["trigger_type"] = None
+            state["activated_window"] = None
+    state["emitted"] = sorted(emitted)
+    return outputs
+
+
+_PROVIDER_WINDOW_SUM_FIELDS = (
+    "request_count",
+    "success_count",
+    "error_count",
+    "provider_request_count",
+    "provider_failure_count",
+    "provider_latency_sample_count",
+    "provider_latency_sum_ms",
+    "latency_sample_count",
+    "latency_sum_ms",
+    "tokens_per_second_sum",
+    "token_count_output",
+)
+
+
+def _provider_window_contribution(metric_event: Dict[str, Any]) -> Dict[str, float]:
+    """One (model, provider) window's sums, for adding up per provider."""
+    request_count = max(0, _safe_int(metric_event.get("request_count"), 0))
+    provider_requests = metric_provider_request_count(metric_event)
+    provider_failures = metric_event.get("provider_failure_count")
+    if provider_failures is None:
+        provider_failures = round(
+            metric_provider_failure_rate(metric_event) * provider_requests
+        )
+    latency_samples = metric_latency_sample_count(metric_event)
+    provider_latency_samples = metric_provider_latency_sample_count(metric_event)
+    if not metric_has_provider_latency_sample(metric_event):
+        provider_latency_samples = 0
+    return {
+        "request_count": request_count,
+        "success_count": max(0, _safe_int(metric_event.get("success_count"), 0)),
+        "error_count": max(0, _safe_int(metric_event.get("error_count"), 0)),
+        "provider_request_count": provider_requests,
+        "provider_failure_count": max(0, _safe_int(provider_failures, 0)),
+        "provider_latency_sample_count": provider_latency_samples,
+        "provider_latency_sum_ms": metric_provider_avg_latency_ms(metric_event)
+        * provider_latency_samples,
+        "latency_sample_count": latency_samples,
+        "latency_sum_ms": _safe_float(metric_event.get("avg_latency_ms"), 0.0)
+        * latency_samples,
+        "tokens_per_second_sum": _safe_float(
+            metric_event.get("avg_tokens_per_second"), 0.0
+        )
+        * latency_samples,
+        "token_count_output": max(
+            0, _safe_int(metric_event.get("token_count_output"), 0)
+        ),
+    }
+
+
+def merge_provider_window(
+    aggregate: Dict[str, Any] | None, metric_event: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Add a (model, provider) metrics window to its provider's window."""
+    merged = dict(aggregate or {})
+    if not merged:
+        merged = {field: 0 for field in _PROVIDER_WINDOW_SUM_FIELDS}
+        merged["models"] = []
+        for field in (
+            "provider",
+            "window_start_ms",
+            "window_end_ms",
+            "window_size_seconds",
+            "event_version",
+        ):
+            merged[field] = metric_event.get(field)
+    for field, value in _provider_window_contribution(metric_event).items():
+        merged[field] = merged.get(field, 0) + value
+    model_name = metric_event.get("model_name")
+    if model_name and model_name not in merged["models"]:
+        merged["models"] = sorted([*merged["models"], str(model_name)])
+    return merged
+
+
+def provider_window_metric_event(aggregate: Dict[str, Any]) -> Dict[str, Any]:
+    """The provider-level metrics window the provider guardrails read."""
+    requests = _safe_int(aggregate.get("request_count"), 0)
+    provider_requests = _safe_int(aggregate.get("provider_request_count"), 0)
+    provider_latency_samples = _safe_int(
+        aggregate.get("provider_latency_sample_count"), 0
+    )
+    latency_samples = _safe_int(aggregate.get("latency_sample_count"), 0)
+    return {
+        "event_type": MODEL_METRICS_1M_EVENT,
+        "event_version": aggregate.get("event_version", EVENT_SCHEMA_VERSION),
+        "window_start_ms": aggregate.get("window_start_ms"),
+        "window_end_ms": aggregate.get("window_end_ms"),
+        "window_size_seconds": aggregate.get("window_size_seconds"),
+        "model_name": None,
+        "models": list(aggregate.get("models", [])),
+        "provider": aggregate.get("provider"),
+        "request_count": requests,
+        "success_count": _safe_int(aggregate.get("success_count"), 0),
+        "error_count": _safe_int(aggregate.get("error_count"), 0),
+        "error_rate": (
+            _safe_int(aggregate.get("error_count"), 0) / requests if requests else 0.0
+        ),
+        "provider_request_count": provider_requests,
+        "provider_failure_count": _safe_int(aggregate.get("provider_failure_count"), 0),
+        "provider_failure_rate": (
+            _safe_int(aggregate.get("provider_failure_count"), 0) / provider_requests
+            if provider_requests
+            else 0.0
+        ),
+        "provider_latency_sample_count": provider_latency_samples,
+        "provider_avg_latency_ms": (
+            _safe_float(aggregate.get("provider_latency_sum_ms"), 0.0)
+            / provider_latency_samples
+            if provider_latency_samples
+            else 0.0
+        ),
+        "latency_sample_count": latency_samples,
+        "avg_latency_ms": (
+            _safe_float(aggregate.get("latency_sum_ms"), 0.0) / latency_samples
+            if latency_samples
+            else 0.0
+        ),
+        "avg_tokens_per_second": (
+            _safe_float(aggregate.get("tokens_per_second_sum"), 0.0) / latency_samples
+            if latency_samples
+            else 0.0
+        ),
+        "token_count_output": _safe_int(aggregate.get("token_count_output"), 0),
+    }
 
 
 def _derive_hotness_from_request_count(
@@ -1042,6 +1479,7 @@ def _empty_routing_policy_aggregate() -> Dict[str, Any]:
         "failed_provider_counts": {},
         "latest_event": {},
         "latest_event_timestamp_ms": -1,
+        "max_event_timestamp_ms": -1,
         "latest_arrival_sequence": -1,
     }
 
@@ -1127,6 +1565,9 @@ def add_routing_policy_event(
     if provider and not succeeded and counts_toward_provider_health(event):
         _increment_count(aggregate.setdefault("failed_provider_counts", {}), provider)
 
+    aggregate["max_event_timestamp_ms"] = max(
+        _safe_int(aggregate.get("max_event_timestamp_ms"), -1), event_timestamp_ms
+    )
     if arrival_sequence >= int(aggregate.get("latest_arrival_sequence", -1)):
         aggregate["latest_arrival_sequence"] = arrival_sequence
         aggregate["latest_event_timestamp_ms"] = event_timestamp_ms
@@ -1183,6 +1624,16 @@ def merge_routing_policy_aggregate(
         target_counts = target.setdefault(key, {})
         for item, count in source.get(key, {}).items():
             _increment_count(target_counts, item, sign * int(count))
+    if sign > 0:
+        target["max_event_timestamp_ms"] = max(
+            _safe_int(target.get("max_event_timestamp_ms"), -1),
+            _safe_int(
+                source.get(
+                    "max_event_timestamp_ms", source.get("latest_event_timestamp_ms")
+                ),
+                -1,
+            ),
+        )
     if sign > 0 and int(source.get("latest_arrival_sequence", -1)) >= int(
         target.get("latest_arrival_sequence", -1)
     ):
@@ -1400,11 +1851,24 @@ def build_routing_policy_state_event_from_aggregate(
             query_type_counts.items(), key=lambda item: (-item[1], item[0])
         )
     }
+    # emitted_at is when Flink emitted the state; latest_event_at is the
+    # newest completion time it covers (the maximum, not the last arrival),
+    # which a replay leaves unchanged.
+    latest_event_ms = max(
+        _safe_int(aggregate.get("max_event_timestamp_ms"), -1),
+        _safe_int(aggregate.get("latest_event_timestamp_ms"), -1),
+    )
+    latest_event_at = (
+        _isoformat(datetime.fromtimestamp(latest_event_ms / 1000.0, tz=timezone.utc))
+        if latest_event_ms >= _MIN_WALL_CLOCK_MS
+        else None
+    )
 
     return {
         "event_type": ROUTING_POLICY_STATE_EVENT,
         "event_version": EVENT_SCHEMA_VERSION,
         "emitted_at": _isoformat(timestamp),
+        "latest_event_at": latest_event_at,
         "scope_type": scope_type,
         "scope_key": scope_key,
         "user_id": user_id,

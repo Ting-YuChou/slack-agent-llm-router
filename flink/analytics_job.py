@@ -118,8 +118,13 @@ from flink.logic import (
     completion_event_timestamp_ms,
     counts_toward_provider_health,
     detect_metric_anomalies,
+    DEFAULT_MODEL_GUARDRAIL_CONFIG,
+    DEFAULT_PROVIDER_GUARDRAIL_CONFIG,
+    apply_guardrail_hysteresis,
     detect_model_routing_guardrails,
     detect_provider_routing_guardrails,
+    merge_provider_window,
+    provider_window_metric_event,
     merge_routing_policy_aggregate,
     metric_cost_per_1k_tokens,
     metric_has_priced_tokens,
@@ -523,8 +528,48 @@ class ModelMetricsAnomalyDetector(KeyedProcessFunction):
         self.error_rate_history_state.update(error_rate_history[-self.history_size :])
 
 
+class _LocalValueState:
+    """In-memory stand-in for a ValueState an operator built before open()."""
+
+    def __init__(self):
+        self._value = None
+
+    def value(self):
+        return self._value
+
+    def update(self, value):
+        self._value = value
+
+    def clear(self):
+        self._value = None
+
+
+def _lazy_json_state(operator: Any, attribute: str) -> Any:
+    """The operator's JSON ValueState, created in memory when open() did not."""
+    state = getattr(operator, attribute, None)
+    if state is None:
+        state = _LocalValueState()
+        setattr(operator, attribute, state)
+    return state
+
+
+def _read_json_state(state: Any) -> Dict[str, Any]:
+    raw = state.value()
+    if not raw:
+        return {}
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
 class ModelRoutingGuardrailDetector(KeyedProcessFunction):
-    """Emit model-scoped routing guardrails from recent metrics windows."""
+    """Emit model-scoped routing guardrails from recent metrics windows.
+
+    Avoid needs consecutive bad windows and ends with a clear event (A2); see
+    apply_guardrail_hysteresis.
+    """
 
     def __init__(
         self,
@@ -552,6 +597,9 @@ class ModelRoutingGuardrailDetector(KeyedProcessFunction):
         self.cost_per_1k_history_state = runtime_context.get_list_state(
             ListStateDescriptor("guardrail_cost_per_1k_history", Types.FLOAT())
         )
+        self.hysteresis_state = runtime_context.get_state(
+            ValueStateDescriptor("model_guardrail_hysteresis", Types.STRING())
+        )
 
     def process_element(
         self, value: Dict[str, Any], ctx: "KeyedProcessFunction.Context"
@@ -572,15 +620,29 @@ class ModelRoutingGuardrailDetector(KeyedProcessFunction):
             threshold_multiplier=self.threshold_multiplier,
             thresholds=self.thresholds,
         )
-        for guardrail in guardrails:
+        hysteresis_state = _lazy_json_state(self, "hysteresis_state")
+        hysteresis = _read_json_state(hysteresis_state)
+        model_name = str(value.get("model_name", "unknown") or "unknown")
+        for guardrail in apply_guardrail_hysteresis(
+            hysteresis,
+            guardrails,
+            metric_event=value,
+            scope_type="model",
+            scope_key=model_name,
+            thresholds=self.thresholds,
+            defaults=DEFAULT_MODEL_GUARDRAIL_CONFIG,
+        ):
             yield guardrail
+        hysteresis_state.update(json.dumps(hysteresis))
 
         if metric_has_uncached_sample(value):
             latency_history.append(float(value.get("avg_latency_ms", 0.0) or 0.0))
         if metric_has_priced_tokens(value):
             cost_per_1k_history.append(metric_cost_per_1k_tokens(value))
         qps_history.append(float(value.get("queries_per_second", 0.0) or 0.0))
-        error_rate_history.append(float(value.get("error_rate", 0.0) or 0.0))
+        # The model's error baseline leaves out caller and policy failures,
+        # like its error-rate guardrails.
+        error_rate_history.append(metric_provider_failure_rate(value))
         cache_hit_rate_history.append(float(value.get("cache_hit_rate", 0.0) or 0.0))
 
         self.latency_history_state.update(latency_history[-self.history_size :])
@@ -593,7 +655,14 @@ class ModelRoutingGuardrailDetector(KeyedProcessFunction):
 
 
 class ProviderRoutingGuardrailDetector(KeyedProcessFunction):
-    """Emit provider-scoped routing guardrails from recent metrics windows."""
+    """Emit provider-scoped routing guardrails from recent metrics windows.
+
+    The input is keyed by provider but holds one window per (model,
+    provider). Windows of the same start are added up, so a provider is
+    judged on all its models together and min_request_count counts all of
+    them; each arrival re-evaluates the provider's window so far. Avoid
+    needs consecutive bad windows and ends with a clear event (A2).
+    """
 
     def __init__(
         self,
@@ -612,29 +681,82 @@ class ProviderRoutingGuardrailDetector(KeyedProcessFunction):
         self.error_rate_history_state = runtime_context.get_list_state(
             ListStateDescriptor("provider_guardrail_error_rate_history", Types.FLOAT())
         )
+        self.provider_window_state = runtime_context.get_state(
+            ValueStateDescriptor("provider_guardrail_window", Types.STRING())
+        )
 
     def process_element(
         self, value: Dict[str, Any], ctx: "KeyedProcessFunction.Context"
     ):
         latency_history = list(self.latency_history_state.get())
         error_rate_history = list(self.error_rate_history_state.get())
+        window_state = _lazy_json_state(self, "provider_window_state")
+        state = _read_json_state(window_state)
+
+        window_start_ms = int(value.get("window_start_ms", 0) or 0)
+        aggregate = state.get("aggregate") or None
+        current_start = (
+            int(aggregate.get("window_start_ms", 0) or 0) if aggregate else None
+        )
+        if current_start is not None and window_start_ms < current_start:
+            logger.debug(
+                "Ignoring a late provider window for %s: %s < %s",
+                value.get("provider"),
+                window_start_ms,
+                current_start,
+            )
+            return
+        same_window = current_start == window_start_ms
+        if same_window:
+            # The baseline is the windows before this one: drop this
+            # window's own history entries, added on its earlier arrivals.
+            if state.get("latency_in_history") and latency_history:
+                latency_history.pop()
+            if state.get("error_in_history") and error_rate_history:
+                error_rate_history.pop()
+        else:
+            aggregate = None
+        aggregate = merge_provider_window(aggregate, value)
+        provider_window = provider_window_metric_event(aggregate)
 
         guardrails = detect_provider_routing_guardrails(
-            value,
+            provider_window,
             latency_history=latency_history,
             error_rate_history=error_rate_history,
             threshold_multiplier=self.threshold_multiplier,
             thresholds=self.thresholds,
         )
-        for guardrail in guardrails:
+        hysteresis = dict(state.get("hysteresis") or {})
+        provider = str(value.get("provider", "unknown") or "unknown")
+        for guardrail in apply_guardrail_hysteresis(
+            hysteresis,
+            guardrails,
+            metric_event=provider_window,
+            scope_type="provider",
+            scope_key=provider,
+            thresholds=self.thresholds,
+            defaults=DEFAULT_PROVIDER_GUARDRAIL_CONFIG,
+            replace_window=True,
+        ):
             yield guardrail
 
-        if metric_has_provider_latency_sample(value):
-            latency_history.append(metric_provider_avg_latency_ms(value))
-        error_rate_history.append(metric_provider_failure_rate(value))
+        latency_in_history = metric_has_provider_latency_sample(provider_window)
+        if latency_in_history:
+            latency_history.append(metric_provider_avg_latency_ms(provider_window))
+        error_rate_history.append(metric_provider_failure_rate(provider_window))
 
         self.latency_history_state.update(latency_history[-self.history_size :])
         self.error_rate_history_state.update(error_rate_history[-self.history_size :])
+        window_state.update(
+            json.dumps(
+                {
+                    "aggregate": aggregate,
+                    "hysteresis": hysteresis,
+                    "latency_in_history": latency_in_history,
+                    "error_in_history": True,
+                }
+            )
+        )
 
 
 class RollingScopePolicyEmitter(KeyedProcessFunction):
@@ -864,8 +986,18 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
         aggregate["latest_event"] = {}
         aggregate["latest_event_timestamp_ms"] = -1
         aggregate["latest_arrival_sequence"] = -1
+        aggregate["max_event_timestamp_ms"] = -1
         for _, raw_bucket in self.bucket_state.items():
             bucket = json.loads(raw_bucket)
+            aggregate["max_event_timestamp_ms"] = max(
+                int(aggregate["max_event_timestamp_ms"]),
+                int(
+                    bucket.get(
+                        "max_event_timestamp_ms",
+                        bucket.get("latest_event_timestamp_ms", -1),
+                    )
+                ),
+            )
             if int(bucket.get("latest_arrival_sequence", -1)) >= int(
                 aggregate.get("latest_arrival_sequence", -1)
             ):
