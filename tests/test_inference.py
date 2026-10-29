@@ -160,8 +160,18 @@ _ReadTimeout = type(
         pytest.param(_APITimeoutError(), "timeout", id="sdk-timeout"),
         pytest.param(_StatusError(429), "rate_limited", id="status-429"),
         pytest.param(_ResponseStatusError(429), "rate_limited", id="response-429"),
+        pytest.param(_StatusError(408), "timeout", id="status-408"),
+        pytest.param(_ResponseStatusError(408), "timeout", id="response-408"),
         pytest.param(_StatusError(400), "user_or_policy", id="status-400"),
-        pytest.param(_ResponseStatusError(404), "user_or_policy", id="response-404"),
+        pytest.param(_StatusError(413), "user_or_policy", id="status-413"),
+        pytest.param(_ResponseStatusError(422), "user_or_policy", id="response-422"),
+        # Other 4xx say the provider side is broken for us: a revoked key,
+        # a retired model, a conflict.
+        pytest.param(_StatusError(401), "provider_error", id="status-401"),
+        pytest.param(_StatusError(403), "provider_error", id="status-403"),
+        pytest.param(_ResponseStatusError(404), "provider_error", id="response-404"),
+        pytest.param(_StatusError(409), "provider_error", id="status-409"),
+        pytest.param(_StatusError(425), "provider_error", id="status-425"),
         pytest.param(
             AdmissionRejectedError(
                 AdmissionDecision.reject(

@@ -280,6 +280,11 @@ def _first_nested_usage_value(
     return default
 
 
+# Statuses that blame the request itself (bad input, too large, unprocessable),
+# matching the request-shaped set the failure-handling path uses.
+_REQUEST_SHAPED_STATUS_CODES = frozenset({400, 413, 422})
+
+
 def _exception_status_code(exc: BaseException) -> Optional[int]:
     """HTTP status from SDK errors (exc.status_code) or httpx (exc.response)."""
     for candidate in (exc, getattr(exc, "response", None)):
@@ -303,12 +308,15 @@ def classify_inference_error(exc: BaseException) -> str:
     ):
         return "timeout"
     status_code = _exception_status_code(exc)
-    if status_code == 429:
-        return "rate_limited"
-    if status_code is not None and status_code >= 500:
+    if status_code is not None and status_code >= 400:
+        if status_code == 408:
+            return "timeout"
+        if status_code == 429:
+            return "rate_limited"
+        if status_code in _REQUEST_SHAPED_STATUS_CODES:
+            return "user_or_policy"
+        # 5xx, and 4xx such as 401/403 (revoked key) or 404 (retired model).
         return "provider_error"
-    if status_code is not None and 400 <= status_code < 500:
-        return "user_or_policy"
     if isinstance(exc, ConnectionError) or class_names & {
         "APIConnectionError",
         "TransportError",
