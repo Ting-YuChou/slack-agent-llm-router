@@ -354,8 +354,9 @@ class _SocketModeRequest:
 
 
 class _SocketModeResponse:
-    def __init__(self, envelope_id):
+    def __init__(self, envelope_id, payload=None):
         self.envelope_id = envelope_id
+        self.payload = payload
 
 
 async_client.AsyncWebClient = _AsyncWebClient

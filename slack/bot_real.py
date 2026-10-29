@@ -90,6 +90,8 @@ MEMORY_SLASH_ONLY_MESSAGE = (
     "Use `/llm remember`, `/llm memories`, or `/llm forget`."
 )
 SLACK_BUSY_MESSAGE = "The LLM Router is busy right now. Please retry in a moment."
+SLACK_THINKING_TEXT = "_Thinking…_"
+SLACK_SLASH_WORKING_TEXT = "Working on it…"
 SLACK_EMPTY_ANSWER_MESSAGE = (
     "🤔 The model returned an empty answer. Please try again or rephrase "
     "your question."
@@ -3595,7 +3597,12 @@ class SlackBot:
     ):
         """Handle incoming socket mode requests"""
         try:
-            response = SocketModeResponse(envelope_id=req.envelope_id)
+            ack_payload = self._socket_ack_payload(req)
+            response = (
+                SocketModeResponse(envelope_id=req.envelope_id, payload=ack_payload)
+                if ack_payload
+                else SocketModeResponse(envelope_id=req.envelope_id)
+            )
             await client.send_socket_mode_response(response)
 
             if req.type == "events_api":
@@ -3918,6 +3925,7 @@ class SlackBot:
 
     async def _process_message(self, event: Dict[str, Any]):
         """Process incoming message"""
+        placeholder_ts: Optional[str] = None
         try:
             channel_id = event.get("channel")
             user_id = event.get("user")
@@ -3946,6 +3954,11 @@ class SlackBot:
                 self._mark_thread_active(channel_id, reply_thread_ts)
                 active_thread_key = self._thread_key(channel_id, reply_thread_ts)
 
+            if self._is_query_event(event) and not agent_request:
+                placeholder_ts = await self._post_placeholder(
+                    channel_id, reply_thread_ts
+                )
+
             attachments = await self._extract_query_attachments(event)
             if attachments:
                 event["_query_attachments"] = attachments
@@ -3964,25 +3977,37 @@ class SlackBot:
                 max_length = self.config.get("response_settings", {}).get(
                     "max_response_length", 2000
                 )
-                if len(response_text) > max_length:
-                    responses = self._split_response(response_text, max_length)
-
-                    for response_part in responses:
-                        await self.web_client.chat_postMessage(
-                            channel=channel_id,
-                            text=response_part,
-                            thread_ts=thread_ts,
+                responses = (
+                    self._split_response(response_text, max_length)
+                    if len(response_text) > max_length
+                    else [response_text]
+                )
+                for index, response_part in enumerate(responses):
+                    if index == 0 and placeholder_ts:
+                        replaced = await self._replace_placeholder(
+                            channel_id, placeholder_ts, text=response_part
                         )
+                        # The answer owns the placeholder now: a later
+                        # failure must not overwrite it with the error.
+                        placeholder_ts = None
+                        if replaced:
+                            continue
+                    elif index:
                         await asyncio.sleep(0.5)  # Small delay between parts
-                else:
                     await self.web_client.chat_postMessage(
-                        channel=channel_id, text=response_text, thread_ts=thread_ts
+                        channel=channel_id,
+                        text=response_part,
+                        thread_ts=thread_ts,
                     )
 
                 if thread_ts:
                     self._mark_thread_active(channel_id, thread_ts)
                     state_changed = True
                     active_thread_key = self._thread_key(channel_id, thread_ts)
+            elif placeholder_ts:
+                await self._replace_placeholder(
+                    channel_id, placeholder_ts, text=SLACK_EMPTY_ANSWER_MESSAGE
+                )
             elif self._is_agent_thread(channel_id, agent_thread_ts):
                 # The handler posted the reply itself: an Agent run's status message.
                 state_changed = True
@@ -4008,11 +4033,74 @@ class SlackBot:
 
         except Exception as e:
             logger.error(f"Error processing message: {e}")
+            error_text = self._build_user_safe_error_message()
+            if placeholder_ts and await self._replace_placeholder(
+                event.get("channel"), placeholder_ts, text=error_text
+            ):
+                return
             await self.web_client.chat_postMessage(
                 channel=event.get("channel"),
-                text=self._build_user_safe_error_message(),
+                text=error_text,
                 thread_ts=event.get("thread_ts") or event.get("ts"),
             )
+
+    def _typing_indicator_enabled(self) -> bool:
+        return bool(
+            self.config.get("response_settings", {}).get("typing_indicator", True)
+        )
+
+    def _socket_ack_payload(self, req: Any) -> Optional[Dict[str, Any]]:
+        """Tell the user a model-backed slash command is underway."""
+        if getattr(req, "type", None) != "slash_commands":
+            return None
+        if not self._typing_indicator_enabled():
+            return None
+        payload = getattr(req, "payload", None) or {}
+        consumes_query_quota = getattr(
+            self.message_handler, "command_consumes_query_quota", None
+        )
+        if callable(consumes_query_quota) and not consumes_query_quota(
+            payload.get("text", "") or ""
+        ):
+            return None
+        return {"response_type": "ephemeral", "text": SLACK_SLASH_WORKING_TEXT}
+
+    async def _post_placeholder(
+        self, channel_id: Optional[str], thread_ts: Optional[str]
+    ) -> Optional[str]:
+        """Show progress where the answer will appear; its ts, or None.
+
+        Only a client that can update the placeholder gets one.
+        """
+        if not self._typing_indicator_enabled():
+            return None
+        if not callable(getattr(self.web_client, "chat_update", None)):
+            return None
+        try:
+            response = await self.web_client.chat_postMessage(
+                channel=channel_id, text=SLACK_THINKING_TEXT, thread_ts=thread_ts
+            )
+        except Exception as exc:
+            logger.warning("Could not post the Slack progress placeholder: %s", exc)
+            return None
+        try:
+            ts = response.get("ts") if response is not None else None
+        except Exception:
+            ts = None
+        return ts if isinstance(ts, str) and ts else None
+
+    async def _replace_placeholder(
+        self, channel_id: Optional[str], placeholder_ts: str, **message: Any
+    ) -> bool:
+        """Turn the placeholder into `message`; False when Slack refused."""
+        try:
+            await self.web_client.chat_update(
+                channel=channel_id, ts=placeholder_ts, **message
+            )
+        except Exception as exc:
+            logger.warning("Could not update the Slack progress placeholder: %s", exc)
+            return False
+        return True
 
     def _reply_thread_ts(
         self, event: Dict[str, Any], user_prefs: Dict[str, Any]
