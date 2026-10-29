@@ -177,20 +177,22 @@ async def test_a_failed_dlq_send_still_moves_past_the_poison_message():
 
 @pytest.mark.asyncio
 async def test_an_unavailable_cache_still_holds_the_offset():
+    async def unavailable(_event):
+        # The materializer is stopped while it waits for Redis.
+        materializer.running = False
+        raise PolicyCacheUnavailableError("cooldown")
+
     cache = SimpleNamespace(
         config={"consumer": {"enable_auto_commit": False}},
         enabled=True,
-        materialize_routing_guardrail=AsyncMock(
-            side_effect=PolicyCacheUnavailableError("cooldown")
-        ),
+        materialize_routing_guardrail=unavailable,
     )
     materializer = _materializer(cache)
     consumer = _Consumer(
         [_message("routing.guardrails", {"scope_type": "model", "scope_key": "m"})]
     )
 
-    with pytest.raises(PolicyCacheUnavailableError):
-        await materializer._consume_routing_guardrails(consumer)
+    await materializer._consume_routing_guardrails(consumer)
 
     consumer.commit.assert_not_awaited()
 

@@ -131,6 +131,16 @@ def policy_event_time_ms(event: Dict[str, Any], *fields: str) -> Optional[int]:
     return None
 
 
+POLICY_MATERIALIZER_CONSUMER_RESTARTS = Counter(
+    "llm_router_policy_materializer_consumer_restarts_total",
+    "Policy materializer consumer task restarts",
+    ["topic"],
+)
+POLICY_MATERIALIZER_REDIS_RETRIES = Counter(
+    "llm_router_policy_materializer_redis_retries_total",
+    "Policy events held and retried in place while the cache's Redis is down",
+    ["topic"],
+)
 POLICY_MATERIALIZER_INVALID_MESSAGES = Counter(
     "llm_router_policy_materializer_invalid_messages_total",
     "Malformed policy events moved past: dead-lettered, or skipped without a DLQ",
@@ -383,6 +393,31 @@ class RoutingPolicyCache:
         self._redis_failure_at = None
         self._set_redis_state("available")
 
+    @staticmethod
+    def _is_pool_exhausted(exc: BaseException) -> bool:
+        """redis-py's "Too many connections": this replica is busy, Redis is up."""
+        try:
+            from redis.exceptions import ConnectionError as RedisConnectionError
+            from redis.exceptions import MaxConnectionsError
+        except ImportError:  # pragma: no cover - redis always ships these
+            return False
+        if isinstance(exc, MaxConnectionsError):
+            return True
+        return isinstance(exc, RedisConnectionError) and (
+            "too many connections" in str(exc).lower()
+        )
+
+    def _note_redis_error(self, operation: str, exc: BaseException) -> str:
+        """Classify a Redis error; only a real failure starts the cooldown.
+
+        Returns the unavailability reason: "pool_exhausted" when the local
+        connection pool is full, "redis_error" otherwise.
+        """
+        if self._is_pool_exhausted(exc):
+            return "pool_exhausted"
+        self._mark_redis_failure(operation, exc)
+        return "redis_error"
+
     def _mark_redis_failure(self, operation: str, exc: BaseException) -> None:
         self._redis_available = False
         self._redis_failure_at = self._time_func()
@@ -441,12 +476,13 @@ class RoutingPolicyCache:
             raise PolicyCacheUnavailableError("cooldown")
 
     def record_read_timeout(self) -> None:
-        """The router gave up on a policy read: count it and start a cooldown."""
+        """Count a policy read the router gave up on.
+
+        The router's deadline is shorter than the socket timeout and also
+        fires on event-loop stalls, so it says nothing certain about Redis:
+        it does not mark Redis failed or start a cooldown.
+        """
         POLICY_CACHE_UNAVAILABLE.labels(reason="timeout").inc()
-        if self._redis_enabled():
-            self._mark_redis_failure(
-                "read", TimeoutError("policy read exceeded the router deadline")
-            )
 
     @staticmethod
     def _record_unavailable(reason: str) -> None:
@@ -542,8 +578,7 @@ class RoutingPolicyCache:
         try:
             payload = await self._run_redis_operation(self.redis_client.get(cache_key))
         except Exception as e:
-            self._mark_redis_failure("read", e)
-            self._record_unavailable("redis_error")
+            self._record_unavailable(self._note_redis_error("read", e))
             logger.warning(f"Failed to read routing policy cache key {cache_key}: {e}")
             return None
 
@@ -591,9 +626,9 @@ class RoutingPolicyCache:
                 pipeline.smembers(self._guardrail_index_key(scope_type))
             results = list(await self._run_redis_operation(pipeline.execute()))
         except Exception as e:
-            self._mark_redis_failure("read", e)
+            reason = self._note_redis_error("read", e)
             logger.warning(f"Failed to read routing policy cache: {e}")
-            raise PolicyCacheUnavailableError("redis_error", str(e)) from e
+            raise PolicyCacheUnavailableError(reason, str(e)) from e
 
         for cache_key, payload in zip(pending_keys, results):
             records[cache_key] = self._decode_record(cache_key, payload)
@@ -694,9 +729,9 @@ class RoutingPolicyCache:
             ):
                 return
         except Exception as e:
-            self._mark_redis_failure("write", e)
+            reason = self._note_redis_error("write", e)
             logger.warning(f"Failed to write routing policy cache key {cache_key}: {e}")
-            raise
+            raise PolicyCacheUnavailableError(reason, str(e)) from e
         self._local_set(cache_key, value, ttl_seconds)
 
     async def get_request_policy(self, request_id: str) -> Optional[Dict[str, Any]]:
@@ -1052,11 +1087,11 @@ class RoutingPolicyCache:
             ):
                 return
         except Exception as e:
-            self._mark_redis_failure("write", e)
+            reason = self._note_redis_error("write", e)
             logger.warning(
                 f"Failed to update routing guardrail index {scope_type}:{scope_key}: {e}"
             )
-            raise
+            raise PolicyCacheUnavailableError(reason, str(e)) from e
 
         self._local_set(cache_key, payload, ttl_seconds)
 
@@ -1087,11 +1122,11 @@ class RoutingPolicyCache:
                     )
                 )
             except Exception as e:
-                self._mark_redis_failure("write", e)
+                reason = self._note_redis_error("write", e)
                 logger.warning(
                     f"Failed to clear routing guardrail {scope_type}:{scope_key}: {e}"
                 )
-                raise
+                raise PolicyCacheUnavailableError(reason, str(e)) from e
             if int(cleared or 0) != 1:
                 POLICY_CACHE_STALE_WRITES.labels(
                     namespace="guardrail", reason="older"
@@ -1185,9 +1220,9 @@ class RoutingPolicyCache:
                 )
             )
         except Exception as e:
-            self._mark_redis_failure("read", e)
+            reason = self._note_redis_error("read", e)
             logger.warning(f"Failed to read routing guardrails: {e}")
-            raise PolicyCacheUnavailableError("redis_error", str(e)) from e
+            raise PolicyCacheUnavailableError(reason, str(e)) from e
 
         expired: List[Tuple[str, str]] = []
         for (scope_type, scope_key, cache_key), raw_payload in zip(pending, payloads):
@@ -1283,6 +1318,20 @@ class PolicyMaterializer:
             dlq_config.get("send_timeout_seconds", 10.0)
         )
         self.dlq_producer: Optional[Any] = None
+        # While the cache's Redis is down a message is held and retried in
+        # place: no commit, no consumer restart and no rebalance.
+        self.redis_retry_initial_backoff_seconds = float(
+            materializer_config.get(
+                "redis_retry_initial_backoff_seconds",
+                self.supervisor_initial_backoff_seconds,
+            )
+        )
+        self.redis_retry_max_backoff_seconds = float(
+            materializer_config.get(
+                "redis_retry_max_backoff_seconds", self.supervisor_max_backoff_seconds
+            )
+        )
+        self._redis_backoff_topics: set[str] = set()
         self.running = False
 
     async def initialize(self):
@@ -1388,7 +1437,7 @@ class PolicyMaterializer:
                 self.consumer_restart_counts[topic_key] = (
                     self.consumer_restart_counts.get(topic_key, 0) + 1
                 )
-                PIPELINE_METRICS.consumer_restarts.labels(topic=topic_key).inc()
+                POLICY_MATERIALIZER_CONSUMER_RESTARTS.labels(topic=topic_key).inc()
                 logger.error(
                     "Policy materializer consumer for %s stopped; restarting in %.1fs: %s",
                     topic_key,
@@ -1428,6 +1477,47 @@ class PolicyMaterializer:
         if handler is None:
             raise RuntimeError(f"No policy materializer handler for {topic_key}")
         await handler(consumer)
+
+    async def _materialize_with_retry(
+        self,
+        topic_key: str,
+        materialize: Any,
+        payload: Dict[str, Any],
+    ) -> bool:
+        """Materialize one event, waiting out an unavailable cache.
+
+        Returns False when the materializer stops while waiting; the caller
+        then leaves the offset uncommitted.
+        """
+        backoff_seconds = max(0.0, self.redis_retry_initial_backoff_seconds)
+        try:
+            while True:
+                try:
+                    await materialize(payload)
+                    return True
+                except PolicyCacheUnavailableError as e:
+                    if not self.running:
+                        return False
+                    self._redis_backoff_topics.add(topic_key)
+                    POLICY_MATERIALIZER_REDIS_RETRIES.labels(topic=topic_key).inc()
+                    logger.warning(
+                        "Policy cache unavailable for %s (%s); retrying in %.2fs",
+                        topic_key,
+                        e,
+                        backoff_seconds,
+                    )
+                    await asyncio.sleep(backoff_seconds)
+                    if not self.running:
+                        return False
+                    backoff_seconds = min(
+                        max(
+                            backoff_seconds * 2,
+                            self.redis_retry_initial_backoff_seconds,
+                        ),
+                        self.redis_retry_max_backoff_seconds,
+                    )
+        finally:
+            self._redis_backoff_topics.discard(topic_key)
 
     async def _commit_processed_message(self, consumer: AIOKafkaConsumer, message: Any):
         """Commit a processed Kafka message when manual commits are enabled."""
@@ -1542,7 +1632,12 @@ class PolicyMaterializer:
                     break
                 try:
                     payload = self._decode_message_value(message)
-                    await self.policy_cache.materialize_request_enriched(payload)
+                    if not await self._materialize_with_retry(
+                        "requests_enriched",
+                        self.policy_cache.materialize_request_enriched,
+                        payload,
+                    ):
+                        break
                     await self._commit_processed_message(consumer, message)
                 except (json.JSONDecodeError, ValueError) as e:
                     await self._skip_invalid_message(
@@ -1564,7 +1659,12 @@ class PolicyMaterializer:
                     break
                 try:
                     payload = self._decode_message_value(message)
-                    await self.policy_cache.materialize_fast_lane_hint(payload)
+                    if not await self._materialize_with_retry(
+                        "fast_lane_hints",
+                        self.policy_cache.materialize_fast_lane_hint,
+                        payload,
+                    ):
+                        break
                     await self._commit_processed_message(consumer, message)
                 except (json.JSONDecodeError, ValueError) as e:
                     await self._skip_invalid_message(
@@ -1586,7 +1686,12 @@ class PolicyMaterializer:
                     break
                 try:
                     payload = self._decode_message_value(message)
-                    await self.policy_cache.materialize_routing_guardrail(payload)
+                    if not await self._materialize_with_retry(
+                        "routing_guardrails",
+                        self.policy_cache.materialize_routing_guardrail,
+                        payload,
+                    ):
+                        break
                     await self._commit_processed_message(consumer, message)
                 except (json.JSONDecodeError, ValueError) as e:
                     await self._skip_invalid_message(
@@ -1608,7 +1713,12 @@ class PolicyMaterializer:
                     break
                 try:
                     payload = self._decode_message_value(message)
-                    await self.policy_cache.materialize_routing_policy_state(payload)
+                    if not await self._materialize_with_retry(
+                        "routing_policy_state",
+                        self.policy_cache.materialize_routing_policy_state,
+                        payload,
+                    ):
+                        break
                     await self._commit_processed_message(consumer, message)
                 except (json.JSONDecodeError, ValueError) as e:
                     await self._skip_invalid_message(
@@ -1628,7 +1738,11 @@ class PolicyMaterializer:
         return json.loads(message.decode("utf-8"))
 
     def is_healthy(self) -> bool:
-        """Return whether the materializer is configured and ready."""
+        """Return whether the materializer is configured and its consumers run.
+
+        A down Redis does not make it unhealthy: routing fails open, messages
+        wait in place, and is_degraded() reports it.
+        """
         if not self.policy_cache.enabled:
             return True
         if not self.consumers:
@@ -1637,13 +1751,21 @@ class PolicyMaterializer:
             status.get("last_error") for status in self.consumer_task_status.values()
         )
 
+    def is_degraded(self) -> bool:
+        """True while the cache is degraded or a consumer waits on Redis."""
+        if self._redis_backoff_topics:
+            return True
+        cache_degraded = getattr(self.policy_cache, "is_degraded", None)
+        return bool(cache_degraded()) if callable(cache_degraded) else False
+
     def get_health_status(self) -> Dict[str, Any]:
         """Return materializer consumer supervisor status."""
         cache_status_getter = getattr(self.policy_cache, "get_health_status", None)
         cache_status = cache_status_getter() if callable(cache_status_getter) else {}
         return {
             "healthy": self.is_healthy(),
-            "degraded": cache_status.get("status") == "degraded",
+            "degraded": self.is_degraded(),
+            "waiting_on_redis": sorted(self._redis_backoff_topics),
             "policy_cache": cache_status,
             "topics": dict(self.consumer_task_status),
             "restart_counts": dict(self.consumer_restart_counts),
