@@ -386,63 +386,107 @@ class QueryClassifier:
         return scores
 
 
+# CJK ideographs, kana, hangul and full-width forms: tokenizers spend about one
+# token on each, while a whitespace split sees a whole paragraph as one word.
+_CJK_CHARACTER = re.compile("[⺀-⿟　-〿぀-ヿ㄀-ㇿ㐀-䶿" "一-鿿가-힯豈-﫿＀-￯" "\U00020000-\U0002fa1f]")
+
+
+def approximate_token_count(text: str) -> int:
+    """Count tokens without a tokenizer: CJK characters plus 1.3 per other word."""
+    cjk_characters = len(_CJK_CHARACTER.findall(text))
+    other_words = len(_CJK_CHARACTER.sub(" ", text).split())
+    return cjk_characters + int(other_words * 1.3)
+
+
 class TokenCounter:
-    """Efficient token counting for different models"""
+    """Count tokens with tiktoken, or estimate them when it is unavailable.
+
+    cl100k_base is the default (conservative for models without a public
+    tokenizer); a model known to use another encoding gets it, falling back to
+    the default when that encoding could not be loaded. The image pre-fetches
+    both encodings into TIKTOKEN_CACHE_DIR, so loading needs no network.
+    """
+
+    DEFAULT_ENCODING = "cl100k_base"
+    ENCODINGS = ("cl100k_base", "o200k_base")
+    # (model name marker, encoding); the first match wins.
+    MODEL_ENCODINGS = (("gpt-5", "o200k_base"),)
+    APPROXIMATE = "approximate"
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
         self.encoders: Dict[str, Any] = {}
+        self._encode_error_logged = False
         if enabled:
             self._initialize_encoders()
-
-    def _initialize_encoders(self):
-        """Initialize tokenizer encodings for different models"""
-        try:
-            import tiktoken
-
-            # OpenAI models
-            self.encoders["gpt-4"] = tiktoken.encoding_for_model("gpt-4")
-            self.encoders["gpt-5"] = tiktoken.encoding_for_model("gpt-4")
-            self.encoders["gpt-3.5-turbo"] = tiktoken.encoding_for_model(
-                "gpt-3.5-turbo"
+        for encoding in self.ENCODINGS:
+            ROUTER_METRICS.tokenizer_available.labels(encoding=encoding).set(
+                1 if encoding in self.encoders else 0
             )
 
-            # Anthropic models (approximation using GPT-4 tokenizer)
-            self.encoders["claude"] = tiktoken.encoding_for_model("gpt-4")
+    def _initialize_encoders(self):
+        """Load each encoding; log one ERROR for whatever is missing."""
+        try:
+            import tiktoken
+        except Exception as exc:
+            logger.error(
+                "tiktoken is unavailable (%s); token counts are estimated, "
+                "which can misjudge context fit and admission budgets",
+                exc,
+            )
+            return
 
-            # Default encoder
-            self.encoders["default"] = tiktoken.get_encoding("cl100k_base")
+        missing = []
+        for encoding in self.ENCODINGS:
+            try:
+                self.encoders[encoding] = tiktoken.get_encoding(encoding)
+            except Exception as exc:
+                missing.append(f"{encoding} ({exc})")
+        if missing:
+            logger.error(
+                "Tokenizer encodings unavailable: %s; affected models use %s "
+                "or an estimate. Pre-fetch them into TIKTOKEN_CACHE_DIR.",
+                ", ".join(missing),
+                self.DEFAULT_ENCODING,
+            )
 
-        except Exception as e:
-            logger.warning(f"Failed to initialize some tokenizers: {e}")
+    def encoding_name(self, model: str = "default") -> str:
+        """The encoding count_tokens uses for a model, or "approximate"."""
+        if not self.enabled:
+            return self.APPROXIMATE
+        model_lower = (model or "").lower()
+        for marker, encoding in self.MODEL_ENCODINGS:
+            if marker in model_lower and encoding in self.encoders:
+                return encoding
+        if self.DEFAULT_ENCODING in self.encoders:
+            return self.DEFAULT_ENCODING
+        return self.APPROXIMATE
 
     def count_tokens(self, text: str, model: str = "default") -> int:
         """Count tokens for given text and model"""
-        if not self.enabled or "default" not in self.encoders:
-            return int(len(text.split()) * 1.3)
+        encoding = self.encoding_name(model)
+        if encoding == self.APPROXIMATE:
+            return approximate_token_count(text)
         try:
-            # Map model names to encoder keys
-            encoder_key = self._get_encoder_key(model)
-            encoder = self.encoders.get(encoder_key, self.encoders["default"])
-            return len(encoder.encode(text))
-        except Exception as e:
-            logger.warning(f"Token counting failed: {e}")
-            # Fallback to word-based approximation
-            return int(len(text.split()) * 1.3)  # Rough approximation
+            return len(self.encoders[encoding].encode(text))
+        except Exception as exc:
+            if not self._encode_error_logged:
+                self._encode_error_logged = True
+                logger.error(
+                    "Token counting with %s failed (%s); estimating instead",
+                    encoding,
+                    exc,
+                )
+            return approximate_token_count(text)
 
-    def _get_encoder_key(self, model: str) -> str:
-        """Map model name to encoder key"""
-        model_lower = model.lower()
-        if "gpt-5" in model_lower:
-            return "gpt-5"
-        elif "gpt-4" in model_lower:
-            return "gpt-4"
-        elif "gpt-3.5" in model_lower or "turbo" in model_lower:
-            return "gpt-3.5-turbo"
-        elif "claude" in model_lower:
-            return "claude"
-        else:
-            return "default"
+    def status(self) -> Dict[str, Any]:
+        """Tokenizer availability for readiness details (never a readiness gate)."""
+        encodings = {encoding: encoding in self.encoders for encoding in self.ENCODINGS}
+        return {
+            "enabled": self.enabled,
+            "available": self.enabled and encodings[self.DEFAULT_ENCODING],
+            "encodings": encodings,
+        }
 
 
 class ModelRouter:
@@ -548,6 +592,10 @@ class ModelRouter:
             and default_model_loaded
             and policy_cache_healthy
         )
+
+    def tokenizer_status(self) -> Dict[str, Any]:
+        """Tokenizer availability; a missing tokenizer degrades, never unreadies."""
+        return self.token_counter.status()
 
     def _load_models(self):
         """Load model configurations"""
@@ -762,7 +810,7 @@ class ModelRouter:
             return {}
 
     def _fallback_token_estimate(self, request: QueryRequest) -> int:
-        """The routing token estimate, or a word count if that fails too."""
+        """The routing token estimate, or a CJK-aware estimate if that fails too."""
         try:
             return max(0, int(self._estimate_request_token_count(request)))
         except Exception:
@@ -770,7 +818,7 @@ class ModelRouter:
             text = "\n\n".join(
                 part for part in (request.context, request.query) if part
             )
-            return max(1, int(len(text.split()) * 1.3), len(text) // 4)
+            return max(1, approximate_token_count(text), len(text) // 4)
 
     async def select_model_with_capability(
         self,
@@ -988,7 +1036,9 @@ class ModelRouter:
             return False
         return query_type == QueryType.WEB_RESEARCH
 
-    def _estimate_request_token_count(self, request: QueryRequest) -> int:
+    def _estimate_request_token_count(
+        self, request: QueryRequest, model: Optional[str] = None
+    ) -> int:
         """Approximate the prompt shape used by inference providers for routing."""
         prompt_parts = []
         response_style_instructions = (request.metadata or {}).get(
@@ -1013,7 +1063,10 @@ class ModelRouter:
             prompt_parts.append(str(web_search_context))
         prompt_parts.append(f"Query: {request.query}")
 
-        return self.token_counter.count_tokens("\n\n".join(prompt_parts))
+        prompt = "\n\n".join(prompt_parts)
+        if model is None:
+            return self.token_counter.count_tokens(prompt)
+        return self.token_counter.count_tokens(prompt, model)
 
     def _estimate_attachment_prompt(self, request: QueryRequest) -> str:
         """Mirror inference attachment excerpts closely enough for routing decisions."""

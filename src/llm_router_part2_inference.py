@@ -4140,7 +4140,7 @@ class InferenceEngine:
                 model_name=model_name,
                 provider=str(provider_name),
                 estimated_input_tokens=self._estimate_provider_admission_input_tokens(
-                    request
+                    request, model_name
                 ),
                 operation=call_provider,
                 execution_budget=execution_budget,
@@ -4150,11 +4150,18 @@ class InferenceEngine:
             ),
         )
 
-    def _estimate_provider_admission_input_tokens(self, request: QueryRequest) -> int:
-        """Estimate provider input tokens for admission budget reservation."""
+    def _estimate_provider_admission_input_tokens(
+        self, request: QueryRequest, model_name: Optional[str] = None
+    ) -> int:
+        """Estimate provider input tokens for admission budget reservation.
+
+        The router counts with the called model's encoding when it is known.
+        """
         estimator = getattr(self.router, "_estimate_request_token_count", None)
         if estimator is not None:
             try:
+                if model_name and isinstance(self.router, ModelRouter):
+                    return max(0, int(estimator(request, model_name)))
                 return max(0, int(estimator(request)))
             except Exception:
                 logger.debug("Provider admission token estimator failed", exc_info=True)

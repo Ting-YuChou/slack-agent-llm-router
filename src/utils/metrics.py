@@ -298,6 +298,13 @@ class RouterMetrics:
             ["original_model", "fallback_model", "reason"],
         )
 
+        # Tokenizer encodings the router could load (0 = token counts estimated)
+        self.tokenizer_available = Gauge(
+            "llm_router_tokenizer_available",
+            "Tokenizer encoding availability (1=loaded, 0=estimated counts)",
+            ["encoding"],
+        )
+
 
 class InferenceMetrics:
     """Inference engine metrics"""
