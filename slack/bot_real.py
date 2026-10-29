@@ -87,20 +87,45 @@ SLACK_EMPTY_ANSWER_MESSAGE = (
     "🤔 The model returned an empty answer. Please try again or rephrase "
     "your question."
 )
-# What a failed answer tells the user, by InferenceResponse.error_type. Any
-# other type gets the generic message, which reveals nothing internal.
+_RATE_LIMITED_TEXT = (
+    "⏳ The model provider is rate-limiting requests right now. "
+    "Please try again in a minute."
+)
+_TIMEOUT_TEXT = (
+    "⌛ The model took too long to answer. Please try again, or ask for "
+    "something shorter."
+)
+_TOO_LONG_TEXT = (
+    "❌ That request is too long for the model. Try shortening it or splitting "
+    "it into smaller requests."
+)
+# What a failed answer tells the user. A precise InferenceResponse.error_code
+# wins; else its error_type decides; anything else gets the generic message,
+# which reveals nothing internal.
+SLACK_ERROR_CODE_MESSAGES = {
+    "context_length_exceeded": _TOO_LONG_TEXT,
+    "prompt_too_large": _TOO_LONG_TEXT,
+    "model_not_entitled": (
+        "❌ The model this request needs is not available for your tier."
+    ),
+    "retrieval_unavailable": (
+        "⚠️ Document search is unavailable right now. Please try again in a "
+        "few minutes."
+    ),
+    "rate_limited": _RATE_LIMITED_TEXT,
+    "provider_unavailable": (
+        "⚠️ The model provider is unavailable right now. Please try again in a "
+        "few minutes."
+    ),
+    "timeout": _TIMEOUT_TEXT,
+}
 SLACK_INFERENCE_ERROR_MESSAGES = {
-    "rate_limited": (
-        "⏳ The model provider is rate-limiting requests right now. "
-        "Please try again in a minute."
-    ),
-    "timeout": (
-        "⌛ The model took too long to answer. Please try again, or ask for "
-        "something shorter."
-    ),
+    "rate_limited": _RATE_LIMITED_TEXT,
+    "timeout": _TIMEOUT_TEXT,
+    # Every ValueError lands here, internal ones too: blame nothing.
     "user_or_policy": (
-        "❌ I couldn't process that request as sent. It may be too long, or "
-        "need a model your tier can't use. Try a shorter or simpler request."
+        "❌ I couldn't complete that request. Rephrasing it may help; "
+        "otherwise please try again later."
     ),
 }
 # The windows UserManager.check_rate_limit counts requests in.
@@ -3007,7 +3032,8 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 )
                 SLACK_METRICS.errors.labels(error_type="inference_error_response").inc()
                 return self._inference_error_message(
-                    getattr(response, "error_type", None)
+                    getattr(response, "error_type", None),
+                    getattr(response, "error_code", None),
                 )
 
             if not (getattr(response, "response_text", "") or "").strip():
@@ -3046,11 +3072,17 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             SLACK_METRICS.errors.labels(error_type=type(e).__name__).inc()
             return self._inference_error_message(None)
 
-    def _inference_error_message(self, error_type: Optional[str]) -> str:
-        """What a failed answer tells the user, chosen by its error type."""
-        message = SLACK_INFERENCE_ERROR_MESSAGES.get(error_type or "")
-        if message:
-            return message
+    def _inference_error_message(
+        self, error_type: Optional[str], error_code: Optional[str] = None
+    ) -> str:
+        """What a failed answer tells the user: by error code, else error type."""
+        for messages, key in (
+            (SLACK_ERROR_CODE_MESSAGES, error_code),
+            (SLACK_INFERENCE_ERROR_MESSAGES, error_type),
+        ):
+            message = messages.get(key) if isinstance(key, str) else None
+            if message:
+                return message
         error_builder = getattr(self.bot, "_build_user_safe_error_message", None)
         if callable(error_builder):
             return error_builder()

@@ -534,10 +534,54 @@ async def test_error_text_follows_the_error_type(inference_response_factory):
 
     assert "rate-limiting" in rate_limited
     assert "took too long" in timeout
-    assert "too long" in user_or_policy and "tier" in user_or_policy
+    # Any ValueError lands in user_or_policy, an internal one too: never
+    # blame the request or the user's tier on that alone.
+    assert "too long" not in user_or_policy and "tier" not in user_or_policy
     assert len({generic, rate_limited, timeout, user_or_policy}) == 4
     for other in ("provider_error", "internal", None):
         assert await reply_for(other) == generic
+
+
+async def reply_for_failure(**fields):
+    # InferenceResponse has no error_code on this branch yet; a stand-in does.
+    failed = SimpleNamespace(
+        response_text="Request processing failed",
+        provider="error",
+        error="inference_failed",
+        **fields,
+    )
+    bot = chat_bot(AsyncMock(return_value=failed))
+    await bot._process_message(top_level(ts="200.0"))
+    assert history(bot, "200.0") == []
+    return bot.web_client.chat_postMessage.await_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_code,says",
+    [
+        ("context_length_exceeded", "too long for the model"),
+        ("prompt_too_large", "too long for the model"),
+        ("model_not_entitled", "not available for your tier"),
+        ("retrieval_unavailable", "document search is unavailable right now"),
+        ("rate_limited", "rate-limiting"),
+        ("provider_unavailable", "provider is unavailable right now"),
+        ("timeout", "took too long"),
+    ],
+)
+async def test_error_text_prefers_the_more_precise_error_code(error_code, says):
+    text = await reply_for_failure(error_code=error_code, error_type="user_or_policy")
+
+    assert says in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_error_code_falls_back_to_the_error_type():
+    timeout = await reply_for_failure(error_type="timeout")
+
+    assert await reply_for_failure(error_code="new_code", error_type="timeout") == (
+        timeout
+    )
 
 
 # S14: the tier comes from config on every request
