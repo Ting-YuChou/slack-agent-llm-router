@@ -4,9 +4,11 @@ Pure-Python logic shared by the Flink job and local integration tests.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any, Dict
 
+from src.redaction import context_summary
 from src.routing_features import (
     CODE_KEYWORDS as CODE_KEYWORDS,
     HIGH_REASONING_QUERY_TYPES,
@@ -223,6 +225,27 @@ def validate_inference_completed_event(data: Dict[str, Any]) -> Dict[str, Any]:
     return event
 
 
+def serialize_event(event: Dict[str, Any]) -> str:
+    """JSON for the Kafka sinks, with non-ASCII text left as UTF-8."""
+    text = json.dumps(event, ensure_ascii=False)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        # A lone surrogate has no UTF-8 form; escaped JSON still round-trips it.
+        return json.dumps(event)
+    return text
+
+
+def _drop_context_text(event: Dict[str, Any]) -> None:
+    """Keep a legacy event's `context` text out of everything Flink emits."""
+    if "context" not in event:
+        return
+    context = event.pop("context")
+    summary = context_summary(None if context is None else str(context))
+    for key, value in summary.items():
+        event.setdefault(key, value)
+
+
 def classify_query_event(
     data: Dict[str, Any], timestamp: datetime | None = None
 ) -> Dict[str, Any]:
@@ -238,6 +261,7 @@ def classify_query_event(
     route_to_fast_lane = bool(routing_features.get("route_to_fast_lane", False))
 
     event.update(routing_features)
+    _drop_context_text(event)
     event["priority"] = priority
     event["processing_timestamp"] = _isoformat(timestamp)
     event["route_to_fast_lane"] = route_to_fast_lane
@@ -301,8 +325,11 @@ def build_alert_event(
     severity: str = "warning",
     timestamp: datetime | None = None,
 ) -> Dict[str, Any]:
-    """Build an alert payload for malformed or rejected request events."""
-    original_payload = data if isinstance(data, dict) else {"raw_message": str(data)}
+    """Build an alert for a malformed or rejected request event.
+
+    The alert names the request and the error; it never embeds the payload.
+    """
+    original_payload = data if isinstance(data, dict) else {}
     normalized_payload = normalize_request_event(original_payload)
 
     return {
@@ -316,7 +343,6 @@ def build_alert_event(
         "severity": severity,
         "description": description,
         "original_event_type": normalized_payload.get("event_type"),
-        "original_payload": original_payload,
     }
 
 

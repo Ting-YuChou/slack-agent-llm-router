@@ -29,6 +29,7 @@ from flink.logic import (
     build_alert_event,
     build_fast_lane_hint_event,
     build_request_enriched_event,
+    serialize_event,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,9 @@ class QueryEnrichmentMapper(MapFunction):
         try:
             data = json.loads(value)
         except json.JSONDecodeError:
-            logger.error(f"Invalid JSON in requests.raw message: {value}")
+            logger.error(
+                "Invalid JSON in requests.raw message (%d chars)", len(value or "")
+            )
             return build_alert_event(
                 value,
                 alert_type="invalid_json",
@@ -52,7 +55,11 @@ class QueryEnrichmentMapper(MapFunction):
         try:
             return build_request_enriched_event(data)
         except Exception as exc:
-            logger.error(f"Failed to enrich request event: {exc}")
+            logger.error(
+                "Failed to enrich request event %s: %s",
+                data.get("request_id") if isinstance(data, dict) else None,
+                type(exc).__name__,
+            )
             return build_alert_event(
                 data,
                 alert_type="enrichment_error",
@@ -92,9 +99,7 @@ def create_flink_job(config: Dict[str, Any]):
         "group.id": config.get("kafka", {}).get(
             "consumer_group", "flink-request-enrichment"
         ),
-        "auto.offset.reset": config.get("kafka", {}).get(
-            "auto_offset_reset", "latest"
-        ),
+        "auto.offset.reset": config.get("kafka", {}).get("auto_offset_reset", "latest"),
     }
 
     request_consumer = FlinkKafkaConsumer(
@@ -131,16 +136,16 @@ def create_flink_job(config: Dict[str, Any]):
         output_type=Types.PICKLED_BYTE_ARRAY(),
     )
 
-    enriched_stream.map(lambda event: json.dumps(event), output_type=Types.STRING()).add_sink(
-        enriched_producer
-    ).name("Requests Enriched Sink")
+    enriched_stream.map(
+        lambda event: serialize_event(event), output_type=Types.STRING()
+    ).add_sink(enriched_producer).name("Requests Enriched Sink")
     fast_lane_stream.map(
-        lambda event: json.dumps(event),
+        lambda event: serialize_event(event),
         output_type=Types.STRING(),
     ).add_sink(fast_lane_producer).name("Fast Lane Hint Sink")
-    alerts_stream.map(lambda event: json.dumps(event), output_type=Types.STRING()).add_sink(
-        alert_producer
-    ).name("Alerts Sink")
+    alerts_stream.map(
+        lambda event: serialize_event(event), output_type=Types.STRING()
+    ).add_sink(alert_producer).name("Alerts Sink")
 
     return env
 

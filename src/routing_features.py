@@ -311,6 +311,9 @@ def build_routing_features(data: Dict[str, Any]) -> Dict[str, Any]:
     metadata = data.get("metadata") or {}
     query_text = str(data.get("query_text") or data.get("query") or "")
     context = str(data.get("context") or "")
+    # requests.raw carries `context_chars` instead of the text; older events
+    # still carry `context`.
+    context_length = max(len(context), _safe_int(data.get("context_chars")))
     attachments = data.get("attachments") or []
     attachments_count = _safe_int(
         data.get(
@@ -331,7 +334,7 @@ def build_routing_features(data: Dict[str, Any]) -> Dict[str, Any]:
     if token_estimate <= 0:
         token_estimate = estimate_query_tokens(query_text, context)
     long_context = (
-        len(context) >= 4000
+        context_length >= 4000
         or token_estimate >= 2500
         or _safe_int(data.get("max_tokens")) >= 4096
     )
@@ -343,7 +346,7 @@ def build_routing_features(data: Dict[str, Any]) -> Dict[str, Any]:
         query_type=query_type,
         query_text=query_text,
         token_estimate=token_estimate,
-        context_length=len(context),
+        context_length=context_length,
         attachments_count=attachments_count,
     )
     session_hotness = derive_session_hotness(metadata)

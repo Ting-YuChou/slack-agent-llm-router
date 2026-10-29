@@ -21,6 +21,8 @@ from aiokafka.structs import TopicPartition
 import clickhouse_connect
 from clickhouse_connect.driver import Client
 
+from src.redaction import context_summary, redact, redact_text
+from src.routing_features import estimate_query_tokens
 from src.utils.logger import setup_logging
 from src.utils.metrics import PIPELINE_METRICS
 from src.utils.schema import QueryRequest, InferenceResponse, SystemMetric, UserTier
@@ -28,6 +30,31 @@ from src.utils.schema import QueryRequest, InferenceResponse, SystemMetric, User
 logger = logging.getLogger(__name__)
 
 EVENT_SCHEMA_VERSION = "1.0"
+ROUTING_GUARDRAIL_EVENT_TYPE = "routing.guardrails"
+# What an alert row keeps in `payload_json`: identifiers and the error, never
+# the request that triggered it. `metrics` holds only window aggregates.
+ALERT_PAYLOAD_FIELDS = (
+    "event_type",
+    "event_version",
+    "emitted_at",
+    "request_id",
+    "query_id",
+    "user_id",
+    "alert_type",
+    "anomaly_type",
+    "trigger_type",
+    "severity",
+    "description",
+    "original_event_type",
+    "model_name",
+    "provider",
+    "window_start_ms",
+    "window_end_ms",
+    "metrics",
+    "error",
+    "error_type",
+    "error_message",
+)
 
 
 @dataclass(frozen=True)
@@ -113,6 +140,38 @@ def _json_safe_payload(value: Any) -> Any:
     return repr(value)
 
 
+def _json_bytes(value: Any, default: Optional[Callable[[Any], Any]] = None) -> bytes:
+    """Serialize as UTF-8 JSON; non-ASCII text is not expanded to escapes."""
+    try:
+        return json.dumps(value, default=default, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        # A lone surrogate has no UTF-8 form; escaped JSON still round-trips it.
+        return json.dumps(value, default=default).encode("utf-8")
+
+
+def _json_text(value: Any, default: Optional[Callable[[Any], Any]] = None) -> str:
+    return _json_bytes(value, default=default).decode("utf-8")
+
+
+def _private_free_payload(value: Any) -> Any:
+    """Redact credentials and replace a request `context` with its size and hash."""
+    if isinstance(value, dict) and "context" in value:
+        value = dict(value)
+        context = value.pop("context")
+        summary = context_summary(None if context is None else str(context))
+        for key, item in summary.items():
+            value.setdefault(key, item)
+    return redact(value)
+
+
+def _alert_payload(data: Dict[str, Any]) -> Any:
+    if data.get("event_type") == ROUTING_GUARDRAIL_EVENT_TYPE:
+        # Built by Flink from metric windows; get_routing_guardrails reads
+        # its scope fields back from payload_json.
+        return redact(data)
+    return redact({key: data[key] for key in ALERT_PAYLOAD_FIELDS if key in data})
+
+
 def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
     """Build the pre-inference event emitted by the API request path."""
     attachments = [
@@ -135,8 +194,12 @@ def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
         "user_id": query_request.user_id,
         "user_tier": _enum_value(query_request.user_tier),
         "request_timestamp": _isoformat_utc(query_request.timestamp),
-        "query_text": query_request.query,
-        "context": query_request.context,
+        "query_text": redact_text(query_request.query),
+        # Other people's Slack messages ride in `context`; send only its shape.
+        **context_summary(query_request.context),
+        "query_token_estimate": estimate_query_tokens(
+            query_request.query, query_request.context or ""
+        ),
         "max_tokens": query_request.max_tokens,
         "temperature": query_request.temperature,
         "priority": query_request.priority,
@@ -147,7 +210,7 @@ def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
         else None,
         "session_id": query_request.session_id,
         "conversation_id": query_request.conversation_id,
-        "metadata": query_request.metadata or {},
+        "metadata": redact(query_request.metadata or {}),
         "attachments": attachments,
         "attachments_count": len(attachments),
     }
@@ -195,7 +258,7 @@ def build_inference_completed_event(
         "conversation_id": query_request.conversation_id,
         "request_timestamp": _isoformat_utc(query_request.timestamp),
         "completion_timestamp": _isoformat_utc(inference_response.timestamp),
-        "query_text": query_request.query,
+        "query_text": redact_text(query_request.query),
         "query_type": _enum_value(query_type),
         "selected_model": inference_response.model_name,
         "provider": inference_response.provider,
@@ -276,7 +339,7 @@ class QueryLogEntry:
             "user_tier": self.user_tier.value
             if isinstance(self.user_tier, UserTier)
             else str(self.user_tier),
-            "query_text": self.query_text[:10000],
+            "query_text": redact_text(self.query_text)[:10000],
             "query_type": self.query_type.value
             if hasattr(self.query_type, "value")
             else str(self.query_type),
@@ -891,9 +954,9 @@ class KafkaProducerManager:
                     return obj.isoformat()
                 raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
-            return json.dumps(message, default=default_serializer).encode("utf-8")
+            return _json_bytes(message, default=default_serializer)
         else:
-            return json.dumps(message).encode("utf-8")
+            return _json_bytes(message)
 
     @staticmethod
     async def _wait_for_cancelled_dispatcher(dispatcher: asyncio.Task) -> None:
@@ -2155,8 +2218,10 @@ class KafkaConsumerManager:
             "source_key": _decode_kafka_key(getattr(message, "key", None)),
             "failure_stage": stage,
             "error_type": type(error).__name__,
-            "error_message": str(error)[:2000],
-            "payload": _json_safe_payload(getattr(message, "value", None)),
+            "error_message": redact_text(str(error))[:2000],
+            "payload": _private_free_payload(
+                _json_safe_payload(getattr(message, "value", None))
+            ),
         }
         topic = self._dead_letter_topic(topic_key, message)
         key = metadata["event_id"] or str(uuid.uuid4())
@@ -2302,7 +2367,7 @@ class KafkaConsumerManager:
             provider=str(data.get("provider", "") or ""),
             window_start_ms=int(data.get("window_start_ms", 0) or 0),
             window_end_ms=int(data.get("window_end_ms", 0) or 0),
-            payload_json=json.dumps(data, default=str),
+            payload_json=_json_text(_alert_payload(data), default=str),
             **(kafka_metadata or {}),
         )
 
@@ -2336,7 +2401,7 @@ class KafkaConsumerManager:
             preferred_models=list(data.get("preferred_models", []) or []),
             avoid_models=list(data.get("avoid_models", []) or []),
             avoid_providers=list(data.get("avoid_providers", []) or []),
-            payload_json=json.dumps(data, default=str),
+            payload_json=_json_text(data, default=str),
             **(kafka_metadata or {}),
         )
 
@@ -2732,7 +2797,7 @@ class KafkaConsumerManager:
 
     def _serialize_message(self, message: Any) -> bytes:
         """Serialize consumer-side DLQ payloads as JSON bytes."""
-        return json.dumps(message, default=str).encode("utf-8")
+        return _json_bytes(message, default=str)
 
     async def shutdown(self):
         """Shutdown all consumers"""

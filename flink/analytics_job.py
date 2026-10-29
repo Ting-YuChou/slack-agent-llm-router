@@ -201,7 +201,10 @@ class InferenceCompletedMapper(MapFunction):
         try:
             data = json.loads(value)
         except json.JSONDecodeError:
-            logger.error(f"Invalid JSON in inference.completed message: {value}")
+            logger.error(
+                "Invalid JSON in inference.completed message (%d chars)",
+                len(value or ""),
+            )
             return build_alert_event(
                 value,
                 alert_type="invalid_json",
