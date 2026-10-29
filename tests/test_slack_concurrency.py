@@ -6,7 +6,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from slack.bot_real import SlackBot, SlackWorkItem
+from slack.bot_real import (
+    SLACK_BUSY_MESSAGE,
+    SlackBot,
+    SlackThreadWork,
+    SlackWorkItem,
+)
 from src.agent_runtime import AgentRuntimeUnavailable
 
 
@@ -541,3 +546,93 @@ async def test_a_failed_attachment_download_still_raises():
         await bot._extract_query_attachments(
             {"files": [{"id": "F0"}, {"id": "F1"}, {"id": "F2"}]}
         )
+
+
+# S12 round 2: parking after an await, and the shared queue capacity
+
+
+@pytest.mark.asyncio
+async def test_a_thread_freed_during_the_allowlist_check_is_taken_over():
+    """The owner can finish while a parking worker waits on conversations.info."""
+    owner_gate = asyncio.Event()
+    info_called = asyncio.Event()
+    info_gate = asyncio.Event()
+    handled = []
+
+    async def handle_event(event):
+        if not handled:
+            await owner_gate.wait()
+        handled.append(event["ts"])
+
+    async def conversations_info(channel):
+        info_called.set()
+        await info_gate.wait()
+        return {"ok": True, "channel": {"name": "private"}}
+
+    bot = chat_bot(channels=["#private"])
+    bot.allowed_channel_names = {"private"}
+    bot.web_client.conversations_info = AsyncMock(side_effect=conversations_info)
+    bot._handle_event = handle_event
+    mention = {
+        "type": "app_mention",
+        "channel": "GPRIVATE1",
+        "user": "U1",
+        "text": "<@UBOT> hi",
+        "ts": "100.0",
+    }
+    follow_up = dict(thread_reply(), channel="GPRIVATE1")
+
+    owner = asyncio.create_task(
+        bot._handle_chat_work(SlackWorkItem("event", mention, "mention"))
+    )
+    await asyncio.sleep(0)
+    parker = asyncio.create_task(
+        bot._handle_chat_work(SlackWorkItem("event", follow_up, "message"))
+    )
+    await asyncio.wait_for(info_called.wait(), timeout=1)
+    owner_gate.set()
+    await asyncio.wait_for(owner, timeout=1)
+    assert not bot._busy_threads
+    info_gate.set()
+    await asyncio.wait_for(parker, timeout=1)
+
+    assert handled == ["100.0", "101.0"]
+    assert bot._thread_pending == 0
+    assert not bot._busy_threads
+
+
+@pytest.mark.asyncio
+async def test_parking_shares_the_work_queue_capacity():
+    bot = chat_bot(work_queue={"capacity": 2})
+    bot._mark_thread_active("C1", "100.0")
+    bot._busy_threads["C1:100.0"] = SlackThreadWork()
+    bot._thread_pending = 1
+    bot._work_queue.put_nowait(
+        SlackWorkItem("event", thread_reply(ts="300.0", thread_ts="300.0"), "x")
+    )
+
+    await bot._handle_chat_work(
+        SlackWorkItem("event", thread_reply(ts="102.0"), "message")
+    )
+
+    assert not bot._busy_threads["C1:100.0"].pending
+    assert bot._thread_pending == 1
+    # The thread gets a busy reply instead.
+    assert (
+        bot.web_client.chat_postMessage.await_args.kwargs["text"] == SLACK_BUSY_MESSAGE
+    )
+
+
+@pytest.mark.asyncio
+async def test_parked_events_count_against_the_queue_capacity_on_enqueue():
+    bot = chat_bot(work_queue={"capacity": 2})
+    bot._mark_thread_active("C1", "100.0")
+    bot._busy_threads["C1:100.0"] = SlackThreadWork()
+    bot._thread_pending = 2
+
+    accepted = await bot._enqueue_work(
+        SlackWorkItem("event", thread_reply(ts="102.0"), "message")
+    )
+
+    assert accepted is False
+    assert bot._queued_work() == 2

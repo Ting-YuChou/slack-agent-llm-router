@@ -3470,7 +3470,8 @@ class SlackBot:
         # the current one (S12). An entry lives only while its worker runs,
         # so the map holds at most one entry per worker.
         self._busy_threads: Dict[str, SlackThreadWork] = {}
-        # Parked events across all threads, bounded by the queue's capacity.
+        # Parked events across all threads; with the work queue's items they
+        # stay within its capacity.
         self._thread_pending = 0
         self._accepting_work = True
         self._socket_disconnect_lock = asyncio.Lock()
@@ -6567,6 +6568,8 @@ class SlackBot:
             else self._work_queue
         )
         try:
+            if queue is self._work_queue and self._work_queue_full():
+                raise asyncio.QueueFull
             queue.put_nowait(item)
         except asyncio.QueueFull:
             SLACK_METRICS.work_rejected.labels(reason="capacity").inc()
@@ -6574,6 +6577,12 @@ class SlackBot:
             return False
         SLACK_METRICS.work_queue_depth.set(self._queued_work())
         return True
+
+    def _work_queue_full(self) -> bool:
+        """Queued and parked chat work share the work queue's capacity."""
+        return (
+            self._work_queue.qsize() + self._thread_pending >= self._work_queue.maxsize
+        )
 
     def _queued_work(self) -> int:
         return (
@@ -6652,11 +6661,14 @@ class SlackBot:
         if key is None:
             await self._handle_event(item.payload)
             return
-        busy = self._busy_threads.get(key)
-        if busy is not None:
+        if key in self._busy_threads:
             if await self._drops_before_thread(item.payload):
                 return
-            if self._thread_pending >= self._work_queue.maxsize:
+        # Read again after the await: the owner may have let the thread go
+        # meanwhile, and an event parked on its entry would never be answered.
+        busy = self._busy_threads.get(key)
+        if busy is not None:
+            if self._work_queue_full():
                 SLACK_METRICS.work_rejected.labels(reason="capacity").inc()
                 await self._reply_busy(item)
                 return
