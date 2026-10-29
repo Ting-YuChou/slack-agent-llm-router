@@ -568,21 +568,38 @@ def _split_fenced_text(text: str, limit: int) -> List[str]:
         else:
             budget = max(limit - len(prefix) - len("\n```"), 1)
             cut = remaining.rfind("\n", 0, budget)
-            if cut < budget // 2:
-                cut = remaining.rfind(" ", 0, budget)
-                if cut >= budget // 2:
-                    piece, remaining = remaining[:cut], remaining[cut + 1 :]
-                else:
-                    piece = remaining[:budget]
-                    remaining = remaining[budget:].lstrip("\n")
+            space = remaining.rfind(" ", 0, budget)
+            if cut >= budget // 2:
+                piece, remaining = remaining[:cut], remaining[cut:]
+                # Inside code only the break's own newline goes (the fence
+                # markers stand in for it); blank code lines stay.
+                remaining = (
+                    remaining[1:]
+                    if _fence_is_open(prefix + piece)
+                    else remaining.lstrip("\n")
+                )
+            elif space >= budget // 2 and not _fence_is_open(
+                prefix + remaining[:space]
+            ):
+                # Prose breaks on a space, which the break replaces.
+                piece, remaining = remaining[:space], remaining[space + 1 :]
             else:
-                piece, remaining = remaining[:cut], remaining[cut:].lstrip("\n")
+                # Code keeps every character: a hard cut.
+                piece, remaining = remaining[:budget], remaining[budget:]
+                if not _fence_is_open(prefix + piece):
+                    remaining = remaining.lstrip("\n")
+                elif remaining.startswith("\n"):
+                    remaining = remaining[1:]
         chunk = prefix + piece
-        open_fence = chunk.count("```") % 2 == 1
+        open_fence = _fence_is_open(chunk)
         if open_fence and remaining:
             chunk += "\n```"
         chunks.append(chunk)
     return chunks
+
+
+def _fence_is_open(text: str) -> bool:
+    return text.count("```") % 2 == 1
 
 
 SLACK_RATE_LIMIT_RETRIES = 2

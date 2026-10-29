@@ -276,6 +276,46 @@ def test_every_part_keeps_code_fences_balanced_and_fits(text, limit):
             assert any(line in part for part in parts), line
 
 
+def _fence_inner(part):
+    """A part of an all-code answer, without its opening and closing fence."""
+    lines = part.split("\n")
+    assert lines[0].startswith("```") and lines[-1] == "```", part
+    return "\n".join(lines[1:-1])
+
+
+@pytest.mark.parametrize("limit", [120, 300, 1000])
+def test_code_lines_and_blank_lines_survive_a_split(limit):
+    code = "\n".join(
+        "" if index % 7 == 3 else f"    value_{index} = f({index})  # note"
+        for index in range(120)
+    )
+    text = f"```python\n{code}\n```"
+    bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
+
+    parts = bot._split_response(text, limit)
+
+    assert len(parts) > 1
+    assert "\n".join(_fence_inner(part) for part in parts) == code
+
+
+@pytest.mark.parametrize("limit", [80, 200, 700])
+def test_no_character_inside_a_code_fence_is_dropped(limit):
+    # Long lines with spaces and no newline near the limit: the splitter
+    # must not break on (and drop) a space inside the code.
+    code = "\n".join(
+        " ".join(f"tok{index}_{word}" for word in range(40)) for index in range(6)
+    )
+    text = f"```\n{code}\n```"
+    bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
+
+    parts = bot._split_response(text, limit)
+
+    assert len(parts) > 1
+    assert all(len(part) <= limit for part in parts)
+    joined = "".join(_fence_inner(part) for part in parts)
+    assert joined.replace("\n", "") == code.replace("\n", "")
+
+
 def test_split_does_not_leave_tiny_fragments():
     paragraph = " ".join(f"word{index}" for index in range(500))
     text = f"Intro line.\n\n{paragraph}\n\nBye."
