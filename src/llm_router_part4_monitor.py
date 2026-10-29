@@ -283,6 +283,13 @@ class AlertManager:
         self.notification_queue_size = max(
             1, int(alerts_config.get("notification_queue_size", 1000))
         )
+        # Replay guard: older stream events are recorded but never notify.
+        # None (the default) disables the check.
+        max_event_age = alerts_config.get("max_event_age_seconds")
+        self.max_event_age_seconds: Optional[float] = (
+            None if max_event_age is None else max(0.0, float(max_event_age))
+        )
+        self.stale_event_count = 0
         self.sender_drain_timeout_seconds = max(
             0.0, float(alerts_config.get("sender_drain_timeout_seconds", 5))
         )
@@ -359,7 +366,8 @@ class AlertManager:
                 duration=1800,
                 severity="warning",
                 description="No stream analytics metrics received recently",
-                enabled=bool(rules_config.get("stream_metrics_stale_enabled", True)),
+                # Opt-in: Flink only emits windows while there is traffic.
+                enabled=bool(rules_config.get("stream_metrics_stale_enabled", False)),
             ),
         ]
 
@@ -406,13 +414,19 @@ class AlertManager:
                 continue
 
             try:
-                # Evaluate alert condition
-                triggered = self._evaluate_condition(rule, metrics)
+                # Evaluate alert condition; None means it could not be
+                # evaluated, which is neither a breach nor a recovery.
+                triggered = self._evaluate_condition_state(rule, metrics)
+                if triggered is None:
+                    continue
 
                 if not triggered:
                     rule.pending_since = None
                     if rule.firing:
                         rule.firing = False
+                        # A new breach after a resolve is a new incident, so
+                        # it notifies without waiting out the cooldown.
+                        rule.last_triggered = None
                         await self._resolve_alert(rule, metrics)
                     continue
 
@@ -438,6 +452,12 @@ class AlertManager:
 
     def _evaluate_condition(self, rule: AlertRule, metrics: Dict[str, float]) -> bool:
         """Evaluate if alert condition is met"""
+        return bool(self._evaluate_condition_state(rule, metrics))
+
+    def _evaluate_condition_state(
+        self, rule: AlertRule, metrics: Dict[str, float]
+    ) -> Optional[bool]:
+        """Evaluate a condition: True/False, or None when evaluation fails."""
         try:
             # Simple condition evaluation
             # In production, use a proper expression parser
@@ -473,11 +493,11 @@ class AlertManager:
             }
 
             # Evaluate condition
-            return eval(condition, {"__builtins__": {}}, context)
+            return bool(eval(condition, {"__builtins__": {}}, context))
 
         except Exception as e:
             logger.error(f"Failed to evaluate condition for rule {rule.name}: {e}")
-            return False
+            return None
 
     @staticmethod
     def _get_metric_value(
@@ -649,16 +669,51 @@ class AlertManager:
         while len(self._seen_alert_identities) > self.dedupe_max_entries:
             self._seen_alert_identities.popitem(last=False)
 
+    _ACTION_RANK = {"warn": 1, "avoid": 2}
+    _SEVERITY_RANK = {"info": 0, "warning": 1, "error": 2, "critical": 3}
+
+    @classmethod
+    def _alert_level(cls, alert: Dict[str, Any]) -> tuple[int, int]:
+        """Rank an alert by guardrail action, then severity."""
+        return (
+            cls._ACTION_RANK.get(str(alert.get("guardrail_action") or ""), 0),
+            cls._SEVERITY_RANK.get(str(alert.get("severity") or "").lower(), 1),
+        )
+
+    @staticmethod
+    def _event_time(alert_data: Dict[str, Any]) -> Optional[datetime]:
+        """Return when a stream event happened: emitted_at, else window end."""
+        emitted_at = alert_data.get("emitted_at")
+        if emitted_at:
+            # Unparseable values read as now, i.e. fresh.
+            return _parse_event_timestamp(emitted_at)
+        window_end_ms = alert_data.get("window_end_ms")
+        if isinstance(window_end_ms, (int, float)) and window_end_ms > 0:
+            return datetime.fromtimestamp(window_end_ms / 1000, tz=timezone.utc)
+        return None
+
+    def _is_stale_event(self, alert_data: Dict[str, Any]) -> bool:
+        if self.max_event_age_seconds is None:
+            return False
+        event_time = self._event_time(alert_data)
+        if event_time is None:
+            return False
+        age = (datetime.now(timezone.utc) - event_time).total_seconds()
+        return age > self.max_event_age_seconds
+
     async def _resolve_external_alert(self, normalized_alert: Dict[str, Any]):
-        """Resolve the active incidents a ``guardrail_action=clear`` closes."""
+        """Resolve every active incident of the scope a ``clear`` closes.
+
+        A clear means the whole scope recovered, even though it carries only
+        the trigger type that first entered.
+        """
         incident, _identity = self._external_alert_keys(normalized_alert)
-        source, alert_type, scope = incident
-        same_scope = [
+        source, _alert_type, scope = incident
+        targets = [
             key
             for key in self._active_external_alerts
             if key[0] == source and key[2] == scope
         ]
-        targets = [key for key in same_scope if key[1] == alert_type] or same_scope
         for key in targets:
             active = self._active_external_alerts.pop(key)
             resolved = {
@@ -723,7 +778,12 @@ class AlertManager:
             "status": "firing",
         }
 
+        stale = self._is_stale_event(alert_data)
         if normalized_alert["guardrail_action"] == "clear":
+            if stale:
+                # A replayed clear must not resolve a current incident.
+                self.stale_event_count += 1
+                return
             await self._resolve_external_alert(normalized_alert)
             return
 
@@ -736,12 +796,21 @@ class AlertManager:
 
         self._append_alert_to_history(normalized_alert)
 
+        if stale:
+            # Replayed from an old offset: keep the record, skip the page.
+            self.stale_event_count += 1
+            return
+
         now = self._clock()
         active = self._active_external_alerts.get(incident)
         if (
             active is not None
             and now - float(active["_notified_at"]) < self.dedupe_cooldown_seconds
+            and self._alert_level(normalized_alert) <= self._alert_level(active)
         ):
+            # Same incident, no escalation: stay quiet but keep it fresh so
+            # a storm does not evict the active incident first.
+            self._active_external_alerts.move_to_end(incident)
             self.suppressed_alert_count += 1
             return
 
@@ -1052,10 +1121,15 @@ class MetricsCollector:
         self._last_stream_metrics_received_at = self._clock()
 
     def stream_metrics_age_seconds(self) -> float:
-        """Seconds since the last stream metrics window arrived (or start)."""
+        """Seconds since the last stream metrics window arrived.
+
+        Before the first window it reads 0, so a deployment without Flink, or
+        one still waiting for traffic, never looks stale.
+        """
         last = self._last_stream_metrics_received_at
-        reference = self._started_at if last is None else last
-        return max(0.0, self._clock() - reference)
+        if last is None:
+            return 0.0
+        return max(0.0, self._clock() - last)
 
     def stream_freshness_metrics(self) -> Dict[str, Any]:
         """Return stream freshness in the nested shape alert checks flatten."""

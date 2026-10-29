@@ -230,7 +230,13 @@ def _stale_rule_names(manager):
 
 @pytest.mark.asyncio
 async def test_stale_stream_metrics_raise_an_alert():
-    service = MonitoringService({"stream_metrics_staleness_seconds": 300})
+    # Review round 1: the stale-stream rule is opt-in.
+    service = MonitoringService(
+        {
+            "stream_metrics_staleness_seconds": 300,
+            "alerts": {"stream_metrics_stale_enabled": True},
+        }
+    )
     handler = _RecordingHandler()
     service.alert_manager.notification_handlers = {"test": handler}
     assert "stream_metrics_stale" in _stale_rule_names(service.alert_manager)
@@ -260,13 +266,15 @@ async def test_stale_stream_metrics_raise_an_alert():
 
 
 @pytest.mark.asyncio
-async def test_stream_metrics_never_received_is_stale_after_threshold():
+async def test_stream_metrics_never_received_are_not_stale():
+    # Review round 1: no window yet means nothing to be stale about.
     collector = MetricsCollector({"stream_metrics_staleness_seconds": 300})
     collector._clock = lambda: collector._started_at + 301
 
     freshness = collector.stream_freshness_metrics()
 
-    assert freshness["streaming"]["metrics_age_seconds"] >= 301
+    assert freshness["streaming"]["metrics_age_seconds"] == 0
+    assert freshness["streaming"]["metrics_received"] == 0
 
 
 @pytest.mark.asyncio

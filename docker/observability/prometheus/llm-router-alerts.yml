@@ -73,13 +73,18 @@ groups:
           summary: "Kafka consumer restarting repeatedly ({{ $labels.topic }})"
           description: "More than 3 consumer task restarts in 15 minutes."
       - alert: LLMRouterKafkaConsumerStalled
-        expr: time() - max by (topic) (llm_router_kafka_last_consumed_timestamp_seconds) > 900
+        # Quiet topics (alerts, guardrails) legitimately go idle; only a
+        # backlog that is not moving means the consumer is stuck.
+        expr: >-
+          (sum by (topic) (llm_router_kafka_consumer_lag) > 0)
+          and on (topic)
+          (time() - max by (topic) (llm_router_kafka_last_consumed_timestamp_seconds) > 900)
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "No Kafka messages consumed recently ({{ $labels.topic }})"
-          description: "The consumer has not committed a message for 15 minutes."
+          summary: "Kafka consumer stuck behind a backlog ({{ $labels.topic }})"
+          description: "The topic has lag but nothing has been consumed for 15 minutes."
 
   - name: llm-router-clickhouse
     rules:

@@ -714,8 +714,13 @@ monitoring:
     dedupe_cooldown_seconds: 900
     notification_timeout_seconds: 10
     notification_queue_size: 1000
-    # Alert when no Flink metrics window arrives for stream_metrics_staleness_seconds.
-    stream_metrics_stale_enabled: true
+    # Opt-in: alert when no Flink metrics window arrives for
+    # stream_metrics_staleness_seconds. Flink only emits windows while there
+    # is traffic, so this pages during idle periods.
+    stream_metrics_stale_enabled: false
+    # Stream alerts older than this (emitted_at, else window end) are recorded
+    # but do not notify, so a consumer replaying from earliest stays quiet.
+    max_event_age_seconds: 900
   health_checks:
     interval_seconds: 30
     timeout_seconds: 10
