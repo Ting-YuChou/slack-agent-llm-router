@@ -19,6 +19,9 @@ SLACK_FILE_HOSTS = frozenset({"files.slack.com"})
 # Modes whose bytes Slack does not host or no longer serves.
 WITHHELD_FILE_MODES = frozenset({"external", "tombstone", "hidden_by_limit"})
 MAX_DOWNLOAD_HOPS = 4
+# Slack-native documents (canvases), as the agent bootstrap recognises them.
+SLACK_DOCUMENT_MIME_TYPES = frozenset({"application/vnd.slack-docs"})
+SLACK_DOCUMENT_FILETYPES = frozenset({"canvas", "quip"})
 
 
 class SlackFileDownloadError(ValueError):
@@ -38,12 +41,18 @@ def is_slack_hosted_file(file_payload: Mapping[str, Any]) -> bool:
 
 
 def declares_html(file_payload: Mapping[str, Any]) -> bool:
+    """True when an HTML body is the file's own content, not a sign-in page.
+
+    That covers HTML files and Slack's native documents (canvases), which
+    Slack serves as HTML.
+    """
     mime_type = str(file_payload.get("mimetype") or "").lower()
     filetype = str(file_payload.get("filetype") or "").lower()
     name = str(file_payload.get("name") or "").lower()
     return (
         "html" in mime_type
-        or filetype in {"html", "htm"}
+        or mime_type in SLACK_DOCUMENT_MIME_TYPES
+        or filetype in {"html", "htm"} | SLACK_DOCUMENT_FILETYPES
         or name.endswith((".html", ".htm"))
     )
 
