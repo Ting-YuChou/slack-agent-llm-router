@@ -1358,16 +1358,42 @@ _SLACK_NOTICE_TEXTS = frozenset(
         *SLACK_INFERENCE_ERROR_MESSAGES.values(),
     )
 )
-# Notices with a variable part (a wait, notes) start with these. Every
-# rate-limit, busy and quota reply starts with the hourglass.
-_SLACK_NOTICE_PREFIXES = ("⏳ ", _normalized_text(SLACK_EMPTY_ANSWER_MESSAGE))
+# Notices with a variable part (a wait, a quota, notes): the busy, provider
+# rate-limit and quota templates above, and the empty answer with its notes.
+_SLACK_NOTICE_PATTERN = re.compile(
+    r"(?:⏳ The LLM Router is busy right now\. Please try again in "
+    r"|⏳ The model provider is rate-limiting requests right now\. "
+    r"Please try again in "
+    r"|⏳ You've reached your \w+ quota for now\. Please try again "
+    r"|⏳ (?:The \w+ tier's|A tier's) shared \w+ quota is used up right now\. "
+    r"Please try again "
+    rf"|{re.escape(_normalized_text(SLACK_EMPTY_ANSWER_MESSAGE))})"
+)
 
 
 def _is_slack_notice_text(text: Any) -> bool:
     normalized = _normalized_text(text)
-    return normalized in _SLACK_NOTICE_TEXTS or normalized.startswith(
-        _SLACK_NOTICE_PREFIXES
+    return normalized in _SLACK_NOTICE_TEXTS or bool(
+        _SLACK_NOTICE_PATTERN.match(normalized)
     )
+
+
+_SLACK_LINK_PATTERN = re.compile(r"<((?:https?|mailto):[^<>|]*)(?:\|([^<>]*))?>")
+
+
+def _slack_text_as_posted(text: Any) -> str:
+    """Slack message text back as the bot wrote it, for comparison only.
+
+    Unwraps `<url>` and `<url|label>` links, unescapes `&lt;`, `&gt;` and
+    `&amp;`, and collapses whitespace.
+    """
+    unwrapped = _SLACK_LINK_PATTERN.sub(
+        lambda match: match.group(2) or match.group(1), str(text or "")
+    )
+    unescaped = (
+        unwrapped.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    )
+    return _normalized_text(unescaped)
 
 
 class UserManager:
@@ -3297,8 +3323,10 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
 
         Without a thread transcript, or when the bot cannot recognise its own
         messages (no bot user id), the whole summary. Otherwise only the last
-        answer, and only when the transcript misses it: an answer posted
-        after the follow-up (later parts, queued work) is past `latest`.
+        answer, and only when the transcript misses its start, e.g. an answer
+        posted after the follow-up (queued work) is past `latest`. Only the
+        start is compared, so a split answer whose first part is in the
+        transcript counts as present.
         """
         conversations = self.bot.conversation_manager
         if (
@@ -3312,12 +3340,13 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         last_answer = conversations.get_last_answer(user_id, channel_id, thread_ts)
         if not last_answer:
             return ""
-        # History leads a degraded answer with a "[...]" label Slack lacks.
-        probe = re.sub(r"^\[[^\]]*\]\s*", "", last_answer)
-        probe = protect_untrusted_boundary(probe)[:LAST_ANSWER_PROBE_CHARS]
-        if probe and probe in slack_context.context:
+        # History leads a degraded answer with a "[...]" label Slack lacks,
+        # and Slack returns the text escaped with its links wrapped.
+        probe = _normalized_text(re.sub(r"^\[[^\]]*\]\s*", "", last_answer))
+        probe = probe[:LAST_ANSWER_PROBE_CHARS]
+        if probe and probe in _slack_text_as_posted(slack_context.context):
             return ""
-        return f"assistant: {last_answer}"
+        return protect_untrusted_boundary(f"assistant: {last_answer}")
 
     async def _fetch_query_slack_context(
         self,
@@ -4464,7 +4493,11 @@ class SlackBot:
         ):
             parent_line = candidate_lines.pop(0)
             parent_limit = max(budget // 3, 0)
-            if len(parent_line) > parent_limit:
+            # Only a thread that does not fit cuts its parent.
+            whole_length = len(parent_line) + sum(
+                len(line) + 1 for line in candidate_lines
+            )
+            if whole_length > budget and len(parent_line) > parent_limit:
                 parent_line = parent_line[: max(parent_limit - 3, 0)].rstrip() + "..."
                 parent_truncated = True
             parent_lines.append(parent_line)
