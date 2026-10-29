@@ -10,7 +10,11 @@ from src.llm_router_part3_pipeline import (
     _parse_datetime,
     build_inference_completed_event,
 )
-from src.llm_router_part4_monitor import MetricsCollector
+from src.llm_router_part4_monitor import (
+    AlertManager,
+    MetricsCollector,
+    _parse_event_timestamp,
+)
 from src.utils.schema import (
     ComponentHealth,
     ErrorResponse,
@@ -195,7 +199,7 @@ def test_parse_datetime_falls_back_when_utc_conversion_overflows(taipei_tz, valu
     _assert_true_utc(_parse_datetime(value))
 
 
-def _record_stream_events(collector: MetricsCollector, emitted_at: str) -> None:
+def _record_stream_events(collector: MetricsCollector, emitted_at: object) -> None:
     collector.record_stream_model_metrics(
         {
             "event_type": "analytics.model_metrics_1m",
@@ -263,10 +267,63 @@ def test_monitor_drops_stale_utc_stream_events(taipei_tz):
     }
 
 
-def test_monitor_reads_naive_stream_timestamps_as_host_local(taipei_tz):
+def test_monitor_parses_naive_event_timestamps_as_utc(taipei_tz):
+    expected = datetime(2026, 10, 28, 7, 50, tzinfo=timezone.utc)
+
+    assert _parse_event_timestamp("2026-10-28T07:50:00") == expected
+    assert _parse_event_timestamp(datetime(2026, 10, 28, 7, 50)) == expected
+    assert _parse_event_timestamp("2026-10-28T07:50:00").tzinfo is timezone.utc
+
+
+def test_monitor_counts_naive_current_utc_stream_event_as_fresh(taipei_tz):
+    collector = MetricsCollector({"stream_metrics_staleness_seconds": 300})
+    naive_utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    _record_stream_events(collector, naive_utc_now.isoformat())
+
+    assert collector.get_stream_metrics_summary(hours=1)["request_count"] == 4
+    assert _stream_counts(collector) == {
+        "fresh_requests": 4,
+        "recent_windows": 1,
+        "routing_features": 1,
+        "guardrails": 1,
+        "policy_states": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "value",
+    [datetime.min, "0001-01-01T00:00:00"],
+    ids=["datetime", "string"],
+)
+def test_monitor_parses_near_min_naive_timestamp_without_raising(taipei_tz, value):
     collector = MetricsCollector({"stream_metrics_staleness_seconds": 300})
 
-    _record_stream_events(collector, datetime.now().isoformat())
+    assert _parse_event_timestamp(value) == datetime.min.replace(tzinfo=timezone.utc)
+    _record_stream_events(collector, value)
+    assert _stream_counts(collector)["routing_features"] == 0
 
-    assert _stream_counts(collector)["fresh_requests"] == 4
-    assert _stream_counts(collector)["policy_states"] == 1
+
+def test_monitor_stream_fallback_timestamps_are_utc(taipei_tz):
+    collector = MetricsCollector({"stream_metrics_staleness_seconds": 300})
+    collector.record_stream_model_metrics({"model_name": "gpt-5", "provider": "x"})
+    collector.record_request_routing_features({"request_id": "req-1"})
+    collector.record_routing_guardrail({"scope_type": "model"})
+    collector.record_routing_policy_state({"scope_type": "user"})
+
+    for history in (
+        collector.stream_metrics_history,
+        collector.routing_feature_history,
+        collector.routing_guardrail_history,
+        collector.routing_policy_state_history,
+    ):
+        _assert_true_utc(datetime.fromisoformat(history[-1]["timestamp"]))
+
+
+@pytest.mark.asyncio
+async def test_external_alert_fallback_timestamp_is_utc(taipei_tz):
+    manager = AlertManager({})
+
+    await manager.record_external_alert({"alert_type": "anomaly_detected"})
+
+    _assert_true_utc(datetime.fromisoformat(manager.alert_history[-1]["timestamp"]))

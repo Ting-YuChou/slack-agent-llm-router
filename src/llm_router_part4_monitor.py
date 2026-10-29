@@ -38,10 +38,9 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_event_timestamp(value: Any) -> datetime:
-    """Parse event timestamps emitted by the streaming pipeline as aware UTC.
+    """Parse event timestamps emitted by the streaming pipeline as aware values.
 
-    Naive values are read as host-local time, like the ``datetime.now()``
-    fallbacks recorded alongside them.
+    Naive values are read as UTC, like the rest of the analytics pipeline.
     """
     if isinstance(value, datetime):
         parsed = value
@@ -53,7 +52,9 @@ def _parse_event_timestamp(value: Any) -> datetime:
             parsed = datetime.now(timezone.utc)
     else:
         parsed = datetime.now(timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _stream_model_provider_key(model_name: Any, provider: Any) -> str:
@@ -469,7 +470,9 @@ class AlertManager:
             "description": alert_data.get("description", "External alert"),
             "threshold": alert_data.get("threshold"),
             "current_value": current_value,
-            "timestamp": alert_data.get("emitted_at", datetime.now().isoformat()),
+            "timestamp": alert_data.get(
+                "emitted_at", datetime.now(timezone.utc).isoformat()
+            ),
             "trigger_count": 1,
             "metric_name": metric_name,
             "alert_type": alert_data.get("alert_type"),
@@ -735,7 +738,8 @@ class MetricsCollector:
         """Store a consumed analytics.model_metrics_1m event for dashboard use."""
         event = dict(metric_event)
         event.setdefault(
-            "timestamp", event.get("emitted_at", datetime.now().isoformat())
+            "timestamp",
+            event.get("emitted_at", datetime.now(timezone.utc).isoformat()),
         )
         model_name = str(event.get("model_name", "unknown"))
         provider = str(event.get("provider", "unknown"))
@@ -841,7 +845,8 @@ class MetricsCollector:
         """Store a consumed requests.enriched event for dashboard use."""
         event = dict(routing_event)
         event.setdefault(
-            "timestamp", event.get("emitted_at", datetime.now().isoformat())
+            "timestamp",
+            event.get("emitted_at", datetime.now(timezone.utc).isoformat()),
         )
         self.routing_feature_history.append(event)
         if len(self.routing_feature_history) > self.max_history_size:
@@ -935,7 +940,8 @@ class MetricsCollector:
         """Store a consumed routing.guardrails event for dashboard use."""
         event = dict(guardrail_event)
         event.setdefault(
-            "timestamp", event.get("emitted_at", datetime.now().isoformat())
+            "timestamp",
+            event.get("emitted_at", datetime.now(timezone.utc).isoformat()),
         )
         self.routing_guardrail_history.append(event)
         if len(self.routing_guardrail_history) > self.max_history_size:
@@ -995,7 +1001,8 @@ class MetricsCollector:
         """Store a consumed routing.policy_state event for dashboard use."""
         event = dict(state_event)
         event.setdefault(
-            "timestamp", event.get("emitted_at", datetime.now().isoformat())
+            "timestamp",
+            event.get("emitted_at", datetime.now(timezone.utc).isoformat()),
         )
         self.routing_policy_state_history.append(event)
         if len(self.routing_policy_state_history) > self.max_history_size:
