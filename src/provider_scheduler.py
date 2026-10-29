@@ -1378,9 +1378,11 @@ class ProviderCapacityScheduler:
             return True
         if isinstance(exc, httpx.TransportError):
             return True
-        # A status code is authoritative: digits in the message are not.
+        # An HTTP error status is authoritative: digits in the message are
+        # not. Any other status (Anthropic raises mid-stream SSE errors with
+        # the 200 of the stream) says nothing, so the heuristics below decide.
         status = _exception_status_code(exc)
-        if status is not None:
+        if status is not None and 400 <= status <= 599:
             return status in RETRYABLE_STATUS_CODES
         name = type(exc).__name__.lower()
         transient_names = (

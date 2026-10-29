@@ -1060,6 +1060,63 @@ def test_word_markers_in_status_less_errors_stay_retryable(message):
     assert scheduler._is_retryable_exception(RuntimeError(message)) is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [StatusCodeError, ResponseStatusError])
+async def test_mid_stream_error_on_a_200_response_falls_back_to_markers(error_type):
+    # Anthropic raises SSE "error" events as an APIStatusError built from the
+    # 200 streaming response, so that status says nothing about the fault.
+    clock = Clock()
+    scheduler = _circuit_scheduler(clock)
+    overloaded = error_type("Overloaded", 200)
+
+    assert scheduler._is_retryable_exception(overloaded) is True
+    await scheduler.record_failure(
+        provider="anthropic", model_name="claude-sonnet-4-6", error=overloaded
+    )
+    state = await scheduler._read_circuit_state("anthropic", "claude-sonnet-4-6")
+    assert state["state"] == "open"
+
+    other = error_type("prompt is too long", 200)
+    assert scheduler._is_retryable_exception(other) is False
+
+
+def test_real_anthropic_mid_stream_overloaded_error_is_retryable():
+    anthropic = pytest.importorskip("anthropic", minversion="0.20")
+    import httpx
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                b"event: error\n"
+                b'data: {"type": "error", "error": '
+                b'{"type": "overloaded_error", "message": "Overloaded"}}\n\n'
+            ),
+        )
+
+    client = anthropic.Anthropic(
+        api_key="test-key",
+        base_url="https://api.example.test",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        max_retries=0,
+    )
+    stream = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=16,
+        messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+    )
+    with pytest.raises(anthropic.APIStatusError) as exc:
+        for _event in stream:
+            pass
+    client.close()
+
+    assert exc.value.status_code == 200
+    scheduler = ProviderCapacityScheduler({}, RecordingAdmission())
+    assert scheduler._is_retryable_exception(exc.value) is True
+
+
 def test_real_sdk_errors_are_classified_by_status_code():
     # The CI conftest stubs both SDKs without a __version__, so minversion
     # skips there and this runs only against the real packages.
