@@ -75,9 +75,12 @@ def _parse_datetime(
     return default or datetime.now(timezone.utc)
 
 
-def _escape_clickhouse_literal(value: Any) -> str:
-    """Escape a value for safe interpolation inside a ClickHouse string literal."""
-    return str(value).replace("\\", "\\\\").replace("'", "\\'")
+_UINT32_MAX = 2**32 - 1
+
+
+def _window_hours(hours: Any) -> int:
+    """Coerce a dashboard look-back window to a non-negative UInt32 hour count."""
+    return min(max(int(hours), 0), _UINT32_MAX)
 
 
 def _decode_kafka_key(key: Any) -> str:
@@ -1380,11 +1383,11 @@ class ClickHouseManager:
     ) -> Dict[str, Any]:
         """Get query analytics for dashboard"""
         try:
-            time_window_hours = max(int(hours), 0)
-            where_clauses = [f"timestamp >= now() - INTERVAL {time_window_hours} HOUR"]
+            parameters: Dict[str, Any] = {"hours": _window_hours(hours)}
+            where_clauses = ["timestamp >= now() - INTERVAL {hours:UInt32} HOUR"]
             if user_id:
-                escaped_user_id = _escape_clickhouse_literal(user_id)
-                where_clauses.append(f"user_id = '{escaped_user_id}'")
+                parameters["user_id"] = str(user_id)
+                where_clauses.append("user_id = {user_id:String}")
             where_sql = " AND ".join(where_clauses)
 
             analytics_query = f"""
@@ -1403,7 +1406,9 @@ class ClickHouseManager:
             GROUP BY GROUPING SETS ((), (selected_model), (query_type))
             """
 
-            result = await self._run_blocking(self.client.query, analytics_query)
+            result = await self._run_blocking(
+                self.client.query, analytics_query, parameters=parameters
+            )
             analytics: Dict[str, Any] = {
                 "total_queries": 0,
                 "total_tokens": 0,
@@ -1447,7 +1452,7 @@ class ClickHouseManager:
     ) -> List[Dict[str, Any]]:
         """Get model performance metrics"""
         try:
-            time_window_hours = max(int(hours), 0)
+            time_window_hours = _window_hours(hours)
             query = f"""
             SELECT 
                 model_name,
@@ -1500,7 +1505,7 @@ class ClickHouseManager:
     ) -> List[Dict[str, Any]]:
         """Get recent routing guardrail events persisted through the alert stream."""
         try:
-            time_window_hours = max(int(hours), 0)
+            time_window_hours = _window_hours(hours)
             query = f"""
             SELECT
                 timestamp,
@@ -1560,7 +1565,7 @@ class ClickHouseManager:
     ) -> List[Dict[str, Any]]:
         """Get recent persisted routing.policy_state events for audit and tuning."""
         try:
-            time_window_hours = max(int(hours), 0)
+            time_window_hours = _window_hours(hours)
             query = f"""
             SELECT
                 timestamp,
@@ -2891,7 +2896,7 @@ class KafkaIngestionPipeline:
         self, user_id: Optional[str] = None, hours: int = 24
     ) -> Dict[str, Any]:
         """Read independent dashboard sections with cache and single-flight."""
-        key = (max(int(hours), 0), user_id)
+        key = (_window_hours(hours), user_id)
         now = time.monotonic()
         cached = self._dashboard_cache.get(key)
         if cached is not None:

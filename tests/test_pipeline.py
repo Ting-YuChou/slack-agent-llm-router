@@ -28,11 +28,16 @@ from src.utils.schema import (
 )
 from src.utils.metrics import PIPELINE_METRICS
 
-HOURS_WINDOWED_DASHBOARD_READS = [
-    "get_model_performance",
-    "get_routing_guardrails",
-    "get_routing_policy_state_events",
+DASHBOARD_READS_WITH_EMPTY_RESULT = [
+    ("get_query_analytics", {}),
+    ("get_model_performance", []),
+    ("get_routing_guardrails", []),
+    ("get_routing_policy_state_events", []),
 ]
+HOURS_WINDOWED_DASHBOARD_READS = [
+    method_name for method_name, _ in DASHBOARD_READS_WITH_EMPTY_RESULT
+]
+UINT32_MAX = 2**32 - 1
 
 
 @pytest.fixture
@@ -839,10 +844,12 @@ class TestClickHouseManager:
         assert call.kwargs["parameters"] == {"hours": 0}
         assert "-5" not in call.args[1]
 
-    @pytest.mark.parametrize("method_name", HOURS_WINDOWED_DASHBOARD_READS)
+    @pytest.mark.parametrize(
+        "method_name, empty_result", DASHBOARD_READS_WITH_EMPTY_RESULT
+    )
     @pytest.mark.asyncio
     async def test_dashboard_reads_reject_non_integer_hours_before_sql(
-        self, pipeline_config, method_name
+        self, pipeline_config, method_name, empty_result
     ):
         manager = ClickHouseManager(pipeline_config["clickhouse"])
         manager.client = MagicMock()
@@ -851,9 +858,44 @@ class TestClickHouseManager:
 
         with pytest.raises(ValueError):
             await method(hours="1; DROP TABLE x", raise_errors=True)
-        assert await method(hours="1; DROP TABLE x") == []
+        assert await method(hours="1; DROP TABLE x") == empty_result
 
         manager._run_blocking.assert_not_awaited()
+
+    @pytest.mark.parametrize("method_name", HOURS_WINDOWED_DASHBOARD_READS)
+    @pytest.mark.asyncio
+    async def test_dashboard_reads_cap_hours_at_uint32_max(
+        self, pipeline_config, method_name
+    ):
+        manager = ClickHouseManager(pipeline_config["clickhouse"])
+        manager.client = MagicMock()
+        manager._run_blocking = AsyncMock(return_value=SimpleNamespace(result_rows=[]))
+
+        await getattr(manager, method_name)(hours=2**40, raise_errors=True)
+        assert manager._run_blocking.await_args.kwargs["parameters"] == {
+            "hours": UINT32_MAX
+        }
+
+        await getattr(manager, method_name)(hours=UINT32_MAX, raise_errors=True)
+        assert manager._run_blocking.await_args.kwargs["parameters"] == {
+            "hours": UINT32_MAX
+        }
+
+    @pytest.mark.asyncio
+    async def test_get_query_analytics_binds_user_id_as_query_parameter(
+        self, pipeline_config
+    ):
+        manager = ClickHouseManager(pipeline_config["clickhouse"])
+        manager.client = MagicMock()
+        manager._run_blocking = AsyncMock(return_value=SimpleNamespace(result_rows=[]))
+        user_id = "o'brien' OR 1=1 --"
+
+        await manager.get_query_analytics(user_id=user_id, hours=6, raise_errors=True)
+
+        call = manager._run_blocking.await_args
+        assert "user_id = {user_id:String}" in call.args[1]
+        assert "brien" not in call.args[1]
+        assert call.kwargs["parameters"] == {"hours": 6, "user_id": user_id}
 
     @pytest.mark.asyncio
     async def test_get_model_performance_groups_by_provider(self, pipeline_config):
@@ -1622,6 +1664,32 @@ class TestKafkaIngestionPipeline:
         await pipeline.get_dashboard_bundle(hours=1)
 
         assert peak == 2
+
+    @pytest.mark.parametrize(
+        "hours, window_hours",
+        [(2**40, UINT32_MAX), (-3, 0), (6, 6)],
+        ids=["above-uint32", "negative", "in-range"],
+    )
+    @pytest.mark.asyncio
+    async def test_dashboard_bundle_keys_and_reads_use_the_clamped_window(
+        self, pipeline_config, hours, window_hours
+    ):
+        pipeline = KafkaIngestionPipeline(pipeline_config)
+        pipeline.get_query_analytics = AsyncMock(return_value={})
+        pipeline.get_model_performance = AsyncMock(return_value=[])
+        pipeline.get_routing_guardrails = AsyncMock(return_value=[])
+        pipeline.get_routing_policy_state_events = AsyncMock(return_value=[])
+
+        await pipeline.get_dashboard_bundle(user_id="user-1", hours=hours)
+
+        assert list(pipeline._dashboard_cache) == [(window_hours, "user-1")]
+        for method in (
+            pipeline.get_query_analytics,
+            pipeline.get_model_performance,
+            pipeline.get_routing_guardrails,
+            pipeline.get_routing_policy_state_events,
+        ):
+            assert method.await_args.kwargs["hours"] == window_hours
 
     @pytest.mark.asyncio
     async def test_health_status_reflects_component_state(self, pipeline_config):
