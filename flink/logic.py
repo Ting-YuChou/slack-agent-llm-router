@@ -112,7 +112,7 @@ def _merged_config(
 
 def _isoformat(timestamp: datetime | None = None) -> str:
     """Serialize timestamps consistently for event payloads."""
-    return (timestamp or datetime.now()).isoformat()
+    return (timestamp or datetime.now(timezone.utc)).isoformat()
 
 
 def _parse_datetime(value: Any) -> datetime | None:

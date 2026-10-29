@@ -62,9 +62,13 @@ def _parse_datetime(
 
     if isinstance(value, str) and value:
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             logger.debug(f"Failed to parse datetime value: {value}")
+        else:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
 
     return default or datetime.now(timezone.utc)
 

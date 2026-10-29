@@ -38,7 +38,11 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_event_timestamp(value: Any) -> datetime:
-    """Parse event timestamps emitted by the streaming pipeline."""
+    """Parse event timestamps emitted by the streaming pipeline as aware UTC.
+
+    Naive values are read as host-local time, like the ``datetime.now()``
+    fallbacks recorded alongside them.
+    """
     if isinstance(value, datetime):
         parsed = value
     elif isinstance(value, str) and value:
@@ -46,12 +50,10 @@ def _parse_event_timestamp(value: Any) -> datetime:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             logger.debug(f"Failed to parse event timestamp: {value}")
-            parsed = datetime.now()
+            parsed = datetime.now(timezone.utc)
     else:
-        parsed = datetime.now()
-    if parsed.tzinfo is not None:
-        return parsed.astimezone(timezone.utc).replace(tzinfo=None)
-    return parsed
+        parsed = datetime.now(timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _stream_model_provider_key(model_name: Any, provider: Any) -> str:
@@ -747,7 +749,7 @@ class MetricsCollector:
 
     def _recent_stream_metrics(self, hours: int = 1) -> List[Dict[str, Any]]:
         """Return stream metrics still within the configured freshness window."""
-        cutoff = datetime.now() - timedelta(hours=hours)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
 
         return [
             metric
@@ -757,7 +759,7 @@ class MetricsCollector:
 
     def _fresh_stream_metrics(self) -> List[Dict[str, Any]]:
         """Return the latest non-stale stream window for each model."""
-        cutoff = datetime.now() - timedelta(
+        cutoff = datetime.now(timezone.utc) - timedelta(
             seconds=self.stream_metrics_staleness_seconds
         )
         return [
@@ -846,7 +848,7 @@ class MetricsCollector:
             self.routing_feature_history.pop(0)
 
     def _recent_request_routing_features(self, hours: int = 1) -> List[Dict[str, Any]]:
-        cutoff = datetime.now() - timedelta(hours=hours)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
         return [
             event
             for event in self.routing_feature_history
@@ -940,7 +942,7 @@ class MetricsCollector:
             self.routing_guardrail_history.pop(0)
 
     def _recent_routing_guardrails(self, hours: int = 1) -> List[Dict[str, Any]]:
-        cutoff = datetime.now() - timedelta(hours=hours)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
         return [
             event
             for event in self.routing_guardrail_history
@@ -1000,7 +1002,7 @@ class MetricsCollector:
             self.routing_policy_state_history.pop(0)
 
     def _recent_routing_policy_states(self, hours: int = 1) -> List[Dict[str, Any]]:
-        cutoff = datetime.now() - timedelta(hours=hours)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
         return [
             event
             for event in self.routing_policy_state_history
