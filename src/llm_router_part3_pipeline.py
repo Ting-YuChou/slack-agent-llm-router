@@ -5,6 +5,7 @@ Handles real-time data ingestion, processing, and storage to ClickHouse
 
 import asyncio
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -178,6 +179,28 @@ def _private_free_payload(value: Any) -> Any:
         for key in _PRIVATE_ROW_FIELDS:
             value.pop(key, None)
     return redact(value)
+
+
+def _dead_letter_payload(value: Any, error: BaseException) -> Any:
+    """Return a private-free DLQ copy of a source message value.
+
+    A value that is not JSON (truncated or corrupt) cannot be filtered field
+    by field and may hold user text, so it is replaced by its length, a hash
+    prefix and the failure reason.
+    """
+    payload = _json_safe_payload(value)
+    if isinstance(payload, (dict, list)) or payload is None:
+        return _private_free_payload(payload)
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+    else:
+        raw = str(value).encode("utf-8", errors="replace")
+    return {
+        "unparseable": True,
+        "length": len(raw),
+        "sha256_prefix": hashlib.sha256(raw).hexdigest()[:16],
+        "reason": type(error).__name__,
+    }
 
 
 def _alert_payload(data: Dict[str, Any]) -> Any:
@@ -2430,9 +2453,7 @@ class KafkaConsumerManager:
             "failure_stage": stage,
             "error_type": type(error).__name__,
             "error_message": redact_text(str(error))[:2000],
-            "payload": _private_free_payload(
-                _json_safe_payload(getattr(message, "value", None))
-            ),
+            "payload": _dead_letter_payload(getattr(message, "value", None), error),
         }
         topic = self._dead_letter_topic(topic_key, message)
         key = metadata["event_id"] or str(uuid.uuid4())
@@ -2466,7 +2487,20 @@ class KafkaConsumerManager:
         if batched:
             # Only this topic's earlier rows must be durable before committing
             # past the poison message; other topics' failures are not ours.
-            await self.flush_topic(topic_key)
+            try:
+                await self.flush_topic(topic_key)
+            except Exception as flush_error:
+                if _classify_insert_error(flush_error) != "schema":
+                    raise
+                # The topic is backing off on schema drift. Raising would
+                # restart the consumer and re-read the buffered rows, so DLQ
+                # the poison message now and commit its offset only together
+                # with those rows, after they are written.
+                if await self._publish_dead_letter(
+                    topic_key, message, error, stage=stage
+                ):
+                    self._track_commit_offset(topic_key, message)
+                return
 
         if await self._publish_dead_letter(topic_key, message, error, stage=stage):
             await self._commit_processed_message(topic_key, message)
@@ -3110,9 +3144,8 @@ class KafkaConsumerManager:
                 stop_error,
                 _classify_insert_error(stop_error),
             )
-        if len(bad) == len(rows) and len(rows) > 1:
-            # No row can be written: that is the table, not the data.
-            return list(rows), error, "schema"
+        # Only a schema-class error (classified before bisecting) keeps a
+        # batch; rows rejected one by one are poison even if all of them are.
         for index, (row, row_error) in enumerate(bad):
             try:
                 dead_lettered = await self._dead_letter_row(topic_key, row, row_error)
@@ -3122,6 +3155,10 @@ class KafkaConsumerManager:
             if not dead_lettered:
                 # Stop at once: keep this and every later bad row for a retry.
                 return [row for row, _ in bad[index:]], row_error, "dlq_failed"
+        if bad:
+            PIPELINE_METRICS.clickhouse_flush_failures.labels(
+                topic=topic_key, kind="row"
+            ).inc()
         return [], None, "row"
 
     async def _dead_letter_row(

@@ -105,24 +105,6 @@ async def test_schema_errors_keep_the_batch_instead_of_dead_lettering(error):
 
 
 @pytest.mark.asyncio
-async def test_every_row_rejected_is_treated_as_schema_drift():
-    consumer = _consumer()
-    error = DatabaseError("Code: 53. DB::Exception: Type mismatch (TYPE_MISMATCH)")
-    consumer.clickhouse.batch_insert_query_logs = AsyncMock(side_effect=error)
-    rows = [_row(0), _row(1), _row(2)]
-    _buffer(consumer, rows)
-    before = _failures("schema")._value.get()
-
-    with pytest.raises(DatabaseError):
-        await consumer.flush_pending_batches()
-
-    consumer.dlq_producer.send_and_wait.assert_not_awaited()
-    consumer.consumers["queries"].commit.assert_not_awaited()
-    assert consumer.batch_processors["queries"] == rows
-    assert _failures("schema")._value.get() == before + 1
-
-
-@pytest.mark.asyncio
 async def test_dlq_failure_stops_at_once_and_keeps_the_bad_rows():
     dlq = AsyncMock()
     dlq.send_and_wait = AsyncMock(side_effect=RuntimeError("dlq down"))
