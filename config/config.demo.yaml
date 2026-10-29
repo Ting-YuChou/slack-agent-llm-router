@@ -33,6 +33,8 @@ router:
         - free
         - premium
         - enterprise
+      reasoning_effort: minimal
+      reasoning_effort_high: high
       capabilities:
         - general
         - reasoning

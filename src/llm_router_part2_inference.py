@@ -1078,6 +1078,42 @@ def _provider_http_timeout(read_seconds: float) -> httpx.Timeout:
     return httpx.Timeout(connect=3.0, read=read_seconds, write=10.0, pool=2.0)
 
 
+# Query types that get a model's high reasoning effort on their own. The other
+# types the router's features count as high reasoning (analysis, planning,
+# code_analysis) get it through requires_high_reasoning, set by the policy.
+_HIGH_EFFORT_QUERY_TYPES = frozenset({"reasoning", "math"})
+
+
+def remember_routing_features(request: QueryRequest, routing_decision: Any) -> None:
+    """Keep the routing decision's features and query type on the request.
+
+    Decisions without features (test doubles, older callers) leave the
+    features unset, so providers use their default settings.
+    """
+    query_type = getattr(routing_decision, "query_type", None)
+    query_type = getattr(query_type, "value", query_type)
+    request._routing_features = getattr(routing_decision, "features", None)
+    request._routing_query_type = (
+        str(query_type).lower() if isinstance(query_type, str) else None
+    )
+
+
+def _routed_as_complex_reasoning(request: QueryRequest) -> bool:
+    """Whether the router read the request as needing deep reasoning.
+
+    Matches the router's own test for reasoning-heavy candidates: the
+    requires_high_reasoning feature or a complex query, plus the reasoning and
+    math query types.
+    """
+    features = getattr(request, "_routing_features", None)
+    if features is not None and (
+        bool(getattr(features, "requires_high_reasoning", False))
+        or getattr(features, "query_complexity", None) == "complex"
+    ):
+        return True
+    return getattr(request, "_routing_query_type", None) in _HIGH_EFFORT_QUERY_TYPES
+
+
 class BaseInferenceProvider(ABC):
     """Abstract base class for inference providers"""
 
@@ -1273,6 +1309,18 @@ class BaseInferenceProvider(ABC):
 class OpenAIProvider(BaseInferenceProvider):
     """OpenAI API provider implementation"""
 
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        model_configs: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(config)
+        # The router's model configs, read for per-model reasoning effort and
+        # temperature support. A model missing here keeps the name rules.
+        self.model_configs: Dict[str, Any] = (
+            model_configs if isinstance(model_configs, dict) else {}
+        )
+
     async def initialize(self):
         """Initialize OpenAI client"""
         api_key = self.config.get("api_key")
@@ -1322,6 +1370,7 @@ class OpenAIProvider(BaseInferenceProvider):
                 total_tokens=total_tokens,
                 provider_cached_input_tokens=cached_tokens,
                 reasoning_tokens=reasoning_tokens,
+                reasoning_effort=(request_kwargs.get("reasoning") or {}).get("effort"),
                 latency_ms=int((time.time() - start_time) * 1000),
                 tokens_per_second=(output_tokens / max(time.time() - start_time, 1e-6)),
                 cost_usd=self._calculate_cost(usage, model_name),
@@ -1390,8 +1439,9 @@ class OpenAIProvider(BaseInferenceProvider):
             "instructions": None,
             "max_output_tokens": request.max_tokens,
         }
-        if self._supports_reasoning_effort(model_name):
-            request_kwargs["reasoning"] = {"effort": "minimal"}
+        reasoning_effort = self._reasoning_effort(request, model_name)
+        if reasoning_effort:
+            request_kwargs["reasoning"] = {"effort": reasoning_effort}
         if self._supports_temperature(model_name):
             request_kwargs["temperature"] = request.temperature
 
@@ -1408,11 +1458,37 @@ class OpenAIProvider(BaseInferenceProvider):
 
     def _supports_temperature(self, model_name: str) -> bool:
         """Some reasoning models only support their default sampling settings."""
+        configured = getattr(
+            self.model_configs.get(model_name), "supports_temperature", None
+        )
+        if configured is not None:
+            return bool(configured)
         return not model_name.startswith("gpt-5")
 
     def _supports_reasoning_effort(self, model_name: str) -> bool:
-        """Keep GPT-5 short-answer requests from spending the full budget reasoning."""
+        """Whether the name rule gives the model a reasoning effort (gpt-5*)."""
         return model_name.startswith("gpt-5")
+
+    def _reasoning_effort(
+        self, request: QueryRequest, model_name: str
+    ) -> Optional[str]:
+        """The reasoning effort for this request on this model, or None.
+
+        Queries routed as complex reasoning use the model's high effort, the
+        rest its default. GPT-5 defaults to minimal so short answers do not
+        spend the budget reasoning; config overrides either level per model.
+        """
+        model_config = self.model_configs.get(model_name)
+        name_rule = self._supports_reasoning_effort(model_name)
+        default_effort = getattr(model_config, "reasoning_effort", None) or (
+            "minimal" if name_rule else None
+        )
+        if not _routed_as_complex_reasoning(request):
+            return default_effort
+        high_effort = getattr(model_config, "reasoning_effort_high", None) or (
+            "high" if name_rule else None
+        )
+        return high_effort or default_effort
 
     def _build_prompt_cache_key(self, request: QueryRequest) -> Optional[str]:
         """Build a stable, non-PII key that helps OpenAI route similar prompts."""
@@ -2565,7 +2641,9 @@ class InferenceEngine:
             and openai_config.get("enabled", True)
             and self._router_uses_provider("openai")
         ):
-            self.providers["openai"] = OpenAIProvider(openai_config)
+            self.providers["openai"] = OpenAIProvider(
+                openai_config, model_configs=getattr(self.router, "models", None)
+            )
             await self.providers["openai"].initialize()
 
         anthropic_config = dict(self.config.get("anthropic", {}) or {})
@@ -2690,6 +2768,7 @@ class InferenceEngine:
         try:
             # Step 1: Route query to appropriate model
             routing_decision = await self.router.route_query(request)
+            remember_routing_features(request, routing_decision)
             model_name = routing_decision.selected_model
 
             # Step 2: Context compression before cache lookup keeps keys stable.

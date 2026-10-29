@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Annotated, Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional
 import uuid
 
 from pydantic import (
@@ -16,6 +16,10 @@ from pydantic import (
 def utc_now() -> datetime:
     """Return the current time as a timezone-aware UTC datetime."""
     return datetime.now(timezone.utc)
+
+
+# Reasoning effort levels the OpenAI Responses API accepts.
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
 
 
 class UserTier(str, Enum):
@@ -121,6 +125,10 @@ BoundedName = Annotated[str, Field(max_length=256)]
 
 class QueryRequest(BaseModel):
     _rag_images: List[Any] = PrivateAttr(default_factory=list)
+    # Set after routing: the decision's features and query type, so providers
+    # can match per-query settings (reasoning effort) to how it was routed.
+    _routing_features: Optional[Any] = PrivateAttr(default=None)
+    _routing_query_type: Optional[str] = PrivateAttr(default=None)
 
     # Required fields
     query: str = Field(..., min_length=1, max_length=50000)
@@ -193,6 +201,8 @@ class InferenceResponse(BaseModel):
     provider_cache_creation_input_tokens: int = Field(default=0, ge=0)
     provider_cache_read_input_tokens: int = Field(default=0, ge=0)
     reasoning_tokens: int = Field(default=0, ge=0)
+    # Reasoning effort sent to the provider; None when it took no such setting.
+    reasoning_effort: Optional[str] = None
     # Failure bucket for analytics: provider_error, timeout, rate_limited,
     # user_or_policy or internal. None on success.
     error_type: Optional[str] = None
@@ -366,6 +376,15 @@ class ModelConfig(BaseModel):
     # Entitlement: the tiers that may use this model. None keeps the old rule,
     # which derived access from priority (see entitled_tiers).
     allowed_tiers: Optional[List[UserTier]] = None
+
+    # Reasoning effort sent to the provider: reasoning_effort for most
+    # queries, reasoning_effort_high for queries routed as complex reasoning.
+    # None keeps the name rule (gpt-5* uses minimal and high, others send none).
+    reasoning_effort: Optional[ReasoningEffort] = None
+    reasoning_effort_high: Optional[ReasoningEffort] = None
+    # Whether the provider accepts a temperature. None keeps the name rule
+    # (gpt-5* reasoning models only use their default sampling).
+    supports_temperature: Optional[bool] = None
 
     def entitled_tiers(self) -> List[UserTier]:
         """Tiers that may use this model.
