@@ -5808,9 +5808,17 @@ class SlackBot:
         self.active_threads[self._thread_key(channel_id, thread_ts)] = datetime.now()
 
     def _is_active_thread(
-        self, channel_id: Optional[str], thread_ts: Optional[str]
+        self,
+        channel_id: Optional[str],
+        thread_ts: Optional[str],
+        *,
+        refresh: bool = True,
     ) -> bool:
-        """Return whether a Slack thread is still active."""
+        """Return whether a Slack thread is still active.
+
+        By default this also extends a live thread and forgets an expired one;
+        refresh=False only looks.
+        """
         if not channel_id or not thread_ts:
             return False
 
@@ -5820,10 +5828,12 @@ class SlackBot:
             return False
 
         if datetime.now() - last_activity > self.active_thread_timeout:
-            self.active_threads.pop(key, None)
+            if refresh:
+                self.active_threads.pop(key, None)
             return False
 
-        self.active_threads[key] = datetime.now()
+        if refresh:
+            self.active_threads[key] = datetime.now()
         return True
 
     def _cleanup_expired_threads(self, return_keys: bool = False):
@@ -6057,22 +6067,11 @@ class SlackBot:
             or (self.bot_user_id and event.get("user") == self.bot_user_id)
         )
 
-    def _is_tracked_thread(
-        self, channel_id: Optional[str], thread_ts: Optional[str]
-    ) -> bool:
-        """Whether the bot follows a thread, without refreshing or expiring it."""
-        if not channel_id or not thread_ts:
-            return False
-        if self._is_agent_thread(channel_id, thread_ts):
-            return True
-        last_activity = self.active_threads.get(self._thread_key(channel_id, thread_ts))
-        return (
-            last_activity is not None
-            and datetime.now() - last_activity <= self.active_thread_timeout
-        )
-
     def _wants_busy_reply(self, item: SlackWorkItem) -> bool:
-        """Whether someone is waiting on the bot: a slash command, mention or thread."""
+        """Whether someone is waiting on the bot: a slash command, mention or thread.
+
+        Read-only: a busy reply neither extends nor expires a thread.
+        """
         if item.kind == "slash":
             return True
         if item.kind != "event":
@@ -6080,8 +6079,12 @@ class SlackBot:
         event_type = item.payload.get("type")
         if event_type == "app_mention":
             return True
-        return event_type == "message" and self._is_tracked_thread(
-            item.payload.get("channel"), item.payload.get("thread_ts")
+        if event_type != "message":
+            return False
+        channel_id = item.payload.get("channel")
+        thread_ts = item.payload.get("thread_ts")
+        return self._is_agent_thread(channel_id, thread_ts) or self._is_active_thread(
+            channel_id, thread_ts, refresh=False
         )
 
     async def _enqueue_work(self, item: SlackWorkItem) -> bool:
