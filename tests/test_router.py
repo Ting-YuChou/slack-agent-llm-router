@@ -5,6 +5,7 @@ import pytest
 
 from src.llm_router_part1_router import (
     ModelRouter,
+    PromptTooLargeError,
     QueryClassifier,
     RoutingRule,
     TokenCounter,
@@ -496,16 +497,14 @@ class TestModelRouter:
 
     def test_fallback_when_no_model_matches(self, router_config):
         router = ModelRouter(router_config)
-        selection = router._capability_based_routing(
-            {
-                "query_type": "translation",
-                "token_count": 999999,
-                "user_tier": "free",
-            }
-        )
-
-        assert selection.model_name == "gpt-5"
-        assert "default" in selection.reason.lower()
+        with pytest.raises(PromptTooLargeError):
+            router._capability_based_routing(
+                {
+                    "query_type": "translation",
+                    "token_count": 999999,
+                    "user_tier": "free",
+                }
+            )
 
     @pytest.mark.asyncio
     async def test_route_query_ignores_policy_fast_lane_without_explicit_sla(

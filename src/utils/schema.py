@@ -282,6 +282,15 @@ class RagBatchRequest(BaseModel):
     documents: List[RagBatchDocument] = Field(..., min_length=1, max_length=1000)
 
 
+class RoutingDecisionFeatures(BaseModel):
+    """How the router read the request, for checks made after routing."""
+
+    query_complexity: Optional[str] = None  # simple, moderate or complex
+    requires_high_reasoning: bool = False
+    long_context: bool = False
+    classification_confidence: float = Field(0.0, ge=0.0, le=1.0)
+
+
 class RoutingDecision(BaseModel):
     # Core routing decision
     selected_model: str = Field(..., min_length=1)
@@ -305,6 +314,7 @@ class RoutingDecision(BaseModel):
     actual_fast_lane_hit: bool = False
     policy_source: str = "none"
     hint_reason: Optional[str] = None
+    features: RoutingDecisionFeatures = Field(default_factory=RoutingDecisionFeatures)
 
 
 class ModelSelection(BaseModel):
@@ -332,6 +342,29 @@ class ModelConfig(BaseModel):
 
     # Authentication
     api_key_env: Optional[str] = None
+
+    # Entitlement: the tiers that may use this model. None keeps the old rule,
+    # which derived access from priority (see entitled_tiers).
+    allowed_tiers: Optional[List[UserTier]] = None
+
+    def entitled_tiers(self) -> List[UserTier]:
+        """Tiers that may use this model.
+
+        Without allowed_tiers, free may use priority >= 3, premium >= 2 and
+        enterprise any priority, as before allowed_tiers existed.
+        """
+        if self.allowed_tiers is not None:
+            return list(dict.fromkeys(self.allowed_tiers))
+        minimum_priority = {
+            UserTier.FREE: 3,
+            UserTier.PREMIUM: 2,
+            UserTier.ENTERPRISE: 1,
+        }
+        return [
+            tier
+            for tier, minimum in minimum_priority.items()
+            if self.priority >= minimum
+        ]
 
     @field_validator("capabilities")
     @classmethod
@@ -533,6 +566,24 @@ class RouterConfig(ConfigModel):
             else:
                 normalized[model_name] = model_config
         return normalized
+
+    @model_validator(mode="after")
+    def require_a_model_for_every_tier(self) -> "RouterConfig":
+        # The router rejects requests from a tier with no model instead of
+        # upgrading them, so a config that leaves a tier out is a mistake.
+        if not self.models:
+            return self
+        missing = [
+            tier.value
+            for tier in UserTier
+            if not any(tier in model.entitled_tiers() for model in self.models.values())
+        ]
+        if missing:
+            raise ValueError(
+                f"router.models: no model is open to tier(s) {', '.join(missing)}; "
+                "set allowed_tiers so every tier has at least one model"
+            )
+        return self
 
 
 class ProviderPoolEndpointConfig(ConfigModel):

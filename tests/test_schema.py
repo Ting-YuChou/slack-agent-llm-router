@@ -19,9 +19,11 @@ from src.utils.schema import (
     RagConfig,
     RagPolicy,
     ResponseSource,
+    RouterConfig,
     SystemMetric,
     ToolCall,
     ToolPolicy,
+    UserTier,
 )
 
 
@@ -173,6 +175,76 @@ def test_model_config_accepts_vision_capability():
     )
 
     assert "vision" in model.capabilities
+
+
+def _model_payload(**overrides):
+    payload = {
+        "provider": "openai",
+        "max_tokens": 1000,
+        "cost_per_token": 0.0,
+        "priority": 2,
+        "capabilities": ["general"],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_model_config_allowed_tiers_default_to_the_priority_rule():
+    def entitled(priority):
+        return ModelConfig(name="m", **_model_payload(priority=priority))
+
+    assert entitled(1).allowed_tiers is None
+    assert entitled(1).entitled_tiers() == [UserTier.ENTERPRISE]
+    assert entitled(2).entitled_tiers() == [UserTier.PREMIUM, UserTier.ENTERPRISE]
+    assert entitled(3).entitled_tiers() == [
+        UserTier.FREE,
+        UserTier.PREMIUM,
+        UserTier.ENTERPRISE,
+    ]
+
+
+def test_model_config_allowed_tiers_replace_the_priority_rule():
+    model = ModelConfig(
+        name="m", **_model_payload(priority=1, allowed_tiers=["free", "enterprise"])
+    )
+
+    assert model.allowed_tiers == [UserTier.FREE, UserTier.ENTERPRISE]
+    assert model.entitled_tiers() == [UserTier.FREE, UserTier.ENTERPRISE]
+
+
+def test_model_config_rejects_unknown_tier():
+    with pytest.raises(ValidationError):
+        ModelConfig(name="m", **_model_payload(allowed_tiers=["gold"]))
+
+
+def test_router_config_rejects_a_tier_without_any_model():
+    with pytest.raises(ValidationError, match="free"):
+        RouterConfig(models={"gpt-5": _model_payload(priority=2)})
+
+    with pytest.raises(ValidationError, match="free, premium"):
+        PlatformConfig.model_validate(
+            {
+                "router": {
+                    "models": {
+                        "gpt-5": _model_payload(
+                            priority=3, allowed_tiers=["enterprise"]
+                        )
+                    }
+                }
+            }
+        )
+
+
+def test_router_config_accepts_every_tier_covered():
+    config = RouterConfig(
+        models={
+            "gpt-5": _model_payload(priority=1, allowed_tiers=["free", "premium"]),
+            "claude": _model_payload(priority=1),
+        }
+    )
+
+    assert config.models["gpt-5"].allowed_tiers == [UserTier.FREE, UserTier.PREMIUM]
+    assert PlatformConfig().router.models == {}
 
 
 def test_rag_config_rejects_enabled_legacy_visual_embedding():

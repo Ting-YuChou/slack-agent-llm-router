@@ -9,7 +9,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, NoReturn, Optional, Tuple
 
 from src.routing_features import build_routing_features
 from src.utils.metrics import ROUTER_METRICS
@@ -19,6 +19,7 @@ from src.utils.schema import (
     QueryRequest,
     QueryType,
     RoutingDecision,
+    RoutingDecisionFeatures,
     ToolPolicy,
     UserTier,
 )
@@ -35,6 +36,70 @@ CLASSIFIER_TAIL_CHARS = 2000
 # crosses dots in "utils.py" or "3.12"), but it spans at most 80 chars, so the
 # classifier patterns cannot backtrack catastrophically on long input.
 _GAP = r"[^\n]{0,80}"
+
+
+# Routing rejections. The router raises these instead of upgrading a user to a
+# model their tier may not use; callers map them to HTTP by these attributes.
+class ModelNotEntitledError(ValueError):
+    """No model the user's tier may use can serve the request."""
+
+    error_code = "model_not_entitled"
+    http_status = 403
+    error_type = "user_or_policy"
+
+    def __init__(self, message: str, *, user_tier: str):
+        super().__init__(message)
+        self.user_tier = user_tier
+
+
+class PromptTooLargeError(ValueError):
+    """The prompt exceeds the context window of every model the tier may use."""
+
+    error_code = "prompt_too_large"
+    http_status = 413
+    error_type = "user_or_policy"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        user_tier: str,
+        token_count: int,
+        max_context_tokens: int,
+    ):
+        super().__init__(message)
+        self.user_tier = user_tier
+        self.token_count = token_count
+        self.max_context_tokens = max_context_tokens
+
+
+# Context keys holding routing guardrails: health signals from the policy cache
+# (and avoid hints from request metadata), never entitlements.
+GUARDRAIL_CONTEXT_KEYS = (
+    "avoid_models",
+    "blocked_models",
+    "avoid_providers",
+    "blocked_providers",
+)
+GUARDRAIL_BYPASS_NOTE = (
+    "routing guardrails bypassed (fail-open): they exclude every model "
+    "available to the tier"
+)
+
+
+class EligibleModels(NamedTuple):
+    """The models a request may use, as _eligible_models found them."""
+
+    models: List[str]
+    capability_match: bool
+    guardrails_bypassed: bool
+    # The context to score them with: guardrail lists are cleared when bypassed.
+    context: Dict[str, Any]
+
+    def reason(self, reason: str) -> str:
+        if self.guardrails_bypassed:
+            return f"{reason}; {GUARDRAIL_BYPASS_NOTE}"
+        return reason
 
 
 @dataclass
@@ -511,6 +576,20 @@ class ModelRouter:
             except Exception as e:
                 logger.error(f"Failed to load model {model_name}: {e}")
 
+        # Config validation requires a model per tier, but credential gating or
+        # a bad model entry can still leave a tier without one.
+        uncovered_tiers = [
+            tier.value
+            for tier in UserTier
+            if not any(tier in model.entitled_tiers() for model in self.models.values())
+        ]
+        if uncovered_tiers:
+            logger.warning(
+                "No loaded model is open to tier(s) %s; their requests will be "
+                "rejected as model_not_entitled",
+                ", ".join(uncovered_tiers),
+            )
+
     def _load_routing_rules(self):
         """Load routing rules from configuration"""
         rules_config = self.config.get("routing_rules", [])
@@ -561,6 +640,9 @@ class ModelRouter:
                 ),
                 policy_source=str(query_context.get("policy_source", "none") or "none"),
                 hint_reason=query_context.get("hint_reason"),
+                routing_strategy=self.routing_strategy,
+                user_tier=self._entitlement_tier(request.user_tier),
+                features=self._decision_features(query_context),
             )
 
             # Update metrics
@@ -572,18 +654,123 @@ class ModelRouter:
 
             return decision
 
+        except (ModelNotEntitledError, PromptTooLargeError):
+            raise
         except Exception:
             logger.exception("Routing failed")
-            # Fallback to default model
-            return RoutingDecision(
-                selected_model=self.default_model,
-                query_type=QueryType.GENERAL,
-                token_count=0,
-                estimated_cost=0.0,
-                routing_reason="Fallback due to routing error",
-                routing_time_ms=int((time.time() - start_time) * 1000),
-                confidence=0.0,
+            return await self._routing_error_decision(request, start_time)
+
+    async def _routing_error_decision(
+        self, request: QueryRequest, start_time: float
+    ) -> RoutingDecision:
+        """Route as _fallback_routing does, without classification, after an error.
+
+        The query counts as general. Policy guardrails apply when the policy
+        context can still be fetched, with the usual fail-open; tier and
+        context-window checks always apply. The token count stays an estimate
+        so the inference fallback limits keep working.
+        """
+        token_count = self._fallback_token_estimate(request)
+        policy_context = await self._routing_error_policy_context(request)
+        routing_features = self._routing_error_features(request, token_count)
+        context: Dict[str, Any] = {
+            "query_type": QueryType.GENERAL.value,
+            "token_count": token_count,
+            "user_tier": self._normalize_user_tier(request.user_tier),
+            "max_tokens": request.max_tokens,
+            "has_attachments": bool(request.attachments),
+        }
+        for key in (*GUARDRAIL_CONTEXT_KEYS, "warn_models", "warn_providers"):
+            context[key] = list(policy_context.get(key) or [])
+
+        routing_reason = "Fallback due to routing error"
+        try:
+            selected_model, eligible = self._default_or_best_model(context)
+            if eligible is not None:
+                routing_reason = eligible.reason(routing_reason)
+        except (ModelNotEntitledError, PromptTooLargeError):
+            raise
+        except Exception:
+            # Scoring may be what failed. The last resort only filters by tier
+            # and context window, with every guardrail and warn list cleared,
+            # so no second error can escape.
+            logger.exception("Model selection failed after a routing error")
+            last_resort_context = {
+                **self._without_guardrails(context),
+                "warn_models": [],
+                "warn_providers": [],
+            }
+            selected_model = self._eligible_models(last_resort_context).models[0]
+            routing_reason = (
+                f"{routing_reason} (model selection failed; guardrails ignored)"
             )
+
+        return RoutingDecision(
+            selected_model=selected_model,
+            query_type=QueryType.GENERAL,
+            token_count=token_count,
+            estimated_cost=0.0,
+            routing_reason=routing_reason,
+            routing_time_ms=int((time.time() - start_time) * 1000),
+            confidence=0.0,
+            policy_source=self._combine_policy_sources(
+                policy_context.get("policy_source", "none"), routing_features
+            ),
+            hint_reason=policy_context.get("hint_reason"),
+            routing_strategy=self.routing_strategy,
+            user_tier=self._entitlement_tier(request.user_tier),
+            features=self._decision_features(
+                {**routing_features, "classification_confidence": 0.0}
+            ),
+        )
+
+    async def _routing_error_policy_context(
+        self, request: QueryRequest
+    ) -> Dict[str, Any]:
+        """The policy context, or none if fetching it fails (it may be what failed)."""
+        try:
+            return await self._get_policy_context(request)
+        except Exception:
+            logger.exception("Routing policy unavailable after a routing error")
+            return {}
+
+    def _decision_features(self, context: Dict[str, Any]) -> RoutingDecisionFeatures:
+        """The request features that checks after routing read from the decision."""
+        query_complexity = context.get("query_complexity")
+        confidence = float(context.get("classification_confidence", 0.0) or 0.0)
+        return RoutingDecisionFeatures(
+            query_complexity=str(query_complexity) if query_complexity else None,
+            requires_high_reasoning=bool(context.get("requires_high_reasoning", False)),
+            long_context=bool(context.get("long_context", False)),
+            classification_confidence=min(max(confidence, 0.0), 1.0),
+        )
+
+    def _routing_error_features(
+        self, request: QueryRequest, token_count: int
+    ) -> Dict[str, Any]:
+        """Best-effort request features after a routing error (none if they fail)."""
+        try:
+            # An empty query_type lets the feature builder infer one from the
+            # text, since the classifier may be what failed.
+            return build_routing_features(
+                self._build_routing_feature_payload(
+                    request=request, query_type="", token_count=token_count
+                )
+            )
+        except Exception:
+            logger.exception("Routing features failed after a routing error")
+            return {}
+
+    def _fallback_token_estimate(self, request: QueryRequest) -> int:
+        """The routing token estimate, or a word count if that fails too."""
+        try:
+            return max(0, int(self._estimate_request_token_count(request)))
+        except Exception:
+            logger.exception("Token estimate failed after a routing error")
+            text = "\n\n".join(
+                part for part in (request.context, request.query) if part
+            )
+            return max(1, int(len(text.split()) * 1.3), len(text) // 4)
 
     async def select_model_with_capability(
         self,
@@ -898,12 +1085,15 @@ class ModelRouter:
     async def _get_policy_context(self, request: QueryRequest) -> Dict[str, Any]:
         """Load request/user-level routing hints from the shared policy cache."""
         metadata = request.metadata or {}
-        metadata_preferred_models = list(metadata.get("preferred_models", []) or [])
-        metadata_avoid_models = list(metadata.get("avoid_models", []) or [])
-        metadata_avoid_providers = [
-            str(provider).lower()
-            for provider in list(metadata.get("avoid_providers", []) or [])
-        ]
+        metadata_preferred_models = self._name_entries(
+            metadata.get("preferred_models"), "metadata.preferred_models"
+        )
+        metadata_avoid_models = self._name_entries(
+            metadata.get("avoid_models"), "metadata.avoid_models"
+        )
+        metadata_avoid_providers = self._name_entries(
+            metadata.get("avoid_providers"), "metadata.avoid_providers", lowercase=True
+        )
 
         if not self.policy_cache:
             return {
@@ -965,28 +1155,38 @@ class ModelRouter:
                 f"Failed to load routing policy for request {request.request_id}: {e}"
             )
             policy = {}
+        if not isinstance(policy, dict):
+            logger.warning(
+                "Ignoring routing policy for request %s: expected a mapping, got %s",
+                request.request_id,
+                type(policy).__name__,
+            )
+            policy = {}
 
-        combined_preferred_models = []
-        for model_name in metadata_preferred_models + list(
-            policy.get("preferred_models", []) or []
-        ):
-            if model_name not in combined_preferred_models:
-                combined_preferred_models.append(model_name)
-
-        combined_avoid_models = []
-        for model_name in metadata_avoid_models + list(
-            policy.get("avoid_models", []) or []
-        ):
-            if model_name not in combined_avoid_models:
-                combined_avoid_models.append(model_name)
-
-        combined_avoid_providers = []
-        for provider_name in metadata_avoid_providers + [
-            str(provider).lower()
-            for provider in list(policy.get("avoid_providers", []) or [])
-        ]:
-            if provider_name not in combined_avoid_providers:
-                combined_avoid_providers.append(provider_name)
+        combined_preferred_models = list(
+            dict.fromkeys(
+                metadata_preferred_models
+                + self._name_entries(
+                    policy.get("preferred_models"), "policy.preferred_models"
+                )
+            )
+        )
+        combined_avoid_models = list(
+            dict.fromkeys(
+                metadata_avoid_models
+                + self._name_entries(policy.get("avoid_models"), "policy.avoid_models")
+            )
+        )
+        combined_avoid_providers = list(
+            dict.fromkeys(
+                metadata_avoid_providers
+                + self._name_entries(
+                    policy.get("avoid_providers"),
+                    "policy.avoid_providers",
+                    lowercase=True,
+                )
+            )
+        )
 
         policy_source = policy.get("policy_source", "none")
         if metadata_preferred_models:
@@ -1002,10 +1202,18 @@ class ModelRouter:
             "preferred_models": combined_preferred_models,
             "avoid_models": combined_avoid_models,
             "avoid_providers": combined_avoid_providers,
-            "blocked_models": list(policy.get("blocked_models", []) or []),
-            "blocked_providers": list(policy.get("blocked_providers", []) or []),
-            "warn_models": list(policy.get("warn_models", []) or []),
-            "warn_providers": list(policy.get("warn_providers", []) or []),
+            "blocked_models": self._name_entries(
+                policy.get("blocked_models"), "policy.blocked_models"
+            ),
+            "blocked_providers": self._name_entries(
+                policy.get("blocked_providers"), "policy.blocked_providers"
+            ),
+            "warn_models": self._name_entries(
+                policy.get("warn_models"), "policy.warn_models"
+            ),
+            "warn_providers": self._name_entries(
+                policy.get("warn_providers"), "policy.warn_providers"
+            ),
             "guardrail_reasons": dict(policy.get("guardrail_reasons", {}) or {}),
             "hint_reason": policy.get("hint_reason")
             or (
@@ -1030,6 +1238,40 @@ class ModelRouter:
                 policy.get("burst_protection_active", False)
             ),
         }
+
+    def _name_entries(
+        self, value: Any, field_name: str, *, lowercase: bool = False
+    ) -> List[str]:
+        """The non-empty string entries of a model or provider list.
+
+        These lists come from request metadata and the policy cache. A single
+        string counts as one entry; anything else that is not a name is logged
+        and dropped, so a malformed entry cannot break routing.
+        """
+        if not value:
+            return []
+        items = [value] if isinstance(value, str) else value
+        if not isinstance(items, (list, tuple, set)):
+            logger.warning(
+                "Ignoring %s: expected a list of names, got %s",
+                field_name,
+                type(value).__name__,
+            )
+            return []
+        entries: List[str] = []
+        dropped = 0
+        for item in items:
+            if not isinstance(item, str) or not item.strip():
+                dropped += 1
+                continue
+            entry = item.lower() if lowercase else item
+            if entry not in entries:
+                entries.append(entry)
+        if dropped:
+            logger.warning(
+                "Ignoring %d entries of %s that are not names", dropped, field_name
+            )
+        return entries
 
     async def _intelligent_routing(self, context: Dict[str, Any]) -> ModelSelection:
         """Intelligent routing based on query analysis and rules"""
@@ -1197,21 +1439,98 @@ class ModelRouter:
 
     def _capability_based_routing(self, context: Dict[str, Any]) -> ModelSelection:
         """Route based on model capabilities and query requirements"""
-        suitable_models = self._filter_models_for_context(
-            list(self.models.keys()), context
+        eligible = self._eligible_models(context)
+        best_model = self._select_best_model(eligible.models, eligible.context)
+        if eligible.capability_match:
+            reason, confidence = "Capability-based selection", 0.8
+        else:
+            reason = (
+                "No model has the capability for this query type; "
+                "best model available to the tier"
+            )
+            confidence = 0.3
+        if eligible.guardrails_bypassed:
+            confidence = 0.3
+        return ModelSelection(
+            model_name=best_model,
+            confidence=confidence,
+            reason=eligible.reason(reason),
         )
 
-        if not suitable_models:
-            return ModelSelection(
-                model_name=self.default_model,
-                confidence=0.3,
-                reason="No suitable models found, using default",
+    def _eligible_models(self, context: Dict[str, Any]) -> EligibleModels:
+        """Models this request may use, and whether they match its query type.
+
+        Models with the capability for the query type come first; if none has
+        it, any model the tier may use that fits the prompt. If guardrails
+        exclude all of those, they are ignored (fail-open): guardrails are
+        health signals, and blocking everything must not stop chat. The tier
+        and the context window are never bypassed: with nothing left this
+        raises ModelNotEntitledError or PromptTooLargeError.
+        """
+        candidates = list(self.models)
+        open_context = self._without_guardrails(context)
+        for scoring_context, bypassed in ((context, False), (open_context, True)):
+            capable_models = self._filter_models_for_context(
+                candidates, scoring_context
+            )
+            fitting_models = capable_models or self._filter_models_for_context(
+                candidates, scoring_context, check_capability=False
+            )
+            if not fitting_models:
+                continue
+            if bypassed:
+                logger.warning(
+                    "Routing guardrails exclude every model available to the %s "
+                    "tier; ignoring them (fail-open)",
+                    self._entitlement_tier(context.get("user_tier")).value,
+                )
+            return EligibleModels(
+                models=fitting_models,
+                capability_match=bool(capable_models),
+                guardrails_bypassed=bypassed,
+                context=scoring_context,
+            )
+        self._raise_no_eligible_model(open_context)
+
+    def _without_guardrails(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """The routing context with every guardrail list cleared."""
+        return {**context, **{key: [] for key in GUARDRAIL_CONTEXT_KEYS}}
+
+    def _raise_no_eligible_model(
+        self, context: Dict[str, Any], candidates: Optional[List[str]] = None
+    ) -> NoReturn:
+        """Raise the rejection that explains why no candidate passed the filters."""
+        tier = self._entitlement_tier(context.get("user_tier"))
+        candidate_names = list(self.models) if candidates is None else candidates
+        entitled_models = [
+            self.models[model_name]
+            for model_name in candidate_names
+            if model_name in self.models
+            and self._check_user_access(self.models[model_name], tier.value)
+        ]
+        if not entitled_models:
+            raise ModelNotEntitledError(
+                f"No model is available to the {tier.value} tier for this request",
+                user_tier=tier.value,
             )
 
-        # Select best model from suitable candidates
-        best_model = self._select_best_model(suitable_models, context)
-        return ModelSelection(
-            model_name=best_model, confidence=0.8, reason="Capability-based selection"
+        token_count = int(context.get("token_count", 0) or 0)
+        largest_window = max(model.max_tokens for model in entitled_models)
+        if token_count > largest_window:
+            raise PromptTooLargeError(
+                f"The prompt needs about {token_count} tokens; the largest model "
+                f"available to the {tier.value} tier accepts {largest_window}",
+                user_tier=tier.value,
+                token_count=token_count,
+                max_context_tokens=largest_window,
+            )
+        # Routing paths fail open on guardrails (_eligible_models) before they
+        # get here; this is a caller handing _select_best_model only candidates
+        # that guardrails exclude.
+        raise ModelNotEntitledError(
+            "Routing guardrails exclude every candidate model for the "
+            f"{tier.value} tier",
+            user_tier=tier.value,
         )
 
     def _filter_models_for_context(
@@ -1306,15 +1625,15 @@ class ModelRouter:
         return any(req_cap in model_capabilities for req_cap in required_capabilities)
 
     def _check_user_access(self, model_config: ModelConfig, user_tier: str) -> bool:
-        """Check if user tier has access to model"""
-        tier_priorities = {"free": 3, "premium": 2, "enterprise": 1}
+        """Check if user tier has access to model (allowed_tiers, else priority)."""
+        return self._entitlement_tier(user_tier) in model_config.entitled_tiers()
 
-        normalized_tier = self._normalize_user_tier(user_tier)
-        user_priority = tier_priorities.get(normalized_tier, 3)
-        model_priority = model_config.priority
-
-        # Lower priority number = higher priority access
-        return model_priority >= user_priority
+    def _entitlement_tier(self, user_tier: Any) -> UserTier:
+        """The tier whose entitlements apply; an unknown tier gets free access."""
+        try:
+            return UserTier(self._normalize_user_tier(user_tier))
+        except ValueError:
+            return UserTier.FREE
 
     def _normalize_user_tier(self, user_tier: Any) -> str:
         """Normalize request/user tier values for rule evaluation and access checks."""
@@ -1328,8 +1647,13 @@ class ModelRouter:
 
     def _select_best_model(self, candidates: List[str], context: Dict[str, Any]) -> str:
         """Select the best model from candidates based on multiple factors"""
-        if not candidates:
-            return self.default_model
+        # Only models the request may use; callers decide the capability check.
+        eligible = self._filter_models_for_context(
+            candidates, context, check_capability=False
+        )
+        if not eligible:
+            self._raise_no_eligible_model(context, candidates)
+        candidates = eligible
 
         scores = {}
         warn_models = set(context.get("warn_models", []) or [])
@@ -1447,14 +1771,9 @@ class ModelRouter:
         return bonus
 
     def _round_robin_routing(self, context: Dict[str, Any]) -> ModelSelection:
-        """Simple round-robin model selection"""
-        available_models = list(self.models.keys())
-        if not available_models:
-            return ModelSelection(
-                model_name=self.default_model,
-                confidence=0.5,
-                reason="No models available",
-            )
+        """Simple round-robin over the models this request may use"""
+        eligible = self._eligible_models(context)
+        available_models = eligible.models
 
         # Simple round-robin based on request count
         request_count = getattr(self, "_request_count", 0)
@@ -1462,18 +1781,15 @@ class ModelRouter:
         self._request_count = request_count + 1
 
         return ModelSelection(
-            model_name=selected_model, confidence=0.6, reason="Round-robin selection"
+            model_name=selected_model,
+            confidence=0.6,
+            reason=eligible.reason("Round-robin selection"),
         )
 
     def _weighted_routing(self, context: Dict[str, Any]) -> ModelSelection:
-        """Weighted random selection based on model priorities"""
-        available_models = list(self.models.keys())
-        if not available_models:
-            return ModelSelection(
-                model_name=self.default_model,
-                confidence=0.5,
-                reason="No models available",
-            )
+        """Weighted random selection, by priority, among models the request may use"""
+        eligible = self._eligible_models(context)
+        available_models = eligible.models
 
         # Calculate weights (inverse of priority)
         weights = []
@@ -1497,14 +1813,38 @@ class ModelRouter:
         return ModelSelection(
             model_name=selected_model,
             confidence=0.7,
-            reason="Weighted random selection",
+            reason=eligible.reason("Weighted random selection"),
         )
 
     def _fallback_routing(self, context: Dict[str, Any]) -> ModelSelection:
-        """Fallback to default model"""
+        """Fallback to the default model, or the best model the request may use"""
+        selected_model, eligible = self._default_or_best_model(context)
+        if eligible is None:
+            return ModelSelection(
+                model_name=selected_model,
+                confidence=0.4,
+                reason="Fallback routing",
+            )
         return ModelSelection(
-            model_name=self.default_model, confidence=0.4, reason="Fallback routing"
+            model_name=selected_model,
+            confidence=0.4,
+            reason=eligible.reason("Fallback routing (default model not eligible)"),
         )
+
+    def _default_or_best_model(
+        self, context: Dict[str, Any]
+    ) -> Tuple[str, Optional[EligibleModels]]:
+        """The default model if the request may use it, else the best eligible one.
+
+        Returns the eligibility when the default was not used, so the caller
+        can note a guardrail bypass in its reason.
+        """
+        if self._filter_models_for_context(
+            [self.default_model], context, check_capability=False
+        ):
+            return self.default_model, None
+        eligible = self._eligible_models(context)
+        return self._select_best_model(eligible.models, eligible.context), eligible
 
     def _estimate_cost(
         self, selection: ModelSelection, context: Dict[str, Any]
