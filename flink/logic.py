@@ -340,10 +340,11 @@ def build_model_metrics_window_event(
 ) -> Dict[str, Any]:
     """Build a 1-minute model metrics aggregate event.
 
-    latency_sample_count is the number of requests in latency_sum_ms (cache hits
-    are left out); it defaults to request_count. provider_failure_count is the
-    errors that count against the provider (see counts_toward_provider_health);
-    it defaults to error_count.
+    latency_sample_count is the number of uncached requests summed into
+    latency_sum_ms and tokens_per_second_sum (a cache hit's latency is the
+    lookup and its throughput is the original call's); it defaults to
+    request_count. provider_failure_count is the errors that count against the
+    provider (see counts_toward_provider_health); it defaults to error_count.
     """
     request_count = max(0, int(request_count))
     success_count = max(0, int(success_count))
@@ -361,7 +362,7 @@ def build_model_metrics_window_event(
 
     avg_latency_ms = latency_sum_ms / latency_samples if latency_samples > 0 else 0.0
     avg_tokens_per_second = (
-        tokens_per_second_sum / request_count if request_count > 0 else 0.0
+        tokens_per_second_sum / latency_samples if latency_samples > 0 else 0.0
     )
     success_rate = success_count / request_count if request_count > 0 else 0.0
     error_rate = error_count / request_count if request_count > 0 else 0.0
@@ -387,6 +388,7 @@ def build_model_metrics_window_event(
         "error_rate": error_rate,
         "provider_failure_count": provider_failures,
         "provider_failure_rate": provider_failure_rate,
+        "latency_sample_count": latency_samples,
         "avg_latency_ms": avg_latency_ms,
         "avg_tokens_per_second": avg_tokens_per_second,
         "queries_per_second": queries_per_second,
@@ -466,6 +468,17 @@ def build_routing_guardrail_event(
     }
 
 
+def metric_has_latency_sample(metric_event: Dict[str, Any]) -> bool:
+    """Return whether a metrics window measured any model latency.
+
+    A window of only cache hits has none, so latency detectors skip it rather
+    than read its 0 ms as a baseline. Windows from before latency_sample_count
+    existed are treated as measured.
+    """
+    samples = metric_event.get("latency_sample_count")
+    return samples is None or _safe_int(samples, 0) > 0
+
+
 def detect_metric_anomalies(
     metric_event: Dict[str, Any],
     *,
@@ -483,7 +496,9 @@ def detect_metric_anomalies(
     current_qps = float(metric_event.get("queries_per_second", 0.0) or 0.0)
     current_error_rate = float(metric_event.get("error_rate", 0.0) or 0.0)
 
-    if len(latency_history) >= minimum_history:
+    if metric_has_latency_sample(metric_event) and (
+        len(latency_history) >= minimum_history
+    ):
         avg_latency = sum(latency_history) / len(latency_history)
         if avg_latency > 0 and current_latency > avg_latency * threshold_multiplier:
             alerts.append(
@@ -551,6 +566,7 @@ def detect_model_routing_guardrails(
     config = _merged_config(DEFAULT_MODEL_GUARDRAIL_CONFIG, thresholds)
 
     model_name = str(metric_event.get("model_name", "unknown") or "unknown")
+    has_latency = metric_has_latency_sample(metric_event)
     current_latency = float(metric_event.get("avg_latency_ms", 0.0) or 0.0)
     current_qps = float(metric_event.get("queries_per_second", 0.0) or 0.0)
     current_error_rate = float(metric_event.get("error_rate", 0.0) or 0.0)
@@ -594,7 +610,7 @@ def detect_model_routing_guardrails(
             )
         )
 
-    if current_latency >= high_latency_ms:
+    if has_latency and current_latency >= high_latency_ms:
         guardrails.append(
             build_routing_guardrail_event(
                 metric_event,
@@ -628,7 +644,7 @@ def detect_model_routing_guardrails(
                 )
             )
 
-    if len(latency_history) >= minimum_history:
+    if has_latency and len(latency_history) >= minimum_history:
         avg_latency = sum(latency_history) / len(latency_history)
         if avg_latency > 0 and current_latency > max(
             regression_latency_floor_ms, avg_latency * threshold_multiplier
@@ -741,6 +757,7 @@ def detect_provider_routing_guardrails(
     config = _merged_config(DEFAULT_PROVIDER_GUARDRAIL_CONFIG, thresholds)
 
     provider = str(metric_event.get("provider", "unknown") or "unknown")
+    has_latency = metric_has_latency_sample(metric_event)
     current_latency = float(metric_event.get("avg_latency_ms", 0.0) or 0.0)
     current_error_rate = metric_provider_failure_rate(metric_event)
     high_error_rate_threshold = _safe_float(config.get("high_error_rate"), 0.20)
@@ -767,7 +784,7 @@ def detect_provider_routing_guardrails(
             )
         )
 
-    if current_latency >= high_latency_ms:
+    if has_latency and current_latency >= high_latency_ms:
         guardrails.append(
             build_routing_guardrail_event(
                 metric_event,
@@ -801,7 +818,7 @@ def detect_provider_routing_guardrails(
                 )
             )
 
-    if len(latency_history) >= minimum_history:
+    if has_latency and len(latency_history) >= minimum_history:
         avg_latency = sum(latency_history) / len(latency_history)
         if avg_latency > 0 and current_latency > max(
             regression_latency_floor_ms, avg_latency * threshold_multiplier
@@ -893,6 +910,7 @@ def _empty_routing_policy_aggregate() -> Dict[str, Any]:
         "request_count": 0,
         "success_count": 0,
         "latency_sum_ms": 0.0,
+        "latency_sample_count": 0,
         "total_tokens_sum": 0,
         "cost_sum_usd": 0.0,
         "fast_lane_hits": 0,
@@ -905,6 +923,13 @@ def _empty_routing_policy_aggregate() -> Dict[str, Any]:
         "latest_event_timestamp_ms": -1,
         "latest_arrival_sequence": -1,
     }
+
+
+def _latency_sample_count(aggregate: Dict[str, Any]) -> int:
+    """Uncached requests in latency_sum_ms; older state summed every request."""
+    return _safe_int(
+        aggregate.get("latency_sample_count", aggregate.get("request_count", 0))
+    )
 
 
 def _increment_count(counts: Dict[str, int], key: str, amount: int = 1) -> None:
@@ -942,13 +967,18 @@ def add_routing_policy_event(
     arrival_sequence: int = 0,
 ) -> Dict[str, Any]:
     """Increment a routing-policy aggregate with one completion event."""
+    latency_samples = _latency_sample_count(aggregate)
     aggregate["request_count"] = int(aggregate.get("request_count", 0)) + 1
     succeeded = event.get("status") == "success"
     if succeeded:
         aggregate["success_count"] = int(aggregate.get("success_count", 0)) + 1
-    aggregate["latency_sum_ms"] = _safe_float(
-        aggregate.get("latency_sum_ms")
-    ) + _safe_float(event.get("latency_ms"))
+    # A cache hit's latency is the lookup, not the model.
+    if not bool(event.get("cached_response", False)):
+        aggregate["latency_sum_ms"] = _safe_float(
+            aggregate.get("latency_sum_ms")
+        ) + _safe_float(event.get("latency_ms"))
+        latency_samples += 1
+    aggregate["latency_sample_count"] = latency_samples
     aggregate["total_tokens_sum"] = _safe_int(
         aggregate.get("total_tokens_sum")
     ) + _safe_int(event.get("total_tokens"))
@@ -1003,6 +1033,9 @@ def merge_routing_policy_aggregate(
     target: Dict[str, Any], source: Dict[str, Any], *, sign: int = 1
 ) -> Dict[str, Any]:
     """Add or subtract a bucket aggregate from a rolling aggregate."""
+    target["latency_sample_count"] = _latency_sample_count(
+        target
+    ) + sign * _latency_sample_count(source)
     for key in (
         "request_count",
         "success_count",
@@ -1079,7 +1112,12 @@ def build_routing_policy_state_event_from_aggregate(
     recent_error_rate = error_count / request_count if request_count > 0 else 0.0
     avg_total_tokens = _safe_int(aggregate.get("total_tokens_sum")) / request_count
     avg_cost_usd = _safe_float(aggregate.get("cost_sum_usd")) / request_count
-    avg_latency_ms = _safe_float(aggregate.get("latency_sum_ms")) / request_count
+    latency_samples = _latency_sample_count(aggregate)
+    avg_latency_ms = (
+        _safe_float(aggregate.get("latency_sum_ms")) / latency_samples
+        if latency_samples > 0
+        else 0.0
+    )
     fast_lane_hits = int(aggregate.get("fast_lane_hits", 0))
     fast_lane_hit_rate = fast_lane_hits / request_count if request_count > 0 else 0.0
 

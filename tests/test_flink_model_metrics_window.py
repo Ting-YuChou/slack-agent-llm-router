@@ -133,7 +133,29 @@ def test_window_of_only_cache_hits_reports_no_latency():
 
     assert metric["request_count"] == 1
     assert metric["cached_count"] == 1
+    assert metric["latency_sample_count"] == 0
     assert metric["avg_latency_ms"] == 0.0
+    assert metric["avg_tokens_per_second"] == 0.0
+
+
+def test_window_throughput_averages_only_uncached_events():
+    metric = _window_metric(
+        [
+            _completion(offset_ms=1_000, tokens_per_second=40.0),
+            _completion(offset_ms=2_000, tokens_per_second=60.0),
+            # A cache hit carries the original call's (stale) throughput.
+            _completion(
+                offset_ms=3_000,
+                tokens_per_second=500.0,
+                latency_ms=2,
+                cost_usd=0.0,
+                cached_response=True,
+            ),
+        ]
+    )
+
+    assert metric["latency_sample_count"] == 2
+    assert metric["avg_tokens_per_second"] == pytest.approx(50.0)
 
 
 def test_window_restored_from_older_state_keeps_averaging_every_request():
