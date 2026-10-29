@@ -206,13 +206,20 @@ class AttachmentRejected(ValueError):
         self.message = message
 
 
-def validate_external_attachments(request: Any, *, max_attachment_bytes: int) -> None:
-    """Reject attachments whose size is inconsistent or above the limit."""
+def normalize_external_attachments(request: Any, *, max_attachment_bytes: int) -> None:
+    """Cap inline attachment content and make size_bytes match it.
+
+    The cap applies to the content actually sent. A caller's size_bytes is
+    only a declaration (JSON carries the content as text, so it may count
+    characters or the original file size): when content is present it is
+    replaced by the real length so downstream sees one consistent value.
+    URL-only attachments carry no content and keep their declared size.
+    """
     for index, attachment in enumerate(getattr(request, "attachments", None) or []):
         content = getattr(attachment, "content", None)
-        size_bytes = int(getattr(attachment, "size_bytes", 0) or 0)
-        actual = len(content) if content is not None else None
-        if max(size_bytes, actual or 0) > max_attachment_bytes:
+        if content is None:
+            continue
+        if len(content) > max_attachment_bytes:
             raise AttachmentRejected(
                 status_code=413,
                 error="attachment_too_large",
@@ -221,15 +228,7 @@ def validate_external_attachments(request: Any, *, max_attachment_bytes: int) ->
                     "limit"
                 ),
             )
-        if actual is not None and actual != size_bytes:
-            raise AttachmentRejected(
-                status_code=422,
-                error="invalid_attachment",
-                message=(
-                    f"Attachment {index} declares size_bytes={size_bytes} but "
-                    f"carries {actual} bytes"
-                ),
-            )
+        attachment.size_bytes = len(content)
 
 
 # JSON fields around an inline document (filename, metadata, ids).

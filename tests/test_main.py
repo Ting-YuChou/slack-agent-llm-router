@@ -1565,13 +1565,21 @@ class TestApiApp:
         assert response.status_code == 200
         assert inference.processed_requests[0].metadata == {"cost_sensitivity": "low"}
 
-    def test_route_rejects_attachment_whose_content_mismatches_size(
-        self, tmp_path, patched_platform_deps
+    @pytest.mark.parametrize(
+        ("content", "declared", "actual"),
+        [
+            ("a,b\n1,2\n", 11, 8),
+            ("café", 4, 5),  # size_bytes counted characters, content is UTF-8
+            ("aGVsbG8gd29ybGQ=", 11, 16),  # base64 text sent with the file's size
+            ("abc", 5_000_000, 3),  # an inflated declaration is not the size
+        ],
+    )
+    def test_route_sets_attachment_size_to_the_content_length(
+        self, content, declared, actual, tmp_path, patched_platform_deps
     ):
         platform = _admission_platform(tmp_path)
         inference = platform.services["inference"]
-        admission = DummyAdmissionController()
-        platform.services["admission"] = admission
+        platform.services["admission"] = DummyAdmissionController()
         app = platform._create_fastapi_app()
 
         with TestClient(app) as client:
@@ -1582,20 +1590,48 @@ class TestApiApp:
                     "user_id": "u1",
                     "attachments": [
                         {
-                            "name": "report.csv",
+                            "name": "report.txt",
                             "type": "document",
-                            "size_bytes": 11,
-                            "mime_type": "text/csv",
-                            "content": "a,b\n1,2\n",
+                            "size_bytes": declared,
+                            "mime_type": "text/plain",
+                            "content": content,
                         }
                     ],
                 },
             )
 
-        assert response.status_code == 422
-        assert response.json()["error"] == "invalid_attachment"
-        assert inference.processed_requests == []
-        assert admission.route_calls == []
+        assert response.status_code == 200
+        attachment = inference.processed_requests[0].attachments[0]
+        assert attachment.size_bytes == actual == len(attachment.content)
+
+    def test_route_accepts_a_large_url_only_attachment(
+        self, tmp_path, patched_platform_deps
+    ):
+        platform = _admission_platform(tmp_path)
+        inference = platform.services["inference"]
+        platform.services["admission"] = DummyAdmissionController()
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/route",
+                json={
+                    "query": "hello",
+                    "user_id": "u1",
+                    "attachments": [
+                        {
+                            "name": "video.mp4",
+                            "type": "file",
+                            "size_bytes": 50_000_000,
+                            "mime_type": "video/mp4",
+                            "url": "https://files.example.com/video.mp4",
+                        }
+                    ],
+                },
+            )
+
+        assert response.status_code == 200
+        assert inference.processed_requests[0].attachments[0].size_bytes == 50_000_000
 
     def test_route_rejects_attachment_over_the_limit(
         self, tmp_path, patched_platform_deps

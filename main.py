@@ -52,9 +52,9 @@ from src.api_security import (
     api_key_clients_configured,
     apply_principal_entitlements,
     filter_external_metadata,
+    normalize_external_attachments,
     rag_request_body_limits,
     resolve_api_principal,
-    validate_external_attachments,
 )
 from src.llm_router_part1_router import ModelRouter
 from src.llm_router_part2_inference import InferenceEngine
@@ -864,7 +864,7 @@ class LLMRouterPlatform:
             self._security_config().get("max_attachment_bytes") or 1024 * 1024
         )
         try:
-            validate_external_attachments(
+            normalize_external_attachments(
                 query_data, max_attachment_bytes=max_attachment_bytes
             )
         except AttachmentRejected as exc:

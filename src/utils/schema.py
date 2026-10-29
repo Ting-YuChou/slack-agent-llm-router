@@ -63,8 +63,9 @@ class Attachment(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), max_length=128)
     name: str = Field(..., max_length=1024)
     type: AttachmentType
-    # Declared size. POST /route rejects a mismatch with len(content); in-process
-    # callers build attachments directly, so the schema does not compare them.
+    # Declared size. POST /route replaces it with len(content) when content is
+    # sent; in-process callers build attachments directly, so the schema does
+    # not compare them.
     size_bytes: int
     mime_type: str = Field(..., max_length=255)
     url: Optional[str] = Field(None, max_length=4096)
@@ -1037,7 +1038,7 @@ class SecurityConfig(ConfigModel):
     # replaces its default; /rag/documents and /rag/batches otherwise get caps
     # derived from rag.upload. Other media types use max_request_body_bytes.
     request_body_limits: Dict[str, Dict[str, int]] = Field(default_factory=dict)
-    # POST /route rejects any attachment declared or sent above this size.
+    # POST /route rejects an attachment whose inline content is above this size.
     max_attachment_bytes: int = Field(1024 * 1024, ge=1)
 
     @field_validator("request_body_limits")
