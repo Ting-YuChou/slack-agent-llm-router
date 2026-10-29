@@ -710,6 +710,32 @@ def slack_chat_request_id(
     )
 
 
+# Thumbs up / down under a chat answer; the value is the answered request id.
+CHAT_FEEDBACK_ACTIONS = {"chat_feedback_up": "up", "chat_feedback_down": "down"}
+CHAT_FEEDBACK_THANKS_TEXT = "Thanks for the feedback."
+CHAT_FEEDBACK_CLICKS_LIMIT = 1000
+
+
+def _chat_feedback_block(request_id: str) -> Dict[str, Any]:
+    return {
+        "type": "actions",
+        "block_id": "chat_feedback",
+        "elements": [
+            {
+                "type": "button",
+                "action_id": action_id,
+                "text": {"type": "plain_text", "text": emoji, "emoji": True},
+                "value": request_id,
+                "accessibility_label": label,
+            }
+            for action_id, emoji, label in (
+                ("chat_feedback_up", "👍", "Good answer"),
+                ("chat_feedback_down", "👎", "Bad answer"),
+            )
+        ],
+    }
+
+
 @dataclass(frozen=True)
 class SlackQueryTrace:
     """What ties a Slack chat query to its logs, events and feedback."""
@@ -762,6 +788,8 @@ class SlackAnswer(str):
     latency_ms: Optional[float]
     cached: bool
     trailer_lines: FrozenSet[str]
+    # The request it answers: what a feedback click rates.
+    request_id: Optional[str]
 
     def __new__(
         cls,
@@ -771,11 +799,13 @@ class SlackAnswer(str):
         latency_ms: Optional[float] = None,
         cached: bool = False,
         trailer_lines: Iterable[str] = (),
+        request_id: Optional[str] = None,
     ) -> "SlackAnswer":
         answer = super().__new__(cls, text)
         answer.model_name = model_name
         answer.latency_ms = latency_ms
         answer.cached = cached
+        answer.request_id = request_id if is_valid_request_id(request_id) else None
         # The bot's own lines after the model's text: notes and sources.
         answer.trailer_lines = frozenset(line for line in trailer_lines if line)
         return answer
@@ -3556,7 +3586,9 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             SLACK_METRICS.messages_processed.labels(user_tier=user_tier.value).inc()
             SLACK_METRICS.response_time.observe(response.latency_ms / 1000)
 
-            return self._format_response_with_sources(response, answer)
+            return self._format_response_with_sources(
+                response, answer, request_id=query_request.request_id
+            )
 
         except AdmissionRejectedError as e:
             logger.warning(
@@ -3705,11 +3737,16 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             metadata["slack_context_error"] = slack_context.error
 
     def _format_response_with_sources(
-        self, response: Any, response_text: Optional[str] = None
+        self,
+        response: Any,
+        response_text: Optional[str] = None,
+        *,
+        request_id: Optional[str] = None,
     ) -> str:
         """Append compact source links for web-search enriched answers.
 
         `response_text` replaces the response's own text, e.g. with notes added.
+        `request_id` is the request answered, for feedback on the answer.
         """
         if response_text is None:
             response_text = getattr(response, "response_text", "") or ""
@@ -3743,6 +3780,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 else None
             ),
             cached=getattr(response, "cached", False) is True,
+            request_id=request_id or getattr(response, "request_id", None),
         )
 
     def _get_max_tokens_for_user(
@@ -3877,6 +3915,8 @@ class SlackBot:
         # "channel:ts" of messages already handled, oldest first. Slack sends
         # both a message and an app_mention event for one mention.
         self.handled_messages: Dict[str, None] = {}
+        # Feedback clicks already recorded, by action_ts (bounded).
+        self._chat_feedback_clicks: Dict[str, None] = {}
         # "channel:ts" of messages already given a busy reply, so a mention's
         # message and app_mention events get one between them.
         self.busy_replied_messages: Dict[str, None] = {}
@@ -4155,11 +4195,17 @@ class SlackBot:
                 # trigger_id expires after ~3s, so the modal cannot wait in the queue.
                 if await self._open_agent_feedback_modal(req.payload):
                     return
+                actions = req.payload.get("actions") or [{}]
+                chat_feedback = actions[0].get("action_id") in CHAT_FEEDBACK_ACTIONS
                 await self._enqueue_work(
                     SlackWorkItem(
                         kind="interactive",
                         payload=req.payload,
-                        name="slack_agent_approval",
+                        name=(
+                            "slack_chat_feedback"
+                            if chat_feedback
+                            else "slack_agent_approval"
+                        ),
                     )
                 )
             elif (
@@ -4630,16 +4676,17 @@ class SlackBot:
         if len(markdown) > SLACK_MARKDOWN_BLOCK_CHARS:
             return message
         blocks: List[Dict[str, Any]] = [{"type": "markdown", "text": markdown}]
+        response_settings = self.config.get("response_settings", {})
         footer = answer.footer() if last else None
-        if footer and self.config.get("response_settings", {}).get(
-            "answer_footer", True
-        ):
+        if footer and response_settings.get("answer_footer", True):
             blocks.append(
                 {
                     "type": "context",
                     "elements": [{"type": "plain_text", "text": footer}],
                 }
             )
+        if last and answer.request_id and response_settings.get("feedback_buttons"):
+            blocks.append(_chat_feedback_block(answer.request_id))
         message["blocks"] = blocks
         return message
 
@@ -6711,11 +6758,61 @@ class SlackBot:
                 text="\n".join(part for part in (response, *details) if part),
             )
 
+    async def _handle_chat_feedback(
+        self, payload: Dict[str, Any], action: Dict[str, Any]
+    ) -> None:
+        """Record a thumbs up / down on a chat answer, once per click.
+
+        Anyone who sees the answer may rate it; the event names who clicked.
+        """
+        rating = CHAT_FEEDBACK_ACTIONS[action["action_id"]]
+        request_id = action.get("value")
+        user_id = (payload.get("user") or {}).get("id")
+        channel_id = (payload.get("channel") or {}).get("id")
+        click_id = str(action.get("action_ts") or payload.get("trigger_id") or "")
+        if not is_valid_request_id(request_id) or not user_id or not click_id:
+            return
+        # Slack may deliver one click twice; a replay is not a second vote.
+        clicks = self._chat_feedback_clicks
+        if click_id in clicks:
+            return
+        clicks[click_id] = None
+        while len(clicks) > CHAT_FEEDBACK_CLICKS_LIMIT:
+            clicks.pop(next(iter(clicks)))
+
+        producer = (getattr(self, "services", None) or {}).get("event_producer")
+        produce = getattr(producer, "produce_chat_feedback", None)
+        if callable(produce):
+            try:
+                await produce(
+                    request_id=request_id,
+                    user_id=str(user_id),
+                    rating=rating,
+                    click_id=click_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to record chat feedback for request %s", request_id
+                )
+        if channel_id and hasattr(self.web_client, "chat_postEphemeral"):
+            container = payload.get("container") or {}
+            message = payload.get("message") or {}
+            thread_ts = container.get("thread_ts") or message.get("thread_ts")
+            await self.web_client.chat_postEphemeral(
+                channel=channel_id,
+                user=user_id,
+                text=CHAT_FEEDBACK_THANKS_TEXT,
+                **({"thread_ts": thread_ts} if thread_ts else {}),
+            )
+
     async def _handle_agent_interactive(self, payload: Dict[str, Any]):
         actions = payload.get("actions") or []
         if not actions:
             return
         action = actions[0]
+        if action.get("action_id") in CHAT_FEEDBACK_ACTIONS:
+            await self._handle_chat_feedback(payload, action)
+            return
         if action.get("action_id") in {
             "pi_agent_download_patch",
             "pi_agent_resume_from_patch",

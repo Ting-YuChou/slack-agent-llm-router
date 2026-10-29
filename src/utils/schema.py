@@ -982,6 +982,8 @@ class SlackResponseSettingsConfig(ConfigModel):
     typing_indicator: bool = True
     # A context line under each answer: model, latency and "cached".
     answer_footer: bool = True
+    # Thumbs up / down under mention and thread answers, sent as chat.feedback.
+    feedback_buttons: bool = False
     thread_replies: bool = True
 
 

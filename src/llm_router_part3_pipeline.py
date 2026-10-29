@@ -273,6 +273,57 @@ def build_chat_request_row(
     }
 
 
+CHAT_FEEDBACK_RATINGS = frozenset({"up", "down"})
+
+
+def build_chat_feedback_event(
+    *,
+    request_id: str,
+    user_id: str,
+    rating: str,
+    click_id: str,
+    source: str = "slack",
+) -> Dict[str, Any]:
+    """A user's rating of one chat answer; an explicit field list, no text."""
+    if rating not in CHAT_FEEDBACK_RATINGS:
+        raise ValueError(f"Unknown chat feedback rating: {rating!r}")
+    return {
+        "event_type": "chat.feedback",
+        "event_version": EVENT_SCHEMA_VERSION,
+        "emitted_at": _isoformat_utc(),
+        "request_id": request_id,
+        "user_id": user_id,
+        "rating": rating,
+        "click_id": click_id,
+        "source": source,
+    }
+
+
+def build_chat_feedback_row(
+    data: Dict[str, Any], kafka_metadata: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """One chat_feedback row from a chat.feedback event."""
+    request_id = str(data.get("request_id") or "")
+    rating = str(data.get("rating") or "")
+    if not request_id or rating not in CHAT_FEEDBACK_RATINGS:
+        raise ValueError("chat.feedback event needs a request_id and a rating")
+    clicked_at = _parse_datetime(data.get("emitted_at"))
+    return {
+        "request_id": request_id,
+        "user_id": str(data.get("user_id") or ""),
+        "rating": rating,
+        "click_id": str(data.get("click_id") or ""),
+        "source": str(data.get("source") or ""),
+        "clicked_at": clicked_at,
+        "version": int(clicked_at.timestamp() * 1000),
+        "event_id": "",
+        "kafka_topic": "",
+        "kafka_partition": -1,
+        "kafka_offset": -1,
+        **(kafka_metadata or {}),
+    }
+
+
 def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
     """Build the pre-inference event emitted by the API request path."""
     attachments = [
@@ -992,6 +1043,30 @@ class KafkaProducerManager:
             ),
         )
 
+    async def produce_chat_feedback(
+        self,
+        *,
+        request_id: str,
+        user_id: str,
+        rating: str,
+        click_id: str,
+        source: str = "slack",
+    ):
+        """Produce a chat.feedback event, keyed by the request it rates."""
+        event = build_chat_feedback_event(
+            request_id=request_id,
+            user_id=user_id,
+            rating=rating,
+            click_id=click_id,
+            source=source,
+        )
+        return self._enqueue_message(
+            "chat_feedback",
+            "chat.feedback",
+            key=request_id,
+            value=event,
+        )
+
     async def produce_query_log(
         self,
         query_request: QueryRequest,
@@ -1454,6 +1529,29 @@ class ClickHouseManager:
             database=self.database
         )
 
+        # A rating of a chat answer by the user who clicked it; each click
+        # is one row, the latest per user and request is their rating.
+        chat_feedback_sql = """
+        CREATE TABLE IF NOT EXISTS {database}.chat_feedback (
+            request_id String,
+            user_id String,
+            rating LowCardinality(String),
+            click_id String,
+            source LowCardinality(String),
+            clicked_at DateTime64(3),
+            version UInt64,
+            event_id String,
+            kafka_topic String DEFAULT '',
+            kafka_partition Int32 DEFAULT -1,
+            kafka_offset Int64 DEFAULT -1
+        ) ENGINE = ReplacingMergeTree(version)
+        PARTITION BY toYYYYMM(clicked_at)
+        ORDER BY (request_id, user_id, click_id)
+        TTL toDateTime(clicked_at) + INTERVAL 90 DAY
+        """.format(
+            database=self.database
+        )
+
         # Execute table creation; new tables go at the end.
         tables = [
             ("query_logs", query_logs_sql),
@@ -1463,6 +1561,7 @@ class ClickHouseManager:
             ("alert_events", alert_events_sql),
             ("routing_policy_state_events", routing_policy_state_sql),
             ("chat_requests", chat_requests_sql),
+            ("chat_feedback", chat_feedback_sql),
         ]
 
         for table_name, sql in tables:
@@ -1614,6 +1713,20 @@ class ClickHouseManager:
             )
         except Exception as e:
             logger.error(f"Failed to batch insert chat requests: {e}")
+            PIPELINE_METRICS.insertion_errors.inc()
+            raise
+
+    async def batch_insert_chat_feedback(self, rows: List[Dict[str, Any]]):
+        """Batch insert chat_feedback rows (see build_chat_feedback_row)."""
+        if not rows:
+            return
+        try:
+            await self._insert_dict_rows("chat_feedback", rows)
+            PIPELINE_METRICS.records_inserted.labels(table="chat_feedback").inc(
+                len(rows)
+            )
+        except Exception as e:
+            logger.error(f"Failed to batch insert chat feedback: {e}")
             PIPELINE_METRICS.insertion_errors.inc()
             raise
 
@@ -2004,6 +2117,7 @@ class KafkaConsumerManager:
             "routing_policy_state",
             "alerts",
             "inference_completed",
+            "chat_feedback",
         )
         self.batch_buffer_states = {
             topic_key: BatchBufferState() for topic_key in batched_topics
@@ -2085,6 +2199,7 @@ class KafkaConsumerManager:
                     "routing_policy_state",
                     "alerts",
                     "inference_completed",
+                    "chat_feedback",
                 ]:
                     consumer = AIOKafkaConsumer(topic_name, **self.consumer_config)
                     await consumer.start()
@@ -2193,6 +2308,7 @@ class KafkaConsumerManager:
             "routing_policy_state": self._consume_routing_policy_state,
             "alerts": self._consume_alerts,
             "inference_completed": self._consume_inference_completed,
+            "chat_feedback": self._consume_chat_feedback,
         }
         handler = handlers.get(topic_key)
         if handler is None:
@@ -2657,33 +2773,44 @@ class KafkaConsumerManager:
             logger.error(f"Analytics model metrics consumer error: {e}")
             raise
 
-    async def _consume_inference_completed(self, consumer: AIOKafkaConsumer):
-        """Persist inference.completed events as chat_requests rows."""
+    async def _consume_batched_rows(
+        self,
+        topic_key: str,
+        consumer: AIOKafkaConsumer,
+        build_row: Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]],
+    ):
+        """Batch each event of topic_key as the row build_row makes of it."""
         try:
             async for message in consumer:
                 try:
                     data = self._decode_message_value(message)
-                    row = build_chat_request_row(
-                        data, kafka_metadata=self._kafka_event_metadata(message)
-                    )
-                    await self._append_batched_row("inference_completed", row, message)
-                    self._record_successful_consume(
-                        "inference_completed", consumer, message
-                    )
-                    PIPELINE_METRICS.messages_consumed.labels(
-                        topic="inference_completed"
-                    ).inc()
+                    row = build_row(data, self._kafka_event_metadata(message))
+                    await self._append_batched_row(topic_key, row, message)
+                    self._record_successful_consume(topic_key, consumer, message)
+                    PIPELINE_METRICS.messages_consumed.labels(topic=topic_key).inc()
                 except Exception as e:
                     await self._handle_processing_failure(
-                        "inference_completed",
+                        topic_key,
                         message,
                         e,
                         stage="consume",
                         batched=True,
                     )
         except Exception as e:
-            logger.error(f"inference.completed consumer error: {e}")
+            logger.error(f"{topic_key} consumer error: {e}")
             raise
+
+    async def _consume_inference_completed(self, consumer: AIOKafkaConsumer):
+        """Persist inference.completed events as chat_requests rows."""
+        await self._consume_batched_rows(
+            "inference_completed", consumer, build_chat_request_row
+        )
+
+    async def _consume_chat_feedback(self, consumer: AIOKafkaConsumer):
+        """Persist chat.feedback events as chat_feedback rows."""
+        await self._consume_batched_rows(
+            "chat_feedback", consumer, build_chat_feedback_row
+        )
 
     async def _consume_alerts(self, consumer: AIOKafkaConsumer):
         """Consume Flink and platform alert events."""
@@ -2996,6 +3123,7 @@ class KafkaConsumerManager:
             ),
             ("alerts", self.clickhouse.batch_insert_alert_events),
             ("inference_completed", self.clickhouse.batch_insert_chat_requests),
+            ("chat_feedback", self.clickhouse.batch_insert_chat_feedback),
         )
         semaphore = asyncio.Semaphore(self.max_concurrent_flushes)
 
