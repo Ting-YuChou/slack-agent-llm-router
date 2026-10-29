@@ -495,12 +495,59 @@ class TestRefitReview:
         assert refit.estimated_cost > 0
         assert refit.actual_fast_lane_hit is False
         assert refit.confidence <= decision.confidence
+        # route_query already counted this request's routing decision.
         assert _metric(
             ROUTER_METRICS.routing_decisions, model="big", query_type="general"
-        ) == (decisions_before + 1)
+        ) == (decisions_before)
         assert _metric(ROUTER_METRICS.refit_outcomes, outcome="rerouted") == (
             rerouted_before + 1
         )
+
+    @pytest.mark.asyncio
+    async def test_reroute_errors_keep_the_decision_with_the_enriched_count(
+        self, monkeypatch
+    ):
+        router = _router(
+            {
+                "mistral-7b": _model("vllm", 8192),
+                "llama-3.1-70b": _model("vllm", 128000),
+            },
+            enriched_tokens=20_000,
+        )
+        request = _request(metadata={"preferred_models": ["mistral-7b"]})
+        decision = await router.route_query(request)
+        errors_before = _metric(ROUTER_METRICS.refit_outcomes, outcome="error")
+
+        def broken(_candidates, _context):
+            raise RuntimeError("scoring exploded")
+
+        monkeypatch.setattr(router, "_select_best_model", broken)
+        request.metadata["web_search_context"] = "ENRICHED web results"
+        refit = await router.refit_routing_decision(request, decision)
+
+        assert refit.selected_model == "mistral-7b"
+        assert refit.token_count == 21_000
+        assert _metric(ROUTER_METRICS.refit_outcomes, outcome="error") == (
+            errors_before + 1
+        )
+
+    @pytest.mark.asyncio
+    async def test_context_errors_keep_the_decision_with_the_enriched_count(self):
+        router = _router({"mistral-7b": _model("vllm", 8192)}, enriched_tokens=100)
+
+        def broken(_query):
+            raise RuntimeError("classifier exploded")
+
+        router.classifier.classify_query = broken
+        request = _request()
+        decision = await router.route_query(request)
+        assert decision.token_count == 1000
+
+        request.metadata["web_search_context"] = "ENRICHED web results"
+        refit = await router.refit_routing_decision(request, decision)
+
+        assert refit.selected_model == "mistral-7b"
+        assert refit.token_count == 1100
 
     @pytest.mark.asyncio
     async def test_no_enrichment_skips_the_refit(self, inference_response_factory):

@@ -868,10 +868,16 @@ class ModelRouter:
         enriched token count, which fallback selection reads.
 
         Any other failure keeps the decision (fail-open, like routing's own
-        error path): the re-check must not fail a request routing served.
+        error path): the re-check must not fail a request routing served. The
+        kept decision still gets a best-effort enriched token count, so
+        fallback selection does not pick a window that is too small.
         """
         try:
-            context = await self._build_query_context(request)
+            return await self._refit_routing_decision(
+                request, decision, required_capability
+            )
+        except (PromptTooLargeError, ModelNotEntitledError):
+            raise
         except Exception:
             logger.exception(
                 "Context-fit re-check failed for request %s; keeping %s",
@@ -879,7 +885,18 @@ class ModelRouter:
                 decision.selected_model,
             )
             ROUTER_METRICS.refit_outcomes.labels(outcome="error").inc()
-            return decision
+            token_count = self._fallback_token_estimate(request)
+            if token_count == decision.token_count:
+                return decision
+            return decision.model_copy(update={"token_count": token_count})
+
+    async def _refit_routing_decision(
+        self,
+        request: QueryRequest,
+        decision: RoutingDecision,
+        required_capability: Optional[str],
+    ) -> RoutingDecision:
+        context = await self._build_query_context(request)
         token_count = int(context["token_count"])
         selected = decision.selected_model
         selected_config = self.models.get(selected)
@@ -933,10 +950,8 @@ class ModelRouter:
                 best_model,
                 token_count,
             )
+            # route_query already counted this request in routing_decisions.
             ROUTER_METRICS.refit_outcomes.labels(outcome="rerouted").inc()
-            ROUTER_METRICS.routing_decisions.labels(
-                model=best_model, query_type=str(context["query_type"])
-            ).inc()
             return decision.model_copy(
                 update={
                     "selected_model": best_model,
