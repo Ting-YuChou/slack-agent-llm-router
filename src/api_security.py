@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import secrets
 from dataclasses import dataclass
@@ -16,7 +17,6 @@ from typing import (
     Awaitable,
     Callable,
     Dict,
-    Iterable,
     List,
     Optional,
     Sequence,
@@ -232,12 +232,42 @@ def validate_external_attachments(request: Any, *, max_attachment_bytes: int) ->
             )
 
 
+# JSON fields around an inline document (filename, metadata, ids).
+RAG_JSON_DOCUMENT_OVERHEAD_BYTES = 64 * 1024
+# Multipart boundaries, part headers and the other form fields.
+RAG_MULTIPART_OVERHEAD_BYTES = 1024 * 1024
+# A batch carries one inline document at most this large plus up to 1000
+# document entries; larger sets go through presigned /rag/uploads.
+RAG_BATCH_OVERHEAD_BYTES = 1024 * 1024
+
+
+def _base64_length(decoded_bytes: int) -> int:
+    return 4 * math.ceil(decoded_bytes / 3)
+
+
+def rag_request_body_limits(upload_config: Dict[str, Any]) -> Dict[str, Dict[str, int]]:
+    """Body caps for the RAG ingestion paths, sized from their own limits."""
+    json_document = _base64_length(
+        int(upload_config.get("json_max_decoded_bytes") or 10_000_000)
+    )
+    multipart_document = int(upload_config.get("multipart_max_bytes") or 100_000_000)
+    return {
+        "/rag/documents": {
+            "application/json": json_document + RAG_JSON_DOCUMENT_OVERHEAD_BYTES,
+            "multipart/form-data": multipart_document + RAG_MULTIPART_OVERHEAD_BYTES,
+        },
+        "/rag/batches": {"application/json": json_document + RAG_BATCH_OVERHEAD_BYTES},
+    }
+
+
 class RequestBodyLimitMiddleware:
     """Pure ASGI middleware that caps request bodies before anything parses them.
 
-    A declared Content-Length above the limit is rejected without reading the
-    body. Otherwise the body is read up to the limit (this also covers chunked
-    bodies without Content-Length) and replayed to the app.
+    The cap is ``path_limits[path][media type]`` (``"*"`` matches any media
+    type) and otherwise ``max_body_bytes``. A declared Content-Length above the
+    cap is rejected without reading the body. Otherwise the body is read up to
+    the cap (this also covers chunked bodies without Content-Length) and
+    replayed to the app.
     """
 
     def __init__(
@@ -245,26 +275,35 @@ class RequestBodyLimitMiddleware:
         app: ASGIApp,
         *,
         max_body_bytes: int,
-        exempt_paths: Iterable[str] = (),
+        path_limits: Optional[Dict[str, Dict[str, int]]] = None,
     ):
         self.app = app
         self.max_body_bytes = int(max_body_bytes)
-        self.exempt_paths = frozenset(exempt_paths)
+        self.path_limits = {
+            path: {str(media).lower(): int(limit) for media, limit in limits.items()}
+            for path, limits in (path_limits or {}).items()
+        }
+
+    def limit_for(self, scope: Dict[str, Any]) -> int:
+        by_media_type = self.path_limits.get(str(scope.get("path") or ""))
+        if not by_media_type:
+            return self.max_body_bytes
+        media_type = _media_type(scope)
+        if media_type in by_media_type:
+            return by_media_type[media_type]
+        return by_media_type.get("*", self.max_body_bytes)
 
     async def __call__(
         self, scope: Dict[str, Any], receive: Receive, send: Send
     ) -> None:
-        if (
-            scope.get("type") != "http"
-            or self.max_body_bytes <= 0
-            or scope.get("path") in self.exempt_paths
-        ):
+        if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
+        limit = self.limit_for(scope)
 
         declared = _declared_content_length(scope)
-        if declared is not None and declared > self.max_body_bytes:
-            await self._reject(send)
+        if declared is not None and declared > limit:
+            await self._reject(send, limit)
             return
 
         chunks: List[bytes] = []
@@ -275,8 +314,8 @@ class RequestBodyLimitMiddleware:
                 return  # the client went away before sending the whole body
             body = message.get("body", b"") or b""
             received += len(body)
-            if received > self.max_body_bytes:
-                await self._reject(send)
+            if received > limit:
+                await self._reject(send, limit)
                 return
             chunks.append(body)
             if not message.get("more_body", False):
@@ -297,13 +336,11 @@ class RequestBodyLimitMiddleware:
 
         await self.app(scope, replay, send)
 
-    async def _reject(self, send: Send) -> None:
+    async def _reject(self, send: Send, limit: int) -> None:
         payload = json.dumps(
             {
                 "error": "request_too_large",
-                "message": (
-                    f"Request body exceeds the {self.max_body_bytes}-byte limit"
-                ),
+                "message": f"Request body exceeds the {limit}-byte limit",
             }
         ).encode("utf-8")
         await send(
@@ -318,6 +355,13 @@ class RequestBodyLimitMiddleware:
             }
         )
         await send({"type": "http.response.body", "body": payload})
+
+
+def _media_type(scope: Dict[str, Any]) -> str:
+    for name, value in scope.get("headers") or []:
+        if name.lower() == b"content-type":
+            return value.decode("latin-1").split(";", 1)[0].strip().lower()
+    return ""
 
 
 def _declared_content_length(scope: Dict[str, Any]) -> Optional[int]:

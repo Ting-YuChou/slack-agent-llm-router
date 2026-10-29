@@ -52,6 +52,7 @@ from src.api_security import (
     api_key_clients_configured,
     apply_principal_entitlements,
     filter_external_metadata,
+    rag_request_body_limits,
     resolve_api_principal,
     validate_external_attachments,
 )
@@ -825,6 +826,14 @@ class LLMRouterPlatform:
         if decision.allowed:
             return None, decision.reservation
         return self._build_admission_response(decision), None
+
+    def _request_body_path_limits(self) -> Dict[str, Dict[str, int]]:
+        """Per-path body caps: RAG ingestion sized from rag.upload, then config."""
+        upload_config = dict((self.config.get("rag", {}) or {}).get("upload", {}) or {})
+        limits = rag_request_body_limits(upload_config)
+        configured = self._security_config().get("request_body_limits") or {}
+        limits.update({path: dict(caps) for path, caps in configured.items()})
+        return limits
 
     def _apply_route_boundary_guards(
         self, query_data: QueryRequest, principal: Optional[ApiPrincipal] = None
@@ -1882,9 +1891,7 @@ class LLMRouterPlatform:
             max_body_bytes=int(
                 security_config.get("max_request_body_bytes") or 2 * 1024 * 1024
             ),
-            exempt_paths=list(
-                security_config.get("request_body_limit_exempt_paths") or []
-            ),
+            path_limits=self._request_body_path_limits(),
         )
 
         @app.get("/")

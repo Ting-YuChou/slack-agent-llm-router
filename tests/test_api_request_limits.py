@@ -3,6 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
+from src.api_security import RequestBodyLimitMiddleware, rag_request_body_limits
 from src.utils.schema import (
     Attachment,
     AttachmentType,
@@ -87,5 +88,105 @@ def test_security_config_defaults_cap_request_bodies():
 
     assert security.max_request_body_bytes == 2 * 1024 * 1024
     assert security.max_attachment_bytes == 1024 * 1024
-    assert "/route" not in security.request_body_limit_exempt_paths
-    assert "/rag/documents" in security.request_body_limit_exempt_paths
+    assert security.request_body_limits == {}
+    assert not hasattr(security, "request_body_limit_exempt_paths")
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [{"rag/batches": {"*": 10}}, {"/rag/batches": {"application/json": 0}}],
+)
+def test_request_body_limits_reject_bad_entries(limits):
+    with pytest.raises(ValidationError):
+        PlatformConfig.model_validate({"security": {"request_body_limits": limits}})
+
+
+def test_request_body_limits_normalize_media_types():
+    security = PlatformConfig.model_validate(
+        {"security": {"request_body_limits": {"/x": {" Application/JSON ": 10}}}}
+    ).security
+
+    assert security.request_body_limits == {"/x": {"application/json": 10}}
+
+
+def test_rag_body_limits_derive_from_the_rag_upload_limits():
+    limits = rag_request_body_limits(
+        {"json_max_decoded_bytes": 3000, "multipart_max_bytes": 500_000}
+    )
+
+    assert limits == {
+        "/rag/documents": {
+            "application/json": 4000 + 64 * 1024,
+            "multipart/form-data": 500_000 + 1024 * 1024,
+        },
+        "/rag/batches": {"application/json": 4000 + 1024 * 1024},
+    }
+
+
+def test_rag_body_limits_use_the_rag_defaults():
+    limits = rag_request_body_limits({})
+
+    # base64 of a 10 MB document is 13_333_336 bytes.
+    assert limits["/rag/documents"]["application/json"] == 13_333_336 + 64 * 1024
+    assert limits["/rag/documents"]["multipart/form-data"] == (
+        100_000_000 + 1024 * 1024
+    )
+
+
+async def _status_for(middleware, path, body, content_type):
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+    sent = []
+
+    async def receive():
+        return messages.pop(0) if messages else {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": path,
+        "headers": [
+            (b"content-type", content_type.encode()),
+            (b"content-length", str(len(body)).encode()),
+        ],
+    }
+    await middleware(scope, receive, send)
+    return sent[0]["status"]
+
+
+async def _ok_app(scope, receive, send):
+    while (await receive()).get("more_body"):
+        pass
+    await send({"type": "http.response.start", "status": 200, "headers": []})
+    await send({"type": "http.response.body", "body": b""})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "content_type", "size", "status"),
+    [
+        ("/route", "application/json", 100, 200),
+        ("/route", "application/json", 101, 413),
+        ("/upload", "application/json; charset=utf-8", 300, 200),
+        ("/upload", "application/json; charset=utf-8", 301, 413),
+        ("/upload", "MULTIPART/FORM-DATA; boundary=x", 500, 200),
+        ("/upload", "multipart/form-data; boundary=x", 501, 413),
+        ("/upload", "text/plain", 101, 413),
+        ("/any-type", "text/plain", 700, 200),
+    ],
+)
+async def test_body_limit_is_chosen_by_path_and_media_type(
+    path, content_type, size, status
+):
+    middleware = RequestBodyLimitMiddleware(
+        _ok_app,
+        max_body_bytes=100,
+        path_limits={
+            "/upload": {"application/json": 300, "multipart/form-data": 500},
+            "/any-type": {"*": 700},
+        },
+    )
+
+    assert await _status_for(middleware, path, b"x" * size, content_type) == status

@@ -1032,12 +1032,34 @@ class SecurityConfig(ConfigModel):
     cors: CorsSecurityConfig = Field(default_factory=CorsSecurityConfig)
     # Request bodies above this size get 413 before they are parsed.
     max_request_body_bytes: int = Field(2 * 1024 * 1024, ge=1)
-    # Document ingestion endpoints enforce their own, larger limits.
-    request_body_limit_exempt_paths: List[str] = Field(
-        default_factory=lambda: ["/rag/documents", "/rag/batches"]
-    )
+    # Per-path caps by media type ("*" matches any), e.g.
+    # {"/rag/batches": {"application/json": 20000000}}. A path listed here
+    # replaces its default; /rag/documents and /rag/batches otherwise get caps
+    # derived from rag.upload. Other media types use max_request_body_bytes.
+    request_body_limits: Dict[str, Dict[str, int]] = Field(default_factory=dict)
     # POST /route rejects any attachment declared or sent above this size.
     max_attachment_bytes: int = Field(1024 * 1024, ge=1)
+
+    @field_validator("request_body_limits")
+    @classmethod
+    def validate_request_body_limits(
+        cls, value: Dict[str, Dict[str, int]]
+    ) -> Dict[str, Dict[str, int]]:
+        for path, by_media_type in value.items():
+            if not path.startswith("/"):
+                raise ValueError(f"request_body_limits path must start with /: {path}")
+            for media_type, limit in by_media_type.items():
+                if limit < 1:
+                    raise ValueError(
+                        f"request_body_limits[{path}][{media_type}] must be >= 1"
+                    )
+        return {
+            path: {
+                media_type.strip().lower(): limit
+                for media_type, limit in by_media_type.items()
+            }
+            for path, by_media_type in value.items()
+        }
 
 
 class DatabasePoolConfig(ConfigModel):

@@ -837,12 +837,11 @@ policy_cache:
   consumer:
     group_id: llm-router-policy-materializer
 security:
-  # Bodies above this get 413 before parsing; RAG ingestion paths keep their
-  # own document limits.
+  # Bodies above this get 413 before parsing. /rag/documents and /rag/batches
+  # get caps derived from rag.upload (base64 or multipart document limit plus
+  # overhead); request_body_limits overrides a path, by media type ("*" = any).
   max_request_body_bytes: 2097152
-  request_body_limit_exempt_paths:
-  - /rag/documents
-  - /rag/batches
+  request_body_limits: {}
   max_attachment_bytes: 1048576
   api_keys:
     enabled: true

@@ -1384,6 +1384,95 @@ class TestApiApp:
         assert response.status_code != 413
         assert response.json()["error"] == "rag_disabled"
 
+    @pytest.mark.parametrize(
+        ("path", "body_size"),
+        [("/rag/documents", 100_000), ("/rag/batches", 1_200_000)],
+    )
+    def test_rag_json_body_over_its_derived_cap_gets_413_before_parsing(
+        self, path, body_size, tmp_path, patched_platform_deps
+    ):
+        # json_max_decoded_bytes=3000: a document's base64 is at most 4000 bytes,
+        # so /rag/documents allows 4000 + 64 KiB and /rag/batches 4000 + 1 MiB.
+        platform = _admission_platform(
+            tmp_path,
+            overrides={
+                "rag": {"enabled": False, "upload": {"json_max_decoded_bytes": 3000}}
+            },
+        )
+        admission = DummyAdmissionController()
+        platform.services["admission"] = admission
+        app = platform._create_fastapi_app()
+        body = json.dumps({"filename": "a.txt", "content_base64": "A" * body_size})
+
+        with TestClient(app) as client:
+            response = client.post(
+                path, content=body, headers={"Content-Type": "application/json"}
+            )
+
+        assert response.status_code == 413
+        assert response.json()["error"] == "request_too_large"
+        assert admission.http_calls == []
+
+    def test_rag_multipart_document_keeps_the_larger_multipart_cap(
+        self, tmp_path, patched_platform_deps
+    ):
+        platform = _admission_platform(
+            tmp_path,
+            overrides={
+                "rag": {
+                    "enabled": False,
+                    "upload": {
+                        "json_max_decoded_bytes": 3000,
+                        "multipart_max_bytes": 500_000,
+                    },
+                }
+            },
+        )
+        platform.services["admission"] = DummyAdmissionController()
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            accepted = client.post(
+                "/rag/documents", files={"file": ("a.txt", b"A" * 400_000)}
+            )
+            rejected = client.post(
+                "/rag/documents", files={"file": ("a.txt", b"A" * 2_000_000)}
+            )
+
+        assert accepted.status_code == 503
+        assert accepted.json()["error"] == "rag_disabled"
+        assert rejected.status_code == 413
+        assert rejected.json()["error"] == "request_too_large"
+
+    def test_configured_request_body_limit_overrides_the_derived_cap(
+        self, tmp_path, patched_platform_deps
+    ):
+        platform = _admission_platform(
+            tmp_path,
+            overrides={
+                "security": {
+                    "api_keys": {"enabled": False},
+                    "request_body_limits": {"/rag/batches": {"*": 1000}},
+                }
+            },
+        )
+        admission = DummyAdmissionController()
+        platform.services["admission"] = admission
+        app = platform._create_fastapi_app()
+        body = json.dumps(
+            {"documents": [{"filename": "a.txt", "storage_ref": "x" * 2000}]}
+        )
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/rag/batches",
+                content=body,
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert response.status_code == 413
+        assert admission.http_calls == []
+
     def test_route_strips_server_only_metadata_from_external_requests(
         self, tmp_path, patched_platform_deps
     ):
