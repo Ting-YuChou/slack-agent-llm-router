@@ -746,9 +746,16 @@ class ResponseCache:
         }
 
 
+def _provider_http_timeout(read_seconds: float) -> httpx.Timeout:
+    """Fail fast on connect and pool waits; allow the provider timeout per read."""
+    return httpx.Timeout(connect=3.0, read=read_seconds, write=10.0, pool=2.0)
+
+
 class BaseInferenceProvider(ABC):
     """Abstract base class for inference providers"""
 
+    # Provider timeout when the config sets none (a dumped config holds None).
+    DEFAULT_TIMEOUT_SECONDS = 60.0
     ATTACHMENT_PROMPT_CHAR_LIMIT = 12_000
     ATTACHMENT_PREVIEW_CHAR_LIMIT = 4_000
     TEXT_MIME_MARKERS = (
@@ -765,6 +772,13 @@ class BaseInferenceProvider(ABC):
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.client = None
+
+    def timeout_seconds(self) -> float:
+        """Longest a single provider call may take, in seconds."""
+        value = self.config.get("timeout") if isinstance(self.config, dict) else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            return float(self.DEFAULT_TIMEOUT_SECONDS)
+        return float(value)
 
     @abstractmethod
     async def initialize(self):
@@ -937,7 +951,7 @@ class OpenAIProvider(BaseInferenceProvider):
         self.client = openai.AsyncOpenAI(
             api_key=api_key,
             base_url=self.config.get("base_url", "https://api.openai.com/v1"),
-            timeout=self.config.get("timeout", 60),
+            timeout=_provider_http_timeout(self.timeout_seconds()),
             max_retries=0,
         )
         logger.info("OpenAI provider initialized")
@@ -1167,7 +1181,7 @@ class AnthropicProvider(BaseInferenceProvider):
         self.client = anthropic.AsyncAnthropic(
             api_key=api_key,
             base_url=self.config.get("base_url", "https://api.anthropic.com"),
-            timeout=self.config.get("timeout", 60),
+            timeout=_provider_http_timeout(self.timeout_seconds()),
             max_retries=0,
         )
         logger.info("Anthropic provider initialized")
@@ -1363,6 +1377,8 @@ class AnthropicProvider(BaseInferenceProvider):
 class vLLMProvider(BaseInferenceProvider):
     """vLLM self-hosted provider implementation"""
 
+    DEFAULT_TIMEOUT_SECONDS = 300.0  # Local inference may take longer.
+
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
         self.endpoints = self._build_endpoint_states(config)
@@ -1399,9 +1415,7 @@ class vLLMProvider(BaseInferenceProvider):
 
             endpoint.client = httpx.AsyncClient(
                 base_url=endpoint.base_url,
-                timeout=self.config.get(
-                    "timeout", 300
-                ),  # Longer timeout for local inference
+                timeout=_provider_http_timeout(self.timeout_seconds()),
             )
             if self.http_client is None:
                 self.http_client = endpoint.client
@@ -2313,6 +2327,13 @@ class InferenceEngine:
         request_id = hashlib.md5(
             f"{request.user_id}:{request.query}:{time.time()}".encode()
         ).hexdigest()
+        # One deadline for the whole request: time spent on retrieval comes out
+        # of the model calls' share instead of extending the request.
+        execution_budget = (
+            self.scheduler.create_execution_budget()
+            if "scheduler" in self.config
+            else None
+        )
 
         try:
             # Step 1: Route query to appropriate model
@@ -2323,7 +2344,9 @@ class InferenceEngine:
             compressed_context = await self._compress_request_context_if_needed(request)
 
             # Step 3: Optionally enrich school-document requests with RAG context.
-            rag_result = await self._run_rag_if_needed(request, routing_decision)
+            rag_result = await self._within_request_deadline(
+                self._run_rag_if_needed(request, routing_decision), execution_budget
+            )
             if rag_result and rag_result.required_no_hits:
                 response = self._build_required_rag_no_hit_response(
                     request,
@@ -2345,9 +2368,9 @@ class InferenceEngine:
             model_name = routing_decision.selected_model
 
             # Step 4: Optionally enrich current-info requests with web search.
-            web_search_result = await self._run_web_search_if_needed(
-                request,
-                routing_decision,
+            web_search_result = await self._within_request_deadline(
+                self._run_web_search_if_needed(request, routing_decision),
+                execution_budget,
             )
 
             # Step 5: Check full-response cache.
@@ -2369,11 +2392,7 @@ class InferenceEngine:
             ) = await self._generate_response_with_fallback(
                 request,
                 routing_decision,
-                execution_budget=(
-                    self.scheduler.create_execution_budget()
-                    if "scheduler" in self.config
-                    else None
-                ),
+                execution_budget=execution_budget,
             )
             response.compressed_context = compressed_context
             self._attach_rag_result(response, rag_result)
@@ -3005,6 +3024,18 @@ class InferenceEngine:
         provider_name = model_info["config"]["provider"]
         return self.providers.get(provider_name)
 
+    async def _within_request_deadline(
+        self,
+        awaitable: Awaitable[Any],
+        execution_budget: Optional[RequestExecutionBudget],
+    ) -> Any:
+        """Await a step before the model call, at most until the request deadline."""
+        if execution_budget is None:
+            return await awaitable
+        return await asyncio.wait_for(
+            awaitable, timeout=execution_budget.remaining_seconds
+        )
+
     async def _generate_response_with_fallback(
         self,
         request: QueryRequest,
@@ -3053,10 +3084,16 @@ class InferenceEngine:
     ) -> Tuple[InferenceResponse, str, Any]:
         primary_model = routing_decision.selected_model
         primary_started_at = time.time()
+        fallback_reserve_seconds = self._primary_fallback_reserve_seconds(
+            request, routing_decision, execution_budget
+        )
 
         try:
             response = await self._execute_model_request(
-                request, primary_model, execution_budget=execution_budget
+                request,
+                primary_model,
+                execution_budget=execution_budget,
+                fallback_reserve_seconds=fallback_reserve_seconds,
             )
             return response, primary_model, routing_decision
         except AdmissionRejectedError as exc:
@@ -3262,13 +3299,46 @@ class InferenceEngine:
             request, routing_decision, execution_budget=None
         )
 
+    def _primary_fallback_reserve_seconds(
+        self,
+        request: QueryRequest,
+        routing_decision: Any,
+        execution_budget: Optional[RequestExecutionBudget],
+    ) -> float:
+        """Time the primary model leaves for its fallback route, if it has one."""
+        if execution_budget is None:
+            return 0.0
+        reserve_seconds = execution_budget.fallback_reserve_seconds()
+        if reserve_seconds <= 0:
+            return 0.0
+        if getattr(request, "_rag_images", []):
+            # A failed vision call is retried as text only.
+            return reserve_seconds
+        try:
+            has_fallback = bool(
+                self._get_local_fallback_models(
+                    request,
+                    routing_decision,
+                    exclude_models=[routing_decision.selected_model],
+                )
+            )
+        except Exception:
+            logger.debug("Fallback route lookup failed", exc_info=True)
+            return 0.0
+        return reserve_seconds if has_fallback else 0.0
+
     async def _execute_model_request(
         self,
         request: QueryRequest,
         model_name: str,
         execution_budget: Optional[RequestExecutionBudget] = None,
+        fallback_reserve_seconds: float = 0.0,
     ) -> InferenceResponse:
-        """Execute a request against a specific model."""
+        """Execute a request against a specific model.
+
+        ``fallback_reserve_seconds`` of the request deadline stay unused by this
+        model's attempts, so a fallback can still run after it hangs.
+        """
         provider = self._get_provider_for_model(model_name)
         if not provider:
             raise ValueError(f"No provider available for model: {model_name}")
@@ -3278,6 +3348,11 @@ class InferenceEngine:
             model_info.get("config", {}).get("provider")
             or getattr(provider, "provider_name", None)
             or "unknown"
+        )
+        attempt_timeout_seconds = (
+            provider.timeout_seconds()
+            if isinstance(provider, BaseInferenceProvider)
+            else None
         )
         return await self.single_flight.run(
             request,
@@ -3292,6 +3367,8 @@ class InferenceEngine:
                 ),
                 operation=lambda: provider.generate_response(request, model_name),
                 execution_budget=execution_budget,
+                attempt_timeout_seconds=attempt_timeout_seconds,
+                fallback_reserve_seconds=fallback_reserve_seconds,
             ),
         )
 

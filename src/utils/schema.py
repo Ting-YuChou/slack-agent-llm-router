@@ -646,6 +646,9 @@ class ProviderSchedulerConfig(ConfigModel):
     allow_fallback_on_provider_rejection: bool = True
     key_prefix: str = "provider_scheduler"
     request_deadline_seconds: float = Field(60.0, gt=0)
+    # Share of the time left when model calls start that a primary model
+    # leaves for its fallback route, when it has one.
+    fallback_reserve_ratio: float = Field(0.3, ge=0.0, lt=1.0)
     retry: SchedulerRetryConfig = Field(default_factory=SchedulerRetryConfig)
     circuit_breaker: SchedulerCircuitBreakerConfig = Field(
         default_factory=SchedulerCircuitBreakerConfig
