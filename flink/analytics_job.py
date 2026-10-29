@@ -986,8 +986,18 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
         aggregate["latest_event"] = {}
         aggregate["latest_event_timestamp_ms"] = -1
         aggregate["latest_arrival_sequence"] = -1
+        aggregate["max_event_timestamp_ms"] = -1
         for _, raw_bucket in self.bucket_state.items():
             bucket = json.loads(raw_bucket)
+            aggregate["max_event_timestamp_ms"] = max(
+                int(aggregate["max_event_timestamp_ms"]),
+                int(
+                    bucket.get(
+                        "max_event_timestamp_ms",
+                        bucket.get("latest_event_timestamp_ms", -1),
+                    )
+                ),
+            )
             if int(bucket.get("latest_arrival_sequence", -1)) >= int(
                 aggregate.get("latest_arrival_sequence", -1)
             ):

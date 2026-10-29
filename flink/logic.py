@@ -1373,6 +1373,7 @@ def _empty_routing_policy_aggregate() -> Dict[str, Any]:
         "failed_provider_counts": {},
         "latest_event": {},
         "latest_event_timestamp_ms": -1,
+        "max_event_timestamp_ms": -1,
         "latest_arrival_sequence": -1,
     }
 
@@ -1458,6 +1459,9 @@ def add_routing_policy_event(
     if provider and not succeeded and counts_toward_provider_health(event):
         _increment_count(aggregate.setdefault("failed_provider_counts", {}), provider)
 
+    aggregate["max_event_timestamp_ms"] = max(
+        _safe_int(aggregate.get("max_event_timestamp_ms"), -1), event_timestamp_ms
+    )
     if arrival_sequence >= int(aggregate.get("latest_arrival_sequence", -1)):
         aggregate["latest_arrival_sequence"] = arrival_sequence
         aggregate["latest_event_timestamp_ms"] = event_timestamp_ms
@@ -1514,6 +1518,16 @@ def merge_routing_policy_aggregate(
         target_counts = target.setdefault(key, {})
         for item, count in source.get(key, {}).items():
             _increment_count(target_counts, item, sign * int(count))
+    if sign > 0:
+        target["max_event_timestamp_ms"] = max(
+            _safe_int(target.get("max_event_timestamp_ms"), -1),
+            _safe_int(
+                source.get(
+                    "max_event_timestamp_ms", source.get("latest_event_timestamp_ms")
+                ),
+                -1,
+            ),
+        )
     if sign > 0 and int(source.get("latest_arrival_sequence", -1)) >= int(
         target.get("latest_arrival_sequence", -1)
     ):
@@ -1732,8 +1746,12 @@ def build_routing_policy_state_event_from_aggregate(
         )
     }
     # emitted_at is when Flink emitted the state; latest_event_at is the
-    # newest completion it covers, which a replay leaves unchanged.
-    latest_event_ms = _safe_int(aggregate.get("latest_event_timestamp_ms"), -1)
+    # newest completion time it covers (the maximum, not the last arrival),
+    # which a replay leaves unchanged.
+    latest_event_ms = max(
+        _safe_int(aggregate.get("max_event_timestamp_ms"), -1),
+        _safe_int(aggregate.get("latest_event_timestamp_ms"), -1),
+    )
     latest_event_at = (
         _isoformat(datetime.fromtimestamp(latest_event_ms / 1000.0, tz=timezone.utc))
         if latest_event_ms >= _MIN_WALL_CLOCK_MS

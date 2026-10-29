@@ -513,6 +513,24 @@ class RoutingPolicyCache:
     def _guardrail_cache_key(self, scope_type: str, identifier: str) -> str:
         return self._cache_key(f"guardrail:{scope_type}", identifier)
 
+    def _request_hint_cache_key(self, request_id: str) -> str:
+        """fast_lane_hints' own request record; reads merge it over requests.enriched."""
+        return self._cache_key("request_hint", request_id)
+
+    def _merge_request_records(
+        self,
+        enriched: Optional[Dict[str, Any]],
+        hint: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """One request policy from both sources, the hint over the enrichment.
+
+        Each consumer writes its own key, so neither drops the other's
+        fields however their events are ordered (A6 review).
+        """
+        if enriched and hint:
+            return self._merge_policy_records(enriched, hint)
+        return enriched or hint or None
+
     def _user_hint_cache_key(self, user_id: str) -> str:
         return self._cache_key("user_hint", user_id)
 
@@ -738,7 +756,10 @@ class RoutingPolicyCache:
         """Get request-scoped policy hints if present."""
         if not request_id:
             return None
-        return await self._get_json(self._cache_key("request", request_id))
+        return self._merge_request_records(
+            await self._get_json(self._cache_key("request", request_id)),
+            await self._get_json(self._request_hint_cache_key(request_id)),
+        )
 
     async def get_user_policy(self, user_id: str) -> Optional[Dict[str, Any]]:
         """Get the user-scoped policy view: the rolling routing.policy_state.
@@ -781,18 +802,22 @@ class RoutingPolicyCache:
         indexes; guardrail payloads not in L1 take one MGET more.
         """
         request_key = self._cache_key("request", request_id) if request_id else None
+        hint_key = self._request_hint_cache_key(request_id) if request_id else None
         session_key = self._cache_key("session", session_id) if session_id else None
         user_key = self._user_state_cache_key(user_id) if user_id else None
         try:
             records, members = await self._read_policy_state(
-                [key for key in (request_key, session_key, user_key) if key],
+                [key for key in (request_key, hint_key, session_key, user_key) if key],
                 GUARDRAIL_SCOPE_TYPES,
             )
             active_guardrails = await self._guardrail_policy(members)
         except PolicyCacheUnavailableError as e:
             self._record_unavailable(e.reason)
             return self._unavailable_policy()
-        request_policy = records.get(request_key) if request_key else None
+        request_policy = self._merge_request_records(
+            records.get(request_key) if request_key else None,
+            records.get(hint_key) if hint_key else None,
+        )
         session_policy = records.get(session_key) if session_key else None
         user_policy = records.get(user_key) if user_key else None
         merged: Dict[str, Any] = {}
@@ -900,7 +925,6 @@ class RoutingPolicyCache:
 
         request_id = _event_text(event, "request_id")
         user_id = _event_text(event, "user_id")
-        existing_request_policy = await self.get_request_policy(request_id)
         selected_model = _event_text(event, "selected_model") or None
         preferred_models = [selected_model] if selected_model else []
         updated_at = event.get("emitted_at")
@@ -943,14 +967,10 @@ class RoutingPolicyCache:
             "source_event_type": event.get("event_type", "fast_lane_hints"),
             "updated_at": updated_at,
         }
-        if existing_request_policy:
-            request_policy = self._merge_policy_records(
-                existing_request_policy, request_policy
-            )
-
+        # The hint has its own key: no read-modify-write of the enrichment.
         if request_id:
             await self._set_json(
-                self._cache_key("request", request_id),
+                self._request_hint_cache_key(request_id),
                 request_policy,
                 self.request_ttl_seconds,
                 event_time_ms=policy_event_time_ms(event, "emitted_at"),
