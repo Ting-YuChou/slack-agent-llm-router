@@ -5,13 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, TypeVar
 
 import httpx
 
 from slack.files import download_slack_file, error_name, is_allowed_slack_file_url
+from slack.thread_history import (
+    DEFAULT_MAX_THREAD_PAGES,
+    bounded_join_newest,
+    fetch_newest_thread_messages,
+    raise_for_slack_error,
+)
 
 
 class AgentBootstrapFetchError(RuntimeError):
@@ -79,7 +84,7 @@ class AgentBootstrapBuilder:
     _LIST_MIME_TYPES = {"application/vnd.slack-list"}
     _INCLUDED_SUBTYPES = (None, "file_share", "thread_broadcast")
     _RESOURCE_CONCURRENCY = 4
-    _DEFAULT_MAX_THREAD_PAGES = 10
+    _DEFAULT_MAX_THREAD_PAGES = DEFAULT_MAX_THREAD_PAGES
     _DEFAULT_REQUEST_TIMEOUT_SECONDS = 5.0
 
     def __init__(
@@ -238,69 +243,40 @@ class AgentBootstrapBuilder:
         }
         if latest_ts:
             kwargs.update({"latest": latest_ts, "inclusive": False})
-        messages_window: deque[Dict[str, Any]] = deque(maxlen=max(max_messages, 1))
-        eligible_count = 0
-        cursor: Optional[str] = None
-        pagination_incomplete = False
         partial = False
         warnings: List[str] = []
         max_pages = max(
             int(self.settings.get("max_thread_pages", self._DEFAULT_MAX_THREAD_PAGES)),
             1,
         )
-        pages = 0
-        while True:
-            page_kwargs = dict(kwargs)
-            if cursor:
-                page_kwargs["cursor"] = cursor
-            try:
-                response = await self._within_budget(
-                    lambda: method(**page_kwargs), deadline
-                )
-            except asyncio.TimeoutError as exc:
-                if not pages:
-                    # Nothing loaded yet: fail open or closed as configured.
-                    raise
-                pagination_incomplete = True
-                if isinstance(exc, _BudgetExhausted):
-                    partial = True
-                else:
-                    warnings.append("thread_page_timeout")
-                break
-            pages += 1
-            self._raise_for_slack_error(response)
-            page_messages = list((response or {}).get("messages", []) or [])
-            eligible_messages = [
-                message
-                for message in page_messages
-                if isinstance(message, dict)
-                and self._include_message(message, latest_ts)
-                and (
-                    self._message_text(message)
-                    or any(
-                        isinstance(item, dict) for item in (message.get("files") or [])
-                    )
-                )
-            ]
-            eligible_count += len(eligible_messages)
-            messages_window.extend(eligible_messages)
-            metadata = (response or {}).get("response_metadata", {}) or {}
-            next_cursor = str(metadata.get("next_cursor") or "")
-            has_more = bool((response or {}).get("has_more") or next_cursor)
-            if not has_more:
-                break
-            if not next_cursor:
-                pagination_incomplete = True
-                break
-            if pages >= max_pages:
-                pagination_incomplete = True
-                warnings.append("thread_page_cap")
-                break
-            cursor = next_cursor
 
-        messages = list(messages_window) if max_messages > 0 else []
-        messages.sort(key=lambda message: self._timestamp_key(message.get("ts")))
-        truncated = pagination_incomplete or eligible_count > max_messages
+        def eligible(message: Dict[str, Any]) -> bool:
+            return self._include_message(message, latest_ts) and bool(
+                self._message_text(message)
+                or any(isinstance(item, dict) for item in (message.get("files") or []))
+            )
+
+        async def send(request: Callable[[], Awaitable[Any]]) -> Any:
+            return await self._within_budget(request, deadline)
+
+        window = await fetch_newest_thread_messages(
+            method,
+            kwargs,
+            max_messages=max_messages,
+            eligible=eligible,
+            max_pages=max_pages,
+            send=send,
+        )
+        if window.stopped_by is not None:
+            if isinstance(window.stopped_by, _BudgetExhausted):
+                partial = True
+            else:
+                warnings.append("thread_page_timeout")
+        if window.page_cap_reached:
+            warnings.append("thread_page_cap")
+
+        messages = window.messages if max_messages > 0 else []
+        truncated = window.incomplete or window.eligible_count > max_messages
 
         message_lines: List[str] = []
         files: List[Dict[str, Any]] = []
@@ -657,37 +633,14 @@ class AgentBootstrapBuilder:
 
     @staticmethod
     def _raise_for_slack_error(response: Any) -> None:
-        if isinstance(response, dict) and response.get("ok") is False:
-            raise RuntimeError(str(response.get("error") or "slack_api_error"))
+        raise_for_slack_error(response)
 
     @classmethod
     def _bounded_join_newest(
         cls, parts: List[str], limit: int
     ) -> tuple[str, int, bool]:
-        """Fill the budget from the newest part back, then restore order.
-
-        Returns the joined text, how many parts it includes (a partially
-        kept part counts) and whether anything was dropped or cut.
-        """
-        kept: List[str] = []
-        used = 0
-        truncated = False
-        for raw_part in reversed(parts):
-            part = str(raw_part).strip()
-            if not part:
-                continue
-            separator = 1 if kept else 0
-            if used + separator + len(part) <= limit:
-                kept.append(part)
-                used += separator + len(part)
-                continue
-            remaining = limit - used - separator
-            if remaining > 3:
-                kept.append(part[: remaining - 3].rstrip() + "...")
-            truncated = True
-            break
-        kept.reverse()
-        return "\n".join(kept), len(kept), truncated
+        """Fill the budget from the newest part back, then restore order."""
+        return bounded_join_newest(parts, limit)
 
     @staticmethod
     def _bounded_join(parts: Iterable[str], limit: int) -> tuple[str, bool]:
@@ -710,17 +663,6 @@ class AgentBootstrapBuilder:
             truncated = True
             break
         return output, truncated
-
-    @staticmethod
-    def _timestamp_key(value: Any) -> tuple[int, int]:
-        try:
-            seconds, fraction = str(value).split(".", 1)
-        except ValueError:
-            seconds, fraction = str(value or "0"), "0"
-        try:
-            return int(seconds), int(fraction)
-        except ValueError:
-            return 0, 0
 
     @staticmethod
     def _sender(message: Dict[str, Any]) -> str:

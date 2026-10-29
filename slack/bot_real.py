@@ -54,6 +54,13 @@ from slack.agent_shortcut import (
     build_agent_shortcut_modal,
     parse_agent_shortcut_submission,
 )
+from slack.thread_history import (
+    DEFAULT_MAX_THREAD_PAGES,
+    MAX_THREAD_PAGE_LIMIT,
+    bounded_join_newest,
+    fetch_newest_thread_messages,
+    raise_for_slack_error,
+)
 from slack.files import (
     declares_html,
     download_slack_file,
@@ -178,6 +185,10 @@ RATE_LIMIT_BURST_WINDOW_SECONDS = 300
 # files, and a reply also sent to the channel. Edits, deletions, joins and the
 # like are never a new request. The same set the Agent thread context reads.
 CHAT_MESSAGE_SUBTYPES = frozenset(AgentBootstrapBuilder._INCLUDED_SUBTYPES)
+# How the bot's own messages appear in the Slack history a request sees.
+SLACK_OWN_MESSAGE_SENDER = "assistant (you)"
+# Most characters of per-user conversation summary a request carries.
+CONVERSATION_SUMMARY_MAX_CHARS = 8000
 SLACK_PRIORITY_WORK_KINDS = frozenset({"interactive"})
 AGENT_TASK_ECHO_LIMIT = 2500
 AGENT_SHORTCUT_NONCE_TTL_SECONDS = 300
@@ -1520,23 +1531,31 @@ class ConversationManager:
     def get_conversation_summary(
         self, user_id: str, channel_id: str, thread_ts: str = None
     ) -> str:
-        """Get conversation summary for context"""
+        """Get this user's recent turns with the bot, one line per turn.
+
+        Only for requests without a Slack transcript. Whitespace collapses
+        to single spaces, so no turn can forge a line of its own; user turns
+        keep their first 200 characters and answers stay whole, within an
+        overall budget filled from the newest turn back.
+        """
         context_key = f"{user_id}:{channel_id}:{thread_ts or 'main'}"
         context = self.conversations.get(context_key)
 
         if not context or not context.conversation_history:
             return ""
 
-        # Create summary of recent conversation
-        recent_messages = context.conversation_history[-10:]  # Last 10 messages
         summary_parts = []
-
-        for msg in recent_messages:
+        for msg in context.conversation_history[-10:]:
             role = msg["role"]
-            content = msg["content"][:200]  # Truncate long messages
+            content = " ".join(str(msg["content"] or "").split())
+            if role != "assistant":
+                content = content[:200]
             summary_parts.append(f"{role}: {content}")
 
-        return "\n".join(summary_parts)
+        summary, _, _ = bounded_join_newest(
+            summary_parts, CONVERSATION_SUMMARY_MAX_CHARS
+        )
+        return summary
 
 
 class SlackMessageHandler:
@@ -3031,11 +3050,6 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             context.preferences = user_prefs
 
             # Build request-scoped Slack and bot conversation context.
-            conversation_context = (
-                self.bot.conversation_manager.get_conversation_summary(
-                    user_id, channel_id, thread_ts
-                )
-            )
             slack_context = SlackFetchedContext()
             slack_context_builder = getattr(self.bot, "_build_slack_context", None)
             if callable(slack_context_builder):
@@ -3044,6 +3058,15 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                     channel_id=channel_id,
                     thread_ts=thread_ts,
                     message_ts=message_ts,
+                )
+            # The thread transcript already holds this user's turns and the
+            # bot's answers; the summary only stands in when there is none.
+            conversation_context = ""
+            if slack_context.source != "thread" or slack_context.error:
+                conversation_context = (
+                    self.bot.conversation_manager.get_conversation_summary(
+                        user_id, channel_id, thread_ts
+                    )
                 )
 
             request_context = self._join_context_sections(
@@ -4159,34 +4182,46 @@ class SlackBot:
             if not callable(method):
                 raise RuntimeError(f"{method_name}_unavailable")
 
+            max_messages = int(self.context_settings.get("max_thread_messages", 20))
             kwargs: Dict[str, Any] = {
                 "channel": channel_id,
                 "ts": thread_ts,
-                "limit": int(self.context_settings.get("max_thread_messages", 20)),
+                "limit": min(max(max_messages, 1), MAX_THREAD_PAGE_LIMIT),
             }
             if message_ts:
                 kwargs["latest"] = message_ts
                 kwargs["inclusive"] = False
-            response = await method(**kwargs)
-            source = "thread"
-        else:
-            if not message_ts:
-                return SlackFetchedContext()
-            method_name = "conversations_history"
-            method = getattr(client, method_name, None)
-            if not callable(method):
-                raise RuntimeError(f"{method_name}_unavailable")
-
-            response = await method(
-                channel=channel_id,
-                latest=message_ts,
-                inclusive=False,
-                limit=int(self.context_settings.get("max_channel_messages", 10)),
+            window = await fetch_newest_thread_messages(
+                method,
+                kwargs,
+                max_messages=max_messages,
+                eligible=lambda message: self._should_include_slack_context_message(
+                    message, message_ts
+                ),
+                max_pages=int(
+                    self.context_settings.get(
+                        "max_thread_pages", DEFAULT_MAX_THREAD_PAGES
+                    )
+                ),
             )
-            source = "channel"
+            fetched = self._format_slack_context(window.messages, "thread")
+            fetched.truncated = fetched.truncated or window.truncated
+            return fetched
 
-        if isinstance(response, dict) and response.get("ok") is False:
-            raise RuntimeError(str(response.get("error") or "slack_api_error"))
+        if not message_ts:
+            return SlackFetchedContext()
+        method_name = "conversations_history"
+        method = getattr(client, method_name, None)
+        if not callable(method):
+            raise RuntimeError(f"{method_name}_unavailable")
+
+        response = await method(
+            channel=channel_id,
+            latest=message_ts,
+            inclusive=False,
+            limit=int(self.context_settings.get("max_channel_messages", 10)),
+        )
+        raise_for_slack_error(response)
 
         messages = list((response or {}).get("messages", []) or [])
         messages.sort(key=lambda message: self._slack_message_sort_key(message))
@@ -4195,27 +4230,54 @@ class SlackBot:
             for message in messages
             if self._should_include_slack_context_message(message, message_ts)
         ]
-        return self._format_slack_context(filtered_messages, source)
+        return self._format_slack_context(filtered_messages, "channel")
+
+    def _is_own_slack_message(self, message: Dict[str, Any]) -> bool:
+        """Whether this bot posted the message, e.g. one of its own answers."""
+        return bool(self.bot_user_id) and message.get("user") == self.bot_user_id
 
     def _should_include_slack_context_message(
         self, message: Dict[str, Any], current_ts: Optional[str]
     ) -> bool:
-        """Filter Slack system/bot/current-query messages out of fetched context."""
+        """Filter Slack system/other-bot/current-query messages out of context.
+
+        The bot's own answers stay: a follow-up from anyone in the thread
+        needs them. Other bots follow `include_bot_messages`.
+        """
         if self._same_slack_timestamp(message.get("ts"), current_ts):
             return False
-        if message.get("subtype"):
+        if message.get("subtype") not in CHAT_MESSAGE_SUBTYPES:
             return False
-        if not self.context_settings.get("include_bot_messages", False):
+        if not self._is_own_slack_message(message) and not self.context_settings.get(
+            "include_bot_messages", False
+        ):
             if message.get("bot_id") or message.get("user") == self.bot_user_id:
                 return False
-        if not self._clean_slack_message_text(message.get("text", "")):
+        if not self._slack_context_message_text(message):
             return False
         return bool(self._slack_message_sender(message))
+
+    def _slack_context_message_text(self, message: Dict[str, Any]) -> str:
+        """A message's text, or the names of the files it shared without any."""
+        text = self._clean_slack_message_text(message.get("text", ""))
+        if text:
+            return text
+        names = [
+            self._clean_slack_message_text(item.get("name") or item.get("title"))
+            for item in (message.get("files") or [])
+            if isinstance(item, dict)
+        ]
+        names = [name for name in names if name]
+        return f"[shared file: {', '.join(names)}]" if names else ""
 
     def _format_slack_context(
         self, messages: List[Dict[str, Any]], source: str
     ) -> SlackFetchedContext:
-        """Render Slack messages into a compact deterministic context block."""
+        """Render Slack messages into a compact deterministic context block.
+
+        The budget fills from the newest message back, so a long history
+        loses its oldest messages, and the block keeps chronological order.
+        """
         if not messages:
             return SlackFetchedContext(source=source)
 
@@ -4223,44 +4285,31 @@ class SlackBot:
             "Slack thread context:" if source == "thread" else "Recent channel context:"
         )
         candidate_lines = [
-            f"{self._slack_message_sender(message)}: "
-            f"{self._clean_slack_message_text(message.get('text', ''))}"
+            f"{self._slack_context_sender(message)}: "
+            f"{self._slack_context_message_text(message)}"
             for message in messages
         ]
 
         max_chars = int(self.context_settings.get("max_context_chars", 4000))
-        output_lines = [header]
-        included_count = 0
-        truncated = False
-
-        for line in candidate_lines:
-            current_text = "\n".join(output_lines)
-            separator_len = 1 if current_text else 0
-            remaining = max_chars - len(current_text) - separator_len
-            if remaining <= 0:
-                truncated = True
-                break
-            if len(line) <= remaining:
-                output_lines.append(line)
-                included_count += 1
-                continue
-            if remaining > 4:
-                output_lines.append(line[: remaining - 3].rstrip() + "...")
-                included_count += 1
-            truncated = True
-            break
-
+        body, included_count, truncated = bounded_join_newest(
+            candidate_lines, max_chars - len(header) - 1
+        )
         if included_count < len(candidate_lines):
             truncated = True
         if included_count == 0:
             return SlackFetchedContext(source=source, truncated=True)
 
         return SlackFetchedContext(
-            context="\n".join(output_lines),
+            context=f"{header}\n{body}",
             source=source,
             message_count=included_count,
             truncated=truncated,
         )
+
+    def _slack_context_sender(self, message: Dict[str, Any]) -> str:
+        if self._is_own_slack_message(message):
+            return SLACK_OWN_MESSAGE_SENDER
+        return self._slack_message_sender(message)
 
     def _clean_slack_message_text(self, text: Any) -> str:
         """Normalize Slack text without resolving user IDs or making extra API calls."""
