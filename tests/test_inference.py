@@ -2147,6 +2147,49 @@ class TestInferenceEngine:
         )
 
     @pytest.mark.asyncio
+    async def test_fallback_cache_hit_leaves_router_model_stats_alone(
+        self,
+        inference_config,
+        sample_query_request,
+    ):
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(
+                selected_model="gpt-5",
+                routing_reason="Capability-based selection",
+            )
+        )
+        router.get_model_info.side_effect = lambda name: {
+            "gpt-5": {"config": {"provider": "openai"}},
+            "mistral-7b": {"config": {"provider": "vllm"}},
+        }.get(name)
+        router.update_model_stats = MagicMock()
+
+        engine = InferenceEngine(inference_config, router)
+        engine.providers = {"openai": AsyncMock(), "vllm": AsyncMock()}
+        engine.providers["openai"].generate_response = AsyncMock(
+            side_effect=RuntimeError("upstream overloaded")
+        )
+        engine._get_local_fallback_models = MagicMock(return_value=["mistral-7b"])
+        engine.cache.get_cached_response = AsyncMock(
+            side_effect=[
+                None,
+                self._stale_cached_payload(model_name="mistral-7b", provider="vllm"),
+            ]
+        )
+        engine.cache.cache_response = AsyncMock()
+
+        response = await engine.process_query(sample_query_request)
+
+        assert response.cached is True
+        # The primary's failure is still recorded; the cache hit served by the
+        # fallback model says nothing about that model's latency or success.
+        assert [
+            call.kwargs["model_name"]
+            for call in router.update_model_stats.call_args_list
+        ] == ["gpt-5"]
+
+    @pytest.mark.asyncio
     async def test_stream_query_acquires_and_releases_scheduler_capacity(
         self,
         inference_config,

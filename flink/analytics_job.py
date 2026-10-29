@@ -311,11 +311,18 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
             "total_tokens": 0,
             "total_cost_usd": 0.0,
             "cached_count": 0,
+            "latency_sample_count": 0,
         }
+        # Buckets restored from older state averaged latency over every request.
+        bucket.setdefault("latency_sample_count", bucket["request_count"])
         bucket["request_count"] += 1
         bucket["success_count"] += 1 if value.get("status") == "success" else 0
         bucket["error_count"] += 1 if value.get("status") != "success" else 0
-        bucket["latency_sum_ms"] += float(value.get("latency_ms", 0.0) or 0.0)
+        # A cache hit's latency is the lookup, not the model; keep it out of
+        # the latency average that guardrails and anomaly detection read.
+        if not value.get("cached_response"):
+            bucket["latency_sum_ms"] += float(value.get("latency_ms", 0.0) or 0.0)
+            bucket["latency_sample_count"] += 1
         bucket["tokens_per_second_sum"] += float(
             value.get("tokens_per_second", 0.0) or 0.0
         )
@@ -420,6 +427,7 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
             total_tokens=int(bucket.get("total_tokens", 0) or 0),
             total_cost_usd=float(bucket.get("total_cost_usd", 0.0) or 0.0),
             cached_count=int(bucket.get("cached_count", 0) or 0),
+            latency_sample_count=bucket.get("latency_sample_count"),
         )
 
 

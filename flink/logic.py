@@ -334,14 +334,24 @@ def build_model_metrics_window_event(
     total_tokens: int,
     total_cost_usd: float,
     cached_count: int,
+    latency_sample_count: int | None = None,
     timestamp: datetime | None = None,
 ) -> Dict[str, Any]:
-    """Build a 1-minute model metrics aggregate event."""
+    """Build a 1-minute model metrics aggregate event.
+
+    latency_sample_count is the number of requests in latency_sum_ms (cache hits
+    are left out); it defaults to request_count.
+    """
     request_count = max(0, int(request_count))
     success_count = max(0, int(success_count))
     error_count = max(0, int(error_count))
+    latency_samples = (
+        request_count
+        if latency_sample_count is None
+        else max(0, int(latency_sample_count))
+    )
 
-    avg_latency_ms = latency_sum_ms / request_count if request_count > 0 else 0.0
+    avg_latency_ms = latency_sum_ms / latency_samples if latency_samples > 0 else 0.0
     avg_tokens_per_second = (
         tokens_per_second_sum / request_count if request_count > 0 else 0.0
     )

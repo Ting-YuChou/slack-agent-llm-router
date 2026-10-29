@@ -2415,11 +2415,14 @@ class InferenceEngine:
         inference_time = time.time() - started_at
         await self._update_stats(model_name, response, inference_time)
         self._record_provider_cache_metrics(model_name, response)
-        self.router.update_model_stats(
-            model_name=model_name,
-            success=True,
-            latency_ms=response.latency_ms,
-        )
+        if not response.cached:
+            # A cache hit served by a fallback model never ran that model, so
+            # its lookup time must not feed the router's latency and success.
+            self.router.update_model_stats(
+                model_name=model_name,
+                success=True,
+                latency_ms=response.latency_ms,
+            )
         INFERENCE_METRICS.requests_total.labels(
             model=model_name,
             provider=response.provider,
