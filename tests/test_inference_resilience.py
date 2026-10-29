@@ -515,13 +515,16 @@ class _RejectFirstAdmission(_Admission):
 
 
 def _router(models=("gpt-5", "claude-sonnet-4-6", "mistral-7b"), policy=None):
+    """A real router; models are names from _MODELS or a name -> config map."""
     from src.llm_router_part1_router import ModelRouter
 
+    if not isinstance(models, dict):
+        models = {name: _MODELS[name] for name in models}
     router = ModelRouter(
         {
             "default_model": "gpt-5",
             "routing_strategy": "intelligent",
-            "models": {name: _MODELS[name] for name in models},
+            "models": models,
             "routing_rules": [],
         },
         policy_cache=policy,
@@ -778,3 +781,140 @@ def test_shipped_configs_chain_gpt5_and_claude_both_ways(config_name):
     assert config.inference.scheduler.fallback_reserve_ratio == 0.3
     for model, chain in config.inference.fallback.chains.items():
         assert {model, *chain} <= set(config.router.models)
+
+
+# --- R11b: local and vision fallbacks obey routing guardrails -------------------
+
+_VISION_MODELS = {
+    "gpt-5": {**_MODELS["gpt-5"], "capabilities": ["general", "vision"]},
+    "claude-sonnet-4-6": {
+        **_MODELS["claude-sonnet-4-6"],
+        "capabilities": ["general", "vision"],
+    },
+    "mistral-7b": _MODELS["mistral-7b"],
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy",
+    [
+        pytest.param({"blocked_models": ["mistral-7b"]}, id="blocked-model"),
+        pytest.param({"blocked_providers": ["vllm"]}, id="blocked-provider"),
+    ],
+)
+async def test_local_fallback_skips_a_guardrail_blocked_mistral(policy):
+    engine = _chain_engine(
+        _router(("gpt-5", "mistral-7b"), policy=_PolicyCache(**policy)),
+        _StatusError(503),
+        chains={},
+    )
+
+    response = await engine.process_query(_request())
+
+    assert response.error == "inference_failed"
+    engine.providers["vllm"].generate_response.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_configured_vllm_fallback_skips_a_guardrail_blocked_mistral():
+    models = {
+        "qwen3.6-27b-fast": {**_MODELS["mistral-7b"], "model_path": "/models/qwen"},
+        "mistral-7b": _MODELS["mistral-7b"],
+    }
+    router = _router(models, policy=_PolicyCache(blocked_models=["mistral-7b"]))
+    engine = InferenceEngine(
+        {
+            "vllm": {
+                "model_fallback": {
+                    "enabled": True,
+                    "fallbacks": {"qwen3.6-27b-fast": ["mistral-7b"]},
+                }
+            }
+        },
+        router,
+    )
+    engine.providers = {
+        "vllm": SimpleNamespace(
+            generate_response=AsyncMock(side_effect=_StatusError(503))
+        )
+    }
+    decision = SimpleNamespace(
+        selected_model="qwen3.6-27b-fast",
+        query_type=QueryType.GENERAL,
+        token_count=64,
+        routing_reason="Fast lane",
+    )
+
+    with pytest.raises(_StatusError):
+        await engine._generate_response_with_fallback(_request(), decision)
+
+    called = [
+        call.args[1]
+        for call in engine.providers["vllm"].generate_response.await_args_list
+    ]
+    assert called == ["qwen3.6-27b-fast"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("metadata", "policy"),
+    [
+        pytest.param(
+            {}, {"blocked_providers": ["anthropic"]}, id="ranked-blocked-provider"
+        ),
+        pytest.param(
+            {"rag_vision_fallback_models": ["claude-sonnet-4-6"]},
+            {"blocked_models": ["claude-sonnet-4-6"]},
+            id="routed-candidates-blocked-model",
+        ),
+    ],
+)
+@pytest.mark.parametrize("path", ["response", "pre-token-stream"])
+async def test_vision_fallback_respects_guardrails(metadata, policy, path):
+    router = _router(_VISION_MODELS, policy=_PolicyCache(**policy))
+    engine = _chain_engine(router, _StatusError(503), chains={})
+    request = _request(
+        **_ENTERPRISE,
+        metadata={**metadata, "rag_text_fallback_models": ["mistral-7b"]},
+    )
+    request._rag_images = [
+        SimpleNamespace(
+            figure_id="fig-1",
+            content_checksum_sha256="abc",
+            asset_ref=SimpleNamespace(index_version="v1", checksum_sha256="abc"),
+        )
+    ]
+    decision = SimpleNamespace(selected_model="gpt-5", routing_reason="vision")
+
+    if path == "response":
+        _, model_name, _ = await engine._generate_response_with_fallback(
+            request, decision
+        )
+    else:
+        _, model_name, _ = await engine._execute_pre_token_vision_fallback(
+            request, decision, "gpt-5"
+        )
+
+    engine.providers["anthropic"].generate_response.assert_not_awaited()
+    assert model_name == "mistral-7b"
+
+
+def test_fallback_context_estimates_tokens_when_routing_reported_none():
+    engine = InferenceEngine({}, _router())
+    request = _request(context="word " * 5000)
+
+    context = engine._build_local_fallback_context(
+        request,
+        SimpleNamespace(selected_model="gpt-5", token_count=0),
+        {"blocked_models": ["mistral-7b"]},
+    )
+
+    assert context["token_count"] > 4096
+    assert context["blocked_models"] == ["mistral-7b"]
+    assert (
+        engine._get_local_fallback_models(
+            request, SimpleNamespace(selected_model="gpt-5", token_count=0)
+        )
+        == []
+    )

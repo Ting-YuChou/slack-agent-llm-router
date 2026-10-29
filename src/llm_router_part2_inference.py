@@ -3140,6 +3140,7 @@ class InferenceEngine:
             request,
             routing_decision,
             exclude_models=[primary_model],
+            policy_context=policy_context,
         )
         chain_models = (
             self._get_fallback_chain_models(
@@ -3351,6 +3352,7 @@ class InferenceEngine:
             request,
             routing_decision,
             exclude_models=[failed_model],
+            policy_context=await self._fallback_policy_context(request),
         )
         if candidates:
             fallback_decision = self._build_capability_routing_decision(
@@ -3505,8 +3507,13 @@ class InferenceEngine:
         request: QueryRequest,
         routing_decision: Any,
         exclude_models: Optional[List[str]] = None,
+        policy_context: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
-        """Return capability-safe fallback candidates for the current request."""
+        """Return capability-safe fallback candidates for the current request.
+
+        ``policy_context`` carries the router's guardrail blocks and avoid
+        lists; candidates they rule out are skipped.
+        """
         selected_model = routing_decision.selected_model
         selected_model_info = self.router.get_model_info(selected_model)
         if not selected_model_info:
@@ -3514,7 +3521,9 @@ class InferenceEngine:
 
         selected_provider = selected_model_info["config"]["provider"].lower()
         exclude = set(exclude_models or [])
-        context = self._build_local_fallback_context(request, routing_decision)
+        context = self._build_local_fallback_context(
+            request, routing_decision, policy_context
+        )
         if getattr(request, "_rag_images", []):
             policy_candidates = request.metadata.get("rag_vision_fallback_models")
             if policy_candidates is not None:
@@ -3523,10 +3532,17 @@ class InferenceEngine:
                     for model_name in policy_candidates
                     if model_name not in exclude
                     and self._get_provider_for_model(model_name) is not None
+                    and not self._ruled_out_by_policy(
+                        model_name, self._configured_provider_name(model_name), context
+                    )
                 ]
             ranked = []
             for model_name, model_config in getattr(self.router, "models", {}).items():
                 if model_name in exclude:
+                    continue
+                if self._ruled_out_by_policy(
+                    model_name, model_config.provider, context
+                ):
                     continue
                 if "vision" not in {
                     capability.lower() for capability in model_config.capabilities
@@ -3570,7 +3586,11 @@ class InferenceEngine:
             query_type = str(query_type)
 
         token_count = getattr(routing_decision, "token_count", None)
-        if token_count is None:
+        if token_count is None or (
+            isinstance(token_count, (int, float)) and token_count <= 0
+        ):
+            # A routing error reports 0 tokens; estimate, so the context
+            # window check still means something.
             token_count = self._estimate_provider_admission_input_tokens(request)
 
         context = {
@@ -3586,6 +3606,26 @@ class InferenceEngine:
         for key, values in (policy_context or {}).items():
             context[key] = list(values or [])
         return context
+
+    @staticmethod
+    def _ruled_out_by_policy(
+        model_name: str, provider_name: Optional[str], context: Dict[str, Any]
+    ) -> bool:
+        """Whether the guardrail blocks or avoid lists in context exclude a model."""
+        blocked_models = {
+            *(context.get("blocked_models") or []),
+            *(context.get("avoid_models") or []),
+        }
+        if model_name in blocked_models:
+            return True
+        blocked_providers = {
+            str(provider).lower()
+            for provider in [
+                *(context.get("blocked_providers") or []),
+                *(context.get("avoid_providers") or []),
+            ]
+        }
+        return bool(provider_name) and str(provider_name).lower() in blocked_providers
 
     def _get_configured_vllm_model_fallbacks(
         self,
@@ -3728,6 +3768,8 @@ class InferenceEngine:
         if not model_config:
             return False
         if getattr(model_config, "provider", "").lower() != "vllm":
+            return False
+        if self._ruled_out_by_policy(model_name, model_config.provider, context):
             return False
         if context["token_count"] > model_config.max_tokens:
             return False
