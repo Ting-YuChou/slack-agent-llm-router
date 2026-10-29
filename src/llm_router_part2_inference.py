@@ -51,6 +51,7 @@ from src.utils.schema import (
     ToolPolicy,
 )
 from src.tools import ToolRegistry, WebSearchTool, WebSearchResult
+from src.tools.web_search import WEB_SEARCH_UNAVAILABLE_WARNING
 
 logger = logging.getLogger(__name__)
 
@@ -623,6 +624,15 @@ def _exception_provider_request_id(exc: BaseException) -> Optional[str]:
     return _header_value(headers, "x-request-id")
 
 
+# Prompt line for a live web search that failed, or that a REQUIRED tool
+# policy needed but that found nothing: no web context reached the model.
+WEB_SEARCH_UNAVAILABLE_NOTICE = (
+    "Live web search failed or returned no results for this request, so no "
+    "current web information is included. Say that you cannot verify the "
+    "latest information, and do not present older knowledge as current."
+)
+
+
 @dataclass
 class InferenceContext:
     """Context information for inference requests"""
@@ -1077,6 +1087,8 @@ class BaseInferenceProvider(ABC):
         web_search_context = (request.metadata or {}).get("web_search_context")
         if web_search_context:
             dynamic_context.append(str(web_search_context))
+        if (request.metadata or {}).get("web_search_unavailable") is True:
+            dynamic_context.append(WEB_SEARCH_UNAVAILABLE_NOTICE)
         return PromptSections(
             static_cache_prefix=static_cache_prefix,
             dynamic_context=dynamic_context,
@@ -2821,6 +2833,16 @@ class InferenceEngine:
                 request.metadata["web_search_provider"] = result.tool_call.provider
         elif result.blocked_reason:
             request.metadata["web_search_blocked_reason"] = result.blocked_reason
+            request.metadata["web_search_cache_bypass"] = True
+        search_failed = WEB_SEARCH_UNAVAILABLE_WARNING in (
+            getattr(result, "warnings", None) or []
+        )
+        if search_failed or (
+            request.tool_policy == ToolPolicy.REQUIRED and not result.context
+        ):
+            # The prompt tells the model not to pass older knowledge off as
+            # current; such an answer is not worth caching either.
+            request.metadata["web_search_unavailable"] = True
             request.metadata["web_search_cache_bypass"] = True
         return result
 
