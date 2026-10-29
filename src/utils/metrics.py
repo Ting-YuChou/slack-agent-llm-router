@@ -298,6 +298,13 @@ class RouterMetrics:
             ["original_model", "fallback_model", "reason"],
         )
 
+        # The re-check of the routed model against the enriched prompt
+        self.refit_outcomes = Counter(
+            "llm_router_refit_outcomes_total",
+            "Context-fit re-checks after enrichment (kept, rerouted, error)",
+            ["outcome"],
+        )
+
         # Tokenizer encodings the router could load (0 = token counts estimated)
         self.tokenizer_available = Gauge(
             "llm_router_tokenizer_available",

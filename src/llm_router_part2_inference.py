@@ -656,6 +656,12 @@ _DEFAULT_RETRIEVAL_BUDGET_RATIO = 0.5
 _RETRIEVAL_BACKSTOP_MARGIN_SECONDS = 0.05
 
 
+def _enrichment_snapshot(request: QueryRequest) -> Tuple[Any, ...]:
+    """The context RAG and web search add to a request, to see if they did."""
+    metadata = request.metadata or {}
+    return (metadata.get("rag_context"), metadata.get("web_search_context"))
+
+
 def _merge_rag_warnings(rag_result: Any, request: QueryRequest) -> None:
     """Add the request's rag_warnings to rag_result.warnings, keeping its own.
 
@@ -2696,6 +2702,7 @@ class InferenceEngine:
             # Step 1: Route query to appropriate model
             routing_decision = await self.router.route_query(request)
             model_name = routing_decision.selected_model
+            routed_enrichment = _enrichment_snapshot(request)
 
             # Step 2: Context compression before cache lookup keeps keys stable.
             compressed_context = await self._compress_request_context_if_needed(request)
@@ -2746,7 +2753,10 @@ class InferenceEngine:
             # Step 4b: RAG and web context came after routing; re-check that
             # the enriched prompt still fits the model, re-routing if not.
             routing_decision = await self._fit_enriched_prompt(
-                request, routing_decision, rag_result
+                request,
+                routing_decision,
+                rag_result,
+                routed_enrichment=routed_enrichment,
             )
             model_name = routing_decision.selected_model
 
@@ -3310,16 +3320,24 @@ class InferenceEngine:
         request: QueryRequest,
         routing_decision: Any,
         rag_result: Optional[SimpleNamespace],
+        routed_enrichment: Optional[Tuple[Any, ...]] = None,
     ) -> Any:
         """The routing decision re-checked against the enriched prompt.
 
         Raises PromptTooLargeError (a 413) when no model the tier may use fits.
         A vision request that no vision model fits is answered from the text.
+        ``routed_enrichment`` is the enrichment routing saw; when RAG and web
+        search added nothing since, the decision already fits.
         """
         if not isinstance(self.router, ModelRouter) or not hasattr(
             routing_decision, "model_copy"
         ):
             return routing_decision  # A stub router has no windows to check.
+        if (
+            routed_enrichment is not None
+            and _enrichment_snapshot(request) == routed_enrichment
+        ):
+            return routing_decision
         if not getattr(request, "_rag_images", []):
             return await self.router.refit_routing_decision(request, routing_decision)
         try:
@@ -4081,6 +4099,30 @@ class InferenceEngine:
         ]
         if not allowed:
             raise ValueError("No text-only model is open to the user's tier")
+        router = getattr(self, "router", None)
+        if isinstance(router, ModelRouter):
+            # The candidate lists predate web search: check them against the
+            # enriched prompt, which the routing decision now counts.
+            fit_context = self._build_local_fallback_context(request, routing_decision)
+            fitting = [
+                name
+                for name in allowed
+                if self._fits_enriched_window(name, fit_context)
+            ]
+            if not fitting:
+                windows = [
+                    model_config.window_tokens()
+                    for model_config in map(self._router_model_config, allowed)
+                    if model_config is not None
+                ]
+                raise PromptTooLargeError(
+                    "No text-only model fits the enriched prompt "
+                    f"(~{fit_context['token_count']} tokens plus output)",
+                    user_tier=router._entitlement_tier(request.user_tier).value,
+                    token_count=int(fit_context["token_count"]),
+                    max_context_tokens=max(windows, default=0),
+                )
+            allowed = fitting
         model_name = allowed[0]
         call_options: Dict[str, Any] = {"execution_budget": execution_budget}
         if started_calls is not None:

@@ -866,8 +866,20 @@ class ModelRouter:
         PromptTooLargeError (or ModelNotEntitledError when the tier has no
         model with the capability). The returned decision carries the
         enriched token count, which fallback selection reads.
+
+        Any other failure keeps the decision (fail-open, like routing's own
+        error path): the re-check must not fail a request routing served.
         """
-        context = await self._build_query_context(request)
+        try:
+            context = await self._build_query_context(request)
+        except Exception:
+            logger.exception(
+                "Context-fit re-check failed for request %s; keeping %s",
+                request.request_id,
+                decision.selected_model,
+            )
+            ROUTER_METRICS.refit_outcomes.labels(outcome="error").inc()
+            return decision
         token_count = int(context["token_count"])
         selected = decision.selected_model
         selected_config = self.models.get(selected)
@@ -879,6 +891,7 @@ class ModelRouter:
                 or self._declares_capability(selected_config, required_capability)
             )
         ):
+            ROUTER_METRICS.refit_outcomes.labels(outcome="kept").inc()
             if decision.token_count == token_count:
                 return decision
             return decision.model_copy(update={"token_count": token_count})
@@ -891,9 +904,8 @@ class ModelRouter:
         ]
         open_context = self._without_guardrails(context)
         for scoring_context, bypassed in ((context, False), (open_context, True)):
-            fitting = self._filter_models_for_context(
-                candidates, scoring_context
-            ) or self._filter_models_for_context(
+            capable = self._filter_models_for_context(candidates, scoring_context)
+            fitting = capable or self._filter_models_for_context(
                 candidates, scoring_context, check_capability=False
             )
             if not fitting:
@@ -906,6 +918,14 @@ class ModelRouter:
             )
             if bypassed:
                 reason = f"{reason}; {GUARDRAIL_BYPASS_NOTE}"
+            # As in capability routing: lower confidence without a capability
+            # match or with guardrails bypassed, never above the original.
+            confidence = min(
+                decision.confidence, 0.8 if capable and not bypassed else 0.3
+            )
+            selection = ModelSelection(
+                model_name=best_model, confidence=confidence, reason=reason
+            )
             logger.info(
                 "Rerouted request %s from %s to %s after enrichment (%d tokens)",
                 request.request_id,
@@ -913,11 +933,19 @@ class ModelRouter:
                 best_model,
                 token_count,
             )
+            ROUTER_METRICS.refit_outcomes.labels(outcome="rerouted").inc()
+            ROUTER_METRICS.routing_decisions.labels(
+                model=best_model, query_type=str(context["query_type"])
+            ).inc()
             return decision.model_copy(
                 update={
                     "selected_model": best_model,
                     "token_count": token_count,
                     "routing_reason": reason,
+                    "confidence": confidence,
+                    "estimated_cost": self._estimate_cost(selection, scoring_context),
+                    "actual_fast_lane_hit": bool(decision.route_to_fast_lane)
+                    and best_model in self._get_fast_lane_candidates(),
                 }
             )
         self._raise_no_eligible_model(open_context, candidates)
