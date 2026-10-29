@@ -1,9 +1,13 @@
 """Slack answer delivery: progress placeholder, splitting, formatting."""
 
+import importlib
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import yaml
 
 from slack.bot_real import SLACK_THINKING_TEXT, SlackBot
 
@@ -237,3 +241,186 @@ async def test_a_failure_after_the_first_part_keeps_that_part(
     assert bot.web_client.chat_update.await_args.kwargs["text"].startswith("line 0 ")
     last = bot.web_client.chat_postMessage.await_args.kwargs
     assert last["text"] == bot._build_user_safe_error_message()
+
+
+# S9: fence-aware splitting and Slack 429 retries
+
+
+def fenced_answer(lines=60):
+    code = "\n".join(
+        f"    result_{index} = compute({index})  # step" for index in range(lines)
+    )
+    return f"Here is the code:\n\n```python\n{code}\n```\n\nThat is all."
+
+
+@pytest.mark.parametrize("limit", [200, 500, 2000])
+@pytest.mark.parametrize(
+    "text",
+    [
+        fenced_answer(),
+        fenced_answer(30) + "\n\n" + fenced_answer(30),
+        "Intro.\n\n```\n" + "x" * 3000 + "\n```\nDone.",
+    ],
+    ids=["one-fence", "two-fences", "long-line-in-fence"],
+)
+def test_every_part_keeps_code_fences_balanced_and_fits(text, limit):
+    bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
+
+    parts = bot._split_response(text, limit)
+
+    assert len(parts) > 1
+    assert all(len(part) <= limit for part in parts)
+    assert all(part.count("```") % 2 == 0 for part in parts)
+    for line in text.splitlines():
+        if line and line != "```" and len(line) < limit // 2:
+            assert any(line in part for part in parts), line
+
+
+def test_split_does_not_leave_tiny_fragments():
+    paragraph = " ".join(f"word{index}" for index in range(500))
+    text = f"Intro line.\n\n{paragraph}\n\nBye."
+    bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
+
+    parts = bot._split_response(text, 2000)
+
+    assert len(parts) == 2
+    assert parts[0].startswith("Intro line.")
+    assert parts[-1].endswith("Bye.")
+    assert all(len(part) >= 500 for part in parts)
+    assert all(not part.startswith(" ") for part in parts)
+
+
+@pytest.mark.asyncio
+async def test_answer_parts_are_posted_without_a_fixed_sleep(
+    inference_response_factory, monkeypatch
+):
+    sleep = AsyncMock()
+    monkeypatch.setattr("slack.bot_real.asyncio.sleep", sleep)
+    answer = "\n".join(f"line {index} " + "x" * 40 for index in range(20))
+    bot = delivery_bot(
+        answering(inference_response_factory, answer),
+        chat_update=False,
+        response_settings={"max_response_length": 300},
+    )
+
+    await bot._process_message(top_level())
+
+    assert bot.web_client.chat_postMessage.await_count > 1
+    sleep.assert_not_awaited()
+
+
+def test_configs_allow_long_slack_answers():
+    root = Path(__file__).resolve().parents[1]
+    for name in ("config.yaml", "config.compose.yaml", "config.demo.yaml"):
+        raw = yaml.safe_load((root / "config" / name).read_text(encoding="utf-8"))
+        settings = raw["slack"]["response_settings"]
+        assert settings["max_response_length"] == 3900, name
+
+
+@pytest.mark.asyncio
+async def test_initialize_adds_a_rate_limit_retry_handler(monkeypatch):
+    from slack import bot_real
+
+    created = {}
+
+    class DummyWebClient:
+        def __init__(self, token):
+            self.token = token
+            self.retry_handlers = ["connection-handler"]
+            self.auth_test = AsyncMock(return_value={"user_id": "B123"})
+            created["web_client"] = self
+
+    class DummySocketClient:
+        def __init__(self, app_token, web_client):
+            self.socket_mode_request_listeners = []
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test")
+    monkeypatch.setattr("slack.bot_real.AsyncWebClient", DummyWebClient)
+    monkeypatch.setattr("slack.bot_real.AsyncSocketModeClient", DummySocketClient)
+    bot = SlackBot(
+        {
+            "bot_token_env": "SLACK_BOT_TOKEN",
+            "app_token_env": "SLACK_APP_TOKEN",
+            "channels": [],
+        },
+        inference_engine=SimpleNamespace(),
+    )
+
+    await bot.initialize()
+
+    handlers = created["web_client"].retry_handlers
+    assert handlers[0] == "connection-handler"
+    assert len(handlers) == 2
+    assert isinstance(handlers[1], bot_real.AsyncRateLimitErrorRetryHandler)
+    assert handlers[1].max_retry_count == 2
+
+
+def _slack_sdk_modules():
+    return [
+        name
+        for name in sys.modules
+        if name == "slack_sdk" or name.startswith("slack_sdk.")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_real_client_retries_a_429_and_posts_once(monkeypatch):
+    """With the real slack_sdk, a 429 then a 200 sends the message once."""
+    from slack import bot_real
+
+    web = pytest.importorskip("aiohttp.web")
+    stubs = {name: sys.modules.pop(name) for name in _slack_sdk_modules()}
+    try:
+        try:
+            async_client = importlib.import_module("slack_sdk.web.async_client")
+            retry = importlib.import_module(
+                "slack_sdk.http_retry.builtin_async_handlers"
+            )
+        except ImportError:
+            pytest.skip("slack_sdk is not installed")
+        monkeypatch.setattr(retry, "random", SimpleNamespace(random=lambda: 0.0))
+        monkeypatch.setattr(
+            bot_real,
+            "AsyncRateLimitErrorRetryHandler",
+            retry.AsyncRateLimitErrorRetryHandler,
+        )
+        received = []
+
+        async def post_message(request):
+            received.append(await request.json())
+            if len(received) == 1:
+                return web.json_response(
+                    {"ok": False, "error": "ratelimited"},
+                    status=429,
+                    headers={"Retry-After": "0"},
+                )
+            return web.json_response({"ok": True, "channel": "C1", "ts": "1.0"})
+
+        app = web.Application()
+        app.router.add_post("/chat.postMessage", post_message)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        try:
+            port = site._server.sockets[0].getsockname()[1]
+            client = async_client.AsyncWebClient(
+                token="xoxb-test", base_url=f"http://127.0.0.1:{port}/"
+            )
+            bot_real._add_rate_limit_retry(client)
+
+            response = await client.chat_postMessage(channel="C1", text="hello")
+        finally:
+            await runner.cleanup()
+    finally:
+        for name in _slack_sdk_modules():
+            del sys.modules[name]
+        sys.modules.update(stubs)
+
+    assert response["ok"] is True
+    assert len(received) == 2
+    assert received[0]["text"] == received[1]["text"] == "hello"

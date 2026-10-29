@@ -18,6 +18,9 @@ from pathlib import Path
 from typing import Awaitable, Callable, Dict, List, Optional, Any, Set, Tuple
 from dataclasses import dataclass
 
+from slack_sdk.http_retry.builtin_async_handlers import (
+    AsyncRateLimitErrorRetryHandler,
+)
 from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.socket_mode.aiohttp import (
     SocketModeClient as AsyncSocketModeClient,
@@ -544,6 +547,17 @@ def _split_agent_result(text: str, limit: int = AGENT_RESULT_BLOCK_CHARS) -> Lis
             text[:AGENT_RESULT_MAX_CHARS].rstrip()
             + f"\n\n_…answer truncated: {omitted:,} more characters were not posted._"
         )
+    return _split_fenced_text(text, limit)
+
+
+def _split_fenced_text(text: str, limit: int) -> List[str]:
+    """Split Markdown into chunks of at most `limit` characters.
+
+    Each chunk is as long as it can be, so no tiny fragments are left
+    between parts. A chunk breaks on a newline when one is near the limit,
+    else on a space, else mid-text; a code fence left open at a break is
+    closed and reopened so each chunk renders alone.
+    """
     chunks: List[str] = []
     remaining = text
     open_fence = False
@@ -552,17 +566,35 @@ def _split_agent_result(text: str, limit: int = AGENT_RESULT_BLOCK_CHARS) -> Lis
         if len(prefix) + len(remaining) <= limit:
             piece, remaining = remaining, ""
         else:
-            budget = limit - len(prefix) - len("\n```")
+            budget = max(limit - len(prefix) - len("\n```"), 1)
             cut = remaining.rfind("\n", 0, budget)
             if cut < budget // 2:
-                cut = budget
-            piece, remaining = remaining[:cut], remaining[cut:].lstrip("\n")
+                cut = remaining.rfind(" ", 0, budget)
+                if cut >= budget // 2:
+                    piece, remaining = remaining[:cut], remaining[cut + 1 :]
+                else:
+                    piece = remaining[:budget]
+                    remaining = remaining[budget:].lstrip("\n")
+            else:
+                piece, remaining = remaining[:cut], remaining[cut:].lstrip("\n")
         chunk = prefix + piece
         open_fence = chunk.count("```") % 2 == 1
         if open_fence and remaining:
             chunk += "\n```"
         chunks.append(chunk)
     return chunks
+
+
+SLACK_RATE_LIMIT_RETRIES = 2
+
+
+def _add_rate_limit_retry(client: Any) -> None:
+    """Retry Slack 429s (honouring Retry-After) instead of failing the post."""
+    retry_handlers = getattr(client, "retry_handlers", None)
+    if isinstance(retry_handlers, list):
+        retry_handlers.append(
+            AsyncRateLimitErrorRetryHandler(max_retry_count=SLACK_RATE_LIMIT_RETRIES)
+        )
 
 
 def _agent_task_echo(task: str) -> str:
@@ -3443,6 +3475,7 @@ class SlackBot:
                 )
 
             self.web_client = AsyncWebClient(token=bot_token)
+            _add_rate_limit_retry(self.web_client)
             self.bot_token = bot_token
             self.socket_client = AsyncSocketModeClient(
                 app_token=app_token, web_client=self.web_client
@@ -3992,8 +4025,6 @@ class SlackBot:
                         placeholder_ts = None
                         if replaced:
                             continue
-                    elif index:
-                        await asyncio.sleep(0.5)  # Small delay between parts
                     await self.web_client.chat_postMessage(
                         channel=channel_id,
                         text=response_part,
@@ -4117,56 +4148,18 @@ class SlackBot:
         return None
 
     def _split_response(self, text: str, max_length: int) -> List[str]:
-        """Split long response into multiple parts"""
+        """Split a long answer into Slack messages of at most `max_length`.
+
+        Code fences stay balanced in every part (see `_split_fenced_text`).
+        """
         if len(text) <= max_length:
             return [text]
-
-        def append_chunk(chunk: str):
-            chunk = chunk.strip()
-            if not chunk:
-                return
-
-            if len(chunk) <= max_length:
-                parts.append(chunk)
-                return
-
-            for start in range(0, len(chunk), max_length):
-                parts.append(chunk[start : start + max_length])
-
-        parts = []
-        current_part = ""
-
-        # Split by paragraphs first
-        paragraphs = text.split("\n\n")
-
-        for paragraph in paragraphs:
-            if len(current_part) + len(paragraph) + 2 <= max_length:
-                if current_part:
-                    current_part += "\n\n" + paragraph
-                else:
-                    current_part = paragraph
-            else:
-                if current_part:
-                    append_chunk(current_part)
-                    current_part = paragraph
-                else:
-                    # Paragraph is too long, split by sentences
-                    sentences = paragraph.split(". ")
-                    for sentence in sentences:
-                        if len(current_part) + len(sentence) + 2 <= max_length:
-                            if current_part:
-                                current_part += ". " + sentence
-                            else:
-                                current_part = sentence
-                        else:
-                            if current_part:
-                                append_chunk(current_part)
-                            current_part = sentence
-
-        if current_part:
-            append_chunk(current_part)
-
-        return parts
+        parts = [
+            part.strip("\n")
+            for part in _split_fenced_text(text, max_length)
+            if part.strip()
+        ]
+        return parts or [text[:max_length]]
 
     def _resolve_context_settings(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """Resolve Slack history context settings with backwards-compatible defaults."""

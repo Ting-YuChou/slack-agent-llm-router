@@ -334,6 +334,8 @@ socket_mode_async = _ensure_module("slack_sdk.socket_mode.async_client")
 socket_mode_aiohttp = _ensure_module("slack_sdk.socket_mode.aiohttp")
 socket_mode_request = _ensure_module("slack_sdk.socket_mode.request")
 socket_mode_response = _ensure_module("slack_sdk.socket_mode.response")
+http_retry = _ensure_module("slack_sdk.http_retry")
+http_retry_async = _ensure_module("slack_sdk.http_retry.builtin_async_handlers")
 
 
 class _AsyncWebClient:
@@ -359,7 +361,14 @@ class _SocketModeResponse:
         self.payload = payload
 
 
+class _AsyncRateLimitErrorRetryHandler:
+    def __init__(self, max_retry_count=1, **kwargs):
+        self.max_retry_count = max_retry_count
+
+
 async_client.AsyncWebClient = _AsyncWebClient
+http_retry_async.AsyncRateLimitErrorRetryHandler = _AsyncRateLimitErrorRetryHandler
+slack_sdk.http_retry = http_retry
 socket_mode_async.AsyncSocketModeClient = _AsyncSocketModeClient
 socket_mode_aiohttp.SocketModeClient = _AsyncSocketModeClient
 socket_mode_request.SocketModeRequest = _SocketModeRequest

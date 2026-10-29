@@ -614,7 +614,7 @@ slack:
     concurrency: 16
     overload_reply_timeout_seconds: 2
   response_settings:
-    max_response_length: 2000
+    max_response_length: 3900
     typing_indicator: true
     thread_replies: true
   rate_limiting:
