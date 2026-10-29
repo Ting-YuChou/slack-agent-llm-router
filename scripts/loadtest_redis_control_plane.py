@@ -26,6 +26,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import redis.asyncio as redis
 
@@ -132,8 +133,18 @@ def _mode_succeeded(result: Dict[str, Any]) -> bool:
 
 
 def _redis_password() -> Optional[str]:
-    """$REDIS_PASSWORD; a password in --redis-url takes precedence."""
+    """The Redis password from $REDIS_PASSWORD, if set."""
     return os.getenv("REDIS_PASSWORD") or None
+
+
+def _display_url(url: str) -> str:
+    """`url` with any password masked, for the printed and saved result."""
+    parts = urlsplit(url)
+    userinfo, at, host = parts.netloc.rpartition("@")
+    if not at or ":" not in userinfo:
+        return url
+    username = userinfo.partition(":")[0]
+    return urlunsplit(parts._replace(netloc=f"{username}:***@{host}"))
 
 
 async def capture_redis_commands(
@@ -466,7 +477,7 @@ async def run_benchmark(args: argparse.Namespace) -> Dict[str, Any]:
     finally:
         await client.aclose()
     result: Dict[str, Any] = {
-        "redis_url": args.redis_url,
+        "redis_url": _display_url(args.redis_url),
         "source_root": str(args.source_root.resolve()) if args.source_root else None,
         "modes": modes,
     }

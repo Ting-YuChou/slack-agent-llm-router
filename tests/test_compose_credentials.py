@@ -1,6 +1,7 @@
 """Operator scripts and the policy cache authenticate against the compose stack."""
 
 import asyncio
+import json
 import os
 import shlex
 import subprocess
@@ -93,21 +94,66 @@ def test_analytics_contract_benchmark_defaults_to_the_environment_password(
     assert captured[0]["password"] == "from-env"
 
 
-def test_clickhouse_migration_default_command_uses_the_container_password(
+CONTAINER_PASSWORD = "it's a $ecret; --password=x"
+FAKE_CLICKHOUSE_CLIENT = """#!/bin/sh
+printf '%s\\n' "$@" >> "$LOG_DIR/argv"
+config=""
+query=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --config-file) config="$2"; shift 2 ;;
+    --query) query="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '%s\\n' "$config" >> "$LOG_DIR/config-paths"
+cat "$config" > "$LOG_DIR/config"
+case "$query" in
+  EXISTS*) echo 1 ;;
+  SHOW*) echo "ENGINE = MergeTree() request_id query_id model_name provider" ;;
+esac
+exit "${FAKE_EXIT:-0}"
+"""
+
+
+def _install_fake_clickhouse_client(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    client = bin_dir / "clickhouse-client"
+    client.write_text(FAKE_CLICKHOUSE_CLIENT)
+    client.chmod(0o755)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    return bin_dir, logs
+
+
+def _assert_password_only_in_a_removed_config_file(logs):
+    argv = (logs / "argv").read_text()
+    assert "--password" not in argv
+    assert "ecret" not in argv
+    assert "--config-file" in argv
+    config = yaml.safe_load((logs / "config").read_text())
+    assert config == {"user": "llm_router", "password": CONTAINER_PASSWORD}
+    paths = (logs / "config-paths").read_text().split()
+    assert paths
+    assert not any(Path(config_path).exists() for config_path in paths)
+
+
+def test_clickhouse_migration_default_command_keeps_the_password_off_argv(
     tmp_path,
 ):
     from scripts import migrate_clickhouse_analytics_v2 as migration
 
     command = shlex.split(migration.parse_args([]).clickhouse_command)
     assert command[:5] == ["docker", "compose", "exec", "-T", "clickhouse"]
+    assert "--password" not in " ".join(command)
 
-    fake_client = tmp_path / "clickhouse-client"
-    fake_client.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
-    fake_client.chmod(0o755)
+    bin_dir, logs = _install_fake_clickhouse_client(tmp_path)
     env = {
-        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "LOG_DIR": str(logs),
         "CLICKHOUSE_USER": "llm_router",
-        "CLICKHOUSE_PASSWORD": "container-secret",
+        "CLICKHOUSE_PASSWORD": CONTAINER_PASSWORD,
     }
     # Run what `docker compose exec` would run inside the container.
     result = subprocess.run(
@@ -115,28 +161,45 @@ def test_clickhouse_migration_default_command_uses_the_container_password(
         env=env,
         capture_output=True,
         text=True,
-        check=True,
     )
 
-    assert result.stdout.splitlines() == [
-        "--user",
-        "llm_router",
-        "--password",
-        "container-secret",
-        "--query",
-        "SELECT 1",
-    ]
+    assert result.returncode == 0, result.stderr
+    assert (logs / "argv").read_text().splitlines()[-2:] == ["--query", "SELECT 1"]
+    _assert_password_only_in_a_removed_config_file(logs)
+
+    failed = subprocess.run(
+        [*command[5:], "--query", "SELECT 1"],
+        env={**env, "FAKE_EXIT": "3"},
+        capture_output=True,
+        text=True,
+    )
+    assert failed.returncode == 3
 
 
-def test_alert_events_migration_requires_the_clickhouse_password(tmp_path):
-    calls = tmp_path / "docker-calls"
-    fake_docker = tmp_path / "docker"
-    fake_docker.write_text(f'#!/bin/sh\necho "$@" >> "{calls}"\n')
+def test_alert_events_migration_keeps_the_password_off_argv(tmp_path):
+    bin_dir, logs = _install_fake_clickhouse_client(tmp_path)
+    fake_docker = bin_dir / "docker"
+    # Record the host command line, then run the rest as the container would,
+    # with the credentials compose gives the ClickHouse container.
+    fake_docker.write_text(
+        "#!/bin/sh\n"
+        'printf \'%s\\n\' "$@" >> "$LOG_DIR/docker-argv"\n'
+        "shift 4\n"
+        "export CLICKHOUSE_USER=llm_router\n"
+        'export CLICKHOUSE_PASSWORD="$CONTAINER_PASSWORD"\n'
+        'exec "$@"\n'
+    )
     fake_docker.chmod(0o755)
     env = {
-        key: value for key, value in os.environ.items() if key != "CLICKHOUSE_PASSWORD"
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("CLICKHOUSE_")
     }
-    env["PATH"] = f"{tmp_path}:{env['PATH']}"
+    env.update(
+        PATH=f"{bin_dir}:{env['PATH']}",
+        LOG_DIR=str(logs),
+        CONTAINER_PASSWORD=CONTAINER_PASSWORD,
+    )
 
     result = subprocess.run(
         ["bash", str(SCRIPTS / "migrate_clickhouse_alert_events.sh")],
@@ -145,9 +208,13 @@ def test_alert_events_migration_requires_the_clickhouse_password(tmp_path):
         text=True,
     )
 
-    assert result.returncode != 0
-    assert "CLICKHOUSE_PASSWORD" in result.stderr
-    assert not calls.exists()
+    assert result.returncode == 0, result.stderr
+    assert "already uses the current schema" in result.stdout
+    docker_argv = (logs / "docker-argv").read_text()
+    assert docker_argv.startswith("compose\nexec\n-T\nclickhouse\n")
+    assert "--password" not in docker_argv
+    assert "ecret" not in docker_argv
+    _assert_password_only_in_a_removed_config_file(logs)
 
 
 @pytest.mark.parametrize(
@@ -200,6 +267,55 @@ def test_loadtest_monitor_connection_sends_the_environment_password(monkeypatch)
         asyncio.run(loadtest.capture_redis_commands("redis://localhost/15", operation))
 
     assert captured[0]["password"] == "from-env"
+
+
+@pytest.mark.asyncio
+async def test_loadtest_result_masks_the_password_in_the_redis_url(monkeypatch):
+    from scripts import loadtest_redis_control_plane as loadtest
+
+    class _FakeClient:
+        async def ping(self):
+            return True
+
+        async def aclose(self):
+            return None
+
+    async def fake_run_mode(**kwargs):
+        return {}
+
+    monkeypatch.setattr(
+        loadtest.redis.Redis, "from_url", lambda *args, **kwargs: _FakeClient()
+    )
+    monkeypatch.setattr(loadtest, "run_mode", fake_run_mode)
+    monkeypatch.setattr(loadtest, "evaluate_gates", lambda *args: {"passed": True})
+    args = Namespace(
+        redis_url="redis://bench:s3cret-p%40ss@localhost:6379/15",
+        requests=1,
+        waiters=1,
+        hold_ms=0.0,
+        wait_timeout_ms=1,
+        source_root=None,
+        baseline=None,
+    )
+
+    result = await loadtest.run_benchmark(args)
+
+    assert result["redis_url"] == "redis://bench:***@localhost:6379/15"
+    assert "s3cret" not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "redis://localhost:6379/15",
+        "redis://bench@localhost:6379/15",
+        "unix:///var/run/redis.sock?db=15",
+    ],
+)
+def test_loadtest_shows_a_redis_url_without_a_password_unchanged(url):
+    from scripts import loadtest_redis_control_plane as loadtest
+
+    assert loadtest._display_url(url) == url
 
 
 def test_rag_benchmark_sends_the_environment_password(monkeypatch):

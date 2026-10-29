@@ -112,7 +112,7 @@ def parse_args() -> argparse.Namespace:
 
 async def main() -> None:
     args = parse_args()
-    # A password in --redis-url takes precedence over $REDIS_PASSWORD.
+    # Authenticate with $REDIS_PASSWORD, not a password in --redis-url.
     client = redis.Redis.from_url(
         args.redis_url,
         password=os.getenv("REDIS_PASSWORD") or None,

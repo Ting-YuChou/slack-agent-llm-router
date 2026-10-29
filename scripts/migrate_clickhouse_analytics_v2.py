@@ -11,6 +11,27 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
+# Runs inside the ClickHouse container: clickhouse-client reads the credentials
+# compose gave the container from a private temporary config file, so the
+# password is on no command line, on the host or in the container.
+CLICKHOUSE_CLIENT_SCRIPT = "\n".join(
+    [
+        "umask 077",
+        "d=$(mktemp -d) || exit 1",
+        "trap 'rm -rf \"$d\"' EXIT",
+        "trap 'exit 1' HUP INT TERM",
+        'q() { printf %s "$1" | sed "s/\'/\'\'/g"; }',
+        "printf \"user: '%s'\\npassword: '%s'\\n\""
+        ' "$(q "$CLICKHOUSE_USER")" "$(q "$CLICKHOUSE_PASSWORD")" > "$d/client.yaml"',
+        'clickhouse-client --config-file "$d/client.yaml" "$@"',
+    ]
+)
+DEFAULT_CLICKHOUSE_COMMAND = shlex.join(
+    ["docker", "compose", "exec", "-T", "clickhouse"]
+    + ["sh", "-c", CLICKHOUSE_CLIENT_SCRIPT, "sh"]
+)
+
+
 @dataclass(frozen=True)
 class TableSpec:
     partition_by: str
@@ -420,16 +441,7 @@ def parse_args(argv=None):
     parser.add_argument("--flush-command")
     parser.add_argument("--resume-command")
     parser.add_argument("--backup-retention-days", type=int, default=7)
-    parser.add_argument(
-        "--clickhouse-command",
-        # The client runs inside the container and reads the credentials that
-        # compose gave it, so the password never appears on the host.
-        default=(
-            "docker compose exec -T clickhouse sh -c "
-            '\'exec clickhouse-client --user "$CLICKHOUSE_USER" '
-            '--password "$CLICKHOUSE_PASSWORD" "$@"\' sh'
-        ),
-    )
+    parser.add_argument("--clickhouse-command", default=DEFAULT_CLICKHOUSE_COMMAND)
     args = parser.parse_args(argv)
     if args.apply:
         missing = [
