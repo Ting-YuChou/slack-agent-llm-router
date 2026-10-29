@@ -194,6 +194,7 @@ def build_inference_completed_event(
         "provider_cache_read_input_tokens": (
             inference_response.provider_cache_read_input_tokens
         ),
+        "reasoning_tokens": inference_response.reasoning_tokens,
         "tokens_per_second": inference_response.tokens_per_second,
         "cost_usd": inference_response.cost_usd,
         "cached_response": inference_response.cached,

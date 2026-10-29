@@ -130,10 +130,13 @@ class TestOpenAIProvider:
         with patch("src.llm_router_part2_inference.openai.AsyncOpenAI") as mock_openai:
             mock_response = MagicMock()
             mock_response.output_text = "Use a simple helper."
-            mock_response.usage.input_tokens = 12
-            mock_response.usage.output_tokens = 18
-            mock_response.usage.total_tokens = 30
-            mock_response.usage.prompt_tokens_details.cached_tokens = 4
+            mock_response.usage = SimpleNamespace(
+                input_tokens=12,
+                output_tokens=18,
+                total_tokens=30,
+                input_tokens_details=SimpleNamespace(cached_tokens=4),
+                output_tokens_details=SimpleNamespace(reasoning_tokens=0),
+            )
 
             mock_client = AsyncMock()
             mock_client.responses.create.return_value = mock_response
@@ -158,10 +161,13 @@ class TestOpenAIProvider:
         with patch("src.llm_router_part2_inference.openai.AsyncOpenAI") as mock_openai:
             mock_response = MagicMock()
             mock_response.output_text = "Cached prefix answer"
-            mock_response.usage.input_tokens = 1200
-            mock_response.usage.output_tokens = 20
-            mock_response.usage.total_tokens = 1220
-            mock_response.usage.prompt_tokens_details.cached_tokens = 1024
+            mock_response.usage = SimpleNamespace(
+                input_tokens=1200,
+                output_tokens=20,
+                total_tokens=1220,
+                input_tokens_details=SimpleNamespace(cached_tokens=1024),
+                output_tokens_details=SimpleNamespace(reasoning_tokens=0),
+            )
 
             mock_client = AsyncMock()
             mock_client.responses.create.return_value = mock_response
@@ -188,6 +194,107 @@ class TestOpenAIProvider:
             assert kwargs["reasoning"] == {"effort": "minimal"}
             assert "user" not in kwargs
             assert response.provider_cached_input_tokens == 1024
+
+    @pytest.mark.asyncio
+    async def test_generate_response_prices_cached_input_tokens_at_cached_rate(
+        self, sample_query_request
+    ):
+        # gpt-5 rates from OpenAIProvider._calculate_cost, plus the configured
+        # prompt-cache multiplier for cached input tokens.
+        gpt5_input_rate = 0.01 / 1000
+        gpt5_output_rate = 0.03 / 1000
+        cached_input_multiplier = 0.25
+        with patch("src.llm_router_part2_inference.openai.AsyncOpenAI") as mock_openai:
+            mock_response = MagicMock()
+            mock_response.output_text = "Cached prefix answer"
+            mock_response.usage = SimpleNamespace(
+                input_tokens=1200,
+                output_tokens=20,
+                total_tokens=1220,
+                input_tokens_details=SimpleNamespace(cached_tokens=1024),
+                output_tokens_details=SimpleNamespace(reasoning_tokens=0),
+            )
+
+            mock_client = AsyncMock()
+            mock_client.responses.create.return_value = mock_response
+            mock_openai.return_value = mock_client
+
+            provider = OpenAIProvider(
+                {
+                    "api_key": "test-key",
+                    "prompt_cache": {
+                        "enabled": True,
+                        "pricing": {"cached_input_multiplier": cached_input_multiplier},
+                    },
+                }
+            )
+            await provider.initialize()
+
+            response = await provider.generate_response(sample_query_request, "gpt-5")
+
+        expected_cost = (
+            (1200 - 1024) * gpt5_input_rate
+            + 1024 * gpt5_input_rate * cached_input_multiplier
+            + 20 * gpt5_output_rate
+        )
+        assert response.cost_usd == pytest.approx(expected_cost)
+
+    @pytest.mark.asyncio
+    async def test_generate_response_reports_reasoning_tokens(
+        self, sample_query_request
+    ):
+        from src.llm_router_part3_pipeline import build_inference_completed_event
+
+        with patch("src.llm_router_part2_inference.openai.AsyncOpenAI") as mock_openai:
+            mock_response = MagicMock()
+            mock_response.output_text = "Thought it through."
+            mock_response.usage = SimpleNamespace(
+                input_tokens=40,
+                output_tokens=300,
+                total_tokens=340,
+                input_tokens_details=SimpleNamespace(cached_tokens=0),
+                output_tokens_details=SimpleNamespace(reasoning_tokens=256),
+            )
+
+            mock_client = AsyncMock()
+            mock_client.responses.create.return_value = mock_response
+            mock_openai.return_value = mock_client
+
+            provider = OpenAIProvider({"api_key": "test-key"})
+            await provider.initialize()
+
+            response = await provider.generate_response(sample_query_request, "gpt-5")
+
+        assert response.reasoning_tokens == 256
+        event = build_inference_completed_event(sample_query_request, response)
+        assert event["reasoning_tokens"] == 256
+
+    @pytest.mark.asyncio
+    async def test_generate_response_falls_back_to_prompt_tokens_details(
+        self, sample_query_request
+    ):
+        with patch("src.llm_router_part2_inference.openai.AsyncOpenAI") as mock_openai:
+            mock_response = MagicMock()
+            mock_response.output_text = "Compatible backend answer"
+            # Chat-Completions-compatible backends report prompt_tokens_details
+            # and no input_tokens_details.
+            mock_response.usage = SimpleNamespace(
+                input_tokens=1200,
+                output_tokens=20,
+                total_tokens=1220,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=512),
+            )
+
+            mock_client = AsyncMock()
+            mock_client.responses.create.return_value = mock_response
+            mock_openai.return_value = mock_client
+
+            provider = OpenAIProvider({"api_key": "test-key"})
+            await provider.initialize()
+
+            response = await provider.generate_response(sample_query_request, "gpt-5")
+
+        assert response.provider_cached_input_tokens == 512
 
     def test_openai_prompt_cache_retention_normalizes_legacy_config(
         self, sample_query_request

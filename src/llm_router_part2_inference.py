@@ -253,6 +253,39 @@ def _nested_usage_value(
     return _safe_int(getattr(parent, field_name, None), default)
 
 
+def _first_nested_usage_value(
+    usage: Any, parent_names: Sequence[str], field_name: str, default: int = 0
+) -> int:
+    """Read a nested usage field from the first parent that reports it.
+
+    The Responses API reports ``input_tokens_details``; Chat-Completions-compatible
+    backends report ``prompt_tokens_details`` instead.
+    """
+    for parent_name in parent_names:
+        parent = (
+            usage.get(parent_name)
+            if isinstance(usage, dict)
+            else getattr(usage, parent_name, None)
+        )
+        if parent is None:
+            continue
+        value = (
+            parent.get(field_name)
+            if isinstance(parent, dict)
+            else getattr(parent, field_name, None)
+        )
+        if value is not None:
+            return _safe_int(value, default)
+    return default
+
+
+def _openai_cached_input_tokens(usage: Any) -> int:
+    """Cached prompt tokens: the Responses API field first, then Chat Completions."""
+    return _first_nested_usage_value(
+        usage, ("input_tokens_details", "prompt_tokens_details"), "cached_tokens"
+    )
+
+
 @dataclass
 class InferenceContext:
     """Context information for inference requests"""
@@ -842,8 +875,9 @@ class OpenAIProvider(BaseInferenceProvider):
 
             usage = response.usage
             generated_text = response.output_text
-            cached_tokens = _nested_usage_value(
-                usage, "prompt_tokens_details", "cached_tokens"
+            cached_tokens = _openai_cached_input_tokens(usage)
+            reasoning_tokens = _nested_usage_value(
+                usage, "output_tokens_details", "reasoning_tokens"
             )
             input_tokens = _usage_value(usage, "input_tokens")
             output_tokens = _usage_value(usage, "output_tokens")
@@ -858,6 +892,7 @@ class OpenAIProvider(BaseInferenceProvider):
                 token_count_output=output_tokens,
                 total_tokens=total_tokens,
                 provider_cached_input_tokens=cached_tokens,
+                reasoning_tokens=reasoning_tokens,
                 latency_ms=int((time.time() - start_time) * 1000),
                 tokens_per_second=(output_tokens / max(time.time() - start_time, 1e-6)),
                 cost_usd=self._calculate_cost(usage, model_name),
@@ -1013,10 +1048,7 @@ class OpenAIProvider(BaseInferenceProvider):
 
         input_tokens = _usage_value(usage, "input_tokens")
         output_tokens = _usage_value(usage, "output_tokens")
-        cached_tokens = min(
-            _nested_usage_value(usage, "prompt_tokens_details", "cached_tokens"),
-            input_tokens,
-        )
+        cached_tokens = min(_openai_cached_input_tokens(usage), input_tokens)
         uncached_tokens = max(input_tokens - cached_tokens, 0)
         cached_multiplier = float(
             self._prompt_cache_pricing().get("cached_input_multiplier", 0.5)
