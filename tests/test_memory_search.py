@@ -156,6 +156,50 @@ async def test_a_store_without_has_items_is_still_searched():
 
 
 @pytest.mark.asyncio
+async def test_a_stale_empty_answer_is_not_cached_over_a_new_memory():
+    """search reads "no items", remember adds one, then search would cache it."""
+    counted = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowCountStore(InMemoryMemoryStore):
+        async def has_items(self, scope):
+            answer = await super().has_items(scope)
+            counted.set()
+            await release.wait()
+            return answer
+
+    manager = manager_for(SlowCountStore())
+    first = asyncio.create_task(manager.search("T1:U1", "deploy region"))
+    await asyncio.wait_for(counted.wait(), timeout=1)
+    await manager.remember("T1:U1", "We deploy to the eu-west region")
+    release.set()
+    assert await first == []
+
+    results = await manager.search("T1:U1", "deploy region")
+
+    assert [result.item.text for result in results] == [
+        "We deploy to the eu-west region"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_remember_still_drops_the_cached_answer():
+    class PartialWriteStore(InMemoryMemoryStore):
+        async def add(self, item):
+            # Like Redis: the item hash lands, then the index write fails.
+            await super().add(item)
+            raise ConnectionError("redis went away")
+
+    manager = manager_for(PartialWriteStore())
+    assert await manager.search("T1:U1", "deploy region") == []
+
+    with pytest.raises(ConnectionError):
+        await manager.remember("T1:U1", "We deploy to the eu-west region")
+
+    assert await manager.search("T1:U1", "deploy region")
+
+
+@pytest.mark.asyncio
 async def test_in_memory_store_has_items_counts_one_scope():
     store = InMemoryMemoryStore()
     await store.add(MemoryItem(scope="T1:U1", text="hello", keywords=["hello"]))

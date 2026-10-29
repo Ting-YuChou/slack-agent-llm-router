@@ -914,6 +914,9 @@ class MemoryManager:
             max_entries=HAS_ITEMS_CACHE_LIMIT,
             ttl_seconds=HAS_ITEMS_CACHE_TTL_SECONDS,
         )
+        # Bumped on every write through the manager; a has_items answer read
+        # before a write is not cached after it.
+        self._has_items_generation = 0
         self.store = store or build_memory_store(self.config)
         self.embedding_provider = embedding_provider or build_embedding_provider(
             dict(self.config.get("embedding", {}) or {})
@@ -964,8 +967,10 @@ class MemoryManager:
             expires_at=expires_at,
             embedding=embedding,
         )
-        await self.store.add(item)
-        self._has_items_cache.pop(scope, None)
+        try:
+            await self.store.add(item)
+        finally:
+            self._invalidate_has_items(scope)
         return item
 
     async def list_memories(
@@ -985,7 +990,7 @@ class MemoryManager:
         try:
             return await self.store.delete(scope, memory_id)
         finally:
-            self._has_items_cache.pop(scope, None)
+            self._invalidate_has_items(scope)
 
     async def forget_all(self, scope: str) -> int:
         if not self.enabled:
@@ -993,7 +998,7 @@ class MemoryManager:
         try:
             return await self.store.delete_all(scope)
         finally:
-            self._has_items_cache.pop(scope, None)
+            self._invalidate_has_items(scope)
 
     async def _scope_has_items(self, scope: str) -> bool:
         cached = self._has_items_cache.get(scope)
@@ -1002,9 +1007,15 @@ class MemoryManager:
         has_items = getattr(self.store, "has_items", None)
         if not callable(has_items):
             return True
+        generation = self._has_items_generation
         result = bool(await has_items(scope))
-        self._has_items_cache[scope] = result
+        if generation == self._has_items_generation:
+            self._has_items_cache[scope] = result
         return result
+
+    def _invalidate_has_items(self, scope: str) -> None:
+        self._has_items_generation += 1
+        self._has_items_cache.pop(scope, None)
 
     async def search(
         self, scope: str, query: str, metadata: Optional[Dict[str, Any]] = None
