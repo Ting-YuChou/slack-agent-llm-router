@@ -1554,9 +1554,9 @@ class TestSlackAgentApprovals:
 
         request = inference_engine.process_query.await_args.args[0]
         assert response == "thread answer"
-        # With a transcript the per-user summary is not repeated after it.
-        assert request.context.startswith("Slack thread context:")
-        assert "previous bot answer" not in request.context
+        assert request.context.index("Slack thread context:") < request.context.index(
+            "assistant: previous bot answer"
+        )
         assert "<@u2>: parent decision" in request.context
         assert "<@u3>: prior reply" in request.context
         assert "current question" not in request.context

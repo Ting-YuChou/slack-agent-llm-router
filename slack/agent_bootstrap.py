@@ -13,6 +13,7 @@ import httpx
 from slack.files import download_slack_file, error_name, is_allowed_slack_file_url
 from slack.thread_history import (
     DEFAULT_MAX_THREAD_PAGES,
+    MAX_THREAD_PAGE_LIMIT,
     bounded_join_newest,
     fetch_newest_thread_messages,
     raise_for_slack_error,
@@ -239,7 +240,7 @@ class AgentBootstrapBuilder:
         kwargs: Dict[str, Any] = {
             "channel": channel_id,
             "ts": thread_ts,
-            "limit": min(max(max_messages, 1), 100),
+            "limit": min(max(max_messages, 1), MAX_THREAD_PAGE_LIMIT),
         }
         if latest_ts:
             kwargs.update({"latest": latest_ts, "inclusive": False})

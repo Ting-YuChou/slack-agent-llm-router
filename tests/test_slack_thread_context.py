@@ -149,7 +149,7 @@ async def test_a_long_thread_is_paged_and_keeps_its_last_twenty_messages(
         "latest": "9.0",
         "inclusive": False,
     }
-    assert second.kwargs == {**first.kwargs, "cursor": "cursor-1"}
+    assert second.kwargs == {**first.kwargs, "cursor": "cursor-1", "limit": 100}
 
 
 @pytest.mark.asyncio

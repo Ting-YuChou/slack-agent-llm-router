@@ -192,10 +192,16 @@ SLACK_OWN_MESSAGE_SENDER = "assistant (you)"
 # part of a transcript: it says nothing, and one left behind when the update
 # failed would read as an answer.
 SLACK_THINKING_TEXT = "_Thinking…_"
+SLACK_GENERIC_ERROR_MESSAGE = (
+    "❌ Sorry, I couldn't process that request right now. Please try again in a "
+    "moment."
+)
 # Fence name for fetched Slack history: `<untrusted_slack_history>`.
 SLACK_HISTORY_FENCE = "slack_history"
 # Most characters of per-user conversation summary a request carries.
 CONVERSATION_SUMMARY_MAX_CHARS = 8000
+# How much of the last answer must appear in the transcript to count as there.
+LAST_ANSWER_PROBE_CHARS = 200
 SLACK_PRIORITY_WORK_KINDS = frozenset({"interactive"})
 AGENT_TASK_ECHO_LIMIT = 2500
 AGENT_SHORTCUT_NONCE_TTL_SECONDS = 300
@@ -1332,6 +1338,35 @@ def _admission_rejection_text(
     return _busy_text(wait)
 
 
+def _normalized_text(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+# What the bot posts instead of an answer: progress, errors, busy and empty
+# answer notices. A transcript skips them, since none of them is an answer.
+_SLACK_NOTICE_TEXTS = frozenset(
+    _normalized_text(text)
+    for text in (
+        SLACK_THINKING_TEXT,
+        SLACK_BUSY_MESSAGE,
+        SLACK_GENERIC_ERROR_MESSAGE,
+        MEMORY_SLASH_ONLY_MESSAGE,
+        *SLACK_ERROR_CODE_MESSAGES.values(),
+        *SLACK_INFERENCE_ERROR_MESSAGES.values(),
+    )
+)
+# Notices with a variable part (a wait, notes) start with these. Every
+# rate-limit, busy and quota reply starts with the hourglass.
+_SLACK_NOTICE_PREFIXES = ("⏳ ", _normalized_text(SLACK_EMPTY_ANSWER_MESSAGE))
+
+
+def _is_slack_notice_text(text: Any) -> bool:
+    normalized = _normalized_text(text)
+    return normalized in _SLACK_NOTICE_TEXTS or normalized.startswith(
+        _SLACK_NOTICE_PREFIXES
+    )
+
+
 class UserManager:
     """Manages user data and preferences"""
 
@@ -1563,6 +1598,19 @@ class ConversationManager:
             summary_parts, CONVERSATION_SUMMARY_MAX_CHARS
         )
         return summary
+
+    def get_last_answer(
+        self, user_id: str, channel_id: str, thread_ts: str = None
+    ) -> str:
+        """This user's last answer from the bot, whitespace-normalized."""
+        context_key = f"{user_id}:{channel_id}:{thread_ts or 'main'}"
+        context = self.conversations.get(context_key)
+        for msg in reversed(getattr(context, "conversation_history", None) or []):
+            if msg.get("role") == "assistant":
+                return " ".join(str(msg.get("content") or "").split())[
+                    :CONVERSATION_SUMMARY_MAX_CHARS
+                ]
+        return ""
 
 
 class SlackMessageHandler:
@@ -3070,15 +3118,12 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                     text, user_id=user_id, channel_id=channel_id, team_id=team_id
                 ),
             )
-            # The thread transcript already holds this user's turns and the
-            # bot's answers; the summary only stands in when there is none.
-            conversation_context = ""
-            if slack_context.source != "thread" or slack_context.error:
-                conversation_context = (
-                    self.bot.conversation_manager.get_conversation_summary(
-                        user_id, channel_id, thread_ts
-                    )
-                )
+            conversation_context = self._conversation_fallback(
+                slack_context,
+                user_id=user_id,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+            )
 
             request_context = self._join_context_sections(
                 [slack_context.context, conversation_context]
@@ -3236,6 +3281,40 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         if callable(error_builder):
             return error_builder()
         return "❌ Sorry, I couldn't process that request right now. Please try again in a moment."
+
+    def _conversation_fallback(
+        self,
+        slack_context: SlackFetchedContext,
+        *,
+        user_id: str,
+        channel_id: str,
+        thread_ts: Optional[str],
+    ) -> str:
+        """What the per-user history adds to the Slack transcript.
+
+        Without a thread transcript, or when the bot cannot recognise its own
+        messages (no bot user id), the whole summary. Otherwise only the last
+        answer, and only when the transcript misses it: an answer posted
+        after the follow-up (later parts, queued work) is past `latest`.
+        """
+        conversations = self.bot.conversation_manager
+        if (
+            slack_context.source != "thread"
+            or slack_context.error
+            or not getattr(self.bot, "bot_user_id", None)
+        ):
+            return conversations.get_conversation_summary(
+                user_id, channel_id, thread_ts
+            )
+        last_answer = conversations.get_last_answer(user_id, channel_id, thread_ts)
+        if not last_answer:
+            return ""
+        # History leads a degraded answer with a "[...]" label Slack lacks.
+        probe = re.sub(r"^\[[^\]]*\]\s*", "", last_answer)
+        probe = protect_untrusted_boundary(probe)[:LAST_ANSWER_PROBE_CHARS]
+        if probe and probe in slack_context.context:
+            return ""
+        return f"assistant: {last_answer}"
 
     async def _fetch_query_slack_context(
         self,
@@ -4201,10 +4280,14 @@ class SlackBot:
         if not client or not channel_id:
             return SlackFetchedContext()
 
+        # The deadline applies per Slack call, so a slow later page ends the
+        # paging and keeps the pages already fetched instead of all of them.
+        deadline = asyncio.get_running_loop().time() + float(
+            self.context_settings.get("timeout_seconds", 3.0)
+        )
         try:
-            return await asyncio.wait_for(
-                self._fetch_slack_context(client, channel_id, thread_ts, message_ts),
-                timeout=float(self.context_settings.get("timeout_seconds", 3.0)),
+            return await self._fetch_slack_context(
+                client, channel_id, thread_ts, message_ts, deadline=deadline
             )
         except Exception as exc:
             if not self.context_settings.get("fail_open", True):
@@ -4219,8 +4302,18 @@ class SlackBot:
         channel_id: str,
         thread_ts: Optional[str],
         message_ts: Optional[str],
+        deadline: Optional[float] = None,
     ) -> SlackFetchedContext:
         """Fetch Slack history using thread context first, then channel context."""
+
+        async def send(request: Callable[[], Awaitable[Any]]) -> Any:
+            if deadline is None:
+                return await request()
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            return await asyncio.wait_for(request(), timeout=remaining)
+
         strategy = self.context_settings.get("strategy", "thread_first")
         if strategy != "thread_first":
             raise ValueError(f"Unsupported Slack context strategy: {strategy}")
@@ -4253,8 +4346,13 @@ class SlackBot:
                         "max_thread_pages", DEFAULT_MAX_THREAD_PAGES
                     )
                 ),
+                send=send,
+                next_page_limit=MAX_THREAD_PAGE_LIMIT,
+                keep_parent=True,
             )
-            fetched = self._format_slack_context(window.messages, "thread")
+            fetched = self._format_slack_context(
+                window.messages, "thread", parent_ts=thread_ts
+            )
             fetched.truncated = fetched.truncated or window.truncated
             return fetched
 
@@ -4265,11 +4363,13 @@ class SlackBot:
         if not callable(method):
             raise RuntimeError(f"{method_name}_unavailable")
 
-        response = await method(
-            channel=channel_id,
-            latest=message_ts,
-            inclusive=False,
-            limit=int(self.context_settings.get("max_channel_messages", 10)),
+        response = await send(
+            lambda: method(
+                channel=channel_id,
+                latest=message_ts,
+                inclusive=False,
+                limit=int(self.context_settings.get("max_channel_messages", 10)),
+            )
         )
         raise_for_slack_error(response)
 
@@ -4298,15 +4398,11 @@ class SlackBot:
             return False
         if message.get("subtype") not in CHAT_MESSAGE_SUBTYPES:
             return False
-        if (
-            self._is_own_slack_message(message)
-            and str(message.get("text") or "").strip() == SLACK_THINKING_TEXT
-        ):
-            return False
-        if not self._is_own_slack_message(message) and not self.context_settings.get(
-            "include_bot_messages", False
-        ):
-            if message.get("bot_id") or message.get("user") == self.bot_user_id:
+        if self._is_own_slack_message(message):
+            if _is_slack_notice_text(message.get("text")):
+                return False
+        elif not self.context_settings.get("include_bot_messages", False):
+            if message.get("bot_id"):
                 return False
         if not self._slack_context_message_text(message):
             return False
@@ -4326,12 +4422,17 @@ class SlackBot:
         return f"[shared file: {', '.join(names)}]" if names else ""
 
     def _format_slack_context(
-        self, messages: List[Dict[str, Any]], source: str
+        self,
+        messages: List[Dict[str, Any]],
+        source: str,
+        parent_ts: Optional[str] = None,
     ) -> SlackFetchedContext:
         """Render Slack messages into a compact deterministic context block.
 
         The budget fills from the newest message back, so a long history
         loses its oldest messages, and the block keeps chronological order.
+        The thread parent (`parent_ts`), usually the opening question, is
+        always kept, cut to a third of the budget at most.
         """
         if not messages:
             return SlackFetchedContext(source=source)
@@ -4352,10 +4453,25 @@ class SlackBot:
         closing = f"</untrusted_{SLACK_HISTORY_FENCE}>"
 
         max_chars = int(self.context_settings.get("max_context_chars", 4000))
-        body, included_count, truncated = bounded_join_newest(
-            candidate_lines,
-            max_chars - len(header) - len(opening) - len(closing) - 3,
-        )
+        budget = max_chars - len(header) - len(opening) - len(closing) - 3
+        parent_lines: List[str] = []
+        parent_truncated = False
+        if parent_ts is not None and self._same_slack_timestamp(
+            messages[0].get("ts"), parent_ts
+        ):
+            parent_line = candidate_lines.pop(0)
+            parent_limit = max(budget // 3, 0)
+            if len(parent_line) > parent_limit:
+                parent_line = parent_line[: max(parent_limit - 3, 0)].rstrip() + "..."
+                parent_truncated = True
+            parent_lines.append(parent_line)
+            budget -= len(parent_line) + 1
+        body, included_count, truncated = bounded_join_newest(candidate_lines, budget)
+        truncated = truncated or parent_truncated
+        if parent_lines:
+            body = "\n".join([*parent_lines, body]) if body else parent_lines[0]
+            included_count += 1
+            candidate_lines.insert(0, parent_lines[0])
         if included_count < len(candidate_lines):
             truncated = True
         if included_count == 0:
@@ -6755,7 +6871,7 @@ class SlackBot:
 
     def _build_user_safe_error_message(self) -> str:
         """Return a generic Slack-safe error message without leaking internals."""
-        return "❌ Sorry, I couldn't process that request right now. Please try again in a moment."
+        return SLACK_GENERIC_ERROR_MESSAGE
 
     def _extract_team_id(self, payload: Dict[str, Any]) -> Optional[str]:
         """Extract Slack team/workspace id from event or command payloads."""
