@@ -1,11 +1,12 @@
 """Slack concurrency: runtime lookups, allowlist checks and per-thread order."""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from slack.bot_real import SlackBot
+from slack.bot_real import SlackBot, SlackWorkItem
 from src.agent_runtime import AgentRuntimeUnavailable
 
 
@@ -202,6 +203,128 @@ async def test_allowlist_miss_calls_conversations_info_once_per_ttl():
     clock.now += 3600
     assert not await bot._is_channel_allowed("COTHER001")
     assert bot.web_client.conversations_info.await_count == 2
+
+
+# S12: one Slack thread is answered one message at a time
+
+
+async def _run_workers_until_idle(bot, release, *, picked_up):
+    bot._start_work_workers()
+    try:
+        # Wait until both items left the queue, so without a per-thread lock
+        # the second one would be running next to the first.
+        for _ in range(200):
+            if bot._work_queue.qsize() == 0 and bot._work_running >= picked_up:
+                break
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0.05)
+        release.set()
+        await asyncio.wait_for(bot._work_queue.join(), timeout=2)
+    finally:
+        await bot._stop_work_workers()
+
+
+@pytest.mark.asyncio
+async def test_same_thread_messages_are_answered_in_order_with_history(
+    inference_response_factory,
+):
+    release = asyncio.Event()
+
+    async def process_query(request):
+        if request.query == "first question":
+            await release.wait()
+        return inference_response_factory(response_text=f"re: {request.query}")
+
+    bot = chat_bot(AsyncMock(side_effect=process_query))
+    bot._mark_thread_active("C1", "100.0")
+    mention = {
+        "type": "app_mention",
+        "channel": "C1",
+        "user": "U1",
+        "text": "<@UBOT> first question",
+        "ts": "100.0",
+    }
+    assert await bot._enqueue_work(
+        SlackWorkItem(kind="event", payload=mention, name="mention")
+    )
+    assert await bot._enqueue_work(
+        SlackWorkItem(
+            kind="event", payload=thread_reply(text="a follow-up"), name="message"
+        )
+    )
+
+    await _run_workers_until_idle(bot, release, picked_up=2)
+
+    assert queries(bot) == ["first question", "a follow-up"]
+    posted = [
+        call.kwargs["text"] for call in bot.web_client.chat_postMessage.await_args_list
+    ]
+    assert posted == ["re: first question", "re: a follow-up"]
+    second_request = bot.inference_engine.process_query.await_args_list[1].args[0]
+    assert "re: first question" in (second_request.context or "")
+    assert not bot._thread_locks
+
+
+@pytest.mark.asyncio
+async def test_different_threads_are_still_answered_in_parallel(
+    inference_response_factory,
+):
+    release = asyncio.Event()
+
+    async def process_query(request):
+        if request.query == "slow one":
+            await release.wait()
+        return inference_response_factory(response_text=f"re: {request.query}")
+
+    bot = chat_bot(AsyncMock(side_effect=process_query))
+    bot._mark_thread_active("C1", "100.0")
+    bot._mark_thread_active("C1", "200.0")
+    for ts, thread_ts, text in (
+        ("101.0", "100.0", "slow one"),
+        ("201.0", "200.0", "fast one"),
+    ):
+        assert await bot._enqueue_work(
+            SlackWorkItem(
+                kind="event",
+                payload=thread_reply(ts=ts, thread_ts=thread_ts, text=text),
+                name="message",
+            )
+        )
+
+    await _run_workers_until_idle(bot, release, picked_up=2)
+
+    posted = [
+        call.kwargs["text"] for call in bot.web_client.chat_postMessage.await_args_list
+    ]
+    assert posted == ["re: fast one", "re: slow one"]
+
+
+@pytest.mark.asyncio
+async def test_agent_background_start_does_not_hold_the_thread_lock():
+    bot = chat_bot()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handle_event(event):
+        started.set()
+        await release.wait()
+
+    bot._is_agent_request = lambda event: True
+    bot._handle_event = handle_event
+    assert await bot._enqueue_work(
+        SlackWorkItem(
+            kind="event", payload=thread_reply(text="agent go"), name="message"
+        )
+    )
+    bot._start_work_workers()
+    try:
+        await asyncio.wait_for(bot._work_queue.join(), timeout=1)
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert not bot._thread_locks
+    finally:
+        release.set()
+        await bot._stop_work_workers()
+        await asyncio.gather(*bot.background_tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio

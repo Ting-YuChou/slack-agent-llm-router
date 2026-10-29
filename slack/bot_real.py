@@ -4,6 +4,7 @@ Enterprise-ready Slack bot with conversation continuity and advanced features
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -15,7 +16,17 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Awaitable, Callable, Dict, List, Optional, Any, Set, Tuple
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
 from dataclasses import dataclass
 
 from slack_sdk.web.async_client import AsyncWebClient
@@ -3444,6 +3455,10 @@ class SlackBot:
         )
         self._work_workers: List[asyncio.Task] = []
         self._work_running = 0
+        # "channel:thread_ts" -> [lock, holders and waiters] (S12). An entry
+        # lives only while a chat item holds or waits for it, so the map is
+        # bounded by in-flight work and a held lock is never dropped.
+        self._thread_locks: Dict[str, List[Any]] = {}
         self._accepting_work = True
         self._socket_disconnect_lock = asyncio.Lock()
         self._socket_disconnected = False
@@ -6558,7 +6573,8 @@ class SlackBot:
                         self._handle_event(item.payload), "pi_agent_start"
                     )
                 else:
-                    await self._handle_event(item.payload)
+                    async with self._thread_lock(item.payload):
+                        await self._handle_event(item.payload)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -6567,6 +6583,32 @@ class SlackBot:
                 self._work_running -= 1
                 SLACK_METRICS.work_running.set(self._work_running)
                 queue.task_done()
+
+    @contextlib.asynccontextmanager
+    async def _thread_lock(self, event: Dict[str, Any]) -> AsyncIterator[None]:
+        """Serialize chat events of one Slack thread (S12).
+
+        A follow-up then sees the answer before it in the thread's history and
+        is posted after it. The key is the thread's root: its thread_ts, or
+        the message's own ts when it starts a thread.
+        """
+        channel_id = event.get("channel")
+        thread_ts = event.get("thread_ts") or event.get("ts")
+        if not channel_id or not thread_ts:
+            yield
+            return
+        key = self._thread_key(channel_id, thread_ts)
+        entry = self._thread_locks.get(key)
+        if entry is None:
+            entry = self._thread_locks[key] = [asyncio.Lock(), 0]
+        entry[1] += 1
+        try:
+            async with entry[0]:
+                yield
+        finally:
+            entry[1] -= 1
+            if entry[1] == 0 and self._thread_locks.get(key) is entry:
+                del self._thread_locks[key]
 
     async def _reply_busy(self, item: SlackWorkItem) -> None:
         if not self._wants_busy_reply(item):
