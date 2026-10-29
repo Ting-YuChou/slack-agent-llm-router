@@ -3131,11 +3131,14 @@ class InferenceEngine:
         primary_model = routing_decision.selected_model
         primary_started_at = time.time()
         # With a shared budget, a primary that has a fallback holds back part
-        # of the time and one attempt for it.
+        # of the time and one attempt for it. With a single attempt per
+        # request the fallback could never run, so nothing is held back.
         fallback_reserve_seconds = 0.0
         reserve_attempts = 0
-        if execution_budget is not None and self._primary_has_fallback_route(
-            request, routing_decision
+        if (
+            execution_budget is not None
+            and execution_budget.max_attempts >= 2
+            and self._primary_has_fallback_route(request, routing_decision)
         ):
             fallback_reserve_seconds = execution_budget.fallback_reserve_seconds()
             reserve_attempts = 1

@@ -175,16 +175,26 @@ def test_attempt_timeout_is_provider_timeout_capped_by_remaining_minus_reserve()
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("fallbacks", "expected_reserve"),
-    [([], 0.0), (["mistral-7b"], 3.0)],
-    ids=["no-fallback", "fallback"],
+    ("fallbacks", "max_attempts", "expected_reserve", "expected_reserve_attempts"),
+    [
+        ([], 3, 0.0, 0),
+        (["mistral-7b"], 3, 3.0, 1),
+        # One attempt per request: the fallback can never run, so holding
+        # time back would only cut the primary short.
+        (["mistral-7b"], 1, 0.0, 0),
+    ],
+    ids=["no-fallback", "fallback", "fallback-but-one-attempt"],
 )
-async def test_primary_attempt_reserves_time_only_when_a_fallback_exists(
-    fallbacks, expected_reserve
+async def test_primary_attempt_reserves_time_only_when_a_fallback_can_run(
+    fallbacks, max_attempts, expected_reserve, expected_reserve_attempts
 ):
     engine = _mock_engine(
         {"gpt-5": "openai", "mistral-7b": "vllm"},
-        scheduler={"request_deadline_seconds": 10, "fallback_reserve_ratio": 0.3},
+        scheduler={
+            "request_deadline_seconds": 10,
+            "fallback_reserve_ratio": 0.3,
+            "retry": {"max_attempts_per_request": max_attempts},
+        },
     )
     engine.providers = {"openai": OpenAIProvider({"timeout": 45})}
     engine._get_local_fallback_models = MagicMock(return_value=fallbacks)
@@ -205,7 +215,7 @@ async def test_primary_attempt_reserves_time_only_when_a_fallback_exists(
     (call,) = calls
     assert call["attempt_timeout_seconds"] == 45
     assert call["fallback_reserve_seconds"] == pytest.approx(expected_reserve, abs=0.05)
-    assert call["reserve_attempts"] == (1 if fallbacks else 0)
+    assert call["reserve_attempts"] == expected_reserve_attempts
 
 
 @pytest.mark.asyncio
