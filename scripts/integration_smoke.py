@@ -19,6 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.kafka_topics import AIOKafkaTopicAdmin, provision_topics, topic_specs
+from src.kafka_topics import start_admin as start_topic_admin
 from src.llm_router_part3_pipeline import KafkaIngestionPipeline
 from src.utils.schema import InferenceResponse, QueryRequest, QueryType, UserTier
 
@@ -55,6 +57,17 @@ async def wait_for(condition, timeout: float, interval: float = 0.5):
     return False
 
 
+async def provision_smoke_topics(config, timeout_seconds: float):
+    """Create the smoke topics and DLQs: the compose broker has auto-create off."""
+    admin = await start_topic_admin(
+        ",".join(config["bootstrap_servers"]), timeout_seconds
+    )
+    try:
+        await provision_topics(AIOKafkaTopicAdmin(admin), topic_specs(config))
+    finally:
+        await admin.close()
+
+
 async def run_smoke(args):
     suffix = uuid.uuid4().hex[:8]
     config = build_config(args, suffix)
@@ -62,6 +75,7 @@ async def run_smoke(args):
     start_task = None
 
     try:
+        await provision_smoke_topics(config, args.timeout_seconds)
         await pipeline.initialize()
         start_task = asyncio.create_task(pipeline.start())
         await asyncio.sleep(2)
@@ -142,7 +156,9 @@ async def run_smoke(args):
                 database="default",
             )
             try:
-                admin_client.command(f"DROP DATABASE IF EXISTS {config['clickhouse']['database']}")
+                admin_client.command(
+                    f"DROP DATABASE IF EXISTS {config['clickhouse']['database']}"
+                )
             finally:
                 admin_client.close()
 

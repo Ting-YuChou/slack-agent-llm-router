@@ -20,6 +20,11 @@ import uuid
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 from aiokafka.errors import KafkaError
 from aiokafka.structs import TopicPartition
+
+try:
+    from aiokafka import ConsumerRebalanceListener
+except ImportError:  # pragma: no cover - CI stubs aiokafka without it
+    ConsumerRebalanceListener = object  # type: ignore[assignment,misc]
 import clickhouse_connect
 from clickhouse_connect.driver import Client
 
@@ -1836,7 +1841,7 @@ class BatchBufferState:
     next_flush_at: float = 0.0
 
 
-class _BatchBackpressureRebalanceListener:
+class _BatchBackpressureRebalanceListener(ConsumerRebalanceListener):
     """Reapply topic backpressure as soon as partitions are assigned."""
 
     def __init__(self, manager: "KafkaConsumerManager", topic_key: str, consumer):
@@ -1994,9 +1999,11 @@ class KafkaConsumerManager:
                     "routing_policy_state",
                     "alerts",
                 ]:
-                    consumer = AIOKafkaConsumer(topic_name, **self.consumer_config)
-                    await consumer.start()
+                    # Subscribe with the backpressure listener before start():
+                    # re-subscribing a running consumer races its fetcher.
+                    consumer = AIOKafkaConsumer(**self.consumer_config)
                     self._install_rebalance_listener(topic_key, topic_name, consumer)
+                    await consumer.start()
                     self.consumers[topic_key] = consumer
                     self.topic_names_by_key[topic_key] = topic_name
                     self.consumer_task_status[topic_key] = {
