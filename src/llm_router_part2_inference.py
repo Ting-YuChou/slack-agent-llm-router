@@ -440,6 +440,24 @@ def inference_error_code(exc: BaseException) -> Optional[str]:
     return None
 
 
+class RetrievalUnavailableError(RuntimeError):
+    """rag_policy is REQUIRED, but document retrieval timed out or failed.
+
+    The answer must come from the documents, so the request fails instead of
+    answering without them. Neither the model nor its provider is at fault.
+    """
+
+    error_code = "retrieval_unavailable"
+    error_type = "internal"
+    http_status = 503
+
+    def __init__(self, status: str, detail: Optional[str] = None):
+        super().__init__(
+            f"Document retrieval {status}" + (f" ({detail})" if detail else "")
+        )
+        self.status = status
+
+
 def _header_value(headers: Any, name: str) -> Optional[str]:
     getter = getattr(headers, "get", None)
     if not callable(getter):
@@ -2657,9 +2675,11 @@ class InferenceEngine:
                     error_type=type(exc).__name__,
                 ).inc()
 
-            # Update router stats
-            if "routing_decision" in locals() and not getattr(
-                exc, "_attempt_recorded", False
+            # Update router stats; a retrieval outage is not the model's fault.
+            if (
+                "routing_decision" in locals()
+                and not getattr(exc, "_attempt_recorded", False)
+                and not isinstance(exc, RetrievalUnavailableError)
             ):
                 self.router.update_model_stats(
                     model_name=routing_decision.selected_model,
@@ -2822,22 +2842,45 @@ class InferenceEngine:
         min_score = (
             options.min_score if options and options.min_score is not None else None
         )
-        results = await self.rag_service.retrieve(
-            request.query,
-            knowledge_base_ids=request.knowledge_base_ids,
-            max_results=max_results,
-            candidate_count=candidate_count,
-            min_score=min_score,
-        )
+        try:
+            outcome = await self._retrieve_rag_outcome(
+                request,
+                max_results=max_results,
+                candidate_count=candidate_count,
+                min_score=min_score,
+            )
+        except asyncio.TimeoutError:
+            # A deadline imposed around this call (the request budget) is a
+            # retrieval timeout too, not a provider timeout.
+            outcome = SimpleNamespace(status="timeout", results=[], detail=None)
+        results = list(outcome.results)
+        rag_unavailable = outcome.status in ("timeout", "error")
         latency_ms = int((time.time() - started_at) * 1000)
         tool_call = self.rag_service.tool_call_from_results(
             request.query,
             results,
             latency_ms,
         )
+        if rag_unavailable and isinstance(tool_call, ToolCall):
+            tool_call = tool_call.model_copy(update={"error": f"rag_{outcome.status}"})
         sources = self.rag_service.sources_from_results(results)
+        warnings: List[str] = []
 
-        if results:
+        if rag_unavailable:
+            request.metadata["rag_hit_count"] = 0
+            request.metadata["rag_unavailable"] = outcome.status
+            request.metadata["rag_cache_bypass"] = True
+            if request.rag_policy == RagPolicy.REQUIRED:
+                raise RetrievalUnavailableError(
+                    outcome.status, getattr(outcome, "detail", None)
+                )
+            logger.warning(
+                "RAG retrieval %s for request %s; answering without documents",
+                outcome.status,
+                request.request_id,
+            )
+            warnings.append("rag_unavailable")
+        elif results:
             request.metadata["rag_context"] = self.rag_service.build_context(results)
             request.metadata["rag_hit_count"] = len(results)
             request.metadata["rag_chunk_ids"] = [
@@ -2860,6 +2903,43 @@ class InferenceEngine:
             tool_call=tool_call,
             latency_ms=latency_ms,
             required_no_hits=request.rag_policy == RagPolicy.REQUIRED and not results,
+            warnings=warnings,
+        )
+
+    async def _retrieve_rag_outcome(
+        self,
+        request: QueryRequest,
+        **retrieve_kwargs: Any,
+    ) -> Any:
+        """Retrieve with a typed outcome: hits, no_hits, timeout or error.
+
+        RAG services without ``retrieve_with_outcome`` only answer a list, so
+        a raised error is the only failure signal they can give.
+        """
+        retrieve_with_outcome = getattr(self.rag_service, "retrieve_with_outcome", None)
+        if callable(retrieve_with_outcome):
+            return await retrieve_with_outcome(
+                request.query,
+                knowledge_base_ids=request.knowledge_base_ids,
+                **retrieve_kwargs,
+            )
+        try:
+            results = await self.rag_service.retrieve(
+                request.query,
+                knowledge_base_ids=request.knowledge_base_ids,
+                **retrieve_kwargs,
+            )
+        except asyncio.TimeoutError:
+            return SimpleNamespace(status="timeout", results=[], detail=None)
+        except Exception as exc:
+            logger.warning("RAG retrieval failed: %s", exc, exc_info=True)
+            return SimpleNamespace(
+                status="error", results=[], detail=type(exc).__name__
+            )
+        return SimpleNamespace(
+            status="hits" if results else "no_hits",
+            results=list(results or []),
+            detail=None,
         )
 
     async def _prepare_rag_images(

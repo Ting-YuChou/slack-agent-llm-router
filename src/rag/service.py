@@ -31,7 +31,11 @@ from src.rag.storage import (
     S3ObjectStore,
     S3RagAssetStore,
 )
-from src.rag.vector_store import RagSearchResult, build_vector_store
+from src.rag.vector_store import (
+    RagSearchResult,
+    build_vector_store,
+    capture_search_report,
+)
 from src.rag.visual import (
     FigureCropper,
     VisualProcessor,
@@ -77,6 +81,29 @@ class RagQueuePreDurabilityError(RuntimeError):
     """A queue submission failure proven to precede every durable side effect."""
 
     safe_to_cleanup_staging = True
+
+
+RAG_HITS = "hits"
+RAG_NO_HITS = "no_hits"
+RAG_TIMEOUT = "timeout"
+RAG_ERROR = "error"
+
+
+@dataclass
+class RagRetrievalOutcome:
+    """One retrieval: hits, no_hits, or a failure (timeout / error).
+
+    ``no_hits`` means the store answered and nothing matched; a timeout or
+    an error means nobody knows whether something would have matched.
+    """
+
+    status: str
+    results: List[RagSearchResult] = field(default_factory=list)
+    detail: Optional[str] = None
+
+    @property
+    def unavailable(self) -> bool:
+        return self.status in (RAG_TIMEOUT, RAG_ERROR)
 
 
 @dataclass(frozen=True)
@@ -889,9 +916,7 @@ class RagService:
     ) -> List[RagSearchResult]:
         if not self.enabled:
             return []
-        deadline_seconds = max(
-            0.001, float(self.retrieval_config.get("deadline_seconds", 30))
-        )
+        deadline_seconds = self._retrieval_deadline_seconds()
         try:
             return await asyncio.wait_for(
                 self._retrieve_within_deadline(
@@ -909,6 +934,65 @@ class RagService:
                 deadline_seconds,
             )
             return []
+
+    async def retrieve_with_outcome(
+        self,
+        query: str,
+        *,
+        knowledge_base_ids: Optional[Sequence[str]] = None,
+        max_results: Optional[int] = None,
+        candidate_count: Optional[int] = None,
+        min_score: Optional[float] = None,
+    ) -> RagRetrievalOutcome:
+        """Retrieve like ``retrieve``, but tell "no hits" apart from a failure.
+
+        ``retrieve`` answers [] for a timeout and lets other errors escape;
+        here both become typed outcomes, and so does a vector store that
+        swallowed its own failures (see RagSearchReport).
+        """
+        if not self.enabled:
+            return RagRetrievalOutcome(status=RAG_NO_HITS)
+        deadline_seconds = self._retrieval_deadline_seconds()
+        with capture_search_report() as report:
+            try:
+                results = await asyncio.wait_for(
+                    self._retrieve_within_deadline(
+                        query,
+                        knowledge_base_ids=knowledge_base_ids,
+                        max_results=max_results,
+                        candidate_count=candidate_count,
+                        min_score=min_score,
+                    ),
+                    timeout=deadline_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "RAG retrieval exceeded its %.3fs shared deadline",
+                    deadline_seconds,
+                )
+                return RagRetrievalOutcome(
+                    status=RAG_TIMEOUT,
+                    detail=f"deadline {deadline_seconds:.3f}s",
+                )
+            except Exception as exc:
+                logger.warning("RAG retrieval failed: %s", exc, exc_info=True)
+                return RagRetrievalOutcome(status=RAG_ERROR, detail=type(exc).__name__)
+        if results:
+            return RagRetrievalOutcome(status=RAG_HITS, results=list(results))
+        if report.timed_out:
+            return RagRetrievalOutcome(
+                status=RAG_TIMEOUT,
+                detail="branches " + ",".join(sorted(report.timed_out)),
+            )
+        if report.unanswered_failures:
+            return RagRetrievalOutcome(
+                status=RAG_ERROR,
+                detail="branches " + ",".join(sorted(report.unanswered_failures)),
+            )
+        return RagRetrievalOutcome(status=RAG_NO_HITS)
+
+    def _retrieval_deadline_seconds(self) -> float:
+        return max(0.001, float(self.retrieval_config.get("deadline_seconds", 30)))
 
     async def _retrieve_within_deadline(
         self,
