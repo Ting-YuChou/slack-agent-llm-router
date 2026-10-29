@@ -26,6 +26,7 @@ class _Producer:
 
     async def produce_chat_feedback(self, **fields):
         self.feedback.append(fields)
+        return True
 
 
 def _bot(inference_response_factory=None, answer="four", **response_settings):

@@ -713,6 +713,9 @@ def slack_chat_request_id(
 # Thumbs up / down under a chat answer; the value is the answered request id.
 CHAT_FEEDBACK_ACTIONS = {"chat_feedback_up": "up", "chat_feedback_down": "down"}
 CHAT_FEEDBACK_THANKS_TEXT = "Thanks for the feedback."
+CHAT_FEEDBACK_NOT_RECORDED_TEXT = (
+    "Sorry, your feedback could not be recorded right now. Please try again."
+)
 CHAT_FEEDBACK_CLICKS_LIMIT = 1000
 
 
@@ -6772,27 +6775,45 @@ class SlackBot:
         if not is_valid_request_id(request_id) or not user_id or not click_id:
             return
         # Slack may deliver one click twice; a replay is not a second vote.
+        # The click is claimed while it is being recorded and kept only once
+        # it was, so a click that failed can be recorded when retried.
         clicks = self._chat_feedback_clicks
         if click_id in clicks:
             return
         clicks[click_id] = None
-        while len(clicks) > CHAT_FEEDBACK_CLICKS_LIMIT:
-            clicks.pop(next(iter(clicks)))
 
+        recorded = False
         producer = (getattr(self, "services", None) or {}).get("event_producer")
         produce = getattr(producer, "produce_chat_feedback", None)
-        if callable(produce):
+        if not callable(produce):
+            logger.warning(
+                "No event producer: chat feedback for request %s not recorded",
+                request_id,
+            )
+        else:
             try:
-                await produce(
-                    request_id=request_id,
-                    user_id=str(user_id),
-                    rating=rating,
-                    click_id=click_id,
+                recorded = bool(
+                    await produce(
+                        request_id=request_id,
+                        user_id=str(user_id),
+                        rating=rating,
+                        click_id=click_id,
+                    )
                 )
             except Exception:
                 logger.exception(
                     "Failed to record chat feedback for request %s", request_id
                 )
+            else:
+                if not recorded:
+                    logger.warning(
+                        "Chat feedback for request %s was not accepted for " "delivery",
+                        request_id,
+                    )
+        if not recorded:
+            clicks.pop(click_id, None)
+        while len(clicks) > CHAT_FEEDBACK_CLICKS_LIMIT:
+            clicks.pop(next(iter(clicks)))
         if channel_id and hasattr(self.web_client, "chat_postEphemeral"):
             container = payload.get("container") or {}
             message = payload.get("message") or {}
@@ -6800,7 +6821,11 @@ class SlackBot:
             await self.web_client.chat_postEphemeral(
                 channel=channel_id,
                 user=user_id,
-                text=CHAT_FEEDBACK_THANKS_TEXT,
+                text=(
+                    CHAT_FEEDBACK_THANKS_TEXT
+                    if recorded
+                    else CHAT_FEEDBACK_NOT_RECORDED_TEXT
+                ),
                 **({"thread_ts": thread_ts} if thread_ts else {}),
             )
 
