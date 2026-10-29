@@ -173,6 +173,10 @@ class LLMRouterPlatform:
         self._service_tasks: set[asyncio.Task] = set()
         self._admission_release_tasks: set[asyncio.Future] = set()
         self._api_server: Optional[uvicorn.Server] = None
+        # Analytics is best-effort: the event producer starts in the background
+        # and only marks readiness as degraded until Kafka accepts it.
+        self._event_producer_ready = True
+        self._event_producer_init_task: Optional[asyncio.Task] = None
         shutdown_config = dict(self.config.get("shutdown", {}) or {})
         self.shutdown_grace_period_seconds = float(
             shutdown_config.get("grace_period_seconds", 75)
@@ -323,6 +327,82 @@ class LLMRouterPlatform:
         """Build shared policy cache config."""
         return dict(self.config.get("policy_cache", {}))
 
+    def _event_producer_startup_config(self) -> Dict[str, float]:
+        """Return the bounded startup and retry timings for the event producer."""
+        producer_config = dict(
+            dict(self.config.get("kafka", {}) or {}).get("producer", {}) or {}
+        )
+        initial = max(
+            0.0, float(producer_config.get("startup_retry_initial_seconds", 1.0))
+        )
+        return {
+            "timeout": max(
+                0.001, float(producer_config.get("startup_timeout_seconds", 10.0))
+            ),
+            "initial": initial,
+            "max": max(
+                initial, float(producer_config.get("startup_retry_max_seconds", 60.0))
+            ),
+        }
+
+    async def _try_initialize_event_producer(
+        self, producer: Any, timeout_seconds: float
+    ) -> bool:
+        """Run one bounded producer initialize; clean up after a failure."""
+        try:
+            await asyncio.wait_for(producer.initialize(), timeout=timeout_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.logger.warning(
+                "Kafka event producer unavailable; analytics degraded: %s", exc
+            )
+            shutdown = getattr(producer, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    await asyncio.wait_for(shutdown(), timeout=timeout_seconds)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.logger.debug(
+                        "Event producer cleanup after failed start failed",
+                        exc_info=True,
+                    )
+            return False
+        return True
+
+    async def _retry_event_producer(self, producer: Any) -> None:
+        """Keep retrying producer startup with capped exponential backoff."""
+        timings = self._event_producer_startup_config()
+        delay = timings["initial"]
+        while not self.shutdown_event.is_set():
+            await asyncio.sleep(delay)
+            if self.shutdown_event.is_set():
+                return
+            if await self._try_initialize_event_producer(producer, timings["timeout"]):
+                self._event_producer_ready = True
+                self.logger.info("Kafka event producer initialized after retry")
+                return
+            delay = min(timings["max"], max(delay * 2, 0.001))
+
+    async def _start_event_producer(self, producer: Any) -> None:
+        """Start the analytics producer without letting Kafka block the API."""
+        timings = self._event_producer_startup_config()
+        if await self._try_initialize_event_producer(producer, timings["timeout"]):
+            self._event_producer_ready = True
+            return
+        self._event_producer_ready = False
+        self._event_producer_init_task = asyncio.create_task(
+            self._retry_event_producer(producer), name="event_producer_init_retry"
+        )
+
+    async def _cancel_event_producer_retry(self) -> None:
+        task = getattr(self, "_event_producer_init_task", None)
+        self._event_producer_init_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def _initialize_core_services(self):
         """Initialize the router and inference services required by the API."""
         if self._event_streaming_enabled():
@@ -334,7 +414,7 @@ class LLMRouterPlatform:
             self.services["event_producer"] = producer_class(
                 config=self._build_event_producer_config()
             )
-            await self.services["event_producer"].initialize()
+            await self._start_event_producer(self.services["event_producer"])
 
         if self._admission_enabled():
             self.services["admission"] = RedisAdmissionController(
@@ -963,19 +1043,56 @@ class LLMRouterPlatform:
             service_status[name] = getattr(service, "is_healthy", lambda: True)()
         return service_status
 
+    # Best-effort services: they never gate readiness, only report degraded.
+    _ANALYTICS_SERVICES = ("event_producer", "policy_cache", "policy_materializer")
+
+    @staticmethod
+    def _degraded_services(
+        services: Dict[str, Any],
+        service_status: Dict[str, bool],
+        *,
+        event_producer_ready: bool = True,
+    ) -> List[str]:
+        """List services that serve in a degraded mode without blocking chat."""
+        degraded: List[str] = []
+        for name, service in services.items():
+            if name == "event_producer" and (
+                not event_producer_ready or not service_status.get(name, True)
+            ):
+                degraded.append(name)
+                continue
+            # Generic hook: services expose ``is_degraded()`` or ``degraded``.
+            marker = getattr(service, "is_degraded", None)
+            if marker is None:
+                marker = getattr(service, "degraded", None)
+            try:
+                is_degraded = marker() if callable(marker) else marker
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "Degraded status unavailable for %s", name, exc_info=True
+                )
+                is_degraded = True
+            if is_degraded is True:
+                degraded.append(name)
+        return degraded
+
     def _build_readiness_payload(self) -> Dict[str, Any]:
         """Build readiness response payload."""
         service_status = self._get_service_status()
         required_services = ["router", "inference"]
         for optional_required in (
             "admission",
-            "event_producer",
             "pipeline",
             "policy_materializer",
             "rag",
         ):
             if optional_required in self.services:
                 required_services.append(optional_required)
+        degraded_services = LLMRouterPlatform._degraded_services(
+            self.services,
+            service_status,
+            event_producer_ready=bool(getattr(self, "_event_producer_ready", True)),
+        )
         missing_services = [
             service_name
             for service_name in required_services
@@ -1012,6 +1129,17 @@ class LLMRouterPlatform:
             "required_services": required_services,
             "missing_services": missing_services,
             "unhealthy_services": unhealthy_services,
+            "degraded_services": degraded_services,
+            "analytics": {
+                "status": (
+                    "degraded"
+                    if any(
+                        name in LLMRouterPlatform._ANALYTICS_SERVICES
+                        for name in degraded_services
+                    )
+                    else "ok"
+                ),
+            },
             "security": {
                 "api_key_auth_enabled": self._api_key_auth_enabled(),
                 "api_key_header_name": self._api_key_header_name(),
@@ -2408,6 +2536,7 @@ class LLMRouterPlatform:
                 self.logger.info("Platform shutdown complete")
 
     async def _shutdown_services_ordered(self) -> None:
+        await self._cancel_event_producer_retry()
         if self._api_server is not None:
             self._api_server.should_exit = True
         slack = self.services.get("slack_bot")
