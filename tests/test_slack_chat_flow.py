@@ -423,6 +423,81 @@ async def test_admission_rejection_says_busy_and_when_to_retry():
     assert history(bot, "200.0") == []
 
 
+def admission_rejection(reason, retry_after_seconds=90, **metadata):
+    from src.admission import AdmissionDecision, AdmissionRejectedError
+
+    return AdmissionRejectedError(
+        AdmissionDecision.reject(
+            status_code=429,
+            error="rate_limited",
+            reason=reason,
+            message="Request rejected",
+            retry_after_seconds=retry_after_seconds,
+            metadata=metadata,
+        )
+    )
+
+
+def rejection_id(rejection):
+    last_reason = rejection.decision.metadata.get("last_reason")
+    return (
+        f"queue_timeout_on_{last_reason}" if last_reason else rejection.decision.reason
+    )
+
+
+async def reply_to(rejection):
+    bot = chat_bot(AsyncMock(side_effect=rejection))
+    await bot._process_message(top_level(ts="200.0"))
+    assert history(bot, "200.0") == []
+    return bot.web_client.chat_postMessage.await_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rejection",
+    [
+        admission_rejection("user_request_rate_exceeded"),
+        admission_rejection("identity_request_rate_exceeded"),
+        admission_rejection("tier_request_rate_exceeded"),
+        admission_rejection("user_token_budget_exceeded"),
+        admission_rejection("tier_token_budget_exceeded"),
+        # A queue wait that ended on the user's own budget.
+        admission_rejection(
+            "scheduler_queue_timeout", last_reason="user_token_budget_exceeded"
+        ),
+    ],
+    ids=rejection_id,
+)
+async def test_an_admission_rejection_of_the_users_own_quota_says_so(rejection):
+    text = await reply_to(rejection)
+
+    assert "quota" in text
+    assert "busy" not in text.lower()
+    assert "Please try again in 2 minutes." in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rejection",
+    [
+        admission_rejection("global_active_requests_exceeded"),
+        admission_rejection("provider_token_budget_exceeded"),
+        admission_rejection("model_active_requests_exceeded"),
+        admission_rejection("circuit_open"),
+        admission_rejection(
+            "scheduler_queue_timeout", last_reason="provider_active_requests_exceeded"
+        ),
+    ],
+    ids=rejection_id,
+)
+async def test_an_admission_rejection_for_shared_capacity_says_busy(rejection):
+    text = await reply_to(rejection)
+
+    assert "busy" in text.lower()
+    assert "quota" not in text
+    assert "Please try again in 2 minutes." in text
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("answer", ["", "   \n"])
 async def test_an_empty_answer_posts_a_fallback_and_stays_out_of_history(

@@ -1164,10 +1164,33 @@ def _format_wait(seconds: float) -> str:
     return _plural(math.ceil(whole_seconds / 60), "minute")
 
 
-def _admission_busy_text(retry_after_seconds: Any) -> str:
-    """The reply when admission turns a query away for lack of capacity."""
-    if isinstance(retry_after_seconds, (int, float)) and retry_after_seconds > 0:
-        wait = _plural(math.ceil(retry_after_seconds), "second")
+# Admission reasons that are the user's own quota (src/admission.py), and how
+# to name it. Every other rejection is shared capacity: the router is busy.
+ADMISSION_QUOTA_REASONS = {
+    "identity_request_rate_exceeded": "your request quota",
+    "user_request_rate_exceeded": "your request quota",
+    "user_token_budget_exceeded": "your token quota",
+    "tier_request_rate_exceeded": "your tier's request quota",
+    "tier_token_budget_exceeded": "your tier's token quota",
+}
+
+
+def _admission_rejection_text(decision: Any) -> str:
+    """The reply when admission turns a query away: a quota, or capacity."""
+    reason = str(getattr(decision, "reason", "") or "")
+    if reason == "scheduler_queue_timeout":
+        # The queue wait ended on whatever turned the request away last.
+        metadata = getattr(decision, "metadata", None) or {}
+        reason = str(metadata.get("last_reason") or "")
+    retry_after = getattr(decision, "retry_after_seconds", None)
+    wait = None
+    if isinstance(retry_after, (int, float)) and retry_after > 0:
+        wait = _format_wait(retry_after)
+    quota = ADMISSION_QUOTA_REASONS.get(reason)
+    if quota:
+        when = f"Please try again in {wait}." if wait else "Please try again later."
+        return f"⏳ You've reached {quota} for now. {when}"
+    if wait:
         return f"⏳ The LLM Router is busy right now. Please try again in {wait}."
     return SLACK_BUSY_MESSAGE
 
@@ -3017,7 +3040,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 e.decision.reason,
             )
             SLACK_METRICS.errors.labels(error_type=type(e).__name__).inc()
-            return _admission_busy_text(e.decision.retry_after_seconds)
+            return _admission_rejection_text(e.decision)
         except Exception as e:
             logger.error(f"Error processing query: {e}")
             SLACK_METRICS.errors.labels(error_type=type(e).__name__).inc()
