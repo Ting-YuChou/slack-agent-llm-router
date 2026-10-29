@@ -1017,10 +1017,11 @@ class MemoryManager:
         filters = self._search_filters(metadata)
         tokens = tokenize(query)
         candidate_limit = max(self.max_results * 3, self.max_results)
-        keyword_results = await self.store.keyword_search(
-            scope, tokens, filters, candidate_limit
+        # The embedding call can take seconds; the keyword search runs meanwhile.
+        keyword_results, embedding = await asyncio.gather(
+            self.store.keyword_search(scope, tokens, filters, candidate_limit),
+            self._safe_embed(query),
         )
-        embedding = await self._safe_embed(query)
         vector_results = []
         if embedding:
             vector_results = await self.store.vector_search(

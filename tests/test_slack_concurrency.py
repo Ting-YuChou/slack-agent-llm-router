@@ -338,3 +338,52 @@ async def test_allowlist_hit_by_name_is_still_resolved():
     assert await bot._is_channel_allowed("CBOTS0001")
     assert await bot._is_channel_allowed("CBOTS0001")
     assert bot.web_client.conversations_info.await_count == 1
+
+
+# S6c: attachments download side by side, in their original order
+
+
+@pytest.mark.asyncio
+async def test_attachments_download_concurrently_and_keep_their_order():
+    bot = chat_bot()
+    in_flight = 0
+    peak = 0
+
+    async def build(file_payload):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            # Later files finish first, so the order must come from the input.
+            await asyncio.sleep(0.01 * (10 - int(file_payload["id"][1:])))
+        finally:
+            in_flight -= 1
+        if file_payload["id"] == "F3":
+            return None
+        return file_payload["id"]
+
+    bot._build_attachment_from_slack_file = build
+    files = [{"id": f"F{index}"} for index in range(6)]
+
+    attachments = await bot._extract_query_attachments({"files": files})
+
+    assert attachments == ["F0", "F1", "F2", "F4", "F5"]
+    assert peak == 4
+
+
+@pytest.mark.asyncio
+async def test_a_failed_attachment_download_still_raises():
+    bot = chat_bot()
+
+    async def build(file_payload):
+        if file_payload["id"] == "F1":
+            raise RuntimeError("boom")
+        await asyncio.sleep(0)
+        return file_payload["id"]
+
+    bot._build_attachment_from_slack_file = build
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await bot._extract_query_attachments(
+            {"files": [{"id": "F0"}, {"id": "F1"}, {"id": "F2"}]}
+        )

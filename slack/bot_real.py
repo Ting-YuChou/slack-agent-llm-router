@@ -96,6 +96,8 @@ SLACK_AGENT_RUN_TTL_SECONDS = 30 * 24 * 3600
 RATE_LIMIT_WINDOW_SECONDS = 3600
 POSTED_CI_JOBS_LIMIT = 1000
 HANDLED_MESSAGES_LIMIT = 1000
+# Slack files of one message downloaded at the same time (S6c).
+ATTACHMENT_DOWNLOAD_CONCURRENCY = 4
 # Threads whose Agent runtime lookup a message event skips (S7): chat threads
 # known not to be Agent threads, and threads whose lookup just failed.
 AGENT_LOOKUP_SKIPS_LIMIT = 10_000
@@ -6834,13 +6836,23 @@ class SlackBot:
             int(self.attachment_settings.get("max_files", 10) or 10),
             10,
         )
+        # Download side by side, a few at a time; results keep Slack's order.
+        semaphore = asyncio.Semaphore(ATTACHMENT_DOWNLOAD_CONCURRENCY)
+
+        async def build(file_payload: Dict[str, Any]) -> Optional[Attachment]:
+            async with semaphore:
+                return await self._build_attachment_from_slack_file(file_payload)
+
+        results = await asyncio.gather(
+            *(build(file_payload) for file_payload in files[:max_files]),
+            return_exceptions=True,
+        )
         attachments = []
-
-        for file_payload in files[:max_files]:
-            attachment = await self._build_attachment_from_slack_file(file_payload)
-            if attachment is not None:
-                attachments.append(attachment)
-
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+            if result is not None:
+                attachments.append(result)
         return attachments
 
     async def _build_attachment_from_slack_file(

@@ -1,5 +1,6 @@
 """Memory search: skip work for users without memories, drop weak matches."""
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -202,6 +203,51 @@ async def test_min_score_defaults_to_off():
     results = await manager.search("T1:U1", "unrelated question")
 
     assert [result.item.text for result in results] == ["memory 0.82", "memory 0.12"]
+
+
+@pytest.mark.asyncio
+async def test_keyword_search_and_embedding_run_concurrently():
+    """S6c: each side waits for the other to start; in sequence it times out."""
+    keyword_started = asyncio.Event()
+    embed_started = asyncio.Event()
+    overlapped = []
+
+    async def wait_for(event):
+        try:
+            await asyncio.wait_for(event.wait(), timeout=0.5)
+        except asyncio.TimeoutError:
+            overlapped.append(False)
+        else:
+            overlapped.append(True)
+
+    class WaitingStore(InMemoryMemoryStore):
+        async def keyword_search(self, scope, tokens, filters, limit):
+            keyword_started.set()
+            await wait_for(embed_started)
+            return await super().keyword_search(scope, tokens, filters, limit)
+
+    class WaitingEmbedder(CountingEmbeddingProvider):
+        async def embed(self, text):
+            embed_started.set()
+            await wait_for(keyword_started)
+            return await super().embed(text)
+
+    store = WaitingStore()
+    embedder = WaitingEmbedder()
+    item = MemoryItem(
+        scope="T1:U1",
+        text="We deploy to the eu-west region",
+        keywords=["deploy", "region"],
+        embedding=await embedder.inner.embed("deploy region"),
+    )
+    await store.add(item)
+    manager = manager_for(store, embedder)
+
+    results = await manager.search("T1:U1", "deploy region")
+
+    assert overlapped == [True, True]
+    assert results[0].item.memory_id == item.memory_id
+    assert results[0].match_source == "hybrid"
 
 
 def test_search_config_min_score_defaults_to_zero():
