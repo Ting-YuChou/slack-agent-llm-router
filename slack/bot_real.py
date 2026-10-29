@@ -67,6 +67,12 @@ logger = logging.getLogger(__name__)
 
 MAX_QUERY_TOKENS = 8192
 STATE_SCHEMA_VERSION = 1
+# How long a conversation, and the bot thread it lives in, stays live.
+SLACK_SESSION_TIMEOUT = timedelta(hours=2)
+# Redis expiry for tracked Agent runs; user settings never expire.
+SLACK_AGENT_RUN_TTL_SECONDS = 30 * 24 * 3600
+# Requests older than this no longer count against a user's rate limit.
+RATE_LIMIT_WINDOW_SECONDS = 3600
 POSTED_CI_JOBS_LIMIT = 1000
 HANDLED_MESSAGES_LIMIT = 1000
 UNVERIFIED_LABEL = "⚠️ 未驗證（沒有 verification profile）"
@@ -603,20 +609,29 @@ class RedisSlackStateStore(SlackStateStore):
         self.active_threads_index_key = f"{self.key_prefix}:active_threads"
         self.agent_runs_index_key = f"{self.key_prefix}:agent_runs"
         self.posted_ci_jobs_key = f"{self.key_prefix}:posted_ci_jobs"
+        self.session_ttl_seconds = int(SLACK_SESSION_TIMEOUT.total_seconds())
+        self.rate_limit_ttl_seconds = RATE_LIMIT_WINDOW_SECONDS
+        self.agent_run_ttl_seconds = SLACK_AGENT_RUN_TTL_SECONDS
         self.client = None
 
     async def initialize(self):
         try:
             import redis.asyncio as redis_asyncio
 
+            password = None
+            password_env = self.redis_config.get("password_env")
+            if password_env:
+                password = os.getenv(str(password_env))
+
             redis_url = self.redis_config.get("url")
             if redis_url and hasattr(redis_asyncio.Redis, "from_url"):
-                self.client = redis_asyncio.Redis.from_url(redis_url)
+                self.client = redis_asyncio.Redis.from_url(redis_url, password=password)
             else:
                 self.client = redis_asyncio.Redis(
                     host=self.redis_config.get("host", "localhost"),
                     port=self.redis_config.get("port", 6379),
                     db=self.redis_config.get("db", 0),
+                    password=password,
                 )
 
             if hasattr(self.client, "ping"):
@@ -711,7 +726,11 @@ class RedisSlackStateStore(SlackStateStore):
                 user_id, rate_limit_payload
             )
             if merged_rate_limits:
-                await self._set_json(self._rate_limit_key(user_id), merged_rate_limits)
+                await self._set_json(
+                    self._rate_limit_key(user_id),
+                    merged_rate_limits,
+                    ttl_seconds=self.rate_limit_ttl_seconds,
+                )
                 await self._sadd(self.rate_limits_index_key, user_id)
             else:
                 await self._delete(self._rate_limit_key(user_id))
@@ -746,7 +765,11 @@ class RedisSlackStateStore(SlackStateStore):
             ):
                 return
 
-            await self._set_json(self._conversation_key(context_key), context_payload)
+            await self._set_json(
+                self._conversation_key(context_key),
+                context_payload,
+                ttl_seconds=self.session_ttl_seconds,
+            )
             await self._sadd(self.conversations_index_key, context_key)
         except Exception as exc:
             logger.warning("Failed to persist Slack conversation to Redis: %s", exc)
@@ -776,7 +799,11 @@ class RedisSlackStateStore(SlackStateStore):
             ):
                 return
 
-            await self._set_json(self._active_thread_key(thread_key), incoming_payload)
+            await self._set_json(
+                self._active_thread_key(thread_key),
+                incoming_payload,
+                ttl_seconds=self.session_ttl_seconds,
+            )
             await self._sadd(self.active_threads_index_key, thread_key)
         except Exception as exc:
             logger.warning("Failed to persist Slack active thread to Redis: %s", exc)
@@ -799,7 +826,11 @@ class RedisSlackStateStore(SlackStateStore):
             return
 
         try:
-            await self._set_json(self._agent_run_key(run_id), payload)
+            await self._set_json(
+                self._agent_run_key(run_id),
+                payload,
+                ttl_seconds=self.agent_run_ttl_seconds,
+            )
             await self._sadd(self.agent_runs_index_key, run_id)
         except Exception as exc:
             logger.warning("Failed to persist Slack agent run to Redis: %s", exc)
@@ -889,12 +920,18 @@ class RedisSlackStateStore(SlackStateStore):
             payload = payload.decode("utf-8")
         return json.loads(payload)
 
-    async def _set_json(self, key: str, payload: Any):
+    async def _set_json(
+        self, key: str, payload: Any, *, ttl_seconds: Optional[int] = None
+    ):
+        """Store JSON that expires after ttl_seconds, or never when that is None."""
         serialized = json.dumps(payload, ensure_ascii=True, sort_keys=True)
         if hasattr(self.client, "set"):
-            await self.client.set(key, serialized)
+            await self.client.set(key, serialized, ex=ttl_seconds)
         elif hasattr(self.client, "setex"):
-            await self.client.setex(key, 30 * 24 * 3600, serialized)
+            # setex needs an expiry; this fallback has always used 30 days.
+            await self.client.setex(
+                key, ttl_seconds or SLACK_AGENT_RUN_TTL_SECONDS, serialized
+            )
 
     async def _delete(self, key: str):
         if hasattr(self.client, "delete"):
@@ -946,7 +983,7 @@ class RedisSlackStateStore(SlackStateStore):
         if not merged_values:
             return []
 
-        cutoff = time.time() - 3600
+        cutoff = time.time() - RATE_LIMIT_WINDOW_SECONDS
         deduped = sorted(set(_rate_limit_entries(merged_values, cutoff)))
         return [_rate_limit_entry(*entry) for entry in deduped]
 
@@ -1230,7 +1267,7 @@ class ConversationManager:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.conversations = {}
-        self.session_timeout = timedelta(hours=2)  # Sessions expire after 2 hours
+        self.session_timeout = SLACK_SESSION_TIMEOUT
 
     def get_or_create_context(
         self, user_id: str, channel_id: str, thread_ts: str = None
@@ -2882,7 +2919,6 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 context=request_context,
                 max_tokens=self._get_max_tokens_for_user(user_tier, user_prefs),
                 temperature=0.7,
-                priority=1 if user_tier != UserTier.FREE else 3,
                 attachments=attachments or [],
                 tool_policy=tool_policy,
                 allowed_tools=allowed_tools or [],
@@ -3073,6 +3109,9 @@ class SlackBot:
         # "channel:ts" of messages already handled, oldest first. Slack sends
         # both a message and an app_mention event for one mention.
         self.handled_messages: Dict[str, None] = {}
+        # "channel:ts" of messages already given a busy reply, so a mention's
+        # message and app_mention events get one between them.
+        self.busy_replied_messages: Dict[str, None] = {}
         self.agent_monitor_tasks: Dict[str, asyncio.Task] = {}
         self.agent_monitor_poll_seconds = float(
             self.agent_config.get("monitor_poll_seconds", 2)
@@ -3394,18 +3433,25 @@ class SlackBot:
         self._strip_bot_mention(event)
         await self._process_message(event)
 
-    def _claim_message(self, event: Dict[str, Any]) -> bool:
-        """True only the first time a Slack message is handled."""
+    def _claim_message(
+        self, event: Dict[str, Any], claimed: Optional[Dict[str, None]] = None
+    ) -> bool:
+        """True only the first time a Slack message is claimed.
+
+        Claims go in handled_messages unless another bounded set is given.
+        """
+        if claimed is None:
+            claimed = self.handled_messages
         channel_id = event.get("channel")
         ts = event.get("ts")
         if not channel_id or not ts:
             return True
         key = self._thread_key(channel_id, ts)
-        if key in self.handled_messages:
+        if key in claimed:
             return False
-        self.handled_messages[key] = None
-        while len(self.handled_messages) > HANDLED_MESSAGES_LIMIT:
-            self.handled_messages.pop(next(iter(self.handled_messages)))
+        claimed[key] = None
+        while len(claimed) > HANDLED_MESSAGES_LIMIT:
+            claimed.pop(next(iter(claimed)))
         return True
 
     def _strip_bot_mention(self, event: Dict[str, Any]) -> None:
@@ -3652,12 +3698,11 @@ class SlackBot:
                 if len(response_text) > max_length:
                     responses = self._split_response(response_text, max_length)
 
-                    for i, response_part in enumerate(responses):
+                    for response_part in responses:
                         await self.web_client.chat_postMessage(
                             channel=channel_id,
                             text=response_part,
                             thread_ts=thread_ts,
-                            reply_broadcast=(i == 0),  # Only broadcast first message
                         )
                         await asyncio.sleep(0.5)  # Small delay between parts
                 else:
@@ -5763,9 +5808,17 @@ class SlackBot:
         self.active_threads[self._thread_key(channel_id, thread_ts)] = datetime.now()
 
     def _is_active_thread(
-        self, channel_id: Optional[str], thread_ts: Optional[str]
+        self,
+        channel_id: Optional[str],
+        thread_ts: Optional[str],
+        *,
+        refresh: bool = True,
     ) -> bool:
-        """Return whether a Slack thread is still active."""
+        """Return whether a Slack thread is still active.
+
+        By default this also extends a live thread and forgets an expired one;
+        refresh=False only looks.
+        """
         if not channel_id or not thread_ts:
             return False
 
@@ -5775,10 +5828,12 @@ class SlackBot:
             return False
 
         if datetime.now() - last_activity > self.active_thread_timeout:
-            self.active_threads.pop(key, None)
+            if refresh:
+                self.active_threads.pop(key, None)
             return False
 
-        self.active_threads[key] = datetime.now()
+        if refresh:
+            self.active_threads[key] = datetime.now()
         return True
 
     def _cleanup_expired_threads(self, return_keys: bool = False):
@@ -6000,7 +6055,41 @@ class SlackBot:
             SLACK_METRICS.work_queue_depth.set(0)
             SLACK_METRICS.work_running.set(0)
 
+    def _is_ignored_message_event(self, event: Dict[str, Any]) -> bool:
+        """A message _handle_message_event always drops: a subtype or a bot's post.
+
+        Dropping it before the queue keeps the bot from answering its own busy
+        reply with another one.
+        """
+        return event.get("type") == "message" and bool(
+            event.get("subtype")
+            or event.get("bot_id")
+            or (self.bot_user_id and event.get("user") == self.bot_user_id)
+        )
+
+    def _wants_busy_reply(self, item: SlackWorkItem) -> bool:
+        """Whether someone is waiting on the bot: a slash command, mention or thread.
+
+        Read-only: a busy reply neither extends nor expires a thread.
+        """
+        if item.kind == "slash":
+            return True
+        if item.kind != "event":
+            return False
+        event_type = item.payload.get("type")
+        if event_type == "app_mention":
+            return True
+        if event_type != "message":
+            return False
+        channel_id = item.payload.get("channel")
+        thread_ts = item.payload.get("thread_ts")
+        return self._is_agent_thread(channel_id, thread_ts) or self._is_active_thread(
+            channel_id, thread_ts, refresh=False
+        )
+
     async def _enqueue_work(self, item: SlackWorkItem) -> bool:
+        if item.kind == "event" and self._is_ignored_message_event(item.payload):
+            return False
         if not self._accepting_work:
             await self._reply_busy(item)
             return False
@@ -6052,29 +6141,44 @@ class SlackBot:
                 queue.task_done()
 
     async def _reply_busy(self, item: SlackWorkItem) -> None:
-        async def send_reply():
+        if not self._wants_busy_reply(item):
+            return
+        if item.kind == "event" and not self._claim_message(
+            item.payload, self.busy_replied_messages
+        ):
+            return
+
+        async def send_reply() -> bool:
             channel = item.payload.get("channel") or item.payload.get("channel_id")
             user = item.payload.get("user") or item.payload.get("user_id")
             if item.kind == "slash" and hasattr(self.web_client, "chat_postEphemeral"):
+                # Like _handle_slash_command, which answers in any channel.
                 await self.web_client.chat_postEphemeral(
                     channel=channel, user=user, text=SLACK_BUSY_MESSAGE
                 )
-                return
+                return True
+            # Like _handle_*_event: stay silent where the bot is not enabled.
+            if not await self._is_channel_allowed(
+                channel, item.payload.get("channel_name")
+            ):
+                return False
             kwargs = {"channel": channel, "text": SLACK_BUSY_MESSAGE}
             thread_ts = item.payload.get("thread_ts") or item.payload.get("ts")
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
             await self.web_client.chat_postMessage(**kwargs)
+            return True
 
         try:
-            await asyncio.wait_for(
+            sent = await asyncio.wait_for(
                 send_reply(), timeout=self._overload_reply_timeout_seconds
             )
         except Exception:
             SLACK_METRICS.busy_replies.labels(outcome="failed").inc()
             logger.warning("Failed to send Slack overload reply", exc_info=True)
         else:
-            SLACK_METRICS.busy_replies.labels(outcome="sent").inc()
+            if sent:
+                SLACK_METRICS.busy_replies.labels(outcome="sent").inc()
 
     def _finalize_background_task(self, task: asyncio.Task):
         """Log unexpected background task failures and drop completed tasks."""
