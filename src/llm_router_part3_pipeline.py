@@ -1632,6 +1632,84 @@ class ClickHouseManager:
         }
         self.last_batch_time = time.time()
 
+        # Cached liveness ping. ``None`` means no ping has run yet, which reads
+        # as healthy so a freshly connected client is not reported down.
+        self.health_ping_interval_seconds = max(
+            0.001, float(config.get("health_ping_interval_seconds", 30) or 30)
+        )
+        self.health_ping_timeout_seconds = max(
+            0.001, float(config.get("health_ping_timeout_seconds", 5) or 5)
+        )
+        self.last_ping_ok: Optional[bool] = None
+        self.last_ping_at: Optional[float] = None
+        self.last_ping_error: Optional[str] = None
+        self._health_ping_task: Optional[asyncio.Task] = None
+        self._health_pings_running = False
+
+    async def ping(self) -> bool:
+        """Ping ClickHouse once and cache the result for health checks."""
+        client = self.client
+        ok = False
+        error: Optional[str] = None
+        if client is None:
+            error = "ClickHouse client is not initialized"
+        else:
+            ping = getattr(client, "ping", None)
+            try:
+                if callable(ping):
+                    result = await asyncio.wait_for(
+                        self._run_blocking(ping),
+                        timeout=self.health_ping_timeout_seconds,
+                    )
+                    ok = bool(result)
+                else:
+                    await asyncio.wait_for(
+                        self._run_blocking(client.query, "SELECT 1"),
+                        timeout=self.health_ping_timeout_seconds,
+                    )
+                    ok = True
+                if not ok:
+                    error = "ClickHouse ping returned false"
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                error = str(exc) or type(exc).__name__
+        if not ok and self.last_ping_ok is not False:
+            logger.warning(f"ClickHouse health ping failed: {error}")
+        self.last_ping_ok = ok
+        self.last_ping_at = time.time()
+        self.last_ping_error = error
+        return ok
+
+    def is_connection_healthy(self) -> bool:
+        """Return the cached connection health; unpinged clients read healthy."""
+        return self.client is not None and self.last_ping_ok is not False
+
+    async def _health_ping_loop(self) -> None:
+        # The flag ends the loop even if Python 3.10's wait_for swallows the
+        # cancellation that races a ping finishing.
+        while self._health_pings_running:
+            await asyncio.sleep(self.health_ping_interval_seconds)
+            if not self._health_pings_running:
+                return
+            await self.ping()
+
+    def start_health_pings(self) -> None:
+        """Start the periodic background ping; idempotent."""
+        if self._health_ping_task is None or self._health_ping_task.done():
+            self._health_pings_running = True
+            self._health_ping_task = asyncio.create_task(
+                self._health_ping_loop(), name="clickhouse_health_ping"
+            )
+
+    async def stop_health_pings(self) -> None:
+        self._health_pings_running = False
+        task = self._health_ping_task
+        self._health_ping_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def _run_blocking(self, func: Callable[..., Any], *args, **kwargs):
         """Run a blocking ClickHouse client call outside the event loop."""
         return await asyncio.to_thread(func, *args, **kwargs)
@@ -4009,8 +4087,13 @@ class KafkaIngestionPipeline:
         logger.info("Starting Kafka ingestion pipeline...")
         self.running = True
 
-        # Start consuming messages
-        await self.consumer_manager.start_consuming()
+        # Keep the cached ClickHouse health current while the pipeline runs.
+        self.clickhouse_manager.start_health_pings()
+        try:
+            # Start consuming messages
+            await self.consumer_manager.start_consuming()
+        finally:
+            await self.clickhouse_manager.stop_health_pings()
 
     async def log_query(
         self,
@@ -4257,7 +4340,8 @@ class KafkaIngestionPipeline:
             "producer_last_error": self.producer_manager.last_error,
             "consumer_healthy": bool(consumer_health.get("healthy")),
             "consumer_status": consumer_health,
-            "clickhouse_healthy": self.clickhouse_manager.client is not None,
+            "clickhouse_healthy": self.clickhouse_manager.is_connection_healthy(),
+            "clickhouse_last_error": self.clickhouse_manager.last_ping_error,
             "total_consumers": len(self.consumer_manager.consumers)
             if self.consumer_manager
             else 0,
@@ -4266,11 +4350,17 @@ class KafkaIngestionPipeline:
     def is_healthy(self) -> bool:
         """Return whether the pipeline can produce, consume, and persist events."""
         health = self.get_health_status()
+        # A failed ClickHouse ping only degrades analytics (see is_degraded);
+        # it must not take a chat-serving instance out of readiness.
         return bool(
             health["producer_healthy"]
             and health["consumer_healthy"]
-            and health["clickhouse_healthy"]
+            and self.clickhouse_manager.client is not None
         )
+
+    def is_degraded(self) -> bool:
+        """Return whether the pipeline runs but its last ClickHouse ping failed."""
+        return self.clickhouse_manager.last_ping_ok is False
 
     async def shutdown(self):
         """Shutdown the pipeline"""
