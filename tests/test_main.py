@@ -1364,6 +1364,69 @@ class TestApiApp:
         assert inference.processed_requests == []
         assert admission.route_calls == []
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("chunk_count", [9, 30])  # 1.8 MB and 6 MB
+    async def test_unauthenticated_chunked_body_is_rejected_before_it_is_read(
+        self, chunk_count, tmp_path, monkeypatch, patched_platform_deps
+    ):
+        monkeypatch.setenv("LLM_ROUTER_API_KEYS", "test-key")
+        platform, admission = _principal_platform(tmp_path, clients=[])
+        app = platform._create_fastapi_app()
+        chunk = b"x" * 200_000
+        consumed = []
+        sent = []
+
+        async def receive():
+            if len(consumed) < chunk_count:
+                consumed.append(len(chunk))
+                more = len(consumed) < chunk_count
+                return {"type": "http.request", "body": chunk, "more_body": more}
+            await asyncio.Event().wait()
+
+        async def send(message):
+            sent.append(message)
+
+        scope = _asgi_scope(
+            "POST", "/route", headers=[(b"transfer-encoding", b"chunked")]
+        )
+        await asyncio.wait_for(app(scope, receive, send), timeout=2)
+
+        assert sent[0]["status"] == 401
+        assert sum(consumed) < chunk_count * len(chunk)
+        assert admission.principal_route_calls == []
+
+    @pytest.mark.asyncio
+    async def test_authenticated_chunked_body_is_capped_as_it_streams(
+        self, tmp_path, monkeypatch, patched_platform_deps
+    ):
+        monkeypatch.setenv("LLM_ROUTER_API_KEYS", "test-key")
+        platform, admission = _principal_platform(tmp_path, clients=[])
+        inference = platform.services["inference"]
+        app = platform._create_fastapi_app()
+        chunk = b"x" * (512 * 1024)
+        consumed = []
+        sent = []
+
+        async def receive():
+            consumed.append(len(chunk))
+            return {"type": "http.request", "body": chunk, "more_body": True}
+
+        async def send(message):
+            sent.append(message)
+
+        scope = _asgi_scope(
+            "POST",
+            "/route",
+            headers=[(b"transfer-encoding", b"chunked"), (b"x-api-key", b"test-key")],
+        )
+        await asyncio.wait_for(app(scope, receive, send), timeout=2)
+
+        starts = [m for m in sent if m["type"] == "http.response.start"]
+        assert [m["status"] for m in starts] == [413]
+        assert sum(consumed) <= 2 * 1024 * 1024 + len(chunk)
+        assert inference.processed_requests == []
+        assert admission.principal_route_calls == []
+
     def test_rag_document_ingestion_keeps_its_own_size_limits(
         self, tmp_path, patched_platform_deps
     ):

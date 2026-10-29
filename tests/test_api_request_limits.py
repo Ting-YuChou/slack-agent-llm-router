@@ -190,3 +190,92 @@ async def test_body_limit_is_chosen_by_path_and_media_type(
     )
 
     assert await _status_for(middleware, path, b"x" * size, content_type) == status
+
+
+def _chunked_scope(path="/route"):
+    return {
+        "type": "http",
+        "method": "POST",
+        "path": path,
+        "headers": [(b"content-type", b"application/json")],
+    }
+
+
+@pytest.mark.asyncio
+async def test_body_is_streamed_to_the_app_rather_than_buffered():
+    chunks = [b"a" * 30, b"b" * 30, b"c" * 30]
+    pending = list(chunks)
+    seen = []
+
+    async def receive():
+        body = pending.pop(0)
+        return {"type": "http.request", "body": body, "more_body": bool(pending)}
+
+    async def app(scope, app_receive, send):
+        while True:
+            message = await app_receive()
+            seen.append(message["body"])
+            if not message.get("more_body"):
+                break
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def send(message):
+        return None
+
+    await RequestBodyLimitMiddleware(app, max_body_bytes=100)(
+        _chunked_scope(), receive, send
+    )
+
+    assert seen == chunks
+
+
+@pytest.mark.asyncio
+async def test_app_that_never_reads_the_body_never_pulls_it():
+    pulled = []
+
+    async def receive():
+        pulled.append(1)
+        return {"type": "http.request", "body": b"x" * 50, "more_body": True}
+
+    async def rejecting_app(scope, app_receive, send):
+        await send({"type": "http.response.start", "status": 401, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    await RequestBodyLimitMiddleware(rejecting_app, max_body_bytes=100)(
+        _chunked_scope(), receive, send
+    )
+
+    assert pulled == []
+    assert sent[0]["status"] == 401
+
+
+@pytest.mark.asyncio
+async def test_overflow_sends_one_413_and_drops_the_apps_own_response():
+    async def receive():
+        return {"type": "http.request", "body": b"x" * 60, "more_body": True}
+
+    async def reading_app(scope, app_receive, send):
+        while True:
+            message = await app_receive()
+            if message["type"] == "http.disconnect":
+                break
+        await send({"type": "http.response.start", "status": 400, "headers": []})
+        await send({"type": "http.response.body", "body": b"bad body"})
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    await RequestBodyLimitMiddleware(reading_app, max_body_bytes=100)(
+        _chunked_scope(), receive, send
+    )
+
+    assert [m["status"] for m in sent if m["type"] == "http.response.start"] == [413]
+    assert b"request_too_large" in sent[1]["body"]

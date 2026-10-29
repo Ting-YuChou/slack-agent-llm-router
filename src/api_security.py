@@ -265,9 +265,10 @@ class RequestBodyLimitMiddleware:
 
     The cap is ``path_limits[path][media type]`` (``"*"`` matches any media
     type) and otherwise ``max_body_bytes``. A declared Content-Length above the
-    cap is rejected without reading the body. Otherwise the body is read up to
-    the cap (this also covers chunked bodies without Content-Length) and
-    replayed to the app.
+    cap is rejected without reading the body. Otherwise bytes are counted as
+    the app reads them (this also covers chunked bodies without
+    Content-Length): past the cap the client gets 413, the app sees a
+    disconnect and its own response is dropped.
     """
 
     def __init__(
@@ -306,35 +307,39 @@ class RequestBodyLimitMiddleware:
             await self._reject(send, limit)
             return
 
-        chunks: List[bytes] = []
+        # Count the body as the app pulls it instead of reading it up front:
+        # a request that authentication rejects is never read at all.
         received = 0
-        while True:
+        overflowed = False
+        rejected = False
+        response_started = False
+
+        async def counting_receive() -> Message:
+            nonlocal received, overflowed, rejected, response_started
+            if overflowed:
+                return {"type": "http.disconnect"}
             message = await receive()
             if message.get("type") != "http.request":
-                return  # the client went away before sending the whole body
-            body = message.get("body", b"") or b""
-            received += len(body)
-            if received > limit:
-                await self._reject(send, limit)
-                return
-            chunks.append(body)
-            if not message.get("more_body", False):
-                break
-
-        buffered: Optional[Message] = {
-            "type": "http.request",
-            "body": b"".join(chunks),
-            "more_body": False,
-        }
-
-        async def replay() -> Message:
-            nonlocal buffered
-            if buffered is not None:
-                message, buffered = buffered, None
                 return message
-            return await receive()
+            received += len(message.get("body", b"") or b"")
+            if received <= limit:
+                return message
+            overflowed = True
+            if not response_started:
+                response_started = rejected = True
+                await self._reject(send, limit)
+            # Stop the app reading; whatever it answers is dropped below.
+            return {"type": "http.disconnect"}
 
-        await self.app(scope, replay, send)
+        async def guarded_send(message: Message) -> None:
+            nonlocal response_started
+            if rejected:
+                return
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        await self.app(scope, counting_receive, guarded_send)
 
     async def _reject(self, send: Send, limit: int) -> None:
         payload = json.dumps(
