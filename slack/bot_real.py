@@ -105,6 +105,8 @@ AGENT_LOOKUP_ERROR_TTL_SECONDS = 10.0
 # Channels outside a name allowlist, so conversations.info runs once per TTL.
 CHANNEL_ALLOWLIST_MISSES_LIMIT = 1000
 CHANNEL_ALLOWLIST_MISS_TTL_SECONDS = 300.0
+# A failed conversations.info call (a 429, a network error) is retried sooner.
+CHANNEL_ALLOWLIST_ERROR_TTL_SECONDS = 10.0
 UNVERIFIED_LABEL = "⚠️ 未驗證（沒有 verification profile）"
 MEMORY_SLASH_ONLY_MESSAGE = (
     "Memory commands are only available through Slack slash commands. "
@@ -3903,7 +3905,7 @@ class SlackBot:
             "owner_user_id": session["owner_user_id"],
             "mode": mode,
         }
-        self.agent_threads[self._thread_key(channel_id, thread_ts)] = tracked
+        self._set_agent_thread(channel_id, thread_ts, tracked)
         self._remember_agent_session(tracked)
         self._mark_thread_active(channel_id, thread_ts)
         return tracked
@@ -4734,14 +4736,18 @@ class SlackBot:
                 resolved_name = self._normalize_channel_name(
                     response.get("channel", {}).get("name")
                 )
-                if resolved_name and resolved_name in self.allowed_channel_names:
-                    self.allowed_channel_ids.add(channel_id)
-                    return True
             except Exception as exc:
                 logger.warning(
                     f"Failed to resolve Slack channel info for allowlist check: {exc}"
                 )
-            # A miss or a failure: ask Slack again only after the TTL.
+                self._channel_allowlist_misses.set(
+                    channel_id, True, ttl_seconds=CHANNEL_ALLOWLIST_ERROR_TTL_SECONDS
+                )
+                return False
+            if resolved_name and resolved_name in self.allowed_channel_names:
+                self.allowed_channel_ids.add(channel_id)
+                return True
+            # Outside the allowlist: ask Slack again only after the TTL.
             self._channel_allowlist_misses[channel_id] = True
 
         return False
@@ -4804,10 +4810,18 @@ class SlackBot:
         self._register_agent_run(tracked)
         return tracked
 
+    def _set_agent_thread(
+        self, channel_id: str, thread_ts: str, tracked: Dict[str, Any]
+    ) -> None:
+        """Track a thread as an Agent thread; it is no longer a chat thread."""
+        key = self._thread_key(channel_id, thread_ts)
+        self.agent_threads[key] = tracked
+        self._agent_lookup_skips.pop(key, None)
+
     def _register_agent_run(self, tracked: Dict[str, Any]) -> None:
         channel_id = tracked["channel_id"]
         thread_ts = tracked["thread_ts"]
-        self.agent_threads[self._thread_key(channel_id, thread_ts)] = tracked
+        self._set_agent_thread(channel_id, thread_ts, tracked)
         self.agent_runs[tracked["run_id"]] = tracked
         self._remember_agent_session(tracked)
         self._mark_thread_active(channel_id, thread_ts)

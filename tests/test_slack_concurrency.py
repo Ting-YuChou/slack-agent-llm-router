@@ -328,6 +328,72 @@ async def test_agent_background_start_does_not_hold_the_thread_lock():
 
 
 @pytest.mark.asyncio
+async def test_a_chat_thread_that_becomes_an_agent_thread_is_looked_up_again():
+    runtime = SimpleNamespace(lookup_session=AsyncMock(return_value=None))
+    bot = chat_bot(runtime=runtime)
+    bot._remember_chat_thread("C1", "100.0")
+    bot._track_agent_run(
+        {"session_id": "S1", "run_id": "R1"},
+        team_id="T1",
+        channel_id="C1",
+        thread_ts="100.0",
+        owner_user_id="U1",
+        mode="implement",
+    )
+    assert "C1:100.0" not in bot._agent_lookup_skips
+
+    # The run's local record goes away (it finished, or another process
+    # owns it now): the next message asks the runtime again.
+    bot.agent_threads.pop("C1:100.0")
+    await bot._look_up_agent_thread(thread_reply())
+
+    runtime.lookup_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_adopting_a_session_forgets_a_recorded_lookup_error():
+    runtime = SimpleNamespace(
+        lookup_session=AsyncMock(
+            side_effect=[
+                AgentRuntimeUnavailable("down"),
+                {
+                    "session_id": "S1",
+                    "run_id": None,
+                    "owner_user_id": "U1",
+                    "active": False,
+                },
+            ]
+        )
+    )
+    bot = chat_bot(runtime=runtime)
+
+    assert await bot._adopt_agent_session("T1", "C1", "100.0") is None
+    assert bot._agent_lookup_skips.get("C1:100.0") == "error"
+    assert await bot._adopt_agent_session("T1", "C1", "100.0") is not None
+
+    assert "C1:100.0" not in bot._agent_lookup_skips
+
+
+@pytest.mark.asyncio
+async def test_a_failed_allowlist_check_is_retried_soon():
+    bot = chat_bot(channels=["#bots"])
+    bot.web_client.conversations_info = AsyncMock(
+        side_effect=[
+            RuntimeError("ratelimited"),
+            {"ok": True, "channel": {"name": "bots"}},
+        ]
+    )
+    bot.allowed_channel_names = {"bots"}
+    clock = FakeClock()
+    bot._channel_allowlist_misses._clock = clock
+
+    assert not await bot._is_channel_allowed("CBOTS0001")
+    clock.now += 15
+    assert await bot._is_channel_allowed("CBOTS0001")
+    assert bot.web_client.conversations_info.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_allowlist_hit_by_name_is_still_resolved():
     bot = chat_bot(channels=["#bots"])
     bot.web_client.conversations_info = AsyncMock(
