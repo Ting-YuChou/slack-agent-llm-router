@@ -16,9 +16,12 @@ logger = logging.getLogger(__name__)
 
 TOKENS_PER_PRICE_UNIT = 1_000_000
 
-# A priced model's name followed by a version or date ("gpt-5" covers
-# "gpt-5.4" and "gpt-5-2025-08-07"), not a different family ("gpt-5-mini").
-_POINT_RELEASE = re.compile(r"[.\-]\d")
+# What may follow a priced model's name for it to inherit the price: a point
+# release, a dated snapshot, or both ("gpt-5" covers "gpt-5.4",
+# "gpt-5-2025-08-07" and "claude-sonnet-4-6" covers its "-20250929"). Any
+# other suffix is a different tier ("gpt-5.4-mini", "gpt-5.1-codex-mini") and
+# stays unpriced.
+_POINT_RELEASE = re.compile(r"(?:\.\d+)*(?:-\d{4}-\d{2}-\d{2}|-\d{8})?")
 
 _warned_unpriced: Set[Tuple[str, str]] = set()
 
@@ -51,7 +54,7 @@ def resolve_model_pricing(
     for name, config in configs.items():
         if name == model_name or not model_name.startswith(name):
             continue
-        if not _POINT_RELEASE.match(model_name[len(name) :]):
+        if not _POINT_RELEASE.fullmatch(model_name[len(name) :]):
             continue
         pricing = _pricing_of(config)
         if pricing is not None and (best is None or len(name) > best[0]):
