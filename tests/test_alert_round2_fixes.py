@@ -232,3 +232,22 @@ async def test_stale_firing_events_are_counted_and_logged(caplog):
     assert STALE_ALERT_EVENTS._value.get() - before == 5
     stale_logs = [r for r in caplog.records if "stale" in r.getMessage().lower()]
     assert len(stale_logs) == 1
+
+
+# --- Cross-branch: avoid(W) -> clear(W) -> avoid(W) pages again ---
+
+
+@pytest.mark.asyncio
+async def test_avoid_after_retraction_clear_in_same_window_notifies():
+    manager = AlertManager({})
+    handler = _RecordingHandler()
+    manager.notification_handlers = {"test": handler}
+    window = 1_710_000_000_000
+
+    await manager.record_external_alert(_event("provider_failure", "avoid", window))
+    await manager.record_external_alert(
+        _event("provider_failure", "clear", window, severity="info")
+    )
+    await manager.record_external_alert(_event("provider_failure", "avoid", window))
+
+    assert [c["status"] for c in handler.calls] == ["firing", "resolved", "firing"]

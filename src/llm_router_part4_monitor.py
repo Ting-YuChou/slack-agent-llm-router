@@ -768,6 +768,16 @@ class AlertManager:
             and key[2] == scope
             and (key[1] == alert_type or active.get("guardrail_action") == "avoid")
         ]
+        if targets:
+            # Forget the windows seen for the resolved incidents, so a
+            # retraction (avoid W, clear W, avoid W) pages again.
+            resolved_keys = set(targets)
+            for identity in [
+                identity
+                for identity in self._seen_alert_identities
+                if identity[:3] in resolved_keys
+            ]:
+                del self._seen_alert_identities[identity]
         for key in targets:
             active = self._active_external_alerts.pop(key)
             resolved = {
