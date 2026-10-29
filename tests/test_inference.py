@@ -1,6 +1,7 @@
 import asyncio
 import builtins
 import time
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -1911,6 +1912,170 @@ class TestInferenceEngine:
 
         assert "".join(chunks) == "from cache"
         provider.stream_response.assert_not_called()
+
+    @staticmethod
+    def _stale_cached_payload(**overrides):
+        """A cached payload as written by process_query an hour ago."""
+        payload = {
+            "response_text": "from cache",
+            "model_name": "gpt-5",
+            "provider": "openai",
+            "token_count_input": 3,
+            "token_count_output": 7,
+            "total_tokens": 10,
+            "latency_ms": 5000,
+            "tokens_per_second": 200.0,
+            "cost_usd": 0.42,
+            "cached": False,
+            "timestamp": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+        }
+        payload.update(overrides)
+        return payload
+
+    @staticmethod
+    def _assert_fresh_cache_hit(request, response, published, elapsed_ms):
+        from src.llm_router_part3_pipeline import build_inference_completed_event
+
+        now = datetime.now(timezone.utc)
+        for served in (response, published):
+            assert served.cached is True
+            assert served.cost_usd == 0
+            assert 0 <= served.latency_ms <= elapsed_ms + 1
+            assert abs((now - served.timestamp).total_seconds()) < 5
+
+        event = build_inference_completed_event(request, published)
+        completed_at = datetime.fromisoformat(
+            event["completion_timestamp"].replace("Z", "+00:00")
+        )
+        assert event["cached_response"] is True
+        assert event["cost_usd"] == 0
+        assert 0 <= event["latency_ms"] <= elapsed_ms + 1
+        assert abs((now - completed_at).total_seconds()) < 5
+
+    @pytest.mark.asyncio
+    async def test_process_query_cache_hit_reports_zero_cost_and_fresh_timing(
+        self,
+        inference_config,
+        sample_query_request,
+    ):
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="gpt-5")
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+        router.update_model_stats = MagicMock()
+
+        event_producer = AsyncMock()
+        event_producer.produce_inference_completed = AsyncMock()
+        event_producer.produce_query_log = AsyncMock()
+
+        engine = InferenceEngine(
+            inference_config, router, event_producer=event_producer
+        )
+        engine.cache.get_cached_response = AsyncMock(
+            return_value=self._stale_cached_payload()
+        )
+        engine.cache.cache_response = AsyncMock()
+
+        started = time.time()
+        response = await engine.process_query(sample_query_request)
+        elapsed_ms = (time.time() - started) * 1000
+
+        event_producer.produce_inference_completed.assert_awaited_once()
+        published = event_producer.produce_inference_completed.await_args.args[1]
+        self._assert_fresh_cache_hit(
+            sample_query_request, response, published, elapsed_ms
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_query_cache_hit_reports_zero_cost_and_fresh_timing(
+        self,
+        inference_config,
+        sample_query_request,
+    ):
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(selected_model="gpt-5")
+        )
+        router.get_model_info.return_value = {"config": {"provider": "openai"}}
+
+        event_producer = AsyncMock()
+        event_producer.produce_inference_completed = AsyncMock()
+        event_producer.produce_query_log = AsyncMock()
+
+        engine = InferenceEngine(
+            {**inference_config, "stream_cache_chunk_chars": 4},
+            router,
+            event_producer=event_producer,
+        )
+        provider = AsyncMock()
+        engine.providers = {"openai": provider}
+        engine.cache.get_cached_response = AsyncMock(
+            return_value=self._stale_cached_payload()
+        )
+
+        started = time.time()
+        chunks = [chunk async for chunk in engine.stream_query(sample_query_request)]
+        elapsed_ms = (time.time() - started) * 1000
+
+        assert "".join(chunks) == "from cache"
+        provider.stream_response.assert_not_called()
+        event_producer.produce_inference_completed.assert_awaited_once()
+        published = event_producer.produce_inference_completed.await_args.args[1]
+        self._assert_fresh_cache_hit(
+            sample_query_request, published, published, elapsed_ms
+        )
+
+    @pytest.mark.asyncio
+    async def test_fallback_cache_hit_reports_zero_cost_and_fresh_timing(
+        self,
+        inference_config,
+        sample_query_request,
+    ):
+        router = MagicMock()
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(
+                selected_model="gpt-5",
+                routing_reason="Capability-based selection",
+            )
+        )
+        router.get_model_info.side_effect = lambda name: {
+            "gpt-5": {"config": {"provider": "openai"}},
+            "mistral-7b": {"config": {"provider": "vllm"}},
+        }.get(name)
+        router.update_model_stats = MagicMock()
+
+        event_producer = AsyncMock()
+        event_producer.produce_inference_completed = AsyncMock()
+        event_producer.produce_query_log = AsyncMock()
+
+        engine = InferenceEngine(
+            inference_config, router, event_producer=event_producer
+        )
+        engine.providers = {"openai": AsyncMock(), "vllm": AsyncMock()}
+        engine.providers["openai"].generate_response = AsyncMock(
+            side_effect=RuntimeError("upstream overloaded")
+        )
+        engine._get_local_fallback_models = MagicMock(return_value=["mistral-7b"])
+        engine.cache.get_cached_response = AsyncMock(
+            side_effect=[
+                None,
+                self._stale_cached_payload(model_name="mistral-7b", provider="vllm"),
+            ]
+        )
+        engine.cache.cache_response = AsyncMock()
+
+        started = time.time()
+        response = await engine.process_query(sample_query_request)
+        elapsed_ms = (time.time() - started) * 1000
+
+        assert response.model_name == "mistral-7b"
+        engine.providers["vllm"].generate_response.assert_not_called()
+        event_producer.produce_inference_completed.assert_awaited_once()
+        published = event_producer.produce_inference_completed.await_args.args[1]
+        self._assert_fresh_cache_hit(
+            sample_query_request, response, published, elapsed_ms
+        )
 
     @pytest.mark.asyncio
     async def test_stream_query_acquires_and_releases_scheduler_capacity(

@@ -11,6 +11,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import (
     Awaitable,
@@ -2159,16 +2160,29 @@ class InferenceEngine:
     async def _get_cached_inference_response(
         self, request: QueryRequest, model_name: str
     ) -> Optional[InferenceResponse]:
-        """Return an app-cache hit for a model, clearly separated from provider cache."""
+        """Return an app-cache hit for a model, clearly separated from provider cache.
+
+        The cached payload carries the original call's cost, latency and timestamp.
+        A hit costs nothing, takes only the lookup time and happens now, so those
+        fields are reset before every hit path publishes analytics.
+        """
         if self._response_cache_bypassed(request):
             return None
+        lookup_started_at = time.time()
         cache_key = self.cache.generate_cache_key(request, model_name)
         cached_response = await self.cache.get_cached_response(cache_key)
         if not cached_response:
             return None
 
-        cached_response["cached"] = True
-        return InferenceResponse(**cached_response)
+        return InferenceResponse(
+            **{
+                **cached_response,
+                "cached": True,
+                "cost_usd": 0.0,
+                "latency_ms": int((time.time() - lookup_started_at) * 1000),
+                "timestamp": datetime.now(timezone.utc),
+            }
+        )
 
     def _response_cache_bypassed(self, request: QueryRequest) -> bool:
         metadata = request.metadata or {}
