@@ -17,7 +17,11 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from src.memory import EmbeddingProvider, build_embedding_provider
+from src.memory import (
+    EmbeddingProvider,
+    NoOpEmbeddingProvider,
+    build_embedding_provider,
+)
 from src.rag.chunker import DocumentChunk, build_chunker
 from src.rag.normalizer import DocumentLayoutNormalizer
 from src.rag.parser import build_document_parser
@@ -35,6 +39,7 @@ from src.rag.vector_store import (
     RagSearchResult,
     build_vector_store,
     capture_search_report,
+    report_search_branch,
 )
 from src.rag.visual import (
     FigureCropper,
@@ -82,6 +87,13 @@ class RagQueuePreDurabilityError(RuntimeError):
 
     safe_to_cleanup_staging = True
 
+
+# The vector store's branches get the retrieval deadline minus this margin
+# (a share of the time left, at most the cap), so they can return the
+# branches that answered, and say which timed out, before the outer deadline
+# cancels the whole search.
+_STORE_DEADLINE_MARGIN_RATIO = 0.1
+_STORE_DEADLINE_MARGIN_MAX_SECONDS = 0.25
 
 RAG_HITS = "hits"
 RAG_NO_HITS = "no_hits"
@@ -928,6 +940,7 @@ class RagService:
                     max_results=max_results,
                     candidate_count=candidate_count,
                     min_score=min_score,
+                    deadline_at=time.monotonic() + deadline_seconds,
                 ),
                 timeout=deadline_seconds,
             )
@@ -946,16 +959,25 @@ class RagService:
         max_results: Optional[int] = None,
         candidate_count: Optional[int] = None,
         min_score: Optional[float] = None,
+        deadline_seconds: Optional[float] = None,
     ) -> RagRetrievalOutcome:
         """Retrieve like ``retrieve``, but tell "no hits" apart from a failure.
 
         ``retrieve`` answers [] for a timeout and lets other errors escape;
         here both become typed outcomes, and so does a vector store that
         swallowed its own failures (see RagSearchReport).
+
+        ``deadline_seconds`` (the caller's share of its own deadline) can only
+        shorten the configured retrieval deadline.
         """
         if not self.enabled:
             return RagRetrievalOutcome(status=RAG_NO_HITS)
-        deadline_seconds = self._retrieval_deadline_seconds()
+        configured_deadline = self._retrieval_deadline_seconds()
+        deadline_seconds = (
+            configured_deadline
+            if deadline_seconds is None
+            else max(0.001, min(configured_deadline, float(deadline_seconds)))
+        )
         with capture_search_report() as report:
             try:
                 results = await asyncio.wait_for(
@@ -965,6 +987,7 @@ class RagService:
                         max_results=max_results,
                         candidate_count=candidate_count,
                         min_score=min_score,
+                        deadline_at=time.monotonic() + deadline_seconds,
                     ),
                     timeout=deadline_seconds,
                 )
@@ -1000,6 +1023,16 @@ class RagService:
     def _retrieval_deadline_seconds(self) -> float:
         return max(0.001, float(self.retrieval_config.get("deadline_seconds", 30)))
 
+    @staticmethod
+    def _store_deadline_seconds(deadline_at: float) -> float:
+        """Time the store's branches get: what is left, minus a small margin."""
+        remaining = max(0.0, deadline_at - time.monotonic())
+        margin = min(
+            _STORE_DEADLINE_MARGIN_MAX_SECONDS,
+            remaining * _STORE_DEADLINE_MARGIN_RATIO,
+        )
+        return remaining - margin
+
     async def _retrieve_within_deadline(
         self,
         query: str,
@@ -1008,8 +1041,15 @@ class RagService:
         max_results: Optional[int] = None,
         candidate_count: Optional[int] = None,
         min_score: Optional[float] = None,
+        deadline_at: Optional[float] = None,
     ) -> List[RagSearchResult]:
         embedding = await self._safe_embed(query)
+        if embedding is None and not isinstance(
+            self.embedding_provider, NoOpEmbeddingProvider
+        ):
+            # Vector search is configured but the embedding service failed:
+            # the vector branch cannot run, which is not "nothing matched".
+            report_search_branch("vector", failed=True)
         effective_kbs = self._effective_knowledge_base_ids(knowledge_base_ids)
         top_k = int(max_results or self.retrieval_config.get("top_k", 5))
         first_stage_candidate_count = int(
@@ -1022,6 +1062,11 @@ class RagService:
             if rerank_enabled
             else top_k
         )
+        store_deadline: Dict[str, float] = {}
+        if deadline_at is not None:
+            store_deadline["deadline_seconds"] = self._store_deadline_seconds(
+                deadline_at
+            )
         results = await self.vector_store.search(
             query,
             embedding,
@@ -1036,6 +1081,7 @@ class RagService:
                 if min_score is not None
                 else self.retrieval_config.get("min_score", 0.0)
             ),
+            **store_deadline,
         )
         if rerank_enabled:
             results = await self._rerank_results(query, results, top_k, rerank_top_n)

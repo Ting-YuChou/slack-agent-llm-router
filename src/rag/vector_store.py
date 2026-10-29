@@ -220,7 +220,8 @@ def capture_search_report() -> Iterator[RagSearchReport]:
         _ACTIVE_SEARCH_REPORT.reset(token)
 
 
-def _report_branch(branch: str, *, failed: bool) -> None:
+def report_search_branch(branch: str, *, failed: bool) -> None:
+    """Record that a branch ("keyword", "vector") answered or failed."""
     report = _ACTIVE_SEARCH_REPORT.get()
     if report is not None:
         (report.failed if failed else report.answered).add(branch)
@@ -328,6 +329,7 @@ class InMemoryRagVectorStore:
         vector_weight: float,
         recency_weight: float,
         min_score: float,
+        deadline_seconds: Optional[float] = None,  # in-process: nothing to cut off
     ) -> List[RagSearchResult]:
         tokens = tokenize(query)
         allowed_kbs = set(knowledge_base_ids or [])
@@ -855,7 +857,19 @@ class RedisStackRagVectorStore:
         vector_weight: float,
         recency_weight: float,
         min_score: float,
+        deadline_seconds: Optional[float] = None,
     ) -> List[RagSearchResult]:
+        """Run the keyword and vector branches concurrently and merge them.
+
+        A branch still running after ``deadline_seconds`` (default: the
+        configured retrieval deadline) is cut off and reported timed out; the
+        other branch's results are still returned.
+        """
+        branch_deadline = (
+            float(self.retrieval_config.get("deadline_seconds", 30))
+            if deadline_seconds is None
+            else max(0.0, float(deadline_seconds))
+        )
         semaphore = asyncio.Semaphore(
             max(1, int(self.retrieval_config.get("max_concurrent_branches", 3)))
         )
@@ -866,7 +880,7 @@ class RedisStackRagVectorStore:
                     return await factory()
                 except Exception as exc:
                     logger.warning("Redis RAG %s retrieval failed: %s", name, exc)
-                    _report_branch(name, failed=True)
+                    report_search_branch(name, failed=True)
                     return []
 
         tasks = [
@@ -890,10 +904,7 @@ class RedisStackRagVectorStore:
         done: set[asyncio.Task] = set()
         pending: set[asyncio.Task] = set(tasks)
         try:
-            done, pending = await asyncio.wait(
-                tasks,
-                timeout=float(self.retrieval_config.get("deadline_seconds", 30)),
-            )
+            done, pending = await asyncio.wait(tasks, timeout=branch_deadline)
         finally:
             unfinished = [task for task in tasks if not task.done()]
             for task in unfinished:
@@ -984,10 +995,13 @@ class RedisStackRagVectorStore:
         knowledge_base_ids: Sequence[str],
         limit: int,
     ) -> List[RagSearchResult]:
+        # No embedding: keyword-only by configuration, or the embedding
+        # service is down (RagService reports that outage itself).
         if not self.client or not embedding:
             return []
         if len(embedding) != self.dimensions:
             logger.warning("Skipping RAG vector search due to dimension mismatch")
+            report_search_branch("vector", failed=True)
             return []
         filter_query = self._filter_query(knowledge_base_ids)
         base_query = "*" if filter_query == "*" else f"({filter_query})"
@@ -1029,12 +1043,12 @@ class RedisStackRagVectorStore:
             )
         except Exception as exc:
             logger.warning("Redis RAG vector search failed: %s", exc)
-            _report_branch("vector", failed=True)
+            report_search_branch("vector", failed=True)
             return []
         # Only a reply that parses counts as an answer; a parse error
         # reaches run_branch and is reported there as a failure.
         results = self._parse_results(raw_results, "vector")
-        _report_branch("vector", failed=False)
+        report_search_branch("vector", failed=False)
         return results
 
     async def _search(
@@ -1082,7 +1096,7 @@ class RedisStackRagVectorStore:
             if raise_on_error:
                 raise
             logger.warning("Redis RAG keyword search failed: %s", exc)
-            _report_branch(source, failed=True)
+            report_search_branch(source, failed=True)
             return []
         results = self._parse_results(
             raw_results,
@@ -1091,7 +1105,7 @@ class RedisStackRagVectorStore:
             with_scores=with_scores,
             normalize_scores=normalize_scores,
         )
-        _report_branch(source, failed=False)
+        report_search_branch(source, failed=False)
         return results
 
     def _parse_results(

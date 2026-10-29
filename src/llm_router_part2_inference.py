@@ -3085,24 +3085,49 @@ class InferenceEngine:
     ) -> Any:
         """Retrieve with a typed outcome: hits, no_hits, timeout or error.
 
-        The RAG service's own deadline still applies; time_limit_seconds (this
-        step's share of the request deadline) can only end it sooner.
+        time_limit_seconds (this step's share of the request deadline) can
+        only shorten the RAG service's own deadline. The service works to it
+        itself, so a hung branch still leaves the answered branch's hits; a
+        timer around the call would cancel those too.
+
+        RAG services without ``retrieve_with_outcome`` only answer a list, so
+        a raised error is the only failure signal they can give.
         """
+        retrieve_with_outcome = getattr(self.rag_service, "retrieve_with_outcome", None)
+        if callable(retrieve_with_outcome):
+            return await retrieve_with_outcome(
+                request.query,
+                knowledge_base_ids=request.knowledge_base_ids,
+                deadline_seconds=time_limit_seconds,
+                **retrieve_kwargs,
+            )
         try:
-            return await _await_within(
-                self._typed_rag_retrieval(request, **retrieve_kwargs),
+            results = await _await_within(
+                self.rag_service.retrieve(
+                    request.query,
+                    knowledge_base_ids=request.knowledge_base_ids,
+                    **retrieve_kwargs,
+                ),
                 time_limit_seconds,
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "RAG retrieval for request %s ran out of its %ss share of the "
-                "request deadline",
+                "RAG retrieval for request %s timed out (share of the request "
+                "deadline: %ss)",
                 request.request_id,
                 time_limit_seconds,
             )
+            return SimpleNamespace(status="timeout", results=[], detail=None)
+        except Exception as exc:
+            logger.warning("RAG retrieval failed: %s", exc, exc_info=True)
             return SimpleNamespace(
-                status="timeout", results=[], detail="request deadline share"
+                status="error", results=[], detail=type(exc).__name__
             )
+        return SimpleNamespace(
+            status="hits" if results else "no_hits",
+            results=list(results or []),
+            detail=None,
+        )
 
     def _retrieval_time_limit(
         self, execution_budget: Optional[RequestExecutionBudget]
@@ -3121,40 +3146,6 @@ class InferenceEngine:
         if not 0.0 < ratio <= 1.0:
             ratio = _DEFAULT_RETRIEVAL_BUDGET_RATIO
         return execution_budget.remaining_seconds * ratio
-
-    async def _typed_rag_retrieval(
-        self,
-        request: QueryRequest,
-        **retrieve_kwargs: Any,
-    ) -> Any:
-        """RAG services without ``retrieve_with_outcome`` only answer a list, so
-        a raised error is the only failure signal they can give.
-        """
-        retrieve_with_outcome = getattr(self.rag_service, "retrieve_with_outcome", None)
-        if callable(retrieve_with_outcome):
-            return await retrieve_with_outcome(
-                request.query,
-                knowledge_base_ids=request.knowledge_base_ids,
-                **retrieve_kwargs,
-            )
-        try:
-            results = await self.rag_service.retrieve(
-                request.query,
-                knowledge_base_ids=request.knowledge_base_ids,
-                **retrieve_kwargs,
-            )
-        except asyncio.TimeoutError:
-            return SimpleNamespace(status="timeout", results=[], detail=None)
-        except Exception as exc:
-            logger.warning("RAG retrieval failed: %s", exc, exc_info=True)
-            return SimpleNamespace(
-                status="error", results=[], detail=type(exc).__name__
-            )
-        return SimpleNamespace(
-            status="hits" if results else "no_hits",
-            results=list(results or []),
-            detail=None,
-        )
 
     async def _prepare_rag_images(
         self,

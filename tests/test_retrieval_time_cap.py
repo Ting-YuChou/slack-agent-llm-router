@@ -80,7 +80,7 @@ def _answer():
     )
 
 
-def _engine(*, rag_service=None, web_search_tool=None, query_type=None):
+def _engine(*, rag_service=None, web_search_tool=None, query_type=None, scheduler=None):
     router = MagicMock()
     router.route_query = AsyncMock(
         return_value=SimpleNamespace(selected_model="gpt-5", query_type=query_type)
@@ -90,7 +90,7 @@ def _engine(*, rag_service=None, web_search_tool=None, query_type=None):
     router.token_counter.count_tokens.return_value = 5
     engine = InferenceEngine(
         {
-            "scheduler": {"request_deadline_seconds": 1.0},
+            "scheduler": scheduler or {"request_deadline_seconds": 1.0},
             "cache": {"enabled": True},
             "batching": {"enabled": False},
         },
