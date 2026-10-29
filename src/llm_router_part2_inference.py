@@ -35,10 +35,8 @@ import anthropic
 from src.admission import AdmissionRejectedError
 from src.llm_router_part1_router import ModelRouter
 from src.prompt_assembly import (
-    RAG_UNAVAILABLE_NOTICE,
     RAG_UNAVAILABLE_STATUSES,
     SYSTEM_PROMPT,
-    WEB_SEARCH_UNAVAILABLE_NOTICE,
     PromptSections,
     build_prompt_sections,
     join_prompt_sections,
@@ -630,7 +628,6 @@ def _exception_provider_request_id(exc: BaseException) -> Optional[str]:
     return _header_value(headers, "x-request-id")
 
 
-_RAG_UNAVAILABLE_STATUSES = RAG_UNAVAILABLE_STATUSES
 # inference.retrieval_budget_ratio when unset or invalid.
 _DEFAULT_RETRIEVAL_BUDGET_RATIO = 0.5
 # Least time a retrieval step leaves before the request deadline, so its own
@@ -3008,7 +3005,7 @@ class InferenceEngine:
             min_score=min_score,
         )
         results = list(outcome.results)
-        rag_unavailable = outcome.status in _RAG_UNAVAILABLE_STATUSES
+        rag_unavailable = outcome.status in RAG_UNAVAILABLE_STATUSES
         latency_ms = int((time.time() - started_at) * 1000)
         tool_call = self.rag_service.tool_call_from_results(
             request.query,
