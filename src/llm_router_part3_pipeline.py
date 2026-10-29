@@ -338,6 +338,17 @@ def build_chat_feedback_row(
     }
 
 
+def _event_query_text(query_request: QueryRequest) -> str:
+    """The query as events carry it: redacted, and for Slack without the
+    attached files' names (a file-only message asks about them by name)."""
+    query = query_request.query
+    if (query_request.metadata or {}).get("source") == "slack":
+        for attachment in query_request.attachments:
+            if attachment.name:
+                query = query.replace(attachment.name, "[attachment]")
+    return redact_text(query)
+
+
 def _without_attachment_names(slack_metadata: Any) -> Any:
     if not isinstance(slack_metadata, dict):
         return slack_metadata
@@ -371,7 +382,7 @@ def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
         "user_id": query_request.user_id,
         "user_tier": _enum_value(query_request.user_tier),
         "request_timestamp": _isoformat_utc(query_request.timestamp),
-        "query_text": redact_text(query_request.query),
+        "query_text": _event_query_text(query_request),
         # Other people's Slack messages ride in `context`; send only its shape.
         **context_summary(query_request.context),
         "query_token_estimate": estimate_query_tokens(
@@ -451,7 +462,7 @@ def build_inference_completed_event(
         "thread_key_hash": thread_key_hash(query_request),
         "request_timestamp": _isoformat_utc(query_request.timestamp),
         "completion_timestamp": _isoformat_utc(inference_response.timestamp),
-        "query_text": redact_text(query_request.query),
+        "query_text": _event_query_text(query_request),
         "query_type": _enum_value(query_type),
         "selected_model": inference_response.model_name,
         "provider": inference_response.provider,
