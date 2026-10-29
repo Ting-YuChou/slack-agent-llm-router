@@ -2,7 +2,7 @@ import json
 import asyncio
 import uuid
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -27,6 +27,49 @@ from src.utils.schema import (
     UserTier,
 )
 from src.utils.metrics import PIPELINE_METRICS
+
+DASHBOARD_READS_WITH_EMPTY_RESULT = [
+    ("get_query_analytics", {}),
+    ("get_model_performance", []),
+    ("get_routing_guardrails", []),
+    ("get_routing_policy_state_events", []),
+]
+HOURS_WINDOWED_DASHBOARD_READS = [
+    method_name for method_name, _ in DASHBOARD_READS_WITH_EMPTY_RESULT
+]
+UINT32_MAX = 2**32 - 1
+TIMESTAMPED_CONSUMERS = [
+    pytest.param(
+        "queries",
+        "_consume_queries",
+        "test-queries",
+        {
+            "query_id": "query-1",
+            "user_id": "user-1",
+            "user_tier": "premium",
+            "query_text": "hello",
+            "query_type": "general",
+            "selected_model": "gpt-5",
+            "token_count_input": 1,
+            "token_count_output": 2,
+            "latency_ms": 10,
+            "cost_usd": 0.01,
+            "status": "success",
+        },
+        id="queries",
+    ),
+    pytest.param(
+        "metrics",
+        "_consume_metrics",
+        "test-metrics",
+        {
+            "service": "router",
+            "metric_name": "latency_ms",
+            "metric_value": 12.5,
+        },
+        id="metrics",
+    ),
+]
 
 
 @pytest.fixture
@@ -801,6 +844,91 @@ class TestClickHouseManager:
         queries = [call.args[1] for call in manager._run_blocking.await_args_list]
         assert all(" FINAL" in query for query in queries)
 
+    @pytest.mark.parametrize("method_name", HOURS_WINDOWED_DASHBOARD_READS)
+    @pytest.mark.asyncio
+    async def test_dashboard_reads_bind_hours_as_query_parameter(
+        self, pipeline_config, method_name
+    ):
+        manager = ClickHouseManager(pipeline_config["clickhouse"])
+        manager.client = MagicMock()
+        manager._run_blocking = AsyncMock(return_value=SimpleNamespace(result_rows=[]))
+
+        await getattr(manager, method_name)(hours=137, raise_errors=True)
+
+        call = manager._run_blocking.await_args
+        assert call.args[0] is manager.client.query
+        assert "INTERVAL {hours:UInt32} HOUR" in call.args[1]
+        assert "137" not in call.args[1]
+        assert call.kwargs["parameters"] == {"hours": 137}
+
+    @pytest.mark.parametrize("method_name", HOURS_WINDOWED_DASHBOARD_READS)
+    @pytest.mark.asyncio
+    async def test_dashboard_reads_clamp_negative_hours_to_zero(
+        self, pipeline_config, method_name
+    ):
+        manager = ClickHouseManager(pipeline_config["clickhouse"])
+        manager.client = MagicMock()
+        manager._run_blocking = AsyncMock(return_value=SimpleNamespace(result_rows=[]))
+
+        await getattr(manager, method_name)(hours=-5, raise_errors=True)
+
+        call = manager._run_blocking.await_args
+        assert call.kwargs["parameters"] == {"hours": 0}
+        assert "-5" not in call.args[1]
+
+    @pytest.mark.parametrize(
+        "method_name, empty_result", DASHBOARD_READS_WITH_EMPTY_RESULT
+    )
+    @pytest.mark.asyncio
+    async def test_dashboard_reads_reject_non_integer_hours_before_sql(
+        self, pipeline_config, method_name, empty_result
+    ):
+        manager = ClickHouseManager(pipeline_config["clickhouse"])
+        manager.client = MagicMock()
+        manager._run_blocking = AsyncMock(return_value=SimpleNamespace(result_rows=[]))
+        method = getattr(manager, method_name)
+
+        with pytest.raises(ValueError):
+            await method(hours="1; DROP TABLE x", raise_errors=True)
+        assert await method(hours="1; DROP TABLE x") == empty_result
+
+        manager._run_blocking.assert_not_awaited()
+
+    @pytest.mark.parametrize("method_name", HOURS_WINDOWED_DASHBOARD_READS)
+    @pytest.mark.asyncio
+    async def test_dashboard_reads_cap_hours_at_uint32_max(
+        self, pipeline_config, method_name
+    ):
+        manager = ClickHouseManager(pipeline_config["clickhouse"])
+        manager.client = MagicMock()
+        manager._run_blocking = AsyncMock(return_value=SimpleNamespace(result_rows=[]))
+
+        await getattr(manager, method_name)(hours=2**40, raise_errors=True)
+        assert manager._run_blocking.await_args.kwargs["parameters"] == {
+            "hours": UINT32_MAX
+        }
+
+        await getattr(manager, method_name)(hours=UINT32_MAX, raise_errors=True)
+        assert manager._run_blocking.await_args.kwargs["parameters"] == {
+            "hours": UINT32_MAX
+        }
+
+    @pytest.mark.asyncio
+    async def test_get_query_analytics_binds_user_id_as_query_parameter(
+        self, pipeline_config
+    ):
+        manager = ClickHouseManager(pipeline_config["clickhouse"])
+        manager.client = MagicMock()
+        manager._run_blocking = AsyncMock(return_value=SimpleNamespace(result_rows=[]))
+        user_id = "o'brien' OR 1=1 --"
+
+        await manager.get_query_analytics(user_id=user_id, hours=6, raise_errors=True)
+
+        call = manager._run_blocking.await_args
+        assert "user_id = {user_id:String}" in call.args[1]
+        assert "brien" not in call.args[1]
+        assert call.kwargs["parameters"] == {"hours": 6, "user_id": user_id}
+
     @pytest.mark.asyncio
     async def test_get_model_performance_groups_by_provider(self, pipeline_config):
         with patch(
@@ -1093,6 +1221,79 @@ class TestKafkaConsumerManager:
         assert entry.kafka_topic == "test-queries"
         assert entry.kafka_partition == 2
         assert entry.kafka_offset == 8
+
+    @pytest.mark.parametrize(
+        "raw_timestamp",
+        ["2026-10-28T07:50:00", "2026-10-28T15:50:00+08:00"],
+        ids=["naive", "offset"],
+    )
+    @pytest.mark.parametrize(
+        "batch_key, consume_method, topic, payload", TIMESTAMPED_CONSUMERS
+    )
+    @pytest.mark.asyncio
+    async def test_consumed_timestamps_are_stored_as_utc(
+        self,
+        pipeline_config,
+        batch_key,
+        consume_method,
+        topic,
+        payload,
+        raw_timestamp,
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        message = SimpleNamespace(
+            value=json.dumps({**payload, "timestamp": raw_timestamp}).encode("utf-8"),
+            topic=topic,
+            partition=0,
+            offset=3,
+        )
+
+        await getattr(consumer, consume_method)(AsyncMessageConsumer([message]))
+
+        stored = consumer.batch_processors[batch_key][0].timestamp
+        assert stored.tzinfo is not None
+        assert stored.utcoffset() == timedelta(0)
+        assert stored == datetime(2026, 10, 28, 7, 50, tzinfo=timezone.utc)
+
+    @pytest.mark.parametrize(
+        "raw_timestamp",
+        ["garbage", 1730000000, None, "0001-01-01T00:00:00+01:00"],
+        ids=["garbage", "epoch-int", "null", "out-of-range"],
+    )
+    @pytest.mark.parametrize(
+        "batch_key, consume_method, topic, payload", TIMESTAMPED_CONSUMERS
+    )
+    @pytest.mark.asyncio
+    async def test_consumed_invalid_timestamps_go_to_dlq_not_batch(
+        self,
+        pipeline_config,
+        batch_key,
+        consume_method,
+        topic,
+        payload,
+        raw_timestamp,
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        consumer.dlq_producer = AsyncMock()
+        message = SimpleNamespace(
+            value=json.dumps({**payload, "timestamp": raw_timestamp}).encode("utf-8"),
+            key=b"bad-key",
+            topic=topic,
+            partition=0,
+            offset=3,
+        )
+        kafka_consumer = AsyncMessageConsumer([message])
+        consumer.consumers[batch_key] = kafka_consumer
+
+        await getattr(consumer, consume_method)(kafka_consumer)
+
+        assert consumer.batch_processors[batch_key] == []
+        dlq_kwargs = consumer.dlq_producer.send_and_wait.await_args.kwargs
+        assert dlq_kwargs["topic"] == f"{topic}.dlq"
+        assert dlq_kwargs["key"] == f"{topic}:0:3"
+        assert dlq_kwargs["value"]["failure_stage"] == "consume"
+        assert dlq_kwargs["value"]["source_offset"] == 3
+        kafka_consumer.commit.assert_awaited_once_with({TopicPartition(topic, 0): 4})
 
     @pytest.mark.asyncio
     async def test_flush_pending_batches_commits_offsets_after_clickhouse_write(
@@ -1504,6 +1705,32 @@ class TestKafkaIngestionPipeline:
         await pipeline.get_dashboard_bundle(hours=1)
 
         assert peak == 2
+
+    @pytest.mark.parametrize(
+        "hours, window_hours",
+        [(2**40, UINT32_MAX), (-3, 0), (6, 6)],
+        ids=["above-uint32", "negative", "in-range"],
+    )
+    @pytest.mark.asyncio
+    async def test_dashboard_bundle_keys_and_reads_use_the_clamped_window(
+        self, pipeline_config, hours, window_hours
+    ):
+        pipeline = KafkaIngestionPipeline(pipeline_config)
+        pipeline.get_query_analytics = AsyncMock(return_value={})
+        pipeline.get_model_performance = AsyncMock(return_value=[])
+        pipeline.get_routing_guardrails = AsyncMock(return_value=[])
+        pipeline.get_routing_policy_state_events = AsyncMock(return_value=[])
+
+        await pipeline.get_dashboard_bundle(user_id="user-1", hours=hours)
+
+        assert list(pipeline._dashboard_cache) == [(window_hours, "user-1")]
+        for method in (
+            pipeline.get_query_analytics,
+            pipeline.get_model_performance,
+            pipeline.get_routing_guardrails,
+            pipeline.get_routing_policy_state_events,
+        ):
+            assert method.await_args.kwargs["hours"] == window_hours
 
     @pytest.mark.asyncio
     async def test_health_status_reflects_component_state(self, pipeline_config):

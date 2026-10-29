@@ -52,26 +52,44 @@ def _enum_value(value: Any) -> Any:
 
 
 def _parse_datetime(
-    value: Optional[Any], *, default: Optional[datetime] = None
+    value: Optional[Any],
+    *,
+    default: Optional[datetime] = None,
+    strict: bool = False,
 ) -> datetime:
-    """Parse ISO timestamps emitted by the platform into timezone-aware datetimes."""
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value
+    """Parse platform timestamps into aware UTC datetimes; naive values are UTC.
 
-    if isinstance(value, str) and value:
+    Unparseable or out-of-range values fall back to ``default`` (or the current
+    time), or raise ``ValueError`` when ``strict`` is set.
+    """
+    parsed: Optional[datetime] = None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value:
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             logger.debug(f"Failed to parse datetime value: {value}")
 
+    if parsed is not None:
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        try:
+            return parsed.astimezone(timezone.utc)
+        except (OverflowError, ValueError):
+            logger.debug(f"Datetime value is out of range in UTC: {value}")
+
+    if strict:
+        raise ValueError(f"Invalid timestamp: {value!r}")
     return default or datetime.now(timezone.utc)
 
 
-def _escape_clickhouse_literal(value: Any) -> str:
-    """Escape a value for safe interpolation inside a ClickHouse string literal."""
-    return str(value).replace("\\", "\\\\").replace("'", "\\'")
+_UINT32_MAX = 2**32 - 1
+
+
+def _window_hours(hours: Any) -> int:
+    """Coerce a dashboard look-back window to a non-negative UInt32 hour count."""
+    return min(max(int(hours), 0), _UINT32_MAX)
 
 
 def _decode_kafka_key(key: Any) -> str:
@@ -1376,11 +1394,11 @@ class ClickHouseManager:
     ) -> Dict[str, Any]:
         """Get query analytics for dashboard"""
         try:
-            time_window_hours = max(int(hours), 0)
-            where_clauses = [f"timestamp >= now() - INTERVAL {time_window_hours} HOUR"]
+            parameters: Dict[str, Any] = {"hours": _window_hours(hours)}
+            where_clauses = ["timestamp >= now() - INTERVAL {hours:UInt32} HOUR"]
             if user_id:
-                escaped_user_id = _escape_clickhouse_literal(user_id)
-                where_clauses.append(f"user_id = '{escaped_user_id}'")
+                parameters["user_id"] = str(user_id)
+                where_clauses.append("user_id = {user_id:String}")
             where_sql = " AND ".join(where_clauses)
 
             analytics_query = f"""
@@ -1399,7 +1417,9 @@ class ClickHouseManager:
             GROUP BY GROUPING SETS ((), (selected_model), (query_type))
             """
 
-            result = await self._run_blocking(self.client.query, analytics_query)
+            result = await self._run_blocking(
+                self.client.query, analytics_query, parameters=parameters
+            )
             analytics: Dict[str, Any] = {
                 "total_queries": 0,
                 "total_tokens": 0,
@@ -1443,6 +1463,7 @@ class ClickHouseManager:
     ) -> List[Dict[str, Any]]:
         """Get model performance metrics"""
         try:
+            time_window_hours = _window_hours(hours)
             query = f"""
             SELECT 
                 model_name,
@@ -1454,12 +1475,16 @@ class ClickHouseManager:
                 sum(error_count) as errors,
                 sum(total_cost_usd) as total_cost
             FROM {self.database}.model_performance FINAL
-            WHERE timestamp >= now() - INTERVAL {hours} HOUR
+            WHERE timestamp >= now() - INTERVAL {{hours:UInt32}} HOUR
             GROUP BY model_name, provider
             ORDER BY requests DESC, model_name ASC, provider ASC
             """
 
-            result = await self._run_blocking(self.client.query, query)
+            result = await self._run_blocking(
+                self.client.query,
+                query,
+                parameters={"hours": time_window_hours},
+            )
 
             performance_data = []
             for row in result.result_rows:
@@ -1491,6 +1516,7 @@ class ClickHouseManager:
     ) -> List[Dict[str, Any]]:
         """Get recent routing guardrail events persisted through the alert stream."""
         try:
+            time_window_hours = _window_hours(hours)
             query = f"""
             SELECT
                 timestamp,
@@ -1501,13 +1527,17 @@ class ClickHouseManager:
                 provider,
                 payload_json
             FROM {self.database}.alert_events FINAL
-            WHERE timestamp >= now() - INTERVAL {hours} HOUR
+            WHERE timestamp >= now() - INTERVAL {{hours:UInt32}} HOUR
               AND source_event_type = 'routing.guardrails'
             ORDER BY timestamp DESC
             LIMIT 50
             """
 
-            result = await self._run_blocking(self.client.query, query)
+            result = await self._run_blocking(
+                self.client.query,
+                query,
+                parameters={"hours": time_window_hours},
+            )
             guardrails = []
             for row in result.result_rows:
                 payload = {}
@@ -1546,6 +1576,7 @@ class ClickHouseManager:
     ) -> List[Dict[str, Any]]:
         """Get recent persisted routing.policy_state events for audit and tuning."""
         try:
+            time_window_hours = _window_hours(hours)
             query = f"""
             SELECT
                 timestamp,
@@ -1571,12 +1602,16 @@ class ClickHouseManager:
                 avoid_providers,
                 payload_json
             FROM {self.database}.routing_policy_state_events FINAL
-            WHERE timestamp >= now() - INTERVAL {hours} HOUR
+            WHERE timestamp >= now() - INTERVAL {{hours:UInt32}} HOUR
             ORDER BY timestamp DESC
             LIMIT 50
             """
 
-            result = await self._run_blocking(self.client.query, query)
+            result = await self._run_blocking(
+                self.client.query,
+                query,
+                parameters={"hours": time_window_hours},
+            )
             state_events = []
             for row in result.result_rows:
                 payload = {}
@@ -1916,9 +1951,7 @@ class KafkaConsumerManager:
                     data = self._decode_message_value(message)
                     query_log = QueryLogEntry(
                         query_id=data["query_id"],
-                        timestamp=datetime.fromisoformat(
-                            data["timestamp"].replace("Z", "+00:00")
-                        ),
+                        timestamp=_parse_datetime(data["timestamp"], strict=True),
                         user_id=data["user_id"],
                         user_tier=data["user_tier"],
                         query_text=data["query_text"],
@@ -1988,9 +2021,7 @@ class KafkaConsumerManager:
                 try:
                     data = self._decode_message_value(message)
                     metric_entry = MetricEntry(
-                        timestamp=datetime.fromisoformat(
-                            data["timestamp"].replace("Z", "+00:00")
-                        ),
+                        timestamp=_parse_datetime(data["timestamp"], strict=True),
                         service=data["service"],
                         metric_name=data["metric_name"],
                         metric_value=data["metric_value"],
@@ -2876,7 +2907,7 @@ class KafkaIngestionPipeline:
         self, user_id: Optional[str] = None, hours: int = 24
     ) -> Dict[str, Any]:
         """Read independent dashboard sections with cache and single-flight."""
-        key = (max(int(hours), 0), user_id)
+        key = (_window_hours(hours), user_id)
         now = time.monotonic()
         cached = self._dashboard_cache.get(key)
         if cached is not None:

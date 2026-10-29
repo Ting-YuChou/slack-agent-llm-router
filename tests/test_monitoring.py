@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -187,7 +187,7 @@ class TestMetricsCollector:
         collector.record_stream_model_metrics(
             {
                 "event_type": "analytics.model_metrics_1m",
-                "emitted_at": datetime.now().isoformat(),
+                "emitted_at": datetime.now(timezone.utc).isoformat(),
                 "model_name": "gpt-5",
                 "provider": "openai",
                 "request_count": 4,
@@ -212,7 +212,7 @@ class TestMetricsCollector:
         collector.record_stream_model_metrics(
             {
                 "event_type": "analytics.model_metrics_1m",
-                "emitted_at": datetime.now().isoformat(),
+                "emitted_at": datetime.now(timezone.utc).isoformat(),
                 "model_name": "gpt-5",
                 "provider": "openai",
                 "request_count": 4,
@@ -227,7 +227,7 @@ class TestMetricsCollector:
         collector.record_stream_model_metrics(
             {
                 "event_type": "analytics.model_metrics_1m",
-                "emitted_at": datetime.now().isoformat(),
+                "emitted_at": datetime.now(timezone.utc).isoformat(),
                 "model_name": "gpt-5",
                 "provider": "azure",
                 "request_count": 6,
@@ -251,7 +251,7 @@ class TestMetricsCollector:
         collector.record_request_routing_features(
             {
                 "event_type": "requests.enriched",
-                "emitted_at": datetime.now().isoformat(),
+                "emitted_at": datetime.now(timezone.utc).isoformat(),
                 "request_id": "req-1",
                 "query_type": "analysis",
                 "query_complexity": "complex",
@@ -265,7 +265,7 @@ class TestMetricsCollector:
         collector.record_routing_guardrail(
             {
                 "event_type": "routing.guardrails",
-                "emitted_at": datetime.now().isoformat(),
+                "emitted_at": datetime.now(timezone.utc).isoformat(),
                 "scope_type": "model",
                 "scope_key": "gpt-5",
                 "trigger_type": "high_error_rate",
@@ -293,7 +293,7 @@ class TestMonitoringService:
         await service.ingest_stream_model_metrics(
             {
                 "event_type": "analytics.model_metrics_1m",
-                "emitted_at": datetime.now().isoformat(),
+                "emitted_at": datetime.now(timezone.utc).isoformat(),
                 "model_name": "gpt-5",
                 "provider": "openai",
                 "request_count": 3,
@@ -308,7 +308,7 @@ class TestMonitoringService:
         await service.ingest_stream_request_enriched(
             {
                 "event_type": "requests.enriched",
-                "emitted_at": datetime.now().isoformat(),
+                "emitted_at": datetime.now(timezone.utc).isoformat(),
                 "request_id": "req-1",
                 "query_type": "analysis",
                 "query_complexity": "complex",
@@ -320,7 +320,7 @@ class TestMonitoringService:
         await service.ingest_stream_routing_guardrail(
             {
                 "event_type": "routing.guardrails",
-                "emitted_at": datetime.now().isoformat(),
+                "emitted_at": datetime.now(timezone.utc).isoformat(),
                 "scope_type": "provider",
                 "scope_key": "openai",
                 "trigger_type": "provider_high_latency",
@@ -332,7 +332,7 @@ class TestMonitoringService:
         await service.ingest_stream_routing_policy_state(
             {
                 "event_type": "routing.policy_state",
-                "emitted_at": datetime.now().isoformat(),
+                "emitted_at": datetime.now(timezone.utc).isoformat(),
                 "scope_type": "session",
                 "scope_key": "session-1",
                 "user_tier": "premium",

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 import uuid
@@ -11,6 +11,11 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+
+def utc_now() -> datetime:
+    """Return the current time as a timezone-aware UTC datetime."""
+    return datetime.now(timezone.utc)
 
 
 class UserTier(str, Enum):
@@ -118,7 +123,7 @@ class QueryRequest(BaseModel):
     # Core fields with proper types
     user_tier: UserTier = UserTier.FREE
     request_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    timestamp: datetime = Field(default_factory=datetime.now)
+    timestamp: datetime = Field(default_factory=utc_now)
 
     # Optional context and settings
     context: Optional[str] = Field(None, max_length=100000)
@@ -212,7 +217,7 @@ class InferenceResponse(BaseModel):
     warnings: List[str] = Field(default_factory=list)
 
     # Timestamps
-    timestamp: datetime = Field(default_factory=datetime.now)
+    timestamp: datetime = Field(default_factory=utc_now)
 
     @model_validator(mode="after")
     def validate_total_tokens(self):
@@ -290,7 +295,7 @@ class RoutingDecision(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
 
     # Context
-    timestamp: datetime = Field(default_factory=datetime.now)
+    timestamp: datetime = Field(default_factory=utc_now)
     fallback_models: List[str] = Field(default_factory=list)
 
     # Metadata
@@ -353,7 +358,7 @@ class ModelConfig(BaseModel):
 class SystemMetric(BaseModel):
     name: str = Field(..., min_length=1)
     value: float
-    timestamp: datetime = Field(default_factory=datetime.now)
+    timestamp: datetime = Field(default_factory=utc_now)
     labels: Dict[str, str] = Field(default_factory=dict)
     unit: Optional[str] = None
 
@@ -370,8 +375,8 @@ class UserSession(BaseModel):
     session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str
     user_tier: UserTier
-    start_time: datetime = Field(default_factory=datetime.now)
-    last_activity: datetime = Field(default_factory=datetime.now)
+    start_time: datetime = Field(default_factory=utc_now)
+    last_activity: datetime = Field(default_factory=utc_now)
     query_count: int = Field(0, ge=0)
     total_tokens: int = Field(0, ge=0)
     total_cost: float = Field(0.0, ge=0.0)
@@ -381,7 +386,7 @@ class ErrorResponse(BaseModel):
     error_type: str
     error_message: str
     error_code: Optional[str] = None
-    timestamp: datetime = Field(default_factory=datetime.now)
+    timestamp: datetime = Field(default_factory=utc_now)
     request_id: Optional[str] = None
     retry_after: Optional[int] = None  # seconds
 
@@ -390,7 +395,7 @@ class ErrorResponse(BaseModel):
 class HealthStatus(BaseModel):
     service: str
     status: str = Field(..., pattern=r"^(healthy|degraded|unhealthy)$")
-    timestamp: datetime = Field(default_factory=datetime.now)
+    timestamp: datetime = Field(default_factory=utc_now)
     details: Optional[Dict[str, Any]] = None
     version: Optional[str] = None
 
@@ -398,7 +403,7 @@ class HealthStatus(BaseModel):
 class ComponentHealth(BaseModel):
     overall_status: str = Field(..., pattern=r"^(healthy|degraded|unhealthy)$")
     components: Dict[str, HealthStatus]
-    timestamp: datetime = Field(default_factory=datetime.now)
+    timestamp: datetime = Field(default_factory=utc_now)
 
 
 class ConfigModel(BaseModel):
