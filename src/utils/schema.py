@@ -369,6 +369,10 @@ class RoutingDecision(BaseModel):
     # Every model the router considered. fallback_models stays the chain
     # inference actually tried.
     candidates: List[RoutingCandidate] = Field(default_factory=list)
+    # policy_cache.mode shadow (A1): the model the policy would have chosen,
+    # and the policy's source; None when not in shadow mode or no policy.
+    shadow_selected_model: Optional[str] = None
+    shadow_policy_source: Optional[str] = None
 
 
 class ModelSelection(BaseModel):
@@ -1156,6 +1160,9 @@ class FlinkConfig(ConfigModel):
 
 class PolicyCacheConfig(ConfigModel):
     enabled: bool = False
+    # enforce: the policy changes routing. shadow (A1): routing ignores it and
+    # records what it would have chosen (RoutingDecision.shadow_selected_model).
+    mode: Literal["enforce", "shadow"] = "enforce"
     request_ttl_seconds: int = Field(300, ge=1)
     user_ttl_seconds: int = Field(900, ge=1)
     local_cache_ttl_seconds: int = Field(5, ge=0)

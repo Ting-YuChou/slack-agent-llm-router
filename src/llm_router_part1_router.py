@@ -143,6 +143,10 @@ DEFAULT_OUTPUT_TOKEN_ESTIMATES: Dict[str, int] = {
     "creative_writing": 1200,
     "code_generation": 1200,
 }
+# policy_cache.mode shadow (A1): the policy's context, stashed by
+# _get_policy_context, and the routing context with it applied.
+SHADOW_POLICY_CONTEXT_KEY = "shadow_policy_context"
+SHADOW_ROUTING_CONTEXT_KEY = "shadow_routing_context"
 # Context key carrying the cheapest eligible candidate's request cost.
 COST_REFERENCE_KEY = "cost_reference"
 
@@ -771,6 +775,10 @@ class ModelRouter:
             else:
                 model_selection = self._fallback_routing(query_context)
 
+            shadow_model, shadow_policy_source = await self._shadow_selection(
+                query_context, model_selection.model_name
+            )
+
             # Create routing decision
             query_type = query_context["query_type"]
             query_type_value = (
@@ -800,6 +808,8 @@ class ModelRouter:
                     model_selection.model_name,
                     model_selection.reason_code,
                 ),
+                shadow_selected_model=shadow_model,
+                shadow_policy_source=shadow_policy_source,
             )
 
             # Update metrics
@@ -1183,12 +1193,22 @@ class ModelRouter:
         context.update(routing_features)
 
         policy_context = await self._request_policy_context(request)
+        shadow_policy = policy_context.pop(SHADOW_POLICY_CONTEXT_KEY, None)
         context.update(policy_context)
         self._restore_current_request_features(context, routing_features)
         context["policy_source"] = self._combine_policy_sources(
             policy_context.get("policy_source", "none"),
             routing_features,
         )
+        if isinstance(shadow_policy, dict):
+            # A1 shadow mode: the same request with the policy applied, for
+            # route_query to see what the policy would have chosen.
+            shadow_context = {**context, **shadow_policy}
+            self._restore_current_request_features(shadow_context, routing_features)
+            shadow_context["policy_source"] = self._combine_policy_sources(
+                shadow_policy.get("policy_source", "none"), routing_features
+            )
+            context[SHADOW_ROUTING_CONTEXT_KEY] = shadow_context
 
         return context
 
@@ -1639,7 +1659,7 @@ class ModelRouter:
                 else "request_metadata"
             )
 
-        return {
+        policy_context = {
             "policy_source": policy_source,
             "route_to_fast_lane": bool(policy.get("route_to_fast_lane", False)),
             "preferred_models": combined_preferred_models,
@@ -1681,6 +1701,94 @@ class ModelRouter:
                 policy.get("burst_protection_active", False)
             ),
         }
+
+        # --- A1 shadow mode (kept apart from the policy fetch above) ---
+        # Routing gets only the request-metadata hints, as with no policy
+        # cache; the policy's context is stashed for route_query to replay.
+        # An empty or unavailable policy has nothing to replay.
+        if self._policy_cache_mode() == "shadow":
+            shadow_context = self._metadata_policy_context(
+                metadata_preferred_models,
+                metadata_avoid_models,
+                metadata_avoid_providers,
+            )
+            if policy:
+                shadow_context[SHADOW_POLICY_CONTEXT_KEY] = policy_context
+            return shadow_context
+        # --- end A1 shadow mode ---
+        return policy_context
+
+    def _policy_cache_mode(self) -> str:
+        """policy_cache.mode: enforce (the default) or shadow."""
+        mode = getattr(self.policy_cache, "mode", None)
+        if mode is None:
+            config = getattr(self.policy_cache, "config", None)
+            if isinstance(config, dict):
+                mode = config.get("mode")
+        return "shadow" if str(mode or "").strip().lower() == "shadow" else "enforce"
+
+    @staticmethod
+    def _metadata_policy_context(
+        preferred_models: List[str],
+        avoid_models: List[str],
+        avoid_providers: List[str],
+    ) -> Dict[str, Any]:
+        """The policy context from request metadata alone (no policy cache)."""
+        return {
+            "policy_source": "request_metadata" if preferred_models else "none",
+            "route_to_fast_lane": False,
+            "preferred_models": list(preferred_models),
+            "avoid_models": list(avoid_models),
+            "avoid_providers": list(avoid_providers),
+            "blocked_models": [],
+            "blocked_providers": [],
+            "warn_models": [],
+            "warn_providers": [],
+            "hint_reason": (
+                "preferred_models from request metadata" if preferred_models else None
+            ),
+        }
+
+    async def _shadow_selection(
+        self, context: Dict[str, Any], routed_model: str
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """(model, policy_source) the policy would have chosen, in shadow mode.
+
+        Runs the routing strategy again on the context with the stashed
+        policy applied. Any failure is logged and counted, never raised:
+        shadow mode must not change routing.
+        """
+        shadow_context = context.get(SHADOW_ROUTING_CONTEXT_KEY)
+        if not isinstance(shadow_context, dict):
+            return None, None
+        try:
+            selection = await self._run_shadow_strategy(shadow_context)
+        except Exception:
+            logger.warning("Shadow policy routing failed", exc_info=True)
+            ROUTER_METRICS.shadow_policy_decisions.labels(outcome="error").inc()
+            return None, None
+        if selection is None:
+            return None, None
+        ROUTER_METRICS.shadow_policy_decisions.labels(
+            outcome="agree" if selection.model_name == routed_model else "differ"
+        ).inc()
+        return selection.model_name, str(
+            shadow_context.get("policy_source", "none") or "none"
+        )
+
+    async def _run_shadow_strategy(
+        self, context: Dict[str, Any]
+    ) -> Optional[ModelSelection]:
+        """The routing strategy's choice for a shadow context.
+
+        Round-robin and weighted routing are stateful or random, so a second
+        run would not show what the policy changes; they get no shadow.
+        """
+        if self.routing_strategy == "intelligent":
+            return await self._intelligent_routing(context)
+        if self.routing_strategy in {"round_robin", "weighted"}:
+            return None
+        return self._fallback_routing(context)
 
     def _name_entries(
         self, value: Any, field_name: str, *, lowercase: bool = False

@@ -305,6 +305,14 @@ class RouterMetrics:
             ["outcome"],
         )
 
+        # policy_cache.mode shadow (A1): whether the policy would have chosen
+        # the routed model (agree, differ) or the shadow run failed (error)
+        self.shadow_policy_decisions = Counter(
+            "llm_router_shadow_policy_decisions_total",
+            "Shadow-mode policy selections compared with the routed model",
+            ["outcome"],
+        )
+
         # Paid models with no configured price (1 = unpriced; X8)
         self.unpriced_models = Gauge(
             "llm_router_unpriced_models",

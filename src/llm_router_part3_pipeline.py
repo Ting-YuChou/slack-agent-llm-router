@@ -300,6 +300,10 @@ def build_inference_completed_event(
         "actual_fast_lane_hit": actual_fast_lane_hit,
         "policy_source": policy_source,
         "hint_reason": hint_reason,
+        # A1 shadow mode: the model the policy cache would have chosen.
+        "shadow_selected_model": getattr(
+            routing_decision, "shadow_selected_model", None
+        ),
         "fallback_models": list(getattr(routing_decision, "fallback_models", []) or []),
         "fallback_from_model": getattr(inference_response, "fallback_from_model", None),
         "attempts": getattr(inference_response, "attempts", 1),
@@ -389,6 +393,10 @@ def build_routing_decision_event(
             getattr(routing_decision, "actual_fast_lane_hit", False)
         ),
         "fallback_models": list(getattr(routing_decision, "fallback_models", []) or []),
+        "shadow_selected_model": getattr(
+            routing_decision, "shadow_selected_model", None
+        ),
+        "shadow_policy_source": getattr(routing_decision, "shadow_policy_source", None),
         "candidates": [
             _routing_candidate_payload(candidate)
             for candidate in list(getattr(routing_decision, "candidates", []) or [])
@@ -682,6 +690,8 @@ class RoutingDecisionEntry:
     route_to_fast_lane: bool = False
     actual_fast_lane_hit: bool = False
     fallback_models: List[str] = field(default_factory=list)
+    shadow_selected_model: str = ""
+    shadow_policy_source: str = ""
     candidates_json: str = "[]"
     event_id: str = ""
     kafka_topic: str = ""
@@ -710,6 +720,8 @@ class RoutingDecisionEntry:
             "route_to_fast_lane": self.route_to_fast_lane,
             "actual_fast_lane_hit": self.actual_fast_lane_hit,
             "fallback_models": list(self.fallback_models),
+            "shadow_selected_model": self.shadow_selected_model,
+            "shadow_policy_source": self.shadow_policy_source,
             "candidates_json": self.candidates_json,
             "kafka_topic": self.kafka_topic,
             "kafka_partition": self.kafka_partition,
@@ -1463,6 +1475,8 @@ class ClickHouseManager:
             route_to_fast_lane Boolean,
             actual_fast_lane_hit Boolean,
             fallback_models Array(String),
+            shadow_selected_model String,
+            shadow_policy_source String,
             candidates_json String,
             kafka_topic String DEFAULT '',
             kafka_partition Int32 DEFAULT -1,
@@ -2806,6 +2820,8 @@ class KafkaConsumerManager:
             fallback_models=[
                 str(model) for model in list(data.get("fallback_models") or [])
             ],
+            shadow_selected_model=str(data.get("shadow_selected_model") or ""),
+            shadow_policy_source=str(data.get("shadow_policy_source") or ""),
             candidates_json=_json_text(
                 [
                     _routing_candidate_payload(candidate)

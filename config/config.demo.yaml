@@ -151,6 +151,10 @@ flink:
 
 policy_cache:
   enabled: false
+  # shadow (A1): routing ignores the Flink policy and records what it
+  # would have chosen (routing.decisions shadow_selected_model); switch
+  # to enforce once shadow and routed choices have been compared.
+  mode: shadow
 
 security:
   # With API key auth off there is no principal: /route keeps the caller's
