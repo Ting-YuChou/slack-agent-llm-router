@@ -1785,6 +1785,39 @@ class TestApiApp:
         attachment = inference.processed_requests[0].attachments[0]
         assert attachment.size_bytes == actual == len(attachment.content)
 
+    def test_route_rejects_an_attachment_with_empty_content(
+        self, tmp_path, patched_platform_deps
+    ):
+        platform = _admission_platform(tmp_path)
+        inference = platform.services["inference"]
+        admission = DummyAdmissionController()
+        platform.services["admission"] = admission
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/route",
+                json={
+                    "query": "hello",
+                    "user_id": "u1",
+                    "attachments": [
+                        {
+                            "name": "empty.txt",
+                            "type": "document",
+                            "size_bytes": 4,
+                            "mime_type": "text/plain",
+                            "content": "",
+                        }
+                    ],
+                },
+            )
+
+        # size_bytes must stay positive, so empty content cannot be accepted.
+        assert response.status_code == 422
+        assert response.json()["error"] == "invalid_attachment"
+        assert inference.processed_requests == []
+        assert admission.route_calls == []
+
     def test_route_accepts_a_large_url_only_attachment(
         self, tmp_path, patched_platform_deps
     ):

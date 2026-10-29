@@ -213,12 +213,20 @@ def normalize_external_attachments(request: Any, *, max_attachment_bytes: int) -
     only a declaration (JSON carries the content as text, so it may count
     characters or the original file size): when content is present it is
     replaced by the real length so downstream sees one consistent value.
+    Empty content is rejected (422), since size_bytes must stay positive.
     URL-only attachments carry no content and keep their declared size.
     """
     for index, attachment in enumerate(getattr(request, "attachments", None) or []):
         content = getattr(attachment, "content", None)
         if content is None:
             continue
+        if not content:
+            # Attachment.size_bytes must be positive; there is nothing to send.
+            raise AttachmentRejected(
+                status_code=422,
+                error="invalid_attachment",
+                message=f"Attachment {index} has empty content",
+            )
         if len(content) > max_attachment_bytes:
             raise AttachmentRejected(
                 status_code=413,
