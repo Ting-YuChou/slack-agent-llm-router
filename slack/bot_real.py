@@ -4221,8 +4221,17 @@ class SlackBot:
                     "5 minutes, the burst limit for your tier."
                 )
                 retry_at = burst_retry_at
-        if reason is None:
-            summary = f"You've reached a {kind} limit. Try again in a few minutes."
+        if hourly_limit <= 0 or burst_limit <= 0:
+            # check_rate_limit refuses every request against a zero limit.
+            summary = (
+                f"The {user_tier.value.title()} tier doesn't allow {kind}s. "
+                "Ask an admin if you need access."
+            )
+        elif reason is None:
+            article = "an" if agent else "a"
+            summary = (
+                f"You've reached {article} {kind} limit. Try again in a few minutes."
+            )
         else:
             summary = f"{reason} Try again in {_format_wait(retry_at - now)}."
 

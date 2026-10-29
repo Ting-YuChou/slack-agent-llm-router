@@ -397,6 +397,21 @@ async def test_an_agent_limit_notice_counts_agent_requests(clock):
     assert "Try again in 5 minutes." in text
     # The chat bucket is empty: its notice cannot name a window.
     assert "You've reached a chat request limit." in bot._build_rate_limit_message("U1")
+    assert "You've reached an Agent request limit." in bot._build_rate_limit_message(
+        "U2", agent=True
+    )
+
+
+@pytest.mark.parametrize("limit", ["requests_per_hour", "burst_requests"])
+@pytest.mark.parametrize("agent,kind", [(False, "chat"), (True, "Agent")])
+def test_a_tier_with_a_zero_limit_is_told_it_allows_none(limit, agent, kind):
+    bot = chat_bot(rate_limiting={"by_tier": {"free": {limit: 0}}})
+    assert not bot._within_rate_limit("U1", agent=agent)
+
+    text = bot._build_rate_limit_message("U1", agent=agent)
+
+    assert f"The Free tier doesn't allow {kind} requests." in text
+    assert "Try again" not in text
 
 
 @pytest.mark.asyncio
