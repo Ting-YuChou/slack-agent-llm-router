@@ -4,6 +4,8 @@ Implements intelligent routing logic for multi-model deployment
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
@@ -36,6 +38,27 @@ CLASSIFIER_TAIL_CHARS = 2000
 # crosses dots in "utils.py" or "3.12"), but it spans at most 80 chars, so the
 # classifier patterns cannot backtrack catastrophically on long input.
 _GAP = r"[^\n]{0,80}"
+# Prompts longer than this are tokenized in a worker thread (about 3 ms of
+# tiktoken per 20k chars), so routing does not stall the event loop.
+THREADED_TOKENIZE_CHARS = 20_000
+# Metadata the vision reroute writes between routing calls; no prompt reads it.
+ROUTING_BOOKKEEPING_METADATA = frozenset(
+    {"rag_vision_fallback_models", "rag_text_fallback_models", "rag_original_model"}
+)
+
+
+def _copy_policy_context(context: Dict[str, Any]) -> Dict[str, Any]:
+    """A copy whose lists and dicts the caller may change."""
+    return {
+        key: (
+            list(value)
+            if isinstance(value, list)
+            else dict(value)
+            if isinstance(value, dict)
+            else value
+        )
+        for key, value in context.items()
+    }
 
 
 # Routing rejections. The router raises these instead of upgrading a user to a
@@ -969,12 +992,10 @@ class ModelRouter:
     async def _build_query_context(self, request: QueryRequest) -> Dict[str, Any]:
         """Build comprehensive context for routing decisions"""
         # Classify query type
-        query_type, classification_confidence = self.classifier.classify_query(
-            request.query
-        )
+        query_type, classification_confidence = self._classify_request(request)
 
         # Count the approximate provider prompt, not just the user query.
-        token_count = self._estimate_request_token_count(request)
+        token_count = await self._request_token_count(request)
         metadata = request.metadata or {}
         web_search_allowed = self._web_search_allowed(request)
         needs_web_search = self._request_needs_web_search(
@@ -1017,7 +1038,7 @@ class ModelRouter:
         }
         context.update(routing_features)
 
-        policy_context = await self._get_policy_context(request)
+        policy_context = await self._request_policy_context(request)
         context.update(policy_context)
         self._restore_current_request_features(context, routing_features)
         context["policy_source"] = self._combine_policy_sources(
@@ -1026,6 +1047,140 @@ class ModelRouter:
         )
 
         return context
+
+    # R9: one request is routed several times (route_query, the vision
+    # candidates, the re-check after enrichment, admission). The costly parts
+    # are memoized on the request, keyed by the inputs each depends on, so a
+    # changed query or an enriched prompt is recomputed and nothing else is.
+
+    def _routing_memo(self, request: QueryRequest) -> Optional[Dict[Any, Any]]:
+        memo = getattr(request, "_routing_memo", None)
+        return memo if isinstance(memo, dict) else None
+
+    def _classify_request(self, request: QueryRequest) -> Tuple[QueryType, float]:
+        memo = self._routing_memo(request)
+        key = (id(self), "classification", request.query)
+        if memo is not None and key in memo:
+            return memo[key]
+        result = self.classifier.classify_query(request.query)
+        if memo is not None:
+            memo[key] = result
+        return result
+
+    def _prompt_fingerprint(self, request: QueryRequest) -> Optional[str]:
+        """A digest of the inputs the routing prompt estimate reads."""
+        metadata = {
+            key: value
+            for key, value in (request.metadata or {}).items()
+            if key not in ROUTING_BOOKKEEPING_METADATA
+        }
+        attachments = [
+            (
+                getattr(attachment, "id", None),
+                getattr(attachment, "name", None),
+                getattr(attachment, "mime_type", None),
+                getattr(attachment, "size_bytes", None),
+                len(getattr(attachment, "content", None) or b""),
+            )
+            for attachment in (request.attachments or [])
+        ]
+        try:
+            payload = json.dumps(
+                [request.query, request.context, metadata, attachments],
+                sort_keys=True,
+                default=str,
+            )
+        except (TypeError, ValueError):
+            return None  # Not memoized: counted every time, as before.
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _token_memo_key(
+        self, request: QueryRequest, model: Optional[str]
+    ) -> Optional[Tuple[Any, ...]]:
+        fingerprint = self._prompt_fingerprint(request)
+        if fingerprint is None:
+            return None
+        encoding = self.token_counter.encoding_name(model or "default")
+        return (id(self), "tokens", encoding, fingerprint)
+
+    def _count_request_tokens(self, request: QueryRequest, model: Optional[str]) -> int:
+        default_encoding = self.token_counter.encoding_name("default")
+        if model is None or self.token_counter.encoding_name(model) == default_encoding:
+            return self._estimate_request_token_count(request)
+        return self._estimate_request_token_count(request, model)
+
+    @staticmethod
+    def _prompt_chars(request: QueryRequest) -> int:
+        metadata_chars = sum(
+            len(value)
+            for value in (request.metadata or {}).values()
+            if isinstance(value, str)
+        )
+        return len(request.query) + len(request.context or "") + metadata_chars
+
+    async def _request_token_count(
+        self, request: QueryRequest, model: Optional[str] = None
+    ) -> int:
+        """The memoized prompt estimate; long prompts tokenize off the loop."""
+        memo = self._routing_memo(request)
+        key = self._token_memo_key(request, model)
+        if memo is not None and key is not None and key in memo:
+            return memo[key]
+        if self._prompt_chars(request) > THREADED_TOKENIZE_CHARS:
+            count = await asyncio.to_thread(self._count_request_tokens, request, model)
+        else:
+            count = self._count_request_tokens(request, model)
+        if memo is not None and key is not None:
+            memo[key] = count
+        return count
+
+    def request_token_count(
+        self, request: QueryRequest, model: Optional[str] = None
+    ) -> int:
+        """The prompt estimate for a model, memoized like routing's (sync)."""
+        memo = self._routing_memo(request)
+        key = self._token_memo_key(request, model)
+        if memo is not None and key is not None and key in memo:
+            return memo[key]
+        count = self._count_request_tokens(request, model)
+        if memo is not None and key is not None:
+            memo[key] = count
+        return count
+
+    async def _request_policy_context(self, request: QueryRequest) -> Dict[str, Any]:
+        """The policy context, read once per request for routing.
+
+        Fallback selection calls _get_policy_context directly, so a model
+        blocked since routing is still seen.
+        """
+        memo = self._routing_memo(request)
+        metadata = request.metadata or {}
+        try:
+            hints = json.dumps(
+                [
+                    metadata.get(key)
+                    for key in ("preferred_models", "avoid_models", "avoid_providers")
+                ],
+                sort_keys=True,
+                default=str,
+            )
+        except (TypeError, ValueError):
+            memo = None
+            hints = ""
+        key = (
+            id(self),
+            "policy",
+            request.request_id,
+            request.user_id,
+            request.session_id,
+            hints,
+        )
+        if memo is not None and key in memo:
+            return _copy_policy_context(memo[key])
+        policy_context = await self._get_policy_context(request)
+        if memo is not None:
+            memo[key] = _copy_policy_context(policy_context)
+        return policy_context
 
     def _build_routing_feature_payload(
         self, *, request: QueryRequest, query_type: str, token_count: int

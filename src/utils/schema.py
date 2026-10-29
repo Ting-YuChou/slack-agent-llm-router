@@ -164,6 +164,10 @@ class QueryRequest(BaseModel):
     conversation_id: Optional[str] = Field(None, max_length=256)
     metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
+    # The router's per-request work (classification, token counts, policy),
+    # keyed by the inputs each depends on, so routing it again is cheap.
+    _routing_memo: Dict[Any, Any] = PrivateAttr(default_factory=dict)
+
     @field_validator("query")
     @classmethod
     def validate_query(cls, v: str) -> str:

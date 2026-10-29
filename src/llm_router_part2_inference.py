@@ -4248,8 +4248,11 @@ class InferenceEngine:
         estimator = getattr(self.router, "_estimate_request_token_count", None)
         if estimator is not None:
             try:
-                if model_name and isinstance(self.router, ModelRouter):
-                    return max(0, int(estimator(request, model_name)))
+                if isinstance(self.router, ModelRouter):
+                    # Memoized: routing usually counted this prompt already.
+                    return max(
+                        0, int(self.router.request_token_count(request, model_name))
+                    )
                 return max(0, int(estimator(request)))
             except Exception:
                 logger.debug("Provider admission token estimator failed", exc_info=True)
