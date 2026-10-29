@@ -19,6 +19,18 @@ x-router-app: &router-app
     - ./config:/app/config:ro
   restart: unless-stopped
 
+# Durable Flink state: RocksDB with checkpoints on the flink_checkpoints volume,
+# retained on cancel so the flink-jobs submitter can resume from them.
+x-flink-properties: &flink-properties |
+  jobmanager.rpc.address: flink-jobmanager
+  taskmanager.numberOfTaskSlots: 4
+  state.backend.type: rocksdb
+  state.backend.incremental: true
+  state.checkpoints.dir: file:///opt/flink/checkpoints
+  state.savepoints.dir: file:///opt/flink/checkpoints/savepoints
+  execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+  execution.checkpointing.num-retained: 3
+
 services:
   redis:
     image: redis:7.4-alpine
@@ -169,14 +181,22 @@ services:
     environment:
       JOB_MANAGER_RPC_ADDRESS: flink-jobmanager
       PYTHONPATH: /workspace
+      FLINK_PROPERTIES: *flink-properties
     volumes:
       - ./flink:/workspace/flink:ro
       - ./src:/workspace/src:ro
+      - flink_checkpoints:/opt/flink/checkpoints
     depends_on:
       kafka:
         condition: service_healthy
       chat-topics:
         condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/overview >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
 
   flink-taskmanager:
     build:
@@ -187,15 +207,43 @@ services:
     environment:
       JOB_MANAGER_RPC_ADDRESS: flink-jobmanager
       PYTHONPATH: /workspace
+      FLINK_PROPERTIES: *flink-properties
     volumes:
       - ./flink:/workspace/flink:ro
       - ./src:/workspace/src:ro
+      - flink_checkpoints:/opt/flink/checkpoints
     depends_on:
       flink-jobmanager:
         condition: service_started
+    restart: unless-stopped
+
+  # Submits the Flink jobs, each resumed from its latest retained checkpoint,
+  # and resubmits them if the JobManager restarts without them.
+  flink-jobs:
+    build:
+      context: .
+      dockerfile: docker/flink/Dockerfile
+    container_name: slack-llm-router-flink-jobs
+    command: ["python3", "/workspace/flink/submitter.py", "--config", "/workspace/config/config.compose.yaml", "--jobmanager", "flink-jobmanager:8081", "--watch"]
+    environment:
+      PYTHONPATH: /workspace
+      FLINK_JOB_PARALLELISM: "1"
+      FLINK_PROPERTIES: *flink-properties
+    volumes:
+      - ./flink:/workspace/flink:ro
+      - ./src:/workspace/src:ro
+      - ./config:/workspace/config:ro
+      - flink_checkpoints:/opt/flink/checkpoints
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+      chat-topics:
+        condition: service_completed_successfully
+    restart: unless-stopped
 
 volumes:
   redis_data:
   redis_stack_data:
   clickhouse_data:
   kafka_data:
+  flink_checkpoints:

@@ -25,3 +25,7 @@ RUN apt-get update \
     && ln -sfn "${JAVA_INCLUDE_DIR}/linux" /opt/java/openjdk/include/linux \
     && pip3 install --no-cache-dir apache-flink==1.20.0 \
     && rm -rf /var/lib/apt/lists/*
+
+# Named volumes copy this ownership, so the flink user can write checkpoints.
+RUN mkdir -p /opt/flink/checkpoints/savepoints \
+    && chown -R flink:flink /opt/flink/checkpoints

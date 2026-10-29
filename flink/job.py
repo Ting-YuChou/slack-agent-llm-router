@@ -88,8 +88,20 @@ class FastLaneHintFilter(FilterFunction):
 def create_flink_job(config: Dict[str, Any]):
     """Create and configure the Flink enrichment job."""
     env = StreamExecutionEnvironment.get_execution_environment()
-    env.set_parallelism(config.get("parallelism", 4))
-    env.enable_checkpointing(config.get("checkpoint_interval_ms", 60000))
+    flink_section = (
+        config.get("flink", {}) if isinstance(config.get("flink"), dict) else {}
+    )
+    env.set_parallelism(
+        int(config.get("parallelism", flink_section.get("parallelism", 4)))
+    )
+    env.enable_checkpointing(
+        int(
+            config.get(
+                "checkpoint_interval_ms",
+                flink_section.get("checkpointing_interval_ms", 60000),
+            )
+        )
+    )
 
     kafka_topics = config.get("kafka", {}).get("topics", {})
     kafka_props = {
@@ -123,11 +135,14 @@ def create_flink_job(config: Dict[str, Any]):
         producer_config=kafka_props,
     )
 
-    request_stream = env.add_source(request_consumer, "Kafka Requests Raw Source")
+    # Stable uids keep savepoints and retained checkpoints restorable.
+    request_stream = env.add_source(request_consumer, "Kafka Requests Raw Source").uid(
+        "requests-raw-source"
+    )
     mapped_stream = request_stream.map(
         QueryEnrichmentMapper(),
         output_type=Types.PICKLED_BYTE_ARRAY(),
-    )
+    ).uid("request-enrichment-mapper")
 
     alerts_stream = mapped_stream.filter(EventTypeFilter(ALERT_EVENT))
     enriched_stream = mapped_stream.filter(EventTypeFilter(REQUESTS_ENRICHED_EVENT))
@@ -138,14 +153,18 @@ def create_flink_job(config: Dict[str, Any]):
 
     enriched_stream.map(
         lambda event: serialize_event(event), output_type=Types.STRING()
-    ).add_sink(enriched_producer).name("Requests Enriched Sink")
+    ).add_sink(enriched_producer).name("Requests Enriched Sink").uid(
+        "requests-enriched-sink"
+    )
     fast_lane_stream.map(
         lambda event: serialize_event(event),
         output_type=Types.STRING(),
-    ).add_sink(fast_lane_producer).name("Fast Lane Hint Sink")
+    ).add_sink(fast_lane_producer).name("Fast Lane Hint Sink").uid(
+        "fast-lane-hints-sink"
+    )
     alerts_stream.map(
         lambda event: serialize_event(event), output_type=Types.STRING()
-    ).add_sink(alert_producer).name("Alerts Sink")
+    ).add_sink(alert_producer).name("Alerts Sink").uid("request-alerts-sink")
 
     return env
 
