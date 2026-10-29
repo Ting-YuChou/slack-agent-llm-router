@@ -96,6 +96,7 @@ slack:
   response_settings:
     max_response_length: 3900
     typing_indicator: true
+    answer_footer: true
     thread_replies: true
   rate_limiting:
     requests_per_hour: 100

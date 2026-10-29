@@ -586,6 +586,41 @@ def _split_fenced_text(text: str, limit: int) -> List[str]:
 
 
 SLACK_RATE_LIMIT_RETRIES = 2
+# Slack's limit on the text of one `markdown` block.
+SLACK_MARKDOWN_BLOCK_CHARS = 12000
+
+
+class SlackAnswer(str):
+    """A model's answer text, carrying what the Slack footer shows about it."""
+
+    model_name: Optional[str]
+    latency_ms: Optional[float]
+    cached: bool
+
+    def __new__(
+        cls,
+        text: str,
+        *,
+        model_name: Optional[str] = None,
+        latency_ms: Optional[float] = None,
+        cached: bool = False,
+    ) -> "SlackAnswer":
+        answer = super().__new__(cls, text)
+        answer.model_name = model_name
+        answer.latency_ms = latency_ms
+        answer.cached = cached
+        return answer
+
+    def footer(self) -> Optional[str]:
+        """`model · 1.2 s · cached`; never the cost."""
+        fields = []
+        if self.model_name and self.model_name != "unknown":
+            fields.append(self.model_name)
+        if self.latency_ms is not None and self.latency_ms >= 0:
+            fields.append(f"{self.latency_ms / 1000:.1f} s")
+        if self.cached:
+            fields.append("cached")
+        return " · ".join(fields) or None
 
 
 def _add_rate_limit_retry(client: Any) -> None:
@@ -3272,18 +3307,29 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         if response_text is None:
             response_text = getattr(response, "response_text", "") or ""
         sources = list(getattr(response, "sources", []) or [])
-        if not sources:
-            return response_text
-
-        lines = [response_text.rstrip(), "", "Sources:"]
-        for source in sources[:5]:
-            title = getattr(source, "title", "") or getattr(source, "url", "")
-            url = getattr(source, "url", "")
-            rank = getattr(source, "rank", len(lines))
-            if not url:
-                continue
-            lines.append(f"[{rank}] {title} - {url}")
-        return "\n".join(lines).strip()
+        if sources:
+            lines = [response_text.rstrip(), "", "Sources:"]
+            for source in sources[:5]:
+                title = getattr(source, "title", "") or getattr(source, "url", "")
+                url = getattr(source, "url", "")
+                rank = getattr(source, "rank", len(lines))
+                if not url:
+                    continue
+                lines.append(f"[{rank}] {title} - {url}")
+            response_text = "\n".join(lines).strip()
+        model_name = getattr(response, "model_name", None)
+        latency_ms = getattr(response, "latency_ms", None)
+        return SlackAnswer(
+            response_text,
+            model_name=model_name if isinstance(model_name, str) else None,
+            latency_ms=(
+                float(latency_ms)
+                if isinstance(latency_ms, (int, float))
+                and not isinstance(latency_ms, bool)
+                else None
+            ),
+            cached=getattr(response, "cached", False) is True,
+        )
 
     def _get_max_tokens_for_user(
         self, user_tier: UserTier, preferences: Dict[str, Any]
@@ -4016,9 +4062,14 @@ class SlackBot:
                     else [response_text]
                 )
                 for index, response_part in enumerate(responses):
+                    message = self._answer_message(
+                        response_part,
+                        response_text,
+                        last=index == len(responses) - 1,
+                    )
                     if index == 0 and placeholder_ts:
                         replaced = await self._replace_placeholder(
-                            channel_id, placeholder_ts, text=response_part
+                            channel_id, placeholder_ts, **message
                         )
                         # The answer owns the placeholder now: a later
                         # failure must not overwrite it with the error.
@@ -4027,8 +4078,8 @@ class SlackBot:
                             continue
                     await self.web_client.chat_postMessage(
                         channel=channel_id,
-                        text=response_part,
                         thread_ts=thread_ts,
+                        **message,
                     )
 
                 if thread_ts:
@@ -4074,6 +4125,33 @@ class SlackBot:
                 text=error_text,
                 thread_ts=event.get("thread_ts") or event.get("ts"),
             )
+
+    def _answer_message(self, part: str, answer: str, *, last: bool) -> Dict[str, Any]:
+        """The message fields for one part of a reply.
+
+        A model's answer renders as a Markdown block, with the plain text
+        kept as the notification fallback, and its last part carries the
+        footer. Command replies and errors stay plain text.
+        """
+        message: Dict[str, Any] = {"text": part}
+        if (
+            not isinstance(answer, SlackAnswer)
+            or len(part) > SLACK_MARKDOWN_BLOCK_CHARS
+        ):
+            return message
+        blocks: List[Dict[str, Any]] = [{"type": "markdown", "text": part}]
+        footer = answer.footer() if last else None
+        if footer and self.config.get("response_settings", {}).get(
+            "answer_footer", True
+        ):
+            blocks.append(
+                {
+                    "type": "context",
+                    "elements": [{"type": "plain_text", "text": footer}],
+                }
+            )
+        message["blocks"] = blocks
+        return message
 
     def _typing_indicator_enabled(self) -> bool:
         return bool(

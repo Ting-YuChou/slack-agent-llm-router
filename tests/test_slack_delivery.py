@@ -424,3 +424,117 @@ async def test_real_client_retries_a_429_and_posts_once(monkeypatch):
     assert response["ok"] is True
     assert len(received) == 2
     assert received[0]["text"] == received[1]["text"] == "hello"
+
+
+# S10: Markdown blocks and the answer footer
+
+
+def _blocks_of_type(message, block_type):
+    return [block for block in message.get("blocks", []) if block["type"] == block_type]
+
+
+@pytest.mark.asyncio
+async def test_answer_is_a_markdown_block_with_a_text_fallback(
+    inference_response_factory,
+):
+    answer = "**Bold** and a [link](https://example.com)\n\n| a | b |\n|---|---|"
+    bot = delivery_bot(answering(inference_response_factory, answer), chat_update=False)
+
+    await bot._process_message(top_level())
+
+    message = bot.web_client.chat_postMessage.await_args.kwargs
+    assert message["text"] == answer
+    assert message["blocks"][0] == {"type": "markdown", "text": answer}
+
+
+@pytest.mark.asyncio
+async def test_last_part_carries_a_footer_with_model_latency_and_cache(
+    inference_response_factory,
+):
+    answer = "\n".join(f"line {index} " + "x" * 40 for index in range(20))
+    bot = delivery_bot(
+        answering(
+            inference_response_factory,
+            answer,
+            model_name="claude-sonnet-4-6",
+            latency_ms=1234,
+            cached=True,
+            cost_usd=0.0004,
+        ),
+        response_settings={"max_response_length": 300},
+    )
+
+    await bot._process_message(top_level())
+
+    first = bot.web_client.chat_update.await_args.kwargs
+    later = [call.kwargs for call in bot.web_client.chat_postMessage.await_args_list][
+        1:
+    ]
+    parts = [first, *later]
+    assert all(part["blocks"][0]["type"] == "markdown" for part in parts)
+    assert all(part["blocks"][0]["text"] == part["text"] for part in parts)
+    assert all(not _blocks_of_type(part, "context") for part in parts[:-1])
+    (footer,) = _blocks_of_type(parts[-1], "context")
+    footer_text = footer["elements"][0]["text"]
+    assert footer_text == "claude-sonnet-4-6 · 1.2 s · cached"
+    assert "$" not in footer_text
+    assert all("claude-sonnet-4-6" not in part["text"] for part in parts)
+
+
+@pytest.mark.asyncio
+async def test_footer_says_nothing_about_cache_for_a_fresh_answer(
+    inference_response_factory,
+):
+    bot = delivery_bot(answering(inference_response_factory, "four"))
+
+    await bot._process_message(top_level())
+
+    update = bot.web_client.chat_update.await_args.kwargs
+    assert update["text"] == "four"
+    (footer,) = _blocks_of_type(update, "context")
+    assert footer["elements"][0]["text"] == "gpt-5 · 0.1 s"
+
+
+@pytest.mark.asyncio
+async def test_footer_can_be_turned_off(inference_response_factory):
+    bot = delivery_bot(
+        answering(inference_response_factory, "four"),
+        response_settings={"answer_footer": False},
+    )
+
+    await bot._process_message(top_level())
+
+    update = bot.web_client.chat_update.await_args.kwargs
+    assert update["blocks"] == [{"type": "markdown", "text": "four"}]
+
+
+@pytest.mark.asyncio
+async def test_command_replies_and_errors_stay_plain_text(
+    inference_response_factory, monkeypatch
+):
+    bot = delivery_bot(
+        AsyncMock(
+            return_value=inference_response_factory(
+                response_text="", error="boom", error_type="provider_error"
+            )
+        ),
+        chat_update=False,
+    )
+
+    await bot._process_message(top_level())
+    error_reply = bot.web_client.chat_postMessage.await_args.kwargs
+    monkeypatch.setattr(
+        bot.message_handler, "handle_message", AsyncMock(return_value="help text")
+    )
+    await bot._process_message(top_level(ts="101.0", text="!llm help"))
+    help_reply = bot.web_client.chat_postMessage.await_args.kwargs
+
+    assert "blocks" not in error_reply
+    assert help_reply == {"channel": "C1", "text": "help text", "thread_ts": "101.0"}
+
+
+def test_schema_accepts_the_footer_setting():
+    from src.utils.schema import SlackResponseSettingsConfig
+
+    assert SlackResponseSettingsConfig().answer_footer is True
+    assert SlackResponseSettingsConfig(answer_footer=False).answer_footer is False
