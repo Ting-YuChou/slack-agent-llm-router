@@ -410,6 +410,41 @@ class TestPolicyReads:
         assert cache._cache_key("request", "r1") in read_keys
 
     @pytest.mark.asyncio
+    async def test_guardrail_written_by_another_replica_is_visible_at_once(self):
+        cache = _redis_policy_cache()
+        redis = cache.redis_client
+        await cache.get_effective_policy("r1", "u1")
+
+        # Another API replica's materializer writes Redis, not this L1.
+        redis.sets[cache._guardrail_index_key("model")] = {"gpt-5"}
+        redis.store[cache._guardrail_cache_key("model", "gpt-5")] = json.dumps(
+            {"guardrail_action": "avoid", "description": "error spike"}
+        )
+        redis.round_trips = 0
+        policy = await cache.get_effective_policy("r2", "u1")
+
+        assert policy["blocked_models"] == ["gpt-5"]
+        # The indexes ride in the same pipeline; only the new payload adds one.
+        assert redis.round_trips <= 2
+
+    @pytest.mark.asyncio
+    async def test_guardrail_lifted_by_another_replica_is_gone_at_once(self):
+        cache = _redis_policy_cache()
+        redis = cache.redis_client
+        redis.sets[cache._guardrail_index_key("model")] = {"gpt-5"}
+        redis.store[cache._guardrail_cache_key("model", "gpt-5")] = json.dumps(
+            {"guardrail_action": "avoid"}
+        )
+        assert (await cache.get_effective_policy("r1", "u1"))["blocked_models"] == [
+            "gpt-5"
+        ]
+
+        redis.sets[cache._guardrail_index_key("model")] = set()
+        policy = await cache.get_effective_policy("r2", "u1")
+
+        assert policy["blocked_models"] == []
+
+    @pytest.mark.asyncio
     async def test_materialized_guardrail_is_visible_immediately(self):
         cache = _redis_policy_cache()
         await cache.get_effective_policy("r1", "u1")

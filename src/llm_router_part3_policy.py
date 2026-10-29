@@ -128,11 +128,7 @@ class RoutingPolicyCache:
             return False, None
 
         value = record["value"]
-        if isinstance(value, dict):
-            return True, dict(value)
-        if isinstance(value, list):
-            return True, list(value)
-        return True, value
+        return True, dict(value) if isinstance(value, dict) else None
 
     def _local_get(self, cache_key: str) -> Optional[Dict[str, Any]]:
         _hit, value = self._local_lookup(cache_key)
@@ -142,7 +138,7 @@ class RoutingPolicyCache:
         self._local_store(cache_key, dict(value), ttl_seconds)
 
     def _local_store(self, cache_key: str, value: Any, ttl_seconds: int):
-        """Store any L1 value: a record, None for an absence, or index members."""
+        """Store an L1 value: a record, or None for a cached absence."""
         ttl_seconds = max(1, ttl_seconds)
         self._local_cache.set(
             cache_key,
@@ -187,9 +183,11 @@ class RoutingPolicyCache:
     ) -> Tuple[Dict[str, Optional[Dict[str, Any]]], Dict[str, List[str]]]:
         """Read policy records and guardrail index members in one round trip.
 
-        L1 hits, absences included, are not read again. Returns the records by
-        key and the guardrail index members by scope type. Without Redis the
-        records come from L1 and the members from the local guardrail index.
+        Records in L1, absences included, are not read again. The guardrail
+        indexes are read from Redis every time, so a guardrail another replica
+        sets or lifts applies at once. Returns the records by key and the
+        index members by scope type. Without Redis the records come from L1
+        and the members from the local guardrail index.
         """
         records: Dict[str, Optional[Dict[str, Any]]] = {}
         members: Dict[str, List[str]] = {}
@@ -209,43 +207,30 @@ class RoutingPolicyCache:
                 records[cache_key] = value if isinstance(value, dict) else None
             else:
                 pending_keys.append(cache_key)
-        pending_scopes = []
-        for scope_type in scope_types:
-            hit, value = self._local_lookup(self._guardrail_index_key(scope_type))
-            if hit:
-                members[scope_type] = list(value or [])
-            else:
-                pending_scopes.append(scope_type)
-        if not pending_keys and not pending_scopes:
+        if not pending_keys and not scope_types:
             return records, members
 
         try:
             pipeline = self.redis_client.pipeline(transaction=False)
             for cache_key in pending_keys:
                 pipeline.get(cache_key)
-            for scope_type in pending_scopes:
+            for scope_type in scope_types:
                 pipeline.smembers(self._guardrail_index_key(scope_type))
             results = list(await pipeline.execute())
         except Exception as e:
             logger.warning(f"Failed to read routing policy cache: {e}")
             for cache_key in pending_keys:
                 records[cache_key] = None
-            for scope_type in pending_scopes:
+            for scope_type in scope_types:
                 members[scope_type] = []
             return records, members
 
         for cache_key, payload in zip(pending_keys, results):
             records[cache_key] = self._decode_record(cache_key, payload)
-        for scope_type, scope_members in zip(
-            pending_scopes, results[len(pending_keys) :]
-        ):
-            names = sorted(str(member) for member in (scope_members or []))
-            self._local_store(
-                self._guardrail_index_key(scope_type),
-                names,
-                self.local_cache_ttl_seconds,
+        for scope_type, scope_members in zip(scope_types, results[len(pending_keys) :]):
+            members[scope_type] = sorted(
+                str(member) for member in (scope_members or [])
             )
-            members[scope_type] = names
         return records, members
 
     async def _set_json(self, cache_key: str, value: Dict[str, Any], ttl_seconds: int):
@@ -583,8 +568,6 @@ class RoutingPolicyCache:
             raise
 
         self._local_set(cache_key, payload, self.guardrail_ttl_seconds)
-        # The cached index would hide the new member until its L1 TTL ends.
-        self._local_cache.pop(index_key, None)
 
     async def get_active_guardrails(self) -> Dict[str, Any]:
         """Return active model/provider guardrails for router candidate filtering."""
@@ -694,7 +677,7 @@ class RoutingPolicyCache:
         return active
 
     async def _prune_expired_guardrails(self, expired: List[Tuple[str, str]]) -> None:
-        """Drop index members whose payload expired, in Redis and in L1."""
+        """Drop index members whose payload expired from the Redis index."""
         try:
             pipeline = self.redis_client.pipeline(transaction=False)
             for scope_type, scope_key in expired:
@@ -702,17 +685,6 @@ class RoutingPolicyCache:
             await pipeline.execute()
         except Exception as e:
             logger.warning(f"Failed to prune expired routing guardrails: {e}")
-        for scope_type in {scope_type for scope_type, _ in expired}:
-            index_key = self._guardrail_index_key(scope_type)
-            hit, names = self._local_lookup(index_key)
-            if not hit:
-                continue
-            gone = {key for scope, key in expired if scope == scope_type}
-            self._local_store(
-                index_key,
-                [name for name in (names or []) if name not in gone],
-                self.local_cache_ttl_seconds,
-            )
 
     async def shutdown(self):
         """Shutdown the shared policy cache."""
