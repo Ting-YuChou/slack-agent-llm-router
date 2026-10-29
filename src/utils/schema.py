@@ -124,7 +124,16 @@ class QueryRequest(BaseModel):
     context: Optional[str] = Field(None, max_length=100000)
     max_tokens: int = Field(512, ge=1, le=8192)
     temperature: float = Field(0.7, ge=0.0, le=2.0)
-    priority: int = Field(1, ge=1, le=5)
+    priority: int = Field(
+        1,
+        ge=1,
+        le=5,
+        description=(
+            "Request urgency: 1 = normal ... 5 = urgent; higher is served first. "
+            "Priority >= 4 also selects the low-latency lane. User tier is "
+            "ranked separately, so do not derive this from it."
+        ),
+    )
 
     # File handling
     attachments: List[Attachment] = Field(default_factory=list)

@@ -2349,6 +2349,34 @@ class TestSlackBot:
         assert bot.user_manager.get_user_tier("U1") == UserTier.PREMIUM
 
     @pytest.mark.asyncio
+    async def test_premium_slack_queries_queue_ahead_of_free_ones(
+        self, inference_response_factory
+    ):
+        from src.provider_scheduler import ProviderCapacityScheduler
+
+        inference_engine = SimpleNamespace(
+            process_query=AsyncMock(return_value=inference_response_factory())
+        )
+        bot = SlackBot(
+            {"channels": [], "user_tiers": {"overrides": {"UP": "premium"}}},
+            inference_engine=inference_engine,
+        )
+        bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+        bot.user_manager.check_rate_limit = lambda *_args, **_kwargs: True
+
+        sent = {}
+        for user_id in ("UF", "UP"):
+            await bot._process_message(
+                {"channel": "C1", "user": user_id, "text": "hello", "ts": "1700.1"}
+            )
+            sent[user_id] = inference_engine.process_query.await_args.args[0]
+
+        assert sent["UF"].user_tier == UserTier.FREE
+        assert sent["UP"].user_tier == UserTier.PREMIUM
+        scheduler = ProviderCapacityScheduler({}, None)
+        assert scheduler._queue_score(sent["UP"]) < scheduler._queue_score(sent["UF"])
+
+    @pytest.mark.asyncio
     async def test_user_stats_report_what_is_left_of_the_chat_bucket(self):
         bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
         config = bot._get_rate_limit_config_for_user("U1")

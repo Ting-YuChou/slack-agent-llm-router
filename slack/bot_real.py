@@ -2882,7 +2882,6 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 context=request_context,
                 max_tokens=self._get_max_tokens_for_user(user_tier, user_prefs),
                 temperature=0.7,
-                priority=1 if user_tier != UserTier.FREE else 3,
                 attachments=attachments or [],
                 tool_policy=tool_policy,
                 allowed_tools=allowed_tools or [],
