@@ -242,7 +242,9 @@ async def test_hung_primary_leaves_time_for_fallback_within_deadline():
         # The attempt had its whole provider timeout: a real hang.
         pytest.param(0.05, 1, id="full-provider-timeout"),
         # The reserve left a sliver of a 60 s timeout: says nothing about it.
-        pytest.param(60, 0, id="window-cut-by-reserve"),
+        # A timeout far beyond the deadline (vLLM's 300 s against 60 s): the
+        # hang used every second the request could give it.
+        pytest.param(60, 1, id="provider-timeout-beyond-deadline"),
     ],
 )
 async def test_hung_primary_counts_against_its_circuit_only_with_a_long_window(
@@ -384,26 +386,41 @@ async def test_cancelled_call_is_not_a_circuit_failure(deadline_passed):
 
 
 @pytest.mark.asyncio
-async def test_timeout_of_a_window_cut_by_the_deadline_is_not_a_circuit_failure():
+@pytest.mark.parametrize(
+    ("spent_share", "expected_failures"),
+    [
+        # A 300 s timeout against a 60 s deadline, scaled down: the hang had
+        # the whole deadline, the longest window any attempt could get.
+        pytest.param(0.0, 1, id="whole-deadline"),
+        # Earlier steps spent 70% of the deadline: the 30% left is a sliver.
+        pytest.param(0.7, 0, id="deadline-mostly-spent"),
+    ],
+)
+async def test_timeout_counts_against_the_circuit_by_the_window_the_request_allowed(
+    spent_share, expected_failures
+):
     scheduler = ProviderCapacityScheduler(
         {**_CIRCUIT, "min_attempt_window_seconds": 0}, _Admission()
     )
+    deadline = 0.1
 
     with pytest.raises(asyncio.TimeoutError):
         await scheduler.run_provider_call(
             request=_request(),
-            model_name="gpt-5",
-            provider="openai",
+            model_name="mistral-7b",
+            provider="vllm",
             estimated_input_tokens=1,
             operation=_hang,
             execution_budget=RequestExecutionBudget(
-                max_attempts=1, deadline_seconds=0.05
+                max_attempts=1,
+                deadline_seconds=deadline,
+                started_at=time.monotonic() - deadline * spent_share,
             ),
-            attempt_timeout_seconds=5,
+            attempt_timeout_seconds=deadline * 5,
         )
 
-    state = await scheduler._read_circuit_state("openai", "gpt-5")
-    assert state.get("failure_count", 0) == 0
+    state = await scheduler._read_circuit_state("vllm", "mistral-7b")
+    assert state.get("failure_count", 0) == expected_failures
 
 
 @pytest.mark.asyncio
