@@ -5,8 +5,10 @@ Handles inference requests across OpenAI, Anthropic, and vLLM providers
 
 import asyncio
 import base64
+import email.utils
 import json
 import logging
+import math
 import os
 import time
 from abc import ABC, abstractmethod
@@ -32,7 +34,12 @@ import anthropic
 
 from src.admission import AdmissionRejectedError
 from src.llm_router_part1_router import ModelRouter
-from src.provider_scheduler import ProviderCapacityScheduler, RequestExecutionBudget
+from src.provider_scheduler import (
+    REQUEST_SHAPED_STATUS_CODES,
+    ProviderCapacityScheduler,
+    RequestExecutionBudget,
+    _exception_status_code,
+)
 from src.utils.metrics import INFERENCE_METRICS, RAG_METRICS
 from src.utils.schema import (
     AttachmentType,
@@ -280,41 +287,97 @@ def _first_nested_usage_value(
     return default
 
 
-# Statuses that blame the request itself (bad input, too large, unprocessable),
-# matching the request-shaped set the failure-handling path uses.
-_REQUEST_SHAPED_STATUS_CODES = frozenset({400, 413, 422})
+# HTTP status /route answers for each error_code; other failures stay 502.
+ERROR_CODE_HTTP_STATUS: Dict[str, int] = {
+    "context_length_exceeded": 413,
+    "prompt_too_large": 413,
+    "model_not_entitled": 403,
+    "rate_limited": 429,
+    "provider_unavailable": 503,
+    "retrieval_unavailable": 503,
+    "timeout": 504,
+}
+# Statuses whose responses may carry Retry-After (RFC 9110 section 10.2.3).
+_RETRY_AFTER_HTTP_STATUSES = frozenset({429, 503})
+# Phrases providers use for a prompt over the model's context window: OpenAI's
+# error code, Anthropic's "prompt is too long", vLLM's "maximum context length".
+_CONTEXT_LENGTH_MARKERS = (
+    "context_length_exceeded",
+    "prompt is too long",
+    "maximum context length",
+    "context window",
+)
 
 
-def _exception_status_code(exc: BaseException) -> Optional[int]:
-    """HTTP status from SDK errors (exc.status_code) or httpx (exc.response)."""
-    for candidate in (exc, getattr(exc, "response", None)):
-        status_code = getattr(candidate, "status_code", None)
-        if isinstance(status_code, int) and not isinstance(status_code, bool):
-            return status_code
-    return None
+def _string_attribute(exc: BaseException, name: str) -> Optional[str]:
+    """A non-empty string attribute that a typed exception sets on purpose."""
+    value = getattr(exc, name, None)
+    return value if isinstance(value, str) and value else None
+
+
+def _admission_rejection_reason(exc: AdmissionRejectedError) -> str:
+    """The rejection reason, looking through a queue wait to what it waited on."""
+    decision = getattr(exc, "decision", None)
+    reason = str(getattr(decision, "reason", "") or "")
+    if reason == "scheduler_queue_timeout":
+        metadata = getattr(decision, "metadata", None) or {}
+        reason = str(metadata.get("last_reason") or "")
+    return reason
+
+
+def _class_names(exc: BaseException) -> set:
+    return {cls.__name__ for cls in type(exc).__mro__}
+
+
+def _is_timeout_exception(exc: BaseException) -> bool:
+    return isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or any(
+        "Timeout" in name for name in _class_names(exc)
+    )
+
+
+def _is_connection_exception(exc: BaseException) -> bool:
+    return isinstance(exc, ConnectionError) or bool(
+        _class_names(exc) & {"APIConnectionError", "TransportError"}
+    )
+
+
+def _provider_error_text(exc: BaseException) -> str:
+    """The error message plus the response body, which httpx leaves out."""
+    parts = [str(exc)]
+    response = getattr(exc, "response", None)
+    try:
+        body = getattr(response, "text", None)
+    except Exception:  # httpx raises ResponseNotRead for an unread stream
+        body = None
+    if isinstance(body, str):
+        parts.append(body[:2000])
+    return " ".join(parts).lower()
+
+
+def _is_context_length_error(exc: BaseException) -> bool:
+    if getattr(exc, "code", None) == "context_length_exceeded":
+        return True
+    text = _provider_error_text(exc)
+    return any(marker in text for marker in _CONTEXT_LENGTH_MARKERS)
 
 
 def classify_inference_error(exc: BaseException) -> str:
     """Bucket a failed inference so analytics only blame providers for their faults.
 
     Matches SDK and httpx errors by attribute and class name, so it works without
-    importing the provider SDKs.
+    importing the provider SDKs. A typed exception that sets ``error_type``
+    decides for itself.
     """
-    class_names = {cls.__name__ for cls in type(exc).__mro__}
+    explicit_error_type = _string_attribute(exc, "error_type")
+    if explicit_error_type:
+        return explicit_error_type
     if isinstance(exc, AdmissionRejectedError):
         # An open circuit (or a queue wait that ended on one) means the provider
         # has been failing; other rejections are our own capacity policy.
-        decision = getattr(exc, "decision", None)
-        reason = str(getattr(decision, "reason", "") or "")
-        if reason == "scheduler_queue_timeout":
-            metadata = getattr(decision, "metadata", None) or {}
-            reason = str(metadata.get("last_reason") or "")
-        if reason == "circuit_open":
+        if _admission_rejection_reason(exc) == "circuit_open":
             return "provider_error"
         return "user_or_policy"
-    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or any(
-        "Timeout" in name for name in class_names
-    ):
+    if _is_timeout_exception(exc):
         return "timeout"
     status_code = _exception_status_code(exc)
     if status_code is not None and status_code >= 400:
@@ -322,14 +385,11 @@ def classify_inference_error(exc: BaseException) -> str:
             return "timeout"
         if status_code == 429:
             return "rate_limited"
-        if status_code in _REQUEST_SHAPED_STATUS_CODES:
+        if status_code in REQUEST_SHAPED_STATUS_CODES:
             return "user_or_policy"
         # 5xx, and 4xx such as 401/403 (revoked key) or 404 (retired model).
         return "provider_error"
-    if isinstance(exc, ConnectionError) or class_names & {
-        "APIConnectionError",
-        "TransportError",
-    }:
+    if _is_connection_exception(exc):
         return "provider_error"
     if isinstance(exc, json.JSONDecodeError):
         # A provider answered with a body that is not JSON (an HTML error page,
@@ -340,6 +400,97 @@ def classify_inference_error(exc: BaseException) -> str:
     if isinstance(exc, RuntimeError):
         return "provider_error"
     return "internal"
+
+
+def inference_error_code(exc: BaseException) -> Optional[str]:
+    """Name a failure specifically enough for the caller to act on it.
+
+    Typed exceptions (the router's entitlement and size rejections, retrieval
+    failures) carry ``error_code`` themselves. Returns None when nothing more
+    specific than "inference failed" is known.
+    """
+    explicit_error_code = _string_attribute(exc, "error_code")
+    if explicit_error_code:
+        return explicit_error_code
+    if isinstance(exc, AdmissionRejectedError):
+        decision_status = getattr(getattr(exc, "decision", None), "status_code", 0)
+        if _admission_rejection_reason(exc) == "circuit_open" or (
+            isinstance(decision_status, int) and decision_status >= 500
+        ):
+            return "provider_unavailable"
+        return "rate_limited"
+    if _is_timeout_exception(exc):
+        return "timeout"
+    status_code = _exception_status_code(exc)
+    if status_code is not None and status_code >= 400:
+        if status_code == 408:
+            return "timeout"
+        if status_code == 429:
+            return "rate_limited"
+        if status_code in REQUEST_SHAPED_STATUS_CODES:
+            if _is_context_length_error(exc):
+                return "context_length_exceeded"
+            return "prompt_too_large" if status_code == 413 else None
+        # 401/403/404 mean our credentials or model name are wrong: a 502.
+        return "provider_unavailable" if status_code >= 500 else None
+    if _is_connection_exception(exc):
+        return "provider_unavailable"
+    if isinstance(exc, RuntimeError) and "no healthy" in str(exc).lower():
+        return "provider_unavailable"
+    return None
+
+
+def _header_value(headers: Any, name: str) -> Optional[str]:
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    for candidate in (name, name.title()):
+        value = getter(candidate)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _retry_after_seconds(exc: BaseException) -> Optional[int]:
+    """How long the provider (or our admission control) asked callers to wait."""
+    if isinstance(exc, AdmissionRejectedError):
+        seconds = getattr(getattr(exc, "decision", None), "retry_after_seconds", None)
+        if isinstance(seconds, int) and not isinstance(seconds, bool):
+            return max(0, seconds)
+        return None
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers is None:
+        return None
+    try:
+        milliseconds = _header_value(headers, "retry-after-ms")
+        if milliseconds is not None:
+            return max(0, math.ceil(float(milliseconds) / 1000))
+        value = _header_value(headers, "retry-after")
+        if value is None:
+            return None
+        try:
+            return max(0, math.ceil(float(value)))
+        except ValueError:
+            retry_at = email.utils.parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+            return max(0, math.ceil(delay))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def route_response_status(response: Any) -> Tuple[int, Dict[str, str]]:
+    """The HTTP status (and headers) /route answers for an engine response."""
+    if not getattr(response, "error", None):
+        return 200, {}
+    error_code = getattr(response, "error_code", None)
+    status_code = ERROR_CODE_HTTP_STATUS.get(error_code or "", 502)
+    headers: Dict[str, str] = {}
+    retry_after = getattr(response, "retry_after_seconds", None)
+    if status_code in _RETRY_AFTER_HTTP_STATUSES and isinstance(retry_after, int):
+        headers["Retry-After"] = str(retry_after)
+    return status_code, headers
 
 
 _PRIMARY_ATTEMPT_EXCEPTION_ATTR = "_primary_attempt_exception"
@@ -1699,7 +1850,7 @@ class vLLMProvider(BaseInferenceProvider):
         """
         if not isinstance(error, httpx.HTTPStatusError):
             return False
-        return error.response.status_code in (400, 413, 422)
+        return error.response.status_code in REQUEST_SHAPED_STATUS_CODES
 
     async def _mark_endpoint_failure(
         self, endpoint: VLLMEndpointState, error: Exception
@@ -2309,10 +2460,8 @@ class InferenceEngine:
         """Process query through the complete inference pipeline"""
         start_time = time.time()
 
-        # Generate request ID for tracking
-        request_id = hashlib.md5(
-            f"{request.user_id}:{request.query}:{time.time()}".encode()
-        ).hexdigest()
+        # Log with the caller's request id so logs join the analytics events.
+        request_id = request.request_id
 
         try:
             # Step 1: Route query to appropriate model
@@ -2426,6 +2575,7 @@ class InferenceEngine:
                 if "routing_decision" in locals()
                 else "unknown"
             )
+            primary_exc = _primary_attempt_exception(exc)
             error_response = InferenceResponse(
                 response_text="Request processing failed",
                 model_name=failed_model,
@@ -2438,7 +2588,9 @@ class InferenceEngine:
                 provider="error",
                 cached=False,
                 error="inference_failed",
-                error_type=classify_inference_error(_primary_attempt_exception(exc)),
+                error_type=classify_inference_error(primary_exc),
+                error_code=inference_error_code(primary_exc),
+                retry_after_seconds=_retry_after_seconds(primary_exc),
             )
             # The caller keeps the "error" provider sentinel; analytics get the
             # failed model's real provider so outages count against it.

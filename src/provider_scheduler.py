@@ -133,6 +133,12 @@ def _is_retryable_status(status: int) -> bool:
     return status in RETRYABLE_CLIENT_STATUS_CODES
 
 
+# Statuses that blame the request itself (bad input, too large, unprocessable):
+# every endpoint would reject it the same way, so it is neither retried
+# elsewhere nor counted against the provider.
+REQUEST_SHAPED_STATUS_CODES = frozenset({400, 413, 422})
+
+
 def _exception_status_code(exc: BaseException) -> Optional[int]:
     """Read an HTTP status from ``status_code`` or ``response.status_code``.
 

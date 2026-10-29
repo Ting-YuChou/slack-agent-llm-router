@@ -190,6 +190,12 @@ class InferenceResponse(BaseModel):
     # Failure bucket for analytics: provider_error, timeout, rate_limited,
     # user_or_policy or internal. None on success.
     error_type: Optional[str] = None
+    # What the caller can act on: context_length_exceeded, prompt_too_large,
+    # model_not_entitled, rate_limited, provider_unavailable, timeout or
+    # retrieval_unavailable. None on success and for unclassified failures.
+    error_code: Optional[str] = None
+    # Seconds the provider asked callers to wait before retrying, when it said.
+    retry_after_seconds: Optional[int] = Field(default=None, ge=0)
 
     # Performance metrics
     latency_ms: int = Field(ge=0)
