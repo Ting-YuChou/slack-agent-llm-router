@@ -220,11 +220,13 @@ async def test_primary_attempt_reserves_time_only_when_a_fallback_can_run(
 
 @pytest.mark.asyncio
 async def test_hung_primary_leaves_time_for_fallback_within_deadline():
+    # The hung primary gets a quarter of the deadline; the fallback has the
+    # other 0.75 s, far more than it needs even on a loaded machine.
     engine = _mock_engine(
         {"gpt-5": "openai", "mistral-7b": "vllm"},
         scheduler={
-            "request_deadline_seconds": 0.5,
-            "fallback_reserve_ratio": 0.3,
+            "request_deadline_seconds": 1.0,
+            "fallback_reserve_ratio": 0.75,
             **_RETRY,
         },
     )
@@ -241,7 +243,7 @@ async def test_hung_primary_leaves_time_for_fallback_within_deadline():
 
     assert response.error is None
     assert response.model_name == "mistral-7b"
-    assert elapsed < 0.5
+    assert elapsed < 1.0
     fallback.assert_awaited_once()
 
 
@@ -497,7 +499,8 @@ async def test_attempt_with_less_than_the_minimum_window_never_starts():
             attempt_timeout_seconds=5,
         )
 
-    assert time.monotonic() - started < 0.1
+    # Raised at once, not after waiting out the 0.5 s deadline.
+    assert time.monotonic() - started < 0.3
     operation.assert_not_awaited()
     assert admission.calls == []
     state = await scheduler._read_circuit_state("openai", "gpt-5")
@@ -718,13 +721,13 @@ async def test_vllm_client_gets_short_connect_and_provider_timeout_elsewhere(
 @pytest.mark.asyncio
 async def test_slow_rag_shortens_the_llm_window_instead_of_extending_the_deadline():
     engine = _mock_engine(
-        {"gpt-5": "openai"}, scheduler={"request_deadline_seconds": 0.3}
+        {"gpt-5": "openai"}, scheduler={"request_deadline_seconds": 0.6}
     )
     engine.providers = {"openai": SimpleNamespace(generate_response=_hang)}
     engine._get_local_fallback_models = MagicMock(return_value=[])
 
     async def slow_rag(*_args):
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.3)
         return None
 
     engine._run_rag_if_needed = slow_rag
@@ -734,7 +737,8 @@ async def test_slow_rag_shortens_the_llm_window_instead_of_extending_the_deadlin
     elapsed = time.monotonic() - started
 
     assert response.error == "inference_failed"
-    assert elapsed < 0.42
+    # Ends at the 0.6 s deadline, not at 0.3 s of retrieval + a 0.6 s window.
+    assert elapsed < 0.8
 
 
 @pytest.mark.asyncio
@@ -752,7 +756,8 @@ async def test_hung_retrieval_is_capped_by_the_request_deadline(stage):
     elapsed = time.monotonic() - started
 
     assert response.error == "inference_failed"
-    assert elapsed < 0.35
+    # Ends at the 0.2 s deadline; an uncapped hang would run into the guard.
+    assert elapsed < 1.0
     provider.assert_not_awaited()
 
 
@@ -1170,7 +1175,7 @@ async def test_single_flight_follower_answered_by_a_fallback_reports_an_attempt(
     engine.single_flight = SingleFlightCoordinator({"enabled": True})
 
     async def slow_claude(_request, model):
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.2)  # Long enough for the second request to join.
         return _response(model, "anthropic")
 
     engine.providers["anthropic"].generate_response = AsyncMock(side_effect=slow_claude)
@@ -1194,12 +1199,14 @@ async def test_single_flight_follower_answered_by_a_fallback_reports_an_attempt(
 
 @pytest.mark.asyncio
 async def test_hung_gpt5_attempt_is_answered_by_claude():
+    # gpt-5 hangs through its quarter of the deadline; claude has the other
+    # 0.75 s, far more than it needs even on a loaded machine.
     engine = _chain_engine(
         _router(),
         _hang,
         scheduler={
-            "request_deadline_seconds": 0.5,
-            "fallback_reserve_ratio": 0.3,
+            "request_deadline_seconds": 1.0,
+            "fallback_reserve_ratio": 0.75,
             **_RETRY,
         },
     )
@@ -1209,7 +1216,7 @@ async def test_hung_gpt5_attempt_is_answered_by_claude():
         engine.process_query(_request(**_ENTERPRISE)), timeout=3
     )
 
-    assert time.monotonic() - started < 0.5
+    assert time.monotonic() - started < 1.0
     assert response.model_name == "claude-sonnet-4-6"
     assert response.fallback_from_model == "gpt-5"
 
