@@ -136,22 +136,30 @@ class ChatIngress:
         return result, status_code, headers
 
     async def record(
-        self, *, endpoint: str, method: str, status_code: int, started_at: float
+        self,
+        *,
+        endpoint: str,
+        method: str,
+        status_code: int,
+        started_at: float,
+        component: str = "api",
+        error_type: str = "RouteError",
     ) -> None:
         await self._platform._record_api_metrics(
             endpoint=endpoint,
             method=method,
             status_code=status_code,
             duration_seconds=time.perf_counter() - started_at,
-            error_type="RouteError" if status_code >= 500 else None,
+            error_type=error_type if status_code >= 500 else None,
+            component=component,
         )
 
-    async def handle(
-        self, query_request: QueryRequest, *, endpoint: str, method: str
-    ) -> Any:
+    async def handle(self, query_request: QueryRequest, *, source: str) -> Any:
         """process() and its metrics in one call, for in-process callers.
 
-        Exceptions propagate, counted as /route would answer them.
+        `source` (e.g. "slack") labels the metrics: endpoint, method and
+        error component, so in-process traffic never counts as HTTP /route
+        traffic. Exceptions propagate, with the status /route would give.
         """
         started_at = time.perf_counter()
         status_code = 500
@@ -163,10 +171,12 @@ class ChatIngress:
             raise
         finally:
             await self.record(
-                endpoint=endpoint,
-                method=method,
+                endpoint=source,
+                method=source,
                 status_code=status_code,
                 started_at=started_at,
+                component=source,
+                error_type=f"{source.capitalize()}ChatError",
             )
 
     def is_healthy(self) -> bool:
@@ -748,8 +758,10 @@ class LLMRouterPlatform:
         status_code: int,
         duration_seconds: float,
         error_type: Optional[str] = None,
+        component: str = "api",
     ):
-        """Record request-level API metrics."""
+        """Record request-level metrics; `component` names the caller's surface
+        (the HTTP API, or an in-process one such as Slack)."""
         requests_total = getattr(SYSTEM_METRICS, "requests_total", None)
         request_duration = getattr(SYSTEM_METRICS, "request_duration", None)
 
@@ -770,7 +782,7 @@ class LLMRouterPlatform:
             errors_total = getattr(SYSTEM_METRICS, "errors_total", None)
             if errors_total is not None:
                 errors_total.labels(
-                    component="api",
+                    component=component,
                     error_type=error_type,
                 ).inc()
 
@@ -780,24 +792,24 @@ class LLMRouterPlatform:
             "status": str(status_code),
         }
         await self._publish_system_metric_event(
-            service="api",
+            service=component,
             metric_name="requests_total",
             metric_value=1.0,
             labels=metric_labels,
         )
         await self._publish_system_metric_event(
-            service="api",
+            service=component,
             metric_name="request_duration_seconds",
             metric_value=duration_seconds,
             labels=metric_labels,
         )
         if error_type:
             await self._publish_system_metric_event(
-                service="api",
+                service=component,
                 metric_name="errors_total",
                 metric_value=1.0,
                 labels={
-                    "component": "api",
+                    "component": component,
                     "error_type": error_type,
                     **metric_labels,
                 },

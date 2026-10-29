@@ -86,7 +86,8 @@ async def test_a_slack_query_goes_through_the_shared_ingress_once(
         "request_duration_seconds",
     ]
     labels = producer.metric_events[0]["labels"]
-    assert labels == {"endpoint": "slack", "method": "mention", "status": "200"}
+    assert labels == {"endpoint": "slack", "method": "slack", "status": "200"}
+    assert {event["service"] for event in producer.metric_events} == {"slack"}
 
 
 @pytest.mark.asyncio
@@ -265,7 +266,7 @@ async def test_chat_requests_table_is_created_after_the_existing_tables():
     (ddl,) = [sql for sql in statements if "llm_router.chat_requests (" in sql]
     assert statements.index(ddl) >= 6
     assert "ENGINE = ReplacingMergeTree(version)" in ddl
-    assert "ORDER BY (toStartOfHour(ts), request_id)" in ddl
+    assert "ORDER BY (toStartOfHour(ts), request_id, ts)" in ddl
     for column in ("model", "provider", "tier", "status"):
         assert f"{column} LowCardinality(String)" in ddl
     for column in ("routing_ms", "queue_wait_ms", "ttft_ms"):

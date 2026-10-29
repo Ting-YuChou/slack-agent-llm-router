@@ -208,6 +208,19 @@ def thread_key_hash(query_request: Any) -> Optional[str]:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
 
 
+def _first_event_time(data: Dict[str, Any], *keys: str) -> datetime:
+    """The first of keys that holds a valid timestamp, never the consume time.
+
+    An event with none of them is malformed: ValueError, a permanent failure.
+    """
+    for key in keys:
+        try:
+            return _parse_datetime(data.get(key), strict=True)
+        except ValueError:
+            continue
+    raise ValueError(f"Event has no valid timestamp in {', '.join(keys)}")
+
+
 def _uint_or_none(value: Any) -> Optional[int]:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -221,14 +234,15 @@ def build_chat_request_row(
 
     An explicit field list: no query text, context or attachment names.
     """
-    ts = _parse_datetime(data.get("request_timestamp") or data.get("emitted_at"))
-    completed_at = _parse_datetime(
-        data.get("completion_timestamp") or data.get("emitted_at")
-    )
-    emitted_at = _parse_datetime(data.get("emitted_at") or completed_at)
     request_id = str(data.get("request_id") or data.get("query_id") or "")
     if not request_id:
         raise ValueError("inference.completed event has no request_id")
+    # Only the event's own times: a replay must get the same ts and version.
+    completed_at = _first_event_time(data, "completion_timestamp", "emitted_at")
+    ts = _first_event_time(
+        data, "request_timestamp", "completion_timestamp", "emitted_at"
+    )
+    emitted_at = _first_event_time(data, "emitted_at", "completion_timestamp")
     return {
         "request_id": request_id,
         "ts": ts,
@@ -307,7 +321,7 @@ def build_chat_feedback_row(
     rating = str(data.get("rating") or "")
     if not request_id or rating not in CHAT_FEEDBACK_RATINGS:
         raise ValueError("chat.feedback event needs a request_id and a rating")
-    clicked_at = _parse_datetime(data.get("emitted_at"))
+    clicked_at = _first_event_time(data, "emitted_at")
     return {
         "request_id": request_id,
         "user_id": str(data.get("user_id") or ""),
@@ -324,12 +338,23 @@ def build_chat_feedback_row(
     }
 
 
+def _without_attachment_names(slack_metadata: Any) -> Any:
+    if not isinstance(slack_metadata, dict):
+        return slack_metadata
+    return {
+        key: value for key, value in slack_metadata.items() if key != "attachment_names"
+    }
+
+
 def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
     """Build the pre-inference event emitted by the API request path."""
+    # A Slack file's name can say what is in it (X6): Slack requests send
+    # only each file's type and size. /route keeps its existing shape.
+    from_slack = (query_request.metadata or {}).get("source") == "slack"
     attachments = [
         {
             "id": attachment.id,
-            "name": attachment.name,
+            **({} if from_slack else {"name": attachment.name}),
             "type": _enum_value(attachment.type),
             "size_bytes": attachment.size_bytes,
             "mime_type": attachment.mime_type,
@@ -365,7 +390,11 @@ def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
         # Prompt content assembled in process (Slack memory hits) stays out.
         "metadata": redact(
             {
-                key: value
+                key: (
+                    _without_attachment_names(value)
+                    if from_slack and key == "slack"
+                    else value
+                )
                 for key, value in (query_request.metadata or {}).items()
                 if key not in PROMPT_CONTENT_METADATA_KEYS
             }
@@ -1483,7 +1512,8 @@ class ClickHouseManager:
         )
 
         # One row per chat request (inference.completed): no query text, no
-        # context. The latest completion of a request id wins on merge.
+        # context. A replay of one request (same id and ts) collapses to its
+        # latest version; distinct calls that reuse an id keep their rows.
         chat_requests_sql = """
         CREATE TABLE IF NOT EXISTS {database}.chat_requests (
             request_id String,
@@ -1523,7 +1553,7 @@ class ClickHouseManager:
             kafka_offset Int64 DEFAULT -1
         ) ENGINE = ReplacingMergeTree(version)
         PARTITION BY toYYYYMMDD(ts)
-        ORDER BY (toStartOfHour(ts), request_id)
+        ORDER BY (toStartOfHour(ts), request_id, ts)
         TTL toDateTime(ts) + INTERVAL 90 DAY
         """.format(
             database=self.database
