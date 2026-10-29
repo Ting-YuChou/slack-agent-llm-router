@@ -108,7 +108,9 @@ _TOO_LONG_TEXT = (
 )
 # What a failed answer tells the user. A precise InferenceResponse.error_code
 # wins; else its error_type decides; anything else gets the generic message,
-# which reveals nothing internal.
+# which reveals nothing internal. A rate_limited error_code is the provider's
+# 429 only when error_type says so too; otherwise our own capacity turned the
+# request away (an admission rejection), and the router is busy.
 SLACK_ERROR_CODE_MESSAGES = {
     "context_length_exceeded": _TOO_LONG_TEXT,
     "prompt_too_large": _TOO_LONG_TEXT,
@@ -119,7 +121,6 @@ SLACK_ERROR_CODE_MESSAGES = {
         "⚠️ Document search is unavailable right now. Please try again in a "
         "few minutes."
     ),
-    "rate_limited": _RATE_LIMITED_TEXT,
     "provider_unavailable": (
         "⚠️ The model provider is unavailable right now. Please try again in a "
         "few minutes."
@@ -156,8 +157,19 @@ SLACK_RESPONSE_WARNING_NOTES = {
         "_Note: part of the answer was withheld by the model's content filter._"
     ),
     "empty_response": (
-        "_Note: the model returned almost no text, so the answer may be " "incomplete._"
+        "_Note: the model returned almost no text, so the answer may be incomplete._"
     ),
+}
+# The same, as a plain-text label that leads the answer in history: the
+# conversation summary keeps only each message's first 200 characters.
+SLACK_RESPONSE_WARNING_LABELS = {
+    "rag_unavailable": "document search was unavailable",
+    "rag_degraded": "document search only partly worked",
+    "web_search_unavailable": "live web search was unavailable",
+    "response_truncated": "answer was cut off",
+    "response_incomplete": "answer may be incomplete",
+    "response_filtered": "part of the answer was withheld by the content filter",
+    "empty_response": "model returned almost no text",
 }
 # The windows UserManager.check_rate_limit counts requests in.
 RATE_LIMIT_WINDOW_SECONDS = 3600
@@ -1231,30 +1243,59 @@ def _retry_wait(retry_after_seconds: Any) -> Optional[str]:
     return None
 
 
-def _response_warning_notes(warnings: Any, *, skip: Tuple[str, ...] = ()) -> str:
-    """The notes for a response's known warnings, each once, in a fixed order."""
+def _known_response_warnings(warnings: Any, *, skip: Tuple[str, ...] = ()) -> List[str]:
+    """A response's warnings that have a note, each once, in a fixed order."""
     if not isinstance(warnings, (list, tuple)):
-        return ""
-    known = {str(warning).split(":", 1)[0] for warning in warnings}
+        return []
+    present = {str(warning).split(":", 1)[0] for warning in warnings}
+    return [
+        warning
+        for warning in SLACK_RESPONSE_WARNING_NOTES
+        if warning in present and warning not in skip
+    ]
+
+
+def _response_warning_notes(warnings: Any, *, skip: Tuple[str, ...] = ()) -> str:
+    """The Slack notes for a response's known warnings."""
     return "\n".join(
-        note
-        for warning, note in SLACK_RESPONSE_WARNING_NOTES.items()
-        if warning in known and warning not in skip
+        SLACK_RESPONSE_WARNING_NOTES[warning]
+        for warning in _known_response_warnings(warnings, skip=skip)
     )
 
 
-# Admission reasons that are the user's own quota (src/admission.py), and how
-# to name it. Every other rejection is shared capacity: the router is busy.
-ADMISSION_QUOTA_REASONS = {
-    "identity_request_rate_exceeded": "your request quota",
-    "user_request_rate_exceeded": "your request quota",
-    "user_token_budget_exceeded": "your token quota",
-    "tier_request_rate_exceeded": "your tier's request quota",
-    "tier_token_budget_exceeded": "your tier's token quota",
+def _response_warning_label(warnings: Any) -> str:
+    """The plain-text history label for a response's known warnings."""
+    labels = [
+        SLACK_RESPONSE_WARNING_LABELS[warning]
+        for warning in _known_response_warnings(warnings)
+    ]
+    return f"[{'; '.join(labels)}]" if labels else ""
+
+
+# Admission reasons that are a quota rather than capacity (src/admission.py),
+# by the kind of quota. The user's own:
+ADMISSION_USER_QUOTA_REASONS = {
+    "identity_request_rate_exceeded": "request",
+    "user_request_rate_exceeded": "request",
+    "user_token_budget_exceeded": "token",
 }
+# One bucket shared by every user of a tier, so not this user's doing:
+ADMISSION_TIER_QUOTA_REASONS = {
+    "tier_request_rate_exceeded": "request",
+    "tier_token_budget_exceeded": "token",
+}
+# Every other rejection is shared capacity: the router is busy.
 
 
-def _admission_rejection_text(decision: Any) -> str:
+def _busy_text(wait: Optional[str]) -> str:
+    if wait:
+        return f"⏳ The LLM Router is busy right now. Please try again in {wait}."
+    return SLACK_BUSY_MESSAGE
+
+
+def _admission_rejection_text(
+    decision: Any, user_tier: Optional[UserTier] = None
+) -> str:
     """The reply when admission turns a query away: a quota, or capacity."""
     reason = str(getattr(decision, "reason", "") or "")
     if reason == "scheduler_queue_timeout":
@@ -1262,13 +1303,15 @@ def _admission_rejection_text(decision: Any) -> str:
         metadata = getattr(decision, "metadata", None) or {}
         reason = str(metadata.get("last_reason") or "")
     wait = _retry_wait(getattr(decision, "retry_after_seconds", None))
-    quota = ADMISSION_QUOTA_REASONS.get(reason)
-    if quota:
-        when = f"Please try again in {wait}." if wait else "Please try again later."
-        return f"⏳ You've reached {quota} for now. {when}"
-    if wait:
-        return f"⏳ The LLM Router is busy right now. Please try again in {wait}."
-    return SLACK_BUSY_MESSAGE
+    when = f"Please try again in {wait}." if wait else "Please try again later."
+    if reason in ADMISSION_USER_QUOTA_REASONS:
+        quota = ADMISSION_USER_QUOTA_REASONS[reason]
+        return f"⏳ You've reached your {quota} quota for now. {when}"
+    if reason in ADMISSION_TIER_QUOTA_REASONS:
+        quota = ADMISSION_TIER_QUOTA_REASONS[reason]
+        tier = f"The {user_tier.value.title()} tier's" if user_tier else "A tier's"
+        return f"⏳ {tier} shared {quota} quota is used up right now. {when}"
+    return _busy_text(wait)
 
 
 class UserManager:
@@ -3103,16 +3146,21 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 notes = _response_warning_notes(warnings, skip=("empty_response",))
                 return "\n\n".join(filter(None, [SLACK_EMPTY_ANSWER_MESSAGE, notes]))
 
-            # A degraded answer says so, here and in history, so the
-            # conversation never treats a cut-off answer as complete.
+            # A degraded answer says so, in Slack after it and in history
+            # before it, so the conversation never treats a cut-off answer
+            # as complete: the summary keeps each message's first 200 chars.
             answer = response.response_text
             notes = _response_warning_notes(warnings)
+            label = _response_warning_label(warnings)
             if notes:
                 answer = f"{answer.rstrip()}\n\n{notes}"
 
             # Add to conversation history
             context.add_message("user", text)
-            context.add_message("assistant", answer)
+            context.add_message(
+                "assistant",
+                f"{label} {response.response_text}" if label else answer,
+            )
 
             # Update metrics
             SLACK_METRICS.messages_processed.labels(user_tier=user_tier.value).inc()
@@ -3127,7 +3175,9 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 e.decision.reason,
             )
             SLACK_METRICS.errors.labels(error_type=type(e).__name__).inc()
-            return _admission_rejection_text(e.decision)
+            return _admission_rejection_text(
+                e.decision, self.bot.user_manager.get_user_tier(user_id)
+            )
         except Exception as e:
             logger.error(f"Error processing query: {e}")
             SLACK_METRICS.errors.labels(error_type=type(e).__name__).inc()
@@ -3141,18 +3191,21 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         retry_after_seconds: Any = None,
     ) -> str:
         """What a failed answer tells the user: by error code, else error type."""
+        wait = _retry_wait(retry_after_seconds)
+        if error_code == "rate_limited" and error_type != "rate_limited":
+            # Our own capacity, e.g. an admission-rejected primary whose
+            # fallbacks failed too: not the provider's 429.
+            return _busy_text(wait)
         for messages, key in (
             (SLACK_ERROR_CODE_MESSAGES, error_code),
             (SLACK_INFERENCE_ERROR_MESSAGES, error_type),
         ):
             message = messages.get(key) if isinstance(key, str) else None
-            if message == _RATE_LIMITED_TEXT:
-                wait = _retry_wait(retry_after_seconds)
-                if wait:
-                    return (
-                        "⏳ The model provider is rate-limiting requests right "
-                        f"now. Please try again in {wait}."
-                    )
+            if message == _RATE_LIMITED_TEXT and wait:
+                return (
+                    "⏳ The model provider is rate-limiting requests right now. "
+                    f"Please try again in {wait}."
+                )
             if message:
                 return message
         error_builder = getattr(self.bot, "_build_user_safe_error_message", None)

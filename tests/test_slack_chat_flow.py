@@ -465,8 +465,8 @@ def rejection_id(rejection):
     )
 
 
-async def reply_to(rejection):
-    bot = chat_bot(AsyncMock(side_effect=rejection))
+async def reply_to(rejection, **config):
+    bot = chat_bot(AsyncMock(side_effect=rejection), **config)
     await bot._process_message(top_level(ts="200.0"))
     assert history(bot, "200.0") == []
     return bot.web_client.chat_postMessage.await_args.kwargs["text"]
@@ -478,9 +478,7 @@ async def reply_to(rejection):
     [
         admission_rejection("user_request_rate_exceeded"),
         admission_rejection("identity_request_rate_exceeded"),
-        admission_rejection("tier_request_rate_exceeded"),
         admission_rejection("user_token_budget_exceeded"),
-        admission_rejection("tier_token_budget_exceeded"),
         # A queue wait that ended on the user's own budget.
         admission_rejection(
             "scheduler_queue_timeout", last_reason="user_token_budget_exceeded"
@@ -491,9 +489,35 @@ async def reply_to(rejection):
 async def test_an_admission_rejection_of_the_users_own_quota_says_so(rejection):
     text = await reply_to(rejection)
 
-    assert "quota" in text
+    assert "You've reached your" in text and "quota" in text
     assert "busy" not in text.lower()
     assert "Please try again in 2 minutes." in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rejection,quota",
+    [
+        (admission_rejection("tier_request_rate_exceeded"), "request"),
+        (admission_rejection("tier_token_budget_exceeded"), "token"),
+        (
+            admission_rejection(
+                "scheduler_queue_timeout", last_reason="tier_token_budget_exceeded"
+            ),
+            "token",
+        ),
+    ],
+    ids=lambda value: rejection_id(value) if not isinstance(value, str) else value,
+)
+async def test_a_tier_quota_rejection_reads_as_a_shared_limit(rejection, quota):
+    # Every user of the tier fills one bucket: this user may have sent nothing.
+    text = await reply_to(rejection, user_tiers={"default": "premium"})
+
+    assert (
+        f"The Premium tier's shared {quota} quota is used up right now. "
+        "Please try again in 2 minutes."
+    ) in text
+    assert "You've" not in text and "your" not in text
 
 
 @pytest.mark.asyncio
@@ -584,7 +608,8 @@ async def reply_for_failure(**fields):
         ("prompt_too_large", "too long for the model"),
         ("model_not_entitled", "not available for your tier"),
         ("retrieval_unavailable", "document search is unavailable right now"),
-        ("rate_limited", "rate-limiting"),
+        # Without a provider 429 (error_type) it is our own capacity.
+        ("rate_limited", "the llm router is busy right now"),
         ("provider_unavailable", "provider is unavailable right now"),
         ("timeout", "took too long"),
     ],
@@ -606,25 +631,49 @@ async def test_an_unknown_error_code_falls_back_to_the_error_type():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "fields,wait",
+    "fields,says,wait",
     [
-        ({"error_type": "rate_limited", "retry_after_seconds": 45}, "45 seconds"),
+        # A provider's own 429 is the only real provider rate limit.
+        (
+            {"error_type": "rate_limited", "retry_after_seconds": 45},
+            "rate-limiting",
+            "Please try again in 45 seconds.",
+        ),
+        (
+            {
+                "error_code": "rate_limited",
+                "error_type": "rate_limited",
+                "retry_after_seconds": 120,
+            },
+            "rate-limiting",
+            "Please try again in 2 minutes.",
+        ),
+        # A rate_limited code with another type is our own capacity, e.g. an
+        # AdmissionRejectedError primary whose fallbacks also failed.
         (
             {
                 "error_code": "rate_limited",
                 "error_type": "provider_error",
                 "retry_after_seconds": 120,
             },
-            "2 minutes",
+            "The LLM Router is busy right now",
+            "Please try again in 2 minutes.",
+        ),
+        (
+            {"error_code": "rate_limited", "error_type": "user_or_policy"},
+            "The LLM Router is busy right now",
+            "retry in a moment.",
         ),
     ],
-    ids=["by_type", "by_code"],
+    ids=["provider_429", "provider_429_code", "own_capacity", "own_capacity_no_wait"],
 )
-async def test_a_rate_limited_failure_says_when_to_retry(fields, wait):
+async def test_a_rate_limited_failure_names_who_limited_it(fields, says, wait):
     text = await reply_for_failure(**fields)
 
-    assert "rate-limiting" in text
-    assert f"Please try again in {wait}." in text
+    assert says in text
+    assert wait in text
+    if "busy" in says:
+        assert "rate-limiting" not in text
 
 
 # S11: an answer that came back degraded says so
@@ -641,28 +690,54 @@ async def answer_with(inference_response_factory, text, warnings, **fields):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "warning,note",
+    "warning,note,label",
     [
         (
             "rag_unavailable",
             "_Note: document search was unavailable, so this answer isn't "
             "based on your documents._",
+            "[document search was unavailable]",
         ),
-        ("rag_unavailable:timeout", "_Note: document search was unavailable"),
-        ("rag_degraded", "_Note: document search only partly worked"),
+        (
+            "rag_unavailable:timeout",
+            "_Note: document search was unavailable",
+            "[document search was unavailable]",
+        ),
+        (
+            "rag_degraded",
+            "_Note: document search only partly worked",
+            "[document search only partly worked]",
+        ),
         (
             "web_search_unavailable",
             "_Note: live web search was unavailable; recent information "
             "couldn't be checked._",
+            "[live web search was unavailable]",
         ),
-        ("response_truncated", "_Note: the answer was cut off._"),
-        ("response_incomplete", "_Note: the answer may be incomplete._"),
-        ("response_filtered", "_Note: part of the answer was withheld"),
-        ("empty_response", "_Note: the model returned almost no text"),
+        (
+            "response_truncated",
+            "_Note: the answer was cut off._",
+            "[answer was cut off]",
+        ),
+        (
+            "response_incomplete",
+            "_Note: the answer may be incomplete._",
+            "[answer may be incomplete]",
+        ),
+        (
+            "response_filtered",
+            "_Note: part of the answer was withheld",
+            "[part of the answer was withheld by the content filter]",
+        ),
+        (
+            "empty_response",
+            "_Note: the model returned almost no text",
+            "[model returned almost no text]",
+        ),
     ],
 )
 async def test_a_degraded_answer_is_posted_and_remembered_with_a_note(
-    inference_response_factory, warning, note
+    inference_response_factory, warning, note, label
 ):
     bot, posted = await answer_with(
         inference_response_factory, "a partial answer", [warning]
@@ -670,12 +745,34 @@ async def test_a_degraded_answer_is_posted_and_remembered_with_a_note(
 
     assert posted.startswith("a partial answer\n\n_Note: ")
     assert note in posted
-    # The conversation stays honest: the next request sees the note too.
+    # The conversation stays honest: history leads with a plain-text label,
+    # which survives the summary's cut to each message's first 200 chars.
     assert history(bot, "200.0")[-1] == {
         "role": "assistant",
-        "content": posted,
+        "content": f"{label} a partial answer",
         "timestamp": ANY,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("length", [600, 190], ids=["long", "short"])
+async def test_the_next_request_sees_that_the_last_answer_was_cut_off(
+    inference_response_factory, length
+):
+    cut_off = inference_response_factory(
+        response_text="x" * length, warnings=["response_truncated"]
+    )
+    bot = chat_bot(AsyncMock(side_effect=[cut_off, inference_response_factory()]))
+    await bot._process_message(top_level(ts="200.0"))
+    posted = bot.web_client.chat_postMessage.await_args.kwargs["text"]
+
+    await bot._process_message(thread_reply(ts="201.0", thread_ts="200.0"))
+
+    context = bot.inference_engine.process_query.await_args.args[0].context
+    assert "assistant: [answer was cut off] xxx" in context
+    assert "_Note" not in context
+    # Slack still shows the note after the answer.
+    assert posted.endswith("\n\n_Note: the answer was cut off._")
 
 
 @pytest.mark.asyncio
