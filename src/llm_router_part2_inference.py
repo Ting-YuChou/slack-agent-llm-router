@@ -302,6 +302,15 @@ def classify_inference_error(exc: BaseException) -> str:
     """
     class_names = {cls.__name__ for cls in type(exc).__mro__}
     if isinstance(exc, AdmissionRejectedError):
+        # An open circuit (or a queue wait that ended on one) means the provider
+        # has been failing; other rejections are our own capacity policy.
+        decision = getattr(exc, "decision", None)
+        reason = str(getattr(decision, "reason", "") or "")
+        if reason == "scheduler_queue_timeout":
+            metadata = getattr(decision, "metadata", None) or {}
+            reason = str(metadata.get("last_reason") or "")
+        if reason == "circuit_open":
+            return "provider_error"
         return "user_or_policy"
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or any(
         "Timeout" in name for name in class_names

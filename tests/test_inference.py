@@ -140,6 +140,19 @@ _ReadTimeout = type(
 )
 
 
+def _admission_rejected(reason, **metadata):
+    return AdmissionRejectedError(
+        AdmissionDecision.reject(
+            status_code=429,
+            error="scheduler_unavailable",
+            reason=reason,
+            message="denied",
+            retry_after_seconds=1,
+            metadata=metadata,
+        )
+    )
+
+
 @pytest.mark.parametrize(
     ("exc", "expected"),
     [
@@ -184,6 +197,30 @@ _ReadTimeout = type(
             ),
             "user_or_policy",
             id="admission-rejected",
+        ),
+        pytest.param(
+            _admission_rejected("provider_active_requests_exceeded"),
+            "user_or_policy",
+            id="admission-provider-busy",
+        ),
+        # An open circuit means the provider has been failing: an outage.
+        pytest.param(
+            _admission_rejected("circuit_open"),
+            "provider_error",
+            id="admission-circuit-open",
+        ),
+        pytest.param(
+            _admission_rejected("scheduler_queue_timeout", last_reason="circuit_open"),
+            "provider_error",
+            id="admission-queued-behind-open-circuit",
+        ),
+        pytest.param(
+            _admission_rejected(
+                "scheduler_queue_timeout",
+                last_reason="provider_active_requests_exceeded",
+            ),
+            "user_or_policy",
+            id="admission-queued-behind-busy-provider",
         ),
         pytest.param(ValueError("no provider"), "user_or_policy", id="value-error"),
         pytest.param(KeyError("bug"), "internal", id="key-error"),
@@ -2863,10 +2900,21 @@ class TestInferenceEngine:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("rejection_reason", "expected_error_type"),
+        [
+            pytest.param(
+                "provider_active_requests_exceeded", "user_or_policy", id="busy"
+            ),
+            pytest.param("circuit_open", "provider_error", id="circuit-open"),
+        ],
+    )
     async def test_failure_event_describes_admission_rejected_primary(
         self,
         inference_config,
         sample_query_request,
+        rejection_reason,
+        expected_error_type,
     ):
         router = self._cloud_router_with_local_fallback()
         event_producer = AsyncMock()
@@ -2875,9 +2923,7 @@ class TestInferenceEngine:
         engine = InferenceEngine(
             inference_config,
             router,
-            admission_controller=RejectingAdmissionController(
-                ["provider_active_requests_exceeded", None]
-            ),
+            admission_controller=RejectingAdmissionController([rejection_reason, None]),
             event_producer=event_producer,
         )
         engine.providers = {"openai": AsyncMock(), "vllm": AsyncMock()}
@@ -2894,7 +2940,7 @@ class TestInferenceEngine:
         assert self._published_failure(event_producer, sample_query_request) == (
             "gpt-5",
             "openai",
-            "user_or_policy",
+            expected_error_type,
         )
 
     @pytest.mark.asyncio
