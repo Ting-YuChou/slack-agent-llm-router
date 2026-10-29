@@ -700,6 +700,9 @@ class InferenceConfig(ConfigModel):
     single_flight: SingleFlightConfig = Field(default_factory=SingleFlightConfig)
     scheduler: ProviderSchedulerConfig = Field(default_factory=ProviderSchedulerConfig)
     fallback: InferenceFallbackConfig = Field(default_factory=InferenceFallbackConfig)
+    # Share of the time left in the request deadline that one retrieval step
+    # (RAG, then web search) may use, so the model call keeps the rest.
+    retrieval_budget_ratio: float = Field(0.5, gt=0.0, le=1.0)
 
     @model_validator(mode="before")
     @classmethod

@@ -658,6 +658,17 @@ RAG_UNAVAILABLE_NOTICE = (
     "grounded in the knowledge base. If the question depends on those "
     "documents, say so instead of guessing what they contain."
 )
+# inference.retrieval_budget_ratio when unset or invalid.
+_DEFAULT_RETRIEVAL_BUDGET_RATIO = 0.5
+
+
+async def _await_within(
+    awaitable: Awaitable[Any], time_limit_seconds: Optional[float]
+) -> Any:
+    """Await, raising asyncio.TimeoutError after time_limit_seconds (None: no limit)."""
+    if time_limit_seconds is None:
+        return await awaitable
+    return await asyncio.wait_for(awaitable, timeout=max(0.0, time_limit_seconds))
 
 
 @dataclass
@@ -2668,8 +2679,14 @@ class InferenceEngine:
             compressed_context = await self._compress_request_context_if_needed(request)
 
             # Step 3: Optionally enrich school-document requests with RAG context.
+            # Retrieval gets a share of the time left, so its own outcome
+            # handling runs; the request deadline is only the backstop.
             rag_result = await self._within_request_deadline(
-                self._run_rag_if_needed(request, routing_decision),
+                self._run_rag_if_needed(
+                    request,
+                    routing_decision,
+                    self._retrieval_time_limit(execution_budget),
+                ),
                 execution_budget,
                 stage="rag",
             )
@@ -2695,7 +2712,11 @@ class InferenceEngine:
 
             # Step 4: Optionally enrich current-info requests with web search.
             web_search_result = await self._within_request_deadline(
-                self._run_web_search_if_needed(request, routing_decision),
+                self._run_web_search_if_needed(
+                    request,
+                    routing_decision,
+                    self._retrieval_time_limit(execution_budget),
+                ),
                 execution_budget,
                 stage="web_search",
             )
@@ -2886,7 +2907,13 @@ class InferenceEngine:
         self,
         request: QueryRequest,
         routing_decision: Any,
+        time_limit_seconds: Optional[float] = None,
     ) -> Optional[WebSearchResult]:
+        """Run web search when the request needs it, within time_limit_seconds.
+
+        Running out of time is a failed search (warning, prompt notice, no
+        cache), not a request failure.
+        """
         if not self._should_run_web_search(request, routing_decision):
             return None
 
@@ -2902,11 +2929,36 @@ class InferenceEngine:
                 blocked_reason="web_search_not_configured",
             )
         else:
-            result = await self.web_search_tool.search(
-                request.query,
-                user_id=request.user_id,
-                options=request.web_search_options,
-            )
+            started_at = time.time()
+            try:
+                result = await _await_within(
+                    self.web_search_tool.search(
+                        request.query,
+                        user_id=request.user_id,
+                        options=request.web_search_options,
+                    ),
+                    time_limit_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Web search for request %s ran out of its %ss share of the "
+                    "request deadline",
+                    request.request_id,
+                    time_limit_seconds,
+                )
+                backend = getattr(self.web_search_tool, "backend", None)
+                result = WebSearchResult(
+                    tool_call=ToolCall(
+                        name="web_search",
+                        provider=str(getattr(backend, "provider_name", "unknown")),
+                        arguments={"query": request.query},
+                        result_count=0,
+                        latency_ms=int((time.time() - started_at) * 1000),
+                        error="web_search_timeout",
+                    ),
+                    blocked_reason="web_search_timeout",
+                    warnings=[WEB_SEARCH_UNAVAILABLE_WARNING],
+                )
 
         if result.context:
             request.metadata["web_search_context"] = result.context
@@ -2932,7 +2984,13 @@ class InferenceEngine:
         self,
         request: QueryRequest,
         routing_decision: Any,
+        time_limit_seconds: Optional[float] = None,
     ) -> Optional[SimpleNamespace]:
+        """Retrieve documents when the request needs them, within time_limit_seconds.
+
+        Running out of time is a retrieval timeout: rag_policy AUTO answers
+        without documents, REQUIRED raises RetrievalUnavailableError.
+        """
         if not self._should_run_rag(request, routing_decision):
             return None
 
@@ -2950,6 +3008,7 @@ class InferenceEngine:
         request.metadata.pop("rag_unavailable", None)
         outcome = await self._retrieve_rag_outcome(
             request,
+            time_limit_seconds=time_limit_seconds,
             max_results=max_results,
             candidate_count=candidate_count,
             min_score=min_score,
@@ -3020,11 +3079,55 @@ class InferenceEngine:
     async def _retrieve_rag_outcome(
         self,
         request: QueryRequest,
+        *,
+        time_limit_seconds: Optional[float] = None,
         **retrieve_kwargs: Any,
     ) -> Any:
         """Retrieve with a typed outcome: hits, no_hits, timeout or error.
 
-        RAG services without ``retrieve_with_outcome`` only answer a list, so
+        The RAG service's own deadline still applies; time_limit_seconds (this
+        step's share of the request deadline) can only end it sooner.
+        """
+        try:
+            return await _await_within(
+                self._typed_rag_retrieval(request, **retrieve_kwargs),
+                time_limit_seconds,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "RAG retrieval for request %s ran out of its %ss share of the "
+                "request deadline",
+                request.request_id,
+                time_limit_seconds,
+            )
+            return SimpleNamespace(
+                status="timeout", results=[], detail="request deadline share"
+            )
+
+    def _retrieval_time_limit(
+        self, execution_budget: Optional[RequestExecutionBudget]
+    ) -> Optional[float]:
+        """Seconds one retrieval step may use: a share of the request time left."""
+        if execution_budget is None:
+            return None
+        try:
+            ratio = float(
+                self.config.get(
+                    "retrieval_budget_ratio", _DEFAULT_RETRIEVAL_BUDGET_RATIO
+                )
+            )
+        except (TypeError, ValueError):
+            ratio = _DEFAULT_RETRIEVAL_BUDGET_RATIO
+        if not 0.0 < ratio <= 1.0:
+            ratio = _DEFAULT_RETRIEVAL_BUDGET_RATIO
+        return execution_budget.remaining_seconds * ratio
+
+    async def _typed_rag_retrieval(
+        self,
+        request: QueryRequest,
+        **retrieve_kwargs: Any,
+    ) -> Any:
+        """RAG services without ``retrieve_with_outcome`` only answer a list, so
         a raised error is the only failure signal they can give.
         """
         retrieve_with_outcome = getattr(self.rag_service, "retrieve_with_outcome", None)
