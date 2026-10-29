@@ -605,6 +605,8 @@ class TestVLLMProvider:
         self, sample_query_request
     ):
         class StreamResponse:
+            status_code = 200
+
             async def __aenter__(self):
                 return self
 
@@ -721,6 +723,184 @@ class TestVLLMProvider:
         assert "endpoint down" in provider.endpoints[0].last_error
         provider.endpoints[1].client.post.assert_called_once()
 
+    def _http_status_pool(self, statuses, calls):
+        """Endpoints qwen-a (port 8001) and qwen-b (8002) on real httpx clients.
+
+        ``statuses`` is one status for every call, or a status per port.
+        """
+        import httpx
+
+        def handler(request):
+            port = request.url.port
+            calls.append((port, request.url.path))
+            status_code = statuses[port] if isinstance(statuses, dict) else statuses
+            if status_code == 200:
+                return httpx.Response(
+                    200,
+                    json={
+                        "choices": [{"text": f"answered by {port}"}],
+                        "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+                    },
+                )
+            return httpx.Response(
+                status_code,
+                json={
+                    "error": {
+                        "message": "This model's maximum context length is 4096"
+                        " tokens. However, you requested 5000 tokens."
+                    }
+                },
+            )
+
+        provider = vLLMProvider(
+            {
+                "failure_cooldown_seconds": 60,
+                "endpoints": [
+                    {"name": "qwen-a", "base_url": "http://127.0.0.1:8001"},
+                    {"name": "qwen-b", "base_url": "http://127.0.0.1:8002"},
+                ],
+            }
+        )
+        for endpoint in provider.endpoints:
+            endpoint.client = httpx.AsyncClient(
+                base_url=endpoint.base_url,
+                transport=httpx.MockTransport(handler),
+            )
+        return provider
+
+    async def _close_endpoint_clients(self, provider):
+        for endpoint in provider.endpoints:
+            await endpoint.client.aclose()
+
+    def _assert_endpoints_untouched(self, provider):
+        for endpoint in provider.endpoints:
+            assert endpoint.healthy is True, endpoint.name
+            assert endpoint.cooldown_until == 0.0, endpoint.name
+            assert endpoint.last_error is None, endpoint.name
+            assert endpoint.outstanding == 0, endpoint.name
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [400, 413, 422])
+    async def test_client_error_is_raised_without_taking_the_pool_offline(
+        self, sample_query_request, status_code
+    ):
+        import httpx
+
+        calls = []
+        provider = self._http_status_pool(status_code, calls)
+        try:
+            with pytest.raises(httpx.HTTPStatusError) as exc:
+                await provider.generate_response(sample_query_request, "mistral-7b")
+        finally:
+            await self._close_endpoint_clients(provider)
+
+        assert exc.value.response.status_code == status_code
+        assert len(calls) == 1
+        assert calls[0][1] == "/v1/completions"
+        self._assert_endpoints_untouched(provider)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [401, 403, 404, 408, 409, 429, 503])
+    async def test_endpoint_fault_still_marks_endpoints_and_fails_over(
+        self, sample_query_request, status_code
+    ):
+        # 404 is also an endpoint that does not load the model or has a wrong
+        # base_url path; 401/403 are its credentials: another endpoint may work.
+        import httpx
+
+        calls = []
+        provider = self._http_status_pool(status_code, calls)
+        try:
+            with pytest.raises(httpx.HTTPStatusError) as exc:
+                await provider.generate_response(sample_query_request, "mistral-7b")
+        finally:
+            await self._close_endpoint_clients(provider)
+
+        assert exc.value.response.status_code == status_code
+        assert sorted(port for port, _path in calls) == [8001, 8002]
+        for endpoint in provider.endpoints:
+            assert endpoint.healthy is False, endpoint.name
+            assert endpoint.cooldown_until > time.time(), endpoint.name
+            assert str(status_code) in endpoint.last_error, endpoint.name
+            assert endpoint.outstanding == 0, endpoint.name
+
+    @pytest.mark.asyncio
+    async def test_404_from_one_endpoint_fails_over_to_the_endpoint_serving_the_model(
+        self, sample_query_request
+    ):
+        calls = []
+        provider = self._http_status_pool({8001: 404, 8002: 200}, calls)
+        try:
+            response = await provider.generate_response(
+                sample_query_request, "mistral-7b"
+            )
+        finally:
+            await self._close_endpoint_clients(provider)
+
+        assert response.response_text == "answered by 8002"
+        assert [port for port, _path in calls] == [8001, 8002]
+        qwen_a, qwen_b = provider.endpoints
+        assert qwen_a.healthy is False
+        assert qwen_a.cooldown_until > time.time()
+        assert "404" in qwen_a.last_error
+        assert qwen_b.healthy is True
+        assert qwen_b.last_error is None
+
+    @pytest.mark.asyncio
+    async def test_stream_client_error_is_raised_without_taking_endpoint_offline(
+        self, sample_query_request
+    ):
+        import httpx
+
+        calls = []
+        provider = self._http_status_pool(400, calls)
+        try:
+            with pytest.raises(httpx.HTTPStatusError) as exc:
+                async for _chunk in provider.stream_response(
+                    sample_query_request, "mistral-7b"
+                ):
+                    pass
+        finally:
+            await self._close_endpoint_clients(provider)
+
+        assert exc.value.response.status_code == 400
+        assert "maximum context length" in exc.value.response.text
+        assert len(calls) == 1
+        self._assert_endpoints_untouched(provider)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [404, 503])
+    async def test_stream_endpoint_fault_marks_the_endpoint_and_reports_an_error(
+        self, sample_query_request, status_code
+    ):
+        calls = []
+        provider = self._http_status_pool(status_code, calls)
+        try:
+            chunks = [
+                chunk
+                async for chunk in provider.stream_response(
+                    sample_query_request, "mistral-7b"
+                )
+            ]
+        finally:
+            await self._close_endpoint_clients(provider)
+
+        assert len(chunks) == 1
+        assert chunks[0].startswith("Error: ")
+        assert str(status_code) in chunks[0]
+        # The chunk reaches the user: no internal endpoint URL or host.
+        assert "http://" not in chunks[0]
+        assert "https://" not in chunks[0]
+        assert "127.0.0.1" not in chunks[0]
+        assert "8001" not in chunks[0]
+        assert [port for port, _path in calls] == [8001]
+        qwen_a, qwen_b = provider.endpoints
+        assert qwen_a.healthy is False
+        assert qwen_a.cooldown_until > time.time()
+        assert str(status_code) in qwen_a.last_error
+        assert qwen_a.outstanding == 0
+        assert qwen_b.healthy is True
+
     @pytest.mark.asyncio
     async def test_prefix_affinity_reuses_prior_endpoint(self, sample_query_request):
         provider = vLLMProvider(
@@ -789,6 +969,8 @@ class TestVLLMProvider:
         observed_outstanding = []
 
         class StreamResponse:
+            status_code = 200
+
             async def __aenter__(self):
                 return self
 

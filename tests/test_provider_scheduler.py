@@ -895,6 +895,337 @@ async def test_probe_release_falls_back_to_epoch_checked_local_state_when_open()
     assert scheduler._local_circuit_state[key]["probe_count"] == 0
 
 
+class StatusCodeError(Exception):
+    """Carries ``status_code`` the way the openai/anthropic status errors do."""
+
+    def __init__(self, message, status_code):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class ResponseStatusError(Exception):
+    """Carries the status only on ``response``, like ``httpx.HTTPStatusError``."""
+
+    def __init__(self, message, status_code):
+        super().__init__(message)
+        self.response = SimpleNamespace(status_code=status_code)
+
+
+def _circuit_scheduler(clock, retry=None):
+    config = {
+        "failure_mode": "open",
+        "circuit_breaker": {"enabled": True, "failure_threshold": 1},
+    }
+    if retry is not None:
+        config["retry"] = retry
+    return ProviderCapacityScheduler(
+        config,
+        RecordingAdmission(),
+        time_func=clock,
+        sleep_func=clock.sleep,
+    )
+
+
+async def _assert_circuit_closed_and_admitting(scheduler):
+    state = scheduler._normalize_circuit_state(
+        await scheduler._read_circuit_state("openai", "gpt-5")
+    )
+    assert state["state"] == "closed"
+    assert state["failure_count"] == 0
+    lease = await scheduler.acquire(
+        request=QueryRequest(query="next", user_id="u2"),
+        model_name="gpt-5",
+        provider="openai",
+        estimated_input_tokens=1,
+    )
+    await scheduler.release(lease)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [StatusCodeError, ResponseStatusError])
+@pytest.mark.parametrize(
+    ("status_code", "message"),
+    [
+        (400, "max_tokens 5000 exceeds the context window"),
+        (400, "request req_429abc: prompt is too long"),
+        (401, "invalid api key sk-...5029"),
+        (403, "project proj_500 may not use this model"),
+        (404, "model gpt-5-0429 does not exist"),
+        (413, "request body of 15000000 bytes is too large"),
+        (422, "temperature must be <= 2, got 504"),
+    ],
+)
+async def test_client_error_status_is_not_retried_and_keeps_circuit_closed(
+    error_type, status_code, message
+):
+    clock = Clock()
+    scheduler = _circuit_scheduler(
+        clock, retry={"max_attempts_per_request": 3, "initial_backoff_ms": 0}
+    )
+    error = error_type(message, status_code)
+    operation = AsyncMock(side_effect=error)
+
+    assert scheduler._is_retryable_exception(error) is False
+    with pytest.raises(error_type):
+        await scheduler.run_provider_call(
+            request=QueryRequest(query="hello", user_id="u1"),
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+            operation=operation,
+        )
+
+    assert operation.await_count == 1
+    await _assert_circuit_closed_and_admitting(scheduler)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [StatusCodeError, ResponseStatusError])
+@pytest.mark.parametrize(
+    "status_code",
+    # 520-524 and 530 are Cloudflare's, in front of the providers.
+    [408, 409, 425, 429, 500, 502, 503, 504, 520, 522, 524, 529, 530],
+)
+async def test_transient_status_is_retryable_and_counts_toward_circuit(
+    error_type, status_code
+):
+    clock = Clock()
+    error = error_type("upstream refused the request", status_code)
+
+    retrying = ProviderCapacityScheduler(
+        {"retry": {"max_attempts_per_request": 2, "initial_backoff_ms": 0}},
+        RecordingAdmission(),
+        time_func=clock,
+        sleep_func=clock.sleep,
+    )
+    response = SimpleNamespace(total_tokens=2)
+    operation = AsyncMock(side_effect=[error, response])
+    result = await retrying.run_provider_call(
+        request=QueryRequest(query="hello", user_id="u1"),
+        model_name="gpt-5",
+        provider="openai",
+        estimated_input_tokens=1,
+        operation=operation,
+    )
+    assert result is response
+    assert operation.await_count == 2
+
+    scheduler = _circuit_scheduler(clock)
+    assert scheduler._is_retryable_exception(error) is True
+    with pytest.raises(error_type):
+        await scheduler.run_provider_call(
+            request=QueryRequest(query="hello", user_id="u1"),
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+            operation=AsyncMock(side_effect=error),
+        )
+    state = await scheduler._read_circuit_state("openai", "gpt-5")
+    assert state["state"] == "open"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [StatusCodeError, ResponseStatusError])
+@pytest.mark.parametrize("status_code", [501, 505])
+async def test_permanent_server_status_is_not_retried(error_type, status_code):
+    clock = Clock()
+    scheduler = _circuit_scheduler(
+        clock, retry={"max_attempts_per_request": 3, "initial_backoff_ms": 0}
+    )
+    error = error_type("upstream refused the request", status_code)
+    operation = AsyncMock(side_effect=error)
+
+    assert scheduler._is_retryable_exception(error) is False
+    with pytest.raises(error_type):
+        await scheduler.run_provider_call(
+            request=QueryRequest(query="hello", user_id="u1"),
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+            operation=operation,
+        )
+
+    assert operation.await_count == 1
+    await _assert_circuit_closed_and_admitting(scheduler)
+
+
+@pytest.mark.asyncio
+async def test_digits_in_a_plain_error_message_are_not_a_status_code():
+    clock = Clock()
+    scheduler = _circuit_scheduler(
+        clock, retry={"max_attempts_per_request": 3, "initial_backoff_ms": 0}
+    )
+    error = RuntimeError("prompt has 1500 tokens")
+    operation = AsyncMock(side_effect=error)
+
+    assert scheduler._is_retryable_exception(error) is False
+    with pytest.raises(RuntimeError, match="1500 tokens"):
+        await scheduler.run_provider_call(
+            request=QueryRequest(query="hello", user_id="u1"),
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+            operation=operation,
+        )
+
+    assert operation.await_count == 1
+    await _assert_circuit_closed_and_admitting(scheduler)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "503 temporarily overloaded",
+        "upstream overloaded",
+        "qwen temporarily unavailable",
+        "No healthy vLLM endpoint can serve model qwen",
+        "read timeout while waiting for tokens",
+        "rate limit reached for gpt-5",
+    ],
+)
+def test_word_markers_in_status_less_errors_stay_retryable(message):
+    scheduler = ProviderCapacityScheduler({}, RecordingAdmission())
+
+    assert scheduler._is_retryable_exception(RuntimeError(message)) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [StatusCodeError, ResponseStatusError])
+async def test_mid_stream_error_on_a_200_response_falls_back_to_markers(error_type):
+    # Anthropic raises SSE "error" events as an APIStatusError built from the
+    # 200 streaming response, so that status says nothing about the fault.
+    clock = Clock()
+    scheduler = _circuit_scheduler(clock)
+    overloaded = error_type("Overloaded", 200)
+
+    assert scheduler._is_retryable_exception(overloaded) is True
+    await scheduler.record_failure(
+        provider="anthropic", model_name="claude-sonnet-4-6", error=overloaded
+    )
+    state = await scheduler._read_circuit_state("anthropic", "claude-sonnet-4-6")
+    assert state["state"] == "open"
+
+    other = error_type("prompt is too long", 200)
+    assert scheduler._is_retryable_exception(other) is False
+
+
+@pytest.mark.parametrize("status_code", [301, 302, 307, 308])
+def test_redirect_status_is_not_retryable_even_when_the_message_says_temporary(
+    status_code,
+):
+    import httpx
+
+    # The vLLM clients do not follow redirects, so another attempt gets the
+    # same redirect. httpx words a 307 as "Temporary Redirect", which the
+    # "temporar" marker would otherwise match.
+    scheduler = ProviderCapacityScheduler({}, RecordingAdmission())
+    request = httpx.Request("POST", "http://127.0.0.1:8001/v1/completions")
+    response = httpx.Response(
+        status_code,
+        request=request,
+        headers={"location": "http://127.0.0.1:8001/v2/completions"},
+    )
+    with pytest.raises(httpx.HTTPStatusError) as exc:
+        response.raise_for_status()
+
+    assert scheduler._is_retryable_exception(exc.value) is False
+    for error_type in (StatusCodeError, ResponseStatusError):
+        error = error_type("Temporary Redirect, timeout, overloaded", status_code)
+        assert scheduler._is_retryable_exception(error) is False, error_type
+
+
+def test_real_anthropic_mid_stream_overloaded_error_is_retryable():
+    anthropic = pytest.importorskip("anthropic", minversion="0.20")
+    import httpx
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                b"event: error\n"
+                b'data: {"type": "error", "error": '
+                b'{"type": "overloaded_error", "message": "Overloaded"}}\n\n'
+            ),
+        )
+
+    client = anthropic.Anthropic(
+        api_key="test-key",
+        base_url="https://api.example.test",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        max_retries=0,
+    )
+    stream = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=16,
+        messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+    )
+    with pytest.raises(anthropic.APIStatusError) as exc:
+        for _event in stream:
+            pass
+    client.close()
+
+    assert exc.value.status_code == 200
+    scheduler = ProviderCapacityScheduler({}, RecordingAdmission())
+    assert scheduler._is_retryable_exception(exc.value) is True
+
+
+def test_real_sdk_errors_are_classified_by_status_code():
+    # The CI conftest stubs both SDKs without a __version__, so minversion
+    # skips there and this runs only against the real packages.
+    openai = pytest.importorskip("openai", minversion="1.0")
+    anthropic = pytest.importorskip("anthropic", minversion="0.20")
+    import httpx
+
+    scheduler = ProviderCapacityScheduler({}, RecordingAdmission())
+    request = httpx.Request("POST", "https://api.example.test/v1/chat")
+
+    def response(status_code):
+        return httpx.Response(status_code, request=request, json={})
+
+    not_retryable = [
+        openai.BadRequestError(
+            "max_tokens 5000 exceeds the context window",
+            response=response(400),
+            body=None,
+        ),
+        anthropic.BadRequestError(
+            "request req_429abc: prompt is too long",
+            response=response(400),
+            body=None,
+        ),
+        openai.APIStatusError(
+            "model gpt-5-0503 not found", response=response(404), body=None
+        ),
+        openai.InternalServerError(
+            "not implemented", response=response(501), body=None
+        ),
+    ]
+    retryable = [
+        openai.APIStatusError(
+            "upstream refused the request", response=response(500), body=None
+        ),
+        anthropic.APIStatusError(
+            "upstream refused the request", response=response(529), body=None
+        ),
+        openai.RateLimitError("slow down", response=response(429), body=None),
+        anthropic.InternalServerError("oops", response=response(500), body=None),
+        openai.InternalServerError(
+            "origin did not answer", response=response(524), body=None
+        ),
+        openai.APIConnectionError(request=request),
+        openai.APITimeoutError(request=request),
+        anthropic.APIConnectionError(request=request),
+        anthropic.APITimeoutError(request=request),
+    ]
+
+    for error in not_retryable:
+        assert scheduler._is_retryable_exception(error) is False, repr(error)
+    for error in retryable:
+        assert scheduler._is_retryable_exception(error) is True, repr(error)
+
+
 @pytest.mark.asyncio
 async def test_scheduler_retry_budget_exhaustion_stops_retry():
     scheduler = ProviderCapacityScheduler(

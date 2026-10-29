@@ -1357,6 +1357,11 @@ class vLLMProvider(BaseInferenceProvider):
                 )
 
             except Exception as e:
+                if self._is_request_rejection(e):
+                    logger.warning(
+                        "vLLM endpoint %s rejected the request: %s", endpoint.name, e
+                    )
+                    raise
                 last_error = e
                 excluded_endpoints.add(endpoint.name)
                 await self._mark_endpoint_failure(endpoint, e)
@@ -1388,6 +1393,10 @@ class vLLMProvider(BaseInferenceProvider):
                 raise RuntimeError(f"vLLM endpoint {endpoint.name} has no client")
 
             async with client.stream("POST", endpoint_path, json=payload) as response:
+                if response.status_code >= 400:
+                    # Read the error body so the HTTPStatusError carries it.
+                    await response.aread()
+                    response.raise_for_status()
                 async for line in response.aiter_lines():
                     if not line.startswith("data: "):
                         continue
@@ -1401,10 +1410,18 @@ class vLLMProvider(BaseInferenceProvider):
             await self._mark_endpoint_success(endpoint, prefix_key)
 
         except Exception as e:
+            if self._is_request_rejection(e):
+                logger.warning("vLLM endpoint rejected the stream request: %s", e)
+                raise
             if endpoint is not None:
                 await self._mark_endpoint_failure(endpoint, e)
             logger.error(f"vLLM streaming error: {e}")
-            yield f"Error: {str(e)}"
+            if isinstance(e, httpx.HTTPStatusError):
+                # str(e) names the internal endpoint URL; the chunk reaches
+                # the user, so it carries only the status.
+                yield f"Error: upstream returned HTTP {e.response.status_code}"
+            else:
+                yield f"Error: {str(e)}"
 
         finally:
             if endpoint is not None:
@@ -1553,6 +1570,20 @@ class vLLMProvider(BaseInferenceProvider):
                     endpoint.name,
                     time.time() + self.prefix_affinity_ttl_seconds,
                 )
+
+    @staticmethod
+    def _is_request_rejection(error: Exception) -> bool:
+        """400, 413 and 422 fault the request itself, not the endpoint.
+
+        Every endpoint would reject it the same way (too many tokens, bad
+        parameters), so it is neither retried elsewhere nor counted against
+        the endpoint's health. Other 4xx can belong to one endpoint: a 404
+        from one that does not load the model or has a wrong base_url path,
+        401/403 from its credentials. Those fail over like a 5xx.
+        """
+        if not isinstance(error, httpx.HTTPStatusError):
+            return False
+        return error.response.status_code in (400, 413, 422)
 
     async def _mark_endpoint_failure(
         self, endpoint: VLLMEndpointState, error: Exception

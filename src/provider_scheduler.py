@@ -120,6 +120,31 @@ SCHEDULER_WAITABLE_REASONS = {
     "model_token_budget_exceeded",
 }
 
+# 4xx statuses worth another attempt. Every 5xx is too (529 is Anthropic's
+# "overloaded", 520-524 and 530 come from Cloudflare in front of a provider)
+# except the two that say the server will never handle the request.
+RETRYABLE_CLIENT_STATUS_CODES = frozenset({408, 409, 425, 429})
+PERMANENT_SERVER_STATUS_CODES = frozenset({501, 505})
+
+
+def _is_retryable_status(status: int) -> bool:
+    if 500 <= status <= 599:
+        return status not in PERMANENT_SERVER_STATUS_CODES
+    return status in RETRYABLE_CLIENT_STATUS_CODES
+
+
+def _exception_status_code(exc: BaseException) -> Optional[int]:
+    """Read an HTTP status from ``status_code`` or ``response.status_code``.
+
+    Works for httpx and the openai/anthropic SDK errors without importing
+    the SDKs, which are absent in CI.
+    """
+    for carrier in (exc, getattr(exc, "response", None)):
+        status = getattr(carrier, "status_code", None)
+        if isinstance(status, int) and not isinstance(status, bool):
+            return status
+    return None
+
 
 @dataclass
 class CircuitPermit:
@@ -1362,9 +1387,14 @@ class ProviderCapacityScheduler:
             return True
         if isinstance(exc, httpx.TransportError):
             return True
-        if isinstance(exc, httpx.HTTPStatusError):
-            status = exc.response.status_code if exc.response else 0
-            return status in {408, 409, 425, 429, 500, 502, 503, 504}
+        # A status of 300 or more is authoritative: digits or words in the
+        # message are not (httpx calls a 307 a "Temporary Redirect", and the
+        # clients do not follow redirects). A lower status says nothing
+        # (Anthropic raises mid-stream SSE errors with the 200 of the
+        # stream), so the heuristics below decide.
+        status = _exception_status_code(exc)
+        if status is not None and status >= 300:
+            return _is_retryable_status(status)
         name = type(exc).__name__.lower()
         transient_names = (
             "ratelimit",
@@ -1384,11 +1414,6 @@ class ProviderCapacityScheduler:
                 "timeout",
                 "temporar",
                 "rate limit",
-                "429",
-                "500",
-                "502",
-                "503",
-                "504",
                 "overload",
                 "no healthy",
             )
