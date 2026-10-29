@@ -9,7 +9,12 @@ from unittest.mock import AsyncMock
 import pytest
 import yaml
 
-from slack.bot_real import SLACK_EMPTY_ANSWER_MESSAGE, SLACK_THINKING_TEXT, SlackBot
+from slack.bot_real import (
+    SLACK_AGENT_HANDOFF_TEXT,
+    SLACK_EMPTY_ANSWER_MESSAGE,
+    SLACK_THINKING_TEXT,
+    SlackBot,
+)
 
 
 def delivery_bot(process_query=None, *, chat_update=True, **config):
@@ -749,3 +754,61 @@ async def test_chat_files_are_still_downloaded(inference_response_factory):
     )
 
     bot._extract_query_attachments.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_chat_or_agent_is_decided_once_per_message(inference_response_factory):
+    # The thread becomes an Agent thread (the runtime accepted `agent <task>`)
+    # while this follow-up is already on the chat path.
+    bot = agent_thread_bot()
+    del bot.agent_threads[bot._thread_key("C1", "100.0")]
+    bot.inference_engine.process_query = answering(
+        inference_response_factory, "it is a stack trace"
+    )
+
+    async def agent_run_starts(_event):
+        bot.agent_threads[bot._thread_key("C1", "100.0")] = {
+            "channel_id": "C1",
+            "thread_ts": "100.0",
+            "owner_user_id": "U1",
+        }
+        return []
+
+    bot._extract_query_attachments = AsyncMock(side_effect=agent_run_starts)
+
+    await bot._process_message(agent_followup("what is this?"))
+
+    bot.message_handler._start_agent_prompt.assert_not_awaited()
+    bot.agent_bootstrap_builder.build_message_files.assert_not_awaited()
+    update = bot.web_client.chat_update.await_args.kwargs
+    assert update["text"] == "it is a stack trace"
+
+
+@pytest.mark.asyncio
+async def test_placeholder_handed_to_an_agent_gets_a_neutral_notice(monkeypatch):
+    bot = delivery_bot()
+
+    async def agent_posts_its_own_status(_event, _client):
+        bot.agent_threads[bot._thread_key("C1", "100.0")] = {
+            "channel_id": "C1",
+            "thread_ts": "100.0",
+            "owner_user_id": "U1",
+        }
+        return None
+
+    monkeypatch.setattr(
+        bot.message_handler,
+        "handle_message",
+        AsyncMock(side_effect=agent_posts_its_own_status),
+    )
+    persist = AsyncMock()
+    monkeypatch.setattr(bot, "_persist_message_state", persist)
+
+    await bot._process_message(top_level())
+
+    update = bot.web_client.chat_update.await_args.kwargs
+    assert update["text"] == SLACK_AGENT_HANDOFF_TEXT
+    assert update["text"] != SLACK_EMPTY_ANSWER_MESSAGE
+    assert persist.await_args.kwargs["active_thread_key"] == bot._thread_key(
+        "C1", "100.0"
+    )

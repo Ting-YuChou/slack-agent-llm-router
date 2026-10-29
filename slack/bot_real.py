@@ -95,6 +95,7 @@ MEMORY_SLASH_ONLY_MESSAGE = (
 SLACK_BUSY_MESSAGE = "The LLM Router is busy right now. Please retry in a moment."
 SLACK_THINKING_TEXT = "_Thinking…_"
 SLACK_SLASH_WORKING_TEXT = "Working on it…"
+SLACK_AGENT_HANDOFF_TEXT = "_Passed to the Agent run in this thread._"
 SLACK_EMPTY_ANSWER_MESSAGE = (
     "🤔 The model returned an empty answer. Please try again or rephrase "
     "your question."
@@ -1708,10 +1709,16 @@ class SlackMessageHandler:
         team_id = self.bot._extract_team_id(event)
         attachments = list(event.get("_query_attachments", []) or [])
 
-        is_agent_thread = getattr(self.bot, "_is_agent_thread", lambda *_args: False)
-        in_agent_thread = bool(event.get("thread_ts")) and is_agent_thread(
-            channel_id, event.get("thread_ts")
-        )
+        # The bot decides chat or Agent once per message, before it shows
+        # progress or downloads files; a thread that became an Agent thread
+        # since then does not change this message's lane.
+        decided_agent = event.get("_agent_request")
+        if not isinstance(decided_agent, bool):
+            is_agent_thread = getattr(
+                self.bot, "_is_agent_thread", lambda *_args: False
+            )
+            decided_agent = is_agent_thread(channel_id, event.get("thread_ts"))
+        in_agent_thread = bool(event.get("thread_ts")) and decided_agent
         # The chat path does not download an Agent thread's files.
         agent_files = [
             item for item in event.get("files") or [] if isinstance(item, dict)
@@ -4063,6 +4070,7 @@ class SlackBot:
             user_state_changed = self._synchronize_user_tier(user_id)
             user_prefs = self.user_manager.get_user_preferences(user_id)
             agent_request = self._is_agent_request(event)
+            event["_agent_request"] = agent_request
 
             if self._is_query_event(event):
                 if not self._within_rate_limit(user_id, agent=agent_request):
@@ -4136,17 +4144,24 @@ class SlackBot:
                     self._mark_thread_active(channel_id, thread_ts)
                     state_changed = True
                     active_thread_key = self._thread_key(channel_id, thread_ts)
-            elif placeholder_ts:
-                if not await self._replace_placeholder(
-                    channel_id, placeholder_ts, text=SLACK_EMPTY_ANSWER_MESSAGE
-                ):
-                    await self._post_reply(
-                        channel_id, reply_thread_ts, text=SLACK_EMPTY_ANSWER_MESSAGE
+            else:
+                # No reply text: the handler posted the reply itself (an Agent
+                # run's status message), or there is no answer.
+                handed_to_agent = self._is_agent_thread(channel_id, agent_thread_ts)
+                if placeholder_ts:
+                    notice = (
+                        SLACK_AGENT_HANDOFF_TEXT
+                        if handed_to_agent
+                        else SLACK_EMPTY_ANSWER_MESSAGE
                     )
-            elif self._is_agent_thread(channel_id, agent_thread_ts):
-                # The handler posted the reply itself: an Agent run's status message.
-                state_changed = True
-                active_thread_key = self._thread_key(channel_id, agent_thread_ts)
+                    replaced = await self._replace_placeholder(
+                        channel_id, placeholder_ts, text=notice
+                    )
+                    if not replaced and not handed_to_agent:
+                        await self._post_reply(channel_id, reply_thread_ts, text=notice)
+                if handed_to_agent:
+                    state_changed = True
+                    active_thread_key = self._thread_key(channel_id, agent_thread_ts)
 
             query_event = self._is_query_event(event)
             if query_event or user_state_changed:
