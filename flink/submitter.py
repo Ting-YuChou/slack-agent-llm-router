@@ -29,7 +29,7 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger("flink.submitter")
 
@@ -169,6 +169,9 @@ def _run(
         )
 
 
+TIMEOUT_RETURNCODE = 124
+
+
 def _submit(
     job: FlinkJob,
     job_config: Mapping[str, Any],
@@ -177,6 +180,21 @@ def _submit(
     restore_from: Optional[Path],
     run: Callable[..., Any],
 ) -> Optional[str]:
+    """Submit one job and return its id, or None if the attempt failed."""
+    return _submit_attempt(
+        job, job_config, jobmanager=jobmanager, restore_from=restore_from, run=run
+    )[0]
+
+
+def _submit_attempt(
+    job: FlinkJob,
+    job_config: Mapping[str, Any],
+    *,
+    jobmanager: str,
+    restore_from: Optional[Path],
+    run: Callable[..., Any],
+) -> Tuple[Optional[str], bool]:
+    """Submit one job; return (job id or None, whether the client timed out)."""
     command = ["flink", "run", "-m", jobmanager, "-d"]
     if restore_from is not None:
         command += ["-s", str(restore_from)]
@@ -186,16 +204,32 @@ def _submit(
         "FLINK_CONFIG_JSON": json.dumps(job_config, separators=(",", ":")),
     }
     result = run(command, env)
+    returncode = getattr(result, "returncode", 1)
     match = _JOB_ID.search(getattr(result, "stdout", "") or "")
-    if getattr(result, "returncode", 1) != 0 or match is None:
+    if returncode != 0 or match is None:
         logger.error(
             "flink run for %s failed (exit %s): %s",
             job.slug,
-            getattr(result, "returncode", None),
+            returncode,
             (getattr(result, "stderr", "") or "")[-2000:],
         )
+        return None, returncode == TIMEOUT_RETURNCODE
+    return match.group(1), False
+
+
+def _active_job_id(
+    fetch_json: Callable[[str], Any], jobmanager: str, name: str
+) -> Optional[str]:
+    """Return the id of an active job with this name, if the cluster has one."""
+    try:
+        overview = fetch_json(f"http://{jobmanager}/jobs/overview") or {}
+    except Exception as exc:
+        logger.warning("Could not list Flink jobs: %s", exc)
         return None
-    return match.group(1)
+    for job in overview.get("jobs", []) or []:
+        if job.get("name") == name and job.get("state") in ACTIVE_STATES:
+            return str(job.get("jid"))
+    return None
 
 
 def reconcile(
@@ -223,11 +257,17 @@ def reconcile(
         checkpoint = latest_checkpoint(
             checkpoint_root, recorded_job_ids(checkpoint_root, job.slug)
         )
-        job_id = _submit(
+        job_id, timed_out = _submit_attempt(
             job, job_config, jobmanager=jobmanager, restore_from=checkpoint, run=run
         )
         status = "restored" if checkpoint is not None else "submitted"
-        if job_id is None and checkpoint is not None:
+        if timed_out:
+            # The client gave up, but the job may have been accepted. Never
+            # start a stateless duplicate: adopt it if it runs, else retry the
+            # same restore on the next pass.
+            job_id = _active_job_id(fetch_json, jobmanager, job.name)
+            status = "adopted"
+        elif job_id is None and checkpoint is not None:
             # A checkpoint that no longer matches the job (or is damaged) must
             # not keep analytics down; start fresh and say so loudly.
             logger.warning(
@@ -235,10 +275,13 @@ def reconcile(
                 job.slug,
                 checkpoint,
             )
-            job_id = _submit(
+            job_id, timed_out = _submit_attempt(
                 job, job_config, jobmanager=jobmanager, restore_from=None, run=run
             )
             status = "submitted_fresh_after_restore_failure"
+            if timed_out:
+                job_id = _active_job_id(fetch_json, jobmanager, job.name)
+                status = "adopted"
         if job_id is None:
             outcome[job.slug] = "failed"
             continue
