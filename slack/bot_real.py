@@ -3049,16 +3049,20 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             context.user_tier = user_tier
             context.preferences = user_prefs
 
-            # Build request-scoped Slack and bot conversation context.
-            slack_context = SlackFetchedContext()
-            slack_context_builder = getattr(self.bot, "_build_slack_context", None)
-            if callable(slack_context_builder):
-                slack_context = await slack_context_builder(
+            # Build request-scoped Slack and bot conversation context. The
+            # Slack history and the memory search are independent, so they
+            # run concurrently and each fails open on its own.
+            slack_context, memory_results = await asyncio.gather(
+                self._fetch_query_slack_context(
                     client=client,
                     channel_id=channel_id,
                     thread_ts=thread_ts,
                     message_ts=message_ts,
-                )
+                ),
+                self._search_query_memory(
+                    text, user_id=user_id, channel_id=channel_id, team_id=team_id
+                ),
+            )
             # The thread transcript already holds this user's turns and the
             # bot's answers; the summary only stands in when there is none.
             conversation_context = ""
@@ -3072,28 +3076,14 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             request_context = self._join_context_sections(
                 [slack_context.context, conversation_context]
             )
-            memory_manager = getattr(self.bot, "memory_manager", None)
-            if memory_manager and getattr(memory_manager, "enabled", False):
-                scope = self.bot._memory_scope(team_id, user_id)
+            if memory_results:
                 try:
-                    memory_results = await memory_manager.search(
-                        scope,
-                        text,
-                        metadata=self._memory_visibility_metadata(
-                            channel_id=channel_id,
-                            include_all=False,
-                            global_only=False,
-                        ),
-                    )
-                    request_context = memory_manager.build_context(
+                    request_context = self.bot.memory_manager.build_context(
                         memory_results,
                         request_context,
                     )
                 except Exception:
-                    logger.exception("Failed to search Slack memory")
-                    request_context = self._join_context_sections(
-                        [slack_context.context, conversation_context]
-                    )
+                    logger.exception("Failed to build Slack memory context")
 
             # Create query request
             conversation_id_builder = getattr(
@@ -3235,6 +3225,55 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         if callable(error_builder):
             return error_builder()
         return "❌ Sorry, I couldn't process that request right now. Please try again in a moment."
+
+    async def _fetch_query_slack_context(
+        self,
+        *,
+        client: AsyncWebClient,
+        channel_id: str,
+        thread_ts: Optional[str],
+        message_ts: Optional[str],
+    ) -> SlackFetchedContext:
+        """Slack history for a query; the builder fails open as configured."""
+        slack_context_builder = getattr(self.bot, "_build_slack_context", None)
+        if not callable(slack_context_builder):
+            return SlackFetchedContext()
+        return await slack_context_builder(
+            client=client,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            message_ts=message_ts,
+        )
+
+    async def _search_query_memory(
+        self,
+        text: str,
+        *,
+        user_id: str,
+        channel_id: str,
+        team_id: Optional[str],
+    ) -> List[Any]:
+        """Long-term memory hits for a query; none when off or on failure."""
+        memory_manager = getattr(self.bot, "memory_manager", None)
+        if not memory_manager or not getattr(memory_manager, "enabled", False):
+            return []
+        try:
+            scope = self.bot._memory_scope(team_id, user_id)
+            return list(
+                await memory_manager.search(
+                    scope,
+                    text,
+                    metadata=self._memory_visibility_metadata(
+                        channel_id=channel_id,
+                        include_all=False,
+                        global_only=False,
+                    ),
+                )
+                or []
+            )
+        except Exception:
+            logger.exception("Failed to search Slack memory")
+            return []
 
     def _join_context_sections(self, sections: List[str]) -> str:
         """Join non-empty context sections without adding persistence semantics."""
