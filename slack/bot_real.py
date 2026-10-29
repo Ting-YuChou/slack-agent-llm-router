@@ -70,6 +70,7 @@ from src.utils.schema import (
     ToolPolicy,
     UserTier,
 )
+from src.utils.bounded_state import BoundedTTLMap
 from src.utils.metrics import SLACK_METRICS
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,13 @@ SLACK_AGENT_RUN_TTL_SECONDS = 30 * 24 * 3600
 RATE_LIMIT_WINDOW_SECONDS = 3600
 POSTED_CI_JOBS_LIMIT = 1000
 HANDLED_MESSAGES_LIMIT = 1000
+# Threads whose Agent runtime lookup a message event skips (S7): chat threads
+# known not to be Agent threads, and threads whose lookup just failed.
+AGENT_LOOKUP_SKIPS_LIMIT = 10_000
+AGENT_LOOKUP_ERROR_TTL_SECONDS = 10.0
+# Channels outside a name allowlist, so conversations.info runs once per TTL.
+CHANNEL_ALLOWLIST_MISSES_LIMIT = 1000
+CHANNEL_ALLOWLIST_MISS_TTL_SECONDS = 300.0
 UNVERIFIED_LABEL = "⚠️ 未驗證（沒有 verification profile）"
 MEMORY_SLASH_ONLY_MESSAGE = (
     "Memory commands are only available through Slack slash commands. "
@@ -3333,6 +3341,11 @@ class SlackBot:
         self.allowed_channels = config.get("channels", [])
         self.allowed_channel_ids: Set[str] = set()
         self.allowed_channel_names: Set[str] = set()
+        # Channel IDs conversations.info showed are outside the allowlist.
+        self._channel_allowlist_misses: BoundedTTLMap[str, bool] = BoundedTTLMap(
+            max_entries=CHANNEL_ALLOWLIST_MISSES_LIMIT,
+            ttl_seconds=CHANNEL_ALLOWLIST_MISS_TTL_SECONDS,
+        )
         self.rate_limiting = config.get("rate_limiting", {})
         self.context_settings = self._resolve_context_settings(
             config.get("context", {})
@@ -3358,6 +3371,13 @@ class SlackBot:
         self.active_threads: Dict[str, datetime] = {}
         self.active_thread_timeout = self.conversation_manager.session_timeout
         self.agent_threads: Dict[str, Dict[str, Any]] = {}
+        # "channel:thread_ts" -> "chat" or "error": a message event in such a
+        # thread does not ask the runtime whether it is an Agent thread. Local
+        # only, so after a restart each thread is looked up once again.
+        self._agent_lookup_skips: BoundedTTLMap[str, str] = BoundedTTLMap(
+            max_entries=AGENT_LOOKUP_SKIPS_LIMIT,
+            ttl_seconds=self.active_thread_timeout.total_seconds(),
+        )
         self.agent_runs: Dict[str, Dict[str, Any]] = {}
         # Each owner's tracked sessions, one per thread, the latest last.
         self.agent_user_runs: Dict[str, List[Dict[str, Any]]] = {}
@@ -3687,8 +3707,7 @@ class SlackBot:
             # thread still takes plain follow-ups, as it did before S13.
             if not self._is_active_thread(channel_id, thread_ts, refresh=False):
                 return
-            if not self._is_agent_thread(channel_id, thread_ts):
-                await self._restore_agent_thread(event)
+            await self._look_up_agent_thread(event)
             if self._is_agent_thread(channel_id, thread_ts):
                 return
         elif await self._reject_non_owner_agent_message(event):
@@ -3733,8 +3752,7 @@ class SlackBot:
         thread_ts = event.get("thread_ts")
         if not thread_ts:
             return False
-        if not self._is_agent_thread(channel_id, thread_ts):
-            await self._restore_agent_thread(event)
+        await self._look_up_agent_thread(event)
         tracked = self.agent_threads.get(self._thread_key(channel_id, thread_ts))
         if not tracked or tracked.get("owner_user_id") == event.get("user"):
             return False
@@ -3775,6 +3793,37 @@ class SlackBot:
                     return str(mode)
         return "discuss"
 
+    async def _look_up_agent_thread(self, event: Dict[str, Any]) -> None:
+        """Ask the runtime about a thread not known locally as an Agent thread.
+
+        A thread already known to be a chat thread, or whose lookup failed in
+        the last few seconds, is not asked about again (S7): a follow-up must
+        not wait on a runtime that is slow or down. A failed lookup counts as
+        "not an Agent thread".
+        """
+        channel_id = event.get("channel")
+        thread_ts = event.get("thread_ts")
+        if not channel_id or not thread_ts:
+            return
+        if self._is_agent_thread(channel_id, thread_ts):
+            return
+        key = self._thread_key(channel_id, thread_ts)
+        if key in self._agent_lookup_skips:
+            return
+        await self._restore_agent_thread(event)
+        if self._is_agent_thread(channel_id, thread_ts):
+            return
+        if key not in self._agent_lookup_skips:
+            # The runtime has no session for the thread: a chat thread.
+            self._agent_lookup_skips[key] = "chat"
+
+    def _remember_chat_thread(
+        self, channel_id: Optional[str], thread_ts: Optional[str]
+    ) -> None:
+        """Record a thread the bot started in chat, so no lookup is needed."""
+        if channel_id and thread_ts:
+            self._agent_lookup_skips[self._thread_key(channel_id, thread_ts)] = "chat"
+
     async def _restore_agent_thread(self, event: Dict[str, Any]):
         await self._adopt_agent_session(
             self._extract_team_id(event) or "unknown-team",
@@ -3797,6 +3846,12 @@ class SlackBot:
         try:
             session = await runtime.lookup_session(team_id, channel_id, thread_ts)
         except AgentRuntimeError:
+            if channel_id and thread_ts:
+                self._agent_lookup_skips.set(
+                    self._thread_key(channel_id, thread_ts),
+                    "error",
+                    ttl_seconds=AGENT_LOOKUP_ERROR_TTL_SECONDS,
+                )
             return None
         if not session:
             return None
@@ -3846,6 +3901,10 @@ class SlackBot:
         if not self._claim_message(event):
             return
 
+        if not event.get("thread_ts") and not self._is_agent_request(event):
+            # The answer starts a new thread at this message; an Agent start
+            # here registers its thread locally, which is checked first.
+            self._remember_chat_thread(channel_id, event.get("ts"))
         self._strip_bot_mention(event)
         await self._process_message(event)
 
@@ -4588,6 +4647,7 @@ class SlackBot:
         """Resolve configured channel names to Slack channel IDs when possible."""
         self.allowed_channel_ids = set()
         self.allowed_channel_names = set()
+        self._channel_allowlist_misses.clear()
 
         unresolved_names = set()
         for channel in self.allowed_channels:
@@ -4648,6 +4708,7 @@ class SlackBot:
         if (
             channel_id
             and self.allowed_channel_names
+            and channel_id not in self._channel_allowlist_misses
             and self.web_client is not None
             and hasattr(self.web_client, "conversations_info")
         ):
@@ -4663,6 +4724,8 @@ class SlackBot:
                 logger.warning(
                     f"Failed to resolve Slack channel info for allowlist check: {exc}"
                 )
+            # A miss or a failure: ask Slack again only after the TTL.
+            self._channel_allowlist_misses[channel_id] = True
 
         return False
 
