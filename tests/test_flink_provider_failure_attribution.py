@@ -117,6 +117,9 @@ class _Stream:
         self.sink_name = name
         return self
 
+    def uid(self, uid):
+        return self
+
 
 class _Env:
     def __init__(self):

@@ -1184,34 +1184,65 @@ def create_flink_job(config: Dict[str, Any]):
         )
     )
 
+    # Stable operator uids keep savepoints and retained checkpoints mapped to
+    # the same state across releases. Never change an existing uid; give a new
+    # operator a new one.
+    for stream, uid in (
+        (completion_stream, "inference-completed-source"),
+        (mapped_stream, "inference-completed-mapper"),
+        (metrics_stream, "model-metrics-window"),
+        (anomaly_stream, "model-metrics-anomaly"),
+        (model_guardrail_stream, "model-routing-guardrails"),
+        (provider_guardrail_stream, "provider-routing-guardrails"),
+        (user_policy_state_stream, "user-policy-state"),
+        (session_policy_state_stream, "session-policy-state"),
+    ):
+        stream.uid(uid)
+
     metrics_stream.map(
         lambda event: json.dumps(event),
         output_type=Types.STRING(),
-    ).add_sink(metrics_producer).name("Model Metrics 1m Sink")
+    ).add_sink(metrics_producer).name("Model Metrics 1m Sink").uid(
+        "model-metrics-1m-sink"
+    )
     validation_alerts_stream.map(
         lambda event: json.dumps(event),
         output_type=Types.STRING(),
-    ).add_sink(alerts_producer).name("Validation Alerts Sink")
+    ).add_sink(alerts_producer).name("Validation Alerts Sink").uid(
+        "validation-alerts-sink"
+    )
     anomaly_stream.map(
         lambda event: json.dumps(event),
         output_type=Types.STRING(),
-    ).add_sink(alerts_producer).name("Anomaly Alerts Sink")
+    ).add_sink(alerts_producer).name("Anomaly Alerts Sink").uid("anomaly-alerts-sink")
     model_guardrail_stream.map(
         lambda event: json.dumps(event),
         output_type=Types.STRING(),
-    ).add_sink(routing_guardrail_producer).name("Model Routing Guardrails Sink")
+    ).add_sink(routing_guardrail_producer).name("Model Routing Guardrails Sink").uid(
+        "model-routing-guardrails-sink"
+    )
     provider_guardrail_stream.map(
         lambda event: json.dumps(event),
         output_type=Types.STRING(),
-    ).add_sink(routing_guardrail_producer).name("Provider Routing Guardrails Sink")
+    ).add_sink(routing_guardrail_producer).name("Provider Routing Guardrails Sink").uid(
+        "provider-routing-guardrails-sink"
+    )
     user_policy_state_stream.map(
         lambda event: json.dumps(event),
         output_type=Types.STRING(),
-    ).add_sink(routing_policy_state_producer).name("User Routing Policy State Sink")
+    ).add_sink(routing_policy_state_producer).name(
+        "User Routing Policy State Sink"
+    ).uid(
+        "user-policy-state-sink"
+    )
     session_policy_state_stream.map(
         lambda event: json.dumps(event),
         output_type=Types.STRING(),
-    ).add_sink(routing_policy_state_producer).name("Session Routing Policy State Sink")
+    ).add_sink(routing_policy_state_producer).name(
+        "Session Routing Policy State Sink"
+    ).uid(
+        "session-policy-state-sink"
+    )
 
     return env
 

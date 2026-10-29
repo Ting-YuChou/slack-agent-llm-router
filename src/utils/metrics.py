@@ -603,6 +603,24 @@ class PipelineMetrics:
             "ClickHouse insertion errors",
         )
 
+        self.clickhouse_flush_failures = Counter(
+            "llm_router_clickhouse_flush_failures_total",
+            "ClickHouse sink batch flush failures by error kind",
+            ["topic", "kind"],
+        )
+
+        self.clickhouse_rows_dead_lettered = Counter(
+            "llm_router_clickhouse_rows_dead_lettered_total",
+            "Rows ClickHouse rejected permanently and sent to the DLQ",
+            ["topic"],
+        )
+
+        self.clickhouse_flush_retry_delay = Gauge(
+            "llm_router_clickhouse_flush_retry_delay_seconds",
+            "Current backoff before the next periodic flush of a sink topic",
+            ["topic"],
+        )
+
         self.query_duration = Histogram(
             "llm_router_clickhouse_query_duration_seconds",
             "ClickHouse query duration",

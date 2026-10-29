@@ -5,22 +5,31 @@ Handles real-time data ingestion, processing, and storage to ClickHouse
 
 import asyncio
 import copy
+import hashlib
 import inspect
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from collections import OrderedDict
-from typing import Dict, List, Optional, Any, Callable
+from types import SimpleNamespace
+from typing import Dict, List, Mapping, Optional, Any, Callable, Tuple
 from dataclasses import dataclass, asdict, field
 import uuid
 
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 from aiokafka.errors import KafkaError
 from aiokafka.structs import TopicPartition
+
+try:
+    from aiokafka import ConsumerRebalanceListener
+except ImportError:  # pragma: no cover - CI stubs aiokafka without it
+    ConsumerRebalanceListener = object  # type: ignore[assignment,misc]
 import clickhouse_connect
 from clickhouse_connect.driver import Client
 
+from src.kafka_topics import dead_letter_topic_name, dlq_enabled
 from src.prompt_assembly import PROMPT_CONTENT_METADATA_KEYS
 from src.redaction import context_summary, redact, redact_text
 from src.routing_features import estimate_query_tokens
@@ -154,15 +163,44 @@ def _json_text(value: Any, default: Optional[Callable[[Any], Any]] = None) -> st
     return _json_bytes(value, default=default).decode("utf-8")
 
 
+# Free-text fields never copied into a dead-letter payload (X6).
+_PRIVATE_ROW_FIELDS = frozenset({"query_text", "query", "context", "response_text"})
+
+
 def _private_free_payload(value: Any) -> Any:
-    """Redact credentials and replace a request `context` with its size."""
-    if isinstance(value, dict) and "context" in value:
+    """Redact credentials, drop free text and replace `context` with its size."""
+    if isinstance(value, dict) and _PRIVATE_ROW_FIELDS & set(value):
         value = dict(value)
-        context = value.pop("context")
-        summary = context_summary(None if context is None else str(context))
-        for key, item in summary.items():
-            value.setdefault(key, item)
+        if "context" in value:
+            context = value.pop("context")
+            summary = context_summary(None if context is None else str(context))
+            for key, item in summary.items():
+                value.setdefault(key, item)
+        for key in _PRIVATE_ROW_FIELDS:
+            value.pop(key, None)
     return redact(value)
+
+
+def _dead_letter_payload(value: Any, error: BaseException) -> Any:
+    """Return a private-free DLQ copy of a source message value.
+
+    A value that is not JSON (truncated or corrupt) cannot be filtered field
+    by field and may hold user text, so it is replaced by its length, a hash
+    prefix and the failure reason.
+    """
+    payload = _json_safe_payload(value)
+    if isinstance(payload, (dict, list)) or payload is None:
+        return _private_free_payload(payload)
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+    else:
+        raw = str(value).encode("utf-8", errors="replace")
+    return {
+        "unparseable": True,
+        "length": len(raw),
+        "sha256_prefix": hashlib.sha256(raw).hexdigest()[:16],
+        "reason": type(error).__name__,
+    }
 
 
 def _alert_payload(data: Dict[str, Any]) -> Any:
@@ -583,6 +621,121 @@ class RoutingPolicyStateEntry:
         }
 
 
+# ClickHouse insert failures fall in three kinds, matched by class name
+# because clickhouse-connect is optional in CI:
+#   "row":       only some rows can never be written; bisect and dead-letter them.
+#   "schema":    the table does not match the code (unknown column or table).
+#                Every row would fail, so keep the batch and back off loudly.
+#   "transient": anything else; keep the batch and back off.
+_ROW_ERROR_NAMES = frozenset({"DataError"})
+_SCHEMA_ERROR_NAMES = frozenset({"ProgrammingError"})
+_TRANSIENT_ERROR_NAMES = frozenset({"OperationalError"})
+# Server-side "Code: N" values that depend only on the rows being inserted.
+_ROW_CLICKHOUSE_ERROR_CODES = frozenset(
+    {
+        6,  # CANNOT_PARSE_TEXT
+        26,  # CANNOT_PARSE_QUOTED_STRING
+        27,  # CANNOT_PARSE_INPUT_ASSERTION_FAILED
+        38,  # CANNOT_PARSE_DATE
+        41,  # CANNOT_PARSE_DATETIME
+        53,  # TYPE_MISMATCH
+        69,  # ARGUMENT_OUT_OF_BOUND
+        70,  # CANNOT_CONVERT_TYPE
+        72,  # CANNOT_PARSE_NUMBER
+        117,  # INCORRECT_DATA
+        321,  # VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE
+        691,  # UNKNOWN_ELEMENT_OF_ENUM
+    }
+)
+# Server-side codes that mean the schema, not the rows, is wrong.
+_SCHEMA_CLICKHOUSE_ERROR_CODES = frozenset(
+    {
+        16,  # NO_SUCH_COLUMN_IN_TABLE
+        47,  # UNKNOWN_IDENTIFIER
+        60,  # UNKNOWN_TABLE
+        81,  # UNKNOWN_DATABASE
+    }
+)
+_CLICKHOUSE_ERROR_CODE = re.compile(r"\bCode:\s*(\d+)")
+
+
+def _classify_insert_error(error: Optional[BaseException]) -> str:
+    """Return "row", "schema" or "transient" for a failed ClickHouse insert."""
+    if error is None:
+        return "transient"
+    names = {cls.__name__ for cls in type(error).__mro__}
+    if names & _TRANSIENT_ERROR_NAMES:
+        return "transient"
+    if names & _SCHEMA_ERROR_NAMES:
+        return "schema"
+    if names & _ROW_ERROR_NAMES:
+        return "row"
+    if "DatabaseError" in names:
+        match = _CLICKHOUSE_ERROR_CODE.search(str(error))
+        code = int(match.group(1)) if match else None
+        if code in _SCHEMA_CLICKHOUSE_ERROR_CODES:
+            return "schema"
+        if code in _ROW_CLICKHOUSE_ERROR_CODES:
+            return "row"
+        return "transient"
+    # Row serialisation in to_dict() or in the driver's column packers.
+    if isinstance(error, (TypeError, ValueError, OverflowError)):
+        return "row"
+    return "transient"
+
+
+def _row_field(row: Any, name: str, default: Any = None) -> Any:
+    """Read a field from a dataclass row or a plain dict row."""
+    if isinstance(row, Mapping):
+        return row.get(name, default)
+    return getattr(row, name, default)
+
+
+def _dead_letter_row_payload(row: Any) -> Dict[str, Any]:
+    """Return a JSON-safe, private-free copy of a rejected ClickHouse row."""
+    try:
+        if isinstance(row, Mapping):
+            data = dict(row)
+        elif callable(getattr(row, "to_dict", None)):
+            data = row.to_dict()
+        else:
+            data = {}
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    payload: Dict[str, Any] = {"row_type": type(row).__name__}
+    for key, value in data.items():
+        if key in _PRIVATE_ROW_FIELDS:
+            continue
+        if isinstance(value, datetime):
+            value = _isoformat_utc(value)
+        payload[key] = _json_safe_payload(value)
+    return payload
+
+
+class AckTimeoutError(asyncio.TimeoutError):
+    """The record may already be on the broker: we only stopped waiting for its ack."""
+
+
+def _is_ack_timeout(error: BaseException) -> bool:
+    """Return whether a send failed after the record may have been written.
+
+    A timeout before the record reached the producer's accumulator (metadata
+    or buffer wait) is a plain TimeoutError and is safe to retry.
+    """
+    return isinstance(error, AckTimeoutError)
+
+
+def _has_two_phase_send(producer: Any) -> bool:
+    """Return whether ``producer.send`` enqueues and returns a delivery future.
+
+    True for aiokafka's producer, whose class defines ``async def send``. Test
+    doubles that only mock ``send_and_wait`` use the single-call path.
+    """
+    return inspect.iscoroutinefunction(getattr(type(producer), "send", None))
+
+
 class KafkaProducerManager:
     """Manages Kafka message production"""
 
@@ -695,7 +848,10 @@ class KafkaProducerManager:
                 return True
             except Exception as e:
                 last_error = e
-                if attempt >= self.retries:
+                if attempt >= self.retries or _is_ack_timeout(e):
+                    # An ack timeout does not mean the broker dropped the record:
+                    # it may already be written. Resending here would duplicate
+                    # it, so leave delivery retries to the idempotent producer.
                     break
                 backoff_seconds = (self.retry_backoff_ms / 1000.0) * (2**attempt)
                 if backoff_seconds > 0:
@@ -835,13 +991,33 @@ class KafkaProducerManager:
         if self.producer is None:
             raise RuntimeError("Kafka producer has not been initialized")
 
+        if self.wait_for_ack and _has_two_phase_send(self.producer):
+            # Phase 1: wait for metadata and buffer space. A timeout here means
+            # the record was never enqueued, so the caller may retry it.
+            delivery = await asyncio.wait_for(
+                self.producer.send(topic=topic, key=key, value=value),
+                timeout=self.send_timeout_seconds,
+            )
+            # Phase 2: the record is in the accumulator; the idempotent
+            # producer retries delivery itself, so never resend after this.
+            try:
+                return await asyncio.wait_for(
+                    delivery, timeout=self.send_timeout_seconds
+                )
+            except asyncio.TimeoutError as exc:
+                raise AckTimeoutError(str(exc)) from exc
+
         if self.wait_for_ack:
             send_and_wait = getattr(self.producer, "send_and_wait", None)
             if callable(send_and_wait):
-                return await asyncio.wait_for(
-                    send_and_wait(topic=topic, key=key, value=value),
-                    timeout=self.send_timeout_seconds,
-                )
+                try:
+                    return await asyncio.wait_for(
+                        send_and_wait(topic=topic, key=key, value=value),
+                        timeout=self.send_timeout_seconds,
+                    )
+                except asyncio.TimeoutError as exc:
+                    # Cannot tell which phase timed out: do not resend.
+                    raise AckTimeoutError(str(exc)) from exc
 
         send_result = await self.producer.send(topic=topic, key=key, value=value)
         if self.wait_for_ack and inspect.isawaitable(send_result):
@@ -1349,7 +1525,13 @@ class ClickHouseManager:
             try:
                 await self._run_blocking(self.client.command, sql)
             except Exception as e:
-                logger.debug(f"Skipping optional schema migration: {e}")
+                # ADD COLUMN IF NOT EXISTS is idempotent, so a failure here means
+                # every insert using the column would fail. Fail startup instead.
+                table_name = sql.split()[2]
+                logger.error(f"Failed schema migration on {table_name}: {e}")
+                raise RuntimeError(
+                    f"Failed to apply ClickHouse schema migration for {table_name}"
+                ) from e
 
     async def insert_query_log(self, query_log: QueryLogEntry):
         """Insert single query log entry"""
@@ -1754,9 +1936,12 @@ class BatchBufferState:
     paused: bool = False
     paused_partitions: set[TopicPartition] = field(default_factory=set)
     flush_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    consecutive_failures: int = 0
+    retry_delay_seconds: float = 0
+    next_flush_at: float = 0.0
 
 
-class _BatchBackpressureRebalanceListener:
+class _BatchBackpressureRebalanceListener(ConsumerRebalanceListener):
     """Reapply topic backpressure as soon as partitions are assigned."""
 
     def __init__(self, manager: "KafkaConsumerManager", topic_key: str, consumer):
@@ -1796,7 +1981,12 @@ class KafkaConsumerManager:
         self.consumer_config = {
             "bootstrap_servers": self.bootstrap_servers,
             "group_id": consumer_section.get("group_id", "llm-router-consumer"),
-            "auto_offset_reset": consumer_section.get("auto_offset_reset", "latest"),
+            # The ClickHouse sink replays the retained backlog when its group is
+            # new or reset; other consumers keep the shared auto_offset_reset.
+            "auto_offset_reset": consumer_section.get(
+                "sink_auto_offset_reset",
+                consumer_section.get("auto_offset_reset", "latest"),
+            ),
             "enable_auto_commit": consumer_section.get("enable_auto_commit", False),
             "max_poll_records": consumer_section.get("max_poll_records", 500),
         }
@@ -1806,9 +1996,7 @@ class KafkaConsumerManager:
         self.supervisor_max_backoff_seconds = float(
             consumer_section.get("supervisor_max_backoff_seconds", 30.0)
         )
-        self.dlq_enabled = bool(
-            dlq_section.get("enabled", consumer_section.get("dlq_enabled", True))
-        )
+        self.dlq_enabled = dlq_enabled(config)
         self.dlq_topic_suffix = str(dlq_section.get("topic_suffix", ".dlq"))
         self.dead_letter_topics = dict(config.get("dead_letter_topics", {}) or {})
         self.dlq_send_timeout_seconds = float(
@@ -1828,15 +2016,15 @@ class KafkaConsumerManager:
             "routing_policy_state",
             "alerts",
         )
-        self.batch_buffer_states = {
-            topic_key: BatchBufferState() for topic_key in batched_topics
-        }
+        self.batch_buffer_states: Dict[str, BatchBufferState] = {}
         # Compatibility views retained for callers and diagnostics that inspect
         # the old public dictionaries. BatchBufferState remains authoritative.
-        self.batch_processors = {
-            topic_key: state.pending_rows
-            for topic_key, state in self.batch_buffer_states.items()
-        }
+        self.batch_processors: Dict[str, List[Any]] = {}
+        self.pending_commit_offsets: Dict[str, Dict[TopicPartition, int]] = {}
+        self.awaiting_commit_offsets: Dict[str, Dict[TopicPartition, int]] = {}
+        self.batch_flush_locks: Dict[str, asyncio.Lock] = {}
+        for topic_key in batched_topics:
+            self._add_batched_topic(topic_key)
         self.observers: Dict[str, List[Callable[[Dict[str, Any]], Any]]] = {
             "requests_enriched": [],
             "analytics_model_metrics_1m": [],
@@ -1859,21 +2047,27 @@ class KafkaConsumerManager:
         self.max_concurrent_flushes = max(
             1, int(consumer_section.get("max_concurrent_flushes", 4))
         )
+        self.flush_retry_initial_backoff_seconds = max(
+            0.0,
+            float(consumer_section.get("flush_retry_initial_backoff_seconds", 5.0)),
+        )
+        self.flush_retry_max_backoff_seconds = max(
+            self.flush_retry_initial_backoff_seconds,
+            float(consumer_section.get("flush_retry_max_backoff_seconds", 120.0)),
+        )
         self.last_batch_time = time.time()
         self.running = False
-        self.pending_commit_offsets: Dict[str, Dict[TopicPartition, int]] = {
-            topic_key: state.pending_offsets
-            for topic_key, state in self.batch_buffer_states.items()
-        }
-        self.awaiting_commit_offsets: Dict[str, Dict[TopicPartition, int]] = {
-            topic_key: state.awaiting_commit_offsets
-            for topic_key, state in self.batch_buffer_states.items()
-        }
-        self.batch_flush_locks: Dict[str, asyncio.Lock] = {
-            topic_key: state.flush_lock
-            for topic_key, state in self.batch_buffer_states.items()
-        }
         self._rebalance_listeners: Dict[str, Any] = {}
+
+    def _add_batched_topic(self, topic_key: str) -> BatchBufferState:
+        """Create the buffer state and compatibility views for a sink topic."""
+        state = BatchBufferState()
+        self.batch_buffer_states[topic_key] = state
+        self.batch_processors[topic_key] = state.pending_rows
+        self.pending_commit_offsets[topic_key] = state.pending_offsets
+        self.awaiting_commit_offsets[topic_key] = state.awaiting_commit_offsets
+        self.batch_flush_locks[topic_key] = state.flush_lock
+        return state
 
     def _install_rebalance_listener(
         self, topic_key: str, topic_name: str, consumer: AIOKafkaConsumer
@@ -1881,6 +2075,19 @@ class KafkaConsumerManager:
         listener = _BatchBackpressureRebalanceListener(self, topic_key, consumer)
         consumer.subscribe(topics=[topic_name], listener=listener)
         self._rebalance_listeners[topic_key] = listener
+
+    async def _create_consumer(
+        self, topic_key: str, topic_name: str
+    ) -> AIOKafkaConsumer:
+        """Subscribe with the backpressure listener, then start.
+
+        Re-subscribing a running consumer races its fetcher, so the listener
+        is installed before start() on first start and on every restart.
+        """
+        consumer = AIOKafkaConsumer(**self.consumer_config)
+        self._install_rebalance_listener(topic_key, topic_name, consumer)
+        await consumer.start()
+        return consumer
 
     async def initialize(self):
         """Initialize Kafka consumers"""
@@ -1908,9 +2115,7 @@ class KafkaConsumerManager:
                     "routing_policy_state",
                     "alerts",
                 ]:
-                    consumer = AIOKafkaConsumer(topic_name, **self.consumer_config)
-                    await consumer.start()
-                    self._install_rebalance_listener(topic_key, topic_name, consumer)
+                    consumer = await self._create_consumer(topic_key, topic_name)
                     self.consumers[topic_key] = consumer
                     self.topic_names_by_key[topic_key] = topic_name
                     self.consumer_task_status[topic_key] = {
@@ -1995,10 +2200,8 @@ class KafkaConsumerManager:
                 logger.warning(f"Failed to stop unhealthy {topic_key} consumer: {e}")
 
         topic_name = self.topic_names_by_key.get(topic_key) or self.topics[topic_key]
-        consumer = AIOKafkaConsumer(topic_name, **self.consumer_config)
-        await consumer.start()
+        consumer = await self._create_consumer(topic_key, topic_name)
         self.consumers[topic_key] = consumer
-        self._install_rebalance_listener(topic_key, topic_name, consumer)
         await self._refresh_batch_backpressure(topic_key)
         return consumer
 
@@ -2043,7 +2246,7 @@ class KafkaConsumerManager:
                         context_compressed=data.get("context_compressed", False),
                         compression_ratio=data.get("compression_ratio", 0.0),
                         cached_response=data.get("cached_response", False),
-                        **self._kafka_event_metadata(message),
+                        **self._payload_event_metadata(data, message),
                     )
 
                     # Add to batch
@@ -2190,19 +2393,36 @@ class KafkaConsumerManager:
             "kafka_offset": offset,
         }
 
+    def _payload_event_metadata(
+        self, data: Dict[str, Any], message: Any
+    ) -> Dict[str, Any]:
+        """Prefer the producer's event identity so replays dedupe in ClickHouse.
+
+        The Kafka coordinate is only a fallback: a resent or replayed message
+        lands at a new offset, which would otherwise create a second row.
+        """
+        metadata = self._kafka_event_metadata(message)
+        payload_event_id = str(data.get("event_id") or "").strip()
+        if payload_event_id:
+            metadata["event_id"] = payload_event_id
+        return metadata
+
     def _dead_letter_topic(self, topic_key: str, message: Any) -> str:
         """Resolve the DLQ topic for a failed source message."""
-        if topic_key in self.dead_letter_topics:
-            return self.dead_letter_topics[topic_key]
-        configured_key = f"{topic_key}_dlq"
-        if configured_key in self.topics:
-            return self.topics[configured_key]
         source_topic = (
             getattr(message, "topic", None)
             or self.topic_names_by_key.get(topic_key)
             or topic_key
         )
-        return f"{source_topic}{self.dlq_topic_suffix}"
+        return dead_letter_topic_name(
+            {
+                **self.config,
+                "dead_letter_topics": self.dead_letter_topics,
+                "dlq": {"topic_suffix": self.dlq_topic_suffix},
+            },
+            topic_key,
+            source_topic,
+        )
 
     async def _publish_dead_letter(
         self,
@@ -2233,9 +2453,7 @@ class KafkaConsumerManager:
             "failure_stage": stage,
             "error_type": type(error).__name__,
             "error_message": redact_text(str(error))[:2000],
-            "payload": _private_free_payload(
-                _json_safe_payload(getattr(message, "value", None))
-            ),
+            "payload": _dead_letter_payload(getattr(message, "value", None), error),
         }
         topic = self._dead_letter_topic(topic_key, message)
         key = metadata["event_id"] or str(uuid.uuid4())
@@ -2267,7 +2485,22 @@ class KafkaConsumerManager:
         PIPELINE_METRICS.consumer_errors.inc()
 
         if batched:
-            await self.flush_pending_batches()
+            # Only this topic's earlier rows must be durable before committing
+            # past the poison message; other topics' failures are not ours.
+            try:
+                await self.flush_topic(topic_key)
+            except Exception as flush_error:
+                if _classify_insert_error(flush_error) != "schema":
+                    raise
+                # The topic is backing off on schema drift. Raising would
+                # restart the consumer and re-read the buffered rows, so DLQ
+                # the poison message now and commit its offset only together
+                # with those rows, after they are written.
+                if await self._publish_dead_letter(
+                    topic_key, message, error, stage=stage
+                ):
+                    self._track_commit_offset(topic_key, message)
+                return
 
         if await self._publish_dead_letter(topic_key, message, error, stage=stage):
             await self._commit_processed_message(topic_key, message)
@@ -2329,19 +2562,31 @@ class KafkaConsumerManager:
         kafka_metadata: Optional[Dict[str, Any]] = None,
     ) -> ModelPerformanceEntry:
         """Convert a Flink analytics window event to a ClickHouse row."""
+        window_start_ms = int(data.get("window_start_ms", 0) or 0)
         window_end_ms = int(data.get("window_end_ms", 0) or 0)
-        event_time = _parse_datetime(
-            data.get("emitted_at"),
-            default=datetime.fromtimestamp(window_end_ms / 1000, tz=timezone.utc)
-            if window_end_ms
-            else datetime.now(timezone.utc),
-        )
+        model_name = str(data.get("model_name", "unknown"))
+        provider = str(data.get("provider", ""))
+        metadata = dict(kafka_metadata or {})
+        if window_start_ms:
+            # A replayed window is re-emitted with a new emitted_at and a new
+            # offset; keying the row on the window keeps FINAL at one row.
+            event_time = datetime.fromtimestamp(window_start_ms / 1000, tz=timezone.utc)
+            metadata[
+                "event_id"
+            ] = f"{model_name}:{provider}:{window_start_ms}:{window_end_ms}"
+        else:
+            event_time = _parse_datetime(
+                data.get("emitted_at"),
+                default=datetime.fromtimestamp(window_end_ms / 1000, tz=timezone.utc)
+                if window_end_ms
+                else datetime.now(timezone.utc),
+            )
 
         return ModelPerformanceEntry(
             timestamp=event_time,
-            model_name=str(data.get("model_name", "unknown")),
-            provider=str(data.get("provider", "")),
-            window_start_ms=int(data.get("window_start_ms", 0) or 0),
+            model_name=model_name,
+            provider=provider,
+            window_start_ms=window_start_ms,
             window_end_ms=window_end_ms,
             window_size_seconds=int(data.get("window_size_seconds", 60) or 60),
             requests_count=int(data.get("request_count", 0) or 0),
@@ -2355,7 +2600,7 @@ class KafkaConsumerManager:
             queries_per_second=float(data.get("queries_per_second", 0.0) or 0.0),
             cache_hit_rate=float(data.get("cache_hit_rate", 0.0) or 0.0),
             cached_count=int(data.get("cached_count", 0) or 0),
-            **(kafka_metadata or {}),
+            **metadata,
         )
 
     def _build_alert_event_entry(
@@ -2365,24 +2610,52 @@ class KafkaConsumerManager:
     ) -> AlertEventEntry:
         """Convert an alert event payload to a ClickHouse row."""
         event_type = str(data.get("event_type", "") or "")
+        alert_type = str(
+            data.get("alert_type") or data.get("trigger_type") or "unknown"
+        )
+        anomaly_type = str(data.get("anomaly_type") or data.get("trigger_type", ""))
+        source_event_type = str(data.get("original_event_type") or event_type)
+        model_name = str(data.get("model_name", "") or "")
+        provider = str(data.get("provider", "") or "")
+        window_start_ms = int(data.get("window_start_ms", 0) or 0)
+        window_end_ms = int(data.get("window_end_ms", 0) or 0)
+        timestamp = _parse_datetime(data.get("emitted_at"))
+        metadata = dict(kafka_metadata or {})
+        if window_start_ms and window_end_ms:
+            # Window alerts and guardrails are re-emitted with a new emitted_at
+            # and offset when Flink restores; key them on what they describe.
+            timestamp = datetime.fromtimestamp(window_end_ms / 1000, tz=timezone.utc)
+            metadata["event_id"] = ":".join(
+                str(part)
+                for part in (
+                    event_type,
+                    data.get("scope_type", "") or "",
+                    data.get("scope_key", "") or "",
+                    alert_type,
+                    anomaly_type,
+                    data.get("guardrail_action", "") or "",
+                    model_name,
+                    provider,
+                    window_start_ms,
+                    window_end_ms,
+                )
+            )
         return AlertEventEntry(
-            timestamp=_parse_datetime(data.get("emitted_at")),
-            alert_type=str(
-                data.get("alert_type") or data.get("trigger_type") or "unknown"
-            ),
+            timestamp=timestamp,
+            alert_type=alert_type,
             severity=str(data.get("severity", "warning")),
             description=str(data.get("description", "")),
-            anomaly_type=str(data.get("anomaly_type") or data.get("trigger_type", "")),
-            source_event_type=str(data.get("original_event_type") or event_type),
+            anomaly_type=anomaly_type,
+            source_event_type=source_event_type,
             request_id=str(data.get("request_id", "") or ""),
             query_id=str(data.get("query_id", "") or ""),
             user_id=str(data.get("user_id", "") or ""),
-            model_name=str(data.get("model_name", "") or ""),
-            provider=str(data.get("provider", "") or ""),
-            window_start_ms=int(data.get("window_start_ms", 0) or 0),
-            window_end_ms=int(data.get("window_end_ms", 0) or 0),
+            model_name=model_name,
+            provider=provider,
+            window_start_ms=window_start_ms,
+            window_end_ms=window_end_ms,
             payload_json=_json_text(_alert_payload(data), default=str),
-            **(kafka_metadata or {}),
+            **metadata,
         )
 
     def _build_routing_policy_state_entry(
@@ -2583,7 +2856,7 @@ class KafkaConsumerManager:
                 batch_timeout_elapsed = current_time - self.last_batch_time > 30
 
                 if reached_batch_size or batch_timeout_elapsed:
-                    await self.flush_pending_batches()
+                    await self.flush_pending_batches(respect_backoff=True)
 
                 # Update last batch time
                 if batch_timeout_elapsed:
@@ -2750,21 +3023,22 @@ class KafkaConsumerManager:
 
             try:
                 await insert_method(batch)
-            except Exception:
-                self._replace_pending_rows(
-                    topic_key, batch + self.batch_processors[topic_key]
-                )
-                current_offsets = self.pending_commit_offsets[topic_key]
-                for partition, offset in offsets.items():
-                    current_offsets[partition] = max(
-                        offset, current_offsets.get(partition, offset)
+            except Exception as error:
+                kind = _classify_insert_error(error)
+                unresolved: List[Any] = batch
+                failure: Optional[Exception] = error
+                if kind == "row":
+                    unresolved, failure, kind = await self._resolve_rejected_batch(
+                        topic_key, batch, insert_method, error
                     )
-                state.inflight_rows = 0
-                state.oldest_enqueued_at = time.monotonic()
-                await self._refresh_batch_backpressure(topic_key)
-                raise
+                if unresolved:
+                    self._restore_detached_batch(topic_key, unresolved, offsets)
+                    self._record_flush_failure(topic_key, kind)
+                    await self._refresh_batch_backpressure(topic_key)
+                    raise failure or error
 
             state.inflight_rows = 0
+            self._record_flush_success(topic_key)
             self._replace_awaiting_offsets(topic_key, offsets)
             await self._refresh_batch_backpressure(topic_key)
             if self.awaiting_commit_offsets[topic_key]:
@@ -2773,9 +3047,143 @@ class KafkaConsumerManager:
                 )
                 self._replace_awaiting_offsets(topic_key, {})
 
-    async def flush_pending_batches(self):
-        """Flush any pending Kafka batches to ClickHouse immediately"""
-        flushes = (
+    def _restore_detached_batch(
+        self,
+        topic_key: str,
+        rows: List[Any],
+        offsets: Dict[TopicPartition, int],
+    ) -> None:
+        """Put unwritten rows back ahead of new arrivals and keep their offsets."""
+        state = self.batch_buffer_states[topic_key]
+        self._replace_pending_rows(topic_key, rows + self.batch_processors[topic_key])
+        current_offsets = self.pending_commit_offsets[topic_key]
+        for partition, offset in offsets.items():
+            current_offsets[partition] = max(
+                offset, current_offsets.get(partition, offset)
+            )
+        state.inflight_rows = 0
+        state.oldest_enqueued_at = time.monotonic()
+
+    def _record_flush_failure(self, topic_key: str, kind: str) -> None:
+        """Back off this topic's periodic flush exponentially, up to a cap."""
+        state = self.batch_buffer_states[topic_key]
+        state.consecutive_failures += 1
+        delay = min(
+            self.flush_retry_initial_backoff_seconds
+            * (2 ** (state.consecutive_failures - 1)),
+            self.flush_retry_max_backoff_seconds,
+        )
+        state.retry_delay_seconds = delay
+        state.next_flush_at = time.monotonic() + delay
+        PIPELINE_METRICS.clickhouse_flush_failures.labels(
+            topic=topic_key, kind=kind
+        ).inc()
+        PIPELINE_METRICS.clickhouse_flush_retry_delay.labels(topic=topic_key).set(delay)
+        log = logger.error if kind in ("schema", "dlq_failed") else logger.warning
+        log(
+            "ClickHouse flush for %s failed (%s, attempt %d); next retry in %.1fs",
+            topic_key,
+            kind,
+            state.consecutive_failures,
+            delay,
+        )
+
+    def _record_flush_success(self, topic_key: str) -> None:
+        state = self.batch_buffer_states[topic_key]
+        if state.consecutive_failures or state.next_flush_at:
+            PIPELINE_METRICS.clickhouse_flush_retry_delay.labels(topic=topic_key).set(0)
+        state.consecutive_failures = 0
+        state.retry_delay_seconds = 0
+        state.next_flush_at = 0.0
+
+    async def _resolve_rejected_batch(
+        self,
+        topic_key: str,
+        rows: List[Any],
+        insert_method: Callable[[List[Any]], Any],
+        error: Exception,
+    ) -> Tuple[List[Any], Optional[Exception], str]:
+        """Bisect a batch rejected for some rows: write good rows, DLQ bad ones.
+
+        Returns the rows that are neither written nor dead-lettered (in their
+        original order), the error that kept them and its failure kind. The
+        caller keeps those rows and their offsets and backs off.
+        """
+        bad: List[Tuple[Any, Exception]] = []
+        unwritten: List[Any] = []
+        stop_error: Optional[Exception] = None
+
+        async def isolate(group: List[Any], group_error: Exception) -> None:
+            nonlocal stop_error
+            if len(group) == 1:
+                bad.append((group[0], group_error))
+                return
+            middle = len(group) // 2
+            for half in (group[:middle], group[middle:]):
+                if stop_error is not None:
+                    unwritten.extend(half)
+                    continue
+                try:
+                    await insert_method(half)
+                except Exception as half_error:
+                    if _classify_insert_error(half_error) == "row":
+                        await isolate(half, half_error)
+                    else:
+                        unwritten.extend(half)
+                        stop_error = half_error
+
+        def in_order(kept: List[Any]) -> List[Any]:
+            kept_ids = {id(row) for row in kept}
+            return [row for row in rows if id(row) in kept_ids]
+
+        await isolate(rows, error)
+        if stop_error is not None:
+            # Bisection was interrupted: nothing is dead-lettered this time.
+            return (
+                in_order(unwritten + [row for row, _ in bad]),
+                stop_error,
+                _classify_insert_error(stop_error),
+            )
+        # Only a schema-class error (classified before bisecting) keeps a
+        # batch; rows rejected one by one are poison even if all of them are.
+        for index, (row, row_error) in enumerate(bad):
+            try:
+                dead_lettered = await self._dead_letter_row(topic_key, row, row_error)
+            except Exception as dlq_error:
+                logger.error(f"Failed to dead-letter {topic_key} row: {dlq_error}")
+                dead_lettered = False
+            if not dead_lettered:
+                # Stop at once: keep this and every later bad row for a retry.
+                return [row for row, _ in bad[index:]], row_error, "dlq_failed"
+        if bad:
+            PIPELINE_METRICS.clickhouse_flush_failures.labels(
+                topic=topic_key, kind="row"
+            ).inc()
+        return [], None, "row"
+
+    async def _dead_letter_row(
+        self, topic_key: str, row: Any, error: Exception
+    ) -> bool:
+        """Publish one row ClickHouse rejected permanently to the topic's DLQ."""
+        message = SimpleNamespace(
+            topic=str(_row_field(row, "kafka_topic", "") or ""),
+            partition=int(_row_field(row, "kafka_partition", -1)),
+            offset=int(_row_field(row, "kafka_offset", -1)),
+            key=None,
+            value=_dead_letter_row_payload(row),
+        )
+        if not await self._publish_dead_letter(
+            topic_key, message, error, stage="persist"
+        ):
+            return False
+        PIPELINE_METRICS.clickhouse_rows_dead_lettered.labels(topic=topic_key).inc()
+        return True
+
+    def _batch_flush_targets(
+        self,
+    ) -> Tuple[Tuple[str, Callable[[List[Any]], Any]], ...]:
+        """Map each batched topic to its ClickHouse insert method."""
+        return (
             ("queries", self.clickhouse.batch_insert_query_logs),
             ("metrics", self.clickhouse.batch_insert_metrics),
             (
@@ -2789,6 +3197,29 @@ class KafkaConsumerManager:
             ),
             ("alerts", self.clickhouse.batch_insert_alert_events),
         )
+
+    async def flush_topic(self, topic_key: str) -> None:
+        """Flush one batched topic now, raising its failure (and only its own)."""
+        for target_key, insert_method in self._batch_flush_targets():
+            if target_key == topic_key:
+                await self._flush_batch_topic(topic_key, insert_method)
+                return
+
+    async def flush_pending_batches(self, *, respect_backoff: bool = False):
+        """Flush any pending Kafka batches to ClickHouse immediately.
+
+        The periodic flusher passes ``respect_backoff`` so a topic that keeps
+        failing is retried on its own exponential schedule; explicit flushes
+        (shutdown, poison-message handling) always try every topic.
+        """
+        flushes = self._batch_flush_targets()
+        if respect_backoff:
+            now = time.monotonic()
+            flushes = tuple(
+                (topic_key, method)
+                for topic_key, method in flushes
+                if self.batch_buffer_states[topic_key].next_flush_at <= now
+            )
         semaphore = asyncio.Semaphore(self.max_concurrent_flushes)
 
         async def limited_flush(topic_key, insert_method):
