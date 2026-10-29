@@ -2073,8 +2073,11 @@ class LLMRouterPlatform:
             active_requests = getattr(SYSTEM_METRICS, "active_requests", None)
 
             def tagged(response: JSONResponse) -> JSONResponse:
-                # Every answer names its request, errors included.
-                response.headers[REQUEST_ID_HEADER] = query_data.request_id
+                # Every answer names its request, errors included, when the
+                # id is a safe header value (a body id is checked for length
+                # only; it still comes back in the body).
+                if is_valid_request_id(query_data.request_id):
+                    response.headers[REQUEST_ID_HEADER] = query_data.request_id
                 return response
 
             try:
