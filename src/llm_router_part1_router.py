@@ -147,6 +147,8 @@ DEFAULT_OUTPUT_TOKEN_ESTIMATES: Dict[str, int] = {
 # _get_policy_context, and the routing context with it applied.
 SHADOW_POLICY_CONTEXT_KEY = "shadow_policy_context"
 SHADOW_ROUTING_CONTEXT_KEY = "shadow_routing_context"
+# Why shadow mode had nothing to replay: unavailable or skipped_empty.
+SHADOW_SKIP_KEY = "shadow_skipped"
 # Context key carrying the cheapest eligible candidate's request cost.
 COST_REFERENCE_KEY = "cost_reference"
 
@@ -1194,7 +1196,10 @@ class ModelRouter:
 
         policy_context = await self._request_policy_context(request)
         shadow_policy = policy_context.pop(SHADOW_POLICY_CONTEXT_KEY, None)
+        shadow_skipped = policy_context.pop(SHADOW_SKIP_KEY, None)
         context.update(policy_context)
+        if shadow_skipped:
+            context[SHADOW_SKIP_KEY] = shadow_skipped
         self._restore_current_request_features(context, routing_features)
         context["policy_source"] = self._combine_policy_sources(
             policy_context.get("policy_source", "none"),
@@ -1705,18 +1710,58 @@ class ModelRouter:
         # --- A1 shadow mode (kept apart from the policy fetch above) ---
         # Routing gets only the request-metadata hints, as with no policy
         # cache; the policy's context is stashed for route_query to replay.
-        # An empty or unavailable policy has nothing to replay.
+        # A policy that is unavailable, or has nothing that changes routing,
+        # is not replayed; route_query counts it as unavailable/skipped_empty.
         if self._policy_cache_mode() == "shadow":
             shadow_context = self._metadata_policy_context(
                 metadata_preferred_models,
                 metadata_avoid_models,
                 metadata_avoid_providers,
             )
-            if policy:
+            if self._policy_unavailable(policy):
+                shadow_context[SHADOW_SKIP_KEY] = "unavailable"
+            elif self._policy_is_actionable(policy):
                 shadow_context[SHADOW_POLICY_CONTEXT_KEY] = policy_context
+            else:
+                shadow_context[SHADOW_SKIP_KEY] = "skipped_empty"
             return shadow_context
         # --- end A1 shadow mode ---
         return policy_context
+
+    @staticmethod
+    def _policy_unavailable(policy: Dict[str, Any]) -> bool:
+        """Whether the policy cache reported it could not be read."""
+        sources = str(policy.get("policy_source") or "").split("+")
+        return "unavailable" in sources
+
+    def _policy_is_actionable(self, policy: Dict[str, Any]) -> bool:
+        """Whether applying the cached policy could change the routed model.
+
+        get_effective_policy always returns the guardrail lists, empty or not;
+        only entries in them, or Flink hints routing reads, count.
+        """
+        list_fields = (
+            "preferred_models",
+            "avoid_models",
+            "avoid_providers",
+            "blocked_models",
+            "blocked_providers",
+            "warn_models",
+            "warn_providers",
+        )
+        if any(
+            self._name_entries(policy.get(name), f"policy.{name}")
+            for name in list_fields
+        ):
+            return True
+        if policy.get("route_to_fast_lane") is True:
+            return True
+        if policy.get("requires_low_latency") is True:
+            return True
+        return any(
+            str(policy.get(name) or "").lower() == "high"
+            for name in ("cost_sensitivity", "error_sensitivity")
+        )
 
     def _policy_cache_mode(self) -> str:
         """policy_cache.mode: enforce (the default) or shadow."""
@@ -1760,6 +1805,9 @@ class ModelRouter:
         """
         shadow_context = context.get(SHADOW_ROUTING_CONTEXT_KEY)
         if not isinstance(shadow_context, dict):
+            skipped = context.get(SHADOW_SKIP_KEY)
+            if skipped in {"unavailable", "skipped_empty"}:
+                ROUTER_METRICS.shadow_policy_decisions.labels(outcome=skipped).inc()
             return None, None
         try:
             selection = await self._run_shadow_strategy(shadow_context)
