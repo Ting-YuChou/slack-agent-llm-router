@@ -301,13 +301,19 @@ ERROR_CODE_HTTP_STATUS: Dict[str, int] = {
 # Statuses whose responses may carry Retry-After (RFC 9110 section 10.2.3).
 _RETRY_AFTER_HTTP_STATUSES = frozenset({429, 503})
 # Phrases providers use for a prompt over the model's context window: OpenAI's
-# error code, Anthropic's "prompt is too long", vLLM's "maximum context length".
+# error code and "context window"; Anthropic's "prompt is too long" and
+# "input length and `max_tokens` exceed context limit"; vLLM's "maximum
+# context length is N tokens" and "is longer than the maximum model length".
 _CONTEXT_LENGTH_MARKERS = (
     "context_length_exceeded",
     "prompt is too long",
+    "exceed context limit",
     "maximum context length",
+    "longer than the maximum model length",
     "context window",
 )
+# OpenAI's 429 for an exhausted billing quota: retrying will not help.
+_INSUFFICIENT_QUOTA_CODE = "insufficient_quota"
 
 
 def _string_attribute(exc: BaseException, name: str) -> Optional[str]:
@@ -360,6 +366,12 @@ def _is_context_length_error(exc: BaseException) -> bool:
         return True
     text = _provider_error_text(exc)
     return any(marker in text for marker in _CONTEXT_LENGTH_MARKERS)
+
+
+def _is_insufficient_quota(exc: BaseException) -> bool:
+    if getattr(exc, "code", None) == _INSUFFICIENT_QUOTA_CODE:
+        return True
+    return _INSUFFICIENT_QUOTA_CODE in _provider_error_text(exc)
 
 
 def classify_inference_error(exc: BaseException) -> str:
@@ -427,6 +439,9 @@ def inference_error_code(exc: BaseException) -> Optional[str]:
         if status_code == 408:
             return "timeout"
         if status_code == 429:
+            # An exhausted billing quota does not clear in seconds.
+            if _is_insufficient_quota(exc):
+                return "provider_unavailable"
             return "rate_limited"
         if status_code in REQUEST_SHAPED_STATUS_CODES:
             if _is_context_length_error(exc):
@@ -478,7 +493,8 @@ def _retry_after_seconds(exc: BaseException) -> Optional[int]:
             return max(0, seconds)
         return None
     headers = getattr(getattr(exc, "response", None), "headers", None)
-    if headers is None:
+    if headers is None or _is_insufficient_quota(exc):
+        # A quota error's Retry-After would only invite futile retries.
         return None
     try:
         milliseconds = _header_value(headers, "retry-after-ms")

@@ -395,3 +395,152 @@ def test_route_endpoint_maps_error_code_to_http_status(
     assert body["error"] == "inference_failed"
     assert body["provider"] == "error"
     assert body["error_code"] == error_code
+
+
+# Review follow-up: more context-length wordings, and OpenAI's billing 429.
+
+_ANTHROPIC_CONTEXT_LIMIT_MESSAGE = (
+    "input length and `max_tokens` exceed context limit: 180000 + 32000 > "
+    "200000, decrease input length or `max_tokens` and try again"
+)
+
+
+def _vllm_status_error(status_code, message):
+    request = httpx.Request("POST", "http://vllm:8000/v1/chat/completions")
+    response = httpx.Response(
+        status_code,
+        request=request,
+        json={
+            "object": "error",
+            "message": message,
+            "type": "BadRequestError",
+            "code": status_code,
+        },
+    )
+    return httpx.HTTPStatusError("Client error", request=request, response=response)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param(
+            "The decoder prompt (length 5000) is longer than the maximum model "
+            "length of 4096. Make sure that `max_model_len` is no smaller than "
+            "the number of text tokens.",
+            id="vllm-decoder-prompt",
+        ),
+        pytest.param(
+            "This model's maximum context length is 4096 tokens. However, you "
+            "requested 5000 tokens (4800 in the messages, 200 in the completion).",
+            id="vllm-older-wording",
+        ),
+    ],
+)
+def test_vllm_context_length_wordings(message):
+    exc = _vllm_status_error(400, message)
+
+    assert inference_error_code(exc) == "context_length_exceeded"
+
+
+def test_anthropic_context_limit_wording_fake():
+    exc = _ProviderStatusError(400, _ANTHROPIC_CONTEXT_LIMIT_MESSAGE)
+
+    assert inference_error_code(exc) == "context_length_exceeded"
+
+
+def test_anthropic_sdk_context_limit_error():
+    anthropic = pytest.importorskip("anthropic", minversion="0.69")
+    body = {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": _ANTHROPIC_CONTEXT_LIMIT_MESSAGE,
+        },
+    }
+    response = httpx.Response(
+        400,
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+        json=body,
+    )
+    exc = anthropic.BadRequestError(
+        f"Error code: 400 - {body}", response=response, body=body
+    )
+
+    error_code = inference_error_code(exc)
+
+    assert error_code == "context_length_exceeded"
+    assert route_response_status(_error_response(error_code=error_code)) == (413, {})
+
+
+def test_openai_sdk_context_length_error():
+    openai = pytest.importorskip("openai", minversion="1.66")
+    error = {
+        "message": "Your input exceeds the context window of this model.",
+        "type": "invalid_request_error",
+        "param": "input",
+        "code": "context_length_exceeded",
+    }
+    response = httpx.Response(
+        400,
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+        json={"error": error},
+    )
+    exc = openai.BadRequestError(
+        f"Error code: 400 - {error}", response=response, body=error
+    )
+
+    assert inference_error_code(exc) == "context_length_exceeded"
+
+
+def test_insufficient_quota_is_provider_unavailable_without_retry_after():
+    exc = _ProviderStatusError(
+        429,
+        "You exceeded your current quota",
+        code="insufficient_quota",
+        headers={"retry-after": "20"},
+    )
+
+    assert inference_error_code(exc) == "provider_unavailable"
+    assert inference_module._retry_after_seconds(exc) is None
+
+
+def _openai_sdk_429(code, *, headers=None):
+    openai = pytest.importorskip("openai", minversion="1.66")
+    error = {
+        "message": "You exceeded your current quota, please check your plan.",
+        "type": code,
+        "param": None,
+        "code": code,
+    }
+    response = httpx.Response(
+        429,
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+        json={"error": error},
+        headers=headers or {},
+    )
+    return openai.RateLimitError(
+        f"Error code: 429 - {error}", response=response, body=error
+    )
+
+
+@pytest.mark.asyncio
+async def test_openai_sdk_insufficient_quota_answers_503(sample_query_request):
+    exc = _openai_sdk_429("insufficient_quota", headers={"retry-after": "20"})
+    engine = _failing_engine(exc)
+
+    response = await engine.process_query(sample_query_request)
+
+    assert response.error_code == "provider_unavailable"
+    assert response.retry_after_seconds is None
+    assert route_response_status(response) == (503, {})
+
+
+@pytest.mark.asyncio
+async def test_openai_sdk_rate_limit_keeps_429_and_retry_after(sample_query_request):
+    exc = _openai_sdk_429("rate_limit_exceeded", headers={"retry-after": "3"})
+    engine = _failing_engine(exc)
+
+    response = await engine.process_query(sample_query_request)
+
+    assert response.error_code == "rate_limited"
+    assert route_response_status(response) == (429, {"Retry-After": "3"})
