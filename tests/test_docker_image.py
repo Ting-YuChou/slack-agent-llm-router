@@ -106,3 +106,34 @@ def test_dockerignore_keeps_what_the_images_copy():
         "agent-runtime/requirements-ci.lock",
     ]:
         assert not _ignored(path), path
+
+
+def _final_stage(dockerfile: Path):
+    text = dockerfile.read_text().replace("\\\n", " ")
+    stages = re.split(r"(?m)^FROM ", text)
+    return stages[-1].splitlines()
+
+
+def test_app_image_prefetches_tiktoken_encodings_for_offline_use():
+    lines = _final_stage(ROOT / "docker/Dockerfile")
+    env_index = next(
+        i
+        for i, line in enumerate(lines)
+        if line.startswith("ENV ") and "TIKTOKEN_CACHE_DIR=" in line
+    )
+    cache_dir = re.search(r"TIKTOKEN_CACHE_DIR=(\S+)", lines[env_index]).group(1)
+    fetch_index = next(
+        i
+        for i, line in enumerate(lines)
+        if line.startswith("RUN ")
+        and "cl100k_base" in line
+        and "o200k_base" in line
+        and "get_encoding" in line
+    )
+    user_index = next(i for i, line in enumerate(lines) if line.startswith("USER "))
+
+    assert cache_dir.startswith("/")
+    assert env_index < fetch_index < user_index
+    fetch = lines[fetch_index]
+    # The runtime user must be able to read the files root fetched.
+    assert cache_dir in fetch and ("a+rX" in fetch or "chown" in fetch)

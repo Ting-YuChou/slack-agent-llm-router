@@ -35,6 +35,13 @@ RUN groupadd --system llmrouter \
 WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
+
+# tiktoken downloads its encodings on first use; fetch them at build time so a
+# container without egress still counts tokens instead of estimating them.
+ENV TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache
+RUN mkdir -p "${TIKTOKEN_CACHE_DIR}" \
+    && python -c "import tiktoken; [tiktoken.get_encoding(name).encode('ok') for name in ('cl100k_base', 'o200k_base')]" \
+    && chmod -R a+rX /opt/tiktoken-cache
 # Copy only what the app runs; API keys come from compose environment variables.
 COPY --chown=llmrouter:llmrouter main.py /app/main.py
 COPY --chown=llmrouter:llmrouter src /app/src

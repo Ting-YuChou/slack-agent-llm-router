@@ -164,6 +164,10 @@ class QueryRequest(BaseModel):
     conversation_id: Optional[str] = Field(None, max_length=256)
     metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
+    # The router's per-request work (classification, token counts, policy),
+    # keyed by the inputs each depends on, so routing it again is cheap.
+    _routing_memo: Dict[Any, Any] = PrivateAttr(default_factory=dict)
+
     @field_validator("query")
     @classmethod
     def validate_query(cls, v: str) -> str:
@@ -351,6 +355,12 @@ class ModelConfig(BaseModel):
 
     # Capacity settings
     max_tokens: int = Field(ge=1)
+    # Tokens of input plus output the model accepts (vLLM's max_model_len);
+    # unset, it is max_tokens, which configs have always set to the window.
+    context_window: Optional[int] = Field(None, ge=1)
+    # The most output tokens the model generates; unset means no cap below
+    # the window. request.max_tokens is clamped to it.
+    max_output_tokens: Optional[int] = Field(None, ge=1)
     cost_per_token: float = Field(ge=0.0)
     priority: int = Field(ge=1)
 
@@ -385,6 +395,38 @@ class ModelConfig(BaseModel):
             for tier, minimum in minimum_priority.items()
             if self.priority >= minimum
         ]
+
+    @model_validator(mode="after")
+    def default_context_window(self) -> "ModelConfig":
+        if self.context_window is None:
+            self.context_window = self.max_tokens
+        if (
+            self.max_output_tokens is not None
+            and self.max_output_tokens > self.context_window
+        ):
+            raise ValueError(
+                f"max_output_tokens ({self.max_output_tokens}) exceeds "
+                f"context_window ({self.context_window})"
+            )
+        return self
+
+    def window_tokens(self) -> int:
+        """The context window: input plus output tokens."""
+        return self.context_window or self.max_tokens
+
+    def output_tokens(self, requested: Any) -> int:
+        """The output tokens a request for ``requested`` gets from this model."""
+        tokens = max(0, int(requested or 0))
+        if self.max_output_tokens is not None:
+            return min(tokens, self.max_output_tokens)
+        return tokens
+
+    def fits_context(self, input_tokens: Any, requested_output: Any) -> bool:
+        """Whether the prompt and its output fit the context window together."""
+        return (
+            int(input_tokens or 0) + self.output_tokens(requested_output)
+            <= self.window_tokens()
+        )
 
     @field_validator("capabilities")
     @classmethod
