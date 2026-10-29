@@ -226,17 +226,101 @@ async def test_tier_without_any_model_is_not_entitled(model_overrides):
     assert classify_inference_error(error) == "user_or_policy"
 
 
-@pytest.mark.asyncio
-async def test_guardrails_excluding_every_allowed_model_is_not_entitled():
+def _with_policy(router, policy):
     class PolicyCacheStub:
         async def get_effective_policy(self, request_id, user_id):
-            return {"policy_source": "user", "blocked_providers": ["openai"]}
+            return {"policy_source": "user", **policy}
 
-    router = _router_from_checked_in_config("config.compose.yaml")
     router.policy_cache = PolicyCacheStub()
+    return router
 
-    with pytest.raises(router_module.ModelNotEntitledError, match="guardrail"):
+
+def _bypasses_guardrails(decision):
+    reason = decision.routing_reason.lower()
+    return "guardrails bypassed" in reason and "fail-open" in reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filename", "policy", "free_models"),
+    [
+        pytest.param(
+            "config.compose.yaml",
+            {"blocked_providers": ["openai"]},
+            {"gpt-5"},
+            id="compose-provider-blocked",
+        ),
+        pytest.param(
+            "config.compose.yaml",
+            {"blocked_models": ["gpt-5"]},
+            {"gpt-5"},
+            id="compose-model-blocked",
+        ),
+        pytest.param(
+            "config.yaml",
+            {"blocked_providers": ["vllm"]},
+            {"qwen3.6-27b-fast", "mistral-7b", "llama-3.1-70b"},
+            id="default-local-models-blocked",
+        ),
+        pytest.param(
+            "config.yaml",
+            {"avoid_providers": ["vllm"]},
+            {"qwen3.6-27b-fast", "mistral-7b", "llama-3.1-70b"},
+            id="default-local-models-avoided",
+        ),
+    ],
+)
+async def test_guardrails_blocking_every_allowed_model_fail_open(
+    filename, policy, free_models
+):
+    # Guardrails are health signals: when they exclude every model the tier
+    # may use, route anyway, but never to a model outside the tier.
+    router = _with_policy(_router_from_checked_in_config(filename), policy)
+
+    decision = await router.route_query(_request("free"))
+
+    assert decision.selected_model in free_models
+    assert _bypasses_guardrails(decision)
+
+
+@pytest.mark.asyncio
+async def test_guardrails_leaving_an_allowed_model_are_not_bypassed():
+    router = _with_policy(
+        _router_from_checked_in_config("config.yaml"),
+        {"blocked_models": ["qwen3.6-27b-fast", "mistral-7b"]},
+    )
+
+    decision = await router.route_query(_request("free"))
+
+    assert decision.selected_model == "llama-3.1-70b"
+    assert not _bypasses_guardrails(decision)
+
+
+@pytest.mark.asyncio
+async def test_guardrail_fail_open_keeps_the_context_window_check():
+    router = _with_policy(
+        _router_from_checked_in_config("config.compose.yaml", token_count=200_000),
+        {"blocked_providers": ["openai", "anthropic"]},
+    )
+
+    with pytest.raises(router_module.PromptTooLargeError):
         await router.route_query(_request("free"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy", ["round_robin", "weighted", "static"])
+async def test_non_intelligent_strategies_fail_open_on_guardrails(
+    router_config, strategy
+):
+    router = _with_policy(
+        _stub_router(ModelRouter({**router_config, "routing_strategy": strategy})),
+        {"blocked_providers": ["vllm"]},
+    )
+
+    decision = await router.route_query(_request("free"))
+
+    assert decision.selected_model in {"qwen3.6-27b-fast", "mistral-7b"}
+    assert _bypasses_guardrails(decision)
 
 
 def test_allowed_tiers_override_the_priority_rule(router_config):
