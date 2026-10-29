@@ -237,26 +237,38 @@ def clock(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_burst_limit_notice_is_ephemeral_in_the_thread_and_names_the_window(
-    clock, inference_response_factory
+@pytest.mark.parametrize(
+    "refused,notice_thread_ts",
+    [
+        # Slack hides an ephemeral sent into a thread that does not exist yet:
+        # a new top-level request has no replies, so its notice stays in the
+        # channel.
+        (top_level(ts="202.0"), None),
+        (thread_reply(ts="101.0"), "100.0"),
+    ],
+    ids=["top_level", "thread_reply"],
+)
+async def test_a_burst_limit_notice_is_ephemeral_and_names_the_window(
+    clock, inference_response_factory, refused, notice_thread_ts
 ):
     bot = chat_bot(
         answering(inference_response_factory),
         rate_limiting={"requests_per_hour": 100, "burst_requests": 2},
     )
+    bot._mark_thread_active("C1", "100.0")
     for ts in ("200.0", "201.0"):
         await bot._process_message(top_level(ts=ts))
         clock["t"] += 60
     posts_before = bot.web_client.chat_postMessage.await_count
 
-    await bot._process_message(top_level(ts="202.0"))
+    await bot._process_message(dict(refused))
 
     assert bot.web_client.chat_postMessage.await_count == posts_before
     bot.web_client.chat_postEphemeral.assert_awaited_once()
     notice = bot.web_client.chat_postEphemeral.await_args.kwargs
     assert notice["channel"] == "C1"
     assert notice["user"] == "U1"
-    assert notice["thread_ts"] == "202.0"
+    assert notice.get("thread_ts") == notice_thread_ts
     text = notice["text"]
     assert "<@U1>" not in text
     assert "Rate Limit Exceeded" in text

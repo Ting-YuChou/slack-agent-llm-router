@@ -3742,7 +3742,7 @@ class SlackBot:
                     await self._send_rate_limit_message(
                         channel_id,
                         user_id,
-                        thread_ts=event.get("thread_ts") or event.get("ts"),
+                        thread_ts=event.get("thread_ts"),
                         agent=agent_request,
                     )
                     if user_state_changed:
@@ -4112,7 +4112,12 @@ class SlackBot:
         thread_ts: Optional[str] = None,
         agent: bool = False,
     ):
-        """Tell only the user, in the thread they asked in, that they hit a limit."""
+        """Tell only the user that they hit a limit, in their thread if any.
+
+        Pass thread_ts only for a reply in an existing thread: Slack never
+        shows an ephemeral sent into a thread that has no replies yet, so a
+        notice for a new top-level request stays in the channel.
+        """
         await self.web_client.chat_postEphemeral(
             channel=channel_id,
             user=user_id,
