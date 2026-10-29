@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -53,6 +54,7 @@ from slack.agent_shortcut import (
     build_agent_shortcut_modal,
     parse_agent_shortcut_submission,
 )
+from src.admission import AdmissionRejectedError
 from src.memory import MemoryManager, build_memory_scope
 from src.utils.schema import (
     Attachment,
@@ -81,6 +83,94 @@ MEMORY_SLASH_ONLY_MESSAGE = (
     "Use `/llm remember`, `/llm memories`, or `/llm forget`."
 )
 SLACK_BUSY_MESSAGE = "The LLM Router is busy right now. Please retry in a moment."
+SLACK_EMPTY_ANSWER_MESSAGE = (
+    "🤔 The model returned an empty answer. Please try again or rephrase "
+    "your question."
+)
+_RATE_LIMITED_TEXT = (
+    "⏳ The model provider is rate-limiting requests right now. "
+    "Please try again in a minute."
+)
+_TIMEOUT_TEXT = (
+    "⌛ The model took too long to answer. Please try again, or ask for "
+    "something shorter."
+)
+_TOO_LONG_TEXT = (
+    "❌ That request is too long for the model. Try shortening it or splitting "
+    "it into smaller requests."
+)
+# What a failed answer tells the user. A precise InferenceResponse.error_code
+# wins; else its error_type decides; anything else gets the generic message,
+# which reveals nothing internal. A rate_limited error_code is the provider's
+# 429 only when error_type says so too; otherwise our own capacity turned the
+# request away (an admission rejection), and the router is busy.
+SLACK_ERROR_CODE_MESSAGES = {
+    "context_length_exceeded": _TOO_LONG_TEXT,
+    "prompt_too_large": _TOO_LONG_TEXT,
+    "model_not_entitled": (
+        "❌ The model this request needs is not available for your tier."
+    ),
+    "retrieval_unavailable": (
+        "⚠️ Document search is unavailable right now. Please try again in a "
+        "few minutes."
+    ),
+    "provider_unavailable": (
+        "⚠️ The model provider is unavailable right now. Please try again in a "
+        "few minutes."
+    ),
+    "timeout": _TIMEOUT_TEXT,
+}
+SLACK_INFERENCE_ERROR_MESSAGES = {
+    "rate_limited": _RATE_LIMITED_TEXT,
+    "timeout": _TIMEOUT_TEXT,
+    # Every ValueError lands here, internal ones too: blame nothing.
+    "user_or_policy": (
+        "❌ I couldn't complete that request. Rephrasing it may help; "
+        "otherwise please try again later."
+    ),
+}
+# A note appended to an answer that came back degraded, by response warning
+# (its part before any ":detail"). Other warnings add nothing.
+SLACK_RESPONSE_WARNING_NOTES = {
+    "rag_unavailable": (
+        "_Note: document search was unavailable, so this answer isn't based on "
+        "your documents._"
+    ),
+    "rag_degraded": (
+        "_Note: document search only partly worked, so this answer may miss "
+        "parts of your documents._"
+    ),
+    "web_search_unavailable": (
+        "_Note: live web search was unavailable; recent information couldn't "
+        "be checked._"
+    ),
+    "response_truncated": "_Note: the answer was cut off._",
+    "response_incomplete": "_Note: the answer may be incomplete._",
+    "response_filtered": (
+        "_Note: part of the answer was withheld by the model's content filter._"
+    ),
+    "empty_response": (
+        "_Note: the model returned almost no text, so the answer may be incomplete._"
+    ),
+}
+# The same, as a plain-text label that leads the answer in history: the
+# conversation summary keeps only each message's first 200 characters.
+SLACK_RESPONSE_WARNING_LABELS = {
+    "rag_unavailable": "document search was unavailable",
+    "rag_degraded": "document search only partly worked",
+    "web_search_unavailable": "live web search was unavailable",
+    "response_truncated": "answer was cut off",
+    "response_incomplete": "answer may be incomplete",
+    "response_filtered": "part of the answer was withheld by the content filter",
+    "empty_response": "model returned almost no text",
+}
+# The windows UserManager.check_rate_limit counts requests in.
+RATE_LIMIT_WINDOW_SECONDS = 3600
+RATE_LIMIT_BURST_WINDOW_SECONDS = 300
+# Message subtypes a person's follow-up can carry: a plain message, one with
+# files, and a reply also sent to the channel. Edits, deletions, joins and the
+# like are never a new request. The same set the Agent thread context reads.
+CHAT_MESSAGE_SUBTYPES = frozenset(AgentBootstrapBuilder._INCLUDED_SUBTYPES)
 SLACK_PRIORITY_WORK_KINDS = frozenset({"interactive"})
 AGENT_TASK_ECHO_LIMIT = 2500
 AGENT_SHORTCUT_NONCE_TTL_SECONDS = 300
@@ -1123,6 +1213,100 @@ def _rate_limit_entries(values: Any, since: float) -> List[Tuple[float, str]]:
     return [entry for entry in entries if entry is not None and entry[0] > since]
 
 
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _format_wait(seconds: float) -> str:
+    """A wait rounded up: seconds under a minute, whole minutes beyond."""
+    whole_seconds = max(1, math.ceil(seconds))
+    if whole_seconds < 60:
+        return _plural(whole_seconds, "second")
+    return _plural(math.ceil(whole_seconds / 60), "minute")
+
+
+def _retry_wait(retry_after_seconds: Any) -> Optional[str]:
+    """`_format_wait` of a positive retry-after; None for anything else."""
+    if (
+        isinstance(retry_after_seconds, (int, float))
+        and not isinstance(retry_after_seconds, bool)
+        and retry_after_seconds > 0
+    ):
+        return _format_wait(retry_after_seconds)
+    return None
+
+
+def _known_response_warnings(warnings: Any, *, skip: Tuple[str, ...] = ()) -> List[str]:
+    """A response's warnings that have a note, each once, in a fixed order."""
+    if not isinstance(warnings, (list, tuple)):
+        return []
+    present = {str(warning).split(":", 1)[0] for warning in warnings}
+    return [
+        warning
+        for warning in SLACK_RESPONSE_WARNING_NOTES
+        if warning in present and warning not in skip
+    ]
+
+
+def _response_warning_notes(warnings: Any, *, skip: Tuple[str, ...] = ()) -> str:
+    """The Slack notes for a response's known warnings."""
+    return "\n".join(
+        SLACK_RESPONSE_WARNING_NOTES[warning]
+        for warning in _known_response_warnings(warnings, skip=skip)
+    )
+
+
+def _response_warning_label(warnings: Any) -> str:
+    """The plain-text history label for a response's known warnings."""
+    labels = [
+        SLACK_RESPONSE_WARNING_LABELS[warning]
+        for warning in _known_response_warnings(warnings)
+    ]
+    return f"[{'; '.join(labels)}]" if labels else ""
+
+
+# Admission reasons that are a quota rather than capacity (src/admission.py),
+# by the kind of quota. The user's own:
+ADMISSION_USER_QUOTA_REASONS = {
+    "identity_request_rate_exceeded": "request",
+    "user_request_rate_exceeded": "request",
+    "user_token_budget_exceeded": "token",
+}
+# One bucket shared by every user of a tier, so not this user's doing:
+ADMISSION_TIER_QUOTA_REASONS = {
+    "tier_request_rate_exceeded": "request",
+    "tier_token_budget_exceeded": "token",
+}
+# Every other rejection is shared capacity: the router is busy.
+
+
+def _busy_text(wait: Optional[str]) -> str:
+    if wait:
+        return f"⏳ The LLM Router is busy right now. Please try again in {wait}."
+    return SLACK_BUSY_MESSAGE
+
+
+def _admission_rejection_text(
+    decision: Any, user_tier: Optional[UserTier] = None
+) -> str:
+    """The reply when admission turns a query away: a quota, or capacity."""
+    reason = str(getattr(decision, "reason", "") or "")
+    if reason == "scheduler_queue_timeout":
+        # The queue wait ended on whatever turned the request away last.
+        metadata = getattr(decision, "metadata", None) or {}
+        reason = str(metadata.get("last_reason") or "")
+    wait = _retry_wait(getattr(decision, "retry_after_seconds", None))
+    when = f"Please try again in {wait}." if wait else "Please try again later."
+    if reason in ADMISSION_USER_QUOTA_REASONS:
+        quota = ADMISSION_USER_QUOTA_REASONS[reason]
+        return f"⏳ You've reached your {quota} quota for now. {when}"
+    if reason in ADMISSION_TIER_QUOTA_REASONS:
+        quota = ADMISSION_TIER_QUOTA_REASONS[reason]
+        tier = f"The {user_tier.value.title()} tier's" if user_tier else "A tier's"
+        return f"⏳ {tier} shared {quota} quota is used up right now. {when}"
+    return _busy_text(wait)
+
+
 class UserManager:
     """Manages user data and preferences"""
 
@@ -1140,18 +1324,15 @@ class UserManager:
         self.rate_limits = {}
 
     def get_user_tier(self, user_id: str) -> UserTier:
-        """Get user tier from user data"""
-        user_data = self.users.get(user_id, {})
-        tier_name = (
-            user_data.get("tier")
-            or self.tier_overrides.get(user_id)
-            or self.default_tier
-        )
+        """The user's tier from config: their override, else the default.
 
-        try:
-            return UserTier(tier_name)
-        except ValueError:
-            return UserTier.FREE
+        The tier stored on a user record is only a record of it, so removing
+        an override or lowering the default takes effect on the next request.
+        """
+        return UserTier(self._configured_tier_name(user_id))
+
+    def _configured_tier_name(self, user_id: str) -> str:
+        return self.tier_overrides.get(user_id) or self.default_tier
 
     def check_rate_limit(
         self, user_id: str, config: Dict[str, Any], bucket: str = RATE_LIMIT_CHAT
@@ -1226,27 +1407,26 @@ class UserManager:
         self.users[user_id]["updated_at"] = datetime.now().isoformat()
 
     def ensure_user_record(self, user_id: str) -> bool:
-        """Apply configured tier defaults/overrides to the in-memory user record."""
+        """Record the configured tier on the user's record; True if it changed.
+
+        A user on the implicit free default gets no record for it alone.
+        """
         if not user_id:
             return False
 
         previous_tier = self.users.get(user_id, {}).get("tier")
-        resolved_tier = self.tier_overrides.get(user_id)
+        resolved_tier = self._configured_tier_name(user_id)
+        if previous_tier == resolved_tier:
+            return False
         if (
-            resolved_tier is None
-            and previous_tier is None
-            and self.default_tier != UserTier.FREE.value
+            previous_tier is None
+            and user_id not in self.tier_overrides
+            and resolved_tier == UserTier.FREE.value
         ):
-            resolved_tier = self.default_tier
-
-        if resolved_tier is None:
             return False
 
         if user_id not in self.users:
             self.users[user_id] = {}
-
-        if previous_tier == resolved_tier:
-            return False
 
         self.users[user_id]["tier"] = resolved_tier
         self.users[user_id]["updated_at"] = datetime.now().isoformat()
@@ -2938,30 +3118,93 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                     response.error,
                 )
                 SLACK_METRICS.errors.labels(error_type="inference_error_response").inc()
-                error_builder = getattr(
-                    self.bot, "_build_user_safe_error_message", None
+                return self._inference_error_message(
+                    getattr(response, "error_type", None),
+                    getattr(response, "error_code", None),
+                    retry_after_seconds=getattr(response, "retry_after_seconds", None),
                 )
-                if callable(error_builder):
-                    return error_builder()
-                return "❌ Sorry, I couldn't process that request right now. Please try again in a moment."
+
+            warnings = getattr(response, "warnings", None)
+            if not (getattr(response, "response_text", "") or "").strip():
+                # Nothing to post or remember: an empty turn would only
+                # mislead the next request's context.
+                logger.warning(
+                    "Slack query for user %s in channel %s got an empty answer "
+                    "from %s",
+                    user_id,
+                    channel_id,
+                    getattr(response, "model_name", "unknown"),
+                )
+                SLACK_METRICS.errors.labels(error_type="empty_response").inc()
+                notes = _response_warning_notes(warnings, skip=("empty_response",))
+                return "\n\n".join(filter(None, [SLACK_EMPTY_ANSWER_MESSAGE, notes]))
+
+            # A degraded answer says so, in Slack after it and in history
+            # before it, so the conversation never treats a cut-off answer
+            # as complete: the summary keeps each message's first 200 chars.
+            answer = response.response_text
+            notes = _response_warning_notes(warnings)
+            label = _response_warning_label(warnings)
+            if notes:
+                answer = f"{answer.rstrip()}\n\n{notes}"
 
             # Add to conversation history
             context.add_message("user", text)
-            context.add_message("assistant", response.response_text)
+            context.add_message(
+                "assistant",
+                f"{label} {response.response_text}" if label else answer,
+            )
 
             # Update metrics
             SLACK_METRICS.messages_processed.labels(user_tier=user_tier.value).inc()
             SLACK_METRICS.response_time.observe(response.latency_ms / 1000)
 
-            return self._format_response_with_sources(response)
+            return self._format_response_with_sources(response, answer)
 
+        except AdmissionRejectedError as e:
+            logger.warning(
+                "Slack query for user %s was not admitted: %s",
+                user_id,
+                e.decision.reason,
+            )
+            SLACK_METRICS.errors.labels(error_type=type(e).__name__).inc()
+            return _admission_rejection_text(
+                e.decision, self.bot.user_manager.get_user_tier(user_id)
+            )
         except Exception as e:
             logger.error(f"Error processing query: {e}")
             SLACK_METRICS.errors.labels(error_type=type(e).__name__).inc()
-            error_builder = getattr(self.bot, "_build_user_safe_error_message", None)
-            if callable(error_builder):
-                return error_builder()
-            return "❌ Sorry, I couldn't process that request right now. Please try again in a moment."
+            return self._inference_error_message(None)
+
+    def _inference_error_message(
+        self,
+        error_type: Optional[str],
+        error_code: Optional[str] = None,
+        *,
+        retry_after_seconds: Any = None,
+    ) -> str:
+        """What a failed answer tells the user: by error code, else error type."""
+        wait = _retry_wait(retry_after_seconds)
+        if error_code == "rate_limited" and error_type != "rate_limited":
+            # Our own capacity, e.g. an admission-rejected primary whose
+            # fallbacks failed too: not the provider's 429.
+            return _busy_text(wait)
+        for messages, key in (
+            (SLACK_ERROR_CODE_MESSAGES, error_code),
+            (SLACK_INFERENCE_ERROR_MESSAGES, error_type),
+        ):
+            message = messages.get(key) if isinstance(key, str) else None
+            if message == _RATE_LIMITED_TEXT and wait:
+                return (
+                    "⏳ The model provider is rate-limiting requests right now. "
+                    f"Please try again in {wait}."
+                )
+            if message:
+                return message
+        error_builder = getattr(self.bot, "_build_user_safe_error_message", None)
+        if callable(error_builder):
+            return error_builder()
+        return "❌ Sorry, I couldn't process that request right now. Please try again in a moment."
 
     def _join_context_sections(self, sections: List[str]) -> str:
         """Join non-empty context sections without adding persistence semantics."""
@@ -2978,9 +3221,15 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         if slack_context.error:
             metadata["slack_context_error"] = slack_context.error
 
-    def _format_response_with_sources(self, response: Any) -> str:
-        """Append compact source links for web-search enriched answers."""
-        response_text = getattr(response, "response_text", "") or ""
+    def _format_response_with_sources(
+        self, response: Any, response_text: Optional[str] = None
+    ) -> str:
+        """Append compact source links for web-search enriched answers.
+
+        `response_text` replaces the response's own text, e.g. with notes added.
+        """
+        if response_text is None:
+            response_text = getattr(response, "response_text", "") or ""
         sources = list(getattr(response, "sources", []) or [])
         if not sources:
             return response_text
@@ -3410,9 +3659,10 @@ class SlackBot:
 
     async def _handle_message_event(self, event: Dict[str, Any]):
         """Handle message events"""
-        # Skip bot messages
+        # Skip bot messages, edits and other subtypes nobody asks with
+        subtype = event.get("subtype")
         if (
-            event.get("subtype")
+            subtype not in CHAT_MESSAGE_SUBTYPES
             or event.get("bot_id")
             or event.get("user") == self.bot_user_id
         ):
@@ -3423,7 +3673,16 @@ class SlackBot:
             return
 
         thread_ts = event.get("thread_ts")
-        if await self._reject_non_owner_agent_message(event):
+        if subtype is not None:
+            # A file share or broadcast continues a chat thread only: an Agent
+            # thread still takes plain follow-ups, as it did before S13.
+            if not self._is_active_thread(channel_id, thread_ts, refresh=False):
+                return
+            if not self._is_agent_thread(channel_id, thread_ts):
+                await self._restore_agent_thread(event)
+            if self._is_agent_thread(channel_id, thread_ts):
+                return
+        elif await self._reject_non_owner_agent_message(event):
             return
         if not thread_ts or not self._is_active_thread(channel_id, thread_ts):
             return
@@ -3610,13 +3869,12 @@ class SlackBot:
         if callable(message_handler_consumes_query_quota):
             consumes_query_quota = message_handler_consumes_query_quota(command_text)
         if consumes_query_quota:
-            if not self._within_rate_limit(
-                user_id, agent=_is_agent_command_text(command_text)
-            ):
+            agent_command = _is_agent_command_text(command_text)
+            if not self._within_rate_limit(user_id, agent=agent_command):
                 await self._post_command_response(
                     channel_id,
                     user_id,
-                    self._build_rate_limit_message(user_id),
+                    self._build_rate_limit_message(user_id, agent=agent_command),
                 )
                 if user_state_changed:
                     await self._persist_user_state(user_id)
@@ -3656,15 +3914,28 @@ class SlackBot:
             user_id = event.get("user")
             user_state_changed = self._synchronize_user_tier(user_id)
             user_prefs = self.user_manager.get_user_preferences(user_id)
+            agent_request = self._is_agent_request(event)
 
             if self._is_query_event(event):
-                if not self._within_rate_limit(
-                    user_id, agent=self._is_agent_request(event)
-                ):
-                    await self._send_rate_limit_message(channel_id, user_id)
+                if not self._within_rate_limit(user_id, agent=agent_request):
+                    await self._send_rate_limit_message(
+                        channel_id,
+                        user_id,
+                        thread_ts=event.get("thread_ts"),
+                        agent=agent_request,
+                    )
                     if user_state_changed:
                         await self._persist_user_state(user_id)
                     return
+
+            reply_thread_ts = self._reply_thread_ts(event, user_prefs)
+            active_thread_key = None
+            if reply_thread_ts and not agent_request:
+                # Accepted: a follow-up sent while this answer is generating
+                # belongs to the thread too. An Agent thread becomes active
+                # once the runtime accepts the run.
+                self._mark_thread_active(channel_id, reply_thread_ts)
+                active_thread_key = self._thread_key(channel_id, reply_thread_ts)
 
             attachments = await self._extract_query_attachments(event)
             if attachments:
@@ -3675,21 +3946,10 @@ class SlackBot:
                 event, self.web_client
             )
 
-            state_changed = False
-            active_thread_key = None
+            state_changed = active_thread_key is not None
             agent_thread_ts = event.get("thread_ts") or event.get("ts")
             if response_text:
-                # Determine if we should reply in thread
-                thread_ts = None
-                threading_enabled = user_prefs.get("threading", True)
-                if event.get("thread_ts"):
-                    thread_ts = event.get("thread_ts")
-                elif (
-                    self.config.get("response_settings", {}).get("thread_replies", True)
-                    and threading_enabled
-                    and event.get("ts")
-                ):
-                    thread_ts = event.get("ts")
+                thread_ts = reply_thread_ts
 
                 # Split long responses
                 max_length = self.config.get("response_settings", {}).get(
@@ -3742,7 +4002,22 @@ class SlackBot:
             await self.web_client.chat_postMessage(
                 channel=event.get("channel"),
                 text=self._build_user_safe_error_message(),
+                thread_ts=event.get("thread_ts") or event.get("ts"),
             )
+
+    def _reply_thread_ts(
+        self, event: Dict[str, Any], user_prefs: Dict[str, Any]
+    ) -> Optional[str]:
+        """The thread a reply to this message goes in; None for the channel."""
+        if event.get("thread_ts"):
+            return event.get("thread_ts")
+        if (
+            self.config.get("response_settings", {}).get("thread_replies", True)
+            and user_prefs.get("threading", True)
+            and event.get("ts")
+        ):
+            return event.get("ts")
+        return None
 
     def _split_response(self, text: str, max_length: int) -> List[str]:
         """Split long response into multiple parts"""
@@ -4008,27 +4283,93 @@ class SlackBot:
             return str(response["error"])
         return str(exc) or type(exc).__name__
 
-    async def _send_rate_limit_message(self, channel_id: str, user_id: str):
-        """Send rate limit exceeded message"""
-        await self.web_client.chat_postMessage(
+    async def _send_rate_limit_message(
+        self,
+        channel_id: str,
+        user_id: str,
+        *,
+        thread_ts: Optional[str] = None,
+        agent: bool = False,
+    ):
+        """Tell only the user that they hit a limit, in their thread if any.
+
+        Pass thread_ts only for a reply in an existing thread: Slack never
+        shows an ephemeral sent into a thread that has no replies yet, so a
+        notice for a new top-level request stays in the channel.
+        """
+        await self.web_client.chat_postEphemeral(
             channel=channel_id,
-            text=self._build_rate_limit_message(user_id),
+            user=user_id,
+            text=self._build_rate_limit_message(user_id, agent=agent),
+            thread_ts=thread_ts,
         )
 
-    def _build_rate_limit_message(self, user_id: str) -> str:
-        """Build a tier-aware rate-limit message for Slack responses."""
+    def _build_rate_limit_message(self, user_id: str, *, agent: bool = False) -> str:
+        """Say which of the user's limits was hit and when to try again.
+
+        The limits are a rolling 60-minute window and a 5-minute burst, each
+        counted per bucket: chat queries and Agent requests apart.
+        """
         user_tier = self.user_manager.get_user_tier(user_id)
         limits = self._get_rate_limit_config_for_tier(user_tier)
-        return f"""
-🚫 *Rate Limit Exceeded*
+        hourly_limit = limits["requests_per_hour"]
+        burst_limit = limits["burst_requests"]
+        kind = "Agent request" if agent else "chat request"
+        now = time.time()
+        counted = sorted(
+            self.user_manager.requests_since(
+                user_id,
+                now - RATE_LIMIT_WINDOW_SECONDS,
+                bucket=RATE_LIMIT_AGENT if agent else RATE_LIMIT_CHAT,
+            )
+        )
+        recent = [at for at in counted if at > now - RATE_LIMIT_BURST_WINDOW_SECONDS]
 
-<@{user_id}>, you've reached your hourly request limit.
+        # The first request that must leave a full window frees a slot in it;
+        # with both full, the later of the two is when a retry goes through.
+        reason = None
+        retry_at = 0.0
+        if 0 < hourly_limit <= len(counted):
+            reason = (
+                f"You've sent {_plural(len(counted), kind)} in the last "
+                "60 minutes, the hourly limit for your tier."
+            )
+            retry_at = counted[len(counted) - hourly_limit] + RATE_LIMIT_WINDOW_SECONDS
+        if 0 < burst_limit <= len(recent):
+            burst_retry_at = (
+                recent[len(recent) - burst_limit] + RATE_LIMIT_BURST_WINDOW_SECONDS
+            )
+            if reason is None or burst_retry_at > retry_at:
+                reason = (
+                    f"You've sent {_plural(len(recent), kind)} in the last "
+                    "5 minutes, the burst limit for your tier."
+                )
+                retry_at = burst_retry_at
+        if hourly_limit <= 0 or burst_limit <= 0:
+            # check_rate_limit refuses every request against a zero limit.
+            summary = (
+                f"The {user_tier.value.title()} tier doesn't allow {kind}s. "
+                "Ask an admin if you need access."
+            )
+        elif reason is None:
+            article = "an" if agent else "a"
+            summary = (
+                f"You've reached {article} {kind} limit. Try again in a few minutes."
+            )
+        else:
+            summary = f"{reason} Try again in {_format_wait(retry_at - now)}."
 
-*Your tier:* {user_tier.value.title()}
-*Hourly limit:* {limits.get('requests_per_hour', 0)}
-*Burst limit:* {limits.get('burst_requests', 0)} requests / 5 min
-*Limit resets:* At the top of each hour
-        """.strip()
+        return "\n".join(
+            [
+                "🚫 *Rate Limit Exceeded*",
+                "",
+                summary,
+                "",
+                f"*Your tier:* {user_tier.value.title()}",
+                f"*Limits:* {hourly_limit} requests per rolling 60 minutes and "
+                f"{burst_limit} per 5 minutes, for chat and Agent requests each",
+            ]
+        )
 
     async def _cleanup_sessions_periodically(self):
         """Periodically clean up expired sessions"""
@@ -5294,7 +5635,9 @@ class SlackBot:
 
         if not self._within_rate_limit(user_id, agent=True):
             await self._post_command_response(
-                nonce.channel_id, user_id, self._build_rate_limit_message(user_id)
+                nonce.channel_id,
+                user_id,
+                self._build_rate_limit_message(user_id, agent=True),
             )
             return
         response = await self.message_handler._start_agent_prompt(
@@ -5451,7 +5794,9 @@ class SlackBot:
 
         if not self._within_rate_limit(user_id, agent=True):
             await self._post_command_response(
-                nonce.channel_id, user_id, self._build_rate_limit_message(user_id)
+                nonce.channel_id,
+                user_id,
+                self._build_rate_limit_message(user_id, agent=True),
             )
             return
 
@@ -5913,9 +6258,11 @@ class SlackBot:
         """Whether a user's message goes to Agent mode rather than chat.
 
         That is an `agent` command, or any other message in an Agent thread,
-        which continues its session.
+        which continues its session. A command shared with a file or sent to
+        the channel too is one as well, so it takes the Agent lane and bucket
+        whichever of Slack's events for it arrives first.
         """
-        if event.get("subtype") or event.get("bot_id"):
+        if event.get("subtype") not in CHAT_MESSAGE_SUBTYPES or event.get("bot_id"):
             return False
         text = event.get("text") or ""
         if self.bot_user_id:
@@ -6056,15 +6403,23 @@ class SlackBot:
             SLACK_METRICS.work_running.set(0)
 
     def _is_ignored_message_event(self, event: Dict[str, Any]) -> bool:
-        """A message _handle_message_event always drops: a subtype or a bot's post.
+        """A message _handle_message_event always drops.
 
-        Dropping it before the queue keeps the bot from answering its own busy
-        reply with another one.
+        That is a bot's post, an edit or another subtype nobody asks with, or a
+        file share or broadcast in a known Agent thread. Dropping it before the
+        queue keeps the bot from answering its own busy reply with another one.
         """
-        return event.get("type") == "message" and bool(
-            event.get("subtype")
+        if event.get("type") != "message":
+            return False
+        subtype = event.get("subtype")
+        return bool(
+            subtype not in CHAT_MESSAGE_SUBTYPES
             or event.get("bot_id")
             or (self.bot_user_id and event.get("user") == self.bot_user_id)
+            or (
+                subtype is not None
+                and self._is_agent_thread(event.get("channel"), event.get("thread_ts"))
+            )
         )
 
     def _wants_busy_reply(self, item: SlackWorkItem) -> bool:
