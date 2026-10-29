@@ -188,6 +188,10 @@ RATE_LIMIT_BURST_WINDOW_SECONDS = 300
 CHAT_MESSAGE_SUBTYPES = frozenset(AgentBootstrapBuilder._INCLUDED_SUBTYPES)
 # How the bot's own messages appear in the Slack history a request sees.
 SLACK_OWN_MESSAGE_SENDER = "assistant (you)"
+# The progress placeholder the bot posts before an answer replaces it. Never
+# part of a transcript: it says nothing, and one left behind when the update
+# failed would read as an answer.
+SLACK_THINKING_TEXT = "_Thinking…_"
 # Fence name for fetched Slack history: `<untrusted_slack_history>`.
 SLACK_HISTORY_FENCE = "slack_history"
 # Most characters of per-user conversation summary a request carries.
@@ -4293,6 +4297,11 @@ class SlackBot:
         if self._same_slack_timestamp(message.get("ts"), current_ts):
             return False
         if message.get("subtype") not in CHAT_MESSAGE_SUBTYPES:
+            return False
+        if (
+            self._is_own_slack_message(message)
+            and str(message.get("text") or "").strip() == SLACK_THINKING_TEXT
+        ):
             return False
         if not self._is_own_slack_message(message) and not self.context_settings.get(
             "include_bot_messages", False

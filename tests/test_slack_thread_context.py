@@ -51,6 +51,28 @@ async def _ask(bot, client, *, user_id="u2", text="and then?", message_ts="9.0")
 
 
 @pytest.mark.asyncio
+async def test_the_bots_thinking_placeholders_stay_out_of_the_transcript(
+    inference_response_factory,
+):
+    bot = _bot(inference_response_factory)
+    client = _replies(
+        [
+            {"ts": "1.0", "user": "u1", "text": "first question"},
+            # A placeholder whose chat_update failed, and the current one.
+            {"ts": "1.1", "user": "UBOT", "bot_id": "B1", "text": " _Thinking…_ "},
+            {"ts": "1.2", "user": "UBOT", "bot_id": "B1", "text": "real answer"},
+            {"ts": "9.1", "user": "UBOT", "bot_id": "B1", "text": "_Thinking…_"},
+        ]
+    )
+
+    request = await _ask(bot, client)
+
+    assert "Thinking" not in request.context
+    assert "assistant (you): real answer" in request.context
+    assert request.metadata["slack_context_message_count"] == 2
+
+
+@pytest.mark.asyncio
 async def test_a_follow_up_from_another_user_sees_the_bots_answer(
     inference_response_factory,
 ):
