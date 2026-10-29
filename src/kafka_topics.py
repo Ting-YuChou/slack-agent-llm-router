@@ -73,8 +73,22 @@ class TopicAdmin(Protocol):
         ...
 
 
-def _dlq_topic_name(kafka_config: Mapping[str, Any], topic_key: str, name: str) -> str:
-    """Mirror KafkaConsumerManager._dead_letter_topic for one source topic."""
+def dlq_enabled(kafka_config: Mapping[str, Any]) -> bool:
+    """Whether failed messages go to a DLQ (``dlq.enabled``, else
+    ``consumer.dlq_enabled``, else on). Shared with the ClickHouse sink."""
+    dlq_section = kafka_config.get("dlq", {}) or {}
+    consumer_section = kafka_config.get("consumer", {}) or {}
+    return bool(dlq_section.get("enabled", consumer_section.get("dlq_enabled", True)))
+
+
+def dead_letter_topic_name(
+    kafka_config: Mapping[str, Any], topic_key: str, source_topic: str
+) -> str:
+    """The DLQ topic for one source topic. Shared with the ClickHouse sink.
+
+    ``kafka.dead_letter_topics[key]`` wins, then a ``<key>_dlq`` topic key,
+    then ``<source topic><dlq.topic_suffix>``.
+    """
     dead_letter_topics = kafka_config.get("dead_letter_topics", {}) or {}
     if topic_key in dead_letter_topics:
         return str(dead_letter_topics[topic_key])
@@ -82,7 +96,7 @@ def _dlq_topic_name(kafka_config: Mapping[str, Any], topic_key: str, name: str) 
     if f"{topic_key}_dlq" in topics:
         return str(topics[f"{topic_key}_dlq"])
     suffix = (kafka_config.get("dlq", {}) or {}).get("topic_suffix", DEFAULT_DLQ_SUFFIX)
-    return f"{name}{suffix}"
+    return f"{source_topic}{suffix}"
 
 
 def _spec(
@@ -123,7 +137,7 @@ def topic_specs(kafka_config: Mapping[str, Any]) -> List[TopicSpec]:
     dlq_retention_ms = int(
         provisioning.get("dlq_retention_ms", DEFAULT_DLQ_RETENTION_MS)
     )
-    dlq_enabled = bool((kafka_config.get("dlq", {}) or {}).get("enabled", True))
+    with_dlq = dlq_enabled(kafka_config)
 
     specs: Dict[str, TopicSpec] = {}
     for topic_key, name in (kafka_config.get("topics", {}) or {}).items():
@@ -143,10 +157,10 @@ def topic_specs(kafka_config: Mapping[str, Any]) -> List[TopicSpec]:
                 retention_ms=dlq_retention_ms if is_dlq else retention_ms,
             ),
         )
-        if is_dlq or not dlq_enabled:
+        if is_dlq or not with_dlq:
             continue
         dlq_key = f"{topic_key}_dlq"
-        dlq_name = _dlq_topic_name(kafka_config, topic_key, name)
+        dlq_name = dead_letter_topic_name(kafka_config, topic_key, name)
         dlq_settings = {**defaults, **(overrides.get(dlq_key, {}) or {})}
         specs.setdefault(
             dlq_name,
@@ -212,15 +226,57 @@ class AIOKafkaTopicAdmin:
         if errors:
             raise RuntimeError("Failed to create Kafka topics: " + "; ".join(errors))
 
-    async def apply_configs(self, specs: Sequence[TopicSpec]) -> None:
+    async def _dynamic_configs(self, names: Sequence[str]) -> Dict[str, Dict[str, str]]:
+        """Return each topic's dynamic (topic-level) config overrides."""
         from aiokafka.admin.config_resource import ConfigResource, ConfigResourceType
 
-        responses = await self.client.alter_configs(
-            [
-                ConfigResource(ConfigResourceType.TOPIC, spec.name, dict(spec.configs))
-                for spec in specs
-            ]
+        responses = await self.client.describe_configs(
+            [ConfigResource(ConfigResourceType.TOPIC, name) for name in names],
+            include_synonyms=True,
         )
+        if not isinstance(responses, (list, tuple)):
+            responses = [responses]
+        current: Dict[str, Dict[str, str]] = {}
+        for response in responses:
+            for resource in getattr(response, "resources", []) or []:
+                error_code, message, _type, name, entries = resource[:5]
+                if int(error_code) != 0:
+                    raise RuntimeError(
+                        f"Failed to describe Kafka topic {name}: "
+                        f"error {error_code} {message}"
+                    )
+                current[name] = {
+                    entry[0]: entry[1]
+                    for entry in entries or []
+                    if _is_dynamic_topic_config(entry) and entry[1] is not None
+                }
+        return current
+
+    async def apply_configs(self, specs: Sequence[TopicSpec]) -> None:
+        """Set the managed configs, keeping any other topic-level overrides.
+
+        aiokafka has no IncrementalAlterConfigs, and AlterConfigs replaces the
+        whole topic config set, so merge with the current dynamic configs and
+        only alter topics whose managed values differ.
+        """
+        from aiokafka.admin.config_resource import ConfigResource, ConfigResourceType
+
+        current = await self._dynamic_configs([spec.name for spec in specs])
+        resources = []
+        for spec in specs:
+            existing = current.get(spec.name, {})
+            if all(existing.get(key) == value for key, value in spec.configs.items()):
+                continue
+            resources.append(
+                ConfigResource(
+                    ConfigResourceType.TOPIC,
+                    spec.name,
+                    {**existing, **spec.configs},
+                )
+            )
+        if not resources:
+            return
+        responses = await self.client.alter_configs(resources)
         if not isinstance(responses, (list, tuple)):
             responses = [responses]
         errors = []
@@ -233,6 +289,24 @@ class AIOKafkaTopicAdmin:
             raise RuntimeError(
                 "Failed to update Kafka topic configs: " + "; ".join(errors)
             )
+
+
+DYNAMIC_TOPIC_CONFIG = 1
+
+
+def _is_dynamic_topic_config(entry: Sequence[Any]) -> bool:
+    """Whether a DescribeConfigs entry is a topic-level override.
+
+    v1+ with synonyms: the first synonym is the effective source. v2 carries
+    the source itself at index 3; v0/v1 only say whether it is a default.
+    """
+    synonyms = entry[5] if len(entry) > 5 else None
+    if synonyms:
+        return int(synonyms[0][2]) == DYNAMIC_TOPIC_CONFIG
+    marker = entry[3]
+    if isinstance(marker, bool):
+        return not marker
+    return int(marker) == DYNAMIC_TOPIC_CONFIG
 
 
 def load_kafka_config(config_path: str) -> Dict[str, Any]:

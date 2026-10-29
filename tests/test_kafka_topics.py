@@ -130,6 +130,9 @@ async def test_aiokafka_admin_tolerates_already_exists_and_raises_other_errors()
             self.new_topics = []
             self.config_resources = []
 
+        async def describe_configs(self, resources, include_synonyms=False):
+            return [SimpleNamespace(resources=[])]
+
         async def create_topics(self, new_topics):
             self.new_topics.extend(new_topics)
             return SimpleNamespace(topic_errors=self.topic_errors)
@@ -185,7 +188,7 @@ def test_chat_topics_service_provisions_before_kafka_clients():
 
 @pytest.mark.parametrize("path", CONFIGS, ids=lambda path: path.name)
 def test_clickhouse_sink_group_replays_from_earliest(path):
-    assert _kafka(path)["consumer"]["auto_offset_reset"] == "earliest"
+    assert _kafka(path)["consumer"]["sink_auto_offset_reset"] == "earliest"
 
 
 @pytest.mark.asyncio

@@ -557,8 +557,9 @@ kafka:
     shutdown_producer_timeout_seconds: 1
   consumer:
     group_id: llm-router-consumer
-    # ClickHouse sink: a new or reset group replays the retained backlog.
-    auto_offset_reset: earliest
+    auto_offset_reset: latest
+    # ClickHouse sink only: a new or reset group replays the retained backlog.
+    sink_auto_offset_reset: earliest
     enable_auto_commit: false
     max_poll_records: 500
     batch_size: 100

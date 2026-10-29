@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover - CI stubs aiokafka without it
 import clickhouse_connect
 from clickhouse_connect.driver import Client
 
+from src.kafka_topics import dead_letter_topic_name, dlq_enabled
 from src.prompt_assembly import PROMPT_CONTENT_METADATA_KEYS
 from src.redaction import context_summary, redact, redact_text
 from src.routing_features import estimate_query_tokens
@@ -1957,7 +1958,12 @@ class KafkaConsumerManager:
         self.consumer_config = {
             "bootstrap_servers": self.bootstrap_servers,
             "group_id": consumer_section.get("group_id", "llm-router-consumer"),
-            "auto_offset_reset": consumer_section.get("auto_offset_reset", "latest"),
+            # The ClickHouse sink replays the retained backlog when its group is
+            # new or reset; other consumers keep the shared auto_offset_reset.
+            "auto_offset_reset": consumer_section.get(
+                "sink_auto_offset_reset",
+                consumer_section.get("auto_offset_reset", "latest"),
+            ),
             "enable_auto_commit": consumer_section.get("enable_auto_commit", False),
             "max_poll_records": consumer_section.get("max_poll_records", 500),
         }
@@ -1967,9 +1973,7 @@ class KafkaConsumerManager:
         self.supervisor_max_backoff_seconds = float(
             consumer_section.get("supervisor_max_backoff_seconds", 30.0)
         )
-        self.dlq_enabled = bool(
-            dlq_section.get("enabled", consumer_section.get("dlq_enabled", True))
-        )
+        self.dlq_enabled = dlq_enabled(config)
         self.dlq_topic_suffix = str(dlq_section.get("topic_suffix", ".dlq"))
         self.dead_letter_topics = dict(config.get("dead_letter_topics", {}) or {})
         self.dlq_send_timeout_seconds = float(
@@ -2049,6 +2053,19 @@ class KafkaConsumerManager:
         consumer.subscribe(topics=[topic_name], listener=listener)
         self._rebalance_listeners[topic_key] = listener
 
+    async def _create_consumer(
+        self, topic_key: str, topic_name: str
+    ) -> AIOKafkaConsumer:
+        """Subscribe with the backpressure listener, then start.
+
+        Re-subscribing a running consumer races its fetcher, so the listener
+        is installed before start() on first start and on every restart.
+        """
+        consumer = AIOKafkaConsumer(**self.consumer_config)
+        self._install_rebalance_listener(topic_key, topic_name, consumer)
+        await consumer.start()
+        return consumer
+
     async def initialize(self):
         """Initialize Kafka consumers"""
         try:
@@ -2075,11 +2092,7 @@ class KafkaConsumerManager:
                     "routing_policy_state",
                     "alerts",
                 ]:
-                    # Subscribe with the backpressure listener before start():
-                    # re-subscribing a running consumer races its fetcher.
-                    consumer = AIOKafkaConsumer(**self.consumer_config)
-                    self._install_rebalance_listener(topic_key, topic_name, consumer)
-                    await consumer.start()
+                    consumer = await self._create_consumer(topic_key, topic_name)
                     self.consumers[topic_key] = consumer
                     self.topic_names_by_key[topic_key] = topic_name
                     self.consumer_task_status[topic_key] = {
@@ -2164,10 +2177,8 @@ class KafkaConsumerManager:
                 logger.warning(f"Failed to stop unhealthy {topic_key} consumer: {e}")
 
         topic_name = self.topic_names_by_key.get(topic_key) or self.topics[topic_key]
-        consumer = AIOKafkaConsumer(topic_name, **self.consumer_config)
-        await consumer.start()
+        consumer = await self._create_consumer(topic_key, topic_name)
         self.consumers[topic_key] = consumer
-        self._install_rebalance_listener(topic_key, topic_name, consumer)
         await self._refresh_batch_backpressure(topic_key)
         return consumer
 
@@ -2375,17 +2386,20 @@ class KafkaConsumerManager:
 
     def _dead_letter_topic(self, topic_key: str, message: Any) -> str:
         """Resolve the DLQ topic for a failed source message."""
-        if topic_key in self.dead_letter_topics:
-            return self.dead_letter_topics[topic_key]
-        configured_key = f"{topic_key}_dlq"
-        if configured_key in self.topics:
-            return self.topics[configured_key]
         source_topic = (
             getattr(message, "topic", None)
             or self.topic_names_by_key.get(topic_key)
             or topic_key
         )
-        return f"{source_topic}{self.dlq_topic_suffix}"
+        return dead_letter_topic_name(
+            {
+                **self.config,
+                "dead_letter_topics": self.dead_letter_topics,
+                "dlq": {"topic_suffix": self.dlq_topic_suffix},
+            },
+            topic_key,
+            source_topic,
+        )
 
     async def _publish_dead_letter(
         self,
