@@ -144,15 +144,10 @@ async def _status_for(middleware, path, body, content_type):
     async def send(message):
         sent.append(message)
 
-    scope = {
-        "type": "http",
-        "method": "POST",
-        "path": path,
-        "headers": [
-            (b"content-type", content_type.encode()),
-            (b"content-length", str(len(body)).encode()),
-        ],
-    }
+    headers = [(b"content-length", str(len(body)).encode())]
+    if content_type is not None:
+        headers.append((b"content-type", content_type.encode()))
+    scope = {"type": "http", "method": "POST", "path": path, "headers": headers}
     await middleware(scope, receive, send)
     return sent[0]["status"]
 
@@ -174,7 +169,9 @@ async def _ok_app(scope, receive, send):
         ("/upload", "application/json; charset=utf-8", 301, 413),
         ("/upload", "MULTIPART/FORM-DATA; boundary=x", 500, 200),
         ("/upload", "multipart/form-data; boundary=x", 501, 413),
-        ("/upload", "text/plain", 101, 413),
+        # An unlisted media type uses the path's smallest cap.
+        ("/upload", "text/plain", 300, 200),
+        ("/upload", "text/plain", 301, 413),
         ("/any-type", "text/plain", 700, 200),
     ],
 )
@@ -280,3 +277,34 @@ async def test_overflow_sends_one_413_and_drops_the_apps_own_response():
 
     assert [m["status"] for m in sent if m["type"] == "http.response.start"] == [413]
     assert b"request_too_large" in sent[1]["body"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "content_type", "size", "status"),
+    [
+        # No Content-Type must not escape a path's caps to the larger global one.
+        ("/json-only", None, 300, 200),
+        ("/json-only", None, 301, 413),
+        ("/json-only", "text/plain", 301, 413),
+        # A "*" entry covers every unlisted media type.
+        ("/with-star", None, 700, 200),
+        ("/with-star", None, 701, 413),
+        # Paths without caps keep the global cap.
+        ("/other", None, 1000, 200),
+        ("/other", None, 1001, 413),
+    ],
+)
+async def test_unlisted_media_type_falls_back_to_the_path_caps(
+    path, content_type, size, status
+):
+    middleware = RequestBodyLimitMiddleware(
+        _ok_app,
+        max_body_bytes=1000,
+        path_limits={
+            "/json-only": {"application/json": 300, "multipart/form-data": 500},
+            "/with-star": {"application/json": 300, "*": 700},
+        },
+    )
+
+    assert await _status_for(middleware, path, b"x" * size, content_type) == status

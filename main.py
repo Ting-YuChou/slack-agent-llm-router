@@ -97,6 +97,9 @@ WEB_SEARCH_ENABLED_ENV_VAR = "LLM_ROUTER_WEB_SEARCH_ENABLED"
 RAG_ENABLED_ENV_VAR = "LLM_ROUTER_RAG_ENABLED"
 RAG_QUEUE_ENABLED_ENV_VAR = "LLM_ROUTER_RAG_QUEUE_ENABLED"
 PUBLIC_ENDPOINTS = {"/", "/live", "/ready", "/health"}
+# Responses sent before the request body is read: closing the connection keeps
+# the server from reading and discarding an arbitrarily large body.
+REJECTED_BEFORE_BODY_HEADERS = {"Connection": "close"}
 
 # Optional infrastructure is imported only when its feature is enabled. Keeping
 # these names patchable also supports the existing isolated service tests.
@@ -1813,6 +1816,8 @@ class LLMRouterPlatform:
 
         response, reservation = await self._admit_http_request(request)
         if response is not None:
+            # Sent before the body is read: close rather than drain it.
+            response.headers["Connection"] = "close"
             return response
 
         try:
@@ -1865,6 +1870,7 @@ class LLMRouterPlatform:
                         "error": "auth_unavailable",
                         "message": "API authentication is enabled but no API keys are configured",
                     },
+                    headers=REJECTED_BEFORE_BODY_HEADERS,
                 )
 
             principal = self._resolve_api_principal(self._extract_api_key(request))
@@ -1886,6 +1892,7 @@ class LLMRouterPlatform:
                     "error": "unauthorized",
                     "message": "A valid API key is required",
                 },
+                headers=REJECTED_BEFORE_BODY_HEADERS,
             )
 
         # Added last, so it is the outermost middleware: oversized bodies are

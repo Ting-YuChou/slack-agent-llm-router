@@ -280,8 +280,9 @@ def rag_request_body_limits(upload_config: Dict[str, Any]) -> Dict[str, Dict[str
 class RequestBodyLimitMiddleware:
     """Pure ASGI middleware that caps request bodies before anything parses them.
 
-    The cap is ``path_limits[path][media type]`` (``"*"`` matches any media
-    type) and otherwise ``max_body_bytes``. A declared Content-Length above the
+    The cap is ``path_limits[path][media type]``; an unlisted or missing media
+    type uses the path's ``"*"`` entry, else its smallest cap. Paths without
+    caps use ``max_body_bytes``. A declared Content-Length above the
     cap is rejected without reading the body. Otherwise bytes are counted as
     the app reads them (this also covers chunked bodies without
     Content-Length): past the cap the client gets 413, the app sees a
@@ -312,7 +313,11 @@ class RequestBodyLimitMiddleware:
         media_type = _media_type(scope)
         if media_type in by_media_type:
             return by_media_type[media_type]
-        return by_media_type.get("*", self.max_body_bytes)
+        # An unlisted (or missing) media type must not escape the path's caps:
+        # use its "*" entry, else the smallest cap it lists.
+        if "*" in by_media_type:
+            return by_media_type["*"]
+        return min(by_media_type.values())
 
     async def __call__(
         self, scope: Dict[str, Any], receive: Receive, send: Send

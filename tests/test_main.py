@@ -1537,6 +1537,81 @@ class TestApiApp:
         assert response.status_code == 413
         assert admission.http_calls == []
 
+    @pytest.mark.parametrize(
+        ("configured_keys", "status"), [(None, 503), ("test-key", 401)]
+    )
+    def test_auth_rejections_close_the_connection(
+        self, configured_keys, status, tmp_path, monkeypatch, patched_platform_deps
+    ):
+        if configured_keys:
+            monkeypatch.setenv("LLM_ROUTER_API_KEYS", configured_keys)
+        else:
+            monkeypatch.delenv("LLM_ROUTER_API_KEYS", raising=False)
+        platform, _admission = _principal_platform(tmp_path, clients=[])
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/rag/documents",
+                content=b"x" * 1000,
+                headers={"Content-Type": "application/json", "X-API-Key": "wrong"},
+            )
+
+        # The unread body would otherwise be drained by the server.
+        assert response.status_code == status
+        assert response.headers["connection"] == "close"
+
+    def test_http_admission_rejection_closes_the_connection(
+        self, tmp_path, patched_platform_deps
+    ):
+        platform = _admission_platform(tmp_path)
+        platform.services["admission"] = DummyAdmissionController(
+            http_decision=main.AdmissionDecision.reject(
+                status_code=429,
+                error="rate_limited",
+                reason="global_request_rate_exceeded",
+                message="denied",
+                retry_after_seconds=1,
+            )
+        )
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/rag/documents",
+                content=b"x" * 1000,
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert response.status_code == 429
+        assert response.headers["connection"] == "close"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("declare_length", [True, False])
+    async def test_body_limit_rejection_closes_the_connection(
+        self, declare_length, tmp_path, patched_platform_deps
+    ):
+        platform = _admission_platform(tmp_path)
+        platform.services["admission"] = DummyAdmissionController()
+        app = platform._create_fastapi_app()
+        body = b"x" * (3 * 1024 * 1024)
+        headers = [(b"content-length", str(len(body)).encode())]
+        if not declare_length:
+            headers = [(b"transfer-encoding", b"chunked")]
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        scope = _asgi_scope("POST", "/route", headers=headers)
+        await asyncio.wait_for(app(scope, receive, send), timeout=2)
+
+        assert sent[0]["status"] == 413
+        assert (b"connection", b"close") in sent[0]["headers"]
+
     def test_rag_document_parser_follows_the_media_type_the_cap_used(
         self, tmp_path, patched_platform_deps
     ):
