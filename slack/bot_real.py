@@ -81,6 +81,10 @@ MEMORY_SLASH_ONLY_MESSAGE = (
     "Use `/llm remember`, `/llm memories`, or `/llm forget`."
 )
 SLACK_BUSY_MESSAGE = "The LLM Router is busy right now. Please retry in a moment."
+# Message subtypes a person's follow-up can carry: a plain message, one with
+# files, and a reply also sent to the channel. Edits, deletions, joins and the
+# like are never a new request. The same set the Agent thread context reads.
+CHAT_MESSAGE_SUBTYPES = frozenset(AgentBootstrapBuilder._INCLUDED_SUBTYPES)
 SLACK_PRIORITY_WORK_KINDS = frozenset({"interactive"})
 AGENT_TASK_ECHO_LIMIT = 2500
 AGENT_SHORTCUT_NONCE_TTL_SECONDS = 300
@@ -3410,9 +3414,10 @@ class SlackBot:
 
     async def _handle_message_event(self, event: Dict[str, Any]):
         """Handle message events"""
-        # Skip bot messages
+        # Skip bot messages, edits and other subtypes nobody asks with
+        subtype = event.get("subtype")
         if (
-            event.get("subtype")
+            subtype not in CHAT_MESSAGE_SUBTYPES
             or event.get("bot_id")
             or event.get("user") == self.bot_user_id
         ):
@@ -3423,7 +3428,16 @@ class SlackBot:
             return
 
         thread_ts = event.get("thread_ts")
-        if await self._reject_non_owner_agent_message(event):
+        if subtype is not None:
+            # A file share or broadcast continues a chat thread only: an Agent
+            # thread takes plain follow-ups, the kind _is_agent_request routes.
+            if not self._is_active_thread(channel_id, thread_ts, refresh=False):
+                return
+            if not self._is_agent_thread(channel_id, thread_ts):
+                await self._restore_agent_thread(event)
+            if self._is_agent_thread(channel_id, thread_ts):
+                return
+        elif await self._reject_non_owner_agent_message(event):
             return
         if not thread_ts or not self._is_active_thread(channel_id, thread_ts):
             return
@@ -3656,15 +3670,23 @@ class SlackBot:
             user_id = event.get("user")
             user_state_changed = self._synchronize_user_tier(user_id)
             user_prefs = self.user_manager.get_user_preferences(user_id)
+            agent_request = self._is_agent_request(event)
 
             if self._is_query_event(event):
-                if not self._within_rate_limit(
-                    user_id, agent=self._is_agent_request(event)
-                ):
+                if not self._within_rate_limit(user_id, agent=agent_request):
                     await self._send_rate_limit_message(channel_id, user_id)
                     if user_state_changed:
                         await self._persist_user_state(user_id)
                     return
+
+            reply_thread_ts = self._reply_thread_ts(event, user_prefs)
+            active_thread_key = None
+            if reply_thread_ts and not agent_request:
+                # Accepted: a follow-up sent while this answer is generating
+                # belongs to the thread too. An Agent thread becomes active
+                # once the runtime accepts the run.
+                self._mark_thread_active(channel_id, reply_thread_ts)
+                active_thread_key = self._thread_key(channel_id, reply_thread_ts)
 
             attachments = await self._extract_query_attachments(event)
             if attachments:
@@ -3675,21 +3697,10 @@ class SlackBot:
                 event, self.web_client
             )
 
-            state_changed = False
-            active_thread_key = None
+            state_changed = active_thread_key is not None
             agent_thread_ts = event.get("thread_ts") or event.get("ts")
             if response_text:
-                # Determine if we should reply in thread
-                thread_ts = None
-                threading_enabled = user_prefs.get("threading", True)
-                if event.get("thread_ts"):
-                    thread_ts = event.get("thread_ts")
-                elif (
-                    self.config.get("response_settings", {}).get("thread_replies", True)
-                    and threading_enabled
-                    and event.get("ts")
-                ):
-                    thread_ts = event.get("ts")
+                thread_ts = reply_thread_ts
 
                 # Split long responses
                 max_length = self.config.get("response_settings", {}).get(
@@ -3743,6 +3754,20 @@ class SlackBot:
                 channel=event.get("channel"),
                 text=self._build_user_safe_error_message(),
             )
+
+    def _reply_thread_ts(
+        self, event: Dict[str, Any], user_prefs: Dict[str, Any]
+    ) -> Optional[str]:
+        """The thread a reply to this message goes in; None for the channel."""
+        if event.get("thread_ts"):
+            return event.get("thread_ts")
+        if (
+            self.config.get("response_settings", {}).get("thread_replies", True)
+            and user_prefs.get("threading", True)
+            and event.get("ts")
+        ):
+            return event.get("ts")
+        return None
 
     def _split_response(self, text: str, max_length: int) -> List[str]:
         """Split long response into multiple parts"""
@@ -6056,15 +6081,23 @@ class SlackBot:
             SLACK_METRICS.work_running.set(0)
 
     def _is_ignored_message_event(self, event: Dict[str, Any]) -> bool:
-        """A message _handle_message_event always drops: a subtype or a bot's post.
+        """A message _handle_message_event always drops.
 
-        Dropping it before the queue keeps the bot from answering its own busy
-        reply with another one.
+        That is a bot's post, an edit or another subtype nobody asks with, or a
+        file share or broadcast in a known Agent thread. Dropping it before the
+        queue keeps the bot from answering its own busy reply with another one.
         """
-        return event.get("type") == "message" and bool(
-            event.get("subtype")
+        if event.get("type") != "message":
+            return False
+        subtype = event.get("subtype")
+        return bool(
+            subtype not in CHAT_MESSAGE_SUBTYPES
             or event.get("bot_id")
             or (self.bot_user_id and event.get("user") == self.bot_user_id)
+            or (
+                subtype is not None
+                and self._is_agent_thread(event.get("channel"), event.get("thread_ts"))
+            )
         )
 
     def _wants_busy_reply(self, item: SlackWorkItem) -> bool:
