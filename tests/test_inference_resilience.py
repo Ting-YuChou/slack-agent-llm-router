@@ -1158,6 +1158,41 @@ async def test_attempts_count_only_models_whose_provider_was_called():
 
 
 @pytest.mark.asyncio
+async def test_single_flight_follower_answered_by_a_fallback_reports_an_attempt():
+    from src.llm_router_part2_inference import SingleFlightCoordinator
+
+    engine = _chain_engine(
+        _router(),
+        None,
+        scheduler=_shipped_scheduler(),
+        admission=_RejectModelsAdmission("gpt-5"),
+    )
+    engine.single_flight = SingleFlightCoordinator({"enabled": True})
+
+    async def slow_claude(_request, model):
+        await asyncio.sleep(0.05)
+        return _response(model, "anthropic")
+
+    engine.providers["anthropic"].generate_response = AsyncMock(side_effect=slow_claude)
+    decision = SimpleNamespace(selected_model="gpt-5", token_count=64)
+
+    results = await asyncio.gather(
+        *(
+            engine._generate_response_with_fallback(_request(**_ENTERPRISE), decision)
+            for _ in range(2)
+        )
+    )
+
+    # One claude call answered both requests; gpt-5 was never called.
+    engine.providers["anthropic"].generate_response.assert_awaited_once()
+    engine.providers["openai"].generate_response.assert_not_awaited()
+    for response, model_name, _decision in results:
+        assert model_name == "claude-sonnet-4-6"
+        assert response.fallback_from_model == "gpt-5"
+        assert response.attempts == 1
+
+
+@pytest.mark.asyncio
 async def test_hung_gpt5_attempt_is_answered_by_claude():
     engine = _chain_engine(
         _router(),
@@ -1499,3 +1534,61 @@ async def test_text_only_retry_fails_when_no_candidate_fits_the_tier():
 
     engine.providers["anthropic"].generate_response.assert_not_awaited()
     engine.providers["openai"].generate_response.assert_not_awaited()
+
+
+def _failed_vision_engine(router, text_only_error=None):
+    """gpt-5 fails a vision request that has no vision fallback left."""
+    engine = _chain_engine(router, _StatusError(503), chains={})
+    if text_only_error is not None:
+        engine.providers["vllm"].generate_response = AsyncMock(
+            side_effect=text_only_error
+        )
+
+    async def attach_images(request, routing_decision, _rag_result):
+        request._rag_images = [
+            SimpleNamespace(
+                figure_id="fig-1",
+                content_checksum_sha256="abc",
+                asset_ref=SimpleNamespace(index_version="v1", checksum_sha256="abc"),
+            )
+        ]
+        return routing_decision
+
+    engine._prepare_rag_images = attach_images
+    return engine
+
+
+@pytest.mark.asyncio
+async def test_text_only_retry_with_no_tier_model_does_not_blame_the_primary_twice():
+    router = _router(_VISION_MODELS)
+    engine = _failed_vision_engine(router)
+    request = _request(
+        user_tier=UserTier.FREE, metadata={"rag_original_model": "claude-sonnet-4-6"}
+    )
+
+    response = await engine.process_query(request)
+
+    assert response.error == "inference_failed"
+    failures, errors, _event = _blame(router, engine, request)
+    assert failures == ["gpt-5"]
+    assert errors == {"gpt-5": 1}
+
+
+@pytest.mark.asyncio
+async def test_failed_text_only_retry_is_blamed_on_its_own_model():
+    # With anthropic blocked no vision fallback is left, only the text retry.
+    router = _router(
+        _VISION_MODELS, policy=_PolicyCache(blocked_providers=["anthropic"])
+    )
+    engine = _failed_vision_engine(router, text_only_error=_StatusError(503))
+    request = _request(
+        **_ENTERPRISE, metadata={"rag_text_fallback_models": ["mistral-7b"]}
+    )
+
+    response = await engine.process_query(request)
+
+    assert response.error == "inference_failed"
+    engine.providers["vllm"].generate_response.assert_awaited_once()
+    failures, errors, _event = _blame(router, engine, request)
+    assert sorted(failures) == ["gpt-5", "mistral-7b"]
+    assert errors == {"gpt-5": 1, "mistral-7b": 1}

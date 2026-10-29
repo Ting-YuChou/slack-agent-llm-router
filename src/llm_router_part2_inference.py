@@ -3285,8 +3285,14 @@ class InferenceEngine:
                     continue
             response.fallback_from_model = primary_model
             # Only models whose provider was called count: not those rejected
-            # at admission or by an open circuit, nor a fallback cache hit.
-            response.attempts = len(started_calls)
+            # at admission or by an open circuit, nor a fallback cache hit. A
+            # fallback that answered counts even when a coalesced call (the
+            # single-flight leader's) reached its provider.
+            response.attempts = (
+                len(started_calls)
+                if from_cache
+                else len({*started_calls, fallback_model})
+            )
             return (
                 response,
                 fallback_model,
@@ -3316,11 +3322,30 @@ class InferenceEngine:
         *,
         started_calls: List[str],
     ) -> Tuple[InferenceResponse, str, Any]:
-        """The text-only retry of a failed vision request, marked as a fallback."""
+        """The text-only retry of a failed vision request, marked as a fallback.
+
+        A failure is recorded against the text-only model when it was called;
+        the earlier failures are already on record, so the routed model is
+        not blamed again.
+        """
         primary_model = routing_decision.selected_model
-        result = await self._execute_text_only_after_vision_failure(
-            request, routing_decision, execution_budget
-        )
+        retry_started_at = time.time()
+        retry_calls: List[str] = []
+        try:
+            result = await self._execute_text_only_after_vision_failure(
+                request, routing_decision, execution_budget, started_calls=retry_calls
+            )
+        except AdmissionRejectedError:
+            raise
+        except Exception as exc:
+            for model_name in retry_calls:
+                self._record_failed_attempt(model_name, exc, retry_started_at)
+            setattr(exc, "_attempt_recorded", True)
+            raise
+        finally:
+            started_calls.extend(
+                name for name in retry_calls if name not in started_calls
+            )
         response, model_name, decision = result
         response.attempts = len({*started_calls, model_name})
         response.fallback_from_model = (
@@ -3411,6 +3436,7 @@ class InferenceEngine:
         request: QueryRequest,
         routing_decision: Any,
         execution_budget: Optional[RequestExecutionBudget],
+        started_calls: Optional[List[str]] = None,
     ) -> Tuple[InferenceResponse, str, Any]:
         """Retry once without images only after all vision-capable routes fail."""
         request._rag_images = []
@@ -3441,8 +3467,11 @@ class InferenceEngine:
         if not allowed:
             raise ValueError("No text-only model is open to the user's tier")
         model_name = allowed[0]
+        call_options: Dict[str, Any] = {"execution_budget": execution_budget}
+        if started_calls is not None:
+            call_options["started_calls"] = started_calls
         response = await self._execute_model_request(
-            request, model_name, execution_budget=execution_budget
+            request, model_name, **call_options
         )
         response.warnings = [*response.warnings, warning]
         return (
