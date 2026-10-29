@@ -28,6 +28,12 @@ from src.utils.schema import (
 )
 from src.utils.metrics import PIPELINE_METRICS
 
+HOURS_WINDOWED_DASHBOARD_READS = [
+    "get_model_performance",
+    "get_routing_guardrails",
+    "get_routing_policy_state_events",
+]
+
 
 @pytest.fixture
 def pipeline_config():
@@ -800,6 +806,54 @@ class TestClickHouseManager:
 
         queries = [call.args[1] for call in manager._run_blocking.await_args_list]
         assert all(" FINAL" in query for query in queries)
+
+    @pytest.mark.parametrize("method_name", HOURS_WINDOWED_DASHBOARD_READS)
+    @pytest.mark.asyncio
+    async def test_dashboard_reads_bind_hours_as_query_parameter(
+        self, pipeline_config, method_name
+    ):
+        manager = ClickHouseManager(pipeline_config["clickhouse"])
+        manager.client = MagicMock()
+        manager._run_blocking = AsyncMock(return_value=SimpleNamespace(result_rows=[]))
+
+        await getattr(manager, method_name)(hours=137, raise_errors=True)
+
+        call = manager._run_blocking.await_args
+        assert call.args[0] is manager.client.query
+        assert "INTERVAL {hours:UInt32} HOUR" in call.args[1]
+        assert "137" not in call.args[1]
+        assert call.kwargs["parameters"] == {"hours": 137}
+
+    @pytest.mark.parametrize("method_name", HOURS_WINDOWED_DASHBOARD_READS)
+    @pytest.mark.asyncio
+    async def test_dashboard_reads_clamp_negative_hours_to_zero(
+        self, pipeline_config, method_name
+    ):
+        manager = ClickHouseManager(pipeline_config["clickhouse"])
+        manager.client = MagicMock()
+        manager._run_blocking = AsyncMock(return_value=SimpleNamespace(result_rows=[]))
+
+        await getattr(manager, method_name)(hours=-5, raise_errors=True)
+
+        call = manager._run_blocking.await_args
+        assert call.kwargs["parameters"] == {"hours": 0}
+        assert "-5" not in call.args[1]
+
+    @pytest.mark.parametrize("method_name", HOURS_WINDOWED_DASHBOARD_READS)
+    @pytest.mark.asyncio
+    async def test_dashboard_reads_reject_non_integer_hours_before_sql(
+        self, pipeline_config, method_name
+    ):
+        manager = ClickHouseManager(pipeline_config["clickhouse"])
+        manager.client = MagicMock()
+        manager._run_blocking = AsyncMock(return_value=SimpleNamespace(result_rows=[]))
+        method = getattr(manager, method_name)
+
+        with pytest.raises(ValueError):
+            await method(hours="1; DROP TABLE x", raise_errors=True)
+        assert await method(hours="1; DROP TABLE x") == []
+
+        manager._run_blocking.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_get_model_performance_groups_by_provider(self, pipeline_config):

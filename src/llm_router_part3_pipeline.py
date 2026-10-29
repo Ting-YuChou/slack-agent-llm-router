@@ -1445,6 +1445,7 @@ class ClickHouseManager:
     ) -> List[Dict[str, Any]]:
         """Get model performance metrics"""
         try:
+            time_window_hours = max(int(hours), 0)
             query = f"""
             SELECT 
                 model_name,
@@ -1456,12 +1457,16 @@ class ClickHouseManager:
                 sum(error_count) as errors,
                 sum(total_cost_usd) as total_cost
             FROM {self.database}.model_performance FINAL
-            WHERE timestamp >= now() - INTERVAL {hours} HOUR
+            WHERE timestamp >= now() - INTERVAL {{hours:UInt32}} HOUR
             GROUP BY model_name, provider
             ORDER BY requests DESC, model_name ASC, provider ASC
             """
 
-            result = await self._run_blocking(self.client.query, query)
+            result = await self._run_blocking(
+                self.client.query,
+                query,
+                parameters={"hours": time_window_hours},
+            )
 
             performance_data = []
             for row in result.result_rows:
@@ -1493,6 +1498,7 @@ class ClickHouseManager:
     ) -> List[Dict[str, Any]]:
         """Get recent routing guardrail events persisted through the alert stream."""
         try:
+            time_window_hours = max(int(hours), 0)
             query = f"""
             SELECT
                 timestamp,
@@ -1503,13 +1509,17 @@ class ClickHouseManager:
                 provider,
                 payload_json
             FROM {self.database}.alert_events FINAL
-            WHERE timestamp >= now() - INTERVAL {hours} HOUR
+            WHERE timestamp >= now() - INTERVAL {{hours:UInt32}} HOUR
               AND source_event_type = 'routing.guardrails'
             ORDER BY timestamp DESC
             LIMIT 50
             """
 
-            result = await self._run_blocking(self.client.query, query)
+            result = await self._run_blocking(
+                self.client.query,
+                query,
+                parameters={"hours": time_window_hours},
+            )
             guardrails = []
             for row in result.result_rows:
                 payload = {}
@@ -1548,6 +1558,7 @@ class ClickHouseManager:
     ) -> List[Dict[str, Any]]:
         """Get recent persisted routing.policy_state events for audit and tuning."""
         try:
+            time_window_hours = max(int(hours), 0)
             query = f"""
             SELECT
                 timestamp,
@@ -1573,12 +1584,16 @@ class ClickHouseManager:
                 avoid_providers,
                 payload_json
             FROM {self.database}.routing_policy_state_events FINAL
-            WHERE timestamp >= now() - INTERVAL {hours} HOUR
+            WHERE timestamp >= now() - INTERVAL {{hours:UInt32}} HOUR
             ORDER BY timestamp DESC
             LIMIT 50
             """
 
-            result = await self._run_blocking(self.client.query, query)
+            result = await self._run_blocking(
+                self.client.query,
+                query,
+                parameters={"hours": time_window_hours},
+            )
             state_events = []
             for row in result.result_rows:
                 payload = {}
