@@ -36,6 +36,13 @@ from src.utils.metrics import (
 
 logger = logging.getLogger(__name__)
 
+# Stream alerts recorded but not notified because they were older than
+# alerts.max_event_age_seconds (for example on a consumer replay).
+STALE_ALERT_EVENTS = Counter(
+    "llm_router_alerts_stale_events_total",
+    "Stream alert events too old to notify",
+)
+
 
 def _parse_event_timestamp(value: Any) -> datetime:
     """Parse event timestamps emitted by the streaming pipeline as aware values.
@@ -82,6 +89,15 @@ class AlertRule:
     pending_since: Optional[datetime] = None
     # Whether a firing notification is outstanding (a resolve is owed).
     firing: bool = False
+    # How long the condition must stay false before RESOLVED is sent; None
+    # means the rule's duration, or 300s when that is unset.
+    resolve_after_seconds: Optional[float] = None
+    recovering_since: Optional[datetime] = None
+
+    def effective_resolve_after_seconds(self) -> float:
+        if self.resolve_after_seconds is not None:
+            return float(self.resolve_after_seconds)
+        return float(self.duration) if self.duration else 300.0
 
 
 @dataclass
@@ -290,6 +306,8 @@ class AlertManager:
             None if max_event_age is None else max(0.0, float(max_event_age))
         )
         self.stale_event_count = 0
+        self.stale_warning_interval_seconds = 60.0
+        self._last_stale_warning_at: Optional[float] = None
         self.sender_drain_timeout_seconds = max(
             0.0, float(alerts_config.get("sender_drain_timeout_seconds", 5))
         )
@@ -372,8 +390,11 @@ class AlertManager:
         ]
 
         pending_seconds = max(0.0, float(rules_config.get("pending_seconds", 0) or 0))
+        resolve_after = rules_config.get("resolve_after_seconds")
         for rule in default_rules:
             rule.pending_seconds = pending_seconds
+            if resolve_after is not None:
+                rule.resolve_after_seconds = max(0.0, float(resolve_after))
 
         self.alert_rules.extend(default_rules)
         logger.info(f"Loaded {len(self.alert_rules)} alert rules")
@@ -404,8 +425,9 @@ class AlertManager:
         """Check all alert rules against current metrics.
 
         A breach must hold for ``pending_seconds`` before it notifies; while
-        it keeps firing, ``duration`` is the re-notify cooldown. Recovery
-        after a firing notification sends a resolve.
+        it keeps firing, ``duration`` is the re-notify cooldown. After a
+        firing notification, RESOLVED is sent once the condition has stayed
+        false for the rule's resolve_after_seconds (hysteresis against flaps).
         """
         current_time = now or datetime.now(timezone.utc)
 
@@ -422,13 +444,25 @@ class AlertManager:
 
                 if not triggered:
                     rule.pending_since = None
-                    if rule.firing:
+                    if not rule.firing:
+                        continue
+                    # Resolve hysteresis: a flapping metric must stay healthy
+                    # for resolve_after_seconds before RESOLVED is sent.
+                    if rule.recovering_since is None:
+                        rule.recovering_since = current_time
+                    recovered_for = (
+                        current_time - rule.recovering_since
+                    ).total_seconds()
+                    if recovered_for >= rule.effective_resolve_after_seconds():
                         rule.firing = False
-                        # A new breach after a resolve is a new incident, so
+                        rule.recovering_since = None
+                        # A breach after a real resolve is a new incident, so
                         # it notifies without waiting out the cooldown.
                         rule.last_triggered = None
                         await self._resolve_alert(rule, metrics)
                     continue
+
+                rule.recovering_since = None
 
                 if rule.pending_since is None:
                     rule.pending_since = current_time
@@ -701,18 +735,38 @@ class AlertManager:
         age = (datetime.now(timezone.utc) - event_time).total_seconds()
         return age > self.max_event_age_seconds
 
-    async def _resolve_external_alert(self, normalized_alert: Dict[str, Any]):
-        """Resolve every active incident of the scope a ``clear`` closes.
+    def _record_stale_event(self, normalized_alert: Dict[str, Any]) -> None:
+        """Count a stale firing event; warn at most once per minute."""
+        self.stale_event_count += 1
+        STALE_ALERT_EVENTS.inc()
+        now = self._clock()
+        last = self._last_stale_warning_at
+        if last is None or now - last >= self.stale_warning_interval_seconds:
+            self._last_stale_warning_at = now
+            logger.warning(
+                "Stale stream alert not notified (older than %ss): %s; "
+                "%d stale so far",
+                self.max_event_age_seconds,
+                normalized_alert.get("rule_name"),
+                self.stale_event_count,
+            )
 
-        A clear means the whole scope recovered, even though it carries only
-        the trigger type that first entered.
+    async def _resolve_external_alert(self, normalized_alert: Dict[str, Any]):
+        """Resolve the active incidents of the scope a ``clear`` closes.
+
+        Flink's hysteresis tracks only avoids, so a clear closes every avoid
+        incident of its scope (it carries only the trigger that entered) plus
+        any incident of its own trigger type. Warn-only incidents are never
+        cleared by Flink; they stay open until their cooldown runs out.
         """
         incident, _identity = self._external_alert_keys(normalized_alert)
-        source, _alert_type, scope = incident
+        source, alert_type, scope = incident
         targets = [
             key
-            for key in self._active_external_alerts
-            if key[0] == source and key[2] == scope
+            for key, active in self._active_external_alerts.items()
+            if key[0] == source
+            and key[2] == scope
+            and (key[1] == alert_type or active.get("guardrail_action") == "avoid")
         ]
         for key in targets:
             active = self._active_external_alerts.pop(key)
@@ -778,12 +832,9 @@ class AlertManager:
             "status": "firing",
         }
 
-        stale = self._is_stale_event(alert_data)
         if normalized_alert["guardrail_action"] == "clear":
-            if stale:
-                # A replayed clear must not resolve a current incident.
-                self.stale_event_count += 1
-                return
+            # Clears are processed however late they arrive; dropping one
+            # would leave its incident open for good.
             await self._resolve_external_alert(normalized_alert)
             return
 
@@ -796,9 +847,9 @@ class AlertManager:
 
         self._append_alert_to_history(normalized_alert)
 
-        if stale:
+        if self._is_stale_event(alert_data):
             # Replayed from an old offset: keep the record, skip the page.
-            self.stale_event_count += 1
+            self._record_stale_event(normalized_alert)
             return
 
         now = self._clock()

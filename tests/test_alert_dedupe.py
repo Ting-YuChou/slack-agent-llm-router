@@ -188,7 +188,11 @@ def _rule(pending_seconds=0, duration=3600):
 @pytest.mark.asyncio
 async def test_pending_period_delays_notification_and_recovery_resolves():
     manager = AlertManager({})
-    manager.alert_rules = [_rule(pending_seconds=120)]
+    # Round 2 added resolve hysteresis; this test covers pending, so resolve
+    # immediately on recovery.
+    rule = _rule(pending_seconds=120)
+    rule.resolve_after_seconds = 0
+    manager.alert_rules = [rule]
     handler = _RecordingHandler()
     manager.notification_handlers = {"test": handler}
     start = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)

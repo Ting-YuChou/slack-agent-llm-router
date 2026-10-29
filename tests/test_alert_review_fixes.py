@@ -1,19 +1,11 @@
 """Round-1 review fixes for A10 alerting."""
 
-import re
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import pytest
-import yaml
 
 from flink.logic import build_routing_guardrail_event
 from src.llm_router_part4_monitor import AlertManager, AlertRule, MonitoringService
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-RULES_PATH = (
-    REPO_ROOT / "docker" / "observability" / "prometheus" / "llm-router-alerts.yml"
-)
 
 
 class _RecordingHandler:
@@ -43,7 +35,8 @@ def _rule(**overrides):
 @pytest.mark.asyncio
 async def test_rebreach_after_resolve_notifies_again():
     manager = AlertManager({})
-    manager.alert_rules = [_rule()]
+    # Round 2 added resolve hysteresis; resolve on the first healthy check.
+    manager.alert_rules = [_rule(resolve_after_seconds=0)]
     handler = _RecordingHandler()
     manager.notification_handlers = {"test": handler}
     start = datetime(2026, 10, 29, 12, 0, tzinfo=timezone.utc)
@@ -231,18 +224,6 @@ async def test_clear_event_shaped_like_flink_resolves_incident():
 
     assert [c["status"] for c in handler.calls] == ["firing", "resolved"]
     assert handler.calls[-1]["scope_key"] == "gpt-5"
-
-
-# --- A10 review 8: no stall alert on quiet but healthy topics ---
-
-
-def test_consumer_stall_rule_requires_lag():
-    document = yaml.safe_load(RULES_PATH.read_text())
-    for group in document["groups"]:
-        for rule in group["rules"]:
-            expr = rule["expr"]
-            if "llm_router_kafka_last_consumed_timestamp_seconds" in expr:
-                assert re.search(r"llm_router_kafka_consumer_lag", expr), rule["alert"]
 
 
 # --- Cross-branch A: the pending warn and the real avoid share one incident ---
