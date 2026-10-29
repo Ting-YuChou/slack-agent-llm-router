@@ -65,6 +65,9 @@ DEFAULT_GUARDRAIL_GATING_CONFIG = {
     "enter_bad_windows": 2,
     "enter_window_lookback": 3,
     "exit_good_windows": 2,
+    # Matches policy_cache.guardrail_ttl_seconds: an entered scope with no
+    # bad window for this long has lapsed in the cache and must enter again.
+    "active_ttl_seconds": 180,
 }
 DEFAULT_MODEL_GUARDRAIL_CONFIG.update(DEFAULT_GUARDRAIL_GATING_CONFIG)
 
@@ -1054,7 +1057,38 @@ def _gating_config(
         ),
         "enter_window_lookback": lookback,
         "exit_good_windows": max(1, _safe_int(config.get("exit_good_windows"), 2)),
+        "active_ttl_ms": max(1, _safe_int(config.get("active_ttl_seconds"), 180))
+        * 1000,
     }
+
+
+def _window_end_ms(metric_event: Dict[str, Any], window_start_ms: int) -> int:
+    end_ms = _safe_int(metric_event.get("window_end_ms"), 0)
+    if end_ms > window_start_ms:
+        return end_ms
+    size_seconds = _safe_int(metric_event.get("window_size_seconds"), 0)
+    return window_start_ms + max(0, size_seconds) * 1000
+
+
+def _hysteresis_clear_event(
+    metric_event: Dict[str, Any],
+    *,
+    scope_type: str,
+    scope_key: str,
+    trigger_type: str,
+    description: str,
+    timestamp: datetime | None,
+) -> Dict[str, Any]:
+    return build_routing_guardrail_event(
+        metric_event,
+        scope_type=scope_type,
+        scope_key=scope_key,
+        trigger_type=trigger_type,
+        description=description,
+        guardrail_action="clear",
+        severity="info",
+        timestamp=timestamp,
+    )
 
 
 def apply_guardrail_hysteresis(
@@ -1080,23 +1114,71 @@ def apply_guardrail_hysteresis(
     exit_good_windows good windows in a row it emits one guardrail_action
     "clear" for the trigger that entered.
 
+    Windows count only when consecutive in event time: a window that does
+    not start where the previous one ended starts the count again. An
+    entered scope that sees no bad window for active_ttl_seconds (the cache
+    TTL of its last avoid) has expired: it emits a clear and must pass the
+    enter gate again.
+
     The same window may be evaluated again as more of it arrives: with
-    replace_window the newest verdict replaces the window's, otherwise a
-    window stays bad once it was. Earlier windows arriving late are ignored.
+    replace_window the newest verdict replaces the window's, and if that
+    turns the window that entered the scope healthy, the avoid is retracted
+    with a clear. Otherwise a window stays bad once it was. Earlier windows
+    arriving late are ignored.
     """
     gating = _gating_config(defaults or DEFAULT_GUARDRAIL_GATING_CONFIG, thresholds)
     window_start_ms = _safe_int(metric_event.get("window_start_ms"), 0)
+    window_end_ms = _window_end_ms(metric_event, window_start_ms)
     avoids = [g for g in guardrails if g.get("guardrail_action") == "avoid"]
     warns = [g for g in guardrails if g.get("guardrail_action") != "avoid"]
     bad = bool(avoids)
+    outputs: list[Dict[str, Any]] = []
 
-    windows: list[list[Any]] = [list(item) for item in state.get("windows", [])]
-    if windows and window_start_ms < _safe_int(windows[-1][0], 0):
+    windows: list[list[Any]] = []
+    for item in state.get("windows", []):
+        start = _safe_int(item[0], 0)
+        end = _safe_int(item[2], 0) if len(item) > 2 else 0
+        windows.append([start, bool(item[1]), end if end > start else start])
+    if windows and window_start_ms < windows[-1][0]:
         return []
-    if windows and _safe_int(windows[-1][0], 0) == window_start_ms:
-        windows[-1][1] = bad if replace_window else (bool(windows[-1][1]) or bad)
+
+    if state.get("active") and window_start_ms >= _safe_int(
+        state.get("active_until_ms"), 0
+    ):
+        # The cache entry has lapsed; the scope must enter again.
+        outputs.append(
+            _hysteresis_clear_event(
+                metric_event,
+                scope_type=scope_type,
+                scope_key=scope_key,
+                trigger_type=str(state.get("trigger_type") or "unknown"),
+                description=(
+                    f"{scope_type.capitalize()} {scope_key} guardrail expired "
+                    "without recent windows"
+                ),
+                timestamp=timestamp,
+            )
+        )
+        state["active"] = False
+        state["trigger_type"] = None
+        state["activated_window"] = None
+
+    retracted = False
+    if windows and windows[-1][0] == window_start_ms:
+        was_bad = windows[-1][1]
+        windows[-1][1] = bad if replace_window else (was_bad or bad)
+        retracted = (
+            replace_window
+            and was_bad
+            and not bad
+            and bool(state.get("active"))
+            and _safe_int(state.get("activated_window"), -1) == window_start_ms
+        )
     else:
-        windows.append([window_start_ms, bad])
+        if windows and window_start_ms > windows[-1][2]:
+            # A gap in event time: earlier windows are not consecutive.
+            windows = []
+        windows.append([window_start_ms, bad, window_end_ms])
         state["emitted"] = []
     keep = max(gating["enter_window_lookback"], gating["exit_good_windows"])
     windows = windows[-keep:]
@@ -1114,14 +1196,37 @@ def apply_guardrail_hysteresis(
                 fresh.append(guardrail)
         return fresh
 
-    outputs: list[Dict[str, Any]] = []
+    def refresh_active() -> None:
+        state["active_until_ms"] = window_end_ms + gating["active_ttl_ms"]
+
     lookback = windows[-gating["enter_window_lookback"] :]
-    bad_count = sum(1 for _, window_bad in lookback if window_bad)
-    if not state.get("active"):
+    bad_count = sum(1 for window in lookback if window[1])
+    if retracted:
+        # The rest of the window that entered the scope arrived healthy.
+        outputs.append(
+            _hysteresis_clear_event(
+                metric_event,
+                scope_type=scope_type,
+                scope_key=scope_key,
+                trigger_type=str(state.get("trigger_type") or "unknown"),
+                description=(
+                    f"{scope_type.capitalize()} {scope_key} window was healthy "
+                    "once complete"
+                ),
+                timestamp=timestamp,
+            )
+        )
+        state["active"] = False
+        state["trigger_type"] = None
+        state["activated_window"] = None
+        emitted = set()
+    elif not state.get("active"):
         if bad and bad_count >= gating["enter_bad_windows"]:
             state["active"] = True
             state["trigger_type"] = avoids[0].get("trigger_type")
-            outputs = emit(avoids)
+            state["activated_window"] = window_start_ms
+            refresh_active()
+            outputs.extend(emit(avoids))
         else:
             pending = [
                 {
@@ -1132,36 +1237,37 @@ def apply_guardrail_hysteresis(
                 }
                 for guardrail in avoids
             ]
-            outputs = emit(warns + pending)
+            outputs.extend(emit(warns + pending))
     elif bad:
-        outputs = emit(avoids)
+        refresh_active()
+        outputs.extend(emit(avoids))
     else:
         good_streak = 0
-        for _, window_bad in reversed(windows):
-            if window_bad:
+        for window in reversed(windows):
+            if window[1]:
                 break
             good_streak += 1
         if good_streak >= gating["exit_good_windows"]:
-            trigger_type = str(state.get("trigger_type") or "unknown")
-            outputs = emit(
-                [
-                    build_routing_guardrail_event(
-                        metric_event,
-                        scope_type=scope_type,
-                        scope_key=scope_key,
-                        trigger_type=trigger_type,
-                        description=(
-                            f"{scope_type.capitalize()} {scope_key} recovered after "
-                            f"{good_streak} healthy windows"
-                        ),
-                        guardrail_action="clear",
-                        severity="info",
-                        timestamp=timestamp,
-                    )
-                ]
+            outputs.extend(
+                emit(
+                    [
+                        _hysteresis_clear_event(
+                            metric_event,
+                            scope_type=scope_type,
+                            scope_key=scope_key,
+                            trigger_type=str(state.get("trigger_type") or "unknown"),
+                            description=(
+                                f"{scope_type.capitalize()} {scope_key} recovered "
+                                f"after {good_streak} healthy windows"
+                            ),
+                            timestamp=timestamp,
+                        )
+                    ]
+                )
             )
             state["active"] = False
             state["trigger_type"] = None
+            state["activated_window"] = None
     state["emitted"] = sorted(emitted)
     return outputs
 

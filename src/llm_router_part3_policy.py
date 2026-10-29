@@ -74,9 +74,11 @@ end
 return 1
 """
 
-# Lifts a guardrail (A2) unless the stored one is newer. KEYS[1] is the
-# guardrail record, KEYS[2] its index set; ARGV is the clear's event time in
-# ms and the index member.
+# Lifts a guardrail (A2) unless the stored one is newer, leaving a tombstone
+# so an older avoid that arrives later (a replay, a rollback, another
+# partition) is rejected by CAS_SET_SCRIPT. KEYS[1] is the guardrail record,
+# KEYS[2] its index set; ARGV is the clear's event time in ms for the
+# comparison, the index member, the tombstone payload and its TTL in seconds.
 CAS_CLEAR_SCRIPT = """
 local current = redis.call('GET', KEYS[1])
 if current then
@@ -88,7 +90,7 @@ if current then
     end
   end
 end
-redis.call('DEL', KEYS[1])
+redis.call('SET', KEYS[1], ARGV[3], 'EX', ARGV[4])
 redis.call('SREM', KEYS[2], ARGV[2])
 return 1
 """
@@ -1126,6 +1128,21 @@ class RoutingPolicyCache:
         cache_key = self._guardrail_cache_key(scope_type, scope_key)
         if self._redis_enabled():
             event_time_ms = policy_event_time_ms(event, "window_end_ms", "emitted_at")
+            # Readers skip a tombstone: it is not in the index and its action
+            # is "clear".
+            tombstone = {
+                "scope_type": scope_type,
+                "scope_key": scope_key,
+                "guardrail_action": "clear",
+                "tombstone": True,
+                "trigger_type": _event_text(event, "trigger_type", "unknown"),
+                "event_time_ms": (
+                    event_time_ms
+                    if event_time_ms is not None
+                    else int(self._wall_time_func() * 1000)
+                ),
+                "updated_at": event.get("emitted_at"),
+            }
             await self._require_redis()
             try:
                 cleared = await self._run_redis_operation(
@@ -1140,6 +1157,8 @@ class RoutingPolicyCache:
                             else event_time_ms
                         ),
                         scope_key,
+                        json.dumps(tombstone),
+                        str(self.guardrail_ttl_seconds),
                     )
                 )
             except Exception as e:

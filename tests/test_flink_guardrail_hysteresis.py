@@ -423,7 +423,9 @@ async def test_clear_script_on_real_redis(real_redis):
             _guardrail_event("clear", BASE_MS + WINDOW_MS)
         )
 
-        assert await real_redis.exists(key) == 0
+        # The guardrail is lifted; a tombstone stays to reject older avoids.
+        assert json.loads(await real_redis.get(key))["guardrail_action"] == "clear"
         assert await real_redis.smembers(index_key) == set()
+        assert (await cache.get_active_guardrails())["blocked_models"] == []
     finally:
         await real_redis.delete(key, index_key)

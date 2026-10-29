@@ -837,6 +837,8 @@ flink:
       enter_bad_windows: 2
       enter_window_lookback: 3
       exit_good_windows: 2
+      # Keep equal to policy_cache.guardrail_ttl_seconds.
+      active_ttl_seconds: 180
     provider_guardrails:
       high_error_rate: 0.2
       high_latency_ms: 6000
@@ -851,6 +853,8 @@ flink:
       enter_bad_windows: 2
       enter_window_lookback: 3
       exit_good_windows: 2
+      # Keep equal to policy_cache.guardrail_ttl_seconds.
+      active_ttl_seconds: 180
     rolling_policy:
       bucket_size_seconds: 5
       emit_interval_seconds: 5
