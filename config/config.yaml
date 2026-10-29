@@ -660,6 +660,8 @@ kafka:
   consumer:
     group_id: llm-router-consumer
     auto_offset_reset: latest
+    # ClickHouse sink only: a new or reset group replays the retained backlog.
+    sink_auto_offset_reset: earliest
     enable_auto_commit: false
     max_poll_records: 500
     batch_size: 100
@@ -673,6 +675,19 @@ kafka:
     enabled: true
     topic_suffix: .dlq
     send_timeout_seconds: 10
+  # Read by `python -m src.kafka_topics` (compose: chat-topics service).
+  # Every kafka.topics entry and its DLQ is created with these settings.
+  provisioning:
+    partitions: 1
+    replication_factor: 1
+    retention_ms: 604800000
+    dlq_retention_ms: 2592000000
+    topics:
+      routing_policy_state:
+        retention_ms: 86400000
+        # Stays on delete: the Flink sink cannot key records by scope_key
+        # yet, and a compacted topic rejects keyless records.
+        cleanup_policy: delete
   enabled: false
 clickhouse:
   host: localhost

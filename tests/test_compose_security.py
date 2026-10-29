@@ -142,7 +142,11 @@ def test_flink_mounts_only_its_code_read_only(service_name):
     service = _base()["services"][service_name]
     volumes = [str(volume) for volume in service["volumes"]]
 
-    assert volumes == ["./flink:/workspace/flink:ro", "./src:/workspace/src:ro"]
+    assert volumes == [
+        "./flink:/workspace/flink:ro",
+        "./src:/workspace/src:ro",
+        "flink_checkpoints:/opt/flink/checkpoints",
+    ]
     assert service["environment"]["PYTHONPATH"] == "/workspace"
 
 
