@@ -122,7 +122,9 @@ from flink.logic import (
     detect_provider_routing_guardrails,
     merge_routing_policy_aggregate,
     metric_cost_per_1k_tokens,
+    metric_has_provider_latency_sample,
     metric_has_uncached_sample,
+    metric_provider_avg_latency_ms,
     metric_provider_failure_rate,
     validate_inference_completed_event,
 )
@@ -317,24 +319,43 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
             "latency_sample_count": 0,
             "uncached_total_tokens": 0,
             "uncached_cost_usd": 0.0,
+            "provider_request_count": 0,
             "provider_failure_count": 0,
+            "provider_latency_sum_ms": 0.0,
+            "provider_latency_sample_count": 0,
         }
         # Buckets restored from older state averaged latency and priced tokens
-        # over every request and counted every error against the provider.
+        # over every request and judged the provider by every request.
         bucket.setdefault("latency_sample_count", bucket["request_count"])
         bucket.setdefault("uncached_total_tokens", bucket["total_tokens"])
         bucket.setdefault("uncached_cost_usd", bucket["total_cost_usd"])
+        bucket.setdefault("provider_request_count", bucket["request_count"])
         bucket.setdefault("provider_failure_count", bucket["error_count"])
+        bucket.setdefault("provider_latency_sum_ms", bucket["latency_sum_ms"])
+        bucket.setdefault(
+            "provider_latency_sample_count", bucket["latency_sample_count"]
+        )
         failed = value.get("status") != "success"
+        cached = bool(value.get("cached_response"))
         bucket["request_count"] += 1
         bucket["success_count"] += 0 if failed else 1
         bucket["error_count"] += 1 if failed else 0
-        if failed and counts_toward_provider_health(value):
-            bucket["provider_failure_count"] += 1
+        # Provider health: cache hits never reached the provider, and
+        # user_or_policy or internal failures say nothing about it.
+        if not cached and counts_toward_provider_health(value):
+            bucket["provider_request_count"] += 1
+            bucket["provider_failure_count"] += 1 if failed else 0
+        # A failure's latency spans RAG, web search and every fallback, so only
+        # uncached successes time the provider.
+        if not cached and not failed:
+            bucket["provider_latency_sum_ms"] += float(
+                value.get("latency_ms", 0.0) or 0.0
+            )
+            bucket["provider_latency_sample_count"] += 1
         # A cache hit's latency is the lookup, its throughput is the original
         # call's and its tokens cost nothing; keep it out of the latency,
         # throughput and cost-per-1k figures the detectors read.
-        if not value.get("cached_response"):
+        if not cached:
             bucket["latency_sum_ms"] += float(value.get("latency_ms", 0.0) or 0.0)
             bucket["tokens_per_second_sum"] += float(
                 value.get("tokens_per_second", 0.0) or 0.0
@@ -346,7 +367,7 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
         bucket["token_count_output"] += int(value.get("token_count_output", 0) or 0)
         bucket["total_tokens"] += int(value.get("total_tokens", 0) or 0)
         bucket["total_cost_usd"] += float(value.get("cost_usd", 0.0) or 0.0)
-        bucket["cached_count"] += 1 if value.get("cached_response") else 0
+        bucket["cached_count"] += 1 if cached else 0
         buckets[window_start_ms] = bucket
 
         ready_windows = [
@@ -447,6 +468,9 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
             provider_failure_count=bucket.get("provider_failure_count"),
             uncached_total_tokens=bucket.get("uncached_total_tokens"),
             uncached_cost_usd=bucket.get("uncached_cost_usd"),
+            provider_request_count=bucket.get("provider_request_count"),
+            provider_latency_sum_ms=bucket.get("provider_latency_sum_ms"),
+            provider_latency_sample_count=bucket.get("provider_latency_sample_count"),
         )
 
 
@@ -601,8 +625,8 @@ class ProviderRoutingGuardrailDetector(KeyedProcessFunction):
         for guardrail in guardrails:
             yield guardrail
 
-        if metric_has_uncached_sample(value):
-            latency_history.append(float(value.get("avg_latency_ms", 0.0) or 0.0))
+        if metric_has_provider_latency_sample(value):
+            latency_history.append(metric_provider_avg_latency_ms(value))
         error_rate_history.append(metric_provider_failure_rate(value))
 
         self.latency_history_state.update(latency_history[-self.history_size :])

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from flink import analytics_job
+from flink import analytics_job, logic
 
 WINDOW_START_MS = 1_710_000_000_000
 
@@ -196,7 +196,9 @@ def test_window_counts_provider_attributable_failures_beside_all_errors():
 
     assert metric["error_count"] == 5
     assert metric["provider_failure_count"] == 3
-    assert metric["provider_failure_rate"] == pytest.approx(3 / 6)
+    # The user_or_policy and internal failures are not provider requests.
+    assert metric["provider_request_count"] == 4
+    assert metric["provider_failure_rate"] == pytest.approx(3 / 4)
 
 
 def test_window_restored_from_older_state_counts_its_errors_as_provider_failures():
@@ -253,3 +255,101 @@ def test_window_cost_per_1k_prices_only_uncached_events():
     assert metric["total_cost_usd"] == pytest.approx(0.08)
     assert detector.cost_per_1k_history_state.get()[-1] == pytest.approx(0.04)
     assert "cost_spike" in {g["trigger_type"] for g in guardrails}
+
+
+def test_caller_failure_latency_does_not_reach_the_provider_guardrail():
+    metric = _window_metric(
+        [
+            _completion(offset_ms=1_000, latency_ms=3_000),
+            # Its latency spans RAG, web search and every fallback attempt.
+            _completion(
+                offset_ms=2_000,
+                latency_ms=13_000,
+                status="error",
+                error_type="user_or_policy",
+                total_tokens=0,
+                cost_usd=0.0,
+            ),
+        ]
+    )
+
+    guardrails = logic.detect_provider_routing_guardrails(
+        metric, latency_history=[], error_rate_history=[]
+    )
+
+    # Model metrics still see every uncached request.
+    assert metric["avg_latency_ms"] == pytest.approx(8_000.0)
+    assert metric["provider_avg_latency_ms"] == pytest.approx(3_000.0)
+    assert metric["provider_failure_rate"] == 0.0
+    assert {g["trigger_type"] for g in guardrails} == set()
+
+
+def test_provider_failure_rate_is_not_diluted_by_cache_hits_or_caller_failures():
+    cache_hits = [
+        _completion(
+            offset_ms=10_000 + i, latency_ms=2, cost_usd=0.0, cached_response=True
+        )
+        for i in range(3)
+    ]
+    caller_failures = [
+        _completion(offset_ms=20_000 + i, status="error", error_type=error_type)
+        for i, error_type in enumerate(["user_or_policy", "internal"])
+    ]
+    metric = _window_metric(
+        [
+            _completion(offset_ms=1_000),
+            _completion(offset_ms=2_000),
+            _completion(offset_ms=3_000, status="error", error_type="provider_error"),
+            _completion(offset_ms=4_000, status="error", error_type="provider_error"),
+            *cache_hits,
+            *caller_failures,
+        ]
+    )
+
+    assert metric["request_count"] == 9
+    assert metric["provider_request_count"] == 4
+    assert metric["provider_failure_rate"] == pytest.approx(0.5)
+
+
+def test_provider_latency_averages_successes_only():
+    metric = _window_metric(
+        [
+            _completion(offset_ms=1_000, latency_ms=1_000),
+            _completion(offset_ms=2_000, latency_ms=3_000),
+            # A provider failure counts in the failure rate, not the latency.
+            _completion(
+                offset_ms=3_000,
+                latency_ms=30_000,
+                status="error",
+                error_type="provider_error",
+            ),
+        ]
+    )
+
+    assert metric["provider_latency_sample_count"] == 2
+    assert metric["provider_avg_latency_ms"] == pytest.approx(2_000.0)
+    assert metric["provider_failure_rate"] == pytest.approx(1 / 3)
+
+
+def test_window_restored_from_older_state_keeps_todays_provider_figures():
+    legacy_bucket = {
+        "window_start_ms": WINDOW_START_MS,
+        "request_count": 2,
+        "success_count": 1,
+        "error_count": 1,
+        "latency_sum_ms": 4000.0,
+        "tokens_per_second_sum": 0.0,
+        "token_count_input": 0,
+        "token_count_output": 0,
+        "total_tokens": 0,
+        "total_cost_usd": 0.0,
+        "cached_count": 0,
+    }
+
+    metric = _window_metric(
+        [_completion(latency_ms=1000)], restored_buckets=[legacy_bucket]
+    )
+
+    assert metric["provider_request_count"] == 3
+    assert metric["provider_failure_rate"] == pytest.approx(1 / 3)
+    assert metric["provider_avg_latency_ms"] == pytest.approx(5000.0 / 3)

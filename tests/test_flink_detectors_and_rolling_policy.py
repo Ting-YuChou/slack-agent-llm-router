@@ -169,6 +169,19 @@ def test_window_from_before_the_upgrade_prices_every_request():
     assert detector.cost_per_1k_history_state.get() == [pytest.approx(0.05)]
 
 
+def test_provider_window_from_before_the_upgrade_uses_todays_latency():
+    legacy_window = _window(avg_latency_ms=7000.0, cached=False)
+    for key in list(legacy_window):
+        if key.startswith("provider_") and key != "provider_failure_rate":
+            del legacy_window[key]
+
+    guardrails = logic.detect_provider_routing_guardrails(
+        legacy_window, latency_history=[], error_rate_history=[]
+    )
+
+    assert "provider_high_latency" in {g["trigger_type"] for g in guardrails}
+
+
 def _policy_completion(**overrides):
     event = {
         "user_id": "user-1",
