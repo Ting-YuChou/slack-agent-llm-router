@@ -263,6 +263,52 @@ async def test_commands_and_agent_requests_post_no_placeholder(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text, shows_progress",
+    [
+        ("!llm web latest python release", True),
+        ("!llm fast what is 2+2", True),
+        ("!llm web", False),
+        ("!llm fast", False),
+    ],
+)
+async def test_web_and_fast_commands_show_progress(monkeypatch, text, shows_progress):
+    bot = delivery_bot()
+    seen_before_handler = []
+
+    async def handle(_event, _client):
+        seen_before_handler.extend(bot.web_client.chat_postMessage.await_args_list)
+        return "answer"
+
+    monkeypatch.setattr(
+        bot.message_handler, "handle_message", AsyncMock(side_effect=handle)
+    )
+
+    await bot._process_message(top_level(text=text))
+
+    texts = [call.kwargs["text"] for call in seen_before_handler]
+    assert texts == ([SLACK_THINKING_TEXT] if shows_progress else [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["web latest python release", "fast what is 2+2"])
+async def test_slash_web_and_fast_acks_say_they_are_working(text):
+    bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
+    bot._enqueue_work = AsyncMock()
+    socket_client = SimpleNamespace(send_socket_mode_response=AsyncMock())
+    request = SimpleNamespace(
+        envelope_id="E1",
+        type="slash_commands",
+        payload={"text": text, "user_id": "U1", "channel_id": "C1"},
+    )
+
+    await bot._handle_socket_mode_request(socket_client, request)
+
+    ack = socket_client.send_socket_mode_response.await_args.args[0]
+    assert ack.payload == {"response_type": "ephemeral", "text": "Working on it…"}
+
+
+@pytest.mark.asyncio
 async def test_slash_command_ack_says_it_is_working():
     bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
     bot._enqueue_work = AsyncMock()

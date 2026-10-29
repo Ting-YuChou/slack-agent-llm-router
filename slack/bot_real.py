@@ -96,6 +96,8 @@ SLACK_BUSY_MESSAGE = "The LLM Router is busy right now. Please retry in a moment
 SLACK_THINKING_TEXT = "_Thinking…_"
 SLACK_SLASH_WORKING_TEXT = "Working on it…"
 SLACK_AGENT_HANDOFF_TEXT = "_Passed to the Agent run in this thread._"
+# Commands that answer through the model, though they spend no query quota.
+MODEL_BACKED_COMMANDS = frozenset({"web", "fast"})
 SLACK_EMPTY_ANSWER_MESSAGE = (
     "🤔 The model returned an empty answer. Please try again or rephrase "
     "your question."
@@ -1695,6 +1697,17 @@ class SlackMessageHandler:
             parts = normalized.split()
             return len(parts) < 2 or parts[1].lower() not in {"status", "stop", "close"}
         return command_name not in self.commands
+
+    def command_waits_on_model(self, command_text: str) -> bool:
+        """Whether a command waits on a model answer or an Agent start.
+
+        That is every quota-spending command plus `web` and `fast` with a
+        query, which are worth a progress indicator.
+        """
+        if self.command_consumes_query_quota(command_text):
+            return True
+        parts = (command_text or "").strip().split(maxsplit=1)
+        return len(parts) == 2 and parts[0].lower() in MODEL_BACKED_COMMANDS
 
     async def handle_message(
         self, event: Dict[str, Any], client: AsyncWebClient
@@ -4093,7 +4106,7 @@ class SlackBot:
                 self._mark_thread_active(channel_id, reply_thread_ts)
                 active_thread_key = self._thread_key(channel_id, reply_thread_ts)
 
-            if self._is_query_event(event) and not agent_request:
+            if not agent_request and self._waits_on_model(event):
                 placeholder_ts = await self._post_placeholder(
                     channel_id, reply_thread_ts
                 )
@@ -4233,14 +4246,25 @@ class SlackBot:
         if not self._typing_indicator_enabled():
             return None
         payload = getattr(req, "payload", None) or {}
-        consumes_query_quota = getattr(
-            self.message_handler, "command_consumes_query_quota", None
-        )
-        if callable(consumes_query_quota) and not consumes_query_quota(
+        waits_on_model = getattr(self.message_handler, "command_waits_on_model", None)
+        if callable(waits_on_model) and not waits_on_model(
             payload.get("text", "") or ""
         ):
             return None
         return {"response_type": "ephemeral", "text": SLACK_SLASH_WORKING_TEXT}
+
+    def _waits_on_model(self, event: Dict[str, Any]) -> bool:
+        """Whether a message waits on a model answer, so progress is shown."""
+        if self._is_query_event(event):
+            return True
+        extract_command_text = getattr(
+            self.message_handler, "extract_prefixed_command_text", None
+        )
+        waits_on_model = getattr(self.message_handler, "command_waits_on_model", None)
+        if not (callable(extract_command_text) and callable(waits_on_model)):
+            return False
+        command_text = extract_command_text((event.get("text") or "").strip())
+        return command_text is not None and bool(waits_on_model(command_text))
 
     async def _post_placeholder(
         self, channel_id: Optional[str], thread_ts: Optional[str]
