@@ -19,3 +19,15 @@ htmlcov
 logs
 site
 tests
+# Secrets never enter a build context; containers get keys from compose environment variables.
+**/.env
+**/.env.*
+**/*.env
+**/*.pem
+**/*.key
+slack/credentials
+# Local agent state, worktrees and installed packages.
+.claude
+.pi-agent-runtime
+.pi-agent-worktrees
+**/node_modules
