@@ -81,11 +81,14 @@ from src.utils.metrics import (
     sum_metric_values,
 )
 from src.utils.schema import (
+    REQUEST_ID_MAX_LENGTH,
+    InferenceResponse,
     PlatformConfig,
     QueryRequest,
     RagBatchRequest,
     RagQueryRequest,
     RagUploadRequest,
+    is_valid_request_id,
 )
 from slack.bot import SlackBot
 
@@ -100,6 +103,16 @@ PUBLIC_ENDPOINTS = {"/", "/live", "/ready", "/health"}
 # Responses sent before the request body is read: closing the connection keeps
 # the server from reading and discarding an arbitrarily large body.
 REJECTED_BEFORE_BODY_HEADERS = {"Connection": "close"}
+# The request id a /route caller may choose, echoed on every /route response.
+REQUEST_ID_HEADER = "X-Request-ID"
+
+
+def _with_request_id(result: Any, request_id: str) -> Any:
+    """The engine's answer, naming the request it answers."""
+    if isinstance(result, InferenceResponse) and result.request_id != request_id:
+        return result.model_copy(update={"request_id": request_id})
+    return result
+
 
 # Optional infrastructure is imported only when its feature is enabled. Keeping
 # these names patchable also supports the existing isolated service tests.
@@ -840,6 +853,31 @@ class LLMRouterPlatform:
         configured = self._security_config().get("request_body_limits") or {}
         limits.update({path: dict(caps) for path, caps in configured.items()})
         return limits
+
+    def _apply_request_id_header(
+        self, query_data: QueryRequest, request: Request
+    ) -> Optional[JSONResponse]:
+        """Adopt the caller's X-Request-ID, or reject one that is not valid.
+
+        A valid id replaces the body's request_id, so logs, events and the
+        response all carry the id the caller chose.
+        """
+        header_value = request.headers.get(REQUEST_ID_HEADER)
+        if header_value is None:
+            return None
+        if not is_valid_request_id(header_value):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_request_id",
+                    "message": (
+                        f"{REQUEST_ID_HEADER} must be 1-{REQUEST_ID_MAX_LENGTH} "
+                        "characters of A-Z, a-z, 0-9, '.', '_', ':' or '-'"
+                    ),
+                },
+            )
+        query_data.request_id = header_value
+        return None
 
     def _apply_route_boundary_guards(
         self, query_data: QueryRequest, principal: Optional[ApiPrincipal] = None
@@ -1958,7 +1996,17 @@ class LLMRouterPlatform:
             active_request_recorded = False
             active_requests = getattr(SYSTEM_METRICS, "active_requests", None)
 
+            def tagged(response: JSONResponse) -> JSONResponse:
+                # Every answer names its request, errors included.
+                response.headers[REQUEST_ID_HEADER] = query_data.request_id
+                return response
+
             try:
+                request_id_response = self._apply_request_id_header(query_data, request)
+                if request_id_response is not None:
+                    status_code = request_id_response.status_code
+                    return request_id_response
+
                 # Set by the auth middleware; None when API key auth is off.
                 principal = getattr(request.state, "api_principal", None)
                 boundary_response = self._apply_route_boundary_guards(
@@ -1966,14 +2014,14 @@ class LLMRouterPlatform:
                 )
                 if boundary_response is not None:
                     status_code = boundary_response.status_code
-                    return boundary_response
+                    return tagged(boundary_response)
 
                 admission_response, route_reservation = await self._admit_route_request(
                     query_data, principal
                 )
                 if admission_response is not None:
                     status_code = admission_response.status_code
-                    return admission_response
+                    return tagged(admission_response)
 
                 if active_requests is not None:
                     active_requests.labels(endpoint=endpoint).inc()
@@ -1981,24 +2029,29 @@ class LLMRouterPlatform:
 
                 await self._publish_request_raw_event(query_data)
                 result = await self.services["inference"].process_query(query_data)
+                result = _with_request_id(result, query_data.request_id)
                 status_code, error_headers = route_response_status(result)
-                return JSONResponse(
-                    status_code=status_code,
-                    content=jsonable_encoder(result),
-                    headers=error_headers,
+                return tagged(
+                    JSONResponse(
+                        status_code=status_code,
+                        content=jsonable_encoder(result),
+                        headers=error_headers,
+                    )
                 )
             except AdmissionRejectedError as exc:
                 status_code = exc.decision.status_code
-                return self._build_admission_response(exc.decision)
+                return tagged(self._build_admission_response(exc.decision))
             except Exception:
                 status_code = 500
                 self.logger.exception("Query processing error")
-                return JSONResponse(
-                    status_code=status_code,
-                    content={
-                        "error": "internal_server_error",
-                        "message": "Request processing failed",
-                    },
+                return tagged(
+                    JSONResponse(
+                        status_code=status_code,
+                        content={
+                            "error": "internal_server_error",
+                            "message": "Request processing failed",
+                        },
+                    )
                 )
             finally:
                 # Free the admission slot first: metrics publishing can be slow

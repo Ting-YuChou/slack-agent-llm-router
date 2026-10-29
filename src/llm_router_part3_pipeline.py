@@ -11,7 +11,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from collections import OrderedDict
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Tuple
 from dataclasses import dataclass, asdict, field
 import uuid
 
@@ -173,6 +173,26 @@ def _alert_payload(data: Dict[str, Any]) -> Any:
     return redact({key: data[key] for key in ALERT_PAYLOAD_FIELDS if key in data})
 
 
+REQUEST_SURFACES = frozenset({"mention", "thread", "slash", "api"})
+
+
+def request_source_and_surface(query_request: Any) -> Tuple[str, Optional[str]]:
+    """Where a request came from: ("slack", "mention" | "thread" | "slash")
+    or ("api", "api").
+
+    Only the server writes these metadata keys (external /route metadata is
+    allowlisted), so a request without them came through the API.
+    """
+    metadata = getattr(query_request, "metadata", None) or {}
+    source = metadata.get("source")
+    if not isinstance(source, str) or not source:
+        return "api", "api"
+    surface = metadata.get("surface")
+    if surface not in REQUEST_SURFACES:
+        surface = None
+    return source, surface
+
+
 def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
     """Build the pre-inference event emitted by the API request path."""
     attachments = [
@@ -253,6 +273,7 @@ def build_inference_completed_event(
         for domain in (getattr(source, "source_domain", None) for source in sources)
         if domain
     ]
+    source, surface = request_source_and_surface(query_request)
 
     return {
         "event_type": "inference.completed",
@@ -264,6 +285,8 @@ def build_inference_completed_event(
         "user_tier": _enum_value(query_request.user_tier),
         "session_id": query_request.session_id,
         "conversation_id": query_request.conversation_id,
+        "source": source,
+        "surface": surface,
         "request_timestamp": _isoformat_utc(query_request.timestamp),
         "completion_timestamp": _isoformat_utc(inference_response.timestamp),
         "query_text": redact_text(query_request.query),

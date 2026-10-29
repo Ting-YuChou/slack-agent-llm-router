@@ -93,6 +93,7 @@ from src.utils.schema import (
     QueryRequest,
     ToolPolicy,
     UserTier,
+    is_valid_request_id,
 )
 from src.utils.bounded_state import BoundedTTLMap
 from src.utils.metrics import SLACK_METRICS
@@ -691,6 +692,67 @@ def _without_blocks(message: Dict[str, Any]) -> Dict[str, Any]:
 
 # Slack's limit on the text of one `markdown` block.
 SLACK_MARKDOWN_BLOCK_CHARS = 12000
+
+
+def slack_chat_request_id(
+    team_id: Optional[str], channel_id: Optional[str], message_ts: Optional[str]
+) -> Optional[str]:
+    """The request id of a chat query asked by the Slack message at message_ts.
+
+    Deterministic, so a redelivered event gets the id it had the first time.
+    """
+    if not channel_id or not message_ts:
+        return None
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL, f"slack:{team_id or ''}:{channel_id}:{message_ts}"
+        )
+    )
+
+
+@dataclass(frozen=True)
+class SlackQueryTrace:
+    """What ties a Slack chat query to its logs, events and feedback."""
+
+    request_id: Optional[str] = None
+    # mention | thread | slash
+    surface: Optional[str] = None
+    event_id: Optional[str] = None
+
+    @classmethod
+    def for_message(
+        cls, event: Dict[str, Any], *, team_id: Optional[str]
+    ) -> "SlackQueryTrace":
+        surface = (
+            "thread"
+            if event.get("type") == "message" and event.get("thread_ts")
+            else "mention"
+        )
+        event_id = event.get("_event_id")
+        return cls(
+            request_id=slack_chat_request_id(
+                team_id, event.get("channel"), event.get("ts")
+            ),
+            surface=surface,
+            event_id=event_id if isinstance(event_id, str) else None,
+        )
+
+    @classmethod
+    def for_slash(cls, request_id: Optional[str]) -> "SlackQueryTrace":
+        return cls(
+            request_id=request_id if is_valid_request_id(request_id) else None,
+            surface="slash",
+        )
+
+    def add_metadata(
+        self, metadata: Dict[str, Any], *, message_ts: Optional[str]
+    ) -> None:
+        if self.surface:
+            metadata["surface"] = self.surface
+        slack = metadata.get("slack")
+        if isinstance(slack, dict):
+            slack["message_ts"] = message_ts
+            slack["event_id"] = self.event_id
 
 
 class SlackAnswer(str):
@@ -1885,6 +1947,7 @@ class SlackMessageHandler:
         message_ts = event.get("ts")
         team_id = self.bot._extract_team_id(event)
         attachments = list(event.get("_query_attachments", []) or [])
+        trace = SlackQueryTrace.for_message(event, team_id=team_id)
 
         # The bot decides chat or Agent once per message, before it shows
         # progress or downloads files; a thread that became an Agent thread
@@ -1916,6 +1979,7 @@ class SlackMessageHandler:
                 attachments=attachments,
                 team_id=team_id,
                 message_ts=message_ts,
+                trace=trace,
             )
 
         if not text and attachments:
@@ -1973,6 +2037,7 @@ class SlackMessageHandler:
             attachments=attachments,
             team_id=team_id,
             message_ts=message_ts,
+            trace=trace,
         )
 
     @staticmethod
@@ -2041,6 +2106,7 @@ class SlackMessageHandler:
         team_id: Optional[str] = None,
         command_surface: str = "message",
         message_ts: Optional[str] = None,
+        trace: Optional["SlackQueryTrace"] = None,
     ) -> str:
         """Handle inline `/llm` / `!llm` payloads as commands or free-form queries."""
         return await self._handle_command(
@@ -2053,6 +2119,7 @@ class SlackMessageHandler:
             team_id=team_id,
             command_surface=command_surface,
             message_ts=message_ts,
+            trace=trace,
         )
 
     async def _handle_command(
@@ -2067,6 +2134,7 @@ class SlackMessageHandler:
         command_surface: str = "message",
         message_ts: Optional[str] = None,
         request_id: Optional[str] = None,
+        trace: Optional["SlackQueryTrace"] = None,
     ) -> str:
         """Handle bot commands, falling back to a free-form query when appropriate."""
         parts = command_text.split()
@@ -2075,6 +2143,9 @@ class SlackMessageHandler:
 
         command = parts[0].lower()
         args = parts[1:] if len(parts) > 1 else []
+        if command_surface == "slash":
+            # Slack resends a slash command with the same trigger_id.
+            trace = SlackQueryTrace.for_slash(request_id)
 
         if command in self.commands:
             if command == "web":
@@ -2087,6 +2158,7 @@ class SlackMessageHandler:
                     attachments=attachments,
                     team_id=team_id,
                     message_ts=message_ts,
+                    trace=trace,
                 )
             if command == "fast":
                 return await self._handle_fast_command(
@@ -2098,6 +2170,7 @@ class SlackMessageHandler:
                     attachments=attachments,
                     team_id=team_id,
                     message_ts=message_ts,
+                    trace=trace,
                 )
             if command in {"remember", "memories", "forget"}:
                 return await self.commands[command](
@@ -2131,6 +2204,7 @@ class SlackMessageHandler:
             attachments=attachments,
             team_id=team_id,
             message_ts=message_ts,
+            trace=trace,
         )
 
     async def _handle_web_command(
@@ -2143,6 +2217,7 @@ class SlackMessageHandler:
         attachments: Optional[List[Attachment]] = None,
         team_id: Optional[str] = None,
         message_ts: Optional[str] = None,
+        trace: Optional["SlackQueryTrace"] = None,
     ) -> str:
         """Handle `/llm web <query>` by requiring the web_search tool."""
         query = " ".join(args).strip()
@@ -2159,6 +2234,7 @@ class SlackMessageHandler:
             tool_policy=ToolPolicy.REQUIRED,
             allowed_tools=["web_search"],
             message_ts=message_ts,
+            trace=trace,
         )
 
     async def _handle_fast_command(
@@ -2171,6 +2247,7 @@ class SlackMessageHandler:
         attachments: Optional[List[Attachment]] = None,
         team_id: Optional[str] = None,
         message_ts: Optional[str] = None,
+        trace: Optional["SlackQueryTrace"] = None,
     ) -> str:
         """Handle `/llm fast <query>` by marking this request low-latency."""
         query = " ".join(args).strip()
@@ -2190,6 +2267,7 @@ class SlackMessageHandler:
                 "routing_intent_source": "slack_fast_command",
             },
             message_ts=message_ts,
+            trace=trace,
         )
 
     async def _handle_agent_command(
@@ -3317,8 +3395,10 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         allowed_tools: Optional[List[str]] = None,
         routing_metadata: Optional[Dict[str, Any]] = None,
         message_ts: Optional[str] = None,
+        trace: Optional["SlackQueryTrace"] = None,
     ) -> str:
         """Handle regular query through inference engine"""
+        trace = trace or SlackQueryTrace()
         try:
             # Get or create conversation context
             context = self.bot.conversation_manager.get_or_create_context(
@@ -3394,8 +3474,12 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             self._add_slack_context_metadata(query_metadata, slack_context)
             if memory_context:
                 query_metadata["memory_context"] = memory_context
+            # Server-written trace keys: an external /route caller cannot set
+            # them (they are not client metadata keys).
+            trace.add_metadata(query_metadata, message_ts=message_ts)
 
             query_request = QueryRequest(
+                **({"request_id": trace.request_id} if trace.request_id else {}),
                 query=text,
                 user_id=user_id,
                 user_tier=user_tier,
@@ -3415,7 +3499,8 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
 
             if getattr(response, "error", None):
                 logger.error(
-                    "Slack query failed for user %s in channel %s: %s",
+                    "Slack query %s failed for user %s in channel %s: %s",
+                    query_request.request_id,
                     user_id,
                     channel_id,
                     response.error,
@@ -4032,6 +4117,11 @@ class SlackBot:
                 team_id = self._extract_team_id(req.payload)
                 if team_id and "_team_id" not in event:
                     event["_team_id"] = team_id
+                # The envelope's event id, kept for tracing: a retry of the
+                # same event carries the same id.
+                event_id = req.payload.get("event_id")
+                if isinstance(event_id, str) and event_id and "_event_id" not in event:
+                    event["_event_id"] = event_id
                 await self._enqueue_work(
                     SlackWorkItem(
                         kind="event",
