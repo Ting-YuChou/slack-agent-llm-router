@@ -894,6 +894,7 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
             "selected_model": value.get("selected_model"),
             "provider": value.get("provider"),
             "status": value.get("status"),
+            "error_type": value.get("error_type"),
             "latency_ms": value.get("latency_ms"),
             "cached_response": bool(value.get("cached_response", False)),
             "total_tokens": value.get("total_tokens"),

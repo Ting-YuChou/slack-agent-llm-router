@@ -304,3 +304,18 @@ def test_rolling_policy_emitter_sees_cache_hits():
 
     assert policy["recent_request_count"] == 2
     assert policy["avg_latency_ms"] == pytest.approx(1000.0)
+
+
+@pytest.mark.parametrize(
+    ("error_type", "failed_provider_counts"),
+    [
+        pytest.param("provider_error", {"openai": 1}, id="provider_error"),
+        pytest.param("user_or_policy", {}, id="user_or_policy"),
+    ],
+)
+def test_rolling_policy_emitter_sees_error_type(error_type, failed_provider_counts):
+    aggregate = _emitter_aggregate(
+        [_policy_completion(status="error", error_type=error_type)]
+    )
+
+    assert aggregate["failed_provider_counts"] == failed_provider_counts
