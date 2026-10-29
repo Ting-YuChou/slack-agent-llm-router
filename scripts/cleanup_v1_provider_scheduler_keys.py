@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from typing import Any, Dict, List
 
 import redis.asyncio as redis
@@ -111,7 +112,13 @@ def parse_args() -> argparse.Namespace:
 
 async def main() -> None:
     args = parse_args()
-    client = redis.Redis.from_url(args.redis_url, decode_responses=True)
+    # Pass the password in $REDIS_PASSWORD, not --redis-url, to keep it out of
+    # argv. redis-py uses a password in the URL over this argument.
+    client = redis.Redis.from_url(
+        args.redis_url,
+        password=os.getenv("REDIS_PASSWORD") or None,
+        decode_responses=True,
+    )
     try:
         report = await cleanup_legacy_keys(
             client, apply=args.apply, scan_count=max(1, args.scan_count)

@@ -3,14 +3,12 @@ set -euo pipefail
 
 service_name="${CLICKHOUSE_SERVICE:-clickhouse}"
 database_name="${CLICKHOUSE_DATABASE:-default}"
-clickhouse_user="${CLICKHOUSE_USER:-llm_router}"
-clickhouse_password="${CLICKHOUSE_PASSWORD:-llm_router_pass}"
+
+# Runs inside the container and keeps the password off every command line.
+client_script="$(cat "$(dirname "${BASH_SOURCE[0]}")/clickhouse_client_in_container.sh")"
 
 run_query() {
-  docker compose exec -T "${service_name}" clickhouse-client \
-    --user "${clickhouse_user}" \
-    --password "${clickhouse_password}" \
-    --query "$1"
+  docker compose exec -T "${service_name}" sh -c "${client_script}" sh --query "$1"
 }
 
 create_alert_events_table() {

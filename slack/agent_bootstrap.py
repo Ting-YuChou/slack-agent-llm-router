@@ -8,9 +8,10 @@ import re
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, TypeVar
-from urllib.parse import urljoin, urlparse
 
 import httpx
+
+from slack.files import download_slack_file, error_name, is_allowed_slack_file_url
 
 
 class AgentBootstrapFetchError(RuntimeError):
@@ -74,7 +75,6 @@ class AgentBootstrapBuilder:
         ".yaml",
         ".yml",
     }
-    _SLACK_FILE_HOSTS = {"files.slack.com"}
     _CANVAS_MIME_TYPES = {"application/vnd.slack-docs"}
     _LIST_MIME_TYPES = {"application/vnd.slack-list"}
     _INCLUDED_SUBTYPES = (None, "file_share", "thread_broadcast")
@@ -127,7 +127,7 @@ class AgentBootstrapBuilder:
                 deadline=self._deadline(),
             )
         except Exception as exc:
-            error = self._error_name(exc)
+            error = error_name(exc)
             if not self.settings.get("fail_open", True):
                 raise AgentBootstrapFetchError(error) from exc
             return AgentBootstrapContext(prompt=task, error=error)
@@ -540,7 +540,7 @@ class AgentBootstrapBuilder:
             or file_payload.get("url_private")
             or ""
         )
-        if not self._is_allowed_slack_file_url(url):
+        if not is_allowed_slack_file_url(url):
             return self._skipped_resource(file_payload, "unsafe_download_url"), [
                 f"unsafe_download_url:{file_id}"
             ]
@@ -556,7 +556,7 @@ class AgentBootstrapBuilder:
                 f"invalid_utf8:{file_id}"
             ]
         except Exception as exc:
-            error = self._error_name(exc)
+            error = error_name(exc)
             return self._skipped_resource(file_payload, f"download_failed:{error}"), [
                 f"download_failed:{file_id}:{error}"
             ]
@@ -572,34 +572,14 @@ class AgentBootstrapBuilder:
         )
 
     async def _download(self, url: str, max_bytes: int) -> bytes:
-        current_url = url
         async with httpx.AsyncClient(
             timeout=self._request_timeout(),
             follow_redirects=False,
             transport=self.http_transport,
         ) as client:
-            for _ in range(4):
-                if not self._is_allowed_slack_file_url(current_url):
-                    raise ValueError("unsafe_redirect")
-                async with client.stream(
-                    "GET",
-                    current_url,
-                    headers={"Authorization": f"Bearer {self.bot_token}"},
-                ) as response:
-                    if response.is_redirect:
-                        location = response.headers.get("location")
-                        if not location:
-                            raise ValueError("redirect_without_location")
-                        current_url = urljoin(current_url, location)
-                        continue
-                    response.raise_for_status()
-                    content = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        if len(content) + len(chunk) > max_bytes:
-                            raise ValueError("resource_too_large")
-                        content.extend(chunk)
-                    return bytes(content)
-        raise ValueError("too_many_redirects")
+            return await download_slack_file(
+                client, url, bot_token=self.bot_token or "", max_bytes=max_bytes
+            )
 
     async def _load_list(
         self, client: Any, file_payload: Dict[str, Any]
@@ -613,7 +593,7 @@ class AgentBootstrapBuilder:
             response = await method(list_id=file_id, limit=100, archived=False)
             self._raise_for_slack_error(response)
         except Exception as exc:
-            return "", [f"list_failed:{file_id}:{self._error_name(exc)}"]
+            return "", [f"list_failed:{file_id}:{error_name(exc)}"]
         rows = []
         for item in (response or {}).get("items", []) or []:
             fields = []
@@ -645,7 +625,7 @@ class AgentBootstrapBuilder:
                 self._raise_for_slack_error(response)
                 metadata.update((response or {}).get("file", {}) or {})
             except Exception as exc:
-                warnings.append(f"canvas_failed:{file_id}:{self._error_name(exc)}")
+                warnings.append(f"canvas_failed:{file_id}:{error_name(exc)}")
         title = str(metadata.get("title") or metadata.get("name") or file_id)
         title_text = self._flatten_blocks(metadata.get("title_blocks") or [])
         summary = metadata.get("ai_summary")
@@ -674,10 +654,6 @@ class AgentBootstrapBuilder:
             return True
         name = str(file_payload.get("name") or file_payload.get("title") or "").lower()
         return any(name.endswith(extension) for extension in self._TEXT_EXTENSIONS)
-
-    def _is_allowed_slack_file_url(self, url: str) -> bool:
-        parsed = urlparse(url)
-        return parsed.scheme == "https" and parsed.hostname in self._SLACK_FILE_HOSTS
 
     @staticmethod
     def _raise_for_slack_error(response: Any) -> None:
@@ -768,16 +744,3 @@ class AgentBootstrapBuilder:
         if isinstance(value, str):
             return value
         return json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-    @staticmethod
-    def _error_name(exc: Exception) -> str:
-        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-            return "timeout"
-        response = getattr(exc, "response", None)
-        data = getattr(response, "data", None)
-        if isinstance(data, dict) and data.get("error"):
-            return str(data["error"])
-        message = str(exc).strip()
-        if re.fullmatch(r"[a-z][a-z0-9_:-]{0,79}", message):
-            return message
-        return exc.__class__.__name__.lower()

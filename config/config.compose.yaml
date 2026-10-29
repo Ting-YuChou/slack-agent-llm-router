@@ -572,7 +572,7 @@ clickhouse:
   port: 8123
   database: default
   username: llm_router
-  password: llm_router_pass
+  password: ""  # set CLICKHOUSE_PASSWORD; main.py applies it
   connect_timeout_seconds: 2
   send_receive_timeout_seconds: 10
   dashboard:
@@ -738,6 +738,7 @@ policy_cache:
     host: redis
     port: 6379
     db: 1
+    password_env: REDIS_PASSWORD
     key_prefix: routing_policy
   consumer:
     group_id: llm-router-policy-materializer

@@ -11,6 +11,7 @@ This layer keeps Kafka and Flink off the synchronous API path:
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -34,6 +35,7 @@ class RoutingPolicyCache:
         self.redis_host = redis_config.get("host", "localhost")
         self.redis_port = int(redis_config.get("port", 6379))
         self.redis_db = int(redis_config.get("db", 1))
+        self.redis_password_env = redis_config.get("password_env")
         self.key_prefix = redis_config.get("key_prefix", "routing_policy")
         self.request_ttl_seconds = int(self.config.get("request_ttl_seconds", 300))
         self.session_ttl_seconds = int(self.config.get("session_ttl_seconds", 600))
@@ -76,10 +78,14 @@ class RoutingPolicyCache:
             return
 
         try:
+            password = None
+            if self.redis_password_env:
+                password = os.getenv(str(self.redis_password_env))
             self.redis_client = redis.Redis(
                 host=self.redis_host,
                 port=self.redis_port,
                 db=self.redis_db,
+                password=password,
                 decode_responses=True,
             )
             await self.redis_client.ping()

@@ -8,7 +8,21 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+
+
+# Runs inside the ClickHouse container and keeps the password off every
+# command line; see the script for how.
+CLICKHOUSE_CLIENT_SCRIPT = (
+    Path(__file__)
+    .with_name("clickhouse_client_in_container.sh")
+    .read_text(encoding="utf-8")
+)
+DEFAULT_CLICKHOUSE_COMMAND = shlex.join(
+    ["docker", "compose", "exec", "-T", "clickhouse"]
+    + ["sh", "-c", CLICKHOUSE_CLIENT_SCRIPT, "sh"]
+)
 
 
 @dataclass(frozen=True)
@@ -420,13 +434,7 @@ def parse_args(argv=None):
     parser.add_argument("--flush-command")
     parser.add_argument("--resume-command")
     parser.add_argument("--backup-retention-days", type=int, default=7)
-    parser.add_argument(
-        "--clickhouse-command",
-        default=(
-            "docker compose exec -T clickhouse clickhouse-client "
-            "--user llm_router --password llm_router_pass"
-        ),
-    )
+    parser.add_argument("--clickhouse-command", default=DEFAULT_CLICKHOUSE_COMMAND)
     args = parser.parse_args(argv)
     if args.apply:
         missing = [

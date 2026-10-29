@@ -52,7 +52,9 @@ def _validate_response(args: argparse.Namespace, payload: Dict[str, Any]) -> Non
 
 
 def run(args: argparse.Namespace) -> None:
-    api_key = args.api_key or os.getenv("LLM_ROUTER_API_KEY", "dev-api-key")
+    api_key = args.api_key or os.getenv("LLM_ROUTER_API_KEY")
+    if not api_key:
+        raise SystemExit("set LLM_ROUTER_API_KEY or pass --api-key")
     endpoint = args.api_url.rstrip("/") + "/route"
     response = httpx.post(
         endpoint,

@@ -54,6 +54,13 @@ from slack.agent_shortcut import (
     build_agent_shortcut_modal,
     parse_agent_shortcut_submission,
 )
+from slack.files import (
+    declares_html,
+    download_slack_file,
+    error_name,
+    is_allowed_slack_file_url,
+    is_slack_hosted_file,
+)
 from src.admission import AdmissionRejectedError
 from src.memory import MemoryManager, build_memory_scope
 from src.utils.schema import (
@@ -3338,6 +3345,8 @@ class SlackBot:
             "download_timeout_seconds": 30,
         }
         self.attachment_settings.update(config.get("attachments", {}))
+        # Created on the first attachment download and closed on shutdown.
+        self._attachment_http_client: Optional[httpx.AsyncClient] = None
         self.agent_bootstrap_builder = AgentBootstrapBuilder(
             self.agent_context_settings,
             bot_token=self._resolve_secret("bot_token", "bot_token_env"),
@@ -4552,6 +4561,7 @@ class SlackBot:
             await self.memory_manager.shutdown()
         except Exception:
             logger.warning("Slack memory shutdown failed", exc_info=True)
+        await self._close_attachment_http_client()
 
         logger.info("Slack bot shutdown complete")
 
@@ -6732,7 +6742,7 @@ class SlackBot:
         self, file_payload: Dict[str, Any]
     ) -> Optional[Attachment]:
         """Build a normalized attachment object from Slack file metadata."""
-        if file_payload.get("mode") == "tombstone":
+        if not is_slack_hosted_file(file_payload):
             return None
 
         download_url = file_payload.get("url_private_download") or file_payload.get(
@@ -6756,7 +6766,9 @@ class SlackBot:
         )
 
         if download_url and size_bytes <= max_file_size_bytes:
-            content = await self._download_attachment_content(download_url)
+            content = await self._download_attachment_content(
+                file_payload, str(download_url), max_file_size_bytes
+            )
             if content is not None and size_bytes <= 0:
                 size_bytes = len(content)
 
@@ -6779,26 +6791,63 @@ class SlackBot:
             content=content,
         )
 
-    async def _download_attachment_content(self, download_url: str) -> Optional[bytes]:
-        """Download a private Slack file using the bot token."""
+    async def _download_attachment_content(
+        self, file_payload: Dict[str, Any], download_url: str, max_bytes: int
+    ) -> Optional[bytes]:
+        """Download a private Slack file using the bot token.
+
+        The token only goes to Slack file hosts. Logs name the file id and the
+        failure, never the URL.
+        """
         if not download_url or not self.bot_token:
             return None
 
-        timeout_seconds = self.attachment_settings.get("download_timeout_seconds", 30)
+        file_id = str(file_payload.get("id") or "unknown")
+        if not is_allowed_slack_file_url(download_url):
+            logger.warning("Skipping Slack attachment %s: unsafe_download_url", file_id)
+            return None
+
         try:
-            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-                response = await client.get(
+            return await asyncio.wait_for(
+                download_slack_file(
+                    self._get_attachment_http_client(),
                     download_url,
-                    headers={"Authorization": f"Bearer {self.bot_token}"},
-                )
-                if hasattr(response, "raise_for_status"):
-                    response.raise_for_status()
-                return getattr(response, "content", None)
+                    bot_token=self.bot_token,
+                    max_bytes=max_bytes,
+                    allow_html=declares_html(file_payload),
+                ),
+                timeout=self._attachment_download_timeout(),
+            )
         except Exception as exc:
             logger.warning(
-                f"Failed to download Slack attachment from {download_url}: {exc}"
+                "Failed to download Slack attachment %s: %s",
+                file_id,
+                error_name(exc),
             )
             return None
+
+    def _attachment_download_timeout(self) -> float:
+        return float(self.attachment_settings.get("download_timeout_seconds", 30) or 30)
+
+    def _get_attachment_http_client(self) -> httpx.AsyncClient:
+        if self._attachment_http_client is None:
+            self._attachment_http_client = httpx.AsyncClient(
+                timeout=self._attachment_download_timeout(),
+                follow_redirects=False,
+            )
+        return self._attachment_http_client
+
+    async def _close_attachment_http_client(self) -> None:
+        client = self._attachment_http_client
+        self._attachment_http_client = None
+        if client is None:
+            return
+        try:
+            await client.aclose()
+        except Exception as exc:
+            logger.warning(
+                "Slack attachment HTTP client close failed: %s", error_name(exc)
+            )
 
     def _infer_attachment_type(self, mime_type: str) -> AttachmentType:
         """Map a MIME type to the internal attachment type enum."""

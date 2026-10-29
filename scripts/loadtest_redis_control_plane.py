@@ -20,11 +20,14 @@ import asyncio
 import importlib
 import json
 import math
+import os
+import re
 import sys
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import redis.asyncio as redis
 
@@ -130,12 +133,36 @@ def _mode_succeeded(result: Dict[str, Any]) -> bool:
     )
 
 
+def _redis_password() -> Optional[str]:
+    """The Redis password from $REDIS_PASSWORD, if set."""
+    return os.getenv("REDIS_PASSWORD") or None
+
+
+_PASSWORD_PARAMETER = re.compile(r"((?:^|&)password=)[^&]*", re.IGNORECASE)
+
+
+def _display_url(url: str) -> str:
+    """`url` with any password masked, for the printed and saved result."""
+    parts = urlsplit(url)
+    userinfo, at, host = parts.netloc.rpartition("@")
+    if at and ":" in userinfo:
+        username = userinfo.partition(":")[0]
+        url = urlunsplit(parts._replace(netloc=f"{username}:***@{host}"))
+    # redis-py also reads ?password= from the query string.
+    base, question, query = url.partition("?")
+    if not question:
+        return url
+    return base + "?" + _PASSWORD_PARAMETER.sub(r"\g<1>***", query)
+
+
 async def capture_redis_commands(
     redis_url: str, operation: Callable[[], Awaitable[Any]]
 ) -> List[Dict[str, Any]]:
     """Capture one operation with a dedicated Redis MONITOR connection."""
     events: List[Dict[str, Any]] = []
-    monitor_client = redis.Redis.from_url(redis_url, decode_responses=True)
+    monitor_client = redis.Redis.from_url(
+        redis_url, password=_redis_password(), decode_responses=True
+    )
     monitor_context = monitor_client.monitor()
     collector: Optional[asyncio.Task] = None
     entered = False
@@ -438,7 +465,9 @@ async def run_mode(
 
 
 async def run_benchmark(args: argparse.Namespace) -> Dict[str, Any]:
-    client = redis.Redis.from_url(args.redis_url, decode_responses=True)
+    client = redis.Redis.from_url(
+        args.redis_url, password=_redis_password(), decode_responses=True
+    )
     try:
         await client.ping()
         modes = {}
@@ -456,7 +485,7 @@ async def run_benchmark(args: argparse.Namespace) -> Dict[str, Any]:
     finally:
         await client.aclose()
     result: Dict[str, Any] = {
-        "redis_url": args.redis_url,
+        "redis_url": _display_url(args.redis_url),
         "source_root": str(args.source_root.resolve()) if args.source_root else None,
         "modes": modes,
     }
