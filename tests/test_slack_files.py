@@ -6,7 +6,6 @@ import pytest
 
 from slack.bot_real import SlackBot
 from slack.files import (
-    declares_html,
     download_slack_file,
     is_allowed_slack_file_url,
     is_slack_hosted_file,
@@ -286,24 +285,16 @@ SLACK_NATIVE_DOCUMENTS = [
 ]
 
 
-@pytest.mark.parametrize("document", SLACK_NATIVE_DOCUMENTS)
-def test_slack_native_documents_may_be_served_as_html(document):
-    assert declares_html(_file(name="Roadmap", **document))
-
-
-def test_ordinary_files_do_not_declare_html():
-    assert not declares_html(_file())
-    assert not declares_html(_file(name="notes.txt", mimetype="text/plain"))
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("document", SLACK_NATIVE_DOCUMENTS)
-async def test_bot_keeps_a_canvas_served_as_html(monkeypatch, document):
+async def test_bot_rejects_html_served_for_a_canvas(monkeypatch, document):
+    # Canvases are not query documents, so an HTML body served for one is
+    # treated like any other undeclared HTML: Slack's sign-in page.
     _requests, handler = _recording_handler(
         httpx.Response(
             200,
             headers={"content-type": "text/html; charset=utf-8"},
-            content=b"<h1>Roadmap</h1>",
+            content=b"<html>Sign in to Slack</html>",
         )
     )
     bot = _bot(monkeypatch, handler)
@@ -312,7 +303,7 @@ async def test_bot_keeps_a_canvas_served_as_html(monkeypatch, document):
         {"files": [_file(name="Roadmap", **document)]}
     )
 
-    assert attachments[0].content == b"<h1>Roadmap</h1>"
+    assert attachments[0].content is None
 
 
 @pytest.mark.asyncio
