@@ -6000,7 +6000,48 @@ class SlackBot:
             SLACK_METRICS.work_queue_depth.set(0)
             SLACK_METRICS.work_running.set(0)
 
+    def _is_ignored_message_event(self, event: Dict[str, Any]) -> bool:
+        """A message _handle_message_event always drops: a subtype or a bot's post.
+
+        Dropping it before the queue keeps the bot from answering its own busy
+        reply with another one.
+        """
+        return event.get("type") == "message" and bool(
+            event.get("subtype")
+            or event.get("bot_id")
+            or (self.bot_user_id and event.get("user") == self.bot_user_id)
+        )
+
+    def _is_tracked_thread(
+        self, channel_id: Optional[str], thread_ts: Optional[str]
+    ) -> bool:
+        """Whether the bot follows a thread, without refreshing or expiring it."""
+        if not channel_id or not thread_ts:
+            return False
+        if self._is_agent_thread(channel_id, thread_ts):
+            return True
+        last_activity = self.active_threads.get(self._thread_key(channel_id, thread_ts))
+        return (
+            last_activity is not None
+            and datetime.now() - last_activity <= self.active_thread_timeout
+        )
+
+    def _wants_busy_reply(self, item: SlackWorkItem) -> bool:
+        """Whether someone is waiting on the bot: a slash command, mention or thread."""
+        if item.kind == "slash":
+            return True
+        if item.kind != "event":
+            return False
+        event_type = item.payload.get("type")
+        if event_type == "app_mention":
+            return True
+        return event_type == "message" and self._is_tracked_thread(
+            item.payload.get("channel"), item.payload.get("thread_ts")
+        )
+
     async def _enqueue_work(self, item: SlackWorkItem) -> bool:
+        if item.kind == "event" and self._is_ignored_message_event(item.payload):
+            return False
         if not self._accepting_work:
             await self._reply_busy(item)
             return False
@@ -6052,6 +6093,9 @@ class SlackBot:
                 queue.task_done()
 
     async def _reply_busy(self, item: SlackWorkItem) -> None:
+        if not self._wants_busy_reply(item):
+            return
+
         async def send_reply():
             channel = item.payload.get("channel") or item.payload.get("channel_id")
             user = item.payload.get("user") or item.payload.get("user_id")

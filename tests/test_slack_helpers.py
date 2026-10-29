@@ -33,6 +33,7 @@ from slack.agent_shortcut import build_agent_shortcut_modal
 from slack.bot_real import (
     AGENT_ERROR_HINTS,
     AGENT_FOLLOWUP_FLAG_PATTERN,
+    SLACK_BUSY_MESSAGE,
     ConversationContext,
     ConversationManager,
     FileSlackStateStore,
@@ -2809,6 +2810,137 @@ async def test_slack_worker_shutdown_cancellation_still_cancels_workers_and_drai
     assert bot._work_workers == []
     assert bot._work_queue.empty()
     assert bot._work_running == 0
+
+
+def _busy_bot(situation):
+    """A bot that cannot take work: its one queue slot is full, or it is draining."""
+    bot = SlackBot(
+        {
+            "channels": [],
+            "work_queue": {"capacity": 1, "overload_reply_timeout_seconds": 1},
+        },
+        inference_engine=SimpleNamespace(),
+    )
+    bot.bot_user_id = "UBOT"
+    bot.web_client = SimpleNamespace(
+        chat_postMessage=AsyncMock(), chat_postEphemeral=AsyncMock()
+    )
+    if situation == "queue_full":
+        bot._work_queue.put_nowait(
+            SlackWorkItem(kind="event", name="filler", payload={})
+        )
+    else:
+        bot._accepting_work = False
+    return bot
+
+
+def _message(**fields):
+    return {"type": "message", "channel": "C1", **fields}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("situation", ["queue_full", "draining"])
+@pytest.mark.parametrize(
+    "kind,payload,posts,ephemerals",
+    [
+        # The bot's own busy reply lands in the thread it answered: a loop.
+        (
+            "event",
+            _message(thread_ts="100.0", ts="101.0", bot_id="B1", text="busy"),
+            0,
+            0,
+        ),
+        ("event", _message(thread_ts="100.0", ts="101.0", user="UBOT"), 0, 0),
+        ("event", _message(thread_ts="100.0", ts="101.0", subtype="edited"), 0, 0),
+        # Human chatter the bot would never have answered.
+        ("event", _message(user="U1", ts="200.0", text="lunch?"), 0, 0),
+        ("event", _message(user="U1", thread_ts="900.0", ts="901.0"), 0, 0),
+        ("event", {"type": "reaction_added", "user": "U1"}, 0, 0),
+        # Someone waiting on the bot.
+        (
+            "event",
+            {"type": "app_mention", "channel": "C1", "user": "U1", "ts": "300.0"},
+            1,
+            0,
+        ),
+        ("event", _message(user="U1", thread_ts="100.0", ts="102.0"), 1, 0),
+        ("event", _message(user="U1", thread_ts="400.0", ts="401.0"), 1, 0),
+        (
+            "slash",
+            {"channel_id": "C1", "user_id": "U1", "command": "/llm", "text": "hi"},
+            0,
+            1,
+        ),
+    ],
+    ids=[
+        "bot_message",
+        "own_message",
+        "subtype_message",
+        "top_level_chatter",
+        "untracked_thread_reply",
+        "other_event",
+        "app_mention",
+        "active_thread_reply",
+        "agent_thread_reply",
+        "slash_command",
+    ],
+)
+async def test_slack_busy_reply_answers_only_people_waiting_on_the_bot(
+    situation, kind, payload, posts, ephemerals
+):
+    bot = _busy_bot(situation)
+    last_activity = datetime.now() - timedelta(minutes=5)
+    bot.active_threads["C1:100.0"] = last_activity
+    bot.agent_threads["C1:400.0"] = {"owner_user_id": "U1"}
+
+    accepted = await bot._enqueue_work(
+        SlackWorkItem(kind=kind, payload=dict(payload), name="test")
+    )
+
+    assert accepted is False
+    assert bot.web_client.chat_postMessage.await_count == posts
+    assert bot.web_client.chat_postEphemeral.await_count == ephemerals
+    for call in (
+        bot.web_client.chat_postMessage.await_args_list
+        + bot.web_client.chat_postEphemeral.await_args_list
+    ):
+        assert call.kwargs["text"] == SLACK_BUSY_MESSAGE
+        assert call.kwargs["channel"] == "C1"
+    # Checking the thread is read-only: a busy reply keeps no thread alive.
+    assert bot.active_threads == {"C1:100.0": last_activity}
+
+
+@pytest.mark.asyncio
+async def test_slack_bot_and_own_messages_are_acked_but_never_queued():
+    bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
+    bot.bot_user_id = "UBOT"
+    bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+    socket_client = SimpleNamespace(send_socket_mode_response=AsyncMock())
+    events = [
+        _message(thread_ts="100.0", ts="101.0", bot_id="B1"),
+        _message(thread_ts="100.0", ts="102.0", user="UBOT"),
+        _message(thread_ts="100.0", ts="103.0", subtype="message_changed"),
+    ]
+
+    for index, event in enumerate(events):
+        await bot._handle_socket_mode_request(
+            socket_client,
+            SimpleNamespace(
+                envelope_id=f"E-{index}",
+                type="events_api",
+                payload={"event": event},
+            ),
+        )
+
+    assert socket_client.send_socket_mode_response.await_count == len(events)
+    assert bot._work_queue.empty()
+    bot.web_client.chat_postMessage.assert_not_awaited()
+
+    human = _message(user="U1", thread_ts="100.0", ts="104.0")
+    assert await bot._enqueue_work(
+        SlackWorkItem(kind="event", payload=human, name="human")
+    )
+    assert bot._work_queue.qsize() == 1
 
 
 @pytest.mark.asyncio
