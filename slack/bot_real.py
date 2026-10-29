@@ -6132,29 +6132,37 @@ class SlackBot:
         ):
             return
 
-        async def send_reply():
+        async def send_reply() -> bool:
             channel = item.payload.get("channel") or item.payload.get("channel_id")
             user = item.payload.get("user") or item.payload.get("user_id")
             if item.kind == "slash" and hasattr(self.web_client, "chat_postEphemeral"):
+                # Like _handle_slash_command, which answers in any channel.
                 await self.web_client.chat_postEphemeral(
                     channel=channel, user=user, text=SLACK_BUSY_MESSAGE
                 )
-                return
+                return True
+            # Like _handle_*_event: stay silent where the bot is not enabled.
+            if not await self._is_channel_allowed(
+                channel, item.payload.get("channel_name")
+            ):
+                return False
             kwargs = {"channel": channel, "text": SLACK_BUSY_MESSAGE}
             thread_ts = item.payload.get("thread_ts") or item.payload.get("ts")
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
             await self.web_client.chat_postMessage(**kwargs)
+            return True
 
         try:
-            await asyncio.wait_for(
+            sent = await asyncio.wait_for(
                 send_reply(), timeout=self._overload_reply_timeout_seconds
             )
         except Exception:
             SLACK_METRICS.busy_replies.labels(outcome="failed").inc()
             logger.warning("Failed to send Slack overload reply", exc_info=True)
         else:
-            SLACK_METRICS.busy_replies.labels(outcome="sent").inc()
+            if sent:
+                SLACK_METRICS.busy_replies.labels(outcome="sent").inc()
 
     def _finalize_background_task(self, task: asyncio.Task):
         """Log unexpected background task failures and drop completed tasks."""

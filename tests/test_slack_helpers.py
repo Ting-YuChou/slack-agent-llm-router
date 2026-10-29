@@ -2955,11 +2955,11 @@ async def test_slack_worker_shutdown_cancellation_still_cancels_workers_and_drai
     assert bot._work_running == 0
 
 
-def _busy_bot(situation):
+def _busy_bot(situation, channels=()):
     """A bot that cannot take work: its one queue slot is full, or it is draining."""
     bot = SlackBot(
         {
-            "channels": [],
+            "channels": list(channels),
             "work_queue": {"capacity": 1, "overload_reply_timeout_seconds": 1},
         },
         inference_engine=SimpleNamespace(),
@@ -3085,6 +3085,36 @@ async def test_slack_busy_reply_answers_a_mention_in_a_thread_once(situation, fi
     await deliver(first, "102.0")
     await deliver(second, "102.0")
     assert bot.web_client.chat_postMessage.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("situation", ["queue_full", "draining"])
+async def test_slack_busy_reply_stays_out_of_channels_the_bot_is_not_enabled_in(
+    situation,
+):
+    bot = _busy_bot(situation, channels=["CALLOWED1", "#bots"])
+    bot.web_client.conversations_list = AsyncMock(return_value={"channels": []})
+    bot.web_client.conversations_info = AsyncMock(
+        return_value={"channel": {"name": "random"}}
+    )
+    await bot._resolve_allowed_channels()
+
+    for channel, ts in (("COTHER001", "300.0"), ("CALLOWED1", "301.0")):
+        await bot._enqueue_work(
+            SlackWorkItem(
+                kind="event",
+                payload={
+                    "type": "app_mention",
+                    "channel": channel,
+                    "user": "U1",
+                    "ts": ts,
+                },
+                name="mention",
+            )
+        )
+
+    bot.web_client.chat_postMessage.assert_awaited_once()
+    assert bot.web_client.chat_postMessage.await_args.kwargs["channel"] == "CALLOWED1"
 
 
 @pytest.mark.asyncio
