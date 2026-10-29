@@ -4,7 +4,7 @@ Comprehensive observability, alerting, and performance monitoring
 """
 
 import asyncio
-from collections import Counter as CollectionCounter
+from collections import Counter as CollectionCounter, OrderedDict
 import json
 import logging
 import time
@@ -71,12 +71,17 @@ class AlertRule:
     name: str
     condition: str
     threshold: float
-    duration: int  # seconds
+    duration: int  # seconds; re-notify cooldown while the rule keeps firing
     severity: str  # critical, warning, info
     description: str
     enabled: bool = True
     last_triggered: Optional[datetime] = None
     trigger_count: int = 0
+    # How long the condition must hold before the first notification.
+    pending_seconds: float = 0
+    pending_since: Optional[datetime] = None
+    # Whether a firing notification is outstanding (a resolve is owed).
+    firing: bool = False
 
 
 @dataclass
@@ -263,6 +268,34 @@ class AlertManager:
         self.alert_history = []
         self.max_history_size = 1000
 
+        alerts_config = dict(config.get("alerts", {}) or {})
+        # External (stream) alerts: dedupe by (type, scope, window) and hold a
+        # cooldown per (type, scope) so a storm or a replay notifies once.
+        self.dedupe_cooldown_seconds = max(
+            0.0, float(alerts_config.get("dedupe_cooldown_seconds", 900))
+        )
+        self.dedupe_max_entries = max(
+            1, int(alerts_config.get("dedupe_max_entries", 4096))
+        )
+        self.notification_timeout_seconds = max(
+            0.001, float(alerts_config.get("notification_timeout_seconds", 10))
+        )
+        self.notification_queue_size = max(
+            1, int(alerts_config.get("notification_queue_size", 1000))
+        )
+        self.sender_drain_timeout_seconds = max(
+            0.0, float(alerts_config.get("sender_drain_timeout_seconds", 5))
+        )
+        self._clock: Callable[[], float] = time.monotonic
+        self._seen_alert_identities: "OrderedDict[tuple, None]" = OrderedDict()
+        self._active_external_alerts: "OrderedDict[tuple, Dict[str, Any]]" = (
+            OrderedDict()
+        )
+        self.suppressed_alert_count = 0
+        self.dropped_notification_count = 0
+        self._notification_queue: Optional[asyncio.Queue] = None
+        self._sender_task: Optional[asyncio.Task] = None
+
         # Load alert rules
         self._load_alert_rules()
 
@@ -315,7 +348,24 @@ class AlertManager:
                 severity="critical",
                 description="Model is unavailable",
             ),
+            AlertRule(
+                # Flink metrics drive error-rate and latency alerts; when they
+                # stop arriving those rules would silently read zero.
+                name="stream_metrics_stale",
+                condition="stream_metrics_age_seconds > threshold",
+                threshold=float(
+                    self.config.get("stream_metrics_staleness_seconds", 300)
+                ),
+                duration=1800,
+                severity="warning",
+                description="No stream analytics metrics received recently",
+                enabled=bool(rules_config.get("stream_metrics_stale_enabled", True)),
+            ),
         ]
+
+        pending_seconds = max(0.0, float(rules_config.get("pending_seconds", 0) or 0))
+        for rule in default_rules:
+            rule.pending_seconds = pending_seconds
 
         self.alert_rules.extend(default_rules)
         logger.info(f"Loaded {len(self.alert_rules)} alert rules")
@@ -340,9 +390,16 @@ class AlertManager:
                 self.config["webhook"]
             )
 
-    async def check_alerts(self, metrics: Dict[str, float]):
-        """Check all alert rules against current metrics"""
-        current_time = datetime.now()
+    async def check_alerts(
+        self, metrics: Dict[str, float], now: Optional[datetime] = None
+    ):
+        """Check all alert rules against current metrics.
+
+        A breach must hold for ``pending_seconds`` before it notifies; while
+        it keeps firing, ``duration`` is the re-notify cooldown. Recovery
+        after a firing notification sends a resolve.
+        """
+        current_time = now or datetime.now(timezone.utc)
 
         for rule in self.alert_rules:
             if not rule.enabled:
@@ -352,16 +409,29 @@ class AlertManager:
                 # Evaluate alert condition
                 triggered = self._evaluate_condition(rule, metrics)
 
-                if triggered:
-                    # Check if we should send notification (debouncing)
-                    if (
-                        not rule.last_triggered
-                        or (current_time - rule.last_triggered).total_seconds()
-                        > rule.duration
-                    ):
-                        await self._trigger_alert(rule, metrics)
-                        rule.last_triggered = current_time
-                        rule.trigger_count += 1
+                if not triggered:
+                    rule.pending_since = None
+                    if rule.firing:
+                        rule.firing = False
+                        await self._resolve_alert(rule, metrics)
+                    continue
+
+                if rule.pending_since is None:
+                    rule.pending_since = current_time
+                pending_for = (current_time - rule.pending_since).total_seconds()
+                if pending_for < rule.pending_seconds:
+                    continue
+
+                # Check if we should send notification (debouncing)
+                if (
+                    not rule.last_triggered
+                    or (current_time - rule.last_triggered).total_seconds()
+                    > rule.duration
+                ):
+                    await self._trigger_alert(rule, metrics)
+                    rule.last_triggered = current_time
+                    rule.trigger_count += 1
+                    rule.firing = True
 
             except Exception as e:
                 logger.error(f"Error checking alert rule {rule.name}: {e}")
@@ -395,6 +465,11 @@ class AlertManager:
                     ["application.model_health_status", "model_health_status"],
                     "healthy",
                 ),
+                "stream_metrics_age_seconds": self._get_metric_value(
+                    metrics,
+                    ["streaming.metrics_age_seconds", "stream_metrics_age_seconds"],
+                    0,
+                ),
             }
 
             # Evaluate condition
@@ -424,8 +499,24 @@ class AlertManager:
             "current_value": self._get_current_value(rule, metrics),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "trigger_count": rule.trigger_count,
+            "status": "firing",
         }
 
+        self._append_alert_to_history(alert_data)
+        await self._dispatch_alert(alert_data)
+
+    async def _resolve_alert(self, rule: AlertRule, metrics: Dict[str, float]):
+        """Notify that a rule which fired has recovered."""
+        alert_data = {
+            "rule_name": rule.name,
+            "severity": rule.severity,
+            "description": f"Resolved: {rule.description}",
+            "threshold": rule.threshold,
+            "current_value": self._get_current_value(rule, metrics),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "trigger_count": rule.trigger_count,
+            "status": "resolved",
+        }
         self._append_alert_to_history(alert_data)
         await self._dispatch_alert(alert_data)
 
@@ -435,19 +526,159 @@ class AlertManager:
         if len(self.alert_history) > self.max_history_size:
             self.alert_history.pop(0)
 
+    @property
+    def sender_running(self) -> bool:
+        """Whether notifications go through the background sender."""
+        return self._sender_task is not None and not self._sender_task.done()
+
+    def start_sender(self) -> None:
+        """Send notifications from one background task fed by a bounded queue.
+
+        Until this runs (for example in tests), alerts are sent inline.
+        """
+        if self.sender_running:
+            return
+        self._notification_queue = asyncio.Queue(maxsize=self.notification_queue_size)
+        self._sender_task = asyncio.create_task(
+            self._sender_loop(self._notification_queue), name="alert_sender"
+        )
+
+    async def _sender_loop(self, queue: asyncio.Queue) -> None:
+        while True:
+            alert_data = await queue.get()
+            try:
+                await self._send_to_handlers(alert_data)
+            finally:
+                queue.task_done()
+
+    async def drain_notifications(self) -> None:
+        """Wait until every queued notification has been attempted."""
+        queue = self._notification_queue
+        if queue is not None and self.sender_running:
+            await queue.join()
+
+    async def stop_sender(self) -> None:
+        """Drain queued notifications briefly, then stop the sender."""
+        task = self._sender_task
+        if task is None:
+            return
+        if not task.done():
+            try:
+                await asyncio.wait_for(
+                    self.drain_notifications(),
+                    timeout=self.sender_drain_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Alert sender stopped with notifications queued")
+        # Python 3.10's wait_for can swallow a cancel that races completion,
+        # so keep cancelling until the task is really done.
+        while not task.done():
+            task.cancel()
+            await asyncio.wait({task}, timeout=0.1)
+        await asyncio.gather(task, return_exceptions=True)
+        self._sender_task = None
+        self._notification_queue = None
+
+    async def close(self) -> None:
+        """Stop the sender and close handler HTTP clients."""
+        await self.stop_sender()
+        for handler in self.notification_handlers.values():
+            aclose = getattr(handler, "aclose", None)
+            if callable(aclose):
+                try:
+                    await aclose()
+                except Exception:
+                    logger.debug("Failed to close alert handler", exc_info=True)
+
     async def _dispatch_alert(self, alert_data: Dict[str, Any]):
-        """Send an alert to all configured notification handlers."""
+        """Send an alert to all configured notification handlers.
+
+        With the background sender running this only enqueues, so a slow
+        handler never blocks the caller (the Kafka consumer); a full queue
+        drops the notification and counts it.
+        """
+        queue = self._notification_queue
+        if queue is not None and self.sender_running:
+            try:
+                queue.put_nowait(alert_data)
+            except asyncio.QueueFull:
+                self.dropped_notification_count += 1
+                logger.warning(
+                    "Alert notification queue full; dropped %s",
+                    alert_data.get("rule_name"),
+                )
+            return
+        await self._send_to_handlers(alert_data)
+
+    async def _send_to_handlers(self, alert_data: Dict[str, Any]) -> None:
         for handler_name, handler in self.notification_handlers.items():
             try:
-                await handler.send_alert(alert_data)
+                await asyncio.wait_for(
+                    handler.send_alert(alert_data),
+                    timeout=self.notification_timeout_seconds,
+                )
                 logger.info(
                     f"Alert sent via {handler_name}: {alert_data.get('rule_name')}"
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"Alert via {handler_name} timed out after "
+                    f"{self.notification_timeout_seconds}s"
                 )
             except Exception as e:
                 logger.error(f"Failed to send alert via {handler_name}: {e}")
 
+    @staticmethod
+    def _external_alert_keys(
+        alert: Dict[str, Any],
+    ) -> tuple[tuple, Optional[tuple]]:
+        """Return the (type, scope) incident key and the windowed identity."""
+        alert_type = str(alert.get("rule_name") or "external_alert")
+        if alert.get("scope_type") or alert.get("scope_key"):
+            scope: tuple = ("scope", alert.get("scope_type"), alert.get("scope_key"))
+        else:
+            scope = ("model", alert.get("model_name"), alert.get("provider"))
+        incident = (alert.get("source"), alert_type, scope)
+        window = (alert.get("window_start_ms"), alert.get("window_end_ms"))
+        identity = None if window == (None, None) else (*incident, window)
+        return incident, identity
+
+    def _remember_identity(self, identity: tuple) -> None:
+        self._seen_alert_identities[identity] = None
+        self._seen_alert_identities.move_to_end(identity)
+        while len(self._seen_alert_identities) > self.dedupe_max_entries:
+            self._seen_alert_identities.popitem(last=False)
+
+    async def _resolve_external_alert(self, normalized_alert: Dict[str, Any]):
+        """Resolve the active incidents a ``guardrail_action=clear`` closes."""
+        incident, _identity = self._external_alert_keys(normalized_alert)
+        source, alert_type, scope = incident
+        same_scope = [
+            key
+            for key in self._active_external_alerts
+            if key[0] == source and key[2] == scope
+        ]
+        targets = [key for key in same_scope if key[1] == alert_type] or same_scope
+        for key in targets:
+            active = self._active_external_alerts.pop(key)
+            resolved = {
+                **{k: v for k, v in active.items() if not k.startswith("_")},
+                "description": f"Resolved: {active.get('description')}",
+                "timestamp": normalized_alert["timestamp"],
+                "guardrail_action": normalized_alert.get("guardrail_action"),
+                "status": "resolved",
+            }
+            self._append_alert_to_history(resolved)
+            await self._dispatch_alert(resolved)
+
     async def record_external_alert(self, alert_data: Dict[str, Any]):
-        """Record and optionally notify on alert events emitted by the stream layer."""
+        """Record and optionally notify on alert events emitted by the stream layer.
+
+        Identical events (same type, scope and window) are recorded once, so
+        a guardrail storm or a consumer replay notifies once. A new window of
+        an incident that already notified stays quiet for the dedupe cooldown.
+        ``guardrail_action == "clear"`` resolves the incident instead.
+        """
         metrics = alert_data.get("metrics", {}) if isinstance(alert_data, dict) else {}
         anomaly_type = alert_data.get("anomaly_type")
         event_type = alert_data.get("event_type")
@@ -487,9 +718,40 @@ class AlertManager:
             "scope_type": alert_data.get("scope_type"),
             "scope_key": alert_data.get("scope_key"),
             "guardrail_action": alert_data.get("guardrail_action"),
+            "window_start_ms": alert_data.get("window_start_ms"),
+            "window_end_ms": alert_data.get("window_end_ms"),
+            "status": "firing",
         }
 
+        if normalized_alert["guardrail_action"] == "clear":
+            await self._resolve_external_alert(normalized_alert)
+            return
+
+        incident, identity = self._external_alert_keys(normalized_alert)
+        if identity is not None:
+            if identity in self._seen_alert_identities:
+                self.suppressed_alert_count += 1
+                return
+            self._remember_identity(identity)
+
         self._append_alert_to_history(normalized_alert)
+
+        now = self._clock()
+        active = self._active_external_alerts.get(incident)
+        if (
+            active is not None
+            and now - float(active["_notified_at"]) < self.dedupe_cooldown_seconds
+        ):
+            self.suppressed_alert_count += 1
+            return
+
+        self._active_external_alerts[incident] = {
+            **normalized_alert,
+            "_notified_at": now,
+        }
+        self._active_external_alerts.move_to_end(incident)
+        while len(self._active_external_alerts) > self.dedupe_max_entries:
+            self._active_external_alerts.popitem(last=False)
         await self._dispatch_alert(normalized_alert)
 
     def _get_current_value(self, rule: AlertRule, metrics: Dict[str, float]) -> float:
@@ -502,6 +764,12 @@ class AlertManager:
             return metrics.get("memory_usage", 0)
         elif "disk" in rule.condition:
             return metrics.get("disk_usage", 0)
+        elif "stream_metrics_age_seconds" in rule.condition:
+            return self._get_metric_value(
+                metrics,
+                ["streaming.metrics_age_seconds", "stream_metrics_age_seconds"],
+                0,
+            )
         else:
             return 0
 
@@ -515,7 +783,27 @@ class AlertManager:
         }
 
 
-class SlackNotificationHandler:
+class _SharedHTTPClientMixin:
+    """One lazily created httpx client per handler, with an explicit timeout."""
+
+    _client: Optional[httpx.AsyncClient] = None
+    timeout_seconds: float = 10.0
+
+    def _http_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self.timeout_seconds)
+            )
+        return self._client
+
+    async def aclose(self) -> None:
+        client = self._client
+        self._client = None
+        if client is not None:
+            await client.aclose()
+
+
+class SlackNotificationHandler(_SharedHTTPClientMixin):
     """Slack notification handler"""
 
     def __init__(self, config: Dict[str, Any]):
@@ -523,6 +811,8 @@ class SlackNotificationHandler:
         self.webhook_url = config.get("webhook_url")
         self.channel = config.get("channel", "#alerts")
         self.username = config.get("username", "LLM Router Monitor")
+        self.timeout_seconds = float(config.get("timeout_seconds", 10) or 10)
+        self._client = None
 
     async def send_alert(self, alert_data: Dict[str, Any]):
         """Send alert to Slack"""
@@ -538,12 +828,20 @@ class SlackNotificationHandler:
         message = {
             "channel": self.channel,
             "username": self.username,
-            "text": f"{emoji} *{alert_data['rule_name'].upper()}*",
+            "text": (
+                f"✅ *RESOLVED: {alert_data['rule_name'].upper()}*"
+                if alert_data.get("status") == "resolved"
+                else f"{emoji} *{alert_data['rule_name'].upper()}*"
+            ),
             "attachments": [
                 {
-                    "color": "danger"
-                    if alert_data["severity"] == "critical"
-                    else "warning",
+                    "color": (
+                        "good"
+                        if alert_data.get("status") == "resolved"
+                        else "danger"
+                        if alert_data["severity"] == "critical"
+                        else "warning"
+                    ),
                     "fields": [
                         {
                             "title": "Description",
@@ -575,9 +873,8 @@ class SlackNotificationHandler:
             ],
         }
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(self.webhook_url, json=message)
-            response.raise_for_status()
+        response = await self._http_client().post(self.webhook_url, json=message)
+        response.raise_for_status()
 
 
 class EmailNotificationHandler:
@@ -592,24 +889,25 @@ class EmailNotificationHandler:
         logger.info(f"Email alert would be sent: {alert_data['rule_name']}")
 
 
-class WebhookNotificationHandler:
+class WebhookNotificationHandler(_SharedHTTPClientMixin):
     """Generic webhook notification handler"""
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.webhook_url = config.get("url")
         self.headers = config.get("headers", {})
+        self.timeout_seconds = float(config.get("timeout_seconds", 10) or 10)
+        self._client = None
 
     async def send_alert(self, alert_data: Dict[str, Any]):
         """Send alert via webhook"""
         if not self.webhook_url:
             return
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                self.webhook_url, json=alert_data, headers=self.headers
-            )
-            response.raise_for_status()
+        response = await self._http_client().post(
+            self.webhook_url, json=alert_data, headers=self.headers
+        )
+        response.raise_for_status()
 
 
 class MetricsCollector:
@@ -628,13 +926,21 @@ class MetricsCollector:
         self.stream_metrics_staleness_seconds = config.get(
             "stream_metrics_staleness_seconds", 300
         )
+        # Freshness of the stream itself uses this monitor's receive time, not
+        # the producer's emitted_at, so clock skew or replays cannot hide it.
+        self._clock: Callable[[], float] = time.monotonic
+        self._started_at = self._clock()
+        self._last_stream_metrics_received_at: Optional[float] = None
 
     async def collect_all_metrics(self) -> Dict[str, Any]:
         """Collect metrics from all sources"""
         system_metrics = await self._collect_system_metrics()
         application_metrics = await self._collect_application_metrics()
         business_metrics = await self._collect_business_metrics()
-        streaming_metrics = self._collect_streaming_metrics()
+        streaming_metrics = {
+            **self._collect_streaming_metrics(),
+            **self.stream_freshness_metrics()["streaming"],
+        }
         routing_metrics = self.get_routing_feature_summary(hours=1)
         metrics = {
             "timestamp": datetime.now().isoformat(),
@@ -704,19 +1010,12 @@ class MetricsCollector:
             return {}
 
     async def _collect_business_metrics(self) -> Dict[str, float]:
-        """Collect business-level metrics"""
-        try:
-            # Calculate business metrics from recent data
-            # This would typically query the database
-            return {
-                "queries_per_minute": 0,  # TODO: Calculate from recent data
-                "average_cost_per_query": 0,
-                "user_satisfaction_score": 0.95,  # Placeholder
-                "model_availability": 1.0,  # Placeholder
-            }
-        except Exception as e:
-            logger.error(f"Failed to collect business metrics: {e}")
-            return {}
+        """Collect business-level metrics.
+
+        There is no data source for these yet. Report nothing rather than
+        fixed placeholder values that look like real measurements.
+        """
+        return {}
 
     def _extract_prometheus_metrics(self, metrics_object) -> Dict[str, float]:
         """Extract values from Prometheus metrics"""
@@ -750,6 +1049,24 @@ class MetricsCollector:
             self.stream_metrics_history.pop(0)
 
         self.latest_stream_metrics_by_key[model_provider_key] = event
+        self._last_stream_metrics_received_at = self._clock()
+
+    def stream_metrics_age_seconds(self) -> float:
+        """Seconds since the last stream metrics window arrived (or start)."""
+        last = self._last_stream_metrics_received_at
+        reference = self._started_at if last is None else last
+        return max(0.0, self._clock() - reference)
+
+    def stream_freshness_metrics(self) -> Dict[str, Any]:
+        """Return stream freshness in the nested shape alert checks flatten."""
+        return {
+            "streaming": {
+                "metrics_age_seconds": self.stream_metrics_age_seconds(),
+                "metrics_received": int(
+                    self._last_stream_metrics_received_at is not None
+                ),
+            }
+        }
 
     def _recent_stream_metrics(self, hours: int = 1) -> List[Dict[str, Any]]:
         """Return stream metrics still within the configured freshness window."""
@@ -1304,6 +1621,7 @@ class MonitoringService:
         """Start all monitoring components"""
         logger.info("Starting monitoring service...")
         self.running = True
+        self.alert_manager.start_sender()
 
         # Start monitoring tasks
         async with asyncio.TaskGroup() as task_group:
@@ -1474,4 +1792,5 @@ class MonitoringService:
         logger.info("Shutting down monitoring service...")
         self.running = False
         self.system_monitor.stop_monitoring()
+        await self.alert_manager.close()
         logger.info("Monitoring service shutdown complete")

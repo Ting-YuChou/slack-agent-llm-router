@@ -1,0 +1,93 @@
+# Prometheus alerting rules for the chat analytics path
+# (API producer -> Kafka -> ingestion consumer -> ClickHouse).
+# Every metric referenced here is defined in src/utils/metrics.py;
+# tests/test_alert_dedupe.py checks that.
+groups:
+  - name: llm-router-kafka-producer
+    rules:
+      - alert: LLMRouterKafkaProducerDroppingEvents
+        expr: sum by (topic, reason) (increase(llm_router_kafka_producer_queue_dropped_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Analytics events dropped before Kafka ({{ $labels.topic }}, {{ $labels.reason }})"
+          description: "The API's best-effort producer queue is dropping events; chat still works but analytics has gaps."
+      - alert: LLMRouterKafkaProducerDeliveryFailing
+        expr: sum by (topic) (increase(llm_router_kafka_producer_delivery_failed_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka deliveries exhausting retries ({{ $labels.topic }})"
+          description: "Accepted analytics events failed delivery after all retries."
+      - alert: LLMRouterKafkaProducerErrors
+        expr: increase(llm_router_kafka_producer_errors_total[10m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka producer errors are elevated"
+          description: "More than 10 producer errors in 10 minutes."
+      - alert: LLMRouterKafkaProducerQueueBacklog
+        expr: max(llm_router_kafka_producer_queue_depth) > 5000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka producer delivery queue is backing up"
+          description: "The in-process delivery queue has held more than 5000 events for 5 minutes."
+
+  - name: llm-router-kafka-consumer
+    rules:
+      - alert: LLMRouterKafkaDeadLetters
+        expr: sum by (topic) (increase(llm_router_kafka_dead_letter_messages_total[10m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Messages sent to the dead-letter topic ({{ $labels.topic }})"
+          description: "The ingestion consumer could not persist some messages and dead-lettered them."
+      - alert: LLMRouterKafkaConsumerLagHigh
+        expr: sum by (topic) (llm_router_kafka_consumer_lag) > 10000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer lag is high ({{ $labels.topic }})"
+          description: "Ingestion is more than 10000 messages behind for 10 minutes."
+      - alert: LLMRouterKafkaConsumerPartitionsPaused
+        expr: sum by (topic) (llm_router_kafka_consumer_paused_partitions) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka partitions paused by ClickHouse backpressure ({{ $labels.topic }})"
+          description: "Partitions have stayed paused for 10 minutes; ClickHouse writes are not keeping up."
+      - alert: LLMRouterKafkaConsumerRestarting
+        expr: sum by (topic) (increase(llm_router_kafka_consumer_restarts_total[15m])) > 3
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer restarting repeatedly ({{ $labels.topic }})"
+          description: "More than 3 consumer task restarts in 15 minutes."
+      - alert: LLMRouterKafkaConsumerStalled
+        expr: time() - max by (topic) (llm_router_kafka_last_consumed_timestamp_seconds) > 900
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No Kafka messages consumed recently ({{ $labels.topic }})"
+          description: "The consumer has not committed a message for 15 minutes."
+
+  - name: llm-router-clickhouse
+    rules:
+      - alert: LLMRouterClickHouseInsertErrors
+        expr: increase(llm_router_clickhouse_insertion_errors_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ClickHouse inserts failing"
+          description: "Analytics rows are failing to insert into ClickHouse."
