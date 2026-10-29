@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import os
 import subprocess
 import threading
 import time
@@ -101,6 +102,12 @@ def test_rag_compose_profile_enables_api_and_worker():
         check=True,
         capture_output=True,
         text=True,
+        env={
+            **os.environ,
+            "CLICKHOUSE_PASSWORD": "test-clickhouse-password",
+            "LLM_ROUTER_API_KEYS": "test-api-key",
+            "REDIS_PASSWORD": "test-redis-password",
+        },
     )
     resolved = yaml.safe_load(result.stdout)
 
