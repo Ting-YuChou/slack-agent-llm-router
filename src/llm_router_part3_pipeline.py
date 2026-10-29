@@ -1935,9 +1935,7 @@ class KafkaConsumerManager:
                     data = self._decode_message_value(message)
                     query_log = QueryLogEntry(
                         query_id=data["query_id"],
-                        timestamp=datetime.fromisoformat(
-                            data["timestamp"].replace("Z", "+00:00")
-                        ),
+                        timestamp=_parse_datetime(data["timestamp"]),
                         user_id=data["user_id"],
                         user_tier=data["user_tier"],
                         query_text=data["query_text"],
@@ -2007,9 +2005,7 @@ class KafkaConsumerManager:
                 try:
                     data = self._decode_message_value(message)
                     metric_entry = MetricEntry(
-                        timestamp=datetime.fromisoformat(
-                            data["timestamp"].replace("Z", "+00:00")
-                        ),
+                        timestamp=_parse_datetime(data["timestamp"]),
                         service=data["service"],
                         metric_name=data["metric_name"],
                         metric_value=data["metric_value"],

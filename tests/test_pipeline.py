@@ -2,7 +2,7 @@ import json
 import asyncio
 import uuid
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1147,6 +1147,70 @@ class TestKafkaConsumerManager:
         assert entry.kafka_topic == "test-queries"
         assert entry.kafka_partition == 2
         assert entry.kafka_offset == 8
+
+    @pytest.mark.parametrize(
+        "raw_timestamp",
+        ["2026-10-28T07:50:00", "2026-10-28T15:50:00+08:00"],
+        ids=["naive", "offset"],
+    )
+    @pytest.mark.parametrize(
+        "batch_key, consume_method, topic, payload",
+        [
+            (
+                "queries",
+                "_consume_queries",
+                "test-queries",
+                {
+                    "query_id": "query-1",
+                    "user_id": "user-1",
+                    "user_tier": "premium",
+                    "query_text": "hello",
+                    "query_type": "general",
+                    "selected_model": "gpt-5",
+                    "token_count_input": 1,
+                    "token_count_output": 2,
+                    "latency_ms": 10,
+                    "cost_usd": 0.01,
+                    "status": "success",
+                },
+            ),
+            (
+                "metrics",
+                "_consume_metrics",
+                "test-metrics",
+                {
+                    "service": "router",
+                    "metric_name": "latency_ms",
+                    "metric_value": 12.5,
+                },
+            ),
+        ],
+        ids=["queries", "metrics"],
+    )
+    @pytest.mark.asyncio
+    async def test_consumed_timestamps_are_stored_as_utc(
+        self,
+        pipeline_config,
+        batch_key,
+        consume_method,
+        topic,
+        payload,
+        raw_timestamp,
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        message = SimpleNamespace(
+            value=json.dumps({**payload, "timestamp": raw_timestamp}).encode("utf-8"),
+            topic=topic,
+            partition=0,
+            offset=3,
+        )
+
+        await getattr(consumer, consume_method)(AsyncMessageConsumer([message]))
+
+        stored = consumer.batch_processors[batch_key][0].timestamp
+        assert stored.tzinfo is not None
+        assert stored.utcoffset() == timedelta(0)
+        assert stored == datetime(2026, 10, 28, 7, 50, tzinfo=timezone.utc)
 
     @pytest.mark.asyncio
     async def test_flush_pending_batches_commits_offsets_after_clickhouse_write(
