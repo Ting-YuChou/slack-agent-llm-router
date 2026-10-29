@@ -36,6 +36,9 @@ logger = logging.getLogger("flink.submitter")
 WORKSPACE = Path(__file__).resolve().parents[1]
 STATE_FILE = "submitter-state.json"
 JOB_ID_HISTORY = 5
+# `flink run -d` returns once the job is submitted; a hang past this is a
+# failed attempt so the watch loop keeps going.
+SUBMIT_TIMEOUT_SECONDS = float(os.environ.get("FLINK_SUBMIT_TIMEOUT_SECONDS", "300"))
 ACTIVE_STATES = frozenset(
     {"CREATED", "INITIALIZING", "RUNNING", "RESTARTING", "RECONCILING"}
 )
@@ -139,10 +142,31 @@ def _fetch_json(url: str) -> Any:
         return json.loads(response.read().decode("utf-8"))
 
 
-def _run(command: Sequence[str], env: Mapping[str, str]):
-    return subprocess.run(
-        list(command), env=dict(env), capture_output=True, text=True, check=False
-    )
+def _run(
+    command: Sequence[str],
+    env: Mapping[str, str],
+    timeout_seconds: float = SUBMIT_TIMEOUT_SECONDS,
+):
+    """Run a command; a hang past the timeout is reported as a failed attempt."""
+    try:
+        return subprocess.run(
+            list(command),
+            env=dict(env),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        return subprocess.CompletedProcess(
+            list(command),
+            returncode=124,
+            stdout=stdout,
+            stderr=f"timed out after {timeout_seconds}s",
+        )
 
 
 def _submit(
