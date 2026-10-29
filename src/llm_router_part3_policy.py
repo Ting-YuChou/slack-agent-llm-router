@@ -182,7 +182,8 @@ def _event_number(event: Dict[str, Any], field: str) -> float:
         try:
             number = float(value)
         except ValueError as exc:
-            raise PolicyEventInvalid(f"{field} must be a number: {exc}") from exc
+            # The message names the field, never the value.
+            raise PolicyEventInvalid(f"{field} must be a number") from exc
         if not math.isfinite(number):
             raise PolicyEventInvalid(f"{field} must be finite")
         return number
@@ -221,6 +222,22 @@ def _event_mapping(event: Dict[str, Any], field: str) -> Dict[str, Any]:
             f"{field} must be an object, got {type(value).__name__}"
         )
     return dict(value)
+
+
+def describe_policy_event_error(error: BaseException) -> str:
+    """A value-free description of why an event was rejected.
+
+    PolicyEventInvalid messages name the field and the expected type only;
+    other errors (a JSON or UTF-8 decode error can quote the payload) are
+    reduced to their type and position.
+    """
+    if isinstance(error, PolicyEventInvalid):
+        return str(error)
+    if isinstance(error, json.JSONDecodeError):
+        return f"JSONDecodeError at char {error.pos}"
+    if isinstance(error, UnicodeDecodeError):
+        return f"UnicodeDecodeError at byte {error.start}"
+    return type(error).__name__
 
 
 class PolicyCacheWriteRejected(PolicyEventInvalid):
@@ -1793,7 +1810,7 @@ class PolicyMaterializer:
             getattr(message, "partition", None),
             getattr(message, "offset", None),
             destination,
-            error,
+            describe_policy_event_error(error),
         )
         await self._commit_processed_message(consumer, message)
 
@@ -1845,7 +1862,7 @@ class PolicyMaterializer:
             "failure_stage": "validate",
             "error_type": type(error).__name__,
             # Parse errors can quote payload values.
-            "error_message": redact_text(str(error))[:500],
+            "error_message": redact_text(describe_policy_event_error(error))[:500],
             "payload_keys": self._payload_keys(message),
         }
         key = f"{source_topic}:{partition}:{offset}"
