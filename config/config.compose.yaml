@@ -723,6 +723,7 @@ policy_cache:
     host: redis
     port: 6379
     db: 1
+    password_env: REDIS_PASSWORD
     key_prefix: routing_policy
   consumer:
     group_id: llm-router-policy-materializer

@@ -164,7 +164,12 @@ async def _embedding_benchmark(count: int) -> Dict[str, float]:
 async def _redis_benchmark(count: int, host: str, port: int) -> Dict[str, float]:
     import redis.asyncio as redis
 
-    raw_client = redis.Redis(host=host, port=port, decode_responses=False)
+    raw_client = redis.Redis(
+        host=host,
+        port=port,
+        password=os.getenv("REDIS_PASSWORD") or None,
+        decode_responses=False,
+    )
     await raw_client.ping()
     baseline_counter = RedisOperationCounter(raw_client)
     prefix = f"ragbench:{uuid.uuid4().hex}"
@@ -183,6 +188,7 @@ async def _redis_benchmark(count: int, host: str, port: int) -> Dict[str, float]
             "redis": {
                 "host": host,
                 "port": port,
+                "password_env": "REDIS_PASSWORD",
                 "key_prefix": prefix,
                 "pipeline_batch_size": 64,
             },
@@ -243,6 +249,7 @@ async def _production_ingestion_run(
             "redis": {
                 "host": host,
                 "port": port,
+                "password_env": "REDIS_PASSWORD",
                 "key_prefix": prefix,
                 "pipeline_batch_size": pipeline_batch_size,
             },
@@ -319,7 +326,12 @@ async def _retrieval_benchmark(
     store = RedisStackRagVectorStore(
         {
             "embedding": {"dimensions": 4},
-            "redis": {"host": host, "port": port, "key_prefix": prefix},
+            "redis": {
+                "host": host,
+                "port": port,
+                "password_env": "REDIS_PASSWORD",
+                "key_prefix": prefix,
+            },
             "retrieval": {
                 "max_concurrent_branches": 3,
                 "deadline_seconds": 1,

@@ -4,7 +4,7 @@ set -euo pipefail
 service_name="${CLICKHOUSE_SERVICE:-clickhouse}"
 database_name="${CLICKHOUSE_DATABASE:-default}"
 clickhouse_user="${CLICKHOUSE_USER:-llm_router}"
-clickhouse_password="${CLICKHOUSE_PASSWORD:-llm_router_pass}"
+clickhouse_password="${CLICKHOUSE_PASSWORD:?Set CLICKHOUSE_PASSWORD to the ClickHouse writer password}"
 
 run_query() {
   docker compose exec -T "${service_name}" clickhouse-client \

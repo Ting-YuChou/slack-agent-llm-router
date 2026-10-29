@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import shlex
 import sys
 from dataclasses import dataclass
@@ -578,10 +579,12 @@ async def migrate(args: argparse.Namespace) -> int:
     redis_config = dict((config.get("rag", {}) or {}).get("redis", {}) or {})
     import redis.asyncio as redis
 
+    password_env = redis_config.get("password_env", "REDIS_PASSWORD")
     client = redis.Redis(
         host=redis_config.get("host", "localhost"),
         port=int(redis_config.get("port", 6380)),
         db=int(redis_config.get("db", 0)),
+        password=(os.getenv(str(password_env)) or None) if password_env else None,
         decode_responses=False,
     )
     spec = MigrationSpec(

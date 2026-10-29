@@ -20,6 +20,7 @@ import asyncio
 import importlib
 import json
 import math
+import os
 import sys
 import time
 import uuid
@@ -130,12 +131,19 @@ def _mode_succeeded(result: Dict[str, Any]) -> bool:
     )
 
 
+def _redis_password() -> Optional[str]:
+    """$REDIS_PASSWORD; a password in --redis-url takes precedence."""
+    return os.getenv("REDIS_PASSWORD") or None
+
+
 async def capture_redis_commands(
     redis_url: str, operation: Callable[[], Awaitable[Any]]
 ) -> List[Dict[str, Any]]:
     """Capture one operation with a dedicated Redis MONITOR connection."""
     events: List[Dict[str, Any]] = []
-    monitor_client = redis.Redis.from_url(redis_url, decode_responses=True)
+    monitor_client = redis.Redis.from_url(
+        redis_url, password=_redis_password(), decode_responses=True
+    )
     monitor_context = monitor_client.monitor()
     collector: Optional[asyncio.Task] = None
     entered = False
@@ -438,7 +446,9 @@ async def run_mode(
 
 
 async def run_benchmark(args: argparse.Namespace) -> Dict[str, Any]:
-    client = redis.Redis.from_url(args.redis_url, decode_responses=True)
+    client = redis.Redis.from_url(
+        args.redis_url, password=_redis_password(), decode_responses=True
+    )
     try:
         await client.ping()
         modes = {}

@@ -798,9 +798,11 @@ def benchmark_clickhouse(
     host: str = "localhost",
     port: int = 8123,
     username: str = "llm_router",
-    password: str = "llm_router_pass",
+    password: Optional[str] = None,
     keep_database: bool = False,
 ) -> Dict[str, Any]:
+    if password is None:
+        password = os.getenv("CLICKHOUSE_PASSWORD", "")
     errors: List[str] = []
     database = f"analytics_contract_{os.getpid()}_{uuid.uuid4().hex[:8]}"
     migration_database = f"{database}_migration"
@@ -956,13 +958,20 @@ def parse_args(argv=None):
     parser.add_argument("--clickhouse-host", default="localhost")
     parser.add_argument("--clickhouse-port", type=int, default=8123)
     parser.add_argument("--clickhouse-user", default="llm_router")
-    parser.add_argument("--clickhouse-password", default="llm_router_pass")
+    parser.add_argument(
+        "--clickhouse-password",
+        default=os.getenv("CLICKHOUSE_PASSWORD"),
+        help="defaults to $CLICKHOUSE_PASSWORD",
+    )
     parser.add_argument("--keep-benchmark-database", action="store_true")
     parser.add_argument("--flink-events", type=int, default=10_000)
     parser.add_argument("--flink-repeats", type=int, default=3)
     parser.add_argument("--minimum-clickhouse-rows", type=int, default=1_000_000)
     parser.add_argument("--minimum-flink-events", type=int, default=10_000)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not args.flink_only and not args.clickhouse_password:
+        parser.error("set CLICKHOUSE_PASSWORD or pass --clickhouse-password")
+    return args
 
 
 def main(argv=None) -> int:

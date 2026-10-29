@@ -422,9 +422,12 @@ def parse_args(argv=None):
     parser.add_argument("--backup-retention-days", type=int, default=7)
     parser.add_argument(
         "--clickhouse-command",
+        # The client runs inside the container and reads the credentials that
+        # compose gave it, so the password never appears on the host.
         default=(
-            "docker compose exec -T clickhouse clickhouse-client "
-            "--user llm_router --password llm_router_pass"
+            "docker compose exec -T clickhouse sh -c "
+            '\'exec clickhouse-client --user "$CLICKHOUSE_USER" '
+            '--password "$CLICKHOUSE_PASSWORD" "$@"\' sh'
         ),
     )
     args = parser.parse_args(argv)

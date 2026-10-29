@@ -5,6 +5,7 @@ End-to-end smoke test for the Kafka -> ClickHouse ingestion pipeline.
 
 import argparse
 import asyncio
+import os
 import sys
 import time
 import uuid
@@ -146,15 +147,22 @@ async def run_smoke(args):
                 admin_client.close()
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Run Kafka -> ClickHouse smoke test")
     parser.add_argument("--kafka-bootstrap", default="localhost:9092")
     parser.add_argument("--clickhouse-host", default="localhost")
     parser.add_argument("--clickhouse-port", type=int, default=8123)
     parser.add_argument("--clickhouse-user", default="llm_router")
-    parser.add_argument("--clickhouse-password", default="llm_router_pass")
+    parser.add_argument(
+        "--clickhouse-password",
+        default=os.getenv("CLICKHOUSE_PASSWORD"),
+        help="defaults to $CLICKHOUSE_PASSWORD",
+    )
     parser.add_argument("--timeout-seconds", type=float, default=30.0)
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if not args.clickhouse_password:
+        parser.error("set CLICKHOUSE_PASSWORD or pass --clickhouse-password")
+    return args
 
 
 if __name__ == "__main__":
