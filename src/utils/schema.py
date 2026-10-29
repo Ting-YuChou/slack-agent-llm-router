@@ -949,6 +949,8 @@ class SlackMemorySearchConfig(ConfigModel):
     vector_weight: float = Field(0.45, ge=0.0)
     recency_weight: float = Field(0.05, ge=0.0)
     importance_weight: float = Field(0.05, ge=0.0)
+    # Cosine-similarity floor for vector matches; 0 keeps every neighbour.
+    min_score: float = Field(0.0, ge=0.0, le=1.0)
 
 
 class SlackMemoryEmbeddingConfig(ConfigModel):
