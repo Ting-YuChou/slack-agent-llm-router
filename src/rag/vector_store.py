@@ -1031,8 +1031,11 @@ class RedisStackRagVectorStore:
             logger.warning("Redis RAG vector search failed: %s", exc)
             _report_branch("vector", failed=True)
             return []
+        # Only a reply that parses counts as an answer; a parse error
+        # reaches run_branch and is reported there as a failure.
+        results = self._parse_results(raw_results, "vector")
         _report_branch("vector", failed=False)
-        return self._parse_results(raw_results, "vector")
+        return results
 
     async def _search(
         self,
@@ -1081,14 +1084,15 @@ class RedisStackRagVectorStore:
             logger.warning("Redis RAG keyword search failed: %s", exc)
             _report_branch(source, failed=True)
             return []
-        _report_branch(source, failed=False)
-        return self._parse_results(
+        results = self._parse_results(
             raw_results,
             source,
             tokens=tokens,
             with_scores=with_scores,
             normalize_scores=normalize_scores,
         )
+        _report_branch(source, failed=False)
+        return results
 
     def _parse_results(
         self,

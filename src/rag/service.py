@@ -95,11 +95,14 @@ class RagRetrievalOutcome:
 
     ``no_hits`` means the store answered and nothing matched; a timeout or
     an error means nobody knows whether something would have matched.
+    ``degraded`` hits came back while another branch failed or timed out,
+    so a better match may be missing.
     """
 
     status: str
     results: List[RagSearchResult] = field(default_factory=list)
     detail: Optional[str] = None
+    degraded: bool = False
 
     @property
     def unavailable(self) -> bool:
@@ -977,18 +980,21 @@ class RagService:
             except Exception as exc:
                 logger.warning("RAG retrieval failed: %s", exc, exc_info=True)
                 return RagRetrievalOutcome(status=RAG_ERROR, detail=type(exc).__name__)
+        broken_branches = report.timed_out | report.unanswered_failures
+        detail = (
+            "branches " + ",".join(sorted(broken_branches)) if broken_branches else None
+        )
         if results:
-            return RagRetrievalOutcome(status=RAG_HITS, results=list(results))
+            return RagRetrievalOutcome(
+                status=RAG_HITS,
+                results=list(results),
+                detail=detail,
+                degraded=bool(broken_branches),
+            )
         if report.timed_out:
-            return RagRetrievalOutcome(
-                status=RAG_TIMEOUT,
-                detail="branches " + ",".join(sorted(report.timed_out)),
-            )
+            return RagRetrievalOutcome(status=RAG_TIMEOUT, detail=detail)
         if report.unanswered_failures:
-            return RagRetrievalOutcome(
-                status=RAG_ERROR,
-                detail="branches " + ",".join(sorted(report.unanswered_failures)),
-            )
+            return RagRetrievalOutcome(status=RAG_ERROR, detail=detail)
         return RagRetrievalOutcome(status=RAG_NO_HITS)
 
     def _retrieval_deadline_seconds(self) -> float:

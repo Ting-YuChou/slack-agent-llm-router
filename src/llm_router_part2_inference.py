@@ -647,6 +647,14 @@ WEB_SEARCH_UNAVAILABLE_NOTICE = (
     "current web information is included. Say that you cannot verify the "
     "latest information, and do not present older knowledge as current."
 )
+# Retrieval outcomes that mean nobody knows what the documents say.
+_RAG_UNAVAILABLE_STATUSES = ("timeout", "error")
+# Prompt line for rag_policy AUTO when document search timed out or failed.
+RAG_UNAVAILABLE_NOTICE = (
+    "Document search was unavailable for this request, so this answer is not "
+    "grounded in the knowledge base. If the question depends on those "
+    "documents, say so instead of guessing what they contain."
+)
 
 
 @dataclass
@@ -1100,6 +1108,8 @@ class BaseInferenceProvider(ABC):
         rag_context = (request.metadata or {}).get("rag_context")
         if rag_context:
             dynamic_context.append(str(rag_context))
+        if (request.metadata or {}).get("rag_unavailable") in _RAG_UNAVAILABLE_STATUSES:
+            dynamic_context.append(RAG_UNAVAILABLE_NOTICE)
         web_search_context = (request.metadata or {}).get("web_search_context")
         if web_search_context:
             dynamic_context.append(str(web_search_context))
@@ -2880,19 +2890,16 @@ class InferenceEngine:
         min_score = (
             options.min_score if options and options.min_score is not None else None
         )
-        try:
-            outcome = await self._retrieve_rag_outcome(
-                request,
-                max_results=max_results,
-                candidate_count=candidate_count,
-                min_score=min_score,
-            )
-        except asyncio.TimeoutError:
-            # A deadline imposed around this call (the request budget) is a
-            # retrieval timeout too, not a provider timeout.
-            outcome = SimpleNamespace(status="timeout", results=[], detail=None)
+        # Only this method decides whether the prompt says retrieval failed.
+        request.metadata.pop("rag_unavailable", None)
+        outcome = await self._retrieve_rag_outcome(
+            request,
+            max_results=max_results,
+            candidate_count=candidate_count,
+            min_score=min_score,
+        )
         results = list(outcome.results)
-        rag_unavailable = outcome.status in ("timeout", "error")
+        rag_unavailable = outcome.status in _RAG_UNAVAILABLE_STATUSES
         latency_ms = int((time.time() - started_at) * 1000)
         tool_call = self.rag_service.tool_call_from_results(
             request.query,
@@ -2919,6 +2926,16 @@ class InferenceEngine:
             )
             warnings.append("rag_unavailable")
         elif results:
+            if getattr(outcome, "degraded", False) is True:
+                # Hits, but a failed branch may have held a better match:
+                # answer with them, without caching the answer for the TTL.
+                logger.warning(
+                    "RAG retrieval for request %s degraded (%s)",
+                    request.request_id,
+                    getattr(outcome, "detail", None),
+                )
+                request.metadata["rag_cache_bypass"] = True
+                warnings.append("rag_degraded")
             request.metadata["rag_context"] = self.rag_service.build_context(results)
             request.metadata["rag_hit_count"] = len(results)
             request.metadata["rag_chunk_ids"] = [
