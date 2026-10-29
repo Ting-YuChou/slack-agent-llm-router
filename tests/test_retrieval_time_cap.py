@@ -88,9 +88,12 @@ def _engine(*, rag_service=None, web_search_tool=None, query_type=None, schedule
     router.get_model_info.return_value = {"config": {"provider": "openai"}}
     router.update_model_stats = MagicMock()
     router.token_counter.count_tokens.return_value = 5
+    # The model doubles answer at once, so they need no minimum window; with
+    # the shipped 1 s, retrieval would get none of a 1 s deadline.
     engine = InferenceEngine(
         {
-            "scheduler": scheduler or {"request_deadline_seconds": 1.0},
+            "scheduler": scheduler
+            or {"request_deadline_seconds": 1.0, "min_attempt_window_seconds": 0},
             "cache": {"enabled": True},
             "batching": {"enabled": False},
         },
@@ -209,3 +212,98 @@ async def test_retrieval_budget_ratio_is_configurable():
 
     assert "rag_unavailable" in response.warnings
     assert elapsed < 0.5
+
+
+# Review follow-up: the model keeps its minimum window; ratio < 1.
+
+
+def test_retrieval_budget_ratio_must_leave_the_model_some_time():
+    with pytest.raises(ValidationError):
+        InferenceConfig(retrieval_budget_ratio=1.0)
+
+
+class _SlowModel:
+    """A model that needs 0.1 s: it fails when retrieval leaves it less."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def generate_response(self, request, model_name):
+        self.calls += 1
+        await asyncio.sleep(0.1)
+        return _answer()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ratio", [1.0, 0.999, 0.99])
+async def test_retrieval_leaves_the_model_its_minimum_window(ratio):
+    engine = _engine(
+        rag_service=_slow_rag_service(),
+        scheduler={"request_deadline_seconds": 1.0, "min_attempt_window_seconds": 0.3},
+    )
+    engine.providers = {"openai": _SlowModel()}
+    engine.config["retrieval_budget_ratio"] = ratio  # unvalidated, as in tests
+    request = _request(knowledge_base_ids=["school"])
+
+    response, elapsed = await _process(engine, request)
+
+    assert response.error is None
+    assert "rag_unavailable" in response.warnings
+    assert engine.providers["openai"].calls == 1
+    assert elapsed < 0.95
+    assert _model_failures(engine) == []
+
+
+@pytest.mark.asyncio
+async def test_retrieval_share_ends_before_the_request_deadline_backstop():
+    # No minimum window and a share of nearly 1: retrieval must still stop
+    # on its own clock, not race the request deadline into a 504.
+    engine = _engine(rag_service=_slow_rag_service())
+    engine.config["retrieval_budget_ratio"] = 0.999
+    request = _request(knowledge_base_ids=["school"])
+
+    response, _ = await _process(engine, request)
+
+    assert response.error is None
+    assert "rag_unavailable" in response.warnings
+    engine.providers["openai"].generate_response.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rag_service",
+    [
+        pytest.param(None, id="rag-not-configured"),
+        pytest.param("disabled-by-policy", id="rag-disabled-by-policy"),
+    ],
+)
+async def test_caller_rag_unavailable_flag_never_reaches_the_prompt(rag_service):
+    engine = _engine(
+        rag_service=_slow_rag_service() if rag_service else None,
+    )
+    request = _request(
+        metadata={"rag_unavailable": "timeout"},
+        rag_policy=RagPolicy.DISABLED if rag_service else RagPolicy.AUTO,
+    )
+
+    await _process(engine, request)
+
+    sent = engine.providers["openai"].generate_response.await_args.args[0]
+    prompt = OpenAIProvider({})._build_prompt(sent)
+    assert "not grounded in the knowledge base" not in prompt
+    assert "rag_unavailable" not in (sent.metadata or {})
+
+
+@pytest.mark.asyncio
+async def test_caller_web_search_unavailable_flag_never_reaches_the_prompt():
+    engine = _engine()
+    request = _request(
+        metadata={"web_search_unavailable": True}, tool_policy=ToolPolicy.DISABLED
+    )
+
+    await _process(engine, request)
+
+    sent = engine.providers["openai"].generate_response.await_args.args[0]
+    prompt = OpenAIProvider({})._build_prompt(sent)
+    assert "cannot verify the latest information" not in prompt
+    assert "web_search_unavailable" not in (sent.metadata or {})

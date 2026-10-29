@@ -660,6 +660,17 @@ RAG_UNAVAILABLE_NOTICE = (
 )
 # inference.retrieval_budget_ratio when unset or invalid.
 _DEFAULT_RETRIEVAL_BUDGET_RATIO = 0.5
+# Least time a retrieval step leaves before the request deadline, so its own
+# timeout always fires before the _within_request_deadline backstop.
+_RETRIEVAL_BACKSTOP_MARGIN_SECONDS = 0.05
+
+
+def _drop_metadata_key(request: QueryRequest, key: str) -> None:
+    """Remove a key the engine owns from caller-supplied request metadata."""
+    if request.metadata and key in request.metadata:
+        request.metadata = {
+            name: value for name, value in request.metadata.items() if name != key
+        }
 
 
 async def _await_within(
@@ -2914,6 +2925,8 @@ class InferenceEngine:
         Running out of time is a failed search (warning, prompt notice, no
         cache), not a request failure.
         """
+        # Likewise only this method sets web_search_unavailable.
+        _drop_metadata_key(request, "web_search_unavailable")
         if not self._should_run_web_search(request, routing_decision):
             return None
 
@@ -2991,6 +3004,9 @@ class InferenceEngine:
         Running out of time is a retrieval timeout: rag_policy AUTO answers
         without documents, REQUIRED raises RetrievalUnavailableError.
         """
+        # Only this method decides whether the prompt says retrieval failed,
+        # so a caller's own rag_unavailable never reaches the prompt.
+        _drop_metadata_key(request, "rag_unavailable")
         if not self._should_run_rag(request, routing_decision):
             return None
 
@@ -3004,8 +3020,6 @@ class InferenceEngine:
         min_score = (
             options.min_score if options and options.min_score is not None else None
         )
-        # Only this method decides whether the prompt says retrieval failed.
-        request.metadata.pop("rag_unavailable", None)
         outcome = await self._retrieve_rag_outcome(
             request,
             time_limit_seconds=time_limit_seconds,
@@ -3132,7 +3146,11 @@ class InferenceEngine:
     def _retrieval_time_limit(
         self, execution_budget: Optional[RequestExecutionBudget]
     ) -> Optional[float]:
-        """Seconds one retrieval step may use: a share of the request time left."""
+        """Seconds one retrieval step may use: a share of the request time left.
+
+        At least the scheduler's minimum attempt window stays for the model;
+        with less than that left, retrieval gets no time.
+        """
         if execution_budget is None:
             return None
         try:
@@ -3143,9 +3161,16 @@ class InferenceEngine:
             )
         except (TypeError, ValueError):
             ratio = _DEFAULT_RETRIEVAL_BUDGET_RATIO
-        if not 0.0 < ratio <= 1.0:
+        if not 0.0 < ratio < 1.0:
             ratio = _DEFAULT_RETRIEVAL_BUDGET_RATIO
-        return execution_budget.remaining_seconds * ratio
+        # The step must end on its own clock before the request deadline's
+        # backstop fires, or the backstop wins and the outcome is lost.
+        model_window = max(
+            _RETRIEVAL_BACKSTOP_MARGIN_SECONDS,
+            float(getattr(self.scheduler, "min_attempt_window_seconds", 1.0)),
+        )
+        remaining = execution_budget.remaining_seconds
+        return max(0.0, min(remaining * ratio, remaining - model_window))
 
     async def _prepare_rag_images(
         self,

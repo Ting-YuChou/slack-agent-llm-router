@@ -701,8 +701,9 @@ class InferenceConfig(ConfigModel):
     scheduler: ProviderSchedulerConfig = Field(default_factory=ProviderSchedulerConfig)
     fallback: InferenceFallbackConfig = Field(default_factory=InferenceFallbackConfig)
     # Share of the time left in the request deadline that one retrieval step
-    # (RAG, then web search) may use, so the model call keeps the rest.
-    retrieval_budget_ratio: float = Field(0.5, gt=0.0, le=1.0)
+    # (RAG, then web search) may use, so the model call keeps the rest (and
+    # never less than scheduler.min_attempt_window_seconds).
+    retrieval_budget_ratio: float = Field(0.5, gt=0.0, lt=1.0)
 
     @model_validator(mode="before")
     @classmethod
