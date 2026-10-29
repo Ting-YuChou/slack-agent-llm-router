@@ -15,7 +15,18 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Awaitable, Callable, Dict, List, Optional, Any, Set, Tuple
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
 from dataclasses import dataclass
 
 from slack_sdk.http_retry.builtin_async_handlers import (
@@ -637,6 +648,7 @@ class SlackAnswer(str):
     model_name: Optional[str]
     latency_ms: Optional[float]
     cached: bool
+    trailer_lines: FrozenSet[str]
 
     def __new__(
         cls,
@@ -645,12 +657,29 @@ class SlackAnswer(str):
         model_name: Optional[str] = None,
         latency_ms: Optional[float] = None,
         cached: bool = False,
+        trailer_lines: Iterable[str] = (),
     ) -> "SlackAnswer":
         answer = super().__new__(cls, text)
         answer.model_name = model_name
         answer.latency_ms = latency_ms
         answer.cached = cached
+        # The bot's own lines after the model's text: notes and sources.
+        answer.trailer_lines = frozenset(line for line in trailer_lines if line)
         return answer
+
+    def markdown(self, part: str) -> str:
+        """`part` for a Markdown block, which joins single newlines.
+
+        Adjacent note and source lines get a blank line between them so
+        each stays on its own line; the model's own text is left alone.
+        """
+        lines = part.split("\n")
+        out = lines[:1]
+        for previous, line in zip(lines, lines[1:]):
+            if previous in self.trailer_lines and line in self.trailer_lines:
+                out.append("")
+            out.append(line)
+        return "\n".join(out)
 
     def footer(self) -> Optional[str]:
         """`model · 1.2 s · cached`; never the cost."""
@@ -3387,8 +3416,15 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             response_text = "\n".join(lines).strip()
         model_name = getattr(response, "model_name", None)
         latency_ms = getattr(response, "latency_ms", None)
+        model_text = (getattr(response, "response_text", "") or "").rstrip()
+        trailer = (
+            response_text[len(model_text) :]
+            if model_text and response_text.startswith(model_text)
+            else ""
+        )
         return SlackAnswer(
             response_text,
+            trailer_lines=trailer.split("\n"),
             model_name=model_name if isinstance(model_name, str) else None,
             latency_ms=(
                 float(latency_ms)
@@ -4220,7 +4256,10 @@ class SlackBot:
             or len(part) > SLACK_MARKDOWN_BLOCK_CHARS
         ):
             return message
-        blocks: List[Dict[str, Any]] = [{"type": "markdown", "text": part}]
+        markdown = answer.markdown(part)
+        if len(markdown) > SLACK_MARKDOWN_BLOCK_CHARS:
+            return message
+        blocks: List[Dict[str, Any]] = [{"type": "markdown", "text": markdown}]
         footer = answer.footer() if last else None
         if footer and self.config.get("response_settings", {}).get(
             "answer_footer", True

@@ -701,6 +701,41 @@ async def test_command_replies_and_errors_stay_plain_text(
     assert help_reply == {"channel": "C1", "text": "help text", "thread_ts": "101.0"}
 
 
+@pytest.mark.asyncio
+async def test_notes_and_sources_stay_on_their_own_lines_in_markdown(
+    inference_response_factory,
+):
+    from src.utils.schema import ResponseSource
+
+    sources = [
+        ResponseSource(title="News", url="https://example.com/n", rank=1),
+        ResponseSource(title="Docs", url="https://example.com/d", rank=2),
+    ]
+    model_text = "First line of the answer\nsecond line of the answer"
+    bot = delivery_bot(
+        answering(
+            inference_response_factory,
+            model_text,
+            warnings=["response_truncated", "web_search_unavailable"],
+            sources=sources,
+        ),
+        chat_update=False,
+    )
+
+    await bot._process_message(top_level())
+
+    message = bot.web_client.chat_postMessage.await_args.kwargs
+    text, markdown = message["text"], message["blocks"][0]["text"]
+    # The plain text is unchanged ...
+    assert "checked._\n_Note: the answer was cut off._" in text
+    assert "Sources:\n[1] News - https://example.com/n\n[2] Docs" in text
+    # ... while Markdown, which joins single newlines, gets paragraph breaks.
+    assert "checked._\n\n_Note: the answer was cut off._" in markdown
+    assert "Sources:\n\n[1] News - https://example.com/n\n\n[2] Docs" in markdown
+    # The model's own text is left alone.
+    assert markdown.startswith(model_text + "\n\n_Note:")
+
+
 def test_schema_accepts_the_footer_setting():
     from src.utils.schema import SlackResponseSettingsConfig
 
