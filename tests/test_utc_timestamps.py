@@ -140,6 +140,19 @@ def test_flink_isoformat_default_is_true_utc(taipei_tz):
     _assert_true_utc(datetime.fromisoformat(serialized))
 
 
+def test_flink_isoformat_reads_naive_argument_as_utc(taipei_tz):
+    assert flink_isoformat(datetime(2026, 10, 28, 7, 50)) == "2026-10-28T07:50:00+00:00"
+
+
+def test_flink_isoformat_keeps_aware_argument_offset(taipei_tz):
+    taipei = timezone(timedelta(hours=8))
+
+    assert (
+        flink_isoformat(datetime(2026, 10, 28, 15, 50, tzinfo=taipei))
+        == "2026-10-28T15:50:00+08:00"
+    )
+
+
 def test_parse_datetime_reads_naive_strings_as_utc(taipei_tz):
     parsed = _parse_datetime("2026-10-28T07:50:00")
 
