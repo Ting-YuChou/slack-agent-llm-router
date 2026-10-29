@@ -934,6 +934,72 @@ class TestRuleBasedRoutingFilters:
         eligible = router._filter_models_for_context(list(router.models), context)
         return decision, eligible
 
+    def _build_enterprise_router(self, router_config, policy, query_type):
+        config = dict(router_config)
+        config["models"] = {
+            **router_config["models"],
+            # As shipped in config/config.yaml: no "general" or "coding".
+            "claude-sonnet-4-6": {
+                "provider": "anthropic",
+                "max_tokens": 1000000,
+                "cost_per_token": 0.000015,
+                "priority": 1,
+                "capabilities": [
+                    "reasoning",
+                    "writing",
+                    "analysis",
+                    "tool_use",
+                    "web_search",
+                    "vision",
+                ],
+                "api_key_env": "ANTHROPIC_API_KEY",
+            },
+        }
+        config["routing_rules"] = [
+            {
+                "condition": "user_tier == 'enterprise'",
+                "models": ["claude-sonnet-4-6", "gpt-5"],
+                "fallback": "claude-sonnet-4-6",
+            },
+            *router_config["routing_rules"],
+        ]
+        router = self._build_router(config, policy)
+        router.classifier.classify_query = lambda _query: (query_type, 0.95)
+        router.model_stats["claude-sonnet-4-6"] = {
+            "success_rate": 0.99,
+            "avg_latency": 100,
+        }
+        return router
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "query_type", [QueryType.GENERAL, QueryType.CODE_GENERATION]
+    )
+    async def test_enterprise_rule_selects_sonnet_without_capability_check(
+        self, router_config, query_type
+    ):
+        router = self._build_enterprise_router(router_config, {}, query_type)
+
+        decision, _eligible = await self._route(router, user_tier=UserTier.ENTERPRISE)
+
+        assert decision.selected_model == "claude-sonnet-4-6"
+        assert "user_tier == 'enterprise'" in decision.routing_reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "query_type", [QueryType.GENERAL, QueryType.CODE_GENERATION]
+    )
+    async def test_enterprise_rule_skips_blocked_sonnet(
+        self, router_config, query_type
+    ):
+        router = self._build_enterprise_router(
+            router_config, {"blocked_models": ["claude-sonnet-4-6"]}, query_type
+        )
+
+        decision, _eligible = await self._route(router, user_tier=UserTier.ENTERPRISE)
+
+        assert decision.selected_model != "claude-sonnet-4-6"
+
     @pytest.mark.asyncio
     async def test_rule_routing_skips_blocked_model(self, router_config):
         router = self._build_router(router_config, {"blocked_models": ["gpt-5"]})

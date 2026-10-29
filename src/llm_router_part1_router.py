@@ -1026,11 +1026,14 @@ class ModelRouter:
 
         # Apply rule-based routing first. Rule candidates and the rule fallback
         # pass the same guardrail, tier and context-window filter as every other
-        # path; a rule with nothing eligible defers to the next rule.
+        # path; a rule with nothing eligible defers to the next rule. Rules name
+        # their models explicitly, so the capability check is not applied.
         for rule in self.routing_rules:
             if not rule.matches(context):
                 continue
-            available_models = self._filter_models_for_context(rule.models, context)
+            available_models = self._filter_models_for_context(
+                rule.models, context, check_capability=False
+            )
             if available_models:
                 best_model = self._select_best_model(available_models, context)
                 return ModelSelection(
@@ -1038,7 +1041,9 @@ class ModelRouter:
                     confidence=0.9,
                     reason=f"Rule-based selection: {rule.condition}",
                 )
-            if self._filter_models_for_context([rule.fallback], context):
+            if self._filter_models_for_context(
+                [rule.fallback], context, check_capability=False
+            ):
                 return ModelSelection(
                     model_name=rule.fallback,
                     confidence=0.9,
@@ -1197,9 +1202,19 @@ class ModelRouter:
         )
 
     def _filter_models_for_context(
-        self, candidate_models: List[str], context: Dict[str, Any]
+        self,
+        candidate_models: List[str],
+        context: Dict[str, Any],
+        *,
+        check_capability: bool = True,
     ) -> List[str]:
-        """Filter candidate models against capability, token, and tier constraints."""
+        """Filter candidate models against capability, token, and tier constraints.
+
+        Guardrails (avoid/blocked models and providers), the context window and
+        the user tier always apply. ``check_capability=False`` skips only the
+        query-type capability check, for routing rules that name models
+        explicitly.
+        """
         query_type = context["query_type"]
         token_count = context["token_count"]
         user_tier = context["user_tier"]
@@ -1224,7 +1239,7 @@ class ModelRouter:
             provider_name = model_config.provider.lower()
             if provider_name in avoid_providers or provider_name in blocked_providers:
                 continue
-            if not self._has_capability(model_config, query_type):
+            if check_capability and not self._has_capability(model_config, query_type):
                 continue
             if token_count > model_config.max_tokens:
                 continue
