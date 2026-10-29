@@ -1,4 +1,5 @@
 import builtins
+import time
 
 import pytest
 
@@ -16,6 +17,95 @@ from src.utils.schema import (
     ToolPolicy,
     UserTier,
 )
+
+QUERY_MAX_CHARS = 50000
+
+# A long single-paragraph paste, as a user would send a transcript or report.
+MIXED_REALISTIC_QUERY = (
+    "Why is that the p99 latency spikes every night after the deploy? "
+    "How can we conclude it is the cache and not the database? "
+    "Write a Python function that parses the gateway logs and build a script "
+    "to compare the error trends per region. "
+    "What does this code do: def handler(event): return event['body']. "
+    "The latest release announced today includes a price update for the stock "
+    "dashboard. Summarize the key points, brainstorm some ideas, and help me "
+    "plan the rollout roadmap with milestones. "
+) * 120
+
+CLASSIFIER_STRESS_QUERIES = {
+    "why_is": "why is " * 7200,
+    "how_can_we": "how can we " * 4600,
+    "write": "write " * 8400,
+    "what_does_this": "what does this " * 3400,
+    "mixed_realistic": MIXED_REALISTIC_QUERY,
+}
+
+# (query, type, confidence) recorded from classify_query before the regex rewrite.
+CLASSIFIER_SNAPSHOT = [
+    (
+        "Write a Python function to sort a list",
+        QueryType.CODE_GENERATION,
+        0.5642857142857143,
+    ),
+    (
+        "Can you implement a binary search algorithm in Rust?",
+        QueryType.CODE_GENERATION,
+        0.20714285714285713,
+    ),
+    (
+        "Please review this code and fix the bug in my parser function",
+        QueryType.CODE_ANALYSIS,
+        0.43333333333333335,
+    ),
+    (
+        "What does this code do? def add(a, b): return a + b",
+        QueryType.CODE_GENERATION,
+        0.20714285714285713,
+    ),
+    (
+        "Analyze the sales data and compare the trends across regions",
+        QueryType.ANALYSIS,
+        0.5166666666666666,
+    ),
+    (
+        "Summarize the key points of this meeting transcript",
+        QueryType.SUMMARIZATION,
+        0.46,
+    ),
+    (
+        "Write a short story about a robot who learns to paint",
+        QueryType.CREATIVE_WRITING,
+        0.43333333333333335,
+    ),
+    (
+        "Compose a poem about autumn leaves",
+        QueryType.CREATIVE_WRITING,
+        0.43333333333333335,
+    ),
+    ("What are some good ideas for a team offsite?", QueryType.BRAINSTORMING, 0.38),
+    ("Help me think of names for my new coffee shop", QueryType.BRAINSTORMING, 0.23),
+    (
+        "How to plan a product launch roadmap with clear milestones",
+        QueryType.PLANNING,
+        0.7333333333333333,
+    ),
+    ("Solve the equation 3x + 5 = 20", QueryType.MATH, 0.43333333333333335),
+    ("Calculate the derivative of x^2 * sin(x)", QueryType.MATH, 0.36666666666666664),
+    (
+        "Why is that the case, and how can we conclude the argument is valid?",
+        QueryType.REASONING,
+        0.5166666666666666,
+    ),
+    (
+        "What is the latest news about the NVIDIA stock price today?",
+        QueryType.WEB_RESEARCH,
+        0.5466666666666666,
+    ),
+    ("最新的 AI 新聞是什麼？", QueryType.WEB_RESEARCH, 0.28444444444444444),
+    ("Hi there, how are you doing?", QueryType.GENERAL, 0.5),
+    ("Thanks, that was really helpful", QueryType.GENERAL, 0.5),
+    ("Translate this sentence into French", QueryType.GENERAL, 0.5),
+]
 
 
 class TestQueryClassifier:
@@ -59,6 +149,36 @@ class TestQueryClassifier:
 
         assert query_type == QueryType.WEB_RESEARCH
         assert confidence > 0.1
+
+    @pytest.mark.parametrize(
+        "query",
+        list(CLASSIFIER_STRESS_QUERIES.values()),
+        ids=list(CLASSIFIER_STRESS_QUERIES),
+    )
+    def test_classify_query_is_fast_on_max_length_input(self, query):
+        classifier = QueryClassifier()
+        classifier._is_initialized = True
+        query = query[:QUERY_MAX_CHARS]
+
+        started = time.perf_counter()
+        classifier.classify_query(query)
+        elapsed = time.perf_counter() - started
+
+        assert elapsed < 0.25
+
+    @pytest.mark.parametrize(
+        ("query", "expected_type", "expected_confidence"), CLASSIFIER_SNAPSHOT
+    )
+    def test_classify_query_matches_recorded_snapshot(
+        self, query, expected_type, expected_confidence
+    ):
+        classifier = QueryClassifier()
+        classifier._is_initialized = True
+
+        query_type, confidence = classifier.classify_query(query)
+
+        assert query_type == expected_type
+        assert confidence == pytest.approx(expected_confidence)
 
 
 class TestTokenCounter:

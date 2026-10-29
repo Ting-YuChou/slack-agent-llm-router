@@ -26,6 +26,12 @@ from src.utils.schema import (
 
 logger = logging.getLogger(__name__)
 
+# Only the head of a query is classified; QueryRequest.query allows 50,000 chars.
+CLASSIFIER_MAX_QUERY_CHARS = 2000
+# Bounded gap between keywords: stays inside one sentence and at most 80 chars,
+# so the classifier patterns cannot backtrack catastrophically on long input.
+_GAP = r"[^.?!\n]{0,80}"
+
 
 @dataclass
 class RoutingRule:
@@ -57,22 +63,26 @@ class QueryClassifier:
         self.model = None
         self.tfidf_vectorizer = None
         self.patterns = self._init_patterns()
+        self._compiled_patterns: Dict[QueryType, List[re.Pattern[str]]] = {
+            query_type: [re.compile(pattern) for pattern in patterns]
+            for query_type, patterns in self.patterns.items()
+        }
         self._is_initialized = False
 
     def _init_patterns(self) -> Dict[QueryType, List[str]]:
         """Initialize regex patterns for query classification"""
         return {
             QueryType.CODE_GENERATION: [
-                r"\b(write|create|generate|implement|build)\b.*\b(function|class|code|script|program)\b",
-                r"\b(python|javascript|java|cpp|rust|go)\b.*\b(code|function|script)\b",
+                rf"\b(write|create|generate|implement|build)\b{_GAP}\b(function|class|code|script|program)\b",
+                rf"\b(python|javascript|java|cpp|rust|go)\b{_GAP}\b(code|function|script)\b",
                 r"def\s+\w+|class\s+\w+|function\s+\w+",
                 r"\b(algorithm|implementation|coding)\b",
             ],
             QueryType.CODE_ANALYSIS: [
-                r"\b(analyze|review|debug|fix|optimize|refactor)\b.*\b(code|function|script)\b",
-                r"\b(bug|error|issue|problem)\b.*\b(code|function)\b",
+                rf"\b(analyze|review|debug|fix|optimize|refactor)\b{_GAP}\b(code|function|script)\b",
+                rf"\b(bug|error|issue|problem)\b{_GAP}\b(code|function)\b",
                 r"\b(complexity|performance|optimization)\b",
-                r"what.*does.*this.*code.*do",
+                rf"what{_GAP}does{_GAP}this{_GAP}code{_GAP}do",
             ],
             QueryType.ANALYSIS: [
                 r"\b(analyze|examination|study|research|investigate)\b",
@@ -89,19 +99,19 @@ class QueryClassifier:
             QueryType.CREATIVE_WRITING: [
                 r"\b(story|poem|essay|article|blog)\b",
                 r"\b(creative|imaginative|fictional)\b",
-                r"\b(write|compose|craft)\b.*\b(story|poem|article)\b",
+                rf"\b(write|compose|craft)\b{_GAP}\b(story|poem|article)\b",
                 r"\b(character|plot|narrative|dialogue)\b",
             ],
             QueryType.BRAINSTORMING: [
                 r"\b(brainstorm|ideas|suggestions|alternatives)\b",
                 r"\b(creative thinking|ideation|innovation)\b",
-                r"what are some.*ideas",
+                rf"what are some{_GAP}ideas",
                 r"help me think of",
             ],
             QueryType.PLANNING: [
                 r"\b(plan|strategy|roadmap|timeline|schedule)\b",
                 r"\b(project planning|strategic planning)\b",
-                r"how to.*plan",
+                rf"how to{_GAP}plan",
                 r"\b(steps|phases|milestones)\b",
             ],
             QueryType.MATH: [
@@ -113,12 +123,12 @@ class QueryClassifier:
             QueryType.REASONING: [
                 r"\b(reasoning|logic|logical|deduce|infer)\b",
                 r"\b(because|therefore|hence|thus)\b",
-                r"why.*is.*that|how.*can.*we.*conclude",
+                rf"why{_GAP}is{_GAP}that|how{_GAP}can{_GAP}we{_GAP}conclude",
                 r"\b(premise|conclusion|argument)\b",
             ],
             QueryType.WEB_RESEARCH: [
                 r"\b(latest|today|current|recent|news|breaking|now)\b",
-                r"\b(price|stock|release|launched|announced|update)\b.*\b(today|latest|current|recent|now|202[0-9])\b",
+                rf"\b(price|stock|release|launched|announced|update)\b{_GAP}\b(today|latest|current|recent|now|202[0-9])\b",
                 r"\b(search|look up|web|internet|online)\b",
                 r"\b(what happened|what is happening)\b",
                 r"(查詢網頁|搜尋|最新|現在|今天|新聞|即時)",
@@ -153,18 +163,19 @@ class QueryClassifier:
         if not self._is_initialized:
             asyncio.create_task(self.initialize())
 
+        text = query[:CLASSIFIER_MAX_QUERY_CHARS].lower()
+
         # Pattern-based classification
         pattern_scores = {}
-        for query_type, patterns in self.patterns.items():
+        for query_type, patterns in self._compiled_patterns.items():
             score = 0.0
             for pattern in patterns:
-                matches = len(re.findall(pattern, query.lower()))
-                score += matches
+                score += len(pattern.findall(text))
             if score > 0:
                 pattern_scores[query_type] = score / len(patterns)
 
         # Keyword-based scoring
-        keyword_scores = self._keyword_classification(query)
+        keyword_scores = self._keyword_classification(text)
 
         # Combine scores
         combined_scores = {}
