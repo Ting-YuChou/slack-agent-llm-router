@@ -3373,6 +3373,18 @@ class InferenceEngine:
             and self._get_provider_for_model(model_name) is not None
         ]
 
+    def _tier_allows_model(self, model_name: str, request: QueryRequest) -> bool:
+        """Whether the user's tier may use a model, by the router's access rule."""
+        router = getattr(self, "router", None)
+        models = getattr(router, "models", None)
+        check_access = getattr(router, "_check_user_access", None)
+        if not isinstance(models, dict) or not callable(check_access):
+            return True  # A stub router has no access rules to apply.
+        model_config = models.get(model_name)
+        return model_config is not None and bool(
+            check_access(model_config, request.user_tier)
+        )
+
     async def _execute_text_only_after_vision_failure(
         self,
         request: QueryRequest,
@@ -3389,11 +3401,25 @@ class InferenceEngine:
             warning,
         ]
         text_fallbacks = list(request.metadata.get("rag_text_fallback_models") or [])
-        model_name = str(
-            request.metadata.get("rag_original_model")
-            or (text_fallbacks[0] if text_fallbacks else None)
-            or routing_decision.selected_model
-        )
+        candidates = [
+            str(name)
+            for name in (
+                request.metadata.get("rag_original_model"),
+                *text_fallbacks,
+                routing_decision.selected_model,
+            )
+            if name
+        ]
+        # Request metadata can come from a caller: run only a model the user's
+        # tier is entitled to.
+        allowed = [
+            name
+            for name in dict.fromkeys(candidates)
+            if self._tier_allows_model(name, request)
+        ]
+        if not allowed:
+            raise ValueError("No text-only model is open to the user's tier")
+        model_name = allowed[0]
         response = await self._execute_model_request(
             request, model_name, execution_budget=execution_budget
         )

@@ -1223,3 +1223,45 @@ def test_fallback_context_estimates_tokens_when_routing_reported_none():
         )
         == []
     )
+
+
+# --- I4: the text-only vision retry respects the user's tier ---------------------
+
+
+def _vision_request(user_tier, **metadata):
+    request = _request(user_tier=user_tier, metadata=metadata)
+    request._rag_images = [object()]
+    return request
+
+
+@pytest.mark.asyncio
+async def test_text_only_retry_skips_a_model_the_tier_may_not_use():
+    engine = _chain_engine(_router(_VISION_MODELS), None, chains={})
+    # claude-sonnet-4-6 is enterprise-only; metadata must not grant it.
+    request = _vision_request(
+        UserTier.PREMIUM,
+        rag_original_model="claude-sonnet-4-6",
+        rag_text_fallback_models=["mistral-7b"],
+    )
+
+    _, model_name, _ = await engine._execute_text_only_after_vision_failure(
+        request, SimpleNamespace(selected_model="gpt-5"), execution_budget=None
+    )
+
+    engine.providers["anthropic"].generate_response.assert_not_awaited()
+    assert model_name == "mistral-7b"
+    assert request._rag_images == []
+
+
+@pytest.mark.asyncio
+async def test_text_only_retry_fails_when_no_candidate_fits_the_tier():
+    engine = _chain_engine(_router(_VISION_MODELS), None, chains={})
+    request = _vision_request(UserTier.FREE, rag_original_model="claude-sonnet-4-6")
+
+    with pytest.raises(ValueError, match="tier"):
+        await engine._execute_text_only_after_vision_failure(
+            request, SimpleNamespace(selected_model="gpt-5"), execution_budget=None
+        )
+
+    engine.providers["anthropic"].generate_response.assert_not_awaited()
+    engine.providers["openai"].generate_response.assert_not_awaited()
