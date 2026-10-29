@@ -820,6 +820,85 @@ class ModelRouter:
             )
             return max(1, approximate_token_count(text), len(text) // 4)
 
+    async def refit_routing_decision(
+        self,
+        request: QueryRequest,
+        decision: RoutingDecision,
+        *,
+        required_capability: Optional[str] = None,
+    ) -> RoutingDecision:
+        """Check the decision against the prompt as enriched after routing.
+
+        RAG and web search add context after route_query counted the prompt.
+        The decision keeps its model while the enriched prompt and its output
+        still fit that model's window (and it has ``required_capability``);
+        otherwise the best model the tier may use that fits is chosen, with
+        guardrails failing open as in routing. With none, this raises
+        PromptTooLargeError (or ModelNotEntitledError when the tier has no
+        model with the capability). The returned decision carries the
+        enriched token count, which fallback selection reads.
+        """
+        context = await self._build_query_context(request)
+        token_count = int(context["token_count"])
+        selected = decision.selected_model
+        selected_config = self.models.get(selected)
+        if (
+            selected_config is not None
+            and selected_config.fits_context(token_count, request.max_tokens)
+            and (
+                required_capability is None
+                or self._declares_capability(selected_config, required_capability)
+            )
+        ):
+            if decision.token_count == token_count:
+                return decision
+            return decision.model_copy(update={"token_count": token_count})
+
+        candidates = [
+            name
+            for name, model_config in self.models.items()
+            if required_capability is None
+            or self._declares_capability(model_config, required_capability)
+        ]
+        open_context = self._without_guardrails(context)
+        for scoring_context, bypassed in ((context, False), (open_context, True)):
+            fitting = self._filter_models_for_context(
+                candidates, scoring_context
+            ) or self._filter_models_for_context(
+                candidates, scoring_context, check_capability=False
+            )
+            if not fitting:
+                continue
+            best_model = self._select_best_model(fitting, scoring_context)
+            reason = (
+                f"{decision.routing_reason}; rerouted from {selected} to "
+                f"{best_model}: the enriched prompt (~{token_count} tokens plus "
+                "output) exceeds its context window"
+            )
+            if bypassed:
+                reason = f"{reason}; {GUARDRAIL_BYPASS_NOTE}"
+            logger.info(
+                "Rerouted request %s from %s to %s after enrichment (%d tokens)",
+                request.request_id,
+                selected,
+                best_model,
+                token_count,
+            )
+            return decision.model_copy(
+                update={
+                    "selected_model": best_model,
+                    "token_count": token_count,
+                    "routing_reason": reason,
+                }
+            )
+        self._raise_no_eligible_model(open_context, candidates)
+
+    @staticmethod
+    def _declares_capability(model_config: ModelConfig, capability: str) -> bool:
+        return capability.lower() in {
+            value.lower() for value in model_config.capabilities
+        }
+
     async def select_model_with_capability(
         self,
         request: QueryRequest,
@@ -1469,18 +1548,16 @@ class ModelRouter:
 
     def _models_with_large_context(self, context: Dict[str, Any]) -> List[str]:
         """Return models with enough headroom for large-context requests."""
-        requested_tokens = max(
-            int(context.get("token_count", 0) or 0),
-            int(context.get("max_tokens", 0) or 0),
-        )
-        minimum_context = max(4096, requested_tokens)
+        input_tokens = int(context.get("token_count", 0) or 0)
+        requested_output = context.get("max_tokens", 0)
         matches = [
-            (model_name, model_config.max_tokens)
+            (model_name, model_config.window_tokens())
             for model_name, model_config in self.models.items()
-            if model_config.max_tokens >= minimum_context
+            if model_config.window_tokens()
+            >= max(4096, input_tokens + model_config.output_tokens(requested_output))
         ]
         matches.sort(key=lambda item: item[1], reverse=True)
-        return [model_name for model_name, _max_tokens in matches]
+        return [model_name for model_name, _window in matches]
 
     def _models_sorted_by_cost(self) -> List[str]:
         """Return models ordered from cheapest to most expensive."""
@@ -1568,11 +1645,17 @@ class ModelRouter:
             )
 
         token_count = int(context.get("token_count", 0) or 0)
-        largest_window = max(model.max_tokens for model in entitled_models)
-        if token_count > largest_window:
+        requested_output = context.get("max_tokens", 0)
+        largest_window = max(model.window_tokens() for model in entitled_models)
+        if not any(
+            model.fits_context(token_count, requested_output)
+            for model in entitled_models
+        ):
             raise PromptTooLargeError(
-                f"The prompt needs about {token_count} tokens; the largest model "
-                f"available to the {tier.value} tier accepts {largest_window}",
+                f"The prompt needs about {token_count} tokens plus up to "
+                f"{int(requested_output or 0)} output tokens; the largest model "
+                f"available to the {tier.value} tier accepts {largest_window} "
+                "in all",
                 user_tier=tier.value,
                 token_count=token_count,
                 max_context_tokens=largest_window,
@@ -1626,7 +1709,7 @@ class ModelRouter:
                 continue
             if check_capability and not self._has_capability(model_config, query_type):
                 continue
-            if token_count > model_config.max_tokens:
+            if not model_config.fits_context(token_count, context.get("max_tokens")):
                 continue
             if not self._check_user_access(model_config, user_tier):
                 continue
@@ -1767,11 +1850,14 @@ class ModelRouter:
         # Priority-based scoring
         score += (10 - model_config.priority) * float(self.scoring["priority_weight"])
 
-        # Context length compatibility
-        token_count = context["token_count"]
-        if token_count <= model_config.max_tokens * 0.8:
+        # Context length compatibility: the prompt plus its output
+        needed_tokens = int(context["token_count"] or 0) + model_config.output_tokens(
+            context.get("max_tokens")
+        )
+        window = model_config.window_tokens()
+        if needed_tokens <= window * 0.8:
             score += float(self.scoring["context_fit_full_weight"])
-        elif token_count <= model_config.max_tokens:
+        elif needed_tokens <= window:
             score += float(self.scoring["context_fit_partial_weight"])
 
         score += self._contextual_model_bonus(model_name, context)

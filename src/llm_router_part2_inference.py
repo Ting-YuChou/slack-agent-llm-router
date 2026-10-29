@@ -33,7 +33,11 @@ import openai
 import anthropic
 
 from src.admission import AdmissionRejectedError
-from src.llm_router_part1_router import ModelRouter
+from src.llm_router_part1_router import (
+    ModelNotEntitledError,
+    ModelRouter,
+    PromptTooLargeError,
+)
 from src.provider_scheduler import (
     REQUEST_SHAPED_STATUS_CODES,
     ProviderCapacityScheduler,
@@ -45,6 +49,7 @@ from src.provider_scheduler import provider_error_text as _provider_error_text
 from src.utils.metrics import INFERENCE_METRICS, RAG_METRICS
 from src.utils.schema import (
     AttachmentType,
+    ModelConfig,
     QueryRequest,
     InferenceResponse,
     QueryType,
@@ -2738,6 +2743,13 @@ class InferenceEngine:
                 stage="web_search",
             )
 
+            # Step 4b: RAG and web context came after routing; re-check that
+            # the enriched prompt still fits the model, re-routing if not.
+            routing_decision = await self._fit_enriched_prompt(
+                request, routing_decision, rag_result
+            )
+            model_name = routing_decision.selected_model
+
             # Step 5: Check full-response cache.
             response = await self._get_cached_inference_response(request, model_name)
             if response:
@@ -2801,13 +2813,20 @@ class InferenceEngine:
                     error_type=type(exc).__name__,
                 ).inc()
 
-            # Update router stats; a retrieval outage or a deadline spent
-            # before any model call is not the model's fault.
+            # Update router stats; a retrieval outage, a deadline spent before
+            # any model call or an enriched prompt no model fits is not the
+            # model's fault.
             if (
                 "routing_decision" in locals()
                 and not getattr(exc, "_attempt_recorded", False)
                 and not isinstance(
-                    exc, (RetrievalUnavailableError, RequestStageDeadlineError)
+                    exc,
+                    (
+                        RetrievalUnavailableError,
+                        RequestStageDeadlineError,
+                        PromptTooLargeError,
+                        ModelNotEntitledError,
+                    ),
                 )
             ):
                 self.router.update_model_stats(
@@ -3285,6 +3304,40 @@ class InferenceEngine:
             RAG_METRICS.vision_outcomes.labels("selected_model").inc()
         request._rag_images = images
         return routing_decision
+
+    async def _fit_enriched_prompt(
+        self,
+        request: QueryRequest,
+        routing_decision: Any,
+        rag_result: Optional[SimpleNamespace],
+    ) -> Any:
+        """The routing decision re-checked against the enriched prompt.
+
+        Raises PromptTooLargeError (a 413) when no model the tier may use fits.
+        A vision request that no vision model fits is answered from the text.
+        """
+        if not isinstance(self.router, ModelRouter) or not hasattr(
+            routing_decision, "model_copy"
+        ):
+            return routing_decision  # A stub router has no windows to check.
+        if not getattr(request, "_rag_images", []):
+            return await self.router.refit_routing_decision(request, routing_decision)
+        try:
+            return await self.router.refit_routing_decision(
+                request, routing_decision, required_capability="vision"
+            )
+        except (PromptTooLargeError, ModelNotEntitledError):
+            request._rag_images = []
+            request.metadata = dict(request.metadata or {})
+            request.metadata["rag_warnings"] = [
+                *request.metadata.get("rag_warnings", []),
+                "rag_vision_fallback: no vision model fits the enriched prompt; "
+                "used text only",
+            ]
+            if rag_result is not None:
+                _merge_rag_warnings(rag_result, request)
+            RAG_METRICS.vision_outcomes.labels("text_only_context_window").inc()
+            return await self.router.refit_routing_decision(request, routing_decision)
 
     def _build_capability_routing_decision(
         self, routing_decision: Any, original_model: str, selected_model: str
@@ -4113,6 +4166,7 @@ class InferenceEngine:
         provider = self._get_provider_for_model(model_name)
         if not provider:
             raise ValueError(f"No provider available for model: {model_name}")
+        request = self._request_within_output_cap(request, model_name)
 
         model_info = self.router.get_model_info(model_name) or {}
         provider_name = (
@@ -4149,6 +4203,40 @@ class InferenceEngine:
                 reserve_attempts=reserve_attempts,
             ),
         )
+
+    def _request_within_output_cap(
+        self, request: QueryRequest, model_name: str
+    ) -> QueryRequest:
+        """The request with max_tokens clamped to the model's max_output_tokens.
+
+        A copy, so a fallback to another model still sees the caller's value.
+        """
+        model_config = self._router_model_config(model_name)
+        if model_config is None:
+            return request
+        output_tokens = model_config.output_tokens(request.max_tokens)
+        if output_tokens >= request.max_tokens:
+            return request
+        return request.model_copy(update={"max_tokens": max(1, output_tokens)})
+
+    def _router_model_config(self, model_name: str) -> Optional[ModelConfig]:
+        models = getattr(self.router, "models", None)
+        model_config = models.get(model_name) if isinstance(models, dict) else None
+        return model_config if isinstance(model_config, ModelConfig) else None
+
+    def _fits_enriched_window(self, model_name: str, context: Dict[str, Any]) -> bool:
+        """Whether a router model fits; listed before enrichment, it may not."""
+        model_config = self._router_model_config(model_name)
+        return model_config is None or self._fits_context_window(model_config, context)
+
+    @staticmethod
+    def _fits_context_window(model_config: Any, context: Dict[str, Any]) -> bool:
+        """Whether the request's prompt and output fit a model's window."""
+        if isinstance(model_config, ModelConfig):
+            return model_config.fits_context(
+                context["token_count"], context.get("max_tokens")
+            )
+        return int(context["token_count"]) <= int(model_config.max_tokens)
 
     def _estimate_provider_admission_input_tokens(
         self, request: QueryRequest, model_name: Optional[str] = None
@@ -4249,6 +4337,7 @@ class InferenceEngine:
                     and not self._ruled_out_by_policy(
                         model_name, self._configured_provider_name(model_name), context
                     )
+                    and self._fits_enriched_window(model_name, context)
                 ]
             ranked = []
             for model_name, model_config in getattr(self.router, "models", {}).items():
@@ -4264,7 +4353,7 @@ class InferenceEngine:
                     continue
                 if model_config.provider not in self.providers:
                     continue
-                if context["token_count"] > model_config.max_tokens:
+                if not self._fits_context_window(model_config, context):
                     continue
                 if not self.router._check_user_access(
                     model_config, context["user_tier"]
@@ -4493,7 +4582,7 @@ class InferenceEngine:
             return False
         if self._ruled_out_by_policy(model_name, model_config.provider, context):
             return False
-        if context["token_count"] > model_config.max_tokens:
+        if not self._fits_context_window(model_config, context):
             return False
         if hasattr(self.router, "_has_capability") and not self.router._has_capability(
             model_config,
