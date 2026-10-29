@@ -672,6 +672,7 @@ class ModelRouter:
         """
         token_count = self._fallback_token_estimate(request)
         policy_context = await self._routing_error_policy_context(request)
+        routing_features = self._routing_error_features(request, token_count)
         context: Dict[str, Any] = {
             "query_type": QueryType.GENERAL.value,
             "token_count": token_count,
@@ -682,19 +683,27 @@ class ModelRouter:
         for key in (*GUARDRAIL_CONTEXT_KEYS, "warn_models", "warn_providers"):
             context[key] = list(policy_context.get(key) or [])
 
-        eligible: Optional[EligibleModels]
+        routing_reason = "Fallback due to routing error"
         try:
             selected_model, eligible = self._default_or_best_model(context)
+            if eligible is not None:
+                routing_reason = eligible.reason(routing_reason)
         except (ModelNotEntitledError, PromptTooLargeError):
             raise
         except Exception:
-            # Scoring may be what failed; _eligible_models only filters.
-            logger.exception("Model scoring failed after a routing error")
-            eligible = self._eligible_models(context)
-            selected_model = eligible.models[0]
-        routing_reason = "Fallback due to routing error"
-        if eligible is not None:
-            routing_reason = eligible.reason(routing_reason)
+            # Scoring may be what failed. The last resort only filters by tier
+            # and context window, with every guardrail and warn list cleared,
+            # so no second error can escape.
+            logger.exception("Model selection failed after a routing error")
+            last_resort_context = {
+                **self._without_guardrails(context),
+                "warn_models": [],
+                "warn_providers": [],
+            }
+            selected_model = self._eligible_models(last_resort_context).models[0]
+            routing_reason = (
+                f"{routing_reason} (model selection failed; guardrails ignored)"
+            )
 
         return RoutingDecision(
             selected_model=selected_model,
@@ -704,9 +713,15 @@ class ModelRouter:
             routing_reason=routing_reason,
             routing_time_ms=int((time.time() - start_time) * 1000),
             confidence=0.0,
+            policy_source=self._combine_policy_sources(
+                policy_context.get("policy_source", "none"), routing_features
+            ),
+            hint_reason=policy_context.get("hint_reason"),
             routing_strategy=self.routing_strategy,
             user_tier=self._entitlement_tier(request.user_tier),
-            features=self._routing_error_features(request, token_count),
+            features=self._decision_features(
+                {**routing_features, "classification_confidence": 0.0}
+            ),
         )
 
     async def _routing_error_policy_context(
@@ -732,20 +747,19 @@ class ModelRouter:
 
     def _routing_error_features(
         self, request: QueryRequest, token_count: int
-    ) -> RoutingDecisionFeatures:
-        """Best-effort features after a routing error, with zero confidence."""
+    ) -> Dict[str, Any]:
+        """Best-effort request features after a routing error (none if they fail)."""
         try:
             # An empty query_type lets the feature builder infer one from the
             # text, since the classifier may be what failed.
-            features = build_routing_features(
+            return build_routing_features(
                 self._build_routing_feature_payload(
                     request=request, query_type="", token_count=token_count
                 )
             )
         except Exception:
             logger.exception("Routing features failed after a routing error")
-            features = {}
-        return self._decision_features({**features, "classification_confidence": 0.0})
+            return {}
 
     def _fallback_token_estimate(self, request: QueryRequest) -> int:
         """The routing token estimate, or a word count if that fails too."""
@@ -1071,12 +1085,15 @@ class ModelRouter:
     async def _get_policy_context(self, request: QueryRequest) -> Dict[str, Any]:
         """Load request/user-level routing hints from the shared policy cache."""
         metadata = request.metadata or {}
-        metadata_preferred_models = list(metadata.get("preferred_models", []) or [])
-        metadata_avoid_models = list(metadata.get("avoid_models", []) or [])
-        metadata_avoid_providers = [
-            str(provider).lower()
-            for provider in list(metadata.get("avoid_providers", []) or [])
-        ]
+        metadata_preferred_models = self._name_entries(
+            metadata.get("preferred_models"), "metadata.preferred_models"
+        )
+        metadata_avoid_models = self._name_entries(
+            metadata.get("avoid_models"), "metadata.avoid_models"
+        )
+        metadata_avoid_providers = self._name_entries(
+            metadata.get("avoid_providers"), "metadata.avoid_providers", lowercase=True
+        )
 
         if not self.policy_cache:
             return {
@@ -1138,28 +1155,38 @@ class ModelRouter:
                 f"Failed to load routing policy for request {request.request_id}: {e}"
             )
             policy = {}
+        if not isinstance(policy, dict):
+            logger.warning(
+                "Ignoring routing policy for request %s: expected a mapping, got %s",
+                request.request_id,
+                type(policy).__name__,
+            )
+            policy = {}
 
-        combined_preferred_models = []
-        for model_name in metadata_preferred_models + list(
-            policy.get("preferred_models", []) or []
-        ):
-            if model_name not in combined_preferred_models:
-                combined_preferred_models.append(model_name)
-
-        combined_avoid_models = []
-        for model_name in metadata_avoid_models + list(
-            policy.get("avoid_models", []) or []
-        ):
-            if model_name not in combined_avoid_models:
-                combined_avoid_models.append(model_name)
-
-        combined_avoid_providers = []
-        for provider_name in metadata_avoid_providers + [
-            str(provider).lower()
-            for provider in list(policy.get("avoid_providers", []) or [])
-        ]:
-            if provider_name not in combined_avoid_providers:
-                combined_avoid_providers.append(provider_name)
+        combined_preferred_models = list(
+            dict.fromkeys(
+                metadata_preferred_models
+                + self._name_entries(
+                    policy.get("preferred_models"), "policy.preferred_models"
+                )
+            )
+        )
+        combined_avoid_models = list(
+            dict.fromkeys(
+                metadata_avoid_models
+                + self._name_entries(policy.get("avoid_models"), "policy.avoid_models")
+            )
+        )
+        combined_avoid_providers = list(
+            dict.fromkeys(
+                metadata_avoid_providers
+                + self._name_entries(
+                    policy.get("avoid_providers"),
+                    "policy.avoid_providers",
+                    lowercase=True,
+                )
+            )
+        )
 
         policy_source = policy.get("policy_source", "none")
         if metadata_preferred_models:
@@ -1175,10 +1202,18 @@ class ModelRouter:
             "preferred_models": combined_preferred_models,
             "avoid_models": combined_avoid_models,
             "avoid_providers": combined_avoid_providers,
-            "blocked_models": list(policy.get("blocked_models", []) or []),
-            "blocked_providers": list(policy.get("blocked_providers", []) or []),
-            "warn_models": list(policy.get("warn_models", []) or []),
-            "warn_providers": list(policy.get("warn_providers", []) or []),
+            "blocked_models": self._name_entries(
+                policy.get("blocked_models"), "policy.blocked_models"
+            ),
+            "blocked_providers": self._name_entries(
+                policy.get("blocked_providers"), "policy.blocked_providers"
+            ),
+            "warn_models": self._name_entries(
+                policy.get("warn_models"), "policy.warn_models"
+            ),
+            "warn_providers": self._name_entries(
+                policy.get("warn_providers"), "policy.warn_providers"
+            ),
             "guardrail_reasons": dict(policy.get("guardrail_reasons", {}) or {}),
             "hint_reason": policy.get("hint_reason")
             or (
@@ -1203,6 +1238,40 @@ class ModelRouter:
                 policy.get("burst_protection_active", False)
             ),
         }
+
+    def _name_entries(
+        self, value: Any, field_name: str, *, lowercase: bool = False
+    ) -> List[str]:
+        """The non-empty string entries of a model or provider list.
+
+        These lists come from request metadata and the policy cache. A single
+        string counts as one entry; anything else that is not a name is logged
+        and dropped, so a malformed entry cannot break routing.
+        """
+        if not value:
+            return []
+        items = [value] if isinstance(value, str) else value
+        if not isinstance(items, (list, tuple, set)):
+            logger.warning(
+                "Ignoring %s: expected a list of names, got %s",
+                field_name,
+                type(value).__name__,
+            )
+            return []
+        entries: List[str] = []
+        dropped = 0
+        for item in items:
+            if not isinstance(item, str) or not item.strip():
+                dropped += 1
+                continue
+            entry = item.lower() if lowercase else item
+            if entry not in entries:
+                entries.append(entry)
+        if dropped:
+            logger.warning(
+                "Ignoring %d entries of %s that are not names", dropped, field_name
+            )
+        return entries
 
     async def _intelligent_routing(self, context: Dict[str, Any]) -> ModelSelection:
         """Intelligent routing based on query analysis and rules"""

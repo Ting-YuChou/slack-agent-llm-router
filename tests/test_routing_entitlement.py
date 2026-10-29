@@ -348,6 +348,7 @@ async def test_routing_error_respects_policy_guardrails():
     assert "routing error" in decision.routing_reason.lower()
     assert not _bypasses_guardrails(decision)
     assert decision.token_count == 321
+    assert decision.policy_source == "user"
 
 
 @pytest.mark.asyncio
@@ -381,6 +382,60 @@ async def test_routing_error_without_policy_context_still_routes():
 
     assert decision.selected_model == "gpt-5"
     assert "routing error" in decision.routing_reason.lower()
+    assert decision.token_count == 321
+    assert decision.policy_source == "none"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("metadata", "policy"),
+    [
+        pytest.param({"avoid_models": [["gpt-5"]]}, None, id="metadata-avoid-list"),
+        pytest.param(
+            {"preferred_models": [{"model": "gpt-5"}], "avoid_providers": [7]},
+            None,
+            id="metadata-preferred-dict",
+        ),
+        pytest.param(
+            {}, {"blocked_models": [{"model": "gpt-5"}]}, id="policy-blocked-dict"
+        ),
+        pytest.param(
+            {},
+            {"warn_models": [["gpt-5"]], "avoid_providers": [None, ""]},
+            id="policy-warn-list",
+        ),
+    ],
+)
+async def test_malformed_guardrail_entries_are_dropped(metadata, policy):
+    router = _router_from_checked_in_config("config.compose.yaml")
+    if policy is not None:
+        _with_policy(router, policy)
+
+    decision = await router.route_query(_request("enterprise", metadata=metadata))
+
+    assert decision.selected_model in {"claude-sonnet-4-6", "gpt-5"}
+    assert "routing error" not in decision.routing_reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_routing_error_last_resort_ignores_guardrails():
+    # Scoring fails on both paths; the last resort only filters by tier and
+    # context window, so nothing else can raise.
+    router = _with_policy(
+        _router_from_checked_in_config("config.compose.yaml", token_count=321),
+        {"blocked_providers": ["openai"], "warn_models": ["claude-sonnet-4-6"]},
+    )
+
+    def broken_score(_model_name, _context):
+        raise RuntimeError("scoring exploded")
+
+    router._score_model = broken_score
+
+    decision = await router.route_query(_request("enterprise"))
+
+    assert decision.selected_model in {"claude-sonnet-4-6", "gpt-5"}
+    assert "routing error" in decision.routing_reason.lower()
+    assert "guardrails ignored" in decision.routing_reason.lower()
     assert decision.token_count == 321
 
 
