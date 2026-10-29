@@ -434,6 +434,10 @@ class ProviderCapacityScheduler:
         self.min_attempt_window_seconds = max(
             0.0, float(1.0 if min_window is None else min_window)
         )
+        circuit_ratio = self.config.get("circuit_timeout_min_window_ratio", 0.5)
+        self.circuit_timeout_min_window_ratio = min(
+            max(float(0.5 if circuit_ratio is None else circuit_ratio), 0.0), 1.0
+        )
         self.key_prefix = str(self.config.get("key_prefix", "provider_scheduler"))
         self.admission_controller = admission_controller
         self.redis_client = redis_client
@@ -491,8 +495,9 @@ class ProviderCapacityScheduler:
         An attempt (or retry) whose window would be shorter than
         min_attempt_window_seconds (capped at the provider timeout) is not
         started. A timeout counts against the circuit only when the attempt
-        had its whole provider timeout: one cut short by the deadline or the
-        reserve says nothing about the provider.
+        had at least circuit_timeout_min_window_ratio of the provider
+        timeout: one left a sliver by the deadline or the reserve (a slow
+        RAG step, say) says nothing about the provider.
         """
         if not self.enabled:
             self._record_decision(provider, model_name, "allowed", "disabled")
@@ -534,7 +539,9 @@ class ProviderCapacityScheduler:
                 # the fallback) for a provider call to be worth starting.
                 raise asyncio.TimeoutError("request execution deadline exceeded")
             window_cut_short = (
-                not attempt_timeout_seconds or attempt_timeout < attempt_timeout_seconds
+                not attempt_timeout_seconds
+                or attempt_timeout
+                < self.circuit_timeout_min_window_ratio * attempt_timeout_seconds
             )
             lease: Optional[SchedulerLease] = None
             response = None

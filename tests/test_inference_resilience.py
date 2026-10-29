@@ -139,6 +139,7 @@ def _mock_engine(providers, *, scheduler, admission=None):
 def test_scheduler_config_reserves_thirty_percent_for_fallback_by_default():
     assert ProviderSchedulerConfig().fallback_reserve_ratio == 0.3
     assert ProviderSchedulerConfig().min_attempt_window_seconds == 1.0
+    assert ProviderSchedulerConfig().circuit_timeout_min_window_ratio == 0.5
     with pytest.raises(ValidationError):
         ProviderSchedulerConfig(fallback_reserve_ratio=1.0)
 
@@ -240,11 +241,11 @@ async def test_hung_primary_leaves_time_for_fallback_within_deadline():
     [
         # The attempt had its whole provider timeout: a real hang.
         pytest.param(0.05, 1, id="full-provider-timeout"),
-        # The fallback reserve cut the attempt short: says nothing about it.
+        # The reserve left a sliver of a 60 s timeout: says nothing about it.
         pytest.param(60, 0, id="window-cut-by-reserve"),
     ],
 )
-async def test_hung_primary_counts_against_its_circuit_only_after_a_full_timeout(
+async def test_hung_primary_counts_against_its_circuit_only_with_a_long_window(
     provider_timeout, expected_failures
 ):
     engine = _mock_engine(
@@ -492,6 +493,50 @@ async def test_slow_rag_does_not_open_healthy_providers_circuits():
     ):
         state = await engine.scheduler._read_circuit_state(provider, model)
         assert state.get("failure_count", 0) == 0, provider
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rag_share", "expected_failures"),
+    [
+        # Window 0.7 x the deadline = 0.7 x the provider timeout: a real hang.
+        pytest.param(0.0, 1, id="no-rag"),
+        # Window 0.7 x 0.4 = 0.28 x the provider timeout: says nothing.
+        pytest.param(0.6, 0, id="rag-used-60-percent"),
+    ],
+)
+async def test_hung_gpt5_trips_its_circuit_under_shipped_timeouts(
+    rag_share, expected_failures
+):
+    # The shipped numbers, 100 times smaller: 60 s provider timeout and
+    # deadline, 0.3 reserve, 1 s minimum window.
+    scale = 0.01
+    scheduler = _shipped_scheduler(
+        request_deadline_seconds=60 * scale, min_attempt_window_seconds=1 * scale
+    )
+    assert scheduler["fallback_reserve_ratio"] == 0.3
+    assert scheduler["circuit_timeout_min_window_ratio"] == 0.5
+    engine = _chain_engine(_router(), None, scheduler=scheduler, admission=_Admission())
+    engine.providers = {
+        "openai": _TimedProvider("openai", None, timeout=60 * scale),
+        "anthropic": _TimedProvider("anthropic", 0, timeout=60 * scale),
+    }
+
+    async def rag(*_args):
+        await asyncio.sleep(60 * scale * rag_share)
+        return None
+
+    engine._run_rag_if_needed = rag
+
+    response = await asyncio.wait_for(
+        engine.process_query(_request(**_ENTERPRISE)), timeout=3
+    )
+
+    assert response.error is None
+    assert response.model_name == "claude-sonnet-4-6"
+    assert response.fallback_from_model == "gpt-5"
+    state = await engine.scheduler._read_circuit_state("openai", "gpt-5")
+    assert state.get("failure_count", 0) == expected_failures
 
 
 @pytest.mark.asyncio
@@ -1084,6 +1129,8 @@ def test_shipped_configs_chain_gpt5_and_claude_both_ways(config_name):
     assert config.inference.fallback.chains == _CHAINS
     assert config.inference.scheduler.fallback_reserve_ratio == 0.3
     assert config.inference.scheduler.min_attempt_window_seconds == 1.0
+    raw = yaml.safe_load(path.read_text())["inference"]["scheduler"]
+    assert raw["circuit_timeout_min_window_ratio"] == 0.5
     for model, chain in config.inference.fallback.chains.items():
         assert {model, *chain} <= set(config.router.models)
 
