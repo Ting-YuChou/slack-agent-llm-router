@@ -2683,6 +2683,9 @@ class InferenceEngine:
             if "scheduler" in self.config
             else None
         )
+        # Models whose provider was called, kept even if the deadline cancels
+        # the fallback chain, so a failure reports the calls it made.
+        started_calls: List[str] = []
 
         try:
             # Step 1: Route query to appropriate model
@@ -2755,6 +2758,7 @@ class InferenceEngine:
                 request,
                 routing_decision,
                 execution_budget=execution_budget,
+                started_calls=started_calls,
             )
             response.compressed_context = compressed_context
             self._attach_rag_result(response, rag_result)
@@ -2838,6 +2842,7 @@ class InferenceEngine:
                 retry_after_seconds=_retry_after_seconds(primary_exc),
                 provider_request_id=_exception_provider_request_id(primary_exc),
                 finish_reason="error",
+                attempts=len(set(started_calls)),
             )
             # The caller keeps the "error" provider sentinel; analytics get the
             # failed model's real provider so outages count against it.
@@ -3625,10 +3630,15 @@ class InferenceEngine:
         request: QueryRequest,
         routing_decision: Any,
         execution_budget: Optional[RequestExecutionBudget] = None,
+        started_calls: Optional[List[str]] = None,
     ) -> Tuple[InferenceResponse, str, Any]:
+        """Generate with fallbacks; ``started_calls`` collects the models called."""
         if execution_budget is None:
             return await self._generate_response_with_fallback_unbounded(
-                request, routing_decision, execution_budget=None
+                request,
+                routing_decision,
+                execution_budget=None,
+                started_calls=started_calls,
             )
         if execution_budget.remaining_seconds <= 0:
             # Routing, compression, image prep or the cache lookup used the
@@ -3639,7 +3649,10 @@ class InferenceEngine:
         execution_budget.ensure_available()
         return await asyncio.wait_for(
             self._generate_response_with_fallback_unbounded(
-                request, routing_decision, execution_budget=execution_budget
+                request,
+                routing_decision,
+                execution_budget=execution_budget,
+                started_calls=started_calls,
             ),
             timeout=execution_budget.remaining_seconds,
         )
@@ -3649,6 +3662,7 @@ class InferenceEngine:
         request: QueryRequest,
         routing_decision: Any,
         execution_budget: Optional[RequestExecutionBudget] = None,
+        started_calls: Optional[List[str]] = None,
     ) -> Tuple[InferenceResponse, str, Any]:
         """Generate a response and fall back to local models when cloud models fail.
 
@@ -3658,7 +3672,11 @@ class InferenceEngine:
         primary_failures: List[BaseException] = []
         try:
             return await self._generate_response_with_fallback_attempts(
-                request, routing_decision, execution_budget, primary_failures
+                request,
+                routing_decision,
+                execution_budget,
+                primary_failures,
+                [] if started_calls is None else started_calls,
             )
         except BaseException as exc:
             if primary_failures and exc is not primary_failures[0]:
@@ -3671,6 +3689,7 @@ class InferenceEngine:
         routing_decision: Any,
         execution_budget: Optional[RequestExecutionBudget],
         primary_failures: List[BaseException],
+        started_calls: List[str],
     ) -> Tuple[InferenceResponse, str, Any]:
         primary_model = routing_decision.selected_model
         primary_started_at = time.time()
@@ -3686,7 +3705,6 @@ class InferenceEngine:
         ):
             fallback_reserve_seconds = execution_budget.fallback_reserve_seconds()
             reserve_attempts = 1
-        started_calls: List[str] = []
 
         try:
             response = await self._execute_model_request(
