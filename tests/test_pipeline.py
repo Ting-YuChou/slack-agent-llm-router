@@ -38,6 +38,38 @@ HOURS_WINDOWED_DASHBOARD_READS = [
     method_name for method_name, _ in DASHBOARD_READS_WITH_EMPTY_RESULT
 ]
 UINT32_MAX = 2**32 - 1
+TIMESTAMPED_CONSUMERS = [
+    pytest.param(
+        "queries",
+        "_consume_queries",
+        "test-queries",
+        {
+            "query_id": "query-1",
+            "user_id": "user-1",
+            "user_tier": "premium",
+            "query_text": "hello",
+            "query_type": "general",
+            "selected_model": "gpt-5",
+            "token_count_input": 1,
+            "token_count_output": 2,
+            "latency_ms": 10,
+            "cost_usd": 0.01,
+            "status": "success",
+        },
+        id="queries",
+    ),
+    pytest.param(
+        "metrics",
+        "_consume_metrics",
+        "test-metrics",
+        {
+            "service": "router",
+            "metric_name": "latency_ms",
+            "metric_value": 12.5,
+        },
+        id="metrics",
+    ),
+]
 
 
 @pytest.fixture
@@ -1196,38 +1228,7 @@ class TestKafkaConsumerManager:
         ids=["naive", "offset"],
     )
     @pytest.mark.parametrize(
-        "batch_key, consume_method, topic, payload",
-        [
-            (
-                "queries",
-                "_consume_queries",
-                "test-queries",
-                {
-                    "query_id": "query-1",
-                    "user_id": "user-1",
-                    "user_tier": "premium",
-                    "query_text": "hello",
-                    "query_type": "general",
-                    "selected_model": "gpt-5",
-                    "token_count_input": 1,
-                    "token_count_output": 2,
-                    "latency_ms": 10,
-                    "cost_usd": 0.01,
-                    "status": "success",
-                },
-            ),
-            (
-                "metrics",
-                "_consume_metrics",
-                "test-metrics",
-                {
-                    "service": "router",
-                    "metric_name": "latency_ms",
-                    "metric_value": 12.5,
-                },
-            ),
-        ],
-        ids=["queries", "metrics"],
+        "batch_key, consume_method, topic, payload", TIMESTAMPED_CONSUMERS
     )
     @pytest.mark.asyncio
     async def test_consumed_timestamps_are_stored_as_utc(
@@ -1253,6 +1254,46 @@ class TestKafkaConsumerManager:
         assert stored.tzinfo is not None
         assert stored.utcoffset() == timedelta(0)
         assert stored == datetime(2026, 10, 28, 7, 50, tzinfo=timezone.utc)
+
+    @pytest.mark.parametrize(
+        "raw_timestamp",
+        ["garbage", 1730000000, None, "0001-01-01T00:00:00+01:00"],
+        ids=["garbage", "epoch-int", "null", "out-of-range"],
+    )
+    @pytest.mark.parametrize(
+        "batch_key, consume_method, topic, payload", TIMESTAMPED_CONSUMERS
+    )
+    @pytest.mark.asyncio
+    async def test_consumed_invalid_timestamps_go_to_dlq_not_batch(
+        self,
+        pipeline_config,
+        batch_key,
+        consume_method,
+        topic,
+        payload,
+        raw_timestamp,
+    ):
+        consumer = KafkaConsumerManager(pipeline_config, MagicMock())
+        consumer.dlq_producer = AsyncMock()
+        message = SimpleNamespace(
+            value=json.dumps({**payload, "timestamp": raw_timestamp}).encode("utf-8"),
+            key=b"bad-key",
+            topic=topic,
+            partition=0,
+            offset=3,
+        )
+        kafka_consumer = AsyncMessageConsumer([message])
+        consumer.consumers[batch_key] = kafka_consumer
+
+        await getattr(consumer, consume_method)(kafka_consumer)
+
+        assert consumer.batch_processors[batch_key] == []
+        dlq_kwargs = consumer.dlq_producer.send_and_wait.await_args.kwargs
+        assert dlq_kwargs["topic"] == f"{topic}.dlq"
+        assert dlq_kwargs["key"] == f"{topic}:0:3"
+        assert dlq_kwargs["value"]["failure_stage"] == "consume"
+        assert dlq_kwargs["value"]["source_offset"] == 3
+        kafka_consumer.commit.assert_awaited_once_with({TopicPartition(topic, 0): 4})
 
     @pytest.mark.asyncio
     async def test_flush_pending_batches_commits_offsets_after_clickhouse_write(

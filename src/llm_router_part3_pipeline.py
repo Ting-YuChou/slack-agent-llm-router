@@ -52,9 +52,16 @@ def _enum_value(value: Any) -> Any:
 
 
 def _parse_datetime(
-    value: Optional[Any], *, default: Optional[datetime] = None
+    value: Optional[Any],
+    *,
+    default: Optional[datetime] = None,
+    strict: bool = False,
 ) -> datetime:
-    """Parse platform timestamps into aware UTC datetimes; naive values are UTC."""
+    """Parse platform timestamps into aware UTC datetimes; naive values are UTC.
+
+    Unparseable or out-of-range values fall back to ``default`` (or the current
+    time), or raise ``ValueError`` when ``strict`` is set.
+    """
     parsed: Optional[datetime] = None
     if isinstance(value, datetime):
         parsed = value
@@ -72,6 +79,8 @@ def _parse_datetime(
         except (OverflowError, ValueError):
             logger.debug(f"Datetime value is out of range in UTC: {value}")
 
+    if strict:
+        raise ValueError(f"Invalid timestamp: {value!r}")
     return default or datetime.now(timezone.utc)
 
 
@@ -1940,7 +1949,7 @@ class KafkaConsumerManager:
                     data = self._decode_message_value(message)
                     query_log = QueryLogEntry(
                         query_id=data["query_id"],
-                        timestamp=_parse_datetime(data["timestamp"]),
+                        timestamp=_parse_datetime(data["timestamp"], strict=True),
                         user_id=data["user_id"],
                         user_tier=data["user_tier"],
                         query_text=data["query_text"],
@@ -2010,7 +2019,7 @@ class KafkaConsumerManager:
                 try:
                     data = self._decode_message_value(message)
                     metric_entry = MetricEntry(
-                        timestamp=_parse_datetime(data["timestamp"]),
+                        timestamp=_parse_datetime(data["timestamp"], strict=True),
                         service=data["service"],
                         metric_name=data["metric_name"],
                         metric_value=data["metric_value"],
