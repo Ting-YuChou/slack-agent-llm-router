@@ -658,17 +658,20 @@ class ModelRouter:
             raise
         except Exception:
             logger.exception("Routing failed")
-            return self._routing_error_decision(request, start_time)
+            return await self._routing_error_decision(request, start_time)
 
-    def _routing_error_decision(
+    async def _routing_error_decision(
         self, request: QueryRequest, start_time: float
     ) -> RoutingDecision:
-        """Pick a model without classification or policy after a routing error.
+        """Route as _fallback_routing does, without classification, after an error.
 
-        Tier and context-window checks still apply, and the token count stays an
-        estimate so the inference fallback limits keep working.
+        The query counts as general. Policy guardrails apply when the policy
+        context can still be fetched, with the usual fail-open; tier and
+        context-window checks always apply. The token count stays an estimate
+        so the inference fallback limits keep working.
         """
         token_count = self._fallback_token_estimate(request)
+        policy_context = await self._routing_error_policy_context(request)
         context: Dict[str, Any] = {
             "query_type": QueryType.GENERAL.value,
             "token_count": token_count,
@@ -676,32 +679,45 @@ class ModelRouter:
             "max_tokens": request.max_tokens,
             "has_attachments": bool(request.attachments),
         }
-        eligible = self._filter_models_for_context(
-            list(self.models), context, check_capability=False
-        )
-        if not eligible:
-            self._raise_no_eligible_model(context)
-        if self.default_model in eligible:
-            selected_model = self.default_model
-        else:
-            try:
-                selected_model = self._select_best_model(eligible, context)
-            except Exception:
-                logger.exception("Model scoring failed after a routing error")
-                selected_model = eligible[0]
+        for key in (*GUARDRAIL_CONTEXT_KEYS, "warn_models", "warn_providers"):
+            context[key] = list(policy_context.get(key) or [])
+
+        eligible: Optional[EligibleModels]
+        try:
+            selected_model, eligible = self._default_or_best_model(context)
+        except (ModelNotEntitledError, PromptTooLargeError):
+            raise
+        except Exception:
+            # Scoring may be what failed; _eligible_models only filters.
+            logger.exception("Model scoring failed after a routing error")
+            eligible = self._eligible_models(context)
+            selected_model = eligible.models[0]
+        routing_reason = "Fallback due to routing error"
+        if eligible is not None:
+            routing_reason = eligible.reason(routing_reason)
 
         return RoutingDecision(
             selected_model=selected_model,
             query_type=QueryType.GENERAL,
             token_count=token_count,
             estimated_cost=0.0,
-            routing_reason="Fallback due to routing error",
+            routing_reason=routing_reason,
             routing_time_ms=int((time.time() - start_time) * 1000),
             confidence=0.0,
             routing_strategy=self.routing_strategy,
             user_tier=self._entitlement_tier(request.user_tier),
             features=self._routing_error_features(request, token_count),
         )
+
+    async def _routing_error_policy_context(
+        self, request: QueryRequest
+    ) -> Dict[str, Any]:
+        """The policy context, or none if fetching it fails (it may be what failed)."""
+        try:
+            return await self._get_policy_context(request)
+        except Exception:
+            logger.exception("Routing policy unavailable after a routing error")
+            return {}
 
     def _decision_features(self, context: Dict[str, Any]) -> RoutingDecisionFeatures:
         """The request features that checks after routing read from the decision."""
@@ -1733,20 +1749,33 @@ class ModelRouter:
 
     def _fallback_routing(self, context: Dict[str, Any]) -> ModelSelection:
         """Fallback to the default model, or the best model the request may use"""
-        if self._filter_models_for_context(
-            [self.default_model], context, check_capability=False
-        ):
+        selected_model, eligible = self._default_or_best_model(context)
+        if eligible is None:
             return ModelSelection(
-                model_name=self.default_model,
+                model_name=selected_model,
                 confidence=0.4,
                 reason="Fallback routing",
             )
-        eligible = self._eligible_models(context)
         return ModelSelection(
-            model_name=self._select_best_model(eligible.models, eligible.context),
+            model_name=selected_model,
             confidence=0.4,
             reason=eligible.reason("Fallback routing (default model not eligible)"),
         )
+
+    def _default_or_best_model(
+        self, context: Dict[str, Any]
+    ) -> Tuple[str, Optional[EligibleModels]]:
+        """The default model if the request may use it, else the best eligible one.
+
+        Returns the eligibility when the default was not used, so the caller
+        can note a guardrail bypass in its reason.
+        """
+        if self._filter_models_for_context(
+            [self.default_model], context, check_capability=False
+        ):
+            return self.default_model, None
+        eligible = self._eligible_models(context)
+        return self._select_best_model(eligible.models, eligible.context), eligible
 
     def _estimate_cost(
         self, selection: ModelSelection, context: Dict[str, Any]

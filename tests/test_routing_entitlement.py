@@ -323,6 +323,67 @@ async def test_non_intelligent_strategies_fail_open_on_guardrails(
     assert _bypasses_guardrails(decision)
 
 
+def _break_classifier(router):
+    def broken_classifier(_query):
+        raise RuntimeError("classifier exploded")
+
+    router.classifier.classify_query = broken_classifier
+    return router
+
+
+@pytest.mark.asyncio
+async def test_routing_error_respects_policy_guardrails():
+    # openai is blocked, so the default gpt-5 is out; Sonnet is open to
+    # enterprise and unblocked.
+    router = _break_classifier(
+        _with_policy(
+            _router_from_checked_in_config("config.compose.yaml", token_count=321),
+            {"blocked_providers": ["openai"]},
+        )
+    )
+
+    decision = await router.route_query(_request("enterprise"))
+
+    assert decision.selected_model == "claude-sonnet-4-6"
+    assert "routing error" in decision.routing_reason.lower()
+    assert not _bypasses_guardrails(decision)
+    assert decision.token_count == 321
+
+
+@pytest.mark.asyncio
+async def test_routing_error_fails_open_when_guardrails_block_the_tier():
+    router = _break_classifier(
+        _with_policy(
+            _router_from_checked_in_config("config.compose.yaml", token_count=321),
+            {"blocked_providers": ["openai"]},
+        )
+    )
+
+    decision = await router.route_query(_request("free"))
+
+    assert decision.selected_model == "gpt-5"
+    assert "routing error" in decision.routing_reason.lower()
+    assert _bypasses_guardrails(decision)
+    assert decision.token_count == 321
+
+
+@pytest.mark.asyncio
+async def test_routing_error_without_policy_context_still_routes():
+    # The policy lookup itself fails: route without guardrails.
+    router = _router_from_checked_in_config("config.compose.yaml", token_count=321)
+
+    async def broken_policy_context(_request):
+        raise RuntimeError("policy cache exploded")
+
+    router._get_policy_context = broken_policy_context
+
+    decision = await router.route_query(_request("enterprise"))
+
+    assert decision.selected_model == "gpt-5"
+    assert "routing error" in decision.routing_reason.lower()
+    assert decision.token_count == 321
+
+
 def test_allowed_tiers_override_the_priority_rule(router_config):
     router = ModelRouter(router_config)
     model = ModelConfig(
