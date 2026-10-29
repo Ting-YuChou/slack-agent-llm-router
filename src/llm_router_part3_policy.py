@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from aiokafka import AIOKafkaConsumer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.structs import TopicPartition
 from prometheus_client import Counter, Gauge
 import redis.asyncio as redis
@@ -108,6 +108,85 @@ def policy_event_time_ms(event: Dict[str, Any], *fields: str) -> Optional[int]:
         if millis is not None:
             return millis
     return None
+
+
+POLICY_MATERIALIZER_INVALID_MESSAGES = Counter(
+    "llm_router_policy_materializer_invalid_messages_total",
+    "Malformed policy events moved past: dead-lettered, or skipped without a DLQ",
+    ["topic", "destination"],
+)
+
+
+class PolicyEventInvalid(ValueError):
+    """A policy event whose payload does not have the expected types (A7)."""
+
+
+def _require_event_object(event: Any) -> None:
+    if event is not None and not isinstance(event, dict):
+        raise PolicyEventInvalid(
+            f"policy event must be a JSON object, got {type(event).__name__}"
+        )
+
+
+def _event_text(event: Dict[str, Any], field: str, default: str = "") -> str:
+    """A string field; numbers are accepted, containers are not."""
+    value = event.get(field)
+    if value is None or value == "":
+        return default
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    raise PolicyEventInvalid(f"{field} must be a string, got {type(value).__name__}")
+
+
+def _event_number(event: Dict[str, Any], field: str) -> float:
+    value = event.get(field)
+    if value is None or value == "" or value is False:
+        return 0.0
+    if isinstance(value, (int, float, str)):
+        try:
+            number = float(value)
+        except ValueError as exc:
+            raise PolicyEventInvalid(f"{field} must be a number: {exc}") from exc
+        if not math.isfinite(number):
+            raise PolicyEventInvalid(f"{field} must be finite")
+        return number
+    raise PolicyEventInvalid(f"{field} must be a number, got {type(value).__name__}")
+
+
+def _event_int(event: Dict[str, Any], field: str) -> int:
+    return int(_event_number(event, field))
+
+
+def _event_float(event: Dict[str, Any], field: str) -> float:
+    return _event_number(event, field)
+
+
+def _event_names(event: Dict[str, Any], field: str) -> List[str]:
+    """A list of names; anything else, a bare string included, is invalid."""
+    value = event.get(field)
+    if value is None or value == "":
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise PolicyEventInvalid(f"{field} must be a list, got {type(value).__name__}")
+    for item in value:
+        if not isinstance(item, str):
+            raise PolicyEventInvalid(
+                f"{field} items must be strings, got {type(item).__name__}"
+            )
+    return list(value)
+
+
+def _event_mapping(event: Dict[str, Any], field: str) -> Dict[str, Any]:
+    value = event.get(field)
+    if value is None or value == "":
+        return {}
+    if not isinstance(value, dict):
+        raise PolicyEventInvalid(
+            f"{field} must be an object, got {type(value).__name__}"
+        )
+    return dict(value)
 
 
 class PolicyCacheUnavailableError(RuntimeError):
@@ -709,13 +788,14 @@ class RoutingPolicyCache:
 
     async def materialize_request_enriched(self, event: Dict[str, Any]):
         """Materialize requests.enriched events into request/user caches."""
+        _require_event_object(event)
         if not event:
             return
 
-        request_id = str(event.get("request_id", "") or "")
-        user_id = str(event.get("user_id", "") or "")
+        request_id = _event_text(event, "request_id")
+        user_id = _event_text(event, "user_id")
         route_to_fast_lane = bool(event.get("route_to_fast_lane", False))
-        priority = str(event.get("priority", "") or "")
+        priority = _event_text(event, "priority")
         updated_at = event.get("emitted_at")
 
         request_policy = {
@@ -737,9 +817,9 @@ class RoutingPolicyCache:
             "error_sensitivity": event.get("error_sensitivity"),
             "latency_sla": event.get("latency_sla"),
             "routing_intent_source": event.get("routing_intent_source"),
-            "preferred_models": list(event.get("preferred_models", []) or []),
-            "avoid_models": list(event.get("avoid_models", []) or []),
-            "avoid_providers": list(event.get("avoid_providers", []) or []),
+            "preferred_models": _event_names(event, "preferred_models"),
+            "avoid_models": _event_names(event, "avoid_models"),
+            "avoid_providers": _event_names(event, "avoid_providers"),
             "hint_reason": event.get("enrichment_stage", "priority_classification"),
             "source_event_type": event.get("event_type", "requests.enriched"),
             "updated_at": updated_at,
@@ -758,13 +838,14 @@ class RoutingPolicyCache:
 
     async def materialize_fast_lane_hint(self, event: Dict[str, Any]):
         """Materialize fast_lane_hints into request/user caches."""
+        _require_event_object(event)
         if not event:
             return
 
-        request_id = str(event.get("request_id", "") or "")
-        user_id = str(event.get("user_id", "") or "")
+        request_id = _event_text(event, "request_id")
+        user_id = _event_text(event, "user_id")
         existing_request_policy = await self.get_request_policy(request_id)
-        selected_model = event.get("selected_model")
+        selected_model = _event_text(event, "selected_model") or None
         preferred_models = [selected_model] if selected_model else []
         updated_at = event.get("emitted_at")
         route_to_fast_lane = bool(event.get("route_to_fast_lane", False))
@@ -800,8 +881,8 @@ class RoutingPolicyCache:
             "latency_sla": event.get("latency_sla"),
             "routing_intent_source": event.get("routing_intent_source"),
             "preferred_models": preferred_models,
-            "avoid_models": list(event.get("avoid_models", []) or []),
-            "avoid_providers": list(event.get("avoid_providers", []) or []),
+            "avoid_models": _event_names(event, "avoid_models"),
+            "avoid_providers": _event_names(event, "avoid_providers"),
             "hint_reason": event.get("hint_reason", "fast_lane_candidate"),
             "source_event_type": event.get("event_type", "fast_lane_hints"),
             "updated_at": updated_at,
@@ -824,11 +905,12 @@ class RoutingPolicyCache:
 
     async def materialize_routing_policy_state(self, event: Dict[str, Any]):
         """Materialize rolling user/session policy state emitted by Flink analytics."""
+        _require_event_object(event)
         if not event:
             return
 
-        scope_type = str(event.get("scope_type", "") or "").lower()
-        scope_key = str(event.get("scope_key", "") or "")
+        scope_type = _event_text(event, "scope_type").lower()
+        scope_key = _event_text(event, "scope_key")
         if scope_type not in {"user", "session"} or not scope_key:
             return
 
@@ -854,16 +936,16 @@ class RoutingPolicyCache:
             "enterprise_priority_active": bool(
                 event.get("enterprise_priority_active", False)
             ),
-            "recent_request_count": int(event.get("recent_request_count", 0) or 0),
-            "recent_error_rate": float(event.get("recent_error_rate", 0.0) or 0.0),
-            "avg_total_tokens": float(event.get("avg_total_tokens", 0.0) or 0.0),
-            "avg_cost_usd": float(event.get("avg_cost_usd", 0.0) or 0.0),
-            "avg_latency_ms": float(event.get("avg_latency_ms", 0.0) or 0.0),
-            "fast_lane_hit_rate": float(event.get("fast_lane_hit_rate", 0.0) or 0.0),
-            "query_type_breakdown": dict(event.get("query_type_breakdown", {}) or {}),
-            "preferred_models": list(event.get("preferred_models", []) or []),
-            "avoid_models": list(event.get("avoid_models", []) or []),
-            "avoid_providers": list(event.get("avoid_providers", []) or []),
+            "recent_request_count": _event_int(event, "recent_request_count"),
+            "recent_error_rate": _event_float(event, "recent_error_rate"),
+            "avg_total_tokens": _event_float(event, "avg_total_tokens"),
+            "avg_cost_usd": _event_float(event, "avg_cost_usd"),
+            "avg_latency_ms": _event_float(event, "avg_latency_ms"),
+            "fast_lane_hit_rate": _event_float(event, "fast_lane_hit_rate"),
+            "query_type_breakdown": _event_mapping(event, "query_type_breakdown"),
+            "preferred_models": _event_names(event, "preferred_models"),
+            "avoid_models": _event_names(event, "avoid_models"),
+            "avoid_providers": _event_names(event, "avoid_providers"),
             "hint_reason": event.get("hint_reason", "rolling_policy_state"),
             "source_event_type": event.get("event_type", "routing.policy_state"),
             "updated_at": event.get("emitted_at"),
@@ -885,11 +967,12 @@ class RoutingPolicyCache:
 
     async def materialize_routing_guardrail(self, event: Dict[str, Any]):
         """Materialize routing.guardrails events into model/provider guardrail views."""
+        _require_event_object(event)
         if not event:
             return
 
-        scope_type = str(event.get("scope_type", "") or "").lower()
-        scope_key = str(event.get("scope_key", "") or "")
+        scope_type = _event_text(event, "scope_type").lower()
+        scope_key = _event_text(event, "scope_key")
         if scope_type not in {"model", "provider"} or not scope_key:
             return
 
@@ -899,7 +982,7 @@ class RoutingPolicyCache:
             "guardrail_action": str(event.get("guardrail_action", "avoid") or "avoid"),
             "severity": str(event.get("severity", "warning") or "warning"),
             "trigger_type": str(event.get("trigger_type", "unknown") or "unknown"),
-            "description": str(event.get("description", "") or ""),
+            "description": _event_text(event, "description"),
             "provider": event.get("provider"),
             "model_name": event.get("model_name"),
             "updated_at": event.get("emitted_at"),
@@ -1122,6 +1205,17 @@ class PolicyMaterializer:
                 consumer_config.get("supervisor_max_backoff_seconds", 30.0),
             )
         )
+        # Malformed events go to <topic><suffix> when a DLQ is enabled;
+        # without one they are skipped. Either way the offset moves on.
+        dlq_config = dict(self.kafka_config.get("dlq", {}) or {})
+        self.dlq_enabled = bool(
+            materializer_config.get("dlq_enabled", dlq_config.get("enabled", False))
+        )
+        self.dlq_topic_suffix = str(dlq_config.get("topic_suffix", ".dlq"))
+        self.dlq_send_timeout_seconds = float(
+            dlq_config.get("send_timeout_seconds", 10.0)
+        )
+        self.dlq_producer: Optional[Any] = None
         self.running = False
 
     async def initialize(self):
@@ -1136,6 +1230,8 @@ class PolicyMaterializer:
         await self.policy_cache.initialize()
         if not self.policy_cache.enabled:
             return
+
+        await self._start_dlq_producer()
 
         topic_keys = (
             "requests_enriched",
@@ -1158,6 +1254,26 @@ class PolicyMaterializer:
                 "last_stopped_at": None,
             }
             logger.info(f"Policy materializer consumer initialized: {topic_name}")
+
+    async def _start_dlq_producer(self) -> None:
+        if not self.dlq_enabled or self.dlq_producer is not None:
+            return
+        producer = AIOKafkaProducer(
+            bootstrap_servers=self.consumer_config["bootstrap_servers"],
+            value_serializer=lambda value: json.dumps(value).encode("utf-8"),
+            key_serializer=lambda key: key.encode("utf-8") if key else None,
+            acks="all",
+        )
+        try:
+            await producer.start()
+        except Exception as e:
+            logger.warning(
+                "Policy materializer DLQ producer failed to start; malformed "
+                "events will be skipped: %s",
+                e,
+            )
+            return
+        self.dlq_producer = producer
 
     async def start(self):
         """Start consuming policy events."""
@@ -1262,13 +1378,95 @@ class PolicyMaterializer:
     @staticmethod
     def _decode_message_value(message: Any) -> Dict[str, Any]:
         value = getattr(message, "value", None)
-        if isinstance(value, dict):
-            return value
         if isinstance(value, bytes):
-            return json.loads(value.decode("utf-8"))
-        if isinstance(value, str):
-            return json.loads(value)
-        raise ValueError(f"Unsupported Kafka message payload type: {type(value)}")
+            value = json.loads(value.decode("utf-8"))
+        elif isinstance(value, str):
+            value = json.loads(value)
+        elif not isinstance(value, dict):
+            raise ValueError(f"Unsupported Kafka message payload type: {type(value)}")
+        if not isinstance(value, dict):
+            raise PolicyEventInvalid(
+                f"policy event must be a JSON object, got {type(value).__name__}"
+            )
+        return value
+
+    async def _skip_invalid_message(
+        self,
+        topic_key: str,
+        consumer: AIOKafkaConsumer,
+        message: Any,
+        error: Exception,
+    ) -> None:
+        """Dead-letter or skip a malformed event, then commit past it (A7)."""
+        destination = "skipped"
+        if self.dlq_producer is not None:
+            try:
+                await self._publish_dead_letter(topic_key, message, error)
+                destination = "dlq"
+            except Exception as e:
+                destination = "dlq_failed"
+                logger.error(
+                    "Failed to dead-letter a malformed %s message; skipping it: %s",
+                    topic_key,
+                    e,
+                )
+        POLICY_MATERIALIZER_INVALID_MESSAGES.labels(
+            topic=topic_key, destination=destination
+        ).inc()
+        logger.warning(
+            "Skipping invalid %s message at %s[%s]@%s (%s): %s",
+            topic_key,
+            getattr(message, "topic", None),
+            getattr(message, "partition", None),
+            getattr(message, "offset", None),
+            destination,
+            error,
+        )
+        await self._commit_processed_message(consumer, message)
+
+    @staticmethod
+    def _payload_keys(message: Any) -> List[str]:
+        """Top-level field names of the payload; values never reach the DLQ."""
+        value = getattr(message, "value", None)
+        try:
+            if isinstance(value, bytes):
+                value = json.loads(value.decode("utf-8"))
+            elif isinstance(value, str):
+                value = json.loads(value)
+        except (ValueError, UnicodeDecodeError):
+            return []
+        return sorted(str(key) for key in value) if isinstance(value, dict) else []
+
+    async def _publish_dead_letter(
+        self, topic_key: str, message: Any, error: Exception
+    ) -> None:
+        source_topic = (
+            getattr(message, "topic", None)
+            or self.topic_names_by_key.get(topic_key)
+            or self.topics.get(topic_key)
+            or topic_key
+        )
+        dlq_topic = f"{source_topic}{self.dlq_topic_suffix}"
+        offset = getattr(message, "offset", None)
+        partition = getattr(message, "partition", None)
+        payload = {
+            "event_type": "dead_letter",
+            "emitted_at": datetime.now(timezone.utc).isoformat(),
+            "source_topic_key": topic_key,
+            "source_topic": source_topic,
+            "source_partition": partition,
+            "source_offset": offset,
+            "failure_stage": "validate",
+            "error_type": type(error).__name__,
+            "error_message": str(error)[:500],
+            "payload_keys": self._payload_keys(message),
+        }
+        key = f"{source_topic}:{partition}:{offset}"
+        await asyncio.wait_for(
+            self.dlq_producer.send_and_wait(dlq_topic, key=key, value=payload),
+            timeout=self.dlq_send_timeout_seconds,
+        )
+        PIPELINE_METRICS.dead_letter_messages.labels(topic=topic_key).inc()
 
     async def _consume_requests_enriched(self, consumer: AIOKafkaConsumer):
         try:
@@ -1280,8 +1478,9 @@ class PolicyMaterializer:
                     await self.policy_cache.materialize_request_enriched(payload)
                     await self._commit_processed_message(consumer, message)
                 except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning(f"Skipping invalid requests.enriched message: {e}")
-                    await self._commit_processed_message(consumer, message)
+                    await self._skip_invalid_message(
+                        "requests_enriched", consumer, message, e
+                    )
                 except Exception as e:
                     logger.warning(
                         f"Failed to materialize requests.enriched message: {e}"
@@ -1301,8 +1500,9 @@ class PolicyMaterializer:
                     await self.policy_cache.materialize_fast_lane_hint(payload)
                     await self._commit_processed_message(consumer, message)
                 except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning(f"Skipping invalid fast_lane_hints message: {e}")
-                    await self._commit_processed_message(consumer, message)
+                    await self._skip_invalid_message(
+                        "fast_lane_hints", consumer, message, e
+                    )
                 except Exception as e:
                     logger.warning(
                         f"Failed to materialize fast_lane_hints message: {e}"
@@ -1322,8 +1522,9 @@ class PolicyMaterializer:
                     await self.policy_cache.materialize_routing_guardrail(payload)
                     await self._commit_processed_message(consumer, message)
                 except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning(f"Skipping invalid routing_guardrails message: {e}")
-                    await self._commit_processed_message(consumer, message)
+                    await self._skip_invalid_message(
+                        "routing_guardrails", consumer, message, e
+                    )
                 except Exception as e:
                     logger.warning(
                         f"Failed to materialize routing_guardrails message: {e}"
@@ -1343,10 +1544,9 @@ class PolicyMaterializer:
                     await self.policy_cache.materialize_routing_policy_state(payload)
                     await self._commit_processed_message(consumer, message)
                 except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning(
-                        f"Skipping invalid routing_policy_state message: {e}"
+                    await self._skip_invalid_message(
+                        "routing_policy_state", consumer, message, e
                     )
-                    await self._commit_processed_message(consumer, message)
                 except Exception as e:
                     logger.warning(
                         f"Failed to materialize routing_policy_state message: {e}"
@@ -1385,11 +1585,12 @@ class PolicyMaterializer:
     async def shutdown(self):
         """Shutdown Kafka consumers. The shared cache is owned by the platform."""
         self.running = False
-        results = await asyncio.gather(
-            *(consumer.stop() for consumer in self.consumers.values()),
-            return_exceptions=True,
-        )
+        stops = [consumer.stop() for consumer in self.consumers.values()]
+        if self.dlq_producer is not None:
+            stops.append(self.dlq_producer.stop())
+        results = await asyncio.gather(*stops, return_exceptions=True)
         self.consumers.clear()
+        self.dlq_producer = None
         failures = [result for result in results if isinstance(result, BaseException)]
         if failures:
             raise failures[0]
