@@ -3527,12 +3527,21 @@ class InferenceEngine:
             f"{getattr(routing_decision, 'routing_reason', 'RAG route')}; "
             f"vision reroute from {original_model} to {selected_model}"
         )
+        # The router's own choice, kept across reroutes and fallbacks.
+        routed_model = (
+            getattr(routing_decision, "routed_model", None)
+            or getattr(routing_decision, "selected_model", None)
+            or original_model
+        )
+        update = {
+            "selected_model": selected_model,
+            "routing_reason": reason,
+            "routed_model": routed_model,
+        }
         if hasattr(routing_decision, "model_copy"):
-            return routing_decision.model_copy(
-                update={"selected_model": selected_model, "routing_reason": reason}
-            )
+            return routing_decision.model_copy(update=update)
         payload = dict(vars(routing_decision))
-        payload.update(selected_model=selected_model, routing_reason=reason)
+        payload.update(update)
         return SimpleNamespace(**payload)
 
     def _should_run_rag(self, request: QueryRequest, routing_decision: Any) -> bool:

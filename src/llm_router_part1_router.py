@@ -2491,17 +2491,22 @@ class ModelRouter:
         reasons = self._model_reject_reasons(
             model_names, context, check_capability=check_capability
         )
+        bypassed: Dict[str, Optional[str]] = {}
+        if reasons.get(selected_model) in GUARDRAIL_REJECT_REASONS:
+            bypassed = {
+                name: reason
+                for name, reason in reasons.items()
+                if reason in GUARDRAIL_REJECT_REASONS
+            }
+            context = self._without_guardrails(context)
+            reasons = self._model_reject_reasons(
+                model_names, context, check_capability=check_capability
+            )
+        # As _eligible_models falls back to models without the capability.
         if check_capability and reasons.get(selected_model) == REJECT_CAPABILITY:
             check_capability = False
             reasons = self._model_reject_reasons(
                 model_names, context, check_capability=False
-            )
-        bypassed: Dict[str, Optional[str]] = {}
-        if reasons.get(selected_model) in GUARDRAIL_REJECT_REASONS:
-            bypassed = reasons
-            context = self._without_guardrails(context)
-            reasons = self._model_reject_reasons(
-                model_names, context, check_capability=check_capability
             )
         context = self._with_cost_reference(
             [name for name in model_names if reasons.get(name) is None], context

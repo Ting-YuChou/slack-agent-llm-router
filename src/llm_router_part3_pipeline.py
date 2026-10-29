@@ -1551,6 +1551,7 @@ class ClickHouseManager:
             f"ALTER TABLE {self.database}.routing_policy_state_events ADD COLUMN IF NOT EXISTS kafka_topic String DEFAULT ''",
             f"ALTER TABLE {self.database}.routing_policy_state_events ADD COLUMN IF NOT EXISTS kafka_partition Int32 DEFAULT -1",
             f"ALTER TABLE {self.database}.routing_policy_state_events ADD COLUMN IF NOT EXISTS kafka_offset Int64 DEFAULT -1",
+            f"ALTER TABLE {self.database}.routing_decisions ADD COLUMN IF NOT EXISTS fallback_from_model String DEFAULT ''",
         ]
 
         for sql in alter_statements:
