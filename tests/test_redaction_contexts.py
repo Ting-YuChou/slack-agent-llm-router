@@ -340,6 +340,176 @@ STRUCTURED_SECRETS = [
     ("hex secret word-like", "secret: deadbeefdeadbeefdeadbeef", "deadbeefdeadbeef"),
     ("password in angle brackets", 'DB_PASSWORD="<_b:-1w9&1!(JW*Cshw>"', "1w9&1!"),
     ("code-like password", "password: V$poI4$Y[GcYXxWbVoPQ", "GcYXxW"),
+    # Private keys whatever surrounds the body.
+    (
+        "pem slack blockquote",
+        "&gt; -----BEGIN RSA PRIVATE KEY-----\n&gt; MIIEowIBAAKCAQEA0Z3VS5JJcds3xfn\n"
+        "&gt; -----END RSA PRIVATE KEY-----",
+        "MIIEowIBAAKCAQEA0Z3",
+    ),
+    (
+        "pem quoted lines",
+        "> -----BEGIN RSA PRIVATE KEY-----\n> MIIEowIBAAKCAQEA0Z3VS5JJcds3xfn\n"
+        "> ygWyF8PbnGy0AHB7MaQmpL9\n> -----END RSA PRIVATE KEY-----",
+        "ygWyF8PbnGy0",
+    ),
+    (
+        "pem python concatenation",
+        "key = ('-----BEGIN PRIVATE KEY-----\\n'\n"
+        "       'MIIEvQIBADANBgkqhkiG9w0BAQEFAASC\\n'\n"
+        "       '-----END PRIVATE KEY-----')",
+        "MIIEvQIBADANBgkq",
+    ),
+    (
+        "pem js concatenation",
+        "const key = '-----BEGIN PRIVATE KEY-----\\n' +\n"
+        "  'MIIEvQIBADANBgkqhkiG9w0BAQEFAASC\\n' +\n"
+        "  '-----END PRIVATE KEY-----\\n';",
+        "MIIEvQIBADANBgkq",
+    ),
+    (
+        "pem json array",
+        '["-----BEGIN RSA PRIVATE KEY-----", "MIIEowIBAAKCAQEA0Z3VS5JJcds3xfn", '
+        '"ygWyF8PbnGy0AHB7MaQmpL9", "-----END RSA PRIVATE KEY-----"]',
+        "ygWyF8PbnGy0",
+    ),
+    (
+        "pem stray underscore",
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0Z3VS5JJcds3xfn\n"
+        "ygWyF8PbnGy0AHB7Ma_QmpL9\n-----END RSA PRIVATE KEY-----",
+        "ygWyF8PbnGy0",
+    ),
+    (
+        "pem long single line without end",
+        "-----BEGIN PRIVATE KEY-----\n" + "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC" * 50,
+        "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC",
+    ),
+    (
+        "pem quoted lines without end",
+        "> -----BEGIN RSA PRIVATE KEY-----\n"
+        "> MIIEowIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PbnGy0AHB7Ma\n> QmpL9xyz",
+        "QmpL9xyz",
+    ),
+    (
+        "pem slack blockquote without end",
+        "&gt; -----BEGIN RSA PRIVATE KEY-----\n"
+        "&gt; MIIEowIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PbnGy0AHB7Ma",
+        "MIIEowIBAAKCAQEA0Z3",
+    ),
+    (
+        "pem truncated without end",
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        "MIIEowIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PbnGy0AHB7MaQmpL9",
+        "MIIEowIBAAKCAQEA0Z3VS5",
+    ),
+    # Regressions against the pre-rework module.
+    ("openssl passin", "openssl rsa -in key.pem -passin pass:Xk7mQ2pL9", "Xk7mQ2pL9"),
+    (
+        "openssl passout",
+        "openssl pkcs12 -export -passout 'pass:Xk7 mQ2pL9' -out a.p12",
+        "mQ2pL9",
+    ),
+    (
+        "aws secret starting with a slash",
+        "AWS_SECRET_ACCESS_KEY=/K7MDENGbPxRfiCYzq9Xb3Lk2wJalrXUtnFEMIab",
+        "K7MDENGbPxRfiCY",
+    ),
+    (
+        "set-cookie quoted value",
+        'Set-Cookie: session="Xk7mQ2pL9zR"; Path=/',
+        "Xk7mQ2pL9zR",
+    ),
+    # CJK names and separators.
+    ("密碼為 colon", "密碼為: Xk7mQ2pL9", "Xk7mQ2pL9"),
+    ("密碼是 fullwidth colon", "密碼是：Xk7mQ2pL9", "Xk7mQ2pL9"),
+    ("密碼 space", "帳號 admin 密碼 Xk7mQ2pL9", "Xk7mQ2pL9"),
+    ("金鑰 colon", "API 金鑰：Xk7mQ2pL9zR", "Xk7mQ2pL9zR"),
+    ("金鑰是", "我的金鑰是 Xk7mQ2pL9zR", "Xk7mQ2pL9zR"),
+    ("存取權杖", "存取權杖：Xk7mQ2pL9zR", "Xk7mQ2pL9zR"),
+    ("權杖 equals", "權杖 = Xk7mQ2pL9zR", "Xk7mQ2pL9zR"),
+    # A credential name as a quoted string, then the literal it is set to.
+    ("python environ set", 'os.environ["DB_PASSWORD"] = "Xk7mQ2pL9"', "Xk7mQ2pL9"),
+    ("ruby ENV set", "ENV['DB_PASSWORD'] = 'Xk7mQ2pL9'", "Xk7mQ2pL9"),
+    ("python dict set", "config['api_key'] = 'Xk7mQ2pL9zR'", "Xk7mQ2pL9zR"),
+    ("php define", "define('DB_PASSWORD', 'Xk7mQ2pL9');", "Xk7mQ2pL9"),
+    ("php define letters", "define( 'DB_PASSWORD', 'summerday' );", "summerday"),
+    ("go setenv", 'os.Setenv("DB_PASSWORD", "Xk7mQ2pL9")', "Xk7mQ2pL9"),
+    ("java setProperty", 'props.setProperty("password", "Xk7mQ2pL9");', "Xk7mQ2pL9"),
+    ("java put", 'props.put("mail.smtp.password", "Xk7mQ2pL9");', "Xk7mQ2pL9"),
+    (
+        "python setdefault",
+        'os.environ.setdefault("DB_PASSWORD", "Xk7mQ2pL9")',
+        "Xk7mQ2pL9",
+    ),
+    ("php env default", "'password' => env('DB_PASSWORD', 'Xk7mQ2pL9'),", "Xk7mQ2pL9"),
+    # Kubernetes and ECS name/value pairs.
+    (
+        "k8s env quoted",
+        'env:\n  - name: DB_PASSWORD\n    value: "Xk7mQ2pL9"',
+        "Xk7mQ2pL9",
+    ),
+    (
+        "k8s env unquoted",
+        "env:\n  - name: DB_PASSWORD\n    value: Summerday",
+        "Summerday",
+    ),
+    (
+        "ecs json",
+        '"environment": [{"name": "DB_PASSWORD", "value": "Xk7mQ2pL9"}]',
+        "Xk7mQ2pL9",
+    ),
+    (
+        "ecs json pretty",
+        '{\n  "name": "API_TOKEN",\n  "value": "Summerday"\n}',
+        "Summerday",
+    ),
+    # Shell assignments that do not start the line.
+    ("shell prompt", "$ export DB_PASSWORD=Summerday\n$ ./run.sh", "Summerday"),
+    ("shell history", "  501  export DB_PASSWORD=Xk7&mQ2;pL9\n  502  ls", "mQ2;pL9"),
+    ("inline code", "I set `DB_PASSWORD=Summerday` but it fails", "Summerday"),
+    ("quote prefix", "> DB_PASSWORD=Summerday", "Summerday"),
+    ("bullet prefix", "* DB_PASSWORD=Summerday", "Summerday"),
+    ("numbered prefix", "1. DB_PASSWORD=Summerday", "Summerday"),
+    (
+        "docker run -e",
+        "docker run -e POSTGRES_PASSWORD=mysecretpassword -d postgres",
+        "mysecretpassword",
+    ),
+    (
+        "docker run -e quoted",
+        "docker run -e POSTGRES_PASSWORD='Xk7 mQ2' -d postgres",
+        "mQ2",
+    ),
+    ("docker run --env", "docker run --env API_TOKEN=Xk7mQ2pL9zR img", "Xk7mQ2pL9zR"),
+    ("env prefix", "env PGPASSWORD=Summerday psql -h db", "Summerday"),
+    ("sudo prefix", "sudo DB_PASSWORD=Summerday ./migrate", "Summerday"),
+    (
+        "kubectl from-literal",
+        "kubectl create secret generic db --from-literal=password=Summerday",
+        "Summerday",
+    ),
+    (
+        "kubectl from-literal quoted",
+        "kubectl create secret generic db --from-literal=password='Xk7 mQ2!'",
+        "mQ2!",
+    ),
+    ("helm set", "helm install x --set auth.password=Summerday", "Summerday"),
+    (
+        "helm set list",
+        "helm upgrade x --set image.tag=1.2,auth.password=Summerday",
+        "Summerday",
+    ),
+    # Password flags of common clients.
+    ("redis-cli -a", "redis-cli -h cache.local -a Xk7mQ2pL9 ping", "Xk7mQ2pL9"),
+    ("mongosh -p", "mongosh --host db -u admin -p Xk7mQ2pL9", "Xk7mQ2pL9"),
+    ("sshpass -p", "sshpass -p 'Xk7mQ2pL9' ssh root@10.0.0.5", "Xk7mQ2pL9"),
+    ("sshpass -p attached", "sshpass -pXk7mQ2pL9 ssh root@10.0.0.5", "Xk7mQ2pL9"),
+    (
+        "az login -p",
+        "az login --service-principal -u 1111-2222 -p Xk7~mQ2.pL9_zR -t tenant",
+        "Xk7~mQ2",
+    ),
+    ("podman login -p", "podman login -u me -p Xk7mQ2pL9 quay.io", "Xk7mQ2pL9"),
 ]
 # Deliberately not masked:
 # - "PASSWORD=correct horse battery staple": an unquoted value ends at the first
@@ -390,6 +560,36 @@ def test_structured_secrets_are_masked(text, secret):
         ("mysql -u root -phunter2 db", "mysql -u root -p[REDACTED] db"),
         ("curl -u admin:hunter2 https://x", "curl -u admin:[REDACTED] https://x"),
         ("--password=hunter2! --verbose", "--password=[REDACTED] --verbose"),
+        ("密碼為: Xk7mQ2pL9", "密碼為: [REDACTED]"),
+        ("密碼是：Xk7mQ2pL9", "密碼是：[REDACTED]"),
+        ("密碼 Xk7mQ2pL9 是我的", "密碼 [REDACTED] 是我的"),
+        (
+            'Set-Cookie: session="Xk7mQ2pL9zR"; Path=/',
+            'Set-Cookie: session="[REDACTED]"; Path=/',
+        ),
+        (
+            "openssl rsa -passin pass:Xk7mQ2pL9 -in k.pem",
+            "openssl rsa -passin pass:[REDACTED] -in k.pem",
+        ),
+        (
+            'define("DB_PASSWORD", "Xk7mQ2pL9");',
+            'define("DB_PASSWORD", "[REDACTED]");',
+        ),
+        (
+            "env:\n  - name: DB_PASSWORD\n    value: Summerday\n  - name: X",
+            "env:\n  - name: DB_PASSWORD\n    value: [REDACTED]\n  - name: X",
+        ),
+        (
+            "&gt; -----BEGIN RSA PRIVATE KEY-----\n&gt; MIIEowIBAAKCA_QEA0Z3VS5JJ\n"
+            "&gt; -----END RSA PRIVATE KEY-----\n&gt; why?",
+            "&gt; [REDACTED]\n&gt; why?",
+        ),
+        (
+            "-----BEGIN PRIVATE KEY-----\n"
+            + "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC" * 50
+            + "\n\nWhy is it rejected?",
+            "[REDACTED]\n\nWhy is it rejected?",
+        ),
         ("password=" + "a1" * 300 + " tail", "password=[REDACTED] tail"),
     ],
 )
@@ -489,6 +689,43 @@ ORDINARY_TEXT = [
     "Use the --token flag to pass your token",
     "the --password option is deprecated in mysql 8",
     "Should I pass --api-key as an argument or read it from the environment?",
+    "Why is it bad if the password is hardcoded?",
+    "Is it a problem that my api key is hardcoded?",
+    "the secret is encoded.",
+    "My token is expired.",
+    "My access token is expired. What should I do?",
+    "The password is incorrect.",
+    "The API key is missing!",
+    "Why do I get 401 when the token is valid?",
+    "my password is correct!",
+    "the private key is encrypted?",
+    "我的密碼是 hardcoded 在 code 裡，這樣安全嗎？",
+    "請問 token 是什麼？",
+    "令牌是 python 的 jwt 套件產生的",
+    "password:\n  min_length: 12\n  require_symbols: true",
+    "auth:\n  token:\n    enabled: true\n    ttl: 3600",
+    "secrets:\n  db_password:\n    file: ./db_password.txt",
+    "cost_per_token: 3.0e-05\nwhy is my bill so high?",
+    "def connect():\n    return psycopg2.connect(\n        host=host,\n"
+    '        password=os.environ["DB_PASSWORD"],\n    )',
+    'authorization = request.headers.get("Authorization", "")',
+    "client = OpenAI(\n    api_key=api_key,\n)",
+    "這個 API 的令牌是 debug 模式下產生的嗎？",
+    "密碼為 8 位數字安全嗎？",
+    "令牌是 JWT 格式嗎？為什麼要簽章？",
+    "密碼是 bcrypt 雜湊後存的嗎？",
+    "os.environ.get('DB_PASSWORD', '')",
+    "ENV['DB_PASSWORD'] = ENV.fetch('X')",
+    "openssl rsa -in key.pem -passin env:KEY_PASS",
+    "redis-cli -a $REDIS_PASSWORD ping",
+    "mongosh -u admin -p",
+    "docker run -e POSTGRES_PASSWORD -d postgres",
+    "docker run -e POSTGRES_PASSWORD=$POSTGRES_PASSWORD -d postgres",
+    "kubectl create secret generic db --from-file=password=./password.txt",
+    "- name: DB_PASSWORD\n  valueFrom:\n    secretKeyRef:\n      name: db",
+    "$ export DB_PASSWORD=$(vault read -field=password secret/db)",
+    "1. Set the password in the settings page",
+    "> The token is valid for one hour.",
 ]
 
 
@@ -628,6 +865,22 @@ ADVERSARIAL = {
     "mysql -p": "mysql " + "-p " * (N // 3),
     "flag run": "--password " * (N // 11),
     "spaced names": "api key " * (N // 8),
+    "BEGIN quote filler": "-----BEGIN PRIVATE KEY-----\n" + "> " * (N // 2),
+    "BEGIN entity filler": "-----BEGIN PRIVATE KEY-----" + "&gt; " * (N // 5),
+    "BEGIN plus filler": "-----BEGIN PRIVATE KEY-----" + " +" * (N // 2),
+    "BEGIN short lines": "-----BEGIN PRIVATE KEY-----" + "\nAAAA" * (N // 5),
+    "BEGIN many no end": ("-----BEGIN PRIVATE KEY-----\n" + "A" * 40 + "\n")
+    * (N // 68),
+    "quoted name pairs": "'password', " * (N // 12),
+    "quoted name subscripts": "['password'] = " * (N // 15),
+    "k8s names": "- name: DB_PASSWORD\n" * (N // 20),
+    "json names": '"name": "DB_PASSWORD", ' * (N // 23),
+    "shell prefixes": "$ 1 > * " * (N // 8),
+    "docker -e": "docker run " + "-e " * (N // 3),
+    "helm set pairs": "helm --set " + "a=b," * (N // 4),
+    "CJK is colon": "密碼為：" * (N // 4),
+    "openssl passin": "-passin pass:" * (N // 13),
+    "client flags": "redis-cli " + "-a " * (N // 3),
 }
 
 

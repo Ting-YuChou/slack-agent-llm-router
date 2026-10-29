@@ -49,6 +49,8 @@ _CREDENTIAL_KEY = re.compile(
 )
 _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _PASSWORD_NAME = re.compile(r"pass|pwd|密碼|密码|口令", re.IGNORECASE)
+_SECRET_NAME = re.compile(r"secret|aws", re.IGNORECASE)
+_BASE64_VALUE = re.compile(r"[A-Za-z0-9+/]{30,}={0,2}")
 
 # ---------------------------------------------------------------------------
 # Values that are not secrets
@@ -80,7 +82,7 @@ _PLACEHOLDER_WORDS = frozenset(
         "empty",
     }
 )
-_NUMBER = re.compile(r"\d+(?:[.,_]\d+)*")
+_NUMBER = re.compile(r"\d+(?:[.,_]\d+)*(?:[eE][+-]?\d+)?")
 _QUANTITY = re.compile(r"[<>~=]?\d+(?:[.,]\d+)?[+%]")
 _VERSION = re.compile(r"v?\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.]+)?")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?Z?)?")
@@ -147,7 +149,15 @@ def _is_literal_data(value: str, name: str) -> bool:
         return True
     if _NUMBER.fullmatch(bare) and not _PASSWORD_NAME.search(name):
         return True  # max_token=128000; a numeric *password* is still masked
-    return bool(_PATH.fullmatch(bare))
+    if not _PATH.fullmatch(bare) or _SECRET_NAME.search(name):
+        return False
+    # A long base64 value that happens to start with '/' is not a path.
+    return not (
+        _BASE64_VALUE.fullmatch(bare)
+        and re.search(r"[0-9]", bare)
+        and re.search(r"[a-z]", bare)
+        and re.search(r"[A-Z]", bare)
+    )
 
 
 def _is_code(value: str) -> bool:
@@ -192,23 +202,22 @@ _PEM_BEGIN = re.compile(
 _PEM_END = re.compile(
     r"-----END (?:[A-Z0-9]{1,32} ){0,3}PRIVATE KEY(?: BLOCK)?-----", re.IGNORECASE
 )
-_PEM_NOT_BODY = re.compile(r"[^A-Za-z0-9+/=\s\\:,.()-]")
 _PEM_MAX_BODY = 131072
-_NEWLINE = r"(?:\r?\n|\\r?\\n)"
-# Without an END marker, the body is the run of whole base64 (or armor header)
-# lines that follows; the first line of prose ends it.
-_PEM_BODY = re.compile(
-    rf"(?:(?:[\t ]*{_NEWLINE})+[\t ]*"
-    r"(?:(?:Proc-Type|DEK-Info|Comment|Version|Hash|Charset):[^\r\n\\]{0,256}"
-    rf"|[A-Za-z0-9+/=]{{4,1024}}(?=[\t ]*(?:{_NEWLINE}|$|-----))))+"
-    r"|(?:[\t ]+[A-Za-z0-9+/=]{16,1024})+"
+_PEM_END_MARKER = r"-----END (?:[A-Z0-9]{1,32} ){0,3}PRIVATE KEY(?: BLOCK)?-----"
+# What may surround the lines of a pasted key: whitespace and escaped newlines,
+# quote prefixes (`> `, Slack's `&gt; `), string quotes, concatenation `+`,
+# commas and brackets. A `+` counts only when no base64 follows it.
+_PEM_FILLER = r"(?:[\t \r\n,;\[\](){}`\"']|\\[rnt]|&gt;|>|\+(?![A-Za-z0-9+/=]))*"
+_PEM_RUN = re.compile(_PEM_FILLER + r"(?P<run>[A-Za-z0-9+/=]{4,})")
+_PEM_ARMOR = re.compile(
+    _PEM_FILLER
+    + r"(?:Proc-Type|DEK-Info|Comment|Version|Hash|Charset):[^\r\n\\]{0,256}"
 )
-_BASE64_RUN = re.compile(r"[A-Za-z0-9+/=]{16}")
-_PEM_TRAILING_END = re.compile(
-    rf"(?:[\t ]*{_NEWLINE})*[\t ]*-----END (?:[A-Z0-9]{{1,32}} ){{0,3}}"
-    r"PRIVATE KEY(?: BLOCK)?-----",
-    re.IGNORECASE,
-)
+_PEM_LINE_BREAK = re.compile(r"\n|\\[rn]")
+_PEM_LINE_END = re.compile(r"[\t \"',;\])}`]*(?:\r?\n|\\[rn]|$|-----)")
+_PEM_TRAILING_END = re.compile(_PEM_FILLER + _PEM_END_MARKER, re.IGNORECASE)
+_PEM_LONG_RUN = 40
+_PEM_LINE_RUN = 16
 _PUTTY = re.compile(
     r"(?P<head>Private-Lines:[\t ]*\d{1,4}[\t ]*\r?\n)"
     r"[A-Za-z0-9+/=]{1,128}(?:\r?\n[A-Za-z0-9+/=]{1,128})*"
@@ -216,33 +225,60 @@ _PUTTY = re.compile(
 )
 
 
+def _pem_body_end(text: str, start: int) -> Optional[int]:
+    """End of the key body after a BEGIN header without END, or None.
+
+    The body is every base64 run of 40+ characters (or a whole line of 16+)
+    that follows, whatever quoting surrounds it, plus a short last line. The
+    first run that is not key material ends it.
+    """
+    position = start
+    armor = _PEM_ARMOR.match(text, position)
+    while armor:
+        position = armor.end()
+        armor = _PEM_ARMOR.match(text, position)
+    stop: Optional[int] = None
+    while True:
+        found = _PEM_RUN.match(text, position)
+        if not found:
+            break
+        run = found.group("run")
+        whole_line = bool(
+            _PEM_LINE_BREAK.search(text, position, found.start("run"))
+            and _PEM_LINE_END.match(text, found.end())
+        )
+        if len(run) >= _PEM_LONG_RUN or (
+            whole_line
+            and len(run) >= _PEM_LINE_RUN
+            and re.search(r"[0-9+/]", run) is not None
+        ):
+            stop = position = found.end()
+            continue
+        if whole_line and stop is not None:
+            stop = found.end()  # the short last line of the body
+        break
+    return stop
+
+
 def _mask_private_keys(text: str) -> str:
-    """Mask BEGIN..END, or BEGIN plus its base64 body; never to end of text."""
+    """Mask BEGIN..END whatever is between, or BEGIN plus its base64 body."""
     begins = list(_PEM_BEGIN.finditer(text))
     if not begins:
         return text
-    ends = list(_PEM_END.finditer(text))
-    end_starts = [end.start() for end in ends]
+    end_starts = [end.start() for end in _PEM_END.finditer(text)]
+    end_stops = [end.end() for end in _PEM_END.finditer(text)]
     parts: List[str] = []
     position = 0
-    known_bad = -1  # first non-body character found by an earlier search
     for begin in begins:
         if begin.start() < position:
             continue
         stop: Optional[int] = None
         index = bisect.bisect_left(end_starts, begin.end())
-        if index < len(ends) and end_starts[index] - begin.end() <= _PEM_MAX_BODY:
-            limit = end_starts[index]
-            if not begin.end() <= known_bad < limit:
-                bad = _PEM_NOT_BODY.search(text, begin.end(), limit)
-                if bad is None:
-                    stop = ends[index].end()
-                else:
-                    known_bad = bad.start()
-        if stop is None:
-            body = _PEM_BODY.match(text, begin.end())
-            if body and _BASE64_RUN.search(body.group()):
-                stop = body.end()
+        if index < len(end_starts) and end_starts[index] - begin.end() <= _PEM_MAX_BODY:
+            stop = end_stops[index]
+        else:
+            stop = _pem_body_end(text, begin.end())
+            if stop is not None:
                 trailing_end = _PEM_TRAILING_END.match(text, stop)
                 if trailing_end:
                     stop = trailing_end.end()
@@ -295,7 +331,8 @@ _COOKIE_START = re.compile(
 )
 _CURL_COOKIE_START = re.compile(r"(?<!\S)-b(?:[\t ]+|=)?[\"']?")
 _COOKIE_PAIR = re.compile(
-    r"(?P<name>[^\s=;,\"']{1,256})=(?P<value>[^\s;,\"']*)(?P<sep>;[\t ]*)?"
+    r"(?P<name>[^\s=;,\"']{1,256})=(?P<value>\"[^\"\s;,]*\"|[^\s;,\"']*)"
+    r"(?P<sep>;[\t ]*)?"
 )
 _COOKIE_ATTRIBUTES = frozenset(
     {
@@ -312,9 +349,28 @@ _COOKIE_ATTRIBUTES = frozenset(
 )
 _COMMAND = re.compile(
     r"(?<![\w-])(?P<command>curl|mysql|mysqldump|mysqladmin|mariadb"
-    r"|docker[\t ]+login)\b[^\r\n]*",
+    r"|(?:docker|podman|buildah|nerdctl)[\t ]+login|redis-cli|sshpass"
+    r"|mongosh|mongo|mongodump|mongorestore|mongoexport|mongoimport"
+    r"|az(?=[\t ]+[a-z])|kubectl|oc(?=[\t ]+[a-z])|helm)\b[^\r\n]*",
     re.IGNORECASE,
 )
+_OPTION_VALUE = (
+    r"(?:(?P<q>[\"'])(?P<qvalue>(?:\\.|(?!(?P=q))[^\\\r\n])*)(?P=q)"
+    r"|(?P<value>[^\s\"'`]+))"
+)
+# The password option of each client, by command.
+_COMMAND_PASSWORD = {
+    "redis-cli": re.compile(r"(?P<head>(?<!\S)(?:-a|--pass)[\t ]+)" + _OPTION_VALUE),
+    "sshpass": re.compile(r"(?P<head>(?<!\S)-p[\t ]*)" + _OPTION_VALUE),
+    "mongo": re.compile(r"(?P<head>(?<!\S)-p[\t ]+)" + _OPTION_VALUE),
+    "az": re.compile(r"(?P<head>(?<!\S)-p[\t ]+)" + _OPTION_VALUE),
+    "login": re.compile(r"(?P<head>(?<!\S)-p[\t ]+)" + _OPTION_VALUE),
+    # kubectl --from-literal=password=X, helm --set a=b,auth.password=X
+    "pairs": re.compile(
+        rf"(?P<head>(?<=[\s,=]){_NAME}=)" + _OPTION_VALUE.replace("`]", "`,]"),
+        re.IGNORECASE,
+    ),
+}
 _QUOTED_BODY = r"(?P<q>[\"'])(?P<value>(?:\\.|(?!(?P=q))[^\\\r\n])*)(?P=q)"
 _USER_FLAG = (
     r"(?P<head>(?<!\S){flag}(?:[\t ]+|=)?(?:(?P<q>[\"'])[^\s:\"']{{0,256}}:"
@@ -336,8 +392,7 @@ _LONG_USER = re.compile(
     _USER_FLAG.format(flag="--user").replace("(?P<q>", "(?P<noq>")
     + r"(?P<value>[^\s\"']+)"
 )
-_MYSQL_PASSWORD = re.compile(r"(?P<head>(?<!\S)-p)(?P<value>[^\s\"']+)")
-_DOCKER_PASSWORD = re.compile(r"(?P<head>(?<!\S)-p[\t ]+)(?P<value>[^\s\"']+)")
+_MYSQL_PASSWORD = re.compile(r"(?P<head>(?<!\S)-p)(?P<value>[^\s\"'`]+)")
 _FLAG = re.compile(
     r"(?P<head>(?<!\S)--[A-Za-z0-9-]{0,48}(?:password|passwd|passphrase|token"
     r"|secret|api-?key|access-key|secret-key|private-key)(?:=|[\t ]+))"
@@ -372,6 +427,68 @@ _PROSE_AFTER_FLAG = frozenset(
         "with",
     }
 )
+# openssl -passin pass:X / -passout 'pass:X'
+_OPENSSL_PASS = re.compile(
+    r"(?P<head>(?<!\S)-(?:passin|passout|pass|password)[\t ]+(?P<q>[\"'])?pass:)"
+    r"(?(q)(?P<qvalue>(?:\\.|(?!(?P=q))[^\\\r\n])*)(?=(?P=q))|(?P<value>[^\s\"']+))"
+)
+
+
+def _mask_openssl_pass(match: Match[str]) -> str:
+    value = match.group("qvalue") if match.group("q") else match.group("value")
+    if _is_reference_or_placeholder(value):
+        return match.group(0)
+    return match.group("head") + REDACTED  # a closing quote stays after it
+
+
+_QUOTED_NAME = rf"(?P<nq>[\"']){_NAME}(?P=nq)"
+# os.environ["DB_PASSWORD"] = "x", ENV['X'] = 'x', config['api_key'] = 'x'
+_SUBSCRIPT_ASSIGNMENT = re.compile(
+    rf"(?P<head>\[[\t ]*{_QUOTED_NAME}[\t ]*\][\t ]*=(?![=~])[\t ]*)" + _QUOTED_BODY,
+    re.IGNORECASE,
+)
+# define('DB_PASSWORD', 'x'), os.Setenv("X", "x"), props.put("password", "x")
+_CALL_PAIR = re.compile(
+    rf"(?P<head>(?<![\w$])(?P<call>[A-Za-z_$][\w$]{{0,64}})\([\t ]*{_QUOTED_NAME}"
+    r"[\t ]*,[\t ]*)" + _QUOTED_BODY,
+    re.IGNORECASE,
+)
+# Calls that read a setting; their literal is a default, often a dev value.
+_LOOKUP_CALLS = frozenset(
+    {
+        "config",
+        "env",
+        "fetch",
+        "get",
+        "getenv",
+        "getenvironmentvariable",
+        "getproperty",
+        "getstring",
+        "getvalue",
+        "lookup",
+    }
+)
+# Kubernetes `- name: X` / `value: ...` and ECS {"name": "X", "value": "..."}
+_K8S_ENV = re.compile(
+    rf"(?P<head>^[\t ]*-[\t ]+name:[\t ]*(?P<nq>[\"']?){_NAME}(?P=nq)[\t ]*\r?\n"
+    r"[\t ]+value:[\t ]*)"
+    r"(?:(?P<q>[\"'])(?P<qvalue>(?:\\.|(?!(?P=q))[^\\\r\n])*)(?P=q)"
+    r"|(?P<value>[^\s\"'#][^\r\n]*))",
+    re.IGNORECASE | re.MULTILINE,
+)
+_NAME_VALUE_PAIR = re.compile(
+    rf"(?P<head>(?<![\w-])[\"']?name[\"']?[\t ]*[:=][\t ]*{_QUOTED_NAME}[\t ]*,"
+    r"\s{0,64}[\"']?value[\"']?[\t ]*[:=][\t ]*)"
+    r"(?P<q>[\"'])(?P<qvalue>(?:\\.|(?!(?P=q))[^\\\r\n])*)(?P=q)",
+    re.IGNORECASE,
+)
+# docker run -e X=..., env X=..., sudo X=..., `X=...`
+_INLINE_ASSIGNMENT = re.compile(
+    r"(?P<head>(?:(?<![\w-])(?:-e|--env|--build-arg)(?:[\t ]+|=)"
+    r"|(?<![\w-])(?:sudo|env)[\t ]+|`)"
+    rf"{_NAME}=)" + _OPTION_VALUE,
+    re.IGNORECASE,
+)
 _AWS_CONFIGURE = re.compile(
     r"^(?P<head>[\t ]*AWS[\t ]+(?:Secret[\t ]+Access[\t ]+Key|Session[\t ]+Token)"
     r"[\t ]*(?:\[[^\]\r\n]{0,64}\])?[\t ]*:[\t ]*)(?P<value>\S+)",
@@ -393,7 +510,9 @@ _PARAMETER = re.compile(
     rf"(?P<head>(?<=[?&;]){_NAME}=)(?P<value>[^\s&;#\"']+)", re.IGNORECASE
 )
 _LINE_ASSIGNMENT = re.compile(
-    r"^(?P<head>[\t ]*(?:(?:export|set|setx)[\t ]+|-[\t ]+)?"
+    r"^(?P<head>[\t ]*(?:(?:&gt;|>)[\t ]*)?(?:(?:[-*+]|\d{1,3}[.)])[\t ]+)?"
+    r"(?:[$#%][\t ]+)?(?:\d{1,6}[\t ]+)?(?:(?:sudo|env)[\t ]+)?"
+    r"(?:(?:export|set|setx|declare|readonly|local)[\t ]+)?"
     rf"(?P<name>{_NAME})(?P<sep>[\"']?[\t ]*(?:=>|[:=\uff1a\uff1d])"
     r"(?:[\t ]*\r?\n[\t ]+|[\t ]*)))(?P<value>\S+)",
     re.IGNORECASE | re.MULTILINE,
@@ -406,9 +525,15 @@ _SPACED_NAME = re.compile(
     r"(?P<value>[A-Za-z0-9._~+/=!@#$%^*?:|-]{1,1024})",
     re.IGNORECASE,
 )
-_CJK_NAME = re.compile(
-    r"(?P<head>(?:密碼|密码|令牌|密鑰|密钥|口令)[\t ]*"
-    r"(?:[:=\uff1a\uff1d]|是|為|为)[\t ]*)(?P<value>[!-~]+)"
+_CJK_NAMES = r"(?:存取權杖|權杖|密碼|密码|令牌|密鑰|密钥|金鑰|口令)"
+# 密碼: X, 密碼為: X, 密碼是：X mask the whole value ...
+_CJK_ASSIGNMENT = re.compile(
+    rf"(?P<head>{_CJK_NAMES}[\t ]*(?:是|為|为)?[\t ]*[:=\uff1a\uff1d][\t ]*)"
+    r"(?P<value>[!-~]+)"
+)
+# ... while 密碼是 X and 密碼 X are sentences: X must look like a secret.
+_CJK_PROSE = re.compile(
+    rf"(?P<head>{_CJK_NAMES}(?:[\t ]*(?:是|為|为)[\t ]*|[\t ]+))(?P<value>[!-~]+)"
 )
 _BEARER = re.compile(
     r"(?P<head>(?<![\w-])Bearer[\t ]+)(?P<value>[A-Za-z0-9._~+/=-]{8,})",
@@ -467,13 +592,43 @@ def _quoted_masker(match: Match[str]) -> str:
     return f"{match.group('head')}{quote}{REDACTED}{quote}"
 
 
+def _rest_of_line(match: Match[str], group: str) -> str:
+    text, start = match.string, match.start(group)
+    line_end = text.find("\n", start, start + _MAX_EXPRESSION)
+    if line_end < 0:
+        line_end = start + _MAX_EXPRESSION
+    return text[start:line_end].rstrip("\r")
+
+
 def _keep_authorization(match: Match[str]) -> bool:
     value = match.group("value")
     if _is_reference_or_placeholder(value):
         return True
     if match.group("scheme"):
         return bool(re.fullmatch(r"[a-z]+", value))  # "authorization: x check"
+    if _is_code(_rest_of_line(match, "value")):
+        return True  # authorization = request.headers.get("Authorization")
     return not _credential_shaped(value, 8)
+
+
+def _mask_call_pair(match: Match[str]) -> str:
+    value = match.group("value")
+    if _is_reference_or_placeholder(value):
+        return match.group(0)
+    if match.group("call").lower() in _LOOKUP_CALLS and not _credential_shaped(
+        value.rstrip(".?!:"), 6
+    ):
+        return match.group(0)  # os.getenv('TOKEN', 'dev')
+    return _quoted_masker(match)
+
+
+def _keep_cjk_prose(match: Match[str]) -> bool:
+    core = match.group("value").rstrip(".?!:")
+    return (
+        not _credential_shaped(core, 6)
+        or _is_reference_or_placeholder(core)
+        or _is_literal_data(core, match.group("head"))
+    )
 
 
 def _keep_flag_value(match: Match[str]) -> bool:
@@ -523,6 +678,16 @@ def _mask_line_assignment(match: Match[str]) -> str:
         return match.group(0)  # api_key: Optional[str], TOKEN = os.getenv(...)
     if spaced_equals and name == name.lower() and _LOWER_IDENTIFIER.fullmatch(value):
         return match.group(0)  # Python: access_token = oauth2_token
+    if "\n" in sep and value.endswith(":"):
+        return match.group(0)  # YAML: a nested key, not the value
+    argument = value.rstrip(",")
+    if (
+        sep.strip() == "="
+        and name == name.lower()
+        and value.endswith(",")
+        and (_LOWER_IDENTIFIER.fullmatch(argument) or _is_code(argument))
+    ):
+        return match.group(0)  # a keyword argument: password=os.environ["X"],
     following = match.string[match.end() : match.end() + 64]
     if (
         (":" in sep or "\uff1a" in sep)
@@ -539,11 +704,13 @@ def _keep_prose(match: Match[str], min_length: int = 6) -> bool:
     if name.lower().endswith("authorization"):
         return True
     following = match.string[match.end() : match.end() + 1]
+    # Sentence punctuation is not part of the value: "the token is expired."
+    core = value.rstrip(".?!:")
     return (
         following in ("(", "[")
-        or not _credential_shaped(value, min_length)
-        or _is_reference_or_placeholder(value)
-        or _is_literal_data(value, name)
+        or not _credential_shaped(core, min_length)
+        or _is_reference_or_placeholder(core)
+        or _is_literal_data(core, name)
     )
 
 
@@ -569,7 +736,8 @@ def _mask_cookie_pairs(text: str, start: int) -> Tuple[str, int]:
         ):
             parts.append(pair.group(0))
         else:
-            parts.append(f"{pair.group('name')}={REDACTED}{pair.group('sep') or ''}")
+            masked = f'"{REDACTED}"' if value.startswith('"') else REDACTED
+            parts.append(f"{pair.group('name')}={masked}{pair.group('sep') or ''}")
         position = pair.end()
         if not pair.group("sep"):
             break
@@ -597,9 +765,31 @@ def _mask_command(match: Match[str]) -> str:
         line = _CURL_USER_QUOTED.sub(_masker(_keep_user_password), line)
         line = _CURL_USER.sub(_masker(_keep_user_password), line)
         return _mask_after(line, _CURL_COOKIE_START)
-    if command.startswith("docker"):
-        return _DOCKER_PASSWORD.sub(_masker(_keep_flag_value), line)
+    if command.endswith("login"):
+        return _COMMAND_PASSWORD["login"].sub(_mask_option, line)
+    if command.startswith("mongo"):
+        return _COMMAND_PASSWORD["mongo"].sub(_mask_option, line)
+    if command in ("kubectl", "oc", "helm"):
+        return _COMMAND_PASSWORD["pairs"].sub(_mask_option, line)
+    if command in _COMMAND_PASSWORD:
+        return _COMMAND_PASSWORD[command].sub(_mask_option, line)
     return _MYSQL_PASSWORD.sub(_masker(_keep_flag_value), line)
+
+
+def _mask_option(match: Match[str]) -> str:
+    """Mask a quoted or bare option value; keep references, paths and flags."""
+    quoted = match.group("qvalue")
+    value = quoted if quoted is not None else match.group("value")
+    if (
+        value.startswith("-")
+        or _is_reference_or_placeholder(value)
+        or _is_literal_data(value, match.group("head"))
+    ):
+        return match.group(0)
+    if quoted is not None:
+        quote = match.group("q")
+        return f"{match.group('head')}{quote}{REDACTED}{quote}"
+    return match.group("head") + REDACTED
 
 
 def _keep_parameter(match: Match[str]) -> bool:
@@ -626,16 +816,23 @@ _STEPS: Tuple[Callable[[str], str], ...] = (
     lambda text: _SIGNATURE.sub(_masker(_keep_structured), text),
     lambda text: _mask_after(text, _COOKIE_START),
     lambda text: _COMMAND.sub(_mask_command, text),
+    lambda text: _OPENSSL_PASS.sub(_mask_openssl_pass, text),
+    lambda text: _INLINE_ASSIGNMENT.sub(_mask_option, text),
     lambda text: _LONG_USER_QUOTED.sub(_masker(_keep_user_password), text),
     lambda text: _LONG_USER.sub(_masker(_keep_user_password), text),
     lambda text: _FLAG.sub(_mask_quoted_flag, text),
     lambda text: _AWS_CONFIGURE.sub(_masker(_keep_structured), text),
     lambda text: _XML_KEY_VALUE.sub(_quoted_masker, text),
+    lambda text: _SUBSCRIPT_ASSIGNMENT.sub(_quoted_masker, text),
+    lambda text: _CALL_PAIR.sub(_mask_call_pair, text),
+    lambda text: _NAME_VALUE_PAIR.sub(_mask_option, text),
+    lambda text: _K8S_ENV.sub(_mask_option, text),
     lambda text: _QUOTED_ASSIGNMENT.sub(_quoted_masker, text),
     lambda text: _XML_ELEMENT.sub(_masker(_keep_structured), text),
     lambda text: _PARAMETER.sub(_masker(_keep_parameter), text),
     lambda text: _LINE_ASSIGNMENT.sub(_mask_line_assignment, text),
-    lambda text: _CJK_NAME.sub(_masker(_keep_structured), text),
+    lambda text: _CJK_ASSIGNMENT.sub(_masker(_keep_structured), text),
+    lambda text: _CJK_PROSE.sub(_masker(_keep_cjk_prose), text),
     lambda text: _SPACED_NAME.sub(
         _masker(lambda m: _keep_prose(m, min_length=8)), text
     ),
