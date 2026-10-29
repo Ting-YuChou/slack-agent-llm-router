@@ -90,29 +90,29 @@ def _assert_no_secrets(serialized: str):
         assert secret not in serialized
 
 
-def test_requests_raw_carries_context_size_and_hash_not_text():
+def test_requests_raw_carries_context_size_not_text_or_hash():
     request = _request()
 
     event = build_request_raw_event(request)
 
     assert "context" not in event
     assert event["context_chars"] == len(OTHER_MEMBERS_THREAD)
-    assert (
-        event["context_sha256"]
-        == hashlib.sha256(OTHER_MEMBERS_THREAD.encode("utf-8")).hexdigest()
-    )
+    # An unsalted hash of a short context can be confirmed by guessing it.
+    assert "context_sha256" not in event
+    digest = hashlib.sha256(OTHER_MEMBERS_THREAD.encode("utf-8")).hexdigest()
+    assert digest not in json.dumps(event)
     assert event["query_token_estimate"] == estimate_query_tokens(
         request.query, OTHER_MEMBERS_THREAD
     )
     assert "merger" not in json.dumps(event, ensure_ascii=False)
 
 
-def test_requests_raw_without_context_has_zero_size_and_no_hash():
+def test_requests_raw_without_context_has_zero_size():
     event = build_request_raw_event(_request(context=None, query="hello"))
 
     assert "context" not in event
     assert event["context_chars"] == 0
-    assert event["context_sha256"] is None
+    assert "context_sha256" not in event
     assert event["query_text"] == "hello"
 
 
@@ -318,7 +318,7 @@ def test_flink_features_match_between_new_and_legacy_raw_events():
     request = _request(query="Summarize this thread for me", context="word " * 600)
     new_event = build_request_raw_event(request)
     legacy_event = dict(new_event, context=request.context)
-    for key in ("context_chars", "context_sha256", "query_token_estimate"):
+    for key in ("context_chars", "query_token_estimate"):
         legacy_event.pop(key)
 
     feature_keys = ("long_context", "query_complexity", "query_token_estimate")

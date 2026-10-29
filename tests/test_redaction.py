@@ -1,8 +1,10 @@
-import hashlib
 import time
 
 import pytest
 
+from flink.logic import build_request_enriched_event
+from src.llm_router_part3_pipeline import build_request_raw_event
+from src.utils.schema import QueryRequest, UserTier
 from src.redaction import (
     REDACTED,
     context_summary,
@@ -148,12 +150,180 @@ def test_adversarial_input_is_linear(text):
     assert time.perf_counter() - started < 1.0
 
 
-def test_context_summary_reports_size_and_hash_only():
+def test_context_summary_reports_size_only():
     context = "其他成員的訊息 secret thread"
 
-    assert context_summary(context) == {
-        "context_chars": len(context),
-        "context_sha256": hashlib.sha256(context.encode("utf-8")).hexdigest(),
+    assert context_summary(context) == {"context_chars": len(context)}
+    assert context_summary(None) == {"context_chars": 0}
+    assert context_summary("") == {"context_chars": 0}
+
+
+PGP_KEY = (
+    "-----BEGIN PGP PRIVATE KEY BLOCK-----\n"
+    "\n"
+    "lQOYBF0Y8mMBCADGu7yWkzxV0ZyA9dZf3zU1Ym7Y0Gf0r1qkQ8cW6pJ1u0Kz3Xx0\n"
+    "=Ab12\n"
+    "-----END PGP PRIVATE KEY BLOCK-----"
+)
+MORE_SECRETS = {
+    "url_password": (
+        "connect to postgres://admin:hunter2@db.internal:5432/app",
+        "hunter2",
+    ),
+    "database_url": (
+        "DATABASE_URL=postgresql://svc:S3cr3t-Pa55@db:5432/app?sslmode=require",
+        "S3cr3t-Pa55",
+    ),
+    "redis_url_no_user": ("redis://:r3dis-pass@cache:6379/0 is down", "r3dis-pass"),
+    "curl_user": ("curl -u admin:hunter2 https://api.example.com", "hunter2"),
+    "curl_long_user": ("curl --user 'deploy:Tr0ub4dor&3' https://x", "Tr0ub4dor&3"),
+    "pgp_private_key": (f"my key:\n{PGP_KEY}\nwhy?", "lQOYBF0Y8mMBCADGu7yW"),
+    "stripe_secret": (
+        "stripe key sk_live_51H8xYzAbCdEfGhIjKlMnOp is rejected",
+        "sk_live_51H8xYzAbCdEfGhIjKlMnOp",
+    ),
+    "stripe_restricted": (
+        "rk_live_51H8xYzAbCdEfGhIjKlMnOp",
+        "rk_live_51H8xYzAbCdEfGhIjKlMnOp",
+    ),
+    "slack_webhook": (
+        "post to https://hooks.slack.com/services/T0123ABCD/B0456EFGH/"
+        "a1B2c3D4e5F6g7H8i9J0k1L2 please",
+        "a1B2c3D4e5F6g7H8i9J0k1L2",
+    ),
+    "huggingface": (
+        "HF says hf_AbCdEfGhIjKlMnOpQrStUvWxYz01234567 is invalid",
+        "hf_AbCdEfGhIjKlMnOpQrStUvWxYz01234567",
+    ),
+    "google_oauth": (
+        "access token ya29.a0AfH6SMBx3yZ-AbCdEfGhIjKlMnOpQrStUv expired",
+        "ya29.a0AfH6SMBx3yZ-AbCdEfGhIjKlMnOpQrStUv",
+    ),
+    "cookie_header": (
+        "Cookie: session=9f8e7d6c5b4a; csrftoken=abc123def456",
+        "9f8e7d6c5b4a",
+    ),
+    "db_pass": ("DB_PASS=Zx9!kLm2qR in the env", "Zx9!kLm2qR"),
+    "passwd": ("passwd: s3cr3tValue", "s3cr3tValue"),
+    "pwd": ("pwd=Qw3rty!99", "Qw3rty!99"),
+    "fullwidth_colon": ("我的 password：hunter2 登不進去", "hunter2"),
+    "aws_pair": (
+        "AKIAIOSFODNN7EXAMPLE wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    ),
+    "aws_secret_name": (
+        "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    ),
+    "authorization_basic": ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(MORE_SECRETS))
+def test_more_credential_formats_are_masked(name):
+    text, secret = MORE_SECRETS[name]
+
+    redacted = redact_text(text)
+
+    assert secret not in redacted
+    assert REDACTED in redacted
+    assert redact_text(redacted) == redacted
+
+
+def test_url_redaction_keeps_the_rest_of_the_url():
+    assert (
+        redact_text("postgres://admin:hunter2@db.internal:5432/app")
+        == "postgres://admin:[REDACTED]@db.internal:5432/app"
+    )
+
+
+def test_assignment_masks_only_the_value_not_the_rest_of_the_line():
+    assert (
+        redact_text("password=hunter2 and then explain the error")
+        == "password=[REDACTED] and then explain the error"
+    )
+
+
+def test_a_bare_forty_character_string_is_not_treated_as_an_aws_secret():
+    text = "commit 0123456789abcdef0123456789abcdef01234567 broke the build"
+
+    assert redact_text(text) == text
+
+
+# Ordinary, code and CJK queries: none holds a credential, so redaction must
+# leave each one unchanged and Flink must classify it the same way.
+ORDINARY_QUERIES = [
+    "Who is the bearer of this note?",
+    "Token: what is a JWT?",
+    "def login(password=None): pass",
+    "Bearer\n\nnext paragraph",
+    "Secret: debug this refactor of the architecture, root cause please",
+    "Password reset emails are not arriving; how do I debug SMTP?",
+    "Explain OAuth bearer tokens versus API keys",
+    "token = get_token()\nheaders = {'Authorization': f'Bearer {token}'}",
+    "config.password = os.environ['DB_PASSWORD']",
+    "api_key = settings.OPENAI_API_KEY",
+    "password = input('Password: ')",
+    "Write a Python function that validates a password: at least 8 characters",
+    "SELECT user, password_hash FROM users WHERE token_expires_at < now()",
+    "Set secret: true in the YAML and token: null when unused",
+    "export API_KEY=$OPENAI_API_KEY",
+    "The API key rotation runbook: step 1, revoke; step 2, reissue.",
+    "Cookie: what is a cookie?",
+    "Use `curl -u` to pass credentials",
+    "Connection strings look like postgres://user@host/db",
+    "Bearer authentication-and-authorization flow diagram",
+    "請幫我總結這份設計文件，重點放在延遲與成本。",
+    "密碼重設信沒有寄出，要怎麼排查？",
+    "token：請解釋 refresh token 的用途",
+    "Compare the tradeoffs of Redis vs Kafka for the session store",
+    "Critical production outage, respond ASAP",
+]
+
+
+@pytest.mark.parametrize("query", ORDINARY_QUERIES)
+def test_ordinary_queries_pass_redaction_unchanged(query):
+    assert redact_text(query) == query
+
+
+FLINK_FEATURE_KEYS = (
+    "query_type",
+    "query_complexity",
+    "query_token_estimate",
+    "long_context",
+    "code_heavy",
+    "requires_high_reasoning",
+    "requires_low_latency",
+    "route_to_fast_lane",
+    "priority",
+)
+
+
+@pytest.mark.parametrize("query", ORDINARY_QUERIES)
+def test_flink_features_match_for_old_and_new_events(query):
+    context = "Earlier in the thread: we discussed the rollout plan."
+    metadata = {"latency_sla": "interactive"}
+    request = QueryRequest(
+        query=query,
+        user_id="u1",
+        user_tier=UserTier.PREMIUM,
+        context=context,
+        metadata=metadata,
+    )
+    old_event = {
+        "request_id": request.request_id,
+        "user_id": "u1",
+        "user_tier": "premium",
+        "query_text": request.query,
+        "context": request.context,
+        "metadata": metadata,
+        "max_tokens": request.max_tokens,
+        "priority": request.priority,
     }
-    assert context_summary(None) == {"context_chars": 0, "context_sha256": None}
-    assert context_summary("") == {"context_chars": 0, "context_sha256": None}
+
+    new_features = build_request_enriched_event(build_request_raw_event(request))
+    old_features = build_request_enriched_event(old_event)
+
+    assert {key: new_features[key] for key in FLINK_FEATURE_KEYS} == {
+        key: old_features[key] for key in FLINK_FEATURE_KEYS
+    }
