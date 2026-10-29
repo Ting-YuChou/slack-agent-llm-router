@@ -176,6 +176,7 @@ async def test_primary_attempt_reserves_time_only_when_a_fallback_exists(
     (call,) = calls
     assert call["attempt_timeout_seconds"] == 45
     assert call["fallback_reserve_seconds"] == pytest.approx(expected_reserve, abs=0.05)
+    assert call["reserve_attempts"] == (1 if fallbacks else 0)
 
 
 @pytest.mark.asyncio
@@ -569,6 +570,20 @@ def _chain_engine(
     return engine
 
 
+def _shipped_scheduler(**overrides):
+    """The scheduler section of config/config.yaml, as deployed.
+
+    failure_mode becomes "open" so circuits fall back to process-local state:
+    the fake admission controller has no Redis eval.
+    """
+    path = Path(__file__).resolve().parents[1] / "config" / "config.yaml"
+    config = PlatformConfig.model_validate(yaml.safe_load(path.read_text()))
+    scheduler = config.inference.scheduler.model_dump(mode="json")
+    scheduler["failure_mode"] = "open"
+    scheduler.update(overrides)
+    return scheduler
+
+
 def _published_event(engine, request):
     from src.llm_router_part3_pipeline import build_inference_completed_event
 
@@ -603,6 +618,58 @@ async def test_unavailable_gpt5_is_answered_by_claude(primary_error):
     assert event["attempts"] == 2
     assert event["fallback_models"] == ["claude-sonnet-4-6", "mistral-7b"]
     engine.providers["vllm"].generate_response.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "primary_error",
+    [
+        pytest.param(_StatusError(503), id="5xx"),
+        pytest.param(_StatusError(429), id="429"),
+        pytest.param(_APIConnectionError("connection reset"), id="connection"),
+    ],
+)
+async def test_failing_gpt5_leaves_its_chain_an_attempt_under_shipped_scheduler(
+    primary_error,
+):
+    scheduler = _shipped_scheduler()
+    assert scheduler["enabled"] is True
+    assert scheduler["retry"]["max_attempts_per_request"] == 3
+    engine = _chain_engine(
+        _router(), primary_error, scheduler=scheduler, admission=_Admission()
+    )
+
+    response = await engine.process_query(_request(**_ENTERPRISE))
+
+    # The shared budget allows 3 transport attempts; the primary retries
+    # once and leaves the last one to its fallback.
+    assert engine.providers["openai"].generate_response.await_count == 2
+    assert response.error is None
+    assert response.model_name == "claude-sonnet-4-6"
+    assert response.fallback_from_model == "gpt-5"
+
+
+@pytest.mark.asyncio
+async def test_fallback_that_never_ran_is_not_marked_failed():
+    # One attempt per request: the primary uses it and the chain cannot run.
+    scheduler = _shipped_scheduler(retry={"max_attempts_per_request": 1})
+    router = _router()
+    engine = _chain_engine(
+        router, _StatusError(503), scheduler=scheduler, admission=_Admission()
+    )
+
+    response = await engine.process_query(_request(**_ENTERPRISE))
+
+    assert response.error == "inference_failed"
+    engine.providers["anthropic"].generate_response.assert_not_awaited()
+    engine.providers["vllm"].generate_response.assert_not_awaited()
+    failed = [
+        call.kwargs["model_name"]
+        for call in router.update_model_stats.call_args_list
+        if call.kwargs["success"] is False
+    ]
+    assert failed == ["gpt-5"]
+    assert "claude-sonnet-4-6" not in engine.inference_stats
 
 
 @pytest.mark.asyncio

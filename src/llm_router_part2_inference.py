@@ -3087,9 +3087,16 @@ class InferenceEngine:
     ) -> Tuple[InferenceResponse, str, Any]:
         primary_model = routing_decision.selected_model
         primary_started_at = time.time()
-        fallback_reserve_seconds = self._primary_fallback_reserve_seconds(
-            request, routing_decision, execution_budget
-        )
+        # With a shared budget, a primary that has a fallback holds back part
+        # of the time and one attempt for it.
+        fallback_reserve_seconds = 0.0
+        reserve_attempts = 0
+        if execution_budget is not None and self._primary_has_fallback_route(
+            request, routing_decision
+        ):
+            fallback_reserve_seconds = execution_budget.fallback_reserve_seconds()
+            reserve_attempts = 1
+        started_calls: List[str] = []
 
         try:
             response = await self._execute_model_request(
@@ -3097,6 +3104,8 @@ class InferenceEngine:
                 primary_model,
                 execution_budget=execution_budget,
                 fallback_reserve_seconds=fallback_reserve_seconds,
+                reserve_attempts=reserve_attempts,
+                started_calls=started_calls,
             )
             return response, primary_model, routing_decision
         except AdmissionRejectedError as exc:
@@ -3105,7 +3114,12 @@ class InferenceEngine:
                 raise
             # A circuit or capacity rejection: the model is unavailable.
             return await self._run_fallback_models(
-                request, routing_decision, execution_budget, exc, cross_provider=True
+                request,
+                routing_decision,
+                execution_budget,
+                exc,
+                cross_provider=True,
+                started_calls=started_calls,
             )
         except Exception as exc:
             primary_failures.append(exc)
@@ -3116,6 +3130,7 @@ class InferenceEngine:
                 execution_budget,
                 exc,
                 cross_provider=self.scheduler.is_availability_failure(exc),
+                started_calls=started_calls,
             )
 
     async def _run_fallback_models(
@@ -3126,13 +3141,15 @@ class InferenceEngine:
         primary_exc: Exception,
         *,
         cross_provider: bool,
+        started_calls: List[str],
     ) -> Tuple[InferenceResponse, str, Any]:
         """Try the fallbacks of a failed primary model, in order.
 
         The configured chain (any provider) comes first, and only when the
         primary was unavailable; local candidates keep their own triggers.
         With no candidate the primary's exception is raised, else the last
-        fallback's.
+        fallback's. ``started_calls`` lists the models whose provider was
+        called for this request.
         """
         primary_model = routing_decision.selected_model
         policy_context = await self._fallback_policy_context(request)
@@ -3180,7 +3197,10 @@ class InferenceEngine:
             if not response:
                 try:
                     response = await self._execute_model_request(
-                        request, fallback_model, execution_budget=execution_budget
+                        request,
+                        fallback_model,
+                        execution_budget=execution_budget,
+                        started_calls=started_calls,
                     )
                 except AdmissionRejectedError as fallback_rejection:
                     if not self.scheduler.allow_fallback_for_rejection(
@@ -3190,11 +3210,16 @@ class InferenceEngine:
                     last_exception = fallback_rejection
                     continue
                 except Exception as fallback_exc:
-                    self._record_failed_attempt(
-                        fallback_model,
-                        fallback_exc,
-                        fallback_started_at,
-                    )
+                    if fallback_model in started_calls:
+                        self._record_failed_attempt(
+                            fallback_model,
+                            fallback_exc,
+                            fallback_started_at,
+                        )
+                    else:
+                        # No attempt or time was left to call it: the model
+                        # did not fail, and the primary's failure is on record.
+                        setattr(fallback_exc, "_attempt_recorded", True)
                     last_exception = fallback_exc
                     continue
             response.fallback_from_model = primary_model
@@ -3365,26 +3390,18 @@ class InferenceEngine:
             request, routing_decision, execution_budget=None
         )
 
-    def _primary_fallback_reserve_seconds(
-        self,
-        request: QueryRequest,
-        routing_decision: Any,
-        execution_budget: Optional[RequestExecutionBudget],
-    ) -> float:
-        """Time the primary model leaves for its fallback route, if it has one."""
-        if execution_budget is None:
-            return 0.0
-        reserve_seconds = execution_budget.fallback_reserve_seconds()
-        if reserve_seconds <= 0:
-            return 0.0
+    def _primary_has_fallback_route(
+        self, request: QueryRequest, routing_decision: Any
+    ) -> bool:
+        """Whether a failed primary would have a fallback to try."""
         if getattr(request, "_rag_images", []):
             # A failed vision call is retried as text only.
-            return reserve_seconds
+            return True
         exclude = [routing_decision.selected_model]
         try:
             # Guardrails are only read once the primary fails, so a fallback
-            # blocked by them still reserves time here.
-            has_fallback = bool(
+            # blocked by them still counts here.
+            return bool(
                 self._get_local_fallback_models(
                     request, routing_decision, exclude_models=exclude
                 )
@@ -3395,8 +3412,7 @@ class InferenceEngine:
             )
         except Exception:
             logger.debug("Fallback route lookup failed", exc_info=True)
-            return 0.0
-        return reserve_seconds if has_fallback else 0.0
+            return False
 
     async def _execute_model_request(
         self,
@@ -3404,11 +3420,15 @@ class InferenceEngine:
         model_name: str,
         execution_budget: Optional[RequestExecutionBudget] = None,
         fallback_reserve_seconds: float = 0.0,
+        reserve_attempts: int = 0,
+        started_calls: Optional[List[str]] = None,
     ) -> InferenceResponse:
         """Execute a request against a specific model.
 
-        ``fallback_reserve_seconds`` of the request deadline stay unused by this
-        model's attempts, so a fallback can still run after it hangs.
+        ``fallback_reserve_seconds`` of the request deadline and
+        ``reserve_attempts`` of its shared attempts stay unused by this
+        model's retries, so a fallback can still run. The model is added to
+        ``started_calls`` once its provider is actually called.
         """
         provider = self._get_provider_for_model(model_name)
         if not provider:
@@ -3425,6 +3445,12 @@ class InferenceEngine:
             if isinstance(provider, BaseInferenceProvider)
             else None
         )
+
+        async def call_provider() -> InferenceResponse:
+            if started_calls is not None and model_name not in started_calls:
+                started_calls.append(model_name)
+            return await provider.generate_response(request, model_name)
+
         return await self.single_flight.run(
             request,
             provider,
@@ -3436,10 +3462,11 @@ class InferenceEngine:
                 estimated_input_tokens=self._estimate_provider_admission_input_tokens(
                     request
                 ),
-                operation=lambda: provider.generate_response(request, model_name),
+                operation=call_provider,
                 execution_budget=execution_budget,
                 attempt_timeout_seconds=attempt_timeout_seconds,
                 fallback_reserve_seconds=fallback_reserve_seconds,
+                reserve_attempts=reserve_attempts,
             ),
         )
 

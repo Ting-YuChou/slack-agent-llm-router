@@ -467,12 +467,16 @@ class ProviderCapacityScheduler:
         execution_budget: Optional[RequestExecutionBudget] = None,
         attempt_timeout_seconds: Optional[float] = None,
         fallback_reserve_seconds: float = 0.0,
+        reserve_attempts: int = 0,
     ) -> Any:
         """Run a non-streaming provider call under scheduler control.
 
         Each attempt may take the provider timeout, but never more than the
         request deadline minus ``fallback_reserve_seconds``: a hung primary
-        must leave its fallback time to answer.
+        must leave its fallback time to answer. Retries also stop while
+        ``reserve_attempts`` of the request's shared attempts are left, so a
+        primary that keeps failing leaves its fallback an attempt. The first
+        attempt always runs.
         """
         if not self.enabled:
             self._record_decision(provider, model_name, "allowed", "disabled")
@@ -572,6 +576,9 @@ class ProviderCapacityScheduler:
                 if (
                     local_attempt >= attempts
                     or budget.attempts_used >= budget.max_attempts
+                    # The request's last attempts belong to the fallback.
+                    or budget.max_attempts - budget.attempts_used
+                    <= max(0, reserve_attempts)
                     or budget.remaining_seconds <= 0
                     or not self._is_retryable_exception(exc)
                     # Another try would eat into the time held for the fallback.
