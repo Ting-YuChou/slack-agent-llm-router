@@ -175,16 +175,26 @@ def test_attempt_timeout_is_provider_timeout_capped_by_remaining_minus_reserve()
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("fallbacks", "expected_reserve"),
-    [([], 0.0), (["mistral-7b"], 3.0)],
-    ids=["no-fallback", "fallback"],
+    ("fallbacks", "max_attempts", "expected_reserve", "expected_reserve_attempts"),
+    [
+        ([], 3, 0.0, 0),
+        (["mistral-7b"], 3, 3.0, 1),
+        # One attempt per request: the fallback can never run, so holding
+        # time back would only cut the primary short.
+        (["mistral-7b"], 1, 0.0, 0),
+    ],
+    ids=["no-fallback", "fallback", "fallback-but-one-attempt"],
 )
-async def test_primary_attempt_reserves_time_only_when_a_fallback_exists(
-    fallbacks, expected_reserve
+async def test_primary_attempt_reserves_time_only_when_a_fallback_can_run(
+    fallbacks, max_attempts, expected_reserve, expected_reserve_attempts
 ):
     engine = _mock_engine(
         {"gpt-5": "openai", "mistral-7b": "vllm"},
-        scheduler={"request_deadline_seconds": 10, "fallback_reserve_ratio": 0.3},
+        scheduler={
+            "request_deadline_seconds": 10,
+            "fallback_reserve_ratio": 0.3,
+            "retry": {"max_attempts_per_request": max_attempts},
+        },
     )
     engine.providers = {"openai": OpenAIProvider({"timeout": 45})}
     engine._get_local_fallback_models = MagicMock(return_value=fallbacks)
@@ -205,16 +215,18 @@ async def test_primary_attempt_reserves_time_only_when_a_fallback_exists(
     (call,) = calls
     assert call["attempt_timeout_seconds"] == 45
     assert call["fallback_reserve_seconds"] == pytest.approx(expected_reserve, abs=0.05)
-    assert call["reserve_attempts"] == (1 if fallbacks else 0)
+    assert call["reserve_attempts"] == expected_reserve_attempts
 
 
 @pytest.mark.asyncio
 async def test_hung_primary_leaves_time_for_fallback_within_deadline():
+    # The hung primary gets a quarter of the deadline; the fallback has the
+    # other 0.75 s, far more than it needs even on a loaded machine.
     engine = _mock_engine(
         {"gpt-5": "openai", "mistral-7b": "vllm"},
         scheduler={
-            "request_deadline_seconds": 0.5,
-            "fallback_reserve_ratio": 0.3,
+            "request_deadline_seconds": 1.0,
+            "fallback_reserve_ratio": 0.75,
             **_RETRY,
         },
     )
@@ -231,7 +243,7 @@ async def test_hung_primary_leaves_time_for_fallback_within_deadline():
 
     assert response.error is None
     assert response.model_name == "mistral-7b"
-    assert elapsed < 0.5
+    assert elapsed < 1.0
     fallback.assert_awaited_once()
 
 
@@ -242,7 +254,9 @@ async def test_hung_primary_leaves_time_for_fallback_within_deadline():
         # The attempt had its whole provider timeout: a real hang.
         pytest.param(0.05, 1, id="full-provider-timeout"),
         # The reserve left a sliver of a 60 s timeout: says nothing about it.
-        pytest.param(60, 0, id="window-cut-by-reserve"),
+        # A timeout far beyond the deadline (vLLM's 300 s against 60 s): the
+        # hang used every second the request could give it.
+        pytest.param(60, 1, id="provider-timeout-beyond-deadline"),
     ],
 )
 async def test_hung_primary_counts_against_its_circuit_only_with_a_long_window(
@@ -340,7 +354,7 @@ async def test_retry_timing_out_in_the_queue_is_not_a_provider_failure():
 
 
 class _ControlledBudget(RequestExecutionBudget):
-    """A budget whose deadline passes when the test says so."""
+    """A budget with 5 s left until the test says the deadline passed."""
 
     expired = False
 
@@ -351,11 +365,21 @@ class _ControlledBudget(RequestExecutionBudget):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "deadline_passed", [True, False], ids=["deadline", "caller-went-away"]
+    ("deadline_seconds", "deadline_passed", "expected_failures"),
+    [
+        # The deadline cancelled a call that had the whole 5 s deadline.
+        pytest.param(5, True, 1, id="deadline-after-full-window"),
+        # Earlier steps had spent 45 s of a 50 s deadline: a sliver.
+        pytest.param(50, True, 0, id="deadline-after-cut-short-window"),
+        # Cancelled with time left: the caller went away, not the provider.
+        pytest.param(5, False, 0, id="caller-went-away"),
+    ],
 )
-async def test_cancelled_call_is_not_a_circuit_failure(deadline_passed):
+async def test_cancelled_call_counts_only_when_the_deadline_ended_a_full_window(
+    deadline_seconds, deadline_passed, expected_failures
+):
     scheduler = ProviderCapacityScheduler(_CIRCUIT, _Admission())
-    budget = _ControlledBudget(max_attempts=1, deadline_seconds=5)
+    budget = _ControlledBudget(max_attempts=1, deadline_seconds=deadline_seconds)
     started = asyncio.Event()
 
     async def hang():
@@ -378,32 +402,79 @@ async def test_cancelled_call_is_not_a_circuit_failure(deadline_passed):
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    # A deadline that cancels a call cut its window short, like the reserve.
     state = await scheduler._read_circuit_state("openai", "gpt-5")
-    assert state.get("failure_count", 0) == 0
+    assert state.get("failure_count", 0) == expected_failures
 
 
 @pytest.mark.asyncio
-async def test_timeout_of_a_window_cut_by_the_deadline_is_not_a_circuit_failure():
+async def test_hung_primary_without_fallback_counts_when_the_outer_deadline_wins():
+    # Single-flight off (the default) and no fallback: the scheduler's attempt
+    # timeout and the request's own deadline fire together, and the outer
+    # cancel usually wins.
+    counted = 0
+    for _ in range(5):
+        engine = _chain_engine(
+            _router(("gpt-5",)),
+            None,
+            chains={},
+            scheduler={
+                "request_deadline_seconds": 0.1,
+                "min_attempt_window_seconds": 0,
+                **_CIRCUIT,
+                **_RETRY,
+            },
+            admission=_Admission(),
+        )
+        assert engine.single_flight.enabled is False
+        engine.providers = {"openai": _TimedProvider("openai", None, timeout=0.1)}
+
+        response = await asyncio.wait_for(
+            engine.process_query(_request(**_ENTERPRISE)), timeout=3
+        )
+
+        assert response.error == "inference_failed"
+        state = await engine.scheduler._read_circuit_state("openai", "gpt-5")
+        counted += state.get("failure_count", 0)
+
+    assert counted == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("spent_share", "expected_failures"),
+    [
+        # A 300 s timeout against a 60 s deadline, scaled down: the hang had
+        # the whole deadline, the longest window any attempt could get.
+        pytest.param(0.0, 1, id="whole-deadline"),
+        # Earlier steps spent 70% of the deadline: the 30% left is a sliver.
+        pytest.param(0.7, 0, id="deadline-mostly-spent"),
+    ],
+)
+async def test_timeout_counts_against_the_circuit_by_the_window_the_request_allowed(
+    spent_share, expected_failures
+):
     scheduler = ProviderCapacityScheduler(
         {**_CIRCUIT, "min_attempt_window_seconds": 0}, _Admission()
     )
+    deadline = 0.1
 
     with pytest.raises(asyncio.TimeoutError):
         await scheduler.run_provider_call(
             request=_request(),
-            model_name="gpt-5",
-            provider="openai",
+            model_name="mistral-7b",
+            provider="vllm",
             estimated_input_tokens=1,
             operation=_hang,
             execution_budget=RequestExecutionBudget(
-                max_attempts=1, deadline_seconds=0.05
+                max_attempts=1,
+                deadline_seconds=deadline,
+                started_at=time.monotonic() - deadline * spent_share,
             ),
-            attempt_timeout_seconds=5,
+            attempt_timeout_seconds=deadline * 5,
         )
 
-    state = await scheduler._read_circuit_state("openai", "gpt-5")
-    assert state.get("failure_count", 0) == 0
+    state = await scheduler._read_circuit_state("vllm", "mistral-7b")
+    assert state.get("failure_count", 0) == expected_failures
 
 
 @pytest.mark.asyncio
@@ -428,7 +499,8 @@ async def test_attempt_with_less_than_the_minimum_window_never_starts():
             attempt_timeout_seconds=5,
         )
 
-    assert time.monotonic() - started < 0.1
+    # Raised at once, not after waiting out the 0.5 s deadline.
+    assert time.monotonic() - started < 0.3
     operation.assert_not_awaited()
     assert admission.calls == []
     state = await scheduler._read_circuit_state("openai", "gpt-5")
@@ -456,6 +528,44 @@ async def test_retry_is_not_started_with_less_than_the_minimum_window_left():
             operation=operation,
             execution_budget=RequestExecutionBudget(
                 max_attempts=3, deadline_seconds=0.12
+            ),
+            attempt_timeout_seconds=5,
+        )
+
+    assert operation.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("left_after_wait", [0.03, 0.0], ids=["sliver", "nothing"])
+async def test_retry_that_loses_its_window_while_waiting_raises_the_real_failure(
+    left_after_wait,
+):
+    scheduler = ProviderCapacityScheduler(
+        {
+            "min_attempt_window_seconds": 0.05,
+            "retry": {"max_attempts_per_request": 3, "initial_backoff_ms": 0},
+        },
+        _Admission(),
+    )
+    deadline = 0.2
+    operation = AsyncMock(side_effect=_StatusError(503))
+
+    async def slow_retry_budget(*_args):
+        # The retry-budget check (a Redis round trip) eats the window.
+        await asyncio.sleep(deadline - left_after_wait)
+        return True
+
+    scheduler._consume_retry_budget = slow_retry_budget
+
+    with pytest.raises(_StatusError):
+        await scheduler.run_provider_call(
+            request=_request(),
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+            operation=operation,
+            execution_budget=RequestExecutionBudget(
+                max_attempts=3, deadline_seconds=deadline
             ),
             attempt_timeout_seconds=5,
         )
@@ -611,13 +721,13 @@ async def test_vllm_client_gets_short_connect_and_provider_timeout_elsewhere(
 @pytest.mark.asyncio
 async def test_slow_rag_shortens_the_llm_window_instead_of_extending_the_deadline():
     engine = _mock_engine(
-        {"gpt-5": "openai"}, scheduler={"request_deadline_seconds": 0.3}
+        {"gpt-5": "openai"}, scheduler={"request_deadline_seconds": 0.6}
     )
     engine.providers = {"openai": SimpleNamespace(generate_response=_hang)}
     engine._get_local_fallback_models = MagicMock(return_value=[])
 
     async def slow_rag(*_args):
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.3)
         return None
 
     engine._run_rag_if_needed = slow_rag
@@ -627,7 +737,8 @@ async def test_slow_rag_shortens_the_llm_window_instead_of_extending_the_deadlin
     elapsed = time.monotonic() - started
 
     assert response.error == "inference_failed"
-    assert elapsed < 0.42
+    # Ends at the 0.6 s deadline, not at 0.3 s of retrieval + a 0.6 s window.
+    assert elapsed < 0.8
 
 
 @pytest.mark.asyncio
@@ -645,7 +756,8 @@ async def test_hung_retrieval_is_capped_by_the_request_deadline(stage):
     elapsed = time.monotonic() - started
 
     assert response.error == "inference_failed"
-    assert elapsed < 0.35
+    # Ends at the 0.2 s deadline; an uncapped hang would run into the guard.
+    assert elapsed < 1.0
     provider.assert_not_awaited()
 
 
@@ -687,6 +799,86 @@ def test_request_stage_deadline_error_carries_its_http_mapping():
         "timeout",
         504,
     )
+
+
+def _blame(router, engine, request):
+    """Router-stat failures, inference_stats errors and the published event."""
+    from src.llm_router_part3_pipeline import build_inference_completed_event
+
+    failures = [
+        call.kwargs["model_name"]
+        for call in router.update_model_stats.call_args_list
+        if call.kwargs.get("success") is False
+    ]
+    errors = {
+        model: stats["error_count"] for model, stats in engine.inference_stats.items()
+    }
+    published = engine.event_producer.produce_inference_completed.await_args.args[1]
+    return failures, errors, build_inference_completed_event(request, published)
+
+
+@pytest.mark.asyncio
+async def test_models_skipped_for_lack_of_time_are_not_blamed():
+    from flink.logic import counts_toward_provider_health
+
+    router = _router()
+    engine = _chain_engine(
+        router,
+        None,
+        scheduler=_shipped_scheduler(request_deadline_seconds=1.0),
+        admission=_Admission(),
+    )
+    openai_provider = _TimedProvider("openai", 0.1)
+    anthropic_provider = _TimedProvider("anthropic", 0.1)
+    engine.providers = {"openai": openai_provider, "anthropic": anthropic_provider}
+
+    async def slow_rag(*_args):
+        await asyncio.sleep(0.93)  # Ends in time, but leaves less than 1 s.
+        return None
+
+    engine._run_rag_if_needed = slow_rag
+    request = _request(**_ENTERPRISE)
+
+    response = await engine.process_query(request)
+
+    assert response.error == "inference_failed"
+    assert openai_provider.calls == anthropic_provider.calls == []
+    failures, errors, event = _blame(router, engine, request)
+    assert failures == []
+    assert errors == {}
+    assert not counts_toward_provider_health(event)
+
+
+@pytest.mark.asyncio
+async def test_deadline_spent_before_any_model_call_is_a_stage_deadline():
+    from flink.logic import counts_toward_provider_health
+    from src.llm_router_part2_inference import RequestStageDeadlineError
+
+    router = _router()
+    engine = _chain_engine(router, None, scheduler={"request_deadline_seconds": 0.2})
+
+    async def slow_cache_lookup(*_args):
+        await asyncio.sleep(0.25)
+        return None
+
+    engine._get_cached_inference_response = slow_cache_lookup
+    request = _request(**_ENTERPRISE)
+
+    response = await engine.process_query(request)
+
+    assert response.error == "inference_failed"
+    engine.providers["openai"].generate_response.assert_not_awaited()
+    failures, errors, event = _blame(router, engine, request)
+    assert failures == []
+    assert not counts_toward_provider_health(event)
+
+    budget = RequestExecutionBudget(
+        max_attempts=3, deadline_seconds=1, started_at=time.monotonic() - 2
+    )
+    with pytest.raises(RequestStageDeadlineError):
+        await engine._generate_response_with_fallback(
+            _request(), SimpleNamespace(selected_model="gpt-5"), budget
+        )
 
 
 # --- I4: config-driven cross-provider fallback chains --------------------------
@@ -971,13 +1163,50 @@ async def test_attempts_count_only_models_whose_provider_was_called():
 
 
 @pytest.mark.asyncio
+async def test_single_flight_follower_answered_by_a_fallback_reports_an_attempt():
+    from src.llm_router_part2_inference import SingleFlightCoordinator
+
+    engine = _chain_engine(
+        _router(),
+        None,
+        scheduler=_shipped_scheduler(),
+        admission=_RejectModelsAdmission("gpt-5"),
+    )
+    engine.single_flight = SingleFlightCoordinator({"enabled": True})
+
+    async def slow_claude(_request, model):
+        await asyncio.sleep(0.2)  # Long enough for the second request to join.
+        return _response(model, "anthropic")
+
+    engine.providers["anthropic"].generate_response = AsyncMock(side_effect=slow_claude)
+    decision = SimpleNamespace(selected_model="gpt-5", token_count=64)
+
+    results = await asyncio.gather(
+        *(
+            engine._generate_response_with_fallback(_request(**_ENTERPRISE), decision)
+            for _ in range(2)
+        )
+    )
+
+    # One claude call answered both requests; gpt-5 was never called.
+    engine.providers["anthropic"].generate_response.assert_awaited_once()
+    engine.providers["openai"].generate_response.assert_not_awaited()
+    for response, model_name, _decision in results:
+        assert model_name == "claude-sonnet-4-6"
+        assert response.fallback_from_model == "gpt-5"
+        assert response.attempts == 1
+
+
+@pytest.mark.asyncio
 async def test_hung_gpt5_attempt_is_answered_by_claude():
+    # gpt-5 hangs through its quarter of the deadline; claude has the other
+    # 0.75 s, far more than it needs even on a loaded machine.
     engine = _chain_engine(
         _router(),
         _hang,
         scheduler={
-            "request_deadline_seconds": 0.5,
-            "fallback_reserve_ratio": 0.3,
+            "request_deadline_seconds": 1.0,
+            "fallback_reserve_ratio": 0.75,
             **_RETRY,
         },
     )
@@ -987,7 +1216,7 @@ async def test_hung_gpt5_attempt_is_answered_by_claude():
         engine.process_query(_request(**_ENTERPRISE)), timeout=3
     )
 
-    assert time.monotonic() - started < 0.5
+    assert time.monotonic() - started < 1.0
     assert response.model_name == "claude-sonnet-4-6"
     assert response.fallback_from_model == "gpt-5"
 
@@ -1312,3 +1541,61 @@ async def test_text_only_retry_fails_when_no_candidate_fits_the_tier():
 
     engine.providers["anthropic"].generate_response.assert_not_awaited()
     engine.providers["openai"].generate_response.assert_not_awaited()
+
+
+def _failed_vision_engine(router, text_only_error=None):
+    """gpt-5 fails a vision request that has no vision fallback left."""
+    engine = _chain_engine(router, _StatusError(503), chains={})
+    if text_only_error is not None:
+        engine.providers["vllm"].generate_response = AsyncMock(
+            side_effect=text_only_error
+        )
+
+    async def attach_images(request, routing_decision, _rag_result):
+        request._rag_images = [
+            SimpleNamespace(
+                figure_id="fig-1",
+                content_checksum_sha256="abc",
+                asset_ref=SimpleNamespace(index_version="v1", checksum_sha256="abc"),
+            )
+        ]
+        return routing_decision
+
+    engine._prepare_rag_images = attach_images
+    return engine
+
+
+@pytest.mark.asyncio
+async def test_text_only_retry_with_no_tier_model_does_not_blame_the_primary_twice():
+    router = _router(_VISION_MODELS)
+    engine = _failed_vision_engine(router)
+    request = _request(
+        user_tier=UserTier.FREE, metadata={"rag_original_model": "claude-sonnet-4-6"}
+    )
+
+    response = await engine.process_query(request)
+
+    assert response.error == "inference_failed"
+    failures, errors, _event = _blame(router, engine, request)
+    assert failures == ["gpt-5"]
+    assert errors == {"gpt-5": 1}
+
+
+@pytest.mark.asyncio
+async def test_failed_text_only_retry_is_blamed_on_its_own_model():
+    # With anthropic blocked no vision fallback is left, only the text retry.
+    router = _router(
+        _VISION_MODELS, policy=_PolicyCache(blocked_providers=["anthropic"])
+    )
+    engine = _failed_vision_engine(router, text_only_error=_StatusError(503))
+    request = _request(
+        **_ENTERPRISE, metadata={"rag_text_fallback_models": ["mistral-7b"]}
+    )
+
+    response = await engine.process_query(request)
+
+    assert response.error == "inference_failed"
+    engine.providers["vllm"].generate_response.assert_awaited_once()
+    failures, errors, _event = _blame(router, engine, request)
+    assert sorted(failures) == ["gpt-5", "mistral-7b"]
+    assert errors == {"gpt-5": 1, "mistral-7b": 1}

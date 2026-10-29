@@ -343,6 +343,10 @@ class _QueuePollCoordinator:
             self._wake_best(state)
 
 
+# A cancellation this close to the request deadline is the deadline's doing.
+_DEADLINE_SLACK_SECONDS = 0.01
+
+
 @dataclass
 class RequestExecutionBudget:
     """One monotonic deadline and transport-attempt budget for a request."""
@@ -495,9 +499,10 @@ class ProviderCapacityScheduler:
         An attempt (or retry) whose window would be shorter than
         min_attempt_window_seconds (capped at the provider timeout) is not
         started. A timeout counts against the circuit only when the attempt
-        had at least circuit_timeout_min_window_ratio of the provider
-        timeout: one left a sliver by the deadline or the reserve (a slow
-        RAG step, say) says nothing about the provider.
+        had at least circuit_timeout_min_window_ratio of the longest window
+        the request could give it (see _circuit_timeout_window): one left a
+        sliver by earlier steps (a slow RAG step, say) says nothing about
+        the provider.
         """
         if not self.enabled:
             self._record_decision(provider, model_name, "allowed", "disabled")
@@ -530,18 +535,22 @@ class ProviderCapacityScheduler:
             return window <= 0 or window < min_window
 
         while local_attempt < attempts:
-            budget.ensure_available()
             attempt_timeout = budget.attempt_timeout_seconds(
                 attempt_timeout_seconds, fallback_reserve_seconds
             )
+            if last_exc is not None and (
+                budget.remaining_seconds <= 0 or too_short(attempt_timeout)
+            ):
+                # The retry lost its window while waiting (backoff, retry
+                # budget): the failure that prompted it is the real one.
+                raise last_exc
+            budget.ensure_available()
             if too_short(attempt_timeout):
                 # Too little of the deadline is left (or the rest is held for
                 # the fallback) for a provider call to be worth starting.
                 raise asyncio.TimeoutError("request execution deadline exceeded")
-            window_cut_short = (
-                not attempt_timeout_seconds
-                or attempt_timeout
-                < self.circuit_timeout_min_window_ratio * attempt_timeout_seconds
+            window_cut_short = attempt_timeout < self._circuit_timeout_window(
+                budget, attempt_timeout_seconds, fallback_reserve_seconds
             )
             lease: Optional[SchedulerLease] = None
             response = None
@@ -576,6 +585,29 @@ class ProviderCapacityScheduler:
                     self._record_retry_metric(provider, model_name, "success")
                 return response
             except asyncio.CancelledError:
+                # Without single-flight the request's own deadline and this
+                # attempt's timeout fire together, and the outer cancel tends
+                # to win: a hang that had a full window counts all the same.
+                if (
+                    operation_started
+                    and not window_cut_short
+                    and budget.remaining_seconds <= _DEADLINE_SLACK_SECONDS
+                ):
+                    try:
+                        await self.record_failure(
+                            provider=provider,
+                            model_name=model_name,
+                            error=asyncio.TimeoutError(
+                                "request execution deadline exceeded"
+                            ),
+                            request_started_at_ms=request_started_at_ms,
+                            circuit_permit=lease.circuit_permit if lease else None,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Circuit failure transition failed after a provider hang",
+                            exc_info=True,
+                        )
                 raise
             except Exception as exc:
                 last_exc = exc
@@ -618,7 +650,7 @@ class ProviderCapacityScheduler:
                 self._record_retry_metric(provider, model_name, "retry")
                 backoff = self._retry_backoff_seconds(local_attempt)
                 if backoff >= budget.remaining_seconds:
-                    raise asyncio.TimeoutError("request execution deadline exceeded")
+                    raise  # No time to retry: the real failure stands.
                 await self._sleep_func(backoff)
             finally:
                 await self.release(
@@ -735,6 +767,28 @@ class ProviderCapacityScheduler:
                 in SCHEDULER_FALLBACK_REASONS
             )
         return str(decision.reason) in SCHEDULER_FALLBACK_REASONS
+
+    def _circuit_timeout_window(
+        self,
+        budget: RequestExecutionBudget,
+        provider_timeout_seconds: Optional[float],
+        fallback_reserve_seconds: float,
+    ) -> float:
+        """Shortest attempt window whose timeout counts against the circuit.
+
+        A share (circuit_timeout_min_window_ratio) of the longest window the
+        request could give the attempt: the provider timeout, but no more
+        than the deadline less the fallback reserve when one is held. A hang
+        that had the whole deadline therefore counts for any provider, even
+        one whose timeout outlasts the deadline (vLLM's 300 s against 60 s).
+        """
+        longest = float(budget.deadline_seconds)
+        if fallback_reserve_seconds > 0:
+            reserve_ratio = min(max(float(budget.fallback_reserve_ratio), 0.0), 1.0)
+            longest *= 1.0 - reserve_ratio
+        if provider_timeout_seconds and provider_timeout_seconds > 0:
+            longest = min(longest, float(provider_timeout_seconds))
+        return self.circuit_timeout_min_window_ratio * longest
 
     def _min_attempt_window(self, provider_timeout_seconds: Optional[float]) -> float:
         """Shortest window worth starting a provider attempt in.

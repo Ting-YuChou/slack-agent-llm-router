@@ -667,7 +667,8 @@ class ProviderSchedulerConfig(ConfigModel):
     # left (capped at the provider timeout); it fails as a deadline timeout.
     min_attempt_window_seconds: float = Field(1.0, ge=0.0)
     # An attempt timeout counts against the provider's circuit only when the
-    # attempt had at least this share of the provider timeout.
+    # attempt had at least this share of the longest window the request could
+    # give it: the provider timeout, capped at the deadline less any reserve.
     circuit_timeout_min_window_ratio: float = Field(0.5, ge=0.0, le=1.0)
     retry: SchedulerRetryConfig = Field(default_factory=SchedulerRetryConfig)
     circuit_breaker: SchedulerCircuitBreakerConfig = Field(

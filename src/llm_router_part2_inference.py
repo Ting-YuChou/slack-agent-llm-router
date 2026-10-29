@@ -3635,6 +3635,12 @@ class InferenceEngine:
             return await self._generate_response_with_fallback_unbounded(
                 request, routing_decision, execution_budget=None
             )
+        if execution_budget.remaining_seconds <= 0:
+            # Routing, compression, image prep or the cache lookup used the
+            # whole deadline: no model or provider is to blame.
+            raise RequestStageDeadlineError(
+                "request deadline reached before the model call"
+            )
         execution_budget.ensure_available()
         return await asyncio.wait_for(
             self._generate_response_with_fallback_unbounded(
@@ -3674,11 +3680,14 @@ class InferenceEngine:
         primary_model = routing_decision.selected_model
         primary_started_at = time.time()
         # With a shared budget, a primary that has a fallback holds back part
-        # of the time and one attempt for it.
+        # of the time and one attempt for it. With a single attempt per
+        # request the fallback could never run, so nothing is held back.
         fallback_reserve_seconds = 0.0
         reserve_attempts = 0
-        if execution_budget is not None and self._primary_has_fallback_route(
-            request, routing_decision
+        if (
+            execution_budget is not None
+            and execution_budget.max_attempts >= 2
+            and self._primary_has_fallback_route(request, routing_decision)
         ):
             fallback_reserve_seconds = execution_budget.fallback_reserve_seconds()
             reserve_attempts = 1
@@ -3708,8 +3717,20 @@ class InferenceEngine:
                 started_calls=started_calls,
             )
         except Exception as exc:
-            primary_failures.append(exc)
-            self._record_failed_attempt(primary_model, exc, primary_started_at)
+            if primary_model in started_calls:
+                primary_failures.append(exc)
+                self._record_failed_attempt(primary_model, exc, primary_started_at)
+            else:
+                # The provider was never called (no time was left for an
+                # attempt): neither the model nor its provider failed.
+                setattr(exc, "_attempt_recorded", True)
+                primary_failures.append(
+                    RequestStageDeadlineError(
+                        "request deadline reached before the model call"
+                    )
+                    if isinstance(exc, asyncio.TimeoutError)
+                    else exc
+                )
             return await self._run_fallback_models(
                 request,
                 routing_decision,
@@ -3813,8 +3834,14 @@ class InferenceEngine:
                     continue
             response.fallback_from_model = primary_model
             # Only models whose provider was called count: not those rejected
-            # at admission or by an open circuit, nor a fallback cache hit.
-            response.attempts = len(started_calls)
+            # at admission or by an open circuit, nor a fallback cache hit. A
+            # fallback that answered counts even when a coalesced call (the
+            # single-flight leader's) reached its provider.
+            response.attempts = (
+                len(started_calls)
+                if from_cache
+                else len({*started_calls, fallback_model})
+            )
             return (
                 response,
                 fallback_model,
@@ -3844,11 +3871,30 @@ class InferenceEngine:
         *,
         started_calls: List[str],
     ) -> Tuple[InferenceResponse, str, Any]:
-        """The text-only retry of a failed vision request, marked as a fallback."""
+        """The text-only retry of a failed vision request, marked as a fallback.
+
+        A failure is recorded against the text-only model when it was called;
+        the earlier failures are already on record, so the routed model is
+        not blamed again.
+        """
         primary_model = routing_decision.selected_model
-        result = await self._execute_text_only_after_vision_failure(
-            request, routing_decision, execution_budget
-        )
+        retry_started_at = time.time()
+        retry_calls: List[str] = []
+        try:
+            result = await self._execute_text_only_after_vision_failure(
+                request, routing_decision, execution_budget, started_calls=retry_calls
+            )
+        except AdmissionRejectedError:
+            raise
+        except Exception as exc:
+            for model_name in retry_calls:
+                self._record_failed_attempt(model_name, exc, retry_started_at)
+            setattr(exc, "_attempt_recorded", True)
+            raise
+        finally:
+            started_calls.extend(
+                name for name in retry_calls if name not in started_calls
+            )
         response, model_name, decision = result
         response.attempts = len({*started_calls, model_name})
         response.fallback_from_model = (
@@ -3939,6 +3985,7 @@ class InferenceEngine:
         request: QueryRequest,
         routing_decision: Any,
         execution_budget: Optional[RequestExecutionBudget],
+        started_calls: Optional[List[str]] = None,
     ) -> Tuple[InferenceResponse, str, Any]:
         """Retry once without images only after all vision-capable routes fail."""
         request._rag_images = []
@@ -3969,8 +4016,11 @@ class InferenceEngine:
         if not allowed:
             raise ValueError("No text-only model is open to the user's tier")
         model_name = allowed[0]
+        call_options: Dict[str, Any] = {"execution_budget": execution_budget}
+        if started_calls is not None:
+            call_options["started_calls"] = started_calls
         response = await self._execute_model_request(
-            request, model_name, execution_budget=execution_budget
+            request, model_name, **call_options
         )
         response.warnings = [*response.warnings, warning]
         return (
