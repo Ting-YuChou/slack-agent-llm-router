@@ -608,7 +608,8 @@ async def reply_for_failure(**fields):
         ("prompt_too_large", "too long for the model"),
         ("model_not_entitled", "not available for your tier"),
         ("retrieval_unavailable", "document search is unavailable right now"),
-        ("rate_limited", "rate-limiting"),
+        # Without a provider 429 (error_type) it is our own capacity.
+        ("rate_limited", "the llm router is busy right now"),
         ("provider_unavailable", "provider is unavailable right now"),
         ("timeout", "took too long"),
     ],
@@ -630,25 +631,49 @@ async def test_an_unknown_error_code_falls_back_to_the_error_type():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "fields,wait",
+    "fields,says,wait",
     [
-        ({"error_type": "rate_limited", "retry_after_seconds": 45}, "45 seconds"),
+        # A provider's own 429 is the only real provider rate limit.
+        (
+            {"error_type": "rate_limited", "retry_after_seconds": 45},
+            "rate-limiting",
+            "Please try again in 45 seconds.",
+        ),
+        (
+            {
+                "error_code": "rate_limited",
+                "error_type": "rate_limited",
+                "retry_after_seconds": 120,
+            },
+            "rate-limiting",
+            "Please try again in 2 minutes.",
+        ),
+        # A rate_limited code with another type is our own capacity, e.g. an
+        # AdmissionRejectedError primary whose fallbacks also failed.
         (
             {
                 "error_code": "rate_limited",
                 "error_type": "provider_error",
                 "retry_after_seconds": 120,
             },
-            "2 minutes",
+            "The LLM Router is busy right now",
+            "Please try again in 2 minutes.",
+        ),
+        (
+            {"error_code": "rate_limited", "error_type": "user_or_policy"},
+            "The LLM Router is busy right now",
+            "retry in a moment.",
         ),
     ],
-    ids=["by_type", "by_code"],
+    ids=["provider_429", "provider_429_code", "own_capacity", "own_capacity_no_wait"],
 )
-async def test_a_rate_limited_failure_says_when_to_retry(fields, wait):
+async def test_a_rate_limited_failure_names_who_limited_it(fields, says, wait):
     text = await reply_for_failure(**fields)
 
-    assert "rate-limiting" in text
-    assert f"Please try again in {wait}." in text
+    assert says in text
+    assert wait in text
+    if "busy" in says:
+        assert "rate-limiting" not in text
 
 
 # S11: an answer that came back degraded says so

@@ -101,7 +101,9 @@ _TOO_LONG_TEXT = (
 )
 # What a failed answer tells the user. A precise InferenceResponse.error_code
 # wins; else its error_type decides; anything else gets the generic message,
-# which reveals nothing internal.
+# which reveals nothing internal. A rate_limited error_code is the provider's
+# 429 only when error_type says so too; otherwise our own capacity turned the
+# request away (an admission rejection), and the router is busy.
 SLACK_ERROR_CODE_MESSAGES = {
     "context_length_exceeded": _TOO_LONG_TEXT,
     "prompt_too_large": _TOO_LONG_TEXT,
@@ -112,7 +114,6 @@ SLACK_ERROR_CODE_MESSAGES = {
         "⚠️ Document search is unavailable right now. Please try again in a "
         "few minutes."
     ),
-    "rate_limited": _RATE_LIMITED_TEXT,
     "provider_unavailable": (
         "⚠️ The model provider is unavailable right now. Please try again in a "
         "few minutes."
@@ -3183,18 +3184,21 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         retry_after_seconds: Any = None,
     ) -> str:
         """What a failed answer tells the user: by error code, else error type."""
+        wait = _retry_wait(retry_after_seconds)
+        if error_code == "rate_limited" and error_type != "rate_limited":
+            # Our own capacity, e.g. an admission-rejected primary whose
+            # fallbacks failed too: not the provider's 429.
+            return _busy_text(wait)
         for messages, key in (
             (SLACK_ERROR_CODE_MESSAGES, error_code),
             (SLACK_INFERENCE_ERROR_MESSAGES, error_type),
         ):
             message = messages.get(key) if isinstance(key, str) else None
-            if message == _RATE_LIMITED_TEXT:
-                wait = _retry_wait(retry_after_seconds)
-                if wait:
-                    return (
-                        "⏳ The model provider is rate-limiting requests right "
-                        f"now. Please try again in {wait}."
-                    )
+            if message == _RATE_LIMITED_TEXT and wait:
+                return (
+                    "⏳ The model provider is rate-limiting requests right now. "
+                    f"Please try again in {wait}."
+                )
             if message:
                 return message
         error_builder = getattr(self.bot, "_build_user_safe_error_message", None)
