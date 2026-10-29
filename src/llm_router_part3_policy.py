@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from aiokafka import AIOKafkaConsumer
 from aiokafka.structs import TopicPartition
+from prometheus_client import Counter, Gauge
 import redis.asyncio as redis
 
 from src.utils.metrics import PIPELINE_METRICS
@@ -25,6 +26,31 @@ from src.utils.bounded_state import BoundedTTLMap
 logger = logging.getLogger(__name__)
 
 GUARDRAIL_SCOPE_TYPES: Tuple[str, ...] = ("model", "provider")
+REDIS_STATES: Tuple[str, ...] = ("available", "unavailable", "recovering")
+
+POLICY_CACHE_UNAVAILABLE = Counter(
+    "llm_router_policy_cache_unavailable_total",
+    "Routing policy reads answered without the shared policy cache",
+    ["reason"],
+)
+POLICY_CACHE_REDIS_STATE = Gauge(
+    "llm_router_policy_cache_redis_state",
+    "Routing policy cache Redis state (1 for the current state)",
+    ["state"],
+)
+POLICY_CACHE_RECOVERY = Counter(
+    "llm_router_policy_cache_recovery_total",
+    "Routing policy cache Redis recovery attempts",
+    ["outcome"],
+)
+
+
+class PolicyCacheUnavailableError(RuntimeError):
+    """The shared policy cache's Redis is unavailable or in its cooldown."""
+
+    def __init__(self, reason: str, message: str = ""):
+        super().__init__(message or f"routing policy cache unavailable: {reason}")
+        self.reason = reason
 
 
 class RoutingPolicyCache:
@@ -39,6 +65,24 @@ class RoutingPolicyCache:
         self.redis_db = int(redis_config.get("db", 1))
         self.redis_password_env = redis_config.get("password_env")
         self.key_prefix = redis_config.get("key_prefix", "routing_policy")
+        self.redis_connect_timeout_ms = int(redis_config.get("connect_timeout_ms", 100))
+        self.redis_socket_timeout_ms = int(redis_config.get("socket_timeout_ms", 100))
+        self.redis_max_connections = int(redis_config.get("max_connections", 50))
+        self.redis_health_check_interval_seconds = int(
+            redis_config.get("health_check_interval_seconds", 30)
+        )
+        self.recovery_cooldown_ms = max(
+            0,
+            int(
+                self.config.get(
+                    "recovery_cooldown_ms",
+                    redis_config.get("recovery_cooldown_ms", 1000),
+                )
+            ),
+        )
+        # The router waits this long for get_effective_policy, then routes
+        # without the shared policy.
+        self.read_timeout_ms = max(1, int(self.config.get("read_timeout_ms", 50)))
         self.request_ttl_seconds = int(self.config.get("request_ttl_seconds", 300))
         self.session_ttl_seconds = int(self.config.get("session_ttl_seconds", 600))
         self.user_ttl_seconds = int(self.config.get("user_ttl_seconds", 900))
@@ -49,8 +93,13 @@ class RoutingPolicyCache:
         self.local_cache_max_entries = int(
             self.config.get("local_cache_max_entries", 4096)
         )
-        self.redis_client = None
+        self.redis_client: Any = None
         self._initialized = False
+        self._redis_available = True
+        self._redis_failure_at: Optional[float] = None
+        self._last_redis_error: Optional[str] = None
+        self._recovery_lock = asyncio.Lock()
+        self._time_func = time.monotonic
         self._local_guardrail_index: Dict[str, set[str]] = {
             "model": set(),
             "provider": set(),
@@ -73,34 +122,185 @@ class RoutingPolicyCache:
         if separator and scope_type in self._local_guardrail_index:
             self._local_guardrail_index[scope_type].discard(scope_key)
 
+    @property
+    def read_timeout_seconds(self) -> float:
+        return self.read_timeout_ms / 1000.0
+
+    def _build_redis_client(self) -> Any:
+        password = None
+        if self.redis_password_env:
+            password = os.getenv(str(self.redis_password_env))
+        return redis.Redis(
+            host=self.redis_host,
+            port=self.redis_port,
+            db=self.redis_db,
+            password=password,
+            decode_responses=True,
+            socket_connect_timeout=self.redis_connect_timeout_ms / 1000.0,
+            socket_timeout=self.redis_socket_timeout_ms / 1000.0,
+            max_connections=self.redis_max_connections,
+            health_check_interval=self.redis_health_check_interval_seconds,
+        )
+
     async def initialize(self):
-        """Initialize Redis if the policy cache is enabled."""
+        """Initialize Redis if the policy cache is enabled.
+
+        A failure leaves the cache enabled but unavailable: reads fail open
+        with policy_source "unavailable" and a ping after the cooldown brings
+        Redis back.
+        """
         if self._initialized or not self.enabled:
             self._initialized = True
             return
 
+        self._initialized = True
         try:
-            password = None
-            if self.redis_password_env:
-                password = os.getenv(str(self.redis_password_env))
-            self.redis_client = redis.Redis(
-                host=self.redis_host,
-                port=self.redis_port,
-                db=self.redis_db,
-                password=password,
-                decode_responses=True,
-            )
-            await self.redis_client.ping()
-            self._initialized = True
-            logger.info("Routing policy cache initialized")
+            self.redis_client = self._build_redis_client()
+            await self._run_redis_operation(self.redis_client.ping())
         except Exception as e:
+            self._mark_redis_failure("initialize", e)
             logger.warning(f"Failed to initialize routing policy cache: {e}")
-            self.enabled = False
-            self._initialized = True
+            return
+        self._mark_redis_available()
+        logger.info("Routing policy cache initialized")
 
     def is_healthy(self) -> bool:
-        """Return whether the shared policy cache is available."""
-        return not self.enabled or self.redis_client is not None
+        """Return whether the policy cache can serve routing.
+
+        Routing fails open without Redis, so an unavailable Redis degrades the
+        cache (see is_degraded and get_health_status) rather than making it
+        unhealthy.
+        """
+        return True
+
+    def is_degraded(self) -> bool:
+        """Return whether the cache is enabled but its Redis is unavailable."""
+        return bool(self._redis_enabled() and not self._redis_available)
+
+    def get_health_status(self) -> Dict[str, Any]:
+        """Policy cache status for readiness detail."""
+        if not self.enabled:
+            status = "disabled"
+        elif self.is_degraded():
+            status = "degraded"
+        else:
+            status = "healthy"
+        return {
+            "status": status,
+            "redis_available": bool(self._redis_available),
+            "last_error": self._last_redis_error,
+            "unavailable_for_seconds": (
+                round(self._time_func() - self._redis_failure_at, 3)
+                if self._redis_failure_at is not None
+                else None
+            ),
+        }
+
+    def _redis_enabled(self) -> bool:
+        """Whether reads and writes go to Redis rather than the local L1."""
+        return bool(
+            self.enabled
+            and (self.redis_client is not None or not self._redis_available)
+        )
+
+    async def _run_redis_operation(self, awaitable: Any) -> Any:
+        # redis-py applies the socket timeouts at the transport; injected
+        # clients without a connection pool get the same bound here.
+        if getattr(self.redis_client, "connection_pool", None) is not None:
+            return await awaitable
+        return await asyncio.wait_for(
+            awaitable, timeout=max(0.001, self.redis_socket_timeout_ms / 1000.0)
+        )
+
+    def _mark_redis_available(self) -> None:
+        self._redis_available = True
+        self._redis_failure_at = None
+        self._set_redis_state("available")
+
+    def _mark_redis_failure(self, operation: str, exc: BaseException) -> None:
+        self._redis_available = False
+        self._redis_failure_at = self._time_func()
+        self._last_redis_error = f"{operation}: {exc or type(exc).__name__}"
+        self._set_redis_state("unavailable")
+
+    @staticmethod
+    def _set_redis_state(state: str) -> None:
+        for candidate in REDIS_STATES:
+            POLICY_CACHE_REDIS_STATE.labels(state=candidate).set(
+                1 if candidate == state else 0
+            )
+
+    async def _recover_if_due(self) -> bool:
+        """Return whether Redis is available, pinging once after the cooldown."""
+        if self._redis_available and self.redis_client is not None:
+            return True
+        cooldown_seconds = self.recovery_cooldown_ms / 1000.0
+        if (
+            self._redis_failure_at is not None
+            and self._time_func() - self._redis_failure_at < cooldown_seconds
+        ):
+            return False
+
+        async with self._recovery_lock:
+            if self._redis_available and self.redis_client is not None:
+                return True
+            if (
+                self._redis_failure_at is not None
+                and self._time_func() - self._redis_failure_at < cooldown_seconds
+            ):
+                return False
+            POLICY_CACHE_RECOVERY.labels(outcome="attempt").inc()
+            self._set_redis_state("recovering")
+            try:
+                if self.redis_client is None:
+                    self.redis_client = self._build_redis_client()
+                await self._run_redis_operation(self.redis_client.ping())
+            except asyncio.CancelledError as e:
+                # A caller's deadline cut the ping short: count it as a failure
+                # so the next read waits out the cooldown instead.
+                POLICY_CACHE_RECOVERY.labels(outcome="failure").inc()
+                self._mark_redis_failure("recovery_ping", e)
+                raise
+            except Exception as e:
+                POLICY_CACHE_RECOVERY.labels(outcome="failure").inc()
+                self._mark_redis_failure("recovery_ping", e)
+                return False
+            POLICY_CACHE_RECOVERY.labels(outcome="success").inc()
+            self._mark_redis_available()
+            logger.info("Routing policy cache Redis recovered")
+            return True
+
+    async def _require_redis(self) -> None:
+        if not await self._recover_if_due():
+            raise PolicyCacheUnavailableError("cooldown")
+
+    def record_read_timeout(self) -> None:
+        """The router gave up on a policy read: count it and start a cooldown."""
+        POLICY_CACHE_UNAVAILABLE.labels(reason="timeout").inc()
+        if self._redis_enabled():
+            self._mark_redis_failure(
+                "read", TimeoutError("policy read exceeded the router deadline")
+            )
+
+    @staticmethod
+    def _record_unavailable(reason: str) -> None:
+        POLICY_CACHE_UNAVAILABLE.labels(reason=reason).inc()
+
+    def _unavailable_policy(self) -> Dict[str, Any]:
+        return {
+            "policy_source": "unavailable",
+            **self._empty_guardrail_policy(),
+        }
+
+    @staticmethod
+    def _empty_guardrail_policy() -> Dict[str, Any]:
+        return {
+            "blocked_models": [],
+            "warn_models": [],
+            "blocked_providers": [],
+            "warn_providers": [],
+            "guardrail_reasons": {},
+        }
 
     def _cache_key(self, namespace: str, identifier: str) -> str:
         return f"{self.key_prefix}:{namespace}:{identifier}"
@@ -167,12 +367,17 @@ class RoutingPolicyCache:
         if hit:
             return cached if isinstance(cached, dict) else None
 
-        if not self.enabled or not self.redis_client:
+        if not self._redis_enabled():
             return None
 
+        if not await self._recover_if_due():
+            self._record_unavailable("cooldown")
+            return None
         try:
-            payload = await self.redis_client.get(cache_key)
+            payload = await self._run_redis_operation(self.redis_client.get(cache_key))
         except Exception as e:
+            self._mark_redis_failure("read", e)
+            self._record_unavailable("redis_error")
             logger.warning(f"Failed to read routing policy cache key {cache_key}: {e}")
             return None
 
@@ -187,11 +392,12 @@ class RoutingPolicyCache:
         indexes are read from Redis every time, so a guardrail another replica
         sets or lifts applies at once. Returns the records by key and the
         index members by scope type. Without Redis the records come from L1
-        and the members from the local guardrail index.
+        and the members from the local guardrail index. Raises
+        PolicyCacheUnavailableError when Redis is enabled but unavailable.
         """
         records: Dict[str, Optional[Dict[str, Any]]] = {}
         members: Dict[str, List[str]] = {}
-        if not self.enabled or not self.redis_client:
+        if not self._redis_enabled():
             for cache_key in record_keys:
                 records[cache_key] = self._local_get(cache_key)
             for scope_type in scope_types:
@@ -210,20 +416,18 @@ class RoutingPolicyCache:
         if not pending_keys and not scope_types:
             return records, members
 
+        await self._require_redis()
         try:
             pipeline = self.redis_client.pipeline(transaction=False)
             for cache_key in pending_keys:
                 pipeline.get(cache_key)
             for scope_type in scope_types:
                 pipeline.smembers(self._guardrail_index_key(scope_type))
-            results = list(await pipeline.execute())
+            results = list(await self._run_redis_operation(pipeline.execute()))
         except Exception as e:
+            self._mark_redis_failure("read", e)
             logger.warning(f"Failed to read routing policy cache: {e}")
-            for cache_key in pending_keys:
-                records[cache_key] = None
-            for scope_type in scope_types:
-                members[scope_type] = []
-            return records, members
+            raise PolicyCacheUnavailableError("redis_error", str(e)) from e
 
         for cache_key, payload in zip(pending_keys, results):
             records[cache_key] = self._decode_record(cache_key, payload)
@@ -234,13 +438,17 @@ class RoutingPolicyCache:
         return records, members
 
     async def _set_json(self, cache_key: str, value: Dict[str, Any], ttl_seconds: int):
-        if not self.enabled or not self.redis_client:
+        if not self._redis_enabled():
             self._local_set(cache_key, value, ttl_seconds)
             return
 
+        await self._require_redis()
         try:
-            await self.redis_client.setex(cache_key, ttl_seconds, json.dumps(value))
+            await self._run_redis_operation(
+                self.redis_client.setex(cache_key, ttl_seconds, json.dumps(value))
+            )
         except Exception as e:
+            self._mark_redis_failure("write", e)
             logger.warning(f"Failed to write routing policy cache key {cache_key}: {e}")
             raise
         self._local_set(cache_key, value, ttl_seconds)
@@ -294,14 +502,18 @@ class RoutingPolicyCache:
         request_key = self._cache_key("request", request_id) if request_id else None
         session_key = self._cache_key("session", session_id) if session_id else None
         user_key = self._user_state_cache_key(user_id) if user_id else None
-        records, members = await self._read_policy_state(
-            [key for key in (request_key, session_key, user_key) if key],
-            GUARDRAIL_SCOPE_TYPES,
-        )
+        try:
+            records, members = await self._read_policy_state(
+                [key for key in (request_key, session_key, user_key) if key],
+                GUARDRAIL_SCOPE_TYPES,
+            )
+            active_guardrails = await self._guardrail_policy(members)
+        except PolicyCacheUnavailableError as e:
+            self._record_unavailable(e.reason)
+            return self._unavailable_policy()
         request_policy = records.get(request_key) if request_key else None
         session_policy = records.get(session_key) if session_key else None
         user_policy = records.get(user_key) if user_key else None
-        active_guardrails = await self._guardrail_policy(members)
         merged: Dict[str, Any] = {}
         policy_sources: List[str] = []
 
@@ -543,7 +755,7 @@ class RoutingPolicyCache:
             "source_event_type": event.get("event_type", "routing.guardrails"),
         }
 
-        if not self.enabled or not self.redis_client:
+        if not self._redis_enabled():
             self._local_guardrail_index.setdefault(scope_type, set()).add(scope_key)
             self._local_set(
                 self._guardrail_cache_key(scope_type, scope_key),
@@ -554,14 +766,16 @@ class RoutingPolicyCache:
 
         cache_key = self._guardrail_cache_key(scope_type, scope_key)
         index_key = self._guardrail_index_key(scope_type)
+        await self._require_redis()
         try:
             transaction = self.redis_client.pipeline(transaction=True)
             transaction.setex(
                 cache_key, self.guardrail_ttl_seconds, json.dumps(payload)
             )
             transaction.sadd(index_key, scope_key)
-            await transaction.execute()
+            await self._run_redis_operation(transaction.execute())
         except Exception as e:
+            self._mark_redis_failure("write", e)
             logger.warning(
                 f"Failed to update routing guardrail index {scope_type}:{scope_key}: {e}"
             )
@@ -571,20 +785,18 @@ class RoutingPolicyCache:
 
     async def get_active_guardrails(self) -> Dict[str, Any]:
         """Return active model/provider guardrails for router candidate filtering."""
-        _records, members = await self._read_policy_state([], GUARDRAIL_SCOPE_TYPES)
-        return await self._guardrail_policy(members)
+        try:
+            _records, members = await self._read_policy_state([], GUARDRAIL_SCOPE_TYPES)
+            return await self._guardrail_policy(members)
+        except PolicyCacheUnavailableError as e:
+            self._record_unavailable(e.reason)
+            return self._empty_guardrail_policy()
 
     async def _guardrail_policy(self, members: Dict[str, List[str]]) -> Dict[str, Any]:
         """The guardrail lists for the router, from the index members read."""
         active_guardrails = await self._read_guardrail_payloads(members)
 
-        policy: Dict[str, Any] = {
-            "blocked_models": [],
-            "warn_models": [],
-            "blocked_providers": [],
-            "warn_providers": [],
-            "guardrail_reasons": {},
-        }
+        policy: Dict[str, Any] = self._empty_guardrail_policy()
 
         for scope_type in GUARDRAIL_SCOPE_TYPES:
             for scope_key, payload in active_guardrails.get(scope_type, {}).items():
@@ -621,7 +833,7 @@ class RoutingPolicyCache:
             scope_type: {} for scope_type in members
         }
 
-        if not self.enabled or not self.redis_client:
+        if not self._redis_enabled():
             for scope_type, scope_keys in members.items():
                 for scope_key in scope_keys:
                     payload = self._local_get(
@@ -649,11 +861,14 @@ class RoutingPolicyCache:
 
         try:
             payloads = list(
-                await self.redis_client.mget([cache_key for *_, cache_key in pending])
+                await self._run_redis_operation(
+                    self.redis_client.mget([cache_key for *_, cache_key in pending])
+                )
             )
         except Exception as e:
+            self._mark_redis_failure("read", e)
             logger.warning(f"Failed to read routing guardrails: {e}")
-            return active
+            raise PolicyCacheUnavailableError("redis_error", str(e)) from e
 
         expired: List[Tuple[str, str]] = []
         for (scope_type, scope_key, cache_key), raw_payload in zip(pending, payloads):
@@ -682,7 +897,7 @@ class RoutingPolicyCache:
             pipeline = self.redis_client.pipeline(transaction=False)
             for scope_type, scope_key in expired:
                 pipeline.srem(self._guardrail_index_key(scope_type), scope_key)
-            await pipeline.execute()
+            await self._run_redis_operation(pipeline.execute())
         except Exception as e:
             logger.warning(f"Failed to prune expired routing guardrails: {e}")
 
@@ -746,6 +961,9 @@ class PolicyMaterializer:
             logger.info("Policy materializer disabled")
             return
 
+        # A cache whose Redis failed to initialize stays enabled and recovers
+        # on its own; consumers start anyway, and a write that fails leaves
+        # its offset uncommitted for the supervisor to retry.
         await self.policy_cache.initialize()
         if not self.policy_cache.enabled:
             return
@@ -985,8 +1203,12 @@ class PolicyMaterializer:
 
     def get_health_status(self) -> Dict[str, Any]:
         """Return materializer consumer supervisor status."""
+        cache_status_getter = getattr(self.policy_cache, "get_health_status", None)
+        cache_status = cache_status_getter() if callable(cache_status_getter) else {}
         return {
             "healthy": self.is_healthy(),
+            "degraded": cache_status.get("status") == "degraded",
+            "policy_cache": cache_status,
             "topics": dict(self.consumer_task_status),
             "restart_counts": dict(self.consumer_restart_counts),
         }
