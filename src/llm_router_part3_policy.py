@@ -22,6 +22,7 @@ from aiokafka.structs import TopicPartition
 from prometheus_client import Counter, Gauge
 import redis.asyncio as redis
 
+from src.redaction import redact_text
 from src.utils.metrics import PIPELINE_METRICS
 from src.utils.bounded_state import BoundedTTLMap
 
@@ -1334,6 +1335,9 @@ class PolicyMaterializer:
             materializer_config.get("dlq_enabled", dlq_config.get("enabled", False))
         )
         self.dlq_topic_suffix = str(dlq_config.get("topic_suffix", ".dlq"))
+        self.dead_letter_topics = dict(
+            self.kafka_config.get("dead_letter_topics", {}) or {}
+        )
         self.dlq_send_timeout_seconds = float(
             dlq_config.get("send_timeout_seconds", 10.0)
         )
@@ -1614,6 +1618,19 @@ class PolicyMaterializer:
             return []
         return sorted(str(key) for key in value) if isinstance(value, dict) else []
 
+    def _dead_letter_topic(self, topic_key: str, source_topic: str) -> str:
+        """The DLQ topic, resolved like the pipeline sink's.
+
+        kafka.dead_letter_topics[topic_key], then kafka.topics[<key>_dlq],
+        then <source topic><kafka.dlq.topic_suffix>.
+        """
+        if self.dead_letter_topics.get(topic_key):
+            return str(self.dead_letter_topics[topic_key])
+        configured = self.topics.get(f"{topic_key}_dlq")
+        if configured:
+            return str(configured)
+        return f"{source_topic}{self.dlq_topic_suffix}"
+
     async def _publish_dead_letter(
         self, topic_key: str, message: Any, error: Exception
     ) -> None:
@@ -1623,7 +1640,7 @@ class PolicyMaterializer:
             or self.topics.get(topic_key)
             or topic_key
         )
-        dlq_topic = f"{source_topic}{self.dlq_topic_suffix}"
+        dlq_topic = self._dead_letter_topic(topic_key, source_topic)
         offset = getattr(message, "offset", None)
         partition = getattr(message, "partition", None)
         payload = {
@@ -1635,7 +1652,8 @@ class PolicyMaterializer:
             "source_offset": offset,
             "failure_stage": "validate",
             "error_type": type(error).__name__,
-            "error_message": str(error)[:500],
+            # Parse errors can quote payload values.
+            "error_message": redact_text(str(error))[:500],
             "payload_keys": self._payload_keys(message),
         }
         key = f"{source_topic}:{partition}:{offset}"
