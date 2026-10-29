@@ -480,6 +480,10 @@ class ApiRateLimitingConfig(ConfigModel):
     providers: Dict[str, ApiRateLimitScopeConfig] = Field(default_factory=dict)
     models: Dict[str, ApiRateLimitScopeConfig] = Field(default_factory=dict)
     token_budget: ApiTokenBudgetConfig = Field(default_factory=ApiTokenBudgetConfig)
+    # Active-request counters live in time buckets of this length. Keep it above
+    # the longest request (deadline plus grace): a slot whose release is lost
+    # stops counting after at most two windows.
+    active_window_ms: int = Field(180_000, ge=1000)
 
     @field_validator("failure_mode")
     @classmethod

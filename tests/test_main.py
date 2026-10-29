@@ -501,6 +501,41 @@ def patched_platform_deps(monkeypatch):
     )
 
 
+def _admission_platform(tmp_path, overrides=None):
+    """Platform with route admission enabled and a dummy inference engine."""
+    config_path = _write_config(
+        tmp_path,
+        overrides={
+            "api": {"rate_limiting": {"enabled": True, "failure_mode": "closed"}},
+            **(overrides or {}),
+        },
+    )
+    platform = main.LLMRouterPlatform(config_path=str(config_path))
+    platform.services["inference"] = DummyInferenceEngine({}, DummyRouter({}))
+    return platform
+
+
+def _asgi_scope(method, path, body=b"", headers=None):
+    raw_headers = [(b"content-type", b"application/json")]
+    if body:
+        raw_headers.append((b"content-length", str(len(body)).encode()))
+    raw_headers.extend(headers or [])
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": raw_headers,
+        "client": ("127.0.0.1", 50000),
+        "server": ("testserver", 80),
+    }
+
+
 class TestPlatformInitialization:
     def test_get_api_worker_count_respects_dev_and_config(self):
         config = {"performance": {"workers": {"api_workers": 4}}}
@@ -1131,6 +1166,112 @@ class TestApiApp:
         assert response.headers["retry-after"] == "3"
         assert response.json()["reason"] == "user_request_rate_exceeded"
         assert inference.processed_requests == []
+
+    def test_route_releases_admission_before_recording_metrics(
+        self, tmp_path, monkeypatch, patched_platform_deps
+    ):
+        events = []
+        reservation = main.AdmissionReservation(reservation_id="r1", stage="route")
+
+        class OrderedAdmission(DummyAdmissionController):
+            async def release(self, reservation, *, actual_tokens=None):
+                events.append("release")
+                return await super().release(reservation, actual_tokens=actual_tokens)
+
+        platform = _admission_platform(tmp_path)
+        admission = OrderedAdmission(
+            route_decision=main.AdmissionDecision.allow(reservation)
+        )
+        platform.services["admission"] = admission
+
+        async def record_api_metrics(**_kwargs):
+            events.append("metrics")
+
+        monkeypatch.setattr(platform, "_record_api_metrics", record_api_metrics)
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post("/route", json={"query": "hello", "user_id": "u1"})
+
+        assert response.status_code == 200
+        assert events == ["release", "metrics"]
+        assert admission.released == [(reservation, None)]
+
+    def test_route_retries_a_failed_admission_release_once(
+        self, tmp_path, patched_platform_deps
+    ):
+        reservation = main.AdmissionReservation(reservation_id="r1", stage="route")
+
+        class FlakyReleaseAdmission(DummyAdmissionController):
+            attempts = 0
+
+            async def release(self, reservation, *, actual_tokens=None):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise ConnectionError("redis connection reset")
+                return await super().release(reservation, actual_tokens=actual_tokens)
+
+        platform = _admission_platform(tmp_path)
+        admission = FlakyReleaseAdmission(
+            route_decision=main.AdmissionDecision.allow(reservation)
+        )
+        platform.services["admission"] = admission
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post("/route", json={"query": "hello", "user_id": "u1"})
+
+        assert response.status_code == 200
+        assert admission.attempts == 2
+        assert admission.released == [(reservation, None)]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_route_still_releases_admission(
+        self, tmp_path, patched_platform_deps
+    ):
+        started = asyncio.Event()
+        reservation = main.AdmissionReservation(reservation_id="r1", stage="route")
+
+        class HangingInferenceEngine(DummyInferenceEngine):
+            async def process_query(self, request):
+                started.set()
+                await asyncio.Event().wait()
+
+        class RoundTripAdmission(DummyAdmissionController):
+            async def release(self, reservation, *, actual_tokens=None):
+                await asyncio.sleep(0.01)  # a Redis round trip yields to the loop
+                return await super().release(reservation, actual_tokens=actual_tokens)
+
+        platform = _admission_platform(tmp_path)
+        platform.services["inference"] = HangingInferenceEngine({}, DummyRouter({}))
+        admission = RoundTripAdmission(
+            route_decision=main.AdmissionDecision.allow(reservation)
+        )
+        platform.services["admission"] = admission
+        app = platform._create_fastapi_app()
+        body = json.dumps({"query": "hello", "user_id": "u1"}).encode()
+        messages = [{"type": "http.request", "body": body, "more_body": False}]
+
+        async def receive():
+            if messages:
+                return messages.pop(0)
+            await asyncio.Event().wait()
+
+        async def send(_message):
+            return None
+
+        handler = asyncio.create_task(
+            app(_asgi_scope("POST", "/route", body), receive, send)
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        handler.cancel()
+        await asyncio.gather(handler, return_exceptions=True)
+        for _ in range(100):
+            if admission.released:
+                break
+            await asyncio.sleep(0.01)
+
+        assert admission.released == [(reservation, None)]
 
     def test_route_scheduler_rejection_returns_429_with_retry_after(
         self, tmp_path, patched_platform_deps

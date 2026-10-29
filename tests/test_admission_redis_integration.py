@@ -486,6 +486,68 @@ async def test_provider_queue_bypasses_global_queue(redis_client):
     assert await redis_client.get(f"{global_prefix}:depth") == "1"
 
 
+def _clocked_controller(redis_client, clock, *, active_requests):
+    prefix = f"test:admission:{uuid.uuid4().hex}"
+    controller = RedisAdmissionController(
+        {
+            "enabled": True,
+            "failure_mode": "closed",
+            "redis": {"key_prefix": prefix},
+            "queue": {"enabled": False},
+            "active_window_ms": 1000,
+            "global_limits": {"active_requests": active_requests},
+        },
+        redis_client=redis_client,
+        time_func=lambda: clock["now"],
+    )
+    return controller, prefix
+
+
+@pytest.mark.asyncio
+async def test_leaked_active_slot_heals_within_two_windows(redis_client):
+    clock = {"now": time.time()}
+    controller, prefix = _clocked_controller(redis_client, clock, active_requests=2)
+    leaked = await controller.acquire_route(QueryRequest(query="leak", user_id="leak"))
+    assert leaked.allowed  # its release is lost: never released
+
+    for step in range(25):
+        clock["now"] += 0.1
+        decision = await controller.acquire_route(
+            QueryRequest(query="steady", user_id=f"u{step}")
+        )
+        assert decision.allowed
+        assert await controller.release(decision.reservation)
+
+    first = await controller.acquire_route(QueryRequest(query="a", user_id="a"))
+    second = await controller.acquire_route(QueryRequest(query="b", user_id="b"))
+
+    assert first.allowed
+    assert second.allowed
+    active_keys = [key async for key in redis_client.scan_iter(f"{prefix}:*active*")]
+    assert active_keys
+    for key in active_keys:
+        assert 0 < await redis_client.pttl(key) <= 2000
+
+
+@pytest.mark.asyncio
+async def test_release_of_expired_bucket_never_goes_negative(redis_client):
+    clock = {"now": time.time()}
+    controller, prefix = _clocked_controller(redis_client, clock, active_requests=2)
+    holder = await controller.acquire_route(QueryRequest(query="hold", user_id="h"))
+    for key in [key async for key in redis_client.scan_iter(f"{prefix}:*active*")]:
+        await redis_client.delete(key)  # the bucket expired before the release
+
+    released = await controller.release(holder.reservation)
+    first = await controller.acquire_route(QueryRequest(query="a", user_id="a"))
+    second = await controller.acquire_route(QueryRequest(query="b", user_id="b"))
+    third = await controller.acquire_route(QueryRequest(query="c", user_id="c"))
+
+    assert released
+    assert first.allowed and second.allowed
+    assert not third.allowed
+    assert third.reason == "global_active_requests_exceeded"
+
+
 def test_scheduler_uses_deterministic_priority_band_without_local_time():
     scheduler = ProviderCapacityScheduler({}, None, time_func=lambda: 1)
     request = QueryRequest(query="one", user_id="u1")

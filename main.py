@@ -155,6 +155,7 @@ class LLMRouterPlatform:
         self._shutdown_complete = False
         self._signal_count = 0
         self._service_tasks: set[asyncio.Task] = set()
+        self._admission_release_tasks: set[asyncio.Future] = set()
         self._api_server: Optional[uvicorn.Server] = None
         shutdown_config = dict(self.config.get("shutdown", {}) or {})
         self.shutdown_grace_period_seconds = float(
@@ -811,10 +812,36 @@ class LLMRouterPlatform:
         *,
         actual_tokens: Optional[int] = None,
     ):
+        """Release an admission slot, surviving cancellation of the caller.
+
+        The release runs in its own task under ``asyncio.shield`` so a
+        cancelled handler still frees its slot, and it is retried once.
+        """
         admission = self._get_admission_controller()
         if admission is None or reservation is None:
             return
-        await admission.release(reservation, actual_tokens=actual_tokens)
+
+        async def release_with_retry():
+            for attempt in range(2):
+                try:
+                    await admission.release(reservation, actual_tokens=actual_tokens)
+                    return
+                except Exception as exc:
+                    if attempt == 0:
+                        self.logger.warning(
+                            "Admission release failed, retrying: %s", exc
+                        )
+                        continue
+                    self.logger.warning(
+                        "Admission release failed; the active slot expires "
+                        "with its time bucket: %s",
+                        exc,
+                    )
+
+        task = asyncio.ensure_future(release_with_retry())
+        self._admission_release_tasks.add(task)
+        task.add_done_callback(self._admission_release_tasks.discard)
+        await asyncio.shield(task)
 
     def _missing_admission_response(self, stage: str) -> Optional[JSONResponse]:
         if not self._admission_enabled():
@@ -1854,6 +1881,11 @@ class LLMRouterPlatform:
                     },
                 )
             finally:
+                # Free the admission slot first: metrics publishing can be slow
+                # or cancelled, and the slot must not wait on it.
+                if active_requests is not None and active_request_recorded:
+                    active_requests.labels(endpoint=endpoint).dec()
+                await self._release_admission_reservation(route_reservation)
                 await self._record_api_metrics(
                     endpoint=endpoint,
                     method=method,
@@ -1861,9 +1893,6 @@ class LLMRouterPlatform:
                     duration_seconds=time.perf_counter() - start_time,
                     error_type="RouteError" if status_code >= 500 else None,
                 )
-                if active_requests is not None and active_request_recorded:
-                    active_requests.labels(endpoint=endpoint).dec()
-                await self._release_admission_reservation(route_reservation)
 
         @app.post("/rag/uploads")
         async def create_rag_upload(
