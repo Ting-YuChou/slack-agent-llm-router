@@ -106,11 +106,19 @@ router:
     reliability_weight: 40
     latency_weight: 20
     cost_weight_cap: 20
+    # Score lost per 10x the request cost of the cheapest candidate.
+    cost_log_ratio_weight: 4
     priority_weight: 2
     context_fit_full_weight: 10
     context_fit_partial_weight: 5
     default_model_bonus: 4
+    default_bonus_models:
+    - gpt-5
     gpt5_default_bonus: 3
+    enterprise_bonus_models:
+    - claude-sonnet-4-6
+    difficult_task_bonus_models:
+    - claude-sonnet-4-6
     sonnet_enterprise_bonus: 12
     sonnet_difficult_task_bonus: 10
     difficult_task_token_threshold: 50000
@@ -130,6 +138,13 @@ router:
       max_tokens: 128000
       context_window: 128000
       cost_per_token: 3.0e-05
+      # List prices, USD per 1M tokens (X8). Source:
+      # https://developers.openai.com/api/docs/pricing (standard tier, gpt-5),
+      # checked 2026-10-29. OpenAI lists no cache-write price.
+      pricing:
+        input: 1.25
+        cached_input: 0.125
+        output: 10.0
       priority: 2
       allowed_tiers:
       - premium
@@ -152,6 +167,15 @@ router:
       context_window: 1000000
       max_output_tokens: 128000
       cost_per_token: 1.5e-05
+      # List prices, USD per 1M tokens (X8). Source:
+      # https://platform.claude.com/docs/en/about-claude/pricing (Claude
+      # Sonnet 4.6), checked 2026-10-29.
+      pricing:
+        input: 3.0
+        cached_input: 0.30
+        output: 15.0
+        cache_write_5m: 3.75
+        cache_write_1h: 6.0
       priority: 1
       allowed_tiers:
       - enterprise

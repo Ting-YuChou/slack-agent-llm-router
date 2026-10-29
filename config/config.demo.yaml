@@ -29,6 +29,13 @@ router:
       max_tokens: 128000
       context_window: 128000
       cost_per_token: 3.0e-05
+      # List prices, USD per 1M tokens (X8). Source:
+      # https://developers.openai.com/api/docs/pricing (standard tier, gpt-5),
+      # checked 2026-10-29. OpenAI lists no cache-write price.
+      pricing:
+        input: 1.25
+        cached_input: 0.125
+        output: 10.0
       priority: 1
       allowed_tiers:
         - free

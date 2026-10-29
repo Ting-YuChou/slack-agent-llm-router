@@ -378,6 +378,20 @@ class ModelSelection(BaseModel):
     reason_code: Optional[str] = None
 
 
+class ModelPricing(BaseModel):
+    """A model's list prices in USD per 1M tokens.
+
+    Unset cache prices fall back to the provider's prompt_cache multipliers
+    (cached input 0.5x or 0.1x, 5-minute writes 1.25x, 1-hour writes 2x).
+    """
+
+    input: float = Field(ge=0.0)
+    output: float = Field(ge=0.0)
+    cached_input: Optional[float] = Field(None, ge=0.0)
+    cache_write_5m: Optional[float] = Field(None, ge=0.0)
+    cache_write_1h: Optional[float] = Field(None, ge=0.0)
+
+
 class ModelConfig(BaseModel):
     # Core model info
     name: str = Field(..., min_length=1)
@@ -392,7 +406,11 @@ class ModelConfig(BaseModel):
     # The most output tokens the model generates; unset means no cap below
     # the window. request.max_tokens is clamped to it.
     max_output_tokens: Optional[int] = Field(None, ge=1)
+    # The one rate used for input and output when pricing is unset.
     cost_per_token: float = Field(ge=0.0)
+    # List prices; a model without them inherits a priced model's by prefix
+    # (gpt-5.4 -> gpt-5), else falls back to cost_per_token with a warning.
+    pricing: Optional[ModelPricing] = None
     priority: int = Field(ge=1)
 
     # Capabilities

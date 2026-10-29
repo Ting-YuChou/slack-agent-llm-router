@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -18,6 +19,7 @@ from src.prompt_assembly import (
     build_prompt_sections,
     join_prompt_sections,
 )
+from src.pricing import per_token, resolve_model_pricing
 from src.routing_features import build_routing_features
 from src.utils.metrics import ROUTER_METRICS
 from src.utils.schema import (
@@ -123,6 +125,26 @@ REJECT_BLOCKED_PROVIDER = "blocked_provider"
 REJECT_CAPABILITY = "capability"
 REJECT_CONTEXT_WINDOW = "context_window"
 REJECT_TIER = "tier"
+
+# Output tokens expected per query type, for cost estimates and the cost
+# score; router.scoring.output_token_estimates overrides them.
+DEFAULT_OUTPUT_TOKEN_ESTIMATES: Dict[str, int] = {
+    "general": 400,
+    "question_answering": 400,
+    "translation": 500,
+    "summarization": 500,
+    "brainstorming": 700,
+    "planning": 800,
+    "math": 800,
+    "analysis": 900,
+    "reasoning": 900,
+    "web_research": 900,
+    "code_analysis": 900,
+    "creative_writing": 1200,
+    "code_generation": 1200,
+}
+# Context key carrying the cheapest eligible candidate's request cost.
+COST_REFERENCE_KEY = "cost_reference"
 
 # Routing paths whose candidates skip the query-type capability check.
 REASON_CODES_WITHOUT_CAPABILITY_CHECK = frozenset(
@@ -583,9 +605,19 @@ class ModelRouter:
             "priority_weight": 2.0,
             "context_fit_full_weight": 10.0,
             "context_fit_partial_weight": 5.0,
+            # Score lost per 10x the request cost of the cheapest eligible
+            # candidate (X8); a free candidate leaves paid ones no cost score.
+            "cost_log_ratio_weight": 4.0,
+            # Output tokens a request is expected to produce, by query type,
+            # for cost estimates (capped by max_tokens).
+            "output_token_estimates": dict(DEFAULT_OUTPUT_TOKEN_ESTIMATES),
             "default_model_bonus": 4.0,
+            # Models that get each bonus (the names used to be hard-coded).
+            "default_bonus_models": ["gpt-5"],
             "gpt5_default_bonus": 3.0,
+            "enterprise_bonus_models": ["claude-sonnet-4-6"],
             "sonnet_enterprise_bonus": 12.0,
+            "difficult_task_bonus_models": ["claude-sonnet-4-6"],
             "sonnet_difficult_task_bonus": 10.0,
             "difficult_task_token_threshold": 50000,
             "local_simple_task_bonus": 12.0,
@@ -673,6 +705,15 @@ class ModelRouter:
             except Exception as e:
                 logger.error(f"Failed to load model {model_name}: {e}")
 
+        for model_name in self.unpriced_models():
+            ROUTER_METRICS.unpriced_models.labels(model=model_name).set(1)
+            logger.warning(
+                "Model %s has no pricing (router.models.%s.pricing); its cost "
+                "falls back to cost_per_token for input and output",
+                model_name,
+                model_name,
+            )
+
         # Config validation requires a model per tier, but credential gating or
         # a bad model entry can still leave a tier without one.
         uncovered_tiers = [
@@ -686,6 +727,19 @@ class ModelRouter:
                 "rejected as model_not_entitled",
                 ", ".join(uncovered_tiers),
             )
+
+    def unpriced_models(self) -> List[str]:
+        """Loaded paid models with no pricing of their own or by prefix.
+
+        Self-hosted (vLLM) models cost nothing unless priced, so they never
+        count as unpriced.
+        """
+        return [
+            model_name
+            for model_name, model_config in self.models.items()
+            if model_config.provider.lower() != "vllm"
+            and resolve_model_pricing(self.models, model_name) is None
+        ]
 
     def _load_routing_rules(self):
         """Load routing rules from configuration"""
@@ -1045,9 +1099,10 @@ class ModelRouter:
         )
         if not candidates:
             return []
+        scoring_context = self._with_cost_reference(candidates, context)
         return sorted(
             candidates,
-            key=lambda model_name: self._score_model(model_name, context),
+            key=lambda model_name: self._score_model(model_name, scoring_context),
             reverse=True,
         )
 
@@ -1071,9 +1126,10 @@ class ModelRouter:
             ],
             context,
         )
+        scoring_context = self._with_cost_reference(candidates, context)
         return sorted(
             candidates,
-            key=lambda model_name: self._score_model(model_name, context),
+            key=lambda model_name: self._score_model(model_name, scoring_context),
             reverse=True,
         )
 
@@ -1822,7 +1878,7 @@ class ModelRouter:
         """Return models ordered from cheapest to most expensive."""
         ranked = sorted(
             self.models.items(),
-            key=lambda item: (item[1].cost_per_token, item[1].priority),
+            key=lambda item: (sum(self._unit_rates(item[1])), item[1].priority),
         )
         return [model_name for model_name, _model_config in ranked]
 
@@ -2081,8 +2137,9 @@ class ModelRouter:
             self._raise_no_eligible_model(context, candidates)
         candidates = eligible
 
+        scoring_context = self._with_cost_reference(candidates, context)
         scores = {
-            model_name: self._adjusted_score(model_name, context)
+            model_name: self._adjusted_score(model_name, scoring_context)
             for model_name in candidates
         }
 
@@ -2155,17 +2212,85 @@ class ModelRouter:
             "model_bonus": self._contextual_model_bonus(model_name, context),
         }
 
+    def _unit_rates(self, model_config: ModelConfig) -> Tuple[float, float]:
+        """(input, output) USD per token: pricing, else cost_per_token for both."""
+        pricing = resolve_model_pricing(self.models, model_config.name)
+        if pricing is None and model_config.pricing is not None:
+            pricing = model_config.pricing
+        if pricing is None:
+            return model_config.cost_per_token, model_config.cost_per_token
+        return per_token(pricing.input), per_token(pricing.output)
+
+    def _expected_output_tokens(self, context: Dict[str, Any]) -> int:
+        """Output tokens the request is expected to produce, by query type."""
+        estimates = dict(DEFAULT_OUTPUT_TOKEN_ESTIMATES)
+        estimates.update(dict(self.scoring.get("output_token_estimates") or {}))
+        query_type = str(context.get("query_type") or QueryType.GENERAL.value)
+        estimate = int(estimates.get(query_type, estimates["general"]))
+        max_tokens = context.get("max_tokens")
+        if isinstance(max_tokens, int) and not isinstance(max_tokens, bool):
+            if max_tokens > 0:
+                estimate = min(estimate, max_tokens)
+        return max(estimate, 0)
+
+    def _request_cost(
+        self, model_config: ModelConfig, context: Dict[str, Any]
+    ) -> float:
+        """Expected USD cost of this request on the model."""
+        input_rate, output_rate = self._unit_rates(model_config)
+        input_tokens = int(context.get("token_count", 0) or 0)
+        return (
+            input_tokens * input_rate
+            + self._expected_output_tokens(context) * output_rate
+        )
+
+    def _with_cost_reference(
+        self, candidates: List[str], context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """The context with the cheapest candidate's request cost to score against."""
+        costs = [
+            self._request_cost(self.models[name], context)
+            for name in candidates
+            if name in self.models
+        ]
+        if not costs:
+            return context
+        return {**context, COST_REFERENCE_KEY: min(costs)}
+
+    def _cost_reference(
+        self, model_config: ModelConfig, context: Dict[str, Any]
+    ) -> float:
+        reference = context.get(COST_REFERENCE_KEY)
+        if isinstance(reference, (int, float)) and not isinstance(reference, bool):
+            return float(reference)
+        # Scored alone: against every model this request may use.
+        eligible = self._filter_models_for_context(
+            list(self.models), context, check_capability=False
+        )
+        costs = [self._request_cost(self.models[name], context) for name in eligible]
+        costs.append(self._request_cost(model_config, context))
+        return min(costs)
+
     def _cost_score(self, model_config: ModelConfig, context: Dict[str, Any]) -> float:
-        """Cost efficiency (inverse relationship)."""
-        cost_per_token = model_config.cost_per_token
+        """Cost efficiency, log-normalised against the cheapest candidate (X8).
+
+        The cheapest candidate gets the full cost_weight_cap; each 10x on its
+        request cost takes cost_log_ratio_weight off, down to 0. A free
+        candidate is infinitely cheaper, so paid ones then score 0.
+        """
         cost_sensitivity = str(context.get("cost_sensitivity", "")).lower()
         cost_weight_cap = float(self.scoring["cost_weight_cap"])
         if cost_sensitivity == "high":
             cost_weight_cap += 10.0
-        if cost_per_token > 0:
-            cost_score = 1 / (cost_per_token * 1000000)  # Normalize
-            return min(cost_score, cost_weight_cap)
-        return cost_weight_cap
+        cost = self._request_cost(model_config, context)
+        if cost <= 0:
+            return cost_weight_cap
+        reference = self._cost_reference(model_config, context)
+        if reference <= 0:
+            return 0.0
+        weight = float(self.scoring.get("cost_log_ratio_weight", 4.0))
+        penalty = weight * math.log10(max(cost / reference, 1.0))
+        return max(0.0, cost_weight_cap - penalty)
 
     def _candidate_table(
         self,
@@ -2184,6 +2309,9 @@ class ModelRouter:
         model_names = list(self.models)
         reasons = self._model_reject_reasons(
             model_names, context, check_capability=check_capability
+        )
+        context = self._with_cost_reference(
+            [name for name in model_names if reasons.get(name) is None], context
         )
         table: List[RoutingCandidate] = []
         for model_name in model_names:
@@ -2247,21 +2375,27 @@ class ModelRouter:
         if model_name == self.default_model:
             bonus += float(self.scoring["default_model_bonus"])
 
-        if model_name == "gpt-5" and user_tier_value != "enterprise":
+        default_bonus_models = set(self.scoring.get("default_bonus_models") or [])
+        enterprise_bonus_models = set(self.scoring.get("enterprise_bonus_models") or [])
+        difficult_task_bonus_models = set(
+            self.scoring.get("difficult_task_bonus_models") or []
+        )
+
+        if model_name in default_bonus_models and user_tier_value != "enterprise":
             if (
                 query_type not in {"analysis", "reasoning"}
                 or token_count <= difficult_threshold
             ):
                 bonus += float(self.scoring["gpt5_default_bonus"])
 
-        if model_name == "claude-sonnet-4-6":
-            if user_tier_value == "enterprise":
-                bonus += float(self.scoring["sonnet_enterprise_bonus"])
-            if (
-                query_type in {"analysis", "reasoning"}
-                and token_count > difficult_threshold
-            ):
-                bonus += float(self.scoring["sonnet_difficult_task_bonus"])
+        if model_name in enterprise_bonus_models and user_tier_value == "enterprise":
+            bonus += float(self.scoring["sonnet_enterprise_bonus"])
+        if (
+            model_name in difficult_task_bonus_models
+            and query_type in {"analysis", "reasoning"}
+            and token_count > difficult_threshold
+        ):
+            bonus += float(self.scoring["sonnet_difficult_task_bonus"])
 
         if (
             model_provider == "vllm"
@@ -2361,14 +2495,7 @@ class ModelRouter:
         if not model_config:
             return 0.0
 
-        input_tokens = context["token_count"]
-        # Estimate output tokens (rough approximation)
-        estimated_output_tokens = min(
-            input_tokens * 0.5, context.get("max_tokens", 1000)
-        )
-
-        total_tokens = input_tokens + estimated_output_tokens
-        return total_tokens * model_config.cost_per_token
+        return self._request_cost(model_config, context)
 
     def update_model_stats(self, model_name: str, success: bool, latency_ms: int):
         """Update model performance statistics"""

@@ -33,6 +33,7 @@ import openai
 import anthropic
 
 from src.admission import AdmissionRejectedError
+from src.pricing import per_token, record_unpriced_cost, resolve_model_pricing
 from src.llm_router_part1_router import (
     ModelNotEntitledError,
     ModelRouter,
@@ -58,6 +59,7 @@ from src.utils.metrics import INFERENCE_METRICS, RAG_METRICS
 from src.utils.schema import (
     AttachmentType,
     ModelConfig,
+    ModelPricing,
     QueryRequest,
     InferenceResponse,
     QueryType,
@@ -1146,9 +1148,18 @@ class BaseInferenceProvider(ABC):
         "javascript",
     )
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        model_configs: Optional[Dict[str, Any]] = None,
+    ):
         self.config = config
         self.client = None
+        # The router's model configs: per-model pricing (and, for OpenAI,
+        # reasoning effort and temperature support).
+        self.model_configs: Dict[str, Any] = (
+            model_configs if isinstance(model_configs, dict) else {}
+        )
 
     def timeout_seconds(self) -> float:
         """Longest a single provider call may take, in seconds."""
@@ -1204,6 +1215,27 @@ class BaseInferenceProvider(ABC):
     def _prompt_cache_pricing(self) -> Dict[str, float]:
         """Return pricing multipliers for provider-side prompt cache accounting."""
         return dict(self._prompt_cache_config().get("pricing", {}) or {})
+
+    def _per_token_rates(
+        self, model_name: str, provider: str
+    ) -> Optional[Tuple[float, float, Optional[ModelPricing]]]:
+        """(input, output) USD per token, and the pricing they came from.
+
+        Pricing comes from router.models (prefix-matched, X8). Without it the
+        model's cost_per_token is used for both, with a warning and a metric;
+        a model the router does not know costs nothing (None).
+        """
+        pricing = resolve_model_pricing(self.model_configs, model_name)
+        if pricing is not None:
+            return per_token(pricing.input), per_token(pricing.output), pricing
+        record_unpriced_cost(model_name, provider)
+        model_config = self.model_configs.get(model_name)
+        rate = getattr(model_config, "cost_per_token", None)
+        if isinstance(model_config, dict):
+            rate = model_config.get("cost_per_token")
+        if isinstance(rate, (int, float)) and not isinstance(rate, bool):
+            return float(rate), float(rate), None
+        return None
 
     def _build_attachment_prompt(self, request: QueryRequest) -> str:
         """Render attachment metadata and extracted text into the provider prompt."""
@@ -1296,12 +1328,10 @@ class OpenAIProvider(BaseInferenceProvider):
         config: Dict[str, Any],
         model_configs: Optional[Dict[str, Any]] = None,
     ):
-        super().__init__(config)
-        # The router's model configs, read for per-model reasoning effort and
-        # temperature support. A model missing here keeps the name rules.
-        self.model_configs: Dict[str, Any] = (
-            model_configs if isinstance(model_configs, dict) else {}
-        )
+        # The router's model configs, read for pricing and per-model reasoning
+        # effort and temperature support. A model missing here keeps the name
+        # rules.
+        super().__init__(config, model_configs)
 
     async def initialize(self):
         """Initialize OpenAI client"""
@@ -1552,30 +1582,25 @@ class OpenAIProvider(BaseInferenceProvider):
         return None
 
     def _calculate_cost(self, usage, model_name: str) -> float:
-        """Calculate cost based on usage"""
-        # OpenAI pricing (example rates - update with actual rates)
-        pricing = {
-            "gpt-5": {"input": 0.01 / 1000, "output": 0.03 / 1000},
-            "gpt-3.5-turbo": {"input": 0.0015 / 1000, "output": 0.002 / 1000},
-        }
-
-        model_pricing = pricing.get(
-            model_name, {"input": 0.001 / 1000, "output": 0.002 / 1000}
-        )
+        """Cost of a response from the configured price table (X8)."""
+        rates = self._per_token_rates(model_name, "openai")
+        if rates is None:
+            return 0.0
+        input_rate, output_rate, pricing = rates
 
         input_tokens = _usage_value(usage, "input_tokens")
         output_tokens = _usage_value(usage, "output_tokens")
         cached_tokens = min(_openai_cached_input_tokens(usage), input_tokens)
         uncached_tokens = max(input_tokens - cached_tokens, 0)
-        cached_multiplier = float(
-            self._prompt_cache_pricing().get("cached_input_multiplier", 0.5)
-        )
+        if pricing is not None and pricing.cached_input is not None:
+            cached_rate = per_token(pricing.cached_input)
+        else:
+            cached_rate = input_rate * float(
+                self._prompt_cache_pricing().get("cached_input_multiplier", 0.5)
+            )
 
-        input_cost = (
-            uncached_tokens * model_pricing["input"]
-            + cached_tokens * model_pricing["input"] * cached_multiplier
-        )
-        output_cost = output_tokens * model_pricing["output"]
+        input_cost = uncached_tokens * input_rate + cached_tokens * cached_rate
+        output_cost = output_tokens * output_rate
 
         return input_cost + output_cost
 
@@ -1763,35 +1788,59 @@ class AnthropicProvider(BaseInferenceProvider):
         return cache_control
 
     def _calculate_cost(self, usage, model_name: str) -> float:
-        """Calculate cost based on usage"""
-        # Anthropic pricing, aligned to current Claude 4 family defaults.
-        pricing = {
-            "claude-sonnet-4-6": {"input": 0.003 / 1000, "output": 0.015 / 1000},
-            "claude-opus-4-6": {"input": 0.005 / 1000, "output": 0.025 / 1000},
-        }
+        """Cost of a response from the configured price table (X8).
 
-        model_pricing = pricing.get(
-            model_name, {"input": 0.003 / 1000, "output": 0.015 / 1000}
+        Cache writes are split by TTL when the usage reports it
+        (cache_creation.ephemeral_5m/1h_input_tokens); otherwise they are all
+        priced at the configured prompt_cache TTL. A 1-hour write costs 2x
+        the input rate and a 5-minute write 1.25x, unless listed prices say
+        otherwise.
+        """
+        rates = self._per_token_rates(model_name, "anthropic")
+        if rates is None:
+            return 0.0
+        input_rate, output_rate, pricing = rates
+        pricing_config = self._prompt_cache_pricing()
+
+        def listed(price: Optional[float], multiplier: float) -> float:
+            if price is not None:
+                return per_token(price)
+            return input_rate * multiplier
+
+        write_5m_rate = listed(
+            pricing.cache_write_5m if pricing else None,
+            float(pricing_config.get("cache_creation_input_multiplier", 1.25)),
+        )
+        write_1h_rate = listed(
+            pricing.cache_write_1h if pricing else None,
+            float(pricing_config.get("cache_creation_1h_input_multiplier", 2.0)),
+        )
+        read_rate = listed(
+            pricing.cached_input if pricing else None,
+            float(pricing_config.get("cache_read_input_multiplier", 0.1)),
         )
 
         uncached_input_tokens = _usage_value(usage, "input_tokens")
         cache_creation_tokens = _usage_value(usage, "cache_creation_input_tokens")
         cache_read_tokens = _usage_value(usage, "cache_read_input_tokens")
         output_tokens = _usage_value(usage, "output_tokens")
-        pricing_config = self._prompt_cache_pricing()
-        cache_creation_multiplier = float(
-            pricing_config.get("cache_creation_input_multiplier", 1.25)
-        )
-        cache_read_multiplier = float(
-            pricing_config.get("cache_read_input_multiplier", 0.1)
-        )
+
+        breakdown = getattr(usage, "cache_creation", None)
+        write_5m_tokens = _usage_value(breakdown, "ephemeral_5m_input_tokens")
+        write_1h_tokens = _usage_value(breakdown, "ephemeral_1h_input_tokens")
+        unattributed = max(cache_creation_tokens - write_5m_tokens - write_1h_tokens, 0)
+        if self._anthropic_cache_control().get("ttl") == "1h":
+            write_1h_tokens += unattributed
+        else:
+            write_5m_tokens += unattributed
 
         input_cost = (
-            uncached_input_tokens * model_pricing["input"]
-            + cache_creation_tokens * model_pricing["input"] * cache_creation_multiplier
-            + cache_read_tokens * model_pricing["input"] * cache_read_multiplier
+            uncached_input_tokens * input_rate
+            + write_5m_tokens * write_5m_rate
+            + write_1h_tokens * write_1h_rate
+            + cache_read_tokens * read_rate
         )
-        output_cost = output_tokens * model_pricing["output"]
+        output_cost = output_tokens * output_rate
 
         return input_cost + output_cost
 
@@ -1809,8 +1858,23 @@ class vLLMProvider(BaseInferenceProvider):
 
     DEFAULT_TIMEOUT_SECONDS = 300.0  # Local inference may take longer.
 
-    def __init__(self, config: Dict[str, Any]):
-        super().__init__(config)
+    def _calculate_cost(self, usage: Any, model_name: str) -> float:
+        """Self-hosted models cost nothing unless router.models prices them."""
+        pricing = resolve_model_pricing(self.model_configs, model_name)
+        if pricing is None or not isinstance(usage, dict):
+            return 0.0
+        prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+        completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+        return prompt_tokens * per_token(pricing.input) + completion_tokens * per_token(
+            pricing.output
+        )
+
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        model_configs: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(config, model_configs)
         self.endpoints = self._build_endpoint_states(config)
         self.base_url = self.endpoints[0].base_url
         self.api_mode = str(config.get("api_mode", "completions")).lower()
@@ -1920,7 +1984,7 @@ class vLLMProvider(BaseInferenceProvider):
                         usage.get("completion_tokens", 0)
                         / max(time.time() - start_time, 1e-6)
                     ),
-                    cost_usd=0.0,  # Self-hosted models have no API cost
+                    cost_usd=self._calculate_cost(usage, model_name),
                     provider="vllm",
                     cached=False,
                     finish_reason=_vllm_finish_reason(data),
@@ -2679,12 +2743,16 @@ class InferenceEngine:
             and anthropic_config.get("enabled", True)
             and self._router_uses_provider("anthropic")
         ):
-            self.providers["anthropic"] = AnthropicProvider(anthropic_config)
+            self.providers["anthropic"] = AnthropicProvider(
+                anthropic_config, model_configs=getattr(self.router, "models", None)
+            )
             await self.providers["anthropic"].initialize()
 
         vllm_config = dict(self.config.get("vllm", {}) or {})
         if self._vllm_configured(vllm_config):
-            self.providers["vllm"] = vLLMProvider(vllm_config)
+            self.providers["vllm"] = vLLMProvider(
+                vllm_config, model_configs=getattr(self.router, "models", None)
+            )
             await self.providers["vllm"].initialize()
 
         self._initialized = True
