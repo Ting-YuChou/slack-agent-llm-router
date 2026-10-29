@@ -532,6 +532,19 @@ def metric_has_uncached_sample(metric_event: Dict[str, Any]) -> bool:
     return samples is None or _safe_int(samples, 0) > 0
 
 
+def metric_has_priced_tokens(metric_event: Dict[str, Any]) -> bool:
+    """Return whether a metrics window has uncached tokens to price per 1k.
+
+    Cache hits cost nothing and failures usually bill no tokens, so a window of
+    only those has no cost per 1k; cost detectors skip it rather than read $0
+    as a baseline. Windows from before uncached_total_tokens existed count.
+    """
+    if not metric_has_uncached_sample(metric_event):
+        return False
+    tokens = metric_event.get("uncached_total_tokens")
+    return tokens is None or _safe_int(tokens, 0) > 0
+
+
 def detect_metric_anomalies(
     metric_event: Dict[str, Any],
     *,
@@ -760,7 +773,9 @@ def detect_model_routing_guardrails(
                 )
             )
 
-    if has_uncached and len(cost_per_1k_history) >= minimum_history:
+    if metric_has_priced_tokens(metric_event) and (
+        len(cost_per_1k_history) >= minimum_history
+    ):
         avg_cost_per_1k = sum(cost_per_1k_history) / len(cost_per_1k_history)
         if (
             avg_cost_per_1k > 0

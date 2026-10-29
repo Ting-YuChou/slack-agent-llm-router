@@ -148,6 +148,53 @@ def test_all_cached_window_leaves_cost_baseline_alone():
     ]
 
 
+def _failure_only_window():
+    request_count = 5
+    return logic.build_model_metrics_window_event(
+        model_name="gpt-5",
+        provider="openai",
+        window_start_ms=1_710_000_000_000,
+        window_end_ms=1_710_000_060_000,
+        window_size_seconds=60,
+        request_count=request_count,
+        success_count=0,
+        error_count=request_count,
+        latency_sum_ms=1000.0 * request_count,
+        tokens_per_second_sum=0.0,
+        token_count_input=0,
+        token_count_output=0,
+        total_tokens=0,
+        total_cost_usd=0.0,
+        cached_count=0,
+        latency_sample_count=request_count,
+        uncached_total_tokens=0,
+        uncached_cost_usd=0.0,
+        timestamp=TIMESTAMP,
+    )
+
+
+def test_failure_only_window_leaves_cost_baseline_alone():
+    baseline = [0.05] * 3
+    detector = _model_guardrail_detector([])
+    detector.cost_per_1k_history_state = _ListState(baseline)
+
+    failure_outputs = list(detector.process_element(_failure_only_window(), None))
+    history_after_failure_window = detector.cost_per_1k_history_state.get()
+    normal_outputs = list(
+        detector.process_element(
+            _window(avg_latency_ms=1000.0, cached=False, cost_usd=0.024), None
+        )
+    )
+
+    assert history_after_failure_window == baseline
+    assert "cost_spike" not in {g["trigger_type"] for g in failure_outputs}
+    assert "cost_spike" not in {g["trigger_type"] for g in normal_outputs}
+    assert detector.cost_per_1k_history_state.get() == [
+        *baseline,
+        pytest.approx(0.08),
+    ]
+
+
 def test_window_from_before_the_upgrade_still_feeds_latency_history():
     detector = _model_guardrail_detector([2000.0] * 3)
     legacy_window = _window(avg_latency_ms=1500.0, cached=False)

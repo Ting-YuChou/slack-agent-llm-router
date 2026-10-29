@@ -122,6 +122,7 @@ from flink.logic import (
     detect_provider_routing_guardrails,
     merge_routing_policy_aggregate,
     metric_cost_per_1k_tokens,
+    metric_has_priced_tokens,
     metric_has_provider_latency_sample,
     metric_has_uncached_sample,
     metric_provider_avg_latency_ms,
@@ -571,9 +572,9 @@ class ModelRoutingGuardrailDetector(KeyedProcessFunction):
         for guardrail in guardrails:
             yield guardrail
 
-        has_uncached = metric_has_uncached_sample(value)
-        if has_uncached:
+        if metric_has_uncached_sample(value):
             latency_history.append(float(value.get("avg_latency_ms", 0.0) or 0.0))
+        if metric_has_priced_tokens(value):
             cost_per_1k_history.append(metric_cost_per_1k_tokens(value))
         qps_history.append(float(value.get("queries_per_second", 0.0) or 0.0))
         error_rate_history.append(float(value.get("error_rate", 0.0) or 0.0))
