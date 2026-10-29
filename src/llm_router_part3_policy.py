@@ -73,6 +73,27 @@ end
 return 1
 """
 
+# Lifts a guardrail (A2) unless the stored one is newer. KEYS[1] is the
+# guardrail record, KEYS[2] its index set; ARGV is the clear's event time in
+# ms and the index member.
+CAS_CLEAR_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+if current then
+  local ok, decoded = pcall(cjson.decode, current)
+  if ok and type(decoded) == 'table' then
+    local stored = tonumber(decoded['event_time_ms'])
+    if stored and stored > tonumber(ARGV[1]) then
+      return 0
+    end
+  end
+end
+redis.call('DEL', KEYS[1])
+redis.call('SREM', KEYS[2], ARGV[2])
+return 1
+"""
+# A clear without an event time lifts any stored guardrail.
+_LATEST_EVENT_TIME_MS = 2**53 - 1
+
 # Event times before 2000-01-01 are counters or defaults, not wall clock.
 _MIN_EVENT_TIME_MS = 946_684_800_000
 
@@ -989,6 +1010,10 @@ class RoutingPolicyCache:
             "source_event_type": event.get("event_type", "routing.guardrails"),
         }
 
+        if payload["guardrail_action"] == "clear":
+            await self._clear_routing_guardrail(event, scope_type, scope_key)
+            return
+
         if not self._redis_enabled():
             self._local_guardrail_index.setdefault(scope_type, set()).add(scope_key)
             self._local_set(
@@ -1035,6 +1060,46 @@ class RoutingPolicyCache:
 
         self._local_set(cache_key, payload, ttl_seconds)
 
+    async def _clear_routing_guardrail(
+        self, event: Dict[str, Any], scope_type: str, scope_key: str
+    ) -> None:
+        """Lift a guardrail on a Flink clear event: delete it and its index member.
+
+        On Redis a stored guardrail with a later event time stays.
+        """
+        cache_key = self._guardrail_cache_key(scope_type, scope_key)
+        if self._redis_enabled():
+            event_time_ms = policy_event_time_ms(event, "window_end_ms", "emitted_at")
+            await self._require_redis()
+            try:
+                cleared = await self._run_redis_operation(
+                    self.redis_client.eval(
+                        CAS_CLEAR_SCRIPT,
+                        2,
+                        cache_key,
+                        self._guardrail_index_key(scope_type),
+                        str(
+                            _LATEST_EVENT_TIME_MS
+                            if event_time_ms is None
+                            else event_time_ms
+                        ),
+                        scope_key,
+                    )
+                )
+            except Exception as e:
+                self._mark_redis_failure("write", e)
+                logger.warning(
+                    f"Failed to clear routing guardrail {scope_type}:{scope_key}: {e}"
+                )
+                raise
+            if int(cleared or 0) != 1:
+                POLICY_CACHE_STALE_WRITES.labels(
+                    namespace="guardrail", reason="older"
+                ).inc()
+                return
+        self._local_guardrail_index.setdefault(scope_type, set()).discard(scope_key)
+        self._local_cache.pop(cache_key, None)
+
     async def get_active_guardrails(self) -> Dict[str, Any]:
         """Return active model/provider guardrails for router candidate filtering."""
         try:
@@ -1055,6 +1120,8 @@ class RoutingPolicyCache:
                 guardrail_action = str(
                     payload.get("guardrail_action", "avoid") or "avoid"
                 )
+                if guardrail_action == "clear":
+                    continue
                 reason = payload.get("description") or payload.get("trigger_type")
                 if scope_type == "model":
                     target_key = (

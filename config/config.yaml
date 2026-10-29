@@ -828,11 +828,29 @@ flink:
       throughput_drop_ratio: 0.4
       throughput_min_request_count: 3
       cost_spike_ratio: 1.75
+      # An avoid needs min_request_count samples in the window, and
+      # enter_bad_windows bad windows among the last enter_window_lookback;
+      # exit_good_windows good windows in a row emit guardrail_action: clear.
+      # A high latency avoids only at high_latency_ms_per_output_token too.
+      min_request_count: 5
+      high_latency_ms_per_output_token: 100
+      enter_bad_windows: 2
+      enter_window_lookback: 3
+      exit_good_windows: 2
     provider_guardrails:
       high_error_rate: 0.2
       high_latency_ms: 6000
       regression_error_rate_floor: 0.1
       regression_latency_floor_ms: 4500
+      # An avoid needs min_request_count samples in the window, and
+      # enter_bad_windows bad windows among the last enter_window_lookback;
+      # exit_good_windows good windows in a row emit guardrail_action: clear.
+      # A high latency avoids only at high_latency_ms_per_output_token too.
+      min_request_count: 5
+      high_latency_ms_per_output_token: 100
+      enter_bad_windows: 2
+      enter_window_lookback: 3
+      exit_good_windows: 2
     rolling_policy:
       bucket_size_seconds: 5
       emit_interval_seconds: 5
