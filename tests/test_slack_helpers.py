@@ -2153,6 +2153,34 @@ class TestSlackBot:
         assert bot.active_threads == {}
 
     @pytest.mark.asyncio
+    async def test_process_message_keeps_every_part_of_a_long_answer_in_thread(
+        self, inference_response_factory, monkeypatch
+    ):
+        long_answer = " ".join(f"sentence {index}." for index in range(40))
+        inference_engine = SimpleNamespace(
+            process_query=AsyncMock(
+                return_value=inference_response_factory(response_text=long_answer)
+            )
+        )
+        bot = SlackBot(
+            {"channels": [], "response_settings": {"max_response_length": 120}},
+            inference_engine=inference_engine,
+        )
+        bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+        bot.user_manager.check_rate_limit = lambda *_args, **_kwargs: True
+        monkeypatch.setattr("slack.bot_real.asyncio.sleep", AsyncMock())
+
+        await bot._process_message(
+            {"channel": "C1", "user": "U1", "text": "hello", "ts": "1700.1"}
+        )
+
+        calls = bot.web_client.chat_postMessage.await_args_list
+        assert len(calls) > 1
+        assert "sentence 0." in calls[0].kwargs["text"]
+        assert all(call.kwargs["thread_ts"] == "1700.1" for call in calls)
+        assert not any(call.kwargs.get("reply_broadcast") for call in calls)
+
+    @pytest.mark.asyncio
     async def test_slash_command_prefers_ephemeral_response(self):
         bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
         bot.web_client = SimpleNamespace(

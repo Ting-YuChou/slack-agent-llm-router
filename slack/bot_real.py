@@ -3652,12 +3652,11 @@ class SlackBot:
                 if len(response_text) > max_length:
                     responses = self._split_response(response_text, max_length)
 
-                    for i, response_part in enumerate(responses):
+                    for response_part in responses:
                         await self.web_client.chat_postMessage(
                             channel=channel_id,
                             text=response_part,
                             thread_ts=thread_ts,
-                            reply_broadcast=(i == 0),  # Only broadcast first message
                         )
                         await asyncio.sleep(0.5)  # Small delay between parts
                 else:
