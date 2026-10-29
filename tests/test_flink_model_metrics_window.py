@@ -221,3 +221,35 @@ def test_window_restored_from_older_state_counts_its_errors_as_provider_failures
 
     assert metric["error_count"] == 3
     assert metric["provider_failure_count"] == 2
+
+
+def test_window_cost_per_1k_prices_only_uncached_events():
+    metric = _window_metric(
+        [
+            _completion(offset_ms=1_000, total_tokens=1000, cost_usd=0.04),
+            _completion(offset_ms=2_000, total_tokens=1000, cost_usd=0.04),
+            # A cache hit keeps its tokens but now costs nothing.
+            _completion(
+                offset_ms=3_000,
+                total_tokens=2000,
+                cost_usd=0.0,
+                latency_ms=2,
+                cached_response=True,
+            ),
+        ]
+    )
+    detector = analytics_job.ModelRoutingGuardrailDetector()
+    detector.latency_history_state = _ListState()
+    detector.qps_history_state = _ListState()
+    detector.error_rate_history_state = _ListState()
+    detector.cache_hit_rate_history_state = _ListState()
+    detector.cost_per_1k_history_state = _ListState()
+    detector.cost_per_1k_history_state.update([0.02] * 3)
+
+    guardrails = list(detector.process_element(metric, None))
+
+    # Uncached: $0.08 over 2000 tokens is $0.04 per 1k, double the baseline.
+    # Counting the cached tokens would give $0.02 and hide the spike.
+    assert metric["total_cost_usd"] == pytest.approx(0.08)
+    assert detector.cost_per_1k_history_state.get()[-1] == pytest.approx(0.04)
+    assert "cost_spike" in {g["trigger_type"] for g in guardrails}

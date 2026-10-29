@@ -35,7 +35,7 @@ class _ListState:
         self.values = []
 
 
-def _window(*, avg_latency_ms, cached):
+def _window(*, avg_latency_ms, cached, cost_usd=0.01):
     request_count = 5
     return logic.build_model_metrics_window_event(
         model_name="gpt-5",
@@ -51,7 +51,7 @@ def _window(*, avg_latency_ms, cached):
         token_count_input=100,
         token_count_output=200,
         total_tokens=300,
-        total_cost_usd=0.0 if cached else 0.01,
+        total_cost_usd=0.0 if cached else cost_usd,
         cached_count=request_count if cached else 0,
         latency_sample_count=0 if cached else request_count,
         timestamp=TIMESTAMP,
@@ -121,6 +121,33 @@ def test_all_cached_window_leaves_latency_baseline_alone(
     assert detector.latency_history_state.get() == [*baseline, normal_latency_ms]
 
 
+def test_all_cached_window_leaves_cost_baseline_alone():
+    # 300 tokens per window: $0.015 is $0.05 per 1k, $0.024 is $0.08 per 1k.
+    baseline = [0.05] * 3
+    detector = _model_guardrail_detector([])
+    detector.cost_per_1k_history_state = _ListState(baseline)
+
+    cached_outputs = list(
+        detector.process_element(_window(avg_latency_ms=0.0, cached=True), None)
+    )
+    history_after_cached_window = detector.cost_per_1k_history_state.get()
+    normal_outputs = list(
+        detector.process_element(
+            _window(avg_latency_ms=1000.0, cached=False, cost_usd=0.024), None
+        )
+    )
+
+    assert history_after_cached_window == baseline
+    assert "cost_spike" not in {g["trigger_type"] for g in cached_outputs}
+    # 0.08 is under 1.75x the real 0.05 baseline, but over it once a $0 sample
+    # from the all-cached window is averaged in.
+    assert "cost_spike" not in {g["trigger_type"] for g in normal_outputs}
+    assert detector.cost_per_1k_history_state.get() == [
+        *baseline,
+        pytest.approx(0.08),
+    ]
+
+
 def test_window_from_before_the_upgrade_still_feeds_latency_history():
     detector = _model_guardrail_detector([2000.0] * 3)
     legacy_window = _window(avg_latency_ms=1500.0, cached=False)
@@ -129,6 +156,17 @@ def test_window_from_before_the_upgrade_still_feeds_latency_history():
     list(detector.process_element(legacy_window, None))
 
     assert detector.latency_history_state.get() == [2000.0] * 3 + [1500.0]
+
+
+def test_window_from_before_the_upgrade_prices_every_request():
+    detector = _model_guardrail_detector([])
+    legacy_window = _window(avg_latency_ms=1000.0, cached=False, cost_usd=0.015)
+    for key in ("latency_sample_count", "uncached_total_tokens", "uncached_cost_usd"):
+        del legacy_window[key]
+
+    list(detector.process_element(legacy_window, None))
+
+    assert detector.cost_per_1k_history_state.get() == [pytest.approx(0.05)]
 
 
 def _policy_completion(**overrides):

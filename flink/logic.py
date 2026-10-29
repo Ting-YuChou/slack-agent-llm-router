@@ -336,6 +336,8 @@ def build_model_metrics_window_event(
     cached_count: int,
     latency_sample_count: int | None = None,
     provider_failure_count: int | None = None,
+    uncached_total_tokens: int | None = None,
+    uncached_cost_usd: float | None = None,
     timestamp: datetime | None = None,
 ) -> Dict[str, Any]:
     """Build a 1-minute model metrics aggregate event.
@@ -343,7 +345,9 @@ def build_model_metrics_window_event(
     latency_sample_count is the number of uncached requests summed into
     latency_sum_ms and tokens_per_second_sum (a cache hit's latency is the
     lookup and its throughput is the original call's); it defaults to
-    request_count. provider_failure_count is the errors that count against the
+    request_count. uncached_total_tokens and uncached_cost_usd are those
+    requests' tokens and cost, for pricing per 1k tokens; they default to the
+    window totals. provider_failure_count is the errors that count against the
     provider (see counts_toward_provider_health); it defaults to error_count.
     """
     request_count = max(0, int(request_count))
@@ -396,6 +400,12 @@ def build_model_metrics_window_event(
         "token_count_output": int(token_count_output),
         "total_tokens": int(total_tokens),
         "total_cost_usd": float(total_cost_usd),
+        "uncached_total_tokens": int(
+            total_tokens if uncached_total_tokens is None else uncached_total_tokens
+        ),
+        "uncached_cost_usd": float(
+            total_cost_usd if uncached_cost_usd is None else uncached_cost_usd
+        ),
         "cache_hit_rate": cache_hit_rate,
         "cached_count": int(cached_count),
     }
@@ -430,12 +440,22 @@ def build_metric_anomaly_alert_event(
     }
 
 
-def _cost_per_1k_tokens(metric_event: Dict[str, Any]) -> float:
-    total_tokens = max(0, int(metric_event.get("total_tokens", 0) or 0))
-    total_cost = float(metric_event.get("total_cost_usd", 0.0) or 0.0)
-    if total_tokens <= 0:
+def metric_cost_per_1k_tokens(metric_event: Dict[str, Any]) -> float:
+    """Cost per 1k tokens of a metrics window's uncached requests.
+
+    A cache hit keeps its tokens but costs nothing, so pricing it in would make
+    the model look cheaper than it is. Windows from before the uncached totals
+    existed price every request.
+    """
+    tokens = metric_event.get("uncached_total_tokens")
+    cost = metric_event.get("uncached_cost_usd")
+    if tokens is None or cost is None:
+        tokens = metric_event.get("total_tokens")
+        cost = metric_event.get("total_cost_usd")
+    tokens = max(0, _safe_int(tokens or 0))
+    if tokens <= 0:
         return 0.0
-    return total_cost * 1000.0 / total_tokens
+    return _safe_float(cost or 0.0) * 1000.0 / tokens
 
 
 def build_routing_guardrail_event(
@@ -468,12 +488,13 @@ def build_routing_guardrail_event(
     }
 
 
-def metric_has_latency_sample(metric_event: Dict[str, Any]) -> bool:
-    """Return whether a metrics window measured any model latency.
+def metric_has_uncached_sample(metric_event: Dict[str, Any]) -> bool:
+    """Return whether a metrics window has any uncached request to measure.
 
-    A window of only cache hits has none, so latency detectors skip it rather
-    than read its 0 ms as a baseline. Windows from before latency_sample_count
-    existed are treated as measured.
+    A window of only cache hits has no model latency and no priced tokens, so
+    latency and cost detectors skip it rather than read its zeros as a
+    baseline. Windows from before latency_sample_count existed are treated as
+    measured.
     """
     samples = metric_event.get("latency_sample_count")
     return samples is None or _safe_int(samples, 0) > 0
@@ -496,7 +517,7 @@ def detect_metric_anomalies(
     current_qps = float(metric_event.get("queries_per_second", 0.0) or 0.0)
     current_error_rate = float(metric_event.get("error_rate", 0.0) or 0.0)
 
-    if metric_has_latency_sample(metric_event) and (
+    if metric_has_uncached_sample(metric_event) and (
         len(latency_history) >= minimum_history
     ):
         avg_latency = sum(latency_history) / len(latency_history)
@@ -566,13 +587,13 @@ def detect_model_routing_guardrails(
     config = _merged_config(DEFAULT_MODEL_GUARDRAIL_CONFIG, thresholds)
 
     model_name = str(metric_event.get("model_name", "unknown") or "unknown")
-    has_latency = metric_has_latency_sample(metric_event)
+    has_uncached = metric_has_uncached_sample(metric_event)
     current_latency = float(metric_event.get("avg_latency_ms", 0.0) or 0.0)
     current_qps = float(metric_event.get("queries_per_second", 0.0) or 0.0)
     current_error_rate = float(metric_event.get("error_rate", 0.0) or 0.0)
     current_cache_hit_rate = float(metric_event.get("cache_hit_rate", 0.0) or 0.0)
     request_count = max(0, int(metric_event.get("request_count", 0) or 0))
-    current_cost_per_1k = _cost_per_1k_tokens(metric_event)
+    current_cost_per_1k = metric_cost_per_1k_tokens(metric_event)
     high_error_rate_threshold = _safe_float(config.get("high_error_rate"), 0.30)
     high_latency_ms = _safe_float(config.get("high_latency_ms"), 5000)
     regression_error_floor = _safe_float(
@@ -610,7 +631,7 @@ def detect_model_routing_guardrails(
             )
         )
 
-    if has_latency and current_latency >= high_latency_ms:
+    if has_uncached and current_latency >= high_latency_ms:
         guardrails.append(
             build_routing_guardrail_event(
                 metric_event,
@@ -644,7 +665,7 @@ def detect_model_routing_guardrails(
                 )
             )
 
-    if has_latency and len(latency_history) >= minimum_history:
+    if has_uncached and len(latency_history) >= minimum_history:
         avg_latency = sum(latency_history) / len(latency_history)
         if avg_latency > 0 and current_latency > max(
             regression_latency_floor_ms, avg_latency * threshold_multiplier
@@ -707,7 +728,7 @@ def detect_model_routing_guardrails(
                 )
             )
 
-    if len(cost_per_1k_history) >= minimum_history:
+    if has_uncached and len(cost_per_1k_history) >= minimum_history:
         avg_cost_per_1k = sum(cost_per_1k_history) / len(cost_per_1k_history)
         if (
             avg_cost_per_1k > 0
@@ -757,7 +778,7 @@ def detect_provider_routing_guardrails(
     config = _merged_config(DEFAULT_PROVIDER_GUARDRAIL_CONFIG, thresholds)
 
     provider = str(metric_event.get("provider", "unknown") or "unknown")
-    has_latency = metric_has_latency_sample(metric_event)
+    has_uncached = metric_has_uncached_sample(metric_event)
     current_latency = float(metric_event.get("avg_latency_ms", 0.0) or 0.0)
     current_error_rate = metric_provider_failure_rate(metric_event)
     high_error_rate_threshold = _safe_float(config.get("high_error_rate"), 0.20)
@@ -784,7 +805,7 @@ def detect_provider_routing_guardrails(
             )
         )
 
-    if has_latency and current_latency >= high_latency_ms:
+    if has_uncached and current_latency >= high_latency_ms:
         guardrails.append(
             build_routing_guardrail_event(
                 metric_event,
@@ -818,7 +839,7 @@ def detect_provider_routing_guardrails(
                 )
             )
 
-    if has_latency and len(latency_history) >= minimum_history:
+    if has_uncached and len(latency_history) >= minimum_history:
         avg_latency = sum(latency_history) / len(latency_history)
         if avg_latency > 0 and current_latency > max(
             regression_latency_floor_ms, avg_latency * threshold_multiplier

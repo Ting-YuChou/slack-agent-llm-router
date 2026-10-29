@@ -121,7 +121,8 @@ from flink.logic import (
     detect_model_routing_guardrails,
     detect_provider_routing_guardrails,
     merge_routing_policy_aggregate,
-    metric_has_latency_sample,
+    metric_cost_per_1k_tokens,
+    metric_has_uncached_sample,
     metric_provider_failure_rate,
     validate_inference_completed_event,
 )
@@ -314,11 +315,15 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
             "total_cost_usd": 0.0,
             "cached_count": 0,
             "latency_sample_count": 0,
+            "uncached_total_tokens": 0,
+            "uncached_cost_usd": 0.0,
             "provider_failure_count": 0,
         }
-        # Buckets restored from older state averaged latency over every request
-        # and counted every error against the provider.
+        # Buckets restored from older state averaged latency and priced tokens
+        # over every request and counted every error against the provider.
         bucket.setdefault("latency_sample_count", bucket["request_count"])
+        bucket.setdefault("uncached_total_tokens", bucket["total_tokens"])
+        bucket.setdefault("uncached_cost_usd", bucket["total_cost_usd"])
         bucket.setdefault("provider_failure_count", bucket["error_count"])
         failed = value.get("status") != "success"
         bucket["request_count"] += 1
@@ -326,14 +331,17 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
         bucket["error_count"] += 1 if failed else 0
         if failed and counts_toward_provider_health(value):
             bucket["provider_failure_count"] += 1
-        # A cache hit's latency is the lookup and its throughput is the original
-        # call's; keep both out of the averages the detectors read.
+        # A cache hit's latency is the lookup, its throughput is the original
+        # call's and its tokens cost nothing; keep it out of the latency,
+        # throughput and cost-per-1k figures the detectors read.
         if not value.get("cached_response"):
             bucket["latency_sum_ms"] += float(value.get("latency_ms", 0.0) or 0.0)
             bucket["tokens_per_second_sum"] += float(
                 value.get("tokens_per_second", 0.0) or 0.0
             )
             bucket["latency_sample_count"] += 1
+            bucket["uncached_total_tokens"] += int(value.get("total_tokens", 0) or 0)
+            bucket["uncached_cost_usd"] += float(value.get("cost_usd", 0.0) or 0.0)
         bucket["token_count_input"] += int(value.get("token_count_input", 0) or 0)
         bucket["token_count_output"] += int(value.get("token_count_output", 0) or 0)
         bucket["total_tokens"] += int(value.get("total_tokens", 0) or 0)
@@ -437,6 +445,8 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
             cached_count=int(bucket.get("cached_count", 0) or 0),
             latency_sample_count=bucket.get("latency_sample_count"),
             provider_failure_count=bucket.get("provider_failure_count"),
+            uncached_total_tokens=bucket.get("uncached_total_tokens"),
+            uncached_cost_usd=bucket.get("uncached_cost_usd"),
         )
 
 
@@ -475,7 +485,7 @@ class ModelMetricsAnomalyDetector(KeyedProcessFunction):
         for alert in alerts:
             yield alert
 
-        if metric_has_latency_sample(value):
+        if metric_has_uncached_sample(value):
             latency_history.append(float(value.get("avg_latency_ms", 0.0) or 0.0))
         qps_history.append(float(value.get("queries_per_second", 0.0) or 0.0))
         error_rate_history.append(float(value.get("error_rate", 0.0) or 0.0))
@@ -537,18 +547,13 @@ class ModelRoutingGuardrailDetector(KeyedProcessFunction):
         for guardrail in guardrails:
             yield guardrail
 
-        total_tokens = max(0, int(value.get("total_tokens", 0) or 0))
-        total_cost_usd = float(value.get("total_cost_usd", 0.0) or 0.0)
-        cost_per_1k = (
-            (total_cost_usd * 1000.0 / total_tokens) if total_tokens > 0 else 0.0
-        )
-
-        if metric_has_latency_sample(value):
+        has_uncached = metric_has_uncached_sample(value)
+        if has_uncached:
             latency_history.append(float(value.get("avg_latency_ms", 0.0) or 0.0))
+            cost_per_1k_history.append(metric_cost_per_1k_tokens(value))
         qps_history.append(float(value.get("queries_per_second", 0.0) or 0.0))
         error_rate_history.append(float(value.get("error_rate", 0.0) or 0.0))
         cache_hit_rate_history.append(float(value.get("cache_hit_rate", 0.0) or 0.0))
-        cost_per_1k_history.append(cost_per_1k)
 
         self.latency_history_state.update(latency_history[-self.history_size :])
         self.qps_history_state.update(qps_history[-self.history_size :])
@@ -596,7 +601,7 @@ class ProviderRoutingGuardrailDetector(KeyedProcessFunction):
         for guardrail in guardrails:
             yield guardrail
 
-        if metric_has_latency_sample(value):
+        if metric_has_uncached_sample(value):
             latency_history.append(float(value.get("avg_latency_ms", 0.0) or 0.0))
         error_rate_history.append(metric_provider_failure_rate(value))
 
