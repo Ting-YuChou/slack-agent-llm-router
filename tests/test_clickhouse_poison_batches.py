@@ -31,10 +31,6 @@ class DataError(DatabaseError):
     pass
 
 
-class ProgrammingError(DatabaseError):
-    pass
-
-
 class OperationalError(DatabaseError):
     pass
 
@@ -108,13 +104,12 @@ def _rejecting_insert(error_factory, inserted):
     "error_factory",
     [
         lambda: DataError("Failed to write column 'user_tier'"),
-        lambda: ProgrammingError("Unrecognized column 'user_tier' in table"),
         lambda: DatabaseError(
             "received ClickHouse error code 691\n Code: 691. DB::Exception: "
             "Unknown element 'bogus-tier' for enum. (UNKNOWN_ELEMENT_OF_ENUM)"
         ),
     ],
-    ids=["DataError", "ProgrammingError", "DatabaseError-enum"],
+    ids=["DataError", "DatabaseError-enum"],
 )
 @pytest.mark.asyncio
 async def test_permanent_row_error_dead_letters_that_row_and_commits_rest(

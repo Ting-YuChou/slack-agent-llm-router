@@ -13,7 +13,7 @@ import time
 from datetime import datetime, timezone
 from collections import OrderedDict
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Any, Callable, Tuple
+from typing import Dict, List, Mapping, Optional, Any, Callable, Tuple
 from dataclasses import dataclass, asdict, field
 import uuid
 
@@ -161,14 +161,21 @@ def _json_text(value: Any, default: Optional[Callable[[Any], Any]] = None) -> st
     return _json_bytes(value, default=default).decode("utf-8")
 
 
+# Free-text fields never copied into a dead-letter payload (X6).
+_PRIVATE_ROW_FIELDS = frozenset({"query_text", "query", "context", "response_text"})
+
+
 def _private_free_payload(value: Any) -> Any:
-    """Redact credentials and replace a request `context` with its size."""
-    if isinstance(value, dict) and "context" in value:
+    """Redact credentials, drop free text and replace `context` with its size."""
+    if isinstance(value, dict) and _PRIVATE_ROW_FIELDS & set(value):
         value = dict(value)
-        context = value.pop("context")
-        summary = context_summary(None if context is None else str(context))
-        for key, item in summary.items():
-            value.setdefault(key, item)
+        if "context" in value:
+            context = value.pop("context")
+            summary = context_summary(None if context is None else str(context))
+            for key, item in summary.items():
+                value.setdefault(key, item)
+        for key in _PRIVATE_ROW_FIELDS:
+            value.pop(key, None)
     return redact(value)
 
 
@@ -590,15 +597,19 @@ class RoutingPolicyStateEntry:
         }
 
 
-# clickhouse-connect raises these for rows the server can never accept. They
-# are matched by class name because the driver is optional in CI.
-_PERMANENT_INSERT_ERROR_NAMES = frozenset({"DataError", "ProgrammingError"})
-_TRANSIENT_INSERT_ERROR_NAMES = frozenset({"OperationalError"})
+# ClickHouse insert failures fall in three kinds, matched by class name
+# because clickhouse-connect is optional in CI:
+#   "row":       only some rows can never be written; bisect and dead-letter them.
+#   "schema":    the table does not match the code (unknown column or table).
+#                Every row would fail, so keep the batch and back off loudly.
+#   "transient": anything else; keep the batch and back off.
+_ROW_ERROR_NAMES = frozenset({"DataError"})
+_SCHEMA_ERROR_NAMES = frozenset({"ProgrammingError"})
+_TRANSIENT_ERROR_NAMES = frozenset({"OperationalError"})
 # Server-side "Code: N" values that depend only on the rows being inserted.
-_PERMANENT_CLICKHOUSE_ERROR_CODES = frozenset(
+_ROW_CLICKHOUSE_ERROR_CODES = frozenset(
     {
         6,  # CANNOT_PARSE_TEXT
-        16,  # NO_SUCH_COLUMN_IN_TABLE
         26,  # CANNOT_PARSE_QUOTED_STRING
         27,  # CANNOT_PARSE_INPUT_ASSERTION_FAILED
         38,  # CANNOT_PARSE_DATE
@@ -612,31 +623,59 @@ _PERMANENT_CLICKHOUSE_ERROR_CODES = frozenset(
         691,  # UNKNOWN_ELEMENT_OF_ENUM
     }
 )
+# Server-side codes that mean the schema, not the rows, is wrong.
+_SCHEMA_CLICKHOUSE_ERROR_CODES = frozenset(
+    {
+        16,  # NO_SUCH_COLUMN_IN_TABLE
+        47,  # UNKNOWN_IDENTIFIER
+        60,  # UNKNOWN_TABLE
+        81,  # UNKNOWN_DATABASE
+    }
+)
 _CLICKHOUSE_ERROR_CODE = re.compile(r"\bCode:\s*(\d+)")
-# Free-text fields never copied into a dead-lettered row (X6).
-_PRIVATE_ROW_FIELDS = frozenset({"query_text", "query", "context", "response_text"})
 
 
-def _is_permanent_insert_error(error: Optional[BaseException]) -> bool:
-    """Return whether retrying the same rows can never succeed."""
+def _classify_insert_error(error: Optional[BaseException]) -> str:
+    """Return "row", "schema" or "transient" for a failed ClickHouse insert."""
     if error is None:
-        return False
+        return "transient"
     names = {cls.__name__ for cls in type(error).__mro__}
-    if names & _TRANSIENT_INSERT_ERROR_NAMES:
-        return False
-    if names & _PERMANENT_INSERT_ERROR_NAMES:
-        return True
+    if names & _TRANSIENT_ERROR_NAMES:
+        return "transient"
+    if names & _SCHEMA_ERROR_NAMES:
+        return "schema"
+    if names & _ROW_ERROR_NAMES:
+        return "row"
     if "DatabaseError" in names:
         match = _CLICKHOUSE_ERROR_CODE.search(str(error))
-        return bool(match and int(match.group(1)) in _PERMANENT_CLICKHOUSE_ERROR_CODES)
+        code = int(match.group(1)) if match else None
+        if code in _SCHEMA_CLICKHOUSE_ERROR_CODES:
+            return "schema"
+        if code in _ROW_CLICKHOUSE_ERROR_CODES:
+            return "row"
+        return "transient"
     # Row serialisation in to_dict() or in the driver's column packers.
-    return isinstance(error, (TypeError, ValueError, OverflowError))
+    if isinstance(error, (TypeError, ValueError, OverflowError)):
+        return "row"
+    return "transient"
+
+
+def _row_field(row: Any, name: str, default: Any = None) -> Any:
+    """Read a field from a dataclass row or a plain dict row."""
+    if isinstance(row, Mapping):
+        return row.get(name, default)
+    return getattr(row, name, default)
 
 
 def _dead_letter_row_payload(row: Any) -> Dict[str, Any]:
     """Return a JSON-safe, private-free copy of a rejected ClickHouse row."""
     try:
-        data = row.to_dict() if callable(getattr(row, "to_dict", None)) else {}
+        if isinstance(row, Mapping):
+            data = dict(row)
+        elif callable(getattr(row, "to_dict", None)):
+            data = row.to_dict()
+        else:
+            data = {}
     except Exception:
         data = {}
     if not isinstance(data, dict):
@@ -2937,28 +2976,18 @@ class KafkaConsumerManager:
             try:
                 await insert_method(batch)
             except Exception as error:
-                if not _is_permanent_insert_error(error):
-                    self._restore_detached_batch(topic_key, batch, offsets)
-                    self._record_flush_failure(topic_key, "transient")
-                    await self._refresh_batch_backpressure(topic_key)
-                    raise
-                PIPELINE_METRICS.clickhouse_flush_failures.labels(
-                    topic=topic_key, kind="permanent"
-                ).inc()
-                unresolved, unresolved_error = await self._insert_isolating_bad_rows(
-                    topic_key, batch, insert_method, error
-                )
+                kind = _classify_insert_error(error)
+                unresolved: List[Any] = batch
+                failure: Optional[Exception] = error
+                if kind == "row":
+                    unresolved, failure, kind = await self._resolve_rejected_batch(
+                        topic_key, batch, insert_method, error
+                    )
                 if unresolved:
                     self._restore_detached_batch(topic_key, unresolved, offsets)
-                    self._record_flush_failure(
-                        topic_key,
-                        "permanent"
-                        if _is_permanent_insert_error(unresolved_error)
-                        else "transient",
-                        count=False,
-                    )
+                    self._record_flush_failure(topic_key, kind)
                     await self._refresh_batch_backpressure(topic_key)
-                    raise unresolved_error or error
+                    raise failure or error
 
             state.inflight_rows = 0
             self._record_flush_success(topic_key)
@@ -2987,9 +3016,7 @@ class KafkaConsumerManager:
         state.inflight_rows = 0
         state.oldest_enqueued_at = time.monotonic()
 
-    def _record_flush_failure(
-        self, topic_key: str, kind: str, *, count: bool = True
-    ) -> None:
+    def _record_flush_failure(self, topic_key: str, kind: str) -> None:
         """Back off this topic's periodic flush exponentially, up to a cap."""
         state = self.batch_buffer_states[topic_key]
         state.consecutive_failures += 1
@@ -3000,12 +3027,12 @@ class KafkaConsumerManager:
         )
         state.retry_delay_seconds = delay
         state.next_flush_at = time.monotonic() + delay
-        if count:
-            PIPELINE_METRICS.clickhouse_flush_failures.labels(
-                topic=topic_key, kind=kind
-            ).inc()
+        PIPELINE_METRICS.clickhouse_flush_failures.labels(
+            topic=topic_key, kind=kind
+        ).inc()
         PIPELINE_METRICS.clickhouse_flush_retry_delay.labels(topic=topic_key).set(delay)
-        logger.warning(
+        log = logger.error if kind in ("schema", "dlq_failed") else logger.warning
+        log(
             "ClickHouse flush for %s failed (%s, attempt %d); next retry in %.1fs",
             topic_key,
             kind,
@@ -3021,65 +3048,76 @@ class KafkaConsumerManager:
         state.retry_delay_seconds = 0
         state.next_flush_at = 0.0
 
-    async def _insert_isolating_bad_rows(
+    async def _resolve_rejected_batch(
         self,
         topic_key: str,
         rows: List[Any],
         insert_method: Callable[[List[Any]], Any],
         error: Exception,
-    ) -> Tuple[List[Any], Optional[Exception]]:
-        """Bisect a permanently rejected batch: write good rows, DLQ bad ones.
+    ) -> Tuple[List[Any], Optional[Exception], str]:
+        """Bisect a batch rejected for some rows: write good rows, DLQ bad ones.
 
-        Returns the rows that were neither written nor dead-lettered, in their
-        original order, and the error that stopped them, so the caller keeps
-        their offsets uncommitted.
+        Returns the rows that are neither written nor dead-lettered (in their
+        original order), the error that kept them and its failure kind. The
+        caller keeps those rows and their offsets and backs off.
         """
-        unresolved: List[Any] = []
+        bad: List[Tuple[Any, Exception]] = []
+        unwritten: List[Any] = []
         stop_error: Optional[Exception] = None
 
         async def isolate(group: List[Any], group_error: Exception) -> None:
             nonlocal stop_error
             if len(group) == 1:
-                try:
-                    dead_lettered = await self._dead_letter_row(
-                        topic_key, group[0], group_error
-                    )
-                except Exception as dlq_error:
-                    logger.error(f"Failed to dead-letter {topic_key} row: {dlq_error}")
-                    dead_lettered = False
-                if not dead_lettered:
-                    unresolved.append(group[0])
-                    stop_error = stop_error or group_error
+                bad.append((group[0], group_error))
                 return
             middle = len(group) // 2
             for half in (group[:middle], group[middle:]):
-                if stop_error is not None and not _is_permanent_insert_error(
-                    stop_error
-                ):
-                    # A transient failure interrupted the bisection; the rest
-                    # stays buffered for the next flush.
-                    unresolved.extend(half)
+                if stop_error is not None:
+                    unwritten.extend(half)
                     continue
                 try:
                     await insert_method(half)
                 except Exception as half_error:
-                    if _is_permanent_insert_error(half_error):
+                    if _classify_insert_error(half_error) == "row":
                         await isolate(half, half_error)
                     else:
-                        unresolved.extend(half)
+                        unwritten.extend(half)
                         stop_error = half_error
 
+        def in_order(kept: List[Any]) -> List[Any]:
+            kept_ids = {id(row) for row in kept}
+            return [row for row in rows if id(row) in kept_ids]
+
         await isolate(rows, error)
-        return unresolved, stop_error
+        if stop_error is not None:
+            # Bisection was interrupted: nothing is dead-lettered this time.
+            return (
+                in_order(unwritten + [row for row, _ in bad]),
+                stop_error,
+                _classify_insert_error(stop_error),
+            )
+        if len(bad) == len(rows) and len(rows) > 1:
+            # No row can be written: that is the table, not the data.
+            return list(rows), error, "schema"
+        for index, (row, row_error) in enumerate(bad):
+            try:
+                dead_lettered = await self._dead_letter_row(topic_key, row, row_error)
+            except Exception as dlq_error:
+                logger.error(f"Failed to dead-letter {topic_key} row: {dlq_error}")
+                dead_lettered = False
+            if not dead_lettered:
+                # Stop at once: keep this and every later bad row for a retry.
+                return [row for row, _ in bad[index:]], row_error, "dlq_failed"
+        return [], None, "row"
 
     async def _dead_letter_row(
         self, topic_key: str, row: Any, error: Exception
     ) -> bool:
         """Publish one row ClickHouse rejected permanently to the topic's DLQ."""
         message = SimpleNamespace(
-            topic=str(getattr(row, "kafka_topic", "") or ""),
-            partition=int(getattr(row, "kafka_partition", -1)),
-            offset=int(getattr(row, "kafka_offset", -1)),
+            topic=str(_row_field(row, "kafka_topic", "") or ""),
+            partition=int(_row_field(row, "kafka_partition", -1)),
+            offset=int(_row_field(row, "kafka_offset", -1)),
             key=None,
             value=_dead_letter_row_payload(row),
         )
