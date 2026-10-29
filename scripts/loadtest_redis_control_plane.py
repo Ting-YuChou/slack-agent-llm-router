@@ -21,6 +21,7 @@ import importlib
 import json
 import math
 import os
+import re
 import sys
 import time
 import uuid
@@ -137,14 +138,21 @@ def _redis_password() -> Optional[str]:
     return os.getenv("REDIS_PASSWORD") or None
 
 
+_PASSWORD_PARAMETER = re.compile(r"((?:^|&)password=)[^&]*", re.IGNORECASE)
+
+
 def _display_url(url: str) -> str:
     """`url` with any password masked, for the printed and saved result."""
     parts = urlsplit(url)
     userinfo, at, host = parts.netloc.rpartition("@")
-    if not at or ":" not in userinfo:
+    if at and ":" in userinfo:
+        username = userinfo.partition(":")[0]
+        url = urlunsplit(parts._replace(netloc=f"{username}:***@{host}"))
+    # redis-py also reads ?password= from the query string.
+    base, question, query = url.partition("?")
+    if not question:
         return url
-    username = userinfo.partition(":")[0]
-    return urlunsplit(parts._replace(netloc=f"{username}:***@{host}"))
+    return base + "?" + _PASSWORD_PARAMETER.sub(r"\g<1>***", query)
 
 
 async def capture_redis_commands(

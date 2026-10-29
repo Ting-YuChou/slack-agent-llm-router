@@ -337,8 +337,10 @@ if [[ "${DEMO_TEST_MODE:-0}" != 1 ]]; then
       exit 2
     fi
     # The reader may only select these views; they read the analytics tables as their definer.
-    if ! docker exec -i "${clickhouse_container}" bash -ec \
-        'clickhouse-client --user "${CLICKHOUSE_USER}" --password "${CLICKHOUSE_PASSWORD}" --multiquery' \
+    # The client reads the container's credentials from a private temporary
+    # config file, so the password is on no command line.
+    clickhouse_client_script="$(cat "${script_dir}/clickhouse_client_in_container.sh")"
+    if ! docker exec -i "${clickhouse_container}" sh -c "${clickhouse_client_script}" sh --multiquery \
         <"${repo_root}/docker/observability/agent-mcp-views.sql" >/dev/null; then
       printf 'Could not apply the agent_mcp views in %s; start the observability stack with the agent MCP overlay first.\n' "${clickhouse_container}" >&2
       exit 2

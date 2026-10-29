@@ -112,7 +112,8 @@ def parse_args() -> argparse.Namespace:
 
 async def main() -> None:
     args = parse_args()
-    # Authenticate with $REDIS_PASSWORD, not a password in --redis-url.
+    # Pass the password in $REDIS_PASSWORD, not --redis-url, to keep it out of
+    # argv. redis-py uses a password in the URL over this argument.
     client = redis.Redis.from_url(
         args.redis_url,
         password=os.getenv("REDIS_PASSWORD") or None,

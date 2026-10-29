@@ -318,6 +318,57 @@ def test_loadtest_shows_a_redis_url_without_a_password_unchanged(url):
     assert loadtest._display_url(url) == url
 
 
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        (
+            "redis://localhost:6379/15?password=s3cret-pw",
+            "redis://localhost:6379/15?password=***",
+        ),
+        (
+            "unix:///run/redis.sock?db=15&password=s3cret-pw&x=1",
+            "unix:///run/redis.sock?db=15&password=***&x=1",
+        ),
+        (
+            "redis://u:s3cret-pw@localhost/0?password=s3cret-pw",
+            "redis://u:***@localhost/0?password=***",
+        ),
+    ],
+)
+def test_loadtest_masks_a_password_query_parameter(url, expected):
+    from scripts import loadtest_redis_control_plane as loadtest
+
+    assert loadtest._display_url(url) == expected
+
+
+def test_no_script_passes_a_password_to_clickhouse_client():
+    offenders = [
+        f"{path.relative_to(ROOT)}:{number}"
+        for path in sorted(SCRIPTS.rglob("*"))
+        if path.is_file() and path.suffix in {".py", ".sh"}
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if "clickhouse-client" in line and "--password" in line
+    ]
+
+    assert offenders == []
+
+
+def test_demo_applies_the_mcp_views_with_the_in_container_client_script(tmp_path):
+    from scripts import migrate_clickhouse_analytics_v2 as migration
+
+    launcher = (SCRIPTS / "run_slack_demo.sh").read_text(encoding="utf-8")
+    assert (
+        'docker exec -i "${clickhouse_container}" sh -c '
+        '"${clickhouse_client_script}" sh --multiquery'
+    ) in launcher
+    shared = (SCRIPTS / "clickhouse_client_in_container.sh").read_text(encoding="utf-8")
+    assert migration.CLICKHOUSE_CLIENT_SCRIPT == shared
+    assert "clickhouse_client_in_container.sh" in launcher
+    assert "clickhouse_client_in_container.sh" in (
+        SCRIPTS / "migrate_clickhouse_alert_events.sh"
+    ).read_text(encoding="utf-8")
+
+
 def test_rag_benchmark_sends_the_environment_password(monkeypatch):
     import redis.asyncio
 

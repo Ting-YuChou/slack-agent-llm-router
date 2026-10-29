@@ -4,21 +4,8 @@ set -euo pipefail
 service_name="${CLICKHOUSE_SERVICE:-clickhouse}"
 database_name="${CLICKHOUSE_DATABASE:-default}"
 
-# Runs inside the container: clickhouse-client reads the credentials compose
-# gave the container from a private temporary config file, so the password is
-# on no command line, on the host or in the container.
-client_script="$(
-  cat <<'SH'
-umask 077
-d=$(mktemp -d) || exit 1
-trap 'rm -rf "$d"' EXIT
-trap 'exit 1' HUP INT TERM
-q() { printf %s "$1" | sed "s/'/''/g"; }
-printf "user: '%s'\npassword: '%s'\n" \
-  "$(q "$CLICKHOUSE_USER")" "$(q "$CLICKHOUSE_PASSWORD")" > "$d/client.yaml"
-clickhouse-client --config-file "$d/client.yaml" "$@"
-SH
-)"
+# Runs inside the container and keeps the password off every command line.
+client_script="$(cat "$(dirname "${BASH_SOURCE[0]}")/clickhouse_client_in_container.sh")"
 
 run_query() {
   docker compose exec -T "${service_name}" sh -c "${client_script}" sh --query "$1"

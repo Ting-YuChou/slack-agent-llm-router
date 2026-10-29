@@ -8,23 +8,16 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
-# Runs inside the ClickHouse container: clickhouse-client reads the credentials
-# compose gave the container from a private temporary config file, so the
-# password is on no command line, on the host or in the container.
-CLICKHOUSE_CLIENT_SCRIPT = "\n".join(
-    [
-        "umask 077",
-        "d=$(mktemp -d) || exit 1",
-        "trap 'rm -rf \"$d\"' EXIT",
-        "trap 'exit 1' HUP INT TERM",
-        'q() { printf %s "$1" | sed "s/\'/\'\'/g"; }',
-        "printf \"user: '%s'\\npassword: '%s'\\n\""
-        ' "$(q "$CLICKHOUSE_USER")" "$(q "$CLICKHOUSE_PASSWORD")" > "$d/client.yaml"',
-        'clickhouse-client --config-file "$d/client.yaml" "$@"',
-    ]
+# Runs inside the ClickHouse container and keeps the password off every
+# command line; see the script for how.
+CLICKHOUSE_CLIENT_SCRIPT = (
+    Path(__file__)
+    .with_name("clickhouse_client_in_container.sh")
+    .read_text(encoding="utf-8")
 )
 DEFAULT_CLICKHOUSE_COMMAND = shlex.join(
     ["docker", "compose", "exec", "-T", "clickhouse"]
