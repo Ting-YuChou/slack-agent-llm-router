@@ -2641,7 +2641,9 @@ class TestSlackStateStores:
         assert created == [{**connection, "password": "s3cret"}]
 
     @pytest.mark.asyncio
-    async def test_redis_slack_store_expires_every_key_it_writes(self):
+    async def test_redis_slack_store_expires_session_state_but_keeps_user_settings(
+        self,
+    ):
         class ExpiringRedis:
             def __init__(self):
                 self.values = {}
@@ -2679,8 +2681,10 @@ class TestSlackStateStores:
         session = int(ConversationManager({}).session_timeout.total_seconds())
         month = 30 * 24 * 3600
         assert store.client.expiry == {
-            "p:user:U1": month,
-            "p:rate_limit:U1": month,
+            # The only copy of a user's /llm settings: it never expires.
+            "p:user:U1": None,
+            # Counted requests older than the hourly window are dropped anyway.
+            "p:rate_limit:U1": 3600,
             "p:conversation:U1:C1:T1": session,
             "p:active_thread:C1:T1": session,
             "p:agent_run:R1": month,

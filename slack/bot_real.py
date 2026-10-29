@@ -69,8 +69,10 @@ MAX_QUERY_TOKENS = 8192
 STATE_SCHEMA_VERSION = 1
 # How long a conversation, and the bot thread it lives in, stays live.
 SLACK_SESSION_TIMEOUT = timedelta(hours=2)
-# Redis expiry for state that outlives a session: users, rate limits, Agent runs.
-SLACK_STATE_TTL_SECONDS = 30 * 24 * 3600
+# Redis expiry for tracked Agent runs; user settings never expire.
+SLACK_AGENT_RUN_TTL_SECONDS = 30 * 24 * 3600
+# Requests older than this no longer count against a user's rate limit.
+RATE_LIMIT_WINDOW_SECONDS = 3600
 POSTED_CI_JOBS_LIMIT = 1000
 HANDLED_MESSAGES_LIMIT = 1000
 UNVERIFIED_LABEL = "⚠️ 未驗證（沒有 verification profile）"
@@ -608,7 +610,8 @@ class RedisSlackStateStore(SlackStateStore):
         self.agent_runs_index_key = f"{self.key_prefix}:agent_runs"
         self.posted_ci_jobs_key = f"{self.key_prefix}:posted_ci_jobs"
         self.session_ttl_seconds = int(SLACK_SESSION_TIMEOUT.total_seconds())
-        self.state_ttl_seconds = SLACK_STATE_TTL_SECONDS
+        self.rate_limit_ttl_seconds = RATE_LIMIT_WINDOW_SECONDS
+        self.agent_run_ttl_seconds = SLACK_AGENT_RUN_TTL_SECONDS
         self.client = None
 
     async def initialize(self):
@@ -723,7 +726,11 @@ class RedisSlackStateStore(SlackStateStore):
                 user_id, rate_limit_payload
             )
             if merged_rate_limits:
-                await self._set_json(self._rate_limit_key(user_id), merged_rate_limits)
+                await self._set_json(
+                    self._rate_limit_key(user_id),
+                    merged_rate_limits,
+                    ttl_seconds=self.rate_limit_ttl_seconds,
+                )
                 await self._sadd(self.rate_limits_index_key, user_id)
             else:
                 await self._delete(self._rate_limit_key(user_id))
@@ -819,7 +826,11 @@ class RedisSlackStateStore(SlackStateStore):
             return
 
         try:
-            await self._set_json(self._agent_run_key(run_id), payload)
+            await self._set_json(
+                self._agent_run_key(run_id),
+                payload,
+                ttl_seconds=self.agent_run_ttl_seconds,
+            )
             await self._sadd(self.agent_runs_index_key, run_id)
         except Exception as exc:
             logger.warning("Failed to persist Slack agent run to Redis: %s", exc)
@@ -912,13 +923,15 @@ class RedisSlackStateStore(SlackStateStore):
     async def _set_json(
         self, key: str, payload: Any, *, ttl_seconds: Optional[int] = None
     ):
-        """Store JSON that expires after ttl_seconds, or the long state TTL."""
+        """Store JSON that expires after ttl_seconds, or never when that is None."""
         serialized = json.dumps(payload, ensure_ascii=True, sort_keys=True)
-        ttl = ttl_seconds or self.state_ttl_seconds
         if hasattr(self.client, "set"):
-            await self.client.set(key, serialized, ex=ttl)
+            await self.client.set(key, serialized, ex=ttl_seconds)
         elif hasattr(self.client, "setex"):
-            await self.client.setex(key, ttl, serialized)
+            # setex needs an expiry; this fallback has always used 30 days.
+            await self.client.setex(
+                key, ttl_seconds or SLACK_AGENT_RUN_TTL_SECONDS, serialized
+            )
 
     async def _delete(self, key: str):
         if hasattr(self.client, "delete"):
@@ -970,7 +983,7 @@ class RedisSlackStateStore(SlackStateStore):
         if not merged_values:
             return []
 
-        cutoff = time.time() - 3600
+        cutoff = time.time() - RATE_LIMIT_WINDOW_SECONDS
         deduped = sorted(set(_rate_limit_entries(merged_values, cutoff)))
         return [_rate_limit_entry(*entry) for entry in deduped]
 
