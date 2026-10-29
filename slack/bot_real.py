@@ -3496,7 +3496,7 @@ class SlackBot:
         thread_ts = event.get("thread_ts")
         if subtype is not None:
             # A file share or broadcast continues a chat thread only: an Agent
-            # thread takes plain follow-ups, the kind _is_agent_request routes.
+            # thread still takes plain follow-ups, as it did before S13.
             if not self._is_active_thread(channel_id, thread_ts, refresh=False):
                 return
             if not self._is_agent_thread(channel_id, thread_ts):
@@ -6070,9 +6070,11 @@ class SlackBot:
         """Whether a user's message goes to Agent mode rather than chat.
 
         That is an `agent` command, or any other message in an Agent thread,
-        which continues its session.
+        which continues its session. A command shared with a file or sent to
+        the channel too is one as well, so it takes the Agent lane and bucket
+        whichever of Slack's events for it arrives first.
         """
-        if event.get("subtype") or event.get("bot_id"):
+        if event.get("subtype") not in CHAT_MESSAGE_SUBTYPES or event.get("bot_id"):
             return False
         text = event.get("text") or ""
         if self.bot_user_id:

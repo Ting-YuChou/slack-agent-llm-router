@@ -2,7 +2,7 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -179,6 +179,84 @@ async def test_agent_threads_still_take_plain_follow_ups_only(subtype):
 
     bot._process_message.assert_not_awaited()
     bot.web_client.chat_postEphemeral.assert_not_awaited()
+
+
+def agent_command_bot(tmp_path):
+    """A bot whose Agent runtime holds create_session until `gate` is set."""
+    gate = asyncio.Event()
+    accepted = {"session_id": "S1", "run_id": "R1", "status": "starting"}
+
+    async def create_session(*_args, **_kwargs):
+        await gate.wait()
+        return accepted
+
+    bot = chat_bot(state={"backend": "file", "file_path": str(tmp_path / "state.json")})
+    bot.agent_runtime_client = SimpleNamespace(
+        create_session=AsyncMock(side_effect=create_session)
+    )
+    bot.web_client.chat_update = AsyncMock()
+    bot._start_agent_monitor = Mock()
+    bot._extract_query_attachments = AsyncMock(return_value=[])
+    bot._work_concurrency = 1
+    bot._mark_thread_active("C1", "100.0")
+    return bot, gate
+
+
+async def deliver_while_the_agent_start_waits(bot, gate, events):
+    """Queue `events`; the one worker must come free while the start waits."""
+    bot._start_work_workers()
+    try:
+        for event in events:
+            await bot._enqueue_work(
+                SlackWorkItem(kind="event", payload=dict(event), name="slack_event")
+            )
+        await asyncio.wait_for(bot._work_queue.join(), timeout=1)
+    finally:
+        gate.set()
+        await bot._stop_work_workers()
+    while bot.background_tasks:
+        await asyncio.gather(*list(bot.background_tasks))
+
+
+def assert_one_agent_start(bot):
+    bot.agent_runtime_client.create_session.assert_awaited_once()
+    bot.inference_engine.process_query.assert_not_awaited()
+    # Counted once, in the Agent bucket.
+    assert len(bot.user_manager.requests_since("U1", 0, bucket="agent")) == 1
+    assert bot.user_manager.requests_since("U1", 0) == []
+
+
+@pytest.mark.asyncio
+async def test_an_agent_command_shared_with_a_file_takes_the_agent_lane(tmp_path):
+    bot, gate = agent_command_bot(tmp_path)
+    event = thread_reply(
+        subtype="file_share", text="!llm agent fix the tests", files=[{"id": "F1"}]
+    )
+
+    await deliver_while_the_agent_start_waits(bot, gate, [event])
+
+    assert_one_agent_start(bot)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ["message", "app_mention"])
+async def test_a_mentioned_agent_command_with_a_file_takes_one_lane_either_way(
+    tmp_path, first
+):
+    bot, gate = agent_command_bot(tmp_path)
+    # Slack sends a file_share message and an app_mention for one @bot post.
+    message = thread_reply(
+        subtype="file_share",
+        text="<@UBOT> !llm agent fix the tests",
+        files=[{"id": "F1"}],
+    )
+    mention = {**message, "type": "app_mention"}
+    mention.pop("subtype")
+    events = [message, mention] if first == "message" else [mention, message]
+
+    await deliver_while_the_agent_start_waits(bot, gate, events)
+
+    assert_one_agent_start(bot)
 
 
 @pytest.mark.asyncio
