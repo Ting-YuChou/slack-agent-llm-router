@@ -656,6 +656,8 @@ slack:
       vector_weight: 0.45
       recency_weight: 0.05
       importance_weight: 0.05
+      # Vector-similarity floor; recalibrate when memory is enabled.
+      min_score: 0.3
     embedding:
       provider: openai
       model: text-embedding-3-small

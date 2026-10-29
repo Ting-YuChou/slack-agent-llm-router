@@ -120,6 +120,13 @@ class BoundedTTLMap(MutableMapping[K, V], Generic[K, V]):
         del self._entries[key]
         self._update_metrics()
 
+    def clear(self) -> None:
+        """Drop every entry at once, without counting them as evictions."""
+        self._entries.clear()
+        self._expiry_heap.clear()
+        self._created_heap.clear()
+        self._update_metrics()
+
     def __iter__(self) -> Iterator[K]:
         self.prune_expired()
         return iter(tuple(self._entries))
