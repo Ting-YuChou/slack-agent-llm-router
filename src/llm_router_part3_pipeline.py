@@ -583,6 +583,11 @@ class RoutingPolicyStateEntry:
         }
 
 
+def _is_ack_timeout(error: BaseException) -> bool:
+    """Return whether a send failed only because we stopped waiting for its ack."""
+    return isinstance(error, (asyncio.TimeoutError, TimeoutError))
+
+
 class KafkaProducerManager:
     """Manages Kafka message production"""
 
@@ -695,7 +700,10 @@ class KafkaProducerManager:
                 return True
             except Exception as e:
                 last_error = e
-                if attempt >= self.retries:
+                if attempt >= self.retries or _is_ack_timeout(e):
+                    # An ack timeout does not mean the broker dropped the record:
+                    # it may already be written. Resending here would duplicate
+                    # it, so leave delivery retries to the idempotent producer.
                     break
                 backoff_seconds = (self.retry_backoff_ms / 1000.0) * (2**attempt)
                 if backoff_seconds > 0:
@@ -2043,7 +2051,7 @@ class KafkaConsumerManager:
                         context_compressed=data.get("context_compressed", False),
                         compression_ratio=data.get("compression_ratio", 0.0),
                         cached_response=data.get("cached_response", False),
-                        **self._kafka_event_metadata(message),
+                        **self._payload_event_metadata(data, message),
                     )
 
                     # Add to batch
@@ -2190,6 +2198,20 @@ class KafkaConsumerManager:
             "kafka_offset": offset,
         }
 
+    def _payload_event_metadata(
+        self, data: Dict[str, Any], message: Any
+    ) -> Dict[str, Any]:
+        """Prefer the producer's event identity so replays dedupe in ClickHouse.
+
+        The Kafka coordinate is only a fallback: a resent or replayed message
+        lands at a new offset, which would otherwise create a second row.
+        """
+        metadata = self._kafka_event_metadata(message)
+        payload_event_id = str(data.get("event_id") or "").strip()
+        if payload_event_id:
+            metadata["event_id"] = payload_event_id
+        return metadata
+
     def _dead_letter_topic(self, topic_key: str, message: Any) -> str:
         """Resolve the DLQ topic for a failed source message."""
         if topic_key in self.dead_letter_topics:
@@ -2329,19 +2351,31 @@ class KafkaConsumerManager:
         kafka_metadata: Optional[Dict[str, Any]] = None,
     ) -> ModelPerformanceEntry:
         """Convert a Flink analytics window event to a ClickHouse row."""
+        window_start_ms = int(data.get("window_start_ms", 0) or 0)
         window_end_ms = int(data.get("window_end_ms", 0) or 0)
-        event_time = _parse_datetime(
-            data.get("emitted_at"),
-            default=datetime.fromtimestamp(window_end_ms / 1000, tz=timezone.utc)
-            if window_end_ms
-            else datetime.now(timezone.utc),
-        )
+        model_name = str(data.get("model_name", "unknown"))
+        provider = str(data.get("provider", ""))
+        metadata = dict(kafka_metadata or {})
+        if window_start_ms:
+            # A replayed window is re-emitted with a new emitted_at and a new
+            # offset; keying the row on the window keeps FINAL at one row.
+            event_time = datetime.fromtimestamp(window_start_ms / 1000, tz=timezone.utc)
+            metadata[
+                "event_id"
+            ] = f"{model_name}:{provider}:{window_start_ms}:{window_end_ms}"
+        else:
+            event_time = _parse_datetime(
+                data.get("emitted_at"),
+                default=datetime.fromtimestamp(window_end_ms / 1000, tz=timezone.utc)
+                if window_end_ms
+                else datetime.now(timezone.utc),
+            )
 
         return ModelPerformanceEntry(
             timestamp=event_time,
-            model_name=str(data.get("model_name", "unknown")),
-            provider=str(data.get("provider", "")),
-            window_start_ms=int(data.get("window_start_ms", 0) or 0),
+            model_name=model_name,
+            provider=provider,
+            window_start_ms=window_start_ms,
             window_end_ms=window_end_ms,
             window_size_seconds=int(data.get("window_size_seconds", 60) or 60),
             requests_count=int(data.get("request_count", 0) or 0),
@@ -2355,7 +2389,7 @@ class KafkaConsumerManager:
             queries_per_second=float(data.get("queries_per_second", 0.0) or 0.0),
             cache_hit_rate=float(data.get("cache_hit_rate", 0.0) or 0.0),
             cached_count=int(data.get("cached_count", 0) or 0),
-            **(kafka_metadata or {}),
+            **metadata,
         )
 
     def _build_alert_event_entry(
