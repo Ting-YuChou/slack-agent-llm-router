@@ -154,7 +154,7 @@ def _json_text(value: Any, default: Optional[Callable[[Any], Any]] = None) -> st
 
 
 def _private_free_payload(value: Any) -> Any:
-    """Redact credentials and replace a request `context` with its size and hash."""
+    """Redact credentials and replace a request `context` with its size."""
     if isinstance(value, dict) and "context" in value:
         value = dict(value)
         context = value.pop("context")
