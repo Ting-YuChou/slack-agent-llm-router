@@ -598,8 +598,14 @@ def _split_fenced_text(text: str, limit: int) -> List[str]:
                 # Prose breaks on a space, which the break replaces.
                 piece, remaining = remaining[:space], remaining[space + 1 :]
             else:
-                # Code keeps every character: a hard cut.
-                piece, remaining = remaining[:budget], remaining[budget:]
+                # Code keeps every character: a hard cut, but never inside a
+                # run of backticks, which would flip every later fence.
+                cut = budget
+                while 0 < cut < len(remaining) and remaining[cut - 1 : cut + 1] == "``":
+                    cut -= 1
+                if cut == 0:
+                    cut = budget
+                piece, remaining = remaining[:cut], remaining[cut:]
                 if not _fence_is_open(prefix + piece):
                     remaining = remaining.lstrip("\n")
                 elif remaining.startswith("\n"):
@@ -608,6 +614,13 @@ def _split_fenced_text(text: str, limit: int) -> List[str]:
         open_fence = _fence_is_open(chunk)
         if open_fence and remaining:
             chunk += "\n```"
+            closing_line, _, after = remaining.partition("\n")
+            if closing_line.startswith("```") and not closing_line[3:].strip():
+                # The break fell just before the fence's own closing line:
+                # that closes this chunk, so the next one is not reopened
+                # (which would render an empty code block).
+                open_fence = False
+                remaining = after.lstrip("\n")
         chunks.append(chunk)
     return chunks
 

@@ -444,6 +444,31 @@ def test_no_character_inside_a_code_fence_is_dropped(limit):
     assert joined.replace("\n", "") == code.replace("\n", "")
 
 
+def test_a_break_before_a_closing_fence_leaves_no_empty_code_block():
+    text = "```\n" + "x" * 48 + "\n```\n" + "word" * 30
+    bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
+
+    parts = bot._split_response(text, 60)
+
+    assert all(len(part) <= 60 for part in parts)
+    assert all(part.count("```") % 2 == 0 for part in parts)
+    assert parts[0] == "```\n" + "x" * 48 + "\n```"
+    assert all(not part.startswith("```\n```") for part in parts)
+    assert "".join(parts[1:]) == "word" * 30
+
+
+def test_a_hard_cut_never_splits_a_run_of_backticks():
+    text = "y" * 47 + "```code```" + "z" * 80
+    bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
+
+    parts = bot._split_response(text, 60)
+
+    assert all(len(part) <= 60 for part in parts)
+    assert all(part.count("```") % 2 == 0 for part in parts)
+    assert not any(part.endswith("``") and not part.endswith("```") for part in parts)
+    assert parts[-1].endswith("z" * 10)
+
+
 def test_split_does_not_leave_tiny_fragments():
     paragraph = " ".join(f"word{index}" for index in range(500))
     text = f"Intro line.\n\n{paragraph}\n\nBye."
