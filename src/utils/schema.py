@@ -203,8 +203,8 @@ class InferenceResponse(BaseModel):
     compressed_context: bool = False
     # Set when a fallback answered: the routed model whose failure it replaced.
     fallback_from_model: Optional[str] = None
-    # Models tried for this answer, the one that gave it included; 0 when it
-    # came from the response cache without a fallback.
+    # Models whose provider was called for this answer, the one that gave it
+    # included; 0 when it came from the response cache.
     attempts: int = Field(default=1, ge=0)
 
     # Tool output

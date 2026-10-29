@@ -3211,7 +3211,10 @@ class InferenceEngine:
         if not fallback_models:
             if getattr(request, "_rag_images", []):
                 return await self._text_only_fallback(
-                    request, routing_decision, execution_budget, attempts=2
+                    request,
+                    routing_decision,
+                    execution_budget,
+                    started_calls=started_calls,
                 )
             raise primary_exc
 
@@ -3224,7 +3227,7 @@ class InferenceEngine:
         )
 
         last_exception: Exception = primary_exc
-        for attempts, fallback_model in enumerate(fallback_models, start=2):
+        for fallback_model in fallback_models:
             fallback_started_at = time.time()
             response = await self._get_cached_inference_response(
                 request,
@@ -3260,7 +3263,9 @@ class InferenceEngine:
                     last_exception = fallback_exc
                     continue
             response.fallback_from_model = primary_model
-            response.attempts = attempts
+            # Only models whose provider was called count: not those rejected
+            # at admission or by an open circuit, nor a fallback cache hit.
+            response.attempts = len(started_calls)
             return (
                 response,
                 fallback_model,
@@ -3278,7 +3283,7 @@ class InferenceEngine:
                 request,
                 routing_decision,
                 execution_budget,
-                attempts=len(fallback_models) + 2,
+                started_calls=started_calls,
             )
         raise last_exception
 
@@ -3288,7 +3293,7 @@ class InferenceEngine:
         routing_decision: Any,
         execution_budget: Optional[RequestExecutionBudget],
         *,
-        attempts: int,
+        started_calls: List[str],
     ) -> Tuple[InferenceResponse, str, Any]:
         """The text-only retry of a failed vision request, marked as a fallback."""
         primary_model = routing_decision.selected_model
@@ -3296,7 +3301,7 @@ class InferenceEngine:
             request, routing_decision, execution_budget
         )
         response, model_name, decision = result
-        response.attempts = attempts
+        response.attempts = len({*started_calls, model_name})
         response.fallback_from_model = (
             primary_model if model_name != primary_model else None
         )

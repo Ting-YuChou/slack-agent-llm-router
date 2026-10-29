@@ -881,6 +881,48 @@ async def test_circuit_open_gpt5_is_answered_by_claude():
     assert response.model_name == "claude-sonnet-4-6"
     assert response.fallback_from_model == "gpt-5"
     engine.providers["openai"].generate_response.assert_not_awaited()
+    # The open circuit kept gpt-5's provider from being called.
+    assert response.attempts == 1
+
+
+class _RejectModelsAdmission(_Admission):
+    """Rejects provider admission for some models, as an open circuit would."""
+
+    def __init__(self, *models):
+        super().__init__()
+        self.rejected = set(models)
+
+    async def acquire_provider(self, **kwargs):
+        if kwargs["model_name"] in self.rejected:
+            return AdmissionDecision.reject(
+                status_code=429,
+                error="rate_limited",
+                reason="circuit_open",
+                message="denied",
+                retry_after_seconds=1,
+            )
+        return await super().acquire_provider(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_attempts_count_only_models_whose_provider_was_called():
+    engine = _chain_engine(
+        _router(("gpt-5", "claude-sonnet-4-6", "claude-haiku-4-5")),
+        _StatusError(503),
+        chains={"gpt-5": ["claude-sonnet-4-6", "claude-haiku-4-5"]},
+        scheduler=_shipped_scheduler(),
+        admission=_RejectModelsAdmission("claude-sonnet-4-6"),
+    )
+    request = _request(**_ENTERPRISE)
+
+    response = await engine.process_query(request)
+
+    assert response.model_name == "claude-haiku-4-5"
+    calls = engine.providers["anthropic"].generate_response.await_args_list
+    assert [call.args[1] for call in calls] == ["claude-haiku-4-5"]
+    # gpt-5 and claude-haiku-4-5 were called; claude-sonnet-4-6 was skipped.
+    assert response.attempts == 2
+    assert _published_event(engine, request)["attempts"] == 2
 
 
 @pytest.mark.asyncio
