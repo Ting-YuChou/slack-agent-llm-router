@@ -2425,30 +2425,21 @@ class TestSlackBot:
     async def test_extract_query_attachments_downloads_private_slack_files(
         self, monkeypatch
     ):
-        class DummyResponse:
-            def __init__(self):
-                self.content = b"abc"
+        requests = []
 
-            def raise_for_status(self):
-                return None
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, content=b"abc")
 
-        class DummyHttpClient:
-            def __init__(self, *args, **kwargs):
-                self.args = args
-                self.kwargs = kwargs
+        real_client = httpx.AsyncClient
 
-            async def __aenter__(self):
-                return self
+        def client_with_mock_transport(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            return real_client(*args, **kwargs)
 
-            async def __aexit__(self, exc_type, exc, tb):
-                return False
-
-            async def get(self, url, headers=None):
-                assert url == "https://files.example/report.csv"
-                assert headers == {"Authorization": "Bearer xoxb-test"}
-                return DummyResponse()
-
-        monkeypatch.setattr("slack.bot_real.httpx.AsyncClient", DummyHttpClient)
+        monkeypatch.setattr(
+            "slack.bot_real.httpx.AsyncClient", client_with_mock_transport
+        )
 
         bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
         bot.bot_token = "xoxb-test"
@@ -2461,12 +2452,16 @@ class TestSlackBot:
                         "name": "report.csv",
                         "mimetype": "text/csv",
                         "size": 3,
-                        "url_private_download": "https://files.example/report.csv",
+                        "url_private_download": "https://files.slack.com/files-pri/T1-F1/report.csv",
                     }
                 ]
             }
         )
 
+        assert [str(request.url) for request in requests] == [
+            "https://files.slack.com/files-pri/T1-F1/report.csv"
+        ]
+        assert requests[0].headers["Authorization"] == "Bearer xoxb-test"
         assert len(attachments) == 1
         assert attachments[0].content == b"abc"
         assert attachments[0].type == AttachmentType.DOCUMENT
