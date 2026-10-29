@@ -4840,6 +4840,10 @@ class InferenceEngine:
         update: Dict[str, Any] = {
             "selected_model": fallback_model,
             "routing_reason": suffix,
+            # The router's own choice, kept across a chain of fallbacks.
+            "routed_model": getattr(routing_decision, "routed_model", None)
+            or getattr(routing_decision, "selected_model", None)
+            or original_model,
         }
         if fallback_models is not None:
             update["fallback_models"] = list(fallback_models)

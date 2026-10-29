@@ -331,6 +331,7 @@ ROUTING_CANDIDATE_FIELDS = (
     "score",
     "score_breakdown",
     "selected",
+    "bypassed_guardrail",
 )
 
 
@@ -346,6 +347,9 @@ def _routing_candidate_payload(candidate: Any) -> Dict[str, Any]:
         str(name): float(value)
         for name, value in dict(payload["score_breakdown"] or {}).items()
     }
+    # Only rows routing kept despite a guardrail (fail-open) carry it.
+    if not payload["bypassed_guardrail"]:
+        payload.pop("bypassed_guardrail")
     return payload
 
 
@@ -373,8 +377,12 @@ def build_routing_decision_event(
         "user_tier": _enum_value(
             getattr(routing_decision, "user_tier", None) or query_request.user_tier
         ),
-        "selected_model": getattr(routing_decision, "selected_model", None),
+        # The router's choice; after an inference fallback the decision's
+        # selected_model is the fallback, which served_model reports.
+        "selected_model": getattr(routing_decision, "routed_model", None)
+        or getattr(routing_decision, "selected_model", None),
         "served_model": getattr(inference_response, "model_name", None),
+        "fallback_from_model": getattr(inference_response, "fallback_from_model", None),
         "query_type": _enum_value(getattr(routing_decision, "query_type", None)),
         "routing_strategy": getattr(routing_decision, "routing_strategy", None),
         "reason_code": getattr(routing_decision, "reason_code", None),
@@ -677,6 +685,7 @@ class RoutingDecisionEntry:
     request_id: str
     selected_model: str = ""
     served_model: str = ""
+    fallback_from_model: str = ""
     user_tier: str = ""
     query_type: str = ""
     routing_strategy: str = ""
@@ -707,6 +716,7 @@ class RoutingDecisionEntry:
             "request_id": self.request_id,
             "selected_model": self.selected_model,
             "served_model": self.served_model,
+            "fallback_from_model": self.fallback_from_model,
             "user_tier": self.user_tier,
             "query_type": self.query_type,
             "routing_strategy": self.routing_strategy,
@@ -1462,6 +1472,7 @@ class ClickHouseManager:
             request_id String,
             selected_model String,
             served_model String,
+            fallback_from_model String,
             user_tier String,
             query_type String,
             routing_strategy String,
@@ -2805,6 +2816,7 @@ class KafkaConsumerManager:
             request_id=request_id,
             selected_model=str(data.get("selected_model") or ""),
             served_model=str(data.get("served_model") or ""),
+            fallback_from_model=str(data.get("fallback_from_model") or ""),
             user_tier=str(data.get("user_tier") or ""),
             query_type=str(data.get("query_type") or ""),
             routing_strategy=str(data.get("routing_strategy") or ""),

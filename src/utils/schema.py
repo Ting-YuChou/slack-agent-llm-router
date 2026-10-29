@@ -337,6 +337,9 @@ class RoutingCandidate(BaseModel):
     score: Optional[float] = None
     score_breakdown: Dict[str, float] = Field(default_factory=dict)
     selected: bool = False
+    # Routing failed open: the guardrail reason that would have excluded
+    # this otherwise eligible model.
+    bypassed_guardrail: Optional[str] = None
 
 
 class RoutingDecision(BaseModel):
@@ -373,6 +376,9 @@ class RoutingDecision(BaseModel):
     # and the policy's source; None when not in shadow mode or no policy.
     shadow_selected_model: Optional[str] = None
     shadow_policy_source: Optional[str] = None
+    # The router's choice, kept when inference falls back and selected_model
+    # becomes the fallback; None while they are the same.
+    routed_model: Optional[str] = None
 
 
 class ModelSelection(BaseModel):

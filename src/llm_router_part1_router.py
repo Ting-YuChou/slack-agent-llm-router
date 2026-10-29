@@ -154,7 +154,15 @@ COST_REFERENCE_KEY = "cost_reference"
 
 # Routing paths whose candidates skip the query-type capability check.
 REASON_CODES_WITHOUT_CAPABILITY_CHECK = frozenset(
-    {"rule", "rule_fallback", "no_capability_match", "routing_error"}
+    {"rule", "rule_fallback", "no_capability_match", "routing_error", "default_model"}
+)
+GUARDRAIL_REJECT_REASONS = frozenset(
+    {
+        REJECT_AVOID_MODEL,
+        REJECT_BLOCKED_MODEL,
+        REJECT_AVOID_PROVIDER,
+        REJECT_BLOCKED_PROVIDER,
+    }
 )
 
 
@@ -858,7 +866,6 @@ class ModelRouter:
             selected_model, eligible = self._default_or_best_model(context)
             if eligible is not None:
                 routing_reason = eligible.reason(routing_reason)
-                scoring_context = eligible.context
         except (ModelNotEntitledError, PromptTooLargeError):
             raise
         except Exception:
@@ -1060,7 +1067,7 @@ class ModelRouter:
                     "estimated_cost": self._estimate_cost(selection, scoring_context),
                     "reason_code": "refit_reroute",
                     "candidates": self._safe_candidate_table(
-                        scoring_context,
+                        context,
                         best_model,
                         None if capable else "no_capability_match",
                     ),
@@ -2458,14 +2465,29 @@ class ModelRouter:
 
         Eligibility uses the filter of the routing path that chose
         ``reason_code`` (rules skip the capability check). Scores are what
-        _select_best_model ranks by, over all eligible models; when the
-        decision bypassed guardrails every model may show a guardrail reason.
+        _select_best_model ranks by, over all eligible models. The selected
+        model is always eligible: if it lacks the capability, the path did
+        not check it; if a guardrail excludes it, routing failed open, so
+        the table is scored without guardrails and each row a guardrail
+        would have excluded names it in bypassed_guardrail.
         """
         check_capability = reason_code not in REASON_CODES_WITHOUT_CAPABILITY_CHECK
         model_names = list(self.models)
         reasons = self._model_reject_reasons(
             model_names, context, check_capability=check_capability
         )
+        if check_capability and reasons.get(selected_model) == REJECT_CAPABILITY:
+            check_capability = False
+            reasons = self._model_reject_reasons(
+                model_names, context, check_capability=False
+            )
+        bypassed: Dict[str, Optional[str]] = {}
+        if reasons.get(selected_model) in GUARDRAIL_REJECT_REASONS:
+            bypassed = reasons
+            context = self._without_guardrails(context)
+            reasons = self._model_reject_reasons(
+                model_names, context, check_capability=check_capability
+            )
         context = self._with_cost_reference(
             [name for name in model_names if reasons.get(name) is None], context
         )
@@ -2494,6 +2516,9 @@ class ModelRouter:
                     score=score,
                     score_breakdown=breakdown,
                     selected=model_name == selected_model,
+                    bypassed_guardrail=(
+                        bypassed.get(model_name) if reason is None else None
+                    ),
                 )
             )
         return table
