@@ -786,6 +786,86 @@ def test_request_stage_deadline_error_carries_its_http_mapping():
     )
 
 
+def _blame(router, engine, request):
+    """Router-stat failures, inference_stats errors and the published event."""
+    from src.llm_router_part3_pipeline import build_inference_completed_event
+
+    failures = [
+        call.kwargs["model_name"]
+        for call in router.update_model_stats.call_args_list
+        if call.kwargs.get("success") is False
+    ]
+    errors = {
+        model: stats["error_count"] for model, stats in engine.inference_stats.items()
+    }
+    published = engine.event_producer.produce_inference_completed.await_args.args[1]
+    return failures, errors, build_inference_completed_event(request, published)
+
+
+@pytest.mark.asyncio
+async def test_models_skipped_for_lack_of_time_are_not_blamed():
+    from flink.logic import counts_toward_provider_health
+
+    router = _router()
+    engine = _chain_engine(
+        router,
+        None,
+        scheduler=_shipped_scheduler(request_deadline_seconds=1.0),
+        admission=_Admission(),
+    )
+    openai_provider = _TimedProvider("openai", 0.1)
+    anthropic_provider = _TimedProvider("anthropic", 0.1)
+    engine.providers = {"openai": openai_provider, "anthropic": anthropic_provider}
+
+    async def slow_rag(*_args):
+        await asyncio.sleep(0.93)  # Ends in time, but leaves less than 1 s.
+        return None
+
+    engine._run_rag_if_needed = slow_rag
+    request = _request(**_ENTERPRISE)
+
+    response = await engine.process_query(request)
+
+    assert response.error == "inference_failed"
+    assert openai_provider.calls == anthropic_provider.calls == []
+    failures, errors, event = _blame(router, engine, request)
+    assert failures == []
+    assert errors == {}
+    assert not counts_toward_provider_health(event)
+
+
+@pytest.mark.asyncio
+async def test_deadline_spent_before_any_model_call_is_a_stage_deadline():
+    from flink.logic import counts_toward_provider_health
+    from src.llm_router_part2_inference import RequestStageDeadlineError
+
+    router = _router()
+    engine = _chain_engine(router, None, scheduler={"request_deadline_seconds": 0.2})
+
+    async def slow_cache_lookup(*_args):
+        await asyncio.sleep(0.25)
+        return None
+
+    engine._get_cached_inference_response = slow_cache_lookup
+    request = _request(**_ENTERPRISE)
+
+    response = await engine.process_query(request)
+
+    assert response.error == "inference_failed"
+    engine.providers["openai"].generate_response.assert_not_awaited()
+    failures, errors, event = _blame(router, engine, request)
+    assert failures == []
+    assert not counts_toward_provider_health(event)
+
+    budget = RequestExecutionBudget(
+        max_attempts=3, deadline_seconds=1, started_at=time.monotonic() - 2
+    )
+    with pytest.raises(RequestStageDeadlineError):
+        await engine._generate_response_with_fallback(
+            _request(), SimpleNamespace(selected_model="gpt-5"), budget
+        )
+
+
 # --- I4: config-driven cross-provider fallback chains --------------------------
 
 _APIConnectionError = type("APIConnectionError", (Exception,), {})

@@ -3086,6 +3086,12 @@ class InferenceEngine:
             return await self._generate_response_with_fallback_unbounded(
                 request, routing_decision, execution_budget=None
             )
+        if execution_budget.remaining_seconds <= 0:
+            # Routing, compression, image prep or the cache lookup used the
+            # whole deadline: no model or provider is to blame.
+            raise RequestStageDeadlineError(
+                "request deadline reached before the model call"
+            )
         execution_budget.ensure_available()
         return await asyncio.wait_for(
             self._generate_response_with_fallback_unbounded(
@@ -3159,8 +3165,20 @@ class InferenceEngine:
                 started_calls=started_calls,
             )
         except Exception as exc:
-            primary_failures.append(exc)
-            self._record_failed_attempt(primary_model, exc, primary_started_at)
+            if primary_model in started_calls:
+                primary_failures.append(exc)
+                self._record_failed_attempt(primary_model, exc, primary_started_at)
+            else:
+                # The provider was never called (no time was left for an
+                # attempt): neither the model nor its provider failed.
+                setattr(exc, "_attempt_recorded", True)
+                primary_failures.append(
+                    RequestStageDeadlineError(
+                        "request deadline reached before the model call"
+                    )
+                    if isinstance(exc, asyncio.TimeoutError)
+                    else exc
+                )
             return await self._run_fallback_models(
                 request,
                 routing_decision,
