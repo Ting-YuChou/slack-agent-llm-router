@@ -26,6 +26,7 @@ from src.llm_router_part2_inference import (
 from src.utils.schema import (
     Attachment,
     AttachmentType,
+    ModelPricing,
     QueryRequest,
     QueryType,
     RagPolicy,
@@ -321,11 +322,20 @@ class TestOpenAIProvider:
     async def test_generate_response_prices_cached_input_tokens_at_cached_rate(
         self, sample_query_request
     ):
-        # gpt-5 rates from OpenAIProvider._calculate_cost, plus the configured
-        # prompt-cache multiplier for cached input tokens.
+        # gpt-5 rates injected through the router's price table (USD per 1M
+        # tokens, X8), plus the configured prompt-cache multiplier for cached
+        # input tokens.
         gpt5_input_rate = 0.01 / 1000
         gpt5_output_rate = 0.03 / 1000
         cached_input_multiplier = 0.25
+        model_configs = {
+            "gpt-5": SimpleNamespace(
+                pricing=ModelPricing(
+                    input=gpt5_input_rate * 1_000_000,
+                    output=gpt5_output_rate * 1_000_000,
+                )
+            )
+        }
         with patch("src.llm_router_part2_inference.openai.AsyncOpenAI") as mock_openai:
             mock_response = MagicMock()
             mock_response.output_text = "Cached prefix answer"
@@ -348,7 +358,8 @@ class TestOpenAIProvider:
                         "enabled": True,
                         "pricing": {"cached_input_multiplier": cached_input_multiplier},
                     },
-                }
+                },
+                model_configs=model_configs,
             )
             await provider.initialize()
 

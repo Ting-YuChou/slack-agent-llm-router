@@ -347,6 +347,23 @@ class RoutingDecisionFeatures(BaseModel):
     classification_confidence: float = Field(0.0, ge=0.0, le=1.0)
 
 
+class RoutingCandidate(BaseModel):
+    """One model the router considered, and why it was or was not eligible."""
+
+    model: str = Field(..., min_length=1)
+    provider: Optional[str] = None
+    eligible: bool = False
+    # Why the model was filtered out: tier, capability, context_window,
+    # avoid_model, blocked_model, avoid_provider or blocked_provider.
+    reject_reason: Optional[str] = None
+    score: Optional[float] = None
+    score_breakdown: Dict[str, float] = Field(default_factory=dict)
+    selected: bool = False
+    # Routing failed open: the guardrail reason that would have excluded
+    # this otherwise eligible model.
+    bypassed_guardrail: Optional[str] = None
+
+
 class RoutingDecision(BaseModel):
     # Core routing decision
     selected_model: str = Field(..., min_length=1)
@@ -371,12 +388,40 @@ class RoutingDecision(BaseModel):
     policy_source: str = "none"
     hint_reason: Optional[str] = None
     features: RoutingDecisionFeatures = Field(default_factory=RoutingDecisionFeatures)
+    # Structured counterpart of routing_reason (which keeps its free text):
+    # the routing path that chose the model, e.g. rule or capability.
+    reason_code: Optional[str] = None
+    # Every model the router considered. fallback_models stays the chain
+    # inference actually tried.
+    candidates: List[RoutingCandidate] = Field(default_factory=list)
+    # policy_cache.mode shadow (A1): the model the policy would have chosen,
+    # and the policy's source; None when not in shadow mode or no policy.
+    shadow_selected_model: Optional[str] = None
+    shadow_policy_source: Optional[str] = None
+    # The router's choice, kept when inference falls back and selected_model
+    # becomes the fallback; None while they are the same.
+    routed_model: Optional[str] = None
 
 
 class ModelSelection(BaseModel):
     model_name: str = Field(..., min_length=1)
     confidence: float = Field(ge=0.0, le=1.0)
     reason: str = Field(..., min_length=1)
+    reason_code: Optional[str] = None
+
+
+class ModelPricing(BaseModel):
+    """A model's list prices in USD per 1M tokens.
+
+    Unset cache prices fall back to the provider's prompt_cache multipliers
+    (cached input 0.5x or 0.1x, 5-minute writes 1.25x, 1-hour writes 2x).
+    """
+
+    input: float = Field(ge=0.0)
+    output: float = Field(ge=0.0)
+    cached_input: Optional[float] = Field(None, ge=0.0)
+    cache_write_5m: Optional[float] = Field(None, ge=0.0)
+    cache_write_1h: Optional[float] = Field(None, ge=0.0)
 
 
 class ModelConfig(BaseModel):
@@ -393,7 +438,11 @@ class ModelConfig(BaseModel):
     # The most output tokens the model generates; unset means no cap below
     # the window. request.max_tokens is clamped to it.
     max_output_tokens: Optional[int] = Field(None, ge=1)
+    # The one rate used for input and output when pricing is unset.
     cost_per_token: float = Field(ge=0.0)
+    # List prices; a model without them inherits a priced model's by prefix
+    # (gpt-5.4 -> gpt-5), else falls back to cost_per_token with a warning.
+    pricing: Optional[ModelPricing] = None
     priority: int = Field(ge=1)
 
     # Capabilities
@@ -1141,6 +1190,9 @@ class FlinkConfig(ConfigModel):
 
 class PolicyCacheConfig(ConfigModel):
     enabled: bool = False
+    # enforce: the policy changes routing. shadow (A1): routing ignores it and
+    # records what it would have chosen (RoutingDecision.shadow_selected_model).
+    mode: Literal["enforce", "shadow"] = "enforce"
     request_ttl_seconds: int = Field(300, ge=1)
     user_ttl_seconds: int = Field(900, ge=1)
     local_cache_ttl_seconds: int = Field(5, ge=0)
