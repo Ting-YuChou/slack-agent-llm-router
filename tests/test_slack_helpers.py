@@ -94,7 +94,7 @@ class TestUserManager:
         assert manager.get_user_preferences("unknown")["response_length"] == "medium"
 
         manager.users["u1"] = {"tier": "premium"}
-        assert manager.get_user_tier("u1") == UserTier.PREMIUM
+        assert manager.get_user_tier("u1") == UserTier.FREE
 
     def test_check_rate_limit_enforces_burst_window(self, monkeypatch):
         manager = UserManager()
@@ -2868,7 +2868,7 @@ class TestSlackStateStores:
         second_bot = SlackBot(config, inference_engine=SimpleNamespace())
         await second_bot.initialize()
 
-        assert second_bot.user_manager.get_user_tier("u1") == UserTier.PREMIUM
+        assert second_bot.user_manager.get_user_tier("u1") == UserTier.FREE
         assert second_bot.user_manager.rate_limits["u1"] == [1.0]
         restored = second_bot.conversation_manager.get_conversation_summary(
             "u1", "C1", "T1"

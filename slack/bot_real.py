@@ -1189,18 +1189,15 @@ class UserManager:
         self.rate_limits = {}
 
     def get_user_tier(self, user_id: str) -> UserTier:
-        """Get user tier from user data"""
-        user_data = self.users.get(user_id, {})
-        tier_name = (
-            user_data.get("tier")
-            or self.tier_overrides.get(user_id)
-            or self.default_tier
-        )
+        """The user's tier from config: their override, else the default.
 
-        try:
-            return UserTier(tier_name)
-        except ValueError:
-            return UserTier.FREE
+        The tier stored on a user record is only a record of it, so removing
+        an override or lowering the default takes effect on the next request.
+        """
+        return UserTier(self._configured_tier_name(user_id))
+
+    def _configured_tier_name(self, user_id: str) -> str:
+        return self.tier_overrides.get(user_id) or self.default_tier
 
     def check_rate_limit(
         self, user_id: str, config: Dict[str, Any], bucket: str = RATE_LIMIT_CHAT
@@ -1275,27 +1272,26 @@ class UserManager:
         self.users[user_id]["updated_at"] = datetime.now().isoformat()
 
     def ensure_user_record(self, user_id: str) -> bool:
-        """Apply configured tier defaults/overrides to the in-memory user record."""
+        """Record the configured tier on the user's record; True if it changed.
+
+        A user on the implicit free default gets no record for it alone.
+        """
         if not user_id:
             return False
 
         previous_tier = self.users.get(user_id, {}).get("tier")
-        resolved_tier = self.tier_overrides.get(user_id)
+        resolved_tier = self._configured_tier_name(user_id)
+        if previous_tier == resolved_tier:
+            return False
         if (
-            resolved_tier is None
-            and previous_tier is None
-            and self.default_tier != UserTier.FREE.value
+            previous_tier is None
+            and user_id not in self.tier_overrides
+            and resolved_tier == UserTier.FREE.value
         ):
-            resolved_tier = self.default_tier
-
-        if resolved_tier is None:
             return False
 
         if user_id not in self.users:
             self.users[user_id] = {}
-
-        if previous_tier == resolved_tier:
-            return False
 
         self.users[user_id]["tier"] = resolved_tier
         self.users[user_id]["updated_at"] = datetime.now().isoformat()

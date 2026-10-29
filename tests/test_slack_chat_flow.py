@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from slack.bot_real import SlackBot, SlackWorkItem
-from src.utils.schema import Attachment, AttachmentType
+from slack.bot_real import SlackBot, SlackWorkItem, UserManager
+from src.utils.schema import Attachment, AttachmentType, UserTier
 
 
 def chat_bot(process_query=None, **config):
@@ -373,3 +373,70 @@ async def test_error_text_follows_the_error_type(inference_response_factory):
     assert len({generic, rate_limited, timeout, user_or_policy}) == 4
     for other in ("provider_error", "internal", None):
         assert await reply_for(other) == generic
+
+
+# S14: the tier comes from config on every request
+
+
+def test_a_stored_tier_is_never_the_source():
+    manager = UserManager(default_tier="free", tier_overrides={"U2": "premium"})
+    manager.users["U1"] = {"tier": "enterprise"}
+    manager.users["U2"] = {"tier": "enterprise"}
+
+    assert manager.get_user_tier("U1") == UserTier.FREE
+    assert manager.get_user_tier("U2") == UserTier.PREMIUM
+
+
+async def ask_after_restart(tmp_path, inference_response_factory, user_tiers):
+    """Restart on the saved state with `user_tiers`; the tier one query runs at."""
+    bot = chat_bot(
+        answering(inference_response_factory),
+        state={"backend": "file", "file_path": str(tmp_path / "state.json")},
+        user_tiers=user_tiers,
+    )
+    await bot._restore_state()
+    await bot._process_message(top_level(ts="200.0"))
+    request = bot.inference_engine.process_query.await_args.args[0]
+    return bot, request.user_tier
+
+
+@pytest.mark.asyncio
+async def test_removing_a_tier_override_downgrades_a_persisted_user(
+    tmp_path, inference_response_factory
+):
+    _, tier = await ask_after_restart(
+        tmp_path, inference_response_factory, {"overrides": {"U1": "enterprise"}}
+    )
+    assert tier == UserTier.ENTERPRISE
+
+    bot, tier = await ask_after_restart(
+        tmp_path, inference_response_factory, {"overrides": {}}
+    )
+
+    assert tier == UserTier.FREE
+    assert bot.user_manager.get_user_tier("U1") == UserTier.FREE
+    # The record only follows the configured tier.
+    assert bot.user_manager.users["U1"]["tier"] == "free"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "before,after",
+    [("premium", UserTier.FREE), ("enterprise", UserTier.PREMIUM)],
+)
+async def test_lowering_the_default_tier_takes_effect(
+    tmp_path, inference_response_factory, before, after
+):
+    _, tier = await ask_after_restart(
+        tmp_path, inference_response_factory, {"default": before}
+    )
+    assert tier == UserTier(before)
+
+    bot, tier = await ask_after_restart(
+        tmp_path, inference_response_factory, {"default": after.value}
+    )
+
+    assert tier == after
+    assert bot._get_rate_limit_config_for_user("U1") == (
+        bot._get_rate_limit_config_for_tier(after)
+    )
