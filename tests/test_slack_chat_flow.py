@@ -198,3 +198,178 @@ async def test_a_file_share_outside_an_active_thread_is_not_answered():
     )
 
     bot._process_message.assert_not_awaited()
+
+
+# S11: where errors and limits are reported, and what they say
+
+
+def top_level(ts="200.0", text="what is a monad?"):
+    return {"type": "message", "channel": "C1", "user": "U1", "text": text, "ts": ts}
+
+
+def history(bot, thread_ts):
+    context = bot.conversation_manager.get_or_create_context("U1", "C1", thread_ts)
+    return context.conversation_history
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event,thread_ts",
+    [(top_level(ts="200.0"), "200.0"), (thread_reply(ts="101.0"), "100.0")],
+    ids=["top_level", "thread_reply"],
+)
+async def test_an_unexpected_failure_is_reported_in_the_thread(event, thread_ts):
+    bot = chat_bot()
+    bot.message_handler.handle_message = AsyncMock(side_effect=RuntimeError("boom"))
+
+    await bot._process_message(dict(event))
+
+    post = bot.web_client.chat_postMessage.await_args.kwargs
+    assert post["thread_ts"] == thread_ts
+    assert post["text"] == bot._build_user_safe_error_message()
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    now = {"t": 1_000_000.0}
+    monkeypatch.setattr("slack.bot_real.time.time", lambda: now["t"])
+    return now
+
+
+@pytest.mark.asyncio
+async def test_a_burst_limit_notice_is_ephemeral_in_the_thread_and_names_the_window(
+    clock, inference_response_factory
+):
+    bot = chat_bot(
+        answering(inference_response_factory),
+        rate_limiting={"requests_per_hour": 100, "burst_requests": 2},
+    )
+    for ts in ("200.0", "201.0"):
+        await bot._process_message(top_level(ts=ts))
+        clock["t"] += 60
+    posts_before = bot.web_client.chat_postMessage.await_count
+
+    await bot._process_message(top_level(ts="202.0"))
+
+    assert bot.web_client.chat_postMessage.await_count == posts_before
+    bot.web_client.chat_postEphemeral.assert_awaited_once()
+    notice = bot.web_client.chat_postEphemeral.await_args.kwargs
+    assert notice["channel"] == "C1"
+    assert notice["user"] == "U1"
+    assert notice["thread_ts"] == "202.0"
+    text = notice["text"]
+    assert "<@U1>" not in text
+    assert "Rate Limit Exceeded" in text
+    assert "last 5 minutes" in text
+    assert "burst limit" in text
+    # The first request leaves the 5-minute window 300 s after it was counted.
+    assert "Try again in 3 minutes." in text
+    assert "top of each hour" not in text
+    assert bot.inference_engine.process_query.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_an_hourly_limit_notice_names_the_rolling_window(
+    clock, inference_response_factory
+):
+    bot = chat_bot(
+        answering(inference_response_factory),
+        rate_limiting={"requests_per_hour": 2, "burst_requests": 5},
+    )
+    bot._mark_thread_active("C1", "100.0")
+    await bot._process_message(top_level(ts="200.0"))
+    clock["t"] += 1000
+    await bot._process_message(top_level(ts="201.0"))
+    clock["t"] += 1000
+
+    await bot._process_message(thread_reply(ts="101.0"))
+
+    notice = bot.web_client.chat_postEphemeral.await_args.kwargs
+    assert notice["thread_ts"] == "100.0"
+    text = notice["text"]
+    assert "<@U1>" not in text
+    assert "last 60 minutes" in text
+    assert "hourly limit" in text
+    # The oldest request leaves the rolling hour 1,600 s from now.
+    assert "Try again in 27 minutes." in text
+    assert "top of each hour" not in text
+
+
+@pytest.mark.asyncio
+async def test_an_agent_limit_notice_counts_agent_requests(clock):
+    bot = chat_bot(rate_limiting={"requests_per_hour": 100, "burst_requests": 1})
+    assert bot._within_rate_limit("U1", agent=True)
+    clock["t"] += 30
+
+    text = bot._build_rate_limit_message("U1", agent=True)
+
+    assert "1 Agent request in the last 5 minutes" in text
+    assert "Try again in 5 minutes." in text
+    # The chat bucket is empty: its notice cannot name a window.
+    assert "You've reached a chat request limit." in bot._build_rate_limit_message("U1")
+
+
+@pytest.mark.asyncio
+async def test_admission_rejection_says_busy_and_when_to_retry():
+    from src.admission import AdmissionDecision, AdmissionRejectedError
+
+    rejection = AdmissionRejectedError(
+        AdmissionDecision.reject(
+            status_code=429,
+            error="provider_capacity_exceeded",
+            reason="provider_concurrency",
+            message="Provider capacity exceeded",
+            retry_after_seconds=7,
+        )
+    )
+    bot = chat_bot(AsyncMock(side_effect=rejection))
+
+    await bot._process_message(top_level(ts="200.0"))
+
+    post = bot.web_client.chat_postMessage.await_args.kwargs
+    assert post["thread_ts"] == "200.0"
+    assert "busy" in post["text"].lower()
+    assert "try again in 7 seconds" in post["text"].lower()
+    assert history(bot, "200.0") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", ["", "   \n"])
+async def test_an_empty_answer_posts_a_fallback_and_stays_out_of_history(
+    answer, inference_response_factory
+):
+    bot = chat_bot(answering(inference_response_factory, text=answer))
+
+    await bot._process_message(top_level(ts="200.0"))
+
+    post = bot.web_client.chat_postMessage.await_args.kwargs
+    assert post["thread_ts"] == "200.0"
+    assert "empty answer" in post["text"]
+    assert history(bot, "200.0") == []
+
+
+@pytest.mark.asyncio
+async def test_error_text_follows_the_error_type(inference_response_factory):
+    async def reply_for(error_type):
+        failed = inference_response_factory(
+            response_text="Request processing failed",
+            provider="error",
+            error="inference_failed",
+            error_type=error_type,
+        )
+        bot = chat_bot(AsyncMock(return_value=failed))
+        await bot._process_message(top_level(ts="200.0"))
+        assert history(bot, "200.0") == []
+        return bot.web_client.chat_postMessage.await_args.kwargs["text"]
+
+    generic = chat_bot()._build_user_safe_error_message()
+    rate_limited = await reply_for("rate_limited")
+    timeout = await reply_for("timeout")
+    user_or_policy = await reply_for("user_or_policy")
+
+    assert "rate-limiting" in rate_limited
+    assert "took too long" in timeout
+    assert "too long" in user_or_policy and "tier" in user_or_policy
+    assert len({generic, rate_limited, timeout, user_or_policy}) == 4
+    for other in ("provider_error", "internal", None):
+        assert await reply_for(other) == generic

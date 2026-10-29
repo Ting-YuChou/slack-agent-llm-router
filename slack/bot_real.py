@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -53,6 +54,7 @@ from slack.agent_shortcut import (
     build_agent_shortcut_modal,
     parse_agent_shortcut_submission,
 )
+from src.admission import AdmissionRejectedError
 from src.memory import MemoryManager, build_memory_scope
 from src.utils.schema import (
     Attachment,
@@ -81,6 +83,29 @@ MEMORY_SLASH_ONLY_MESSAGE = (
     "Use `/llm remember`, `/llm memories`, or `/llm forget`."
 )
 SLACK_BUSY_MESSAGE = "The LLM Router is busy right now. Please retry in a moment."
+SLACK_EMPTY_ANSWER_MESSAGE = (
+    "🤔 The model returned an empty answer. Please try again or rephrase "
+    "your question."
+)
+# What a failed answer tells the user, by InferenceResponse.error_type. Any
+# other type gets the generic message, which reveals nothing internal.
+SLACK_INFERENCE_ERROR_MESSAGES = {
+    "rate_limited": (
+        "⏳ The model provider is rate-limiting requests right now. "
+        "Please try again in a minute."
+    ),
+    "timeout": (
+        "⌛ The model took too long to answer. Please try again, or ask for "
+        "something shorter."
+    ),
+    "user_or_policy": (
+        "❌ I couldn't process that request as sent. It may be too long, or "
+        "need a model your tier can't use. Try a shorter or simpler request."
+    ),
+}
+# The windows UserManager.check_rate_limit counts requests in.
+RATE_LIMIT_WINDOW_SECONDS = 3600
+RATE_LIMIT_BURST_WINDOW_SECONDS = 300
 # Message subtypes a person's follow-up can carry: a plain message, one with
 # files, and a reply also sent to the channel. Edits, deletions, joins and the
 # like are never a new request. The same set the Agent thread context reads.
@@ -1125,6 +1150,26 @@ def _rate_limit_entries(values: Any, since: float) -> List[Tuple[float, str]]:
     """The well-formed counted requests after `since`."""
     entries = (_read_rate_limit_entry(value) for value in values or [])
     return [entry for entry in entries if entry is not None and entry[0] > since]
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _format_wait(seconds: float) -> str:
+    """A wait rounded up: seconds under a minute, whole minutes beyond."""
+    whole_seconds = max(1, math.ceil(seconds))
+    if whole_seconds < 60:
+        return _plural(whole_seconds, "second")
+    return _plural(math.ceil(whole_seconds / 60), "minute")
+
+
+def _admission_busy_text(retry_after_seconds: Any) -> str:
+    """The reply when admission turns a query away for lack of capacity."""
+    if isinstance(retry_after_seconds, (int, float)) and retry_after_seconds > 0:
+        wait = _plural(math.ceil(retry_after_seconds), "second")
+        return f"⏳ The LLM Router is busy right now. Please try again in {wait}."
+    return SLACK_BUSY_MESSAGE
 
 
 class UserManager:
@@ -2942,12 +2987,22 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                     response.error,
                 )
                 SLACK_METRICS.errors.labels(error_type="inference_error_response").inc()
-                error_builder = getattr(
-                    self.bot, "_build_user_safe_error_message", None
+                return self._inference_error_message(
+                    getattr(response, "error_type", None)
                 )
-                if callable(error_builder):
-                    return error_builder()
-                return "❌ Sorry, I couldn't process that request right now. Please try again in a moment."
+
+            if not (getattr(response, "response_text", "") or "").strip():
+                # Nothing to post or remember: an empty turn would only
+                # mislead the next request's context.
+                logger.warning(
+                    "Slack query for user %s in channel %s got an empty answer "
+                    "from %s",
+                    user_id,
+                    channel_id,
+                    getattr(response, "model_name", "unknown"),
+                )
+                SLACK_METRICS.errors.labels(error_type="empty_response").inc()
+                return SLACK_EMPTY_ANSWER_MESSAGE
 
             # Add to conversation history
             context.add_message("user", text)
@@ -2959,13 +3014,28 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
 
             return self._format_response_with_sources(response)
 
+        except AdmissionRejectedError as e:
+            logger.warning(
+                "Slack query for user %s was not admitted: %s",
+                user_id,
+                e.decision.reason,
+            )
+            SLACK_METRICS.errors.labels(error_type=type(e).__name__).inc()
+            return _admission_busy_text(e.decision.retry_after_seconds)
         except Exception as e:
             logger.error(f"Error processing query: {e}")
             SLACK_METRICS.errors.labels(error_type=type(e).__name__).inc()
-            error_builder = getattr(self.bot, "_build_user_safe_error_message", None)
-            if callable(error_builder):
-                return error_builder()
-            return "❌ Sorry, I couldn't process that request right now. Please try again in a moment."
+            return self._inference_error_message(None)
+
+    def _inference_error_message(self, error_type: Optional[str]) -> str:
+        """What a failed answer tells the user, chosen by its error type."""
+        message = SLACK_INFERENCE_ERROR_MESSAGES.get(error_type or "")
+        if message:
+            return message
+        error_builder = getattr(self.bot, "_build_user_safe_error_message", None)
+        if callable(error_builder):
+            return error_builder()
+        return "❌ Sorry, I couldn't process that request right now. Please try again in a moment."
 
     def _join_context_sections(self, sections: List[str]) -> str:
         """Join non-empty context sections without adding persistence semantics."""
@@ -3624,13 +3694,12 @@ class SlackBot:
         if callable(message_handler_consumes_query_quota):
             consumes_query_quota = message_handler_consumes_query_quota(command_text)
         if consumes_query_quota:
-            if not self._within_rate_limit(
-                user_id, agent=_is_agent_command_text(command_text)
-            ):
+            agent_command = _is_agent_command_text(command_text)
+            if not self._within_rate_limit(user_id, agent=agent_command):
                 await self._post_command_response(
                     channel_id,
                     user_id,
-                    self._build_rate_limit_message(user_id),
+                    self._build_rate_limit_message(user_id, agent=agent_command),
                 )
                 if user_state_changed:
                     await self._persist_user_state(user_id)
@@ -3674,7 +3743,12 @@ class SlackBot:
 
             if self._is_query_event(event):
                 if not self._within_rate_limit(user_id, agent=agent_request):
-                    await self._send_rate_limit_message(channel_id, user_id)
+                    await self._send_rate_limit_message(
+                        channel_id,
+                        user_id,
+                        thread_ts=event.get("thread_ts") or event.get("ts"),
+                        agent=agent_request,
+                    )
                     if user_state_changed:
                         await self._persist_user_state(user_id)
                     return
@@ -3753,6 +3827,7 @@ class SlackBot:
             await self.web_client.chat_postMessage(
                 channel=event.get("channel"),
                 text=self._build_user_safe_error_message(),
+                thread_ts=event.get("thread_ts") or event.get("ts"),
             )
 
     def _reply_thread_ts(
@@ -4033,27 +4108,79 @@ class SlackBot:
             return str(response["error"])
         return str(exc) or type(exc).__name__
 
-    async def _send_rate_limit_message(self, channel_id: str, user_id: str):
-        """Send rate limit exceeded message"""
-        await self.web_client.chat_postMessage(
+    async def _send_rate_limit_message(
+        self,
+        channel_id: str,
+        user_id: str,
+        *,
+        thread_ts: Optional[str] = None,
+        agent: bool = False,
+    ):
+        """Tell only the user, in the thread they asked in, that they hit a limit."""
+        await self.web_client.chat_postEphemeral(
             channel=channel_id,
-            text=self._build_rate_limit_message(user_id),
+            user=user_id,
+            text=self._build_rate_limit_message(user_id, agent=agent),
+            thread_ts=thread_ts,
         )
 
-    def _build_rate_limit_message(self, user_id: str) -> str:
-        """Build a tier-aware rate-limit message for Slack responses."""
+    def _build_rate_limit_message(self, user_id: str, *, agent: bool = False) -> str:
+        """Say which of the user's limits was hit and when to try again.
+
+        The limits are a rolling 60-minute window and a 5-minute burst, each
+        counted per bucket: chat queries and Agent requests apart.
+        """
         user_tier = self.user_manager.get_user_tier(user_id)
         limits = self._get_rate_limit_config_for_tier(user_tier)
-        return f"""
-🚫 *Rate Limit Exceeded*
+        hourly_limit = limits["requests_per_hour"]
+        burst_limit = limits["burst_requests"]
+        kind = "Agent request" if agent else "chat request"
+        now = time.time()
+        counted = sorted(
+            self.user_manager.requests_since(
+                user_id,
+                now - RATE_LIMIT_WINDOW_SECONDS,
+                bucket=RATE_LIMIT_AGENT if agent else RATE_LIMIT_CHAT,
+            )
+        )
+        recent = [at for at in counted if at > now - RATE_LIMIT_BURST_WINDOW_SECONDS]
 
-<@{user_id}>, you've reached your hourly request limit.
+        # The first request that must leave a full window frees a slot in it;
+        # with both full, the later of the two is when a retry goes through.
+        reason = None
+        retry_at = 0.0
+        if 0 < hourly_limit <= len(counted):
+            reason = (
+                f"You've sent {_plural(len(counted), kind)} in the last "
+                "60 minutes, the hourly limit for your tier."
+            )
+            retry_at = counted[len(counted) - hourly_limit] + RATE_LIMIT_WINDOW_SECONDS
+        if 0 < burst_limit <= len(recent):
+            burst_retry_at = (
+                recent[len(recent) - burst_limit] + RATE_LIMIT_BURST_WINDOW_SECONDS
+            )
+            if reason is None or burst_retry_at > retry_at:
+                reason = (
+                    f"You've sent {_plural(len(recent), kind)} in the last "
+                    "5 minutes, the burst limit for your tier."
+                )
+                retry_at = burst_retry_at
+        if reason is None:
+            summary = f"You've reached a {kind} limit. Try again in a few minutes."
+        else:
+            summary = f"{reason} Try again in {_format_wait(retry_at - now)}."
 
-*Your tier:* {user_tier.value.title()}
-*Hourly limit:* {limits.get('requests_per_hour', 0)}
-*Burst limit:* {limits.get('burst_requests', 0)} requests / 5 min
-*Limit resets:* At the top of each hour
-        """.strip()
+        return "\n".join(
+            [
+                "🚫 *Rate Limit Exceeded*",
+                "",
+                summary,
+                "",
+                f"*Your tier:* {user_tier.value.title()}",
+                f"*Limits:* {hourly_limit} requests per rolling 60 minutes and "
+                f"{burst_limit} per 5 minutes, for chat and Agent requests each",
+            ]
+        )
 
     async def _cleanup_sessions_periodically(self):
         """Periodically clean up expired sessions"""
@@ -5319,7 +5446,9 @@ class SlackBot:
 
         if not self._within_rate_limit(user_id, agent=True):
             await self._post_command_response(
-                nonce.channel_id, user_id, self._build_rate_limit_message(user_id)
+                nonce.channel_id,
+                user_id,
+                self._build_rate_limit_message(user_id, agent=True),
             )
             return
         response = await self.message_handler._start_agent_prompt(
@@ -5476,7 +5605,9 @@ class SlackBot:
 
         if not self._within_rate_limit(user_id, agent=True):
             await self._post_command_response(
-                nonce.channel_id, user_id, self._build_rate_limit_message(user_id)
+                nonce.channel_id,
+                user_id,
+                self._build_rate_limit_message(user_id, agent=True),
             )
             return
 

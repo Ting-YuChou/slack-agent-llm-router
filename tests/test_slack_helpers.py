@@ -2115,13 +2115,16 @@ class TestSlackBot:
     @pytest.mark.asyncio
     async def test_process_message_enforces_rate_limit_for_queries(self):
         bot = SlackBot({"channels": []}, inference_engine=SimpleNamespace())
-        bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+        bot.web_client = SimpleNamespace(
+            chat_postMessage=AsyncMock(), chat_postEphemeral=AsyncMock()
+        )
         bot.user_manager.check_rate_limit = lambda *_args, **_kwargs: False
         bot.message_handler = SimpleNamespace(handle_message=AsyncMock())
 
         await bot._process_message({"channel": "C1", "user": "U1", "text": "hello"})
 
-        bot.web_client.chat_postMessage.assert_awaited_once()
+        bot.web_client.chat_postEphemeral.assert_awaited_once()
+        bot.web_client.chat_postMessage.assert_not_awaited()
         bot.message_handler.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
