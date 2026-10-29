@@ -1393,6 +1393,10 @@ class vLLMProvider(BaseInferenceProvider):
                 raise RuntimeError(f"vLLM endpoint {endpoint.name} has no client")
 
             async with client.stream("POST", endpoint_path, json=payload) as response:
+                if response.status_code >= 400:
+                    # Read the error body so the HTTPStatusError carries it.
+                    await response.aread()
+                    response.raise_for_status()
                 async for line in response.aiter_lines():
                     if not line.startswith("data: "):
                         continue
