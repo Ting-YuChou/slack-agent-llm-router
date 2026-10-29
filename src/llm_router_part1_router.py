@@ -31,9 +31,10 @@ logger = logging.getLogger(__name__)
 # paste still counts.
 CLASSIFIER_HEAD_CHARS = 2000
 CLASSIFIER_TAIL_CHARS = 2000
-# Bounded gap between keywords: stays inside one sentence and at most 80 chars,
-# so the classifier patterns cannot backtrack catastrophically on long input.
-_GAP = r"[^.?!\n]{0,80}"
+# Bounded gap between keywords: like the old ".*" it stops at a newline (and so
+# crosses dots in "utils.py" or "3.12"), but it spans at most 80 chars, so the
+# classifier patterns cannot backtrack catastrophically on long input.
+_GAP = r"[^\n]{0,80}"
 
 
 @dataclass

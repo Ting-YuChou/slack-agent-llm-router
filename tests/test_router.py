@@ -105,6 +105,18 @@ CLASSIFIER_SNAPSHOT = [
     ("Hi there, how are you doing?", QueryType.GENERAL, 0.5),
     ("Thanks, that was really helpful", QueryType.GENERAL, 0.5),
     ("Translate this sentence into French", QueryType.GENERAL, 0.5),
+    # Keyword gaps that cross a dot inside a sentence.
+    (
+        "write a python 3.12 script to parse logs",
+        QueryType.CODE_GENERATION,
+        0.35714285714285715,
+    ),
+    (
+        "fix the bug in utils.py function",
+        QueryType.CODE_ANALYSIS,
+        0.36666666666666664,
+    ),
+    ("Write a node.js function", QueryType.CODE_GENERATION, 0.2642857142857143),
 ]
 
 
