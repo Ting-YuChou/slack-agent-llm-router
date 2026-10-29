@@ -30,27 +30,37 @@ Receive = Callable[[], Awaitable[Message]]
 Send = Callable[[Message], Awaitable[None]]
 ASGIApp = Callable[[Dict[str, Any], Receive, Send], Awaitable[None]]
 
-# Metadata keys the server writes for itself: retrieved context and style
-# instructions go straight into the prompt, and the Slack and routing keys
-# describe where the request came from. External callers must not set them.
-SERVER_ONLY_METADATA_KEYS = frozenset(
-    {
-        "rag_context",
-        "web_search_context",
-        "response_style_instructions",
-        "routing_intent_source",
-        "slack",
-    }
-)
-SERVER_ONLY_METADATA_PREFIXES: Tuple[str, ...] = ("slack_",)
-
-
 # Metadata that moves a request up the provider queue or into the fast lane.
+# Clients may send it, but only principals with allow_priority keep it.
 URGENCY_METADATA_KEYS: Tuple[str, ...] = (
     "requires_low_latency",
     "route_to_fast_lane",
     "latency_sla",
     "fast_lane",
+)
+
+# The only metadata keys an external POST /route caller may set; every other
+# key is dropped. Everything the server reads from request.metadata is either
+# listed here or written by the server itself (retrieved context, prompt style
+# instructions, cache bypass flags, RAG fallback models and warnings, derived
+# routing features, session counters, Slack and workspace keys), so a caller
+# cannot forge it. Add a key here only if a client may legitimately choose it.
+CLIENT_METADATA_KEYS = frozenset(
+    {
+        # Routing preferences, still bounded by the tier's allowed models.
+        "preferred_models",
+        "avoid_models",
+        "avoid_providers",
+        "cost_sensitivity",
+        "error_sensitivity",
+        "requires_high_reasoning",
+        # Tool and retrieval toggles, like tool_policy and rag_policy.
+        "enable_web_search",
+        "web_search_auto",
+        "enable_rag",
+        "rag_auto",
+        *URGENCY_METADATA_KEYS,
+    }
 )
 _TIER_RANK = {UserTier.FREE: 0, UserTier.PREMIUM: 1, UserTier.ENTERPRISE: 2}
 UNMAPPED_KEY_FINGERPRINT_CHARS = 12
@@ -177,22 +187,15 @@ def apply_principal_entitlements(
     return changes
 
 
-def is_server_only_metadata_key(key: Any) -> bool:
-    name = str(key)
-    return name in SERVER_ONLY_METADATA_KEYS or name.startswith(
-        SERVER_ONLY_METADATA_PREFIXES
-    )
-
-
-def strip_server_only_metadata(request: Any) -> List[str]:
-    """Remove server-only metadata keys in place; return the removed keys."""
+def filter_external_metadata(request: Any) -> List[str]:
+    """Keep only client-settable metadata keys; return the dropped keys."""
     metadata = getattr(request, "metadata", None)
     if not isinstance(metadata, dict):
         return []
-    removed = sorted(str(key) for key in metadata if is_server_only_metadata_key(key))
-    for key in removed:
+    dropped = sorted(str(key) for key in metadata if key not in CLIENT_METADATA_KEYS)
+    for key in dropped:
         metadata.pop(key, None)
-    return removed
+    return dropped
 
 
 class AttachmentRejected(ValueError):

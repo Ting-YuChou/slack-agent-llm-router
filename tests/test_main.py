@@ -1405,13 +1405,13 @@ class TestApiApp:
                         "slack": {"channel_id": "C1"},
                         "slack_context_source": "forged",
                         "routing_intent_source": "forged",
-                        "client_tag": "kept",
+                        "cost_sensitivity": "low",
                     },
                 },
             )
 
         assert response.status_code == 200
-        assert inference.processed_requests[0].metadata == {"client_tag": "kept"}
+        assert inference.processed_requests[0].metadata == {"cost_sensitivity": "low"}
 
     def test_route_rejects_attachment_whose_content_mismatches_size(
         self, tmp_path, patched_platform_deps
@@ -1538,7 +1538,10 @@ class TestApiApp:
                     "user_id": "u1",
                     "user_tier": "enterprise",
                     "priority": 5,
-                    "metadata": {"requires_low_latency": True, "client_tag": "x"},
+                    "metadata": {
+                        "requires_low_latency": True,
+                        "cost_sensitivity": "low",
+                    },
                 },
                 headers={"X-API-Key": "partner-secret"},
             )
@@ -1551,7 +1554,7 @@ class TestApiApp:
         routed = inference.processed_requests[0]
         assert routed.user_tier == UserTier.FREE
         assert routed.priority == 1
-        assert routed.metadata == {"client_tag": "x"}
+        assert routed.metadata == {"cost_sensitivity": "low"}
 
     def test_unmapped_key_is_clamped_to_free_without_priority(
         self, tmp_path, monkeypatch, patched_platform_deps
@@ -1573,7 +1576,7 @@ class TestApiApp:
                         "requires_low_latency": True,
                         "route_to_fast_lane": True,
                         "latency_sla": "interactive",
-                        "client_tag": "x",
+                        "cost_sensitivity": "low",
                     },
                 },
                 headers={"Authorization": "Bearer legacy-key"},
@@ -1588,7 +1591,7 @@ class TestApiApp:
         routed = inference.processed_requests[0]
         assert routed.user_tier == UserTier.FREE
         assert routed.priority == 1
-        assert routed.metadata == {"client_tag": "x"}
+        assert routed.metadata == {"cost_sensitivity": "low"}
 
     def test_allow_priority_key_keeps_priority_and_urgency(
         self, tmp_path, monkeypatch, patched_platform_deps
@@ -1680,6 +1683,80 @@ class TestApiApp:
         assert response.status_code == 200
         assert admission.route_calls[0].user_tier == UserTier.ENTERPRISE
         assert inference.processed_requests[0].user_tier == UserTier.ENTERPRISE
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("rag_original_model", "claude-sonnet-4-6"),
+            ("rag_text_fallback_models", ["claude-sonnet-4-6"]),
+            ("rag_vision_fallback_models", ["claude-sonnet-4-6"]),
+            ("rag_cache_bypass", True),
+            ("web_search_cache_bypass", True),
+            ("rag_warnings", ["forged"]),
+            ("rag_no_hits", True),
+            ("web_search_blocked_reason", "forged"),
+            ("query_complexity", "simple"),
+            ("recent_request_count", 99),
+            ("workspace_id", "another-workspace"),
+            ("memory_hit_ids", ["m1"]),
+            ("unknown_future_key", "x"),
+        ],
+    )
+    def test_route_keeps_only_allowlisted_client_metadata(
+        self, key, value, tmp_path, patched_platform_deps
+    ):
+        platform = _admission_platform(tmp_path)
+        inference = platform.services["inference"]
+        platform.services["admission"] = DummyAdmissionController()
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/route",
+                json={
+                    "query": "hello",
+                    "user_id": "u1",
+                    "metadata": {key: value, "preferred_models": ["gpt-5"]},
+                },
+            )
+
+        assert response.status_code == 200
+        assert inference.processed_requests[0].metadata == {
+            "preferred_models": ["gpt-5"]
+        }
+
+    def test_route_keeps_every_client_settable_metadata_key(
+        self, tmp_path, patched_platform_deps
+    ):
+        client_metadata = {
+            "preferred_models": ["gpt-5"],
+            "avoid_models": ["mistral"],
+            "avoid_providers": ["vllm"],
+            "cost_sensitivity": "low",
+            "error_sensitivity": "high",
+            "requires_high_reasoning": True,
+            "enable_web_search": True,
+            "web_search_auto": False,
+            "enable_rag": True,
+            "rag_auto": False,
+            "requires_low_latency": True,
+            "route_to_fast_lane": True,
+            "latency_sla": "interactive",
+            "fast_lane": True,
+        }
+        platform = _admission_platform(tmp_path)
+        inference = platform.services["inference"]
+        platform.services["admission"] = DummyAdmissionController()
+        app = platform._create_fastapi_app()
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/route",
+                json={"query": "hello", "user_id": "u1", "metadata": client_metadata},
+            )
+
+        assert response.status_code == 200
+        assert inference.processed_requests[0].metadata == client_metadata
 
     def test_route_scheduler_rejection_returns_429_with_retry_after(
         self, tmp_path, patched_platform_deps

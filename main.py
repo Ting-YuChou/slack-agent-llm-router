@@ -51,8 +51,8 @@ from src.api_security import (
     RequestBodyLimitMiddleware,
     api_key_clients_configured,
     apply_principal_entitlements,
+    filter_external_metadata,
     resolve_api_principal,
-    strip_server_only_metadata,
     validate_external_attachments,
 )
 from src.llm_router_part1_router import ModelRouter
@@ -835,10 +835,10 @@ class LLMRouterPlatform:
         their server-side metadata) in-process. With API key auth, the tier,
         priority and latency hints are clamped to the caller's principal.
         """
-        removed = strip_server_only_metadata(query_data)
+        removed = filter_external_metadata(query_data)
         if removed:
             self.logger.info(
-                "Dropped server-only metadata keys from external request %s: %s",
+                "Dropped non-client metadata keys from external request %s: %s",
                 query_data.request_id,
                 ", ".join(removed),
             )
