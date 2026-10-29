@@ -1416,7 +1416,12 @@ class vLLMProvider(BaseInferenceProvider):
             if endpoint is not None:
                 await self._mark_endpoint_failure(endpoint, e)
             logger.error(f"vLLM streaming error: {e}")
-            yield f"Error: {str(e)}"
+            if isinstance(e, httpx.HTTPStatusError):
+                # str(e) names the internal endpoint URL; the chunk reaches
+                # the user, so it carries only the status.
+                yield f"Error: upstream returned HTTP {e.response.status_code}"
+            else:
+                yield f"Error: {str(e)}"
 
         finally:
             if endpoint is not None:

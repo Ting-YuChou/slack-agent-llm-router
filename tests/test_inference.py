@@ -888,6 +888,11 @@ class TestVLLMProvider:
         assert len(chunks) == 1
         assert chunks[0].startswith("Error: ")
         assert str(status_code) in chunks[0]
+        # The chunk reaches the user: no internal endpoint URL or host.
+        assert "http://" not in chunks[0]
+        assert "https://" not in chunks[0]
+        assert "127.0.0.1" not in chunks[0]
+        assert "8001" not in chunks[0]
         assert [port for port, _path in calls] == [8001]
         qwen_a, qwen_b = provider.endpoints
         assert qwen_a.healthy is False
