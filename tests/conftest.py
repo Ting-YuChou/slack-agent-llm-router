@@ -143,7 +143,7 @@ if _missing("redis"):
         async def get(self, key):
             return self.store.get(key)
 
-        async def set(self, key, value):
+        async def set(self, key, value, ex=None):
             self.store[key] = value
 
         async def setex(self, key, _ttl, value):

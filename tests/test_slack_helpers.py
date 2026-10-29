@@ -2600,6 +2600,93 @@ class TestSlackStateStores:
         assert await store.load_state() == {"schema_version": 1, "users": {}}
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "redis_config,connection",
+        [
+            (
+                {"url": "redis://cache:6379/2"},
+                {"url": "redis://cache:6379/2"},
+            ),
+            (
+                {"host": "cache", "port": 6380, "db": 2},
+                {"host": "cache", "port": 6380, "db": 2},
+            ),
+        ],
+        ids=["url", "host"],
+    )
+    async def test_redis_slack_store_authenticates_with_password_env(
+        self, monkeypatch, redis_config, connection
+    ):
+        monkeypatch.setenv("REDIS_PASSWORD", "s3cret")
+        created = []
+
+        class CapturingRedis:
+            def __init__(self, **kwargs):
+                created.append(kwargs)
+
+            @classmethod
+            def from_url(cls, url, **kwargs):
+                return cls(url=url, **kwargs)
+
+            async def ping(self):
+                return True
+
+        monkeypatch.setattr("redis.asyncio.Redis", CapturingRedis)
+        store = RedisSlackStateStore(
+            {"redis": {**redis_config, "password_env": "REDIS_PASSWORD"}}
+        )
+
+        await store.initialize()
+
+        assert created == [{**connection, "password": "s3cret"}]
+
+    @pytest.mark.asyncio
+    async def test_redis_slack_store_expires_every_key_it_writes(self):
+        class ExpiringRedis:
+            def __init__(self):
+                self.values = {}
+                self.expiry = {}
+                self.sets = {}
+
+            async def get(self, key):
+                return self.values.get(key)
+
+            async def set(self, key, value, ex=None):
+                self.values[key] = value
+                self.expiry[key] = ex
+
+            async def delete(self, key):
+                self.values.pop(key, None)
+
+            async def sadd(self, key, member):
+                self.sets.setdefault(key, set()).add(member)
+
+            async def srem(self, key, member):
+                self.sets.get(key, set()).discard(member)
+
+            async def smembers(self, key):
+                return set(self.sets.get(key, set()))
+
+        store = RedisSlackStateStore({"redis": {"key_prefix": "p"}})
+        store.client = ExpiringRedis()
+        now = datetime.now().isoformat()
+
+        await store.persist_user_state("U1", {"tier": "premium"}, [time.time()])
+        await store.persist_conversation_state("U1:C1:T1", {"last_activity": now})
+        await store.persist_active_thread_state("C1:T1", now)
+        await store.persist_agent_run_state("R1", {"run_id": "R1"})
+
+        session = int(ConversationManager({}).session_timeout.total_seconds())
+        month = 30 * 24 * 3600
+        assert store.client.expiry == {
+            "p:user:U1": month,
+            "p:rate_limit:U1": month,
+            "p:conversation:U1:C1:T1": session,
+            "p:active_thread:C1:T1": session,
+            "p:agent_run:R1": month,
+        }
+
+    @pytest.mark.asyncio
     async def test_redis_state_store_round_trips_snapshot(self):
         store = RedisSlackStateStore(
             {

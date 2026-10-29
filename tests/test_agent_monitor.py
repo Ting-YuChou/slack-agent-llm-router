@@ -39,7 +39,7 @@ class FakeRedis:
     async def get(self, key):
         return self.values.get(key)
 
-    async def set(self, key, value):
+    async def set(self, key, value, ex=None):
         self.values[key] = value
 
     async def delete(self, key):

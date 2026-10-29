@@ -67,6 +67,10 @@ logger = logging.getLogger(__name__)
 
 MAX_QUERY_TOKENS = 8192
 STATE_SCHEMA_VERSION = 1
+# How long a conversation, and the bot thread it lives in, stays live.
+SLACK_SESSION_TIMEOUT = timedelta(hours=2)
+# Redis expiry for state that outlives a session: users, rate limits, Agent runs.
+SLACK_STATE_TTL_SECONDS = 30 * 24 * 3600
 POSTED_CI_JOBS_LIMIT = 1000
 HANDLED_MESSAGES_LIMIT = 1000
 UNVERIFIED_LABEL = "⚠️ 未驗證（沒有 verification profile）"
@@ -603,20 +607,28 @@ class RedisSlackStateStore(SlackStateStore):
         self.active_threads_index_key = f"{self.key_prefix}:active_threads"
         self.agent_runs_index_key = f"{self.key_prefix}:agent_runs"
         self.posted_ci_jobs_key = f"{self.key_prefix}:posted_ci_jobs"
+        self.session_ttl_seconds = int(SLACK_SESSION_TIMEOUT.total_seconds())
+        self.state_ttl_seconds = SLACK_STATE_TTL_SECONDS
         self.client = None
 
     async def initialize(self):
         try:
             import redis.asyncio as redis_asyncio
 
+            password = None
+            password_env = self.redis_config.get("password_env")
+            if password_env:
+                password = os.getenv(str(password_env))
+
             redis_url = self.redis_config.get("url")
             if redis_url and hasattr(redis_asyncio.Redis, "from_url"):
-                self.client = redis_asyncio.Redis.from_url(redis_url)
+                self.client = redis_asyncio.Redis.from_url(redis_url, password=password)
             else:
                 self.client = redis_asyncio.Redis(
                     host=self.redis_config.get("host", "localhost"),
                     port=self.redis_config.get("port", 6379),
                     db=self.redis_config.get("db", 0),
+                    password=password,
                 )
 
             if hasattr(self.client, "ping"):
@@ -746,7 +758,11 @@ class RedisSlackStateStore(SlackStateStore):
             ):
                 return
 
-            await self._set_json(self._conversation_key(context_key), context_payload)
+            await self._set_json(
+                self._conversation_key(context_key),
+                context_payload,
+                ttl_seconds=self.session_ttl_seconds,
+            )
             await self._sadd(self.conversations_index_key, context_key)
         except Exception as exc:
             logger.warning("Failed to persist Slack conversation to Redis: %s", exc)
@@ -776,7 +792,11 @@ class RedisSlackStateStore(SlackStateStore):
             ):
                 return
 
-            await self._set_json(self._active_thread_key(thread_key), incoming_payload)
+            await self._set_json(
+                self._active_thread_key(thread_key),
+                incoming_payload,
+                ttl_seconds=self.session_ttl_seconds,
+            )
             await self._sadd(self.active_threads_index_key, thread_key)
         except Exception as exc:
             logger.warning("Failed to persist Slack active thread to Redis: %s", exc)
@@ -889,12 +909,16 @@ class RedisSlackStateStore(SlackStateStore):
             payload = payload.decode("utf-8")
         return json.loads(payload)
 
-    async def _set_json(self, key: str, payload: Any):
+    async def _set_json(
+        self, key: str, payload: Any, *, ttl_seconds: Optional[int] = None
+    ):
+        """Store JSON that expires after ttl_seconds, or the long state TTL."""
         serialized = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+        ttl = ttl_seconds or self.state_ttl_seconds
         if hasattr(self.client, "set"):
-            await self.client.set(key, serialized)
+            await self.client.set(key, serialized, ex=ttl)
         elif hasattr(self.client, "setex"):
-            await self.client.setex(key, 30 * 24 * 3600, serialized)
+            await self.client.setex(key, ttl, serialized)
 
     async def _delete(self, key: str):
         if hasattr(self.client, "delete"):
@@ -1230,7 +1254,7 @@ class ConversationManager:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.conversations = {}
-        self.session_timeout = timedelta(hours=2)  # Sessions expire after 2 hours
+        self.session_timeout = SLACK_SESSION_TIMEOUT
 
     def get_or_create_context(
         self, user_id: str, channel_id: str, thread_ts: str = None
