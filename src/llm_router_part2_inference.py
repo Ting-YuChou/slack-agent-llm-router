@@ -1564,15 +1564,17 @@ class vLLMProvider(BaseInferenceProvider):
 
     @staticmethod
     def _is_request_rejection(error: Exception) -> bool:
-        """A 4xx other than 408/429 faults the request, not the endpoint.
+        """400, 413 and 422 fault the request itself, not the endpoint.
 
-        Every endpoint would reject it the same way, so it is neither retried
-        elsewhere nor counted against the endpoint's health.
+        Every endpoint would reject it the same way (too many tokens, bad
+        parameters), so it is neither retried elsewhere nor counted against
+        the endpoint's health. Other 4xx can belong to one endpoint: a 404
+        from one that does not load the model or has a wrong base_url path,
+        401/403 from its credentials. Those fail over like a 5xx.
         """
         if not isinstance(error, httpx.HTTPStatusError):
             return False
-        status = error.response.status_code
-        return 400 <= status < 500 and status not in (408, 429)
+        return error.response.status_code in (400, 413, 422)
 
     async def _mark_endpoint_failure(
         self, endpoint: VLLMEndpointState, error: Exception

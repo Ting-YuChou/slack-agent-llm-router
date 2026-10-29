@@ -721,12 +721,25 @@ class TestVLLMProvider:
         assert "endpoint down" in provider.endpoints[0].last_error
         provider.endpoints[1].client.post.assert_called_once()
 
-    def _http_status_pool(self, status_code, calls, **client_kwargs):
-        """Two endpoints whose real httpx clients answer every call with a status."""
+    def _http_status_pool(self, statuses, calls, **client_kwargs):
+        """Endpoints qwen-a (port 8001) and qwen-b (8002) on real httpx clients.
+
+        ``statuses`` is one status for every call, or a status per port.
+        """
         import httpx
 
         def handler(request):
-            calls.append((request.url.port, request.url.path))
+            port = request.url.port
+            calls.append((port, request.url.path))
+            status_code = statuses[port] if isinstance(statuses, dict) else statuses
+            if status_code == 200:
+                return httpx.Response(
+                    200,
+                    json={
+                        "choices": [{"text": f"answered by {port}"}],
+                        "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+                    },
+                )
             return httpx.Response(
                 status_code,
                 json={
@@ -766,7 +779,7 @@ class TestVLLMProvider:
             assert endpoint.outstanding == 0, endpoint.name
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("status_code", [400, 404, 413, 422])
+    @pytest.mark.parametrize("status_code", [400, 413, 422])
     async def test_client_error_is_raised_without_taking_the_pool_offline(
         self, sample_query_request, status_code
     ):
@@ -786,10 +799,12 @@ class TestVLLMProvider:
         self._assert_endpoints_untouched(provider)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("status_code", [408, 429, 503])
-    async def test_server_error_still_marks_endpoints_and_fails_over(
+    @pytest.mark.parametrize("status_code", [401, 403, 404, 408, 409, 429, 503])
+    async def test_endpoint_fault_still_marks_endpoints_and_fails_over(
         self, sample_query_request, status_code
     ):
+        # 404 is also an endpoint that does not load the model or has a wrong
+        # base_url path; 401/403 are its credentials: another endpoint may work.
         import httpx
 
         calls = []
@@ -807,6 +822,28 @@ class TestVLLMProvider:
             assert endpoint.cooldown_until > time.time(), endpoint.name
             assert str(status_code) in endpoint.last_error, endpoint.name
             assert endpoint.outstanding == 0, endpoint.name
+
+    @pytest.mark.asyncio
+    async def test_404_from_one_endpoint_fails_over_to_the_endpoint_serving_the_model(
+        self, sample_query_request
+    ):
+        calls = []
+        provider = self._http_status_pool({8001: 404, 8002: 200}, calls)
+        try:
+            response = await provider.generate_response(
+                sample_query_request, "mistral-7b"
+            )
+        finally:
+            await self._close_endpoint_clients(provider)
+
+        assert response.response_text == "answered by 8002"
+        assert [port for port, _path in calls] == [8001, 8002]
+        qwen_a, qwen_b = provider.endpoints
+        assert qwen_a.healthy is False
+        assert qwen_a.cooldown_until > time.time()
+        assert "404" in qwen_a.last_error
+        assert qwen_b.healthy is True
+        assert qwen_b.last_error is None
 
     @pytest.mark.asyncio
     async def test_stream_client_error_is_raised_without_taking_endpoint_offline(
