@@ -10,7 +10,6 @@ import pytest
 import yaml
 
 from slack.bot_real import (
-    SLACK_AGENT_HANDOFF_TEXT,
     SLACK_EMPTY_ANSWER_MESSAGE,
     SLACK_THINKING_TEXT,
     SlackBot,
@@ -907,10 +906,17 @@ async def test_chat_or_agent_is_decided_once_per_message(inference_response_fact
 
 
 @pytest.mark.asyncio
-async def test_placeholder_handed_to_an_agent_gets_a_neutral_notice(monkeypatch):
+@pytest.mark.parametrize("update_fails", [False, True])
+async def test_empty_chat_reply_never_claims_an_agent_handoff(
+    monkeypatch, update_fails
+):
+    # The placeholder is only posted on the chat lane, so a thread that
+    # turned into an Agent thread meanwhile is no sign of a handoff.
     bot = delivery_bot()
+    if update_fails:
+        bot.web_client.chat_update.side_effect = RuntimeError("message_not_found")
 
-    async def agent_posts_its_own_status(_event, _client):
+    async def agent_thread_appears(_event, _client):
         bot.agent_threads[bot._thread_key("C1", "100.0")] = {
             "channel_id": "C1",
             "thread_ts": "100.0",
@@ -921,16 +927,16 @@ async def test_placeholder_handed_to_an_agent_gets_a_neutral_notice(monkeypatch)
     monkeypatch.setattr(
         bot.message_handler,
         "handle_message",
-        AsyncMock(side_effect=agent_posts_its_own_status),
+        AsyncMock(side_effect=agent_thread_appears),
     )
-    persist = AsyncMock()
-    monkeypatch.setattr(bot, "_persist_message_state", persist)
 
     await bot._process_message(top_level())
 
     update = bot.web_client.chat_update.await_args.kwargs
-    assert update["text"] == SLACK_AGENT_HANDOFF_TEXT
-    assert update["text"] != SLACK_EMPTY_ANSWER_MESSAGE
-    assert persist.await_args.kwargs["active_thread_key"] == bot._thread_key(
-        "C1", "100.0"
-    )
+    assert update["text"] == SLACK_EMPTY_ANSWER_MESSAGE
+    posts = [call.kwargs for call in bot.web_client.chat_postMessage.await_args_list]
+    expected = [SLACK_THINKING_TEXT]
+    if update_fails:
+        expected.append(SLACK_EMPTY_ANSWER_MESSAGE)
+    assert [post["text"] for post in posts] == expected
+    assert posts[-1]["thread_ts"] == "100.0"

@@ -106,7 +106,6 @@ MEMORY_SLASH_ONLY_MESSAGE = (
 SLACK_BUSY_MESSAGE = "The LLM Router is busy right now. Please retry in a moment."
 SLACK_THINKING_TEXT = "_Thinking…_"
 SLACK_SLASH_WORKING_TEXT = "Working on it…"
-SLACK_AGENT_HANDOFF_TEXT = "_Passed to the Agent run in this thread._"
 # Commands that answer through the model, though they spend no query quota.
 MODEL_BACKED_COMMANDS = frozenset({"web", "fast"})
 SLACK_EMPTY_ANSWER_MESSAGE = (
@@ -4207,21 +4206,18 @@ class SlackBot:
                     state_changed = True
                     active_thread_key = self._thread_key(channel_id, thread_ts)
             else:
-                # No reply text: the handler posted the reply itself (an Agent
-                # run's status message), or there is no answer.
-                handed_to_agent = self._is_agent_thread(channel_id, agent_thread_ts)
-                if placeholder_ts:
-                    notice = (
-                        SLACK_AGENT_HANDOFF_TEXT
-                        if handed_to_agent
-                        else SLACK_EMPTY_ANSWER_MESSAGE
+                # No reply text. A placeholder is only posted on the chat lane
+                # (the lane handle_message is held to), so there it means no
+                # answer, never an Agent handoff.
+                if placeholder_ts and not await self._replace_placeholder(
+                    channel_id, placeholder_ts, text=SLACK_EMPTY_ANSWER_MESSAGE
+                ):
+                    await self._post_reply(
+                        channel_id, reply_thread_ts, text=SLACK_EMPTY_ANSWER_MESSAGE
                     )
-                    replaced = await self._replace_placeholder(
-                        channel_id, placeholder_ts, text=notice
-                    )
-                    if not replaced and not handed_to_agent:
-                        await self._post_reply(channel_id, reply_thread_ts, text=notice)
-                if handed_to_agent:
+                if self._is_agent_thread(channel_id, agent_thread_ts):
+                    # The handler posted the reply itself: an Agent run's
+                    # status message.
                     state_changed = True
                     active_thread_key = self._thread_key(channel_id, agent_thread_ts)
 
