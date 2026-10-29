@@ -25,6 +25,7 @@ from src.utils.schema import (
     ModelSelection,
     QueryRequest,
     QueryType,
+    RoutingCandidate,
     RoutingDecision,
     RoutingDecisionFeatures,
     ToolPolicy,
@@ -112,6 +113,20 @@ GUARDRAIL_CONTEXT_KEYS = (
 GUARDRAIL_BYPASS_NOTE = (
     "routing guardrails bypassed (fail-open): they exclude every model "
     "available to the tier"
+)
+
+# Why _filter_models_for_context excludes a model (RoutingCandidate.reject_reason).
+REJECT_AVOID_MODEL = "avoid_model"
+REJECT_BLOCKED_MODEL = "blocked_model"
+REJECT_AVOID_PROVIDER = "avoid_provider"
+REJECT_BLOCKED_PROVIDER = "blocked_provider"
+REJECT_CAPABILITY = "capability"
+REJECT_CONTEXT_WINDOW = "context_window"
+REJECT_TIER = "tier"
+
+# Routing paths whose candidates skip the query-type capability check.
+REASON_CODES_WITHOUT_CAPABILITY_CHECK = frozenset(
+    {"rule", "rule_fallback", "no_capability_match", "routing_error"}
 )
 
 
@@ -725,6 +740,12 @@ class ModelRouter:
                 routing_strategy=self.routing_strategy,
                 user_tier=self._entitlement_tier(request.user_tier),
                 features=self._decision_features(query_context),
+                reason_code=model_selection.reason_code,
+                candidates=self._safe_candidate_table(
+                    query_context,
+                    model_selection.model_name,
+                    model_selection.reason_code,
+                ),
             )
 
             # Update metrics
@@ -766,10 +787,12 @@ class ModelRouter:
             context[key] = list(policy_context.get(key) or [])
 
         routing_reason = "Fallback due to routing error"
+        scoring_context = context
         try:
             selected_model, eligible = self._default_or_best_model(context)
             if eligible is not None:
                 routing_reason = eligible.reason(routing_reason)
+                scoring_context = eligible.context
         except (ModelNotEntitledError, PromptTooLargeError):
             raise
         except Exception:
@@ -786,6 +809,7 @@ class ModelRouter:
             routing_reason = (
                 f"{routing_reason} (model selection failed; guardrails ignored)"
             )
+            scoring_context = last_resort_context
 
         return RoutingDecision(
             selected_model=selected_model,
@@ -803,6 +827,10 @@ class ModelRouter:
             user_tier=self._entitlement_tier(request.user_tier),
             features=self._decision_features(
                 {**routing_features, "classification_confidence": 0.0}
+            ),
+            reason_code="routing_error",
+            candidates=self._safe_candidate_table(
+                scoring_context, selected_model, "routing_error"
             ),
         )
 
@@ -964,6 +992,12 @@ class ModelRouter:
                     "routing_reason": reason,
                     "confidence": confidence,
                     "estimated_cost": self._estimate_cost(selection, scoring_context),
+                    "reason_code": "refit_reroute",
+                    "candidates": self._safe_candidate_table(
+                        scoring_context,
+                        best_model,
+                        None if capable else "no_capability_match",
+                    ),
                     "actual_fast_lane_hit": bool(decision.route_to_fast_lane)
                     and best_model in self._get_fast_lane_candidates(),
                 }
@@ -1648,6 +1682,7 @@ class ModelRouter:
                     model_name=best_model,
                     confidence=0.9,
                     reason=f"Rule-based selection: {rule.condition}",
+                    reason_code="rule",
                 )
             if self._filter_models_for_context(
                 [rule.fallback], context, check_capability=False
@@ -1656,6 +1691,7 @@ class ModelRouter:
                     model_name=rule.fallback,
                     confidence=0.9,
                     reason=f"Rule-based selection (fallback): {rule.condition}",
+                    reason_code="rule_fallback",
                 )
 
         # Fallback to capability-based routing
@@ -1687,6 +1723,7 @@ class ModelRouter:
                 model_name=selected_model,
                 confidence=confidence,
                 reason=f"{reason_prefix} ({policy_source}): {hint_reason}",
+                reason_code="preferred_model",
             )
 
         if route_to_fast_lane:
@@ -1707,6 +1744,7 @@ class ModelRouter:
             model_name=selected_model,
             confidence=confidence,
             reason=(f"{reason_prefix} ({policy_source}): {hint_reason}"),
+            reason_code="fast_lane",
         )
 
     def _selection_reason_prefix(self, policy_source: str) -> str:
@@ -1794,7 +1832,9 @@ class ModelRouter:
         best_model = self._select_best_model(eligible.models, eligible.context)
         if eligible.capability_match:
             reason, confidence = "Capability-based selection", 0.8
+            reason_code = "capability"
         else:
+            reason_code = "no_capability_match"
             reason = (
                 "No model has the capability for this query type; "
                 "best model available to the tier"
@@ -1806,6 +1846,7 @@ class ModelRouter:
             model_name=best_model,
             confidence=confidence,
             reason=eligible.reason(reason),
+            reason_code=reason_code,
         )
 
     def _eligible_models(self, context: Dict[str, Any]) -> EligibleModels:
@@ -1904,6 +1945,28 @@ class ModelRouter:
         query-type capability check, for routing rules that name models
         explicitly.
         """
+        reasons = self._model_reject_reasons(
+            candidate_models, context, check_capability=check_capability
+        )
+        return [
+            model_name
+            for model_name in candidate_models
+            if model_name in reasons and reasons[model_name] is None
+        ]
+
+    def _model_reject_reasons(
+        self,
+        candidate_models: List[str],
+        context: Dict[str, Any],
+        *,
+        check_capability: bool = True,
+    ) -> Dict[str, Optional[str]]:
+        """Why each known candidate is excluded (None when it is eligible).
+
+        The checks run in the order _filter_models_for_context has always
+        applied them; the first that fails names the reason. Unknown model
+        names are left out.
+        """
         query_type = context["query_type"]
         token_count = context["token_count"]
         user_tier = context["user_tier"]
@@ -1918,25 +1981,31 @@ class ModelRouter:
             for provider in list(context.get("blocked_providers", []) or [])
         }
 
-        suitable_models = []
+        reasons: Dict[str, Optional[str]] = {}
         for model_name in candidate_models:
             model_config = self.models.get(model_name)
-            if not model_config:
-                continue
-            if model_name in avoid_models or model_name in blocked_models:
+            if not model_config or model_name in reasons:
                 continue
             provider_name = model_config.provider.lower()
-            if provider_name in avoid_providers or provider_name in blocked_providers:
-                continue
-            if check_capability and not self._has_capability(model_config, query_type):
-                continue
-            if not model_config.fits_context(token_count, context.get("max_tokens")):
-                continue
-            if not self._check_user_access(model_config, user_tier):
-                continue
-            suitable_models.append(model_name)
-
-        return suitable_models
+            reason: Optional[str] = None
+            if model_name in avoid_models:
+                reason = REJECT_AVOID_MODEL
+            elif model_name in blocked_models:
+                reason = REJECT_BLOCKED_MODEL
+            elif provider_name in avoid_providers:
+                reason = REJECT_AVOID_PROVIDER
+            elif provider_name in blocked_providers:
+                reason = REJECT_BLOCKED_PROVIDER
+            elif check_capability and not self._has_capability(
+                model_config, query_type
+            ):
+                reason = REJECT_CAPABILITY
+            elif not model_config.fits_context(token_count, context.get("max_tokens")):
+                reason = REJECT_CONTEXT_WINDOW
+            elif not self._check_user_access(model_config, user_tier):
+                reason = REJECT_TIER
+            reasons[model_name] = reason
+        return reasons
 
     def _get_fast_lane_candidates(self) -> List[str]:
         """Resolve the configured fast-lane models for synchronous low-latency routing."""
@@ -2012,31 +2081,43 @@ class ModelRouter:
             self._raise_no_eligible_model(context, candidates)
         candidates = eligible
 
-        scores = {}
+        scores = {
+            model_name: self._adjusted_score(model_name, context)
+            for model_name in candidates
+        }
+
+        # Return model with highest score
+        return max(candidates, key=lambda x: scores.get(x, 0))
+
+    def _warn_penalty(self, model_name: str, context: Dict[str, Any]) -> float:
+        """The score taken off a model the policy cache warns about."""
         warn_models = set(context.get("warn_models", []) or [])
         warn_providers = {
             str(provider).lower()
             for provider in list(context.get("warn_providers", []) or [])
         }
+        penalty = 0.0
+        if model_name in warn_models:
+            penalty += 15
+        if self.models[model_name].provider.lower() in warn_providers:
+            penalty += 12
+        return penalty
 
-        for model_name in candidates:
-            score = self._score_model(model_name, context)
-            model_config = self.models[model_name]
-
-            if model_name in warn_models:
-                score -= 15
-            if model_config.provider.lower() in warn_providers:
-                score -= 12
-
-            scores[model_name] = score
-
-        # Return model with highest score
-        return max(candidates, key=lambda x: scores.get(x, 0))
+    def _adjusted_score(self, model_name: str, context: Dict[str, Any]) -> float:
+        """The score _select_best_model ranks by: _score_model less warnings."""
+        return self._score_model(model_name, context) - self._warn_penalty(
+            model_name, context
+        )
 
     def _score_model(self, model_name: str, context: Dict[str, Any]) -> float:
         """Score a single model for the provided routing context."""
+        return float(sum(self._score_components(model_name, context).values()))
+
+    def _score_components(
+        self, model_name: str, context: Dict[str, Any]
+    ) -> Dict[str, float]:
+        """The terms of a model's score, by name; _score_model is their sum."""
         model_config = self.models[model_name]
-        score = 0.0
 
         # Performance-based scoring
         model_stats = self.model_stats.get(model_name, {})
@@ -2048,15 +2129,34 @@ class ModelRouter:
         if error_sensitivity == "high":
             reliability_weight += 10.0
 
-        score += success_rate * reliability_weight
         latency_weight = float(self.scoring["latency_weight"])
         if bool(context.get("requires_low_latency", False)):
             latency_weight += float(self.scoring.get("low_latency_weight_bonus", 0.0))
-        score += max(
-            0, latency_weight - avg_latency / 100
-        )  # Speed weight (lower latency = higher score)
 
-        # Cost efficiency (inverse relationship)
+        # Context length compatibility: the prompt plus its output
+        needed_tokens = int(context["token_count"] or 0) + model_config.output_tokens(
+            context.get("max_tokens")
+        )
+        window = model_config.window_tokens()
+        context_fit = 0.0
+        if needed_tokens <= window * 0.8:
+            context_fit = float(self.scoring["context_fit_full_weight"])
+        elif needed_tokens <= window:
+            context_fit = float(self.scoring["context_fit_partial_weight"])
+
+        return {
+            "reliability": success_rate * reliability_weight,
+            # Speed weight (lower latency = higher score)
+            "latency": max(0, latency_weight - avg_latency / 100),
+            "cost": self._cost_score(model_config, context),
+            "priority": (10 - model_config.priority)
+            * float(self.scoring["priority_weight"]),
+            "context_fit": context_fit,
+            "model_bonus": self._contextual_model_bonus(model_name, context),
+        }
+
+    def _cost_score(self, model_config: ModelConfig, context: Dict[str, Any]) -> float:
+        """Cost efficiency (inverse relationship)."""
         cost_per_token = model_config.cost_per_token
         cost_sensitivity = str(context.get("cost_sensitivity", "")).lower()
         cost_weight_cap = float(self.scoring["cost_weight_cap"])
@@ -2064,25 +2164,68 @@ class ModelRouter:
             cost_weight_cap += 10.0
         if cost_per_token > 0:
             cost_score = 1 / (cost_per_token * 1000000)  # Normalize
-            score += min(cost_score, cost_weight_cap)
-        else:
-            score += cost_weight_cap
+            return min(cost_score, cost_weight_cap)
+        return cost_weight_cap
 
-        # Priority-based scoring
-        score += (10 - model_config.priority) * float(self.scoring["priority_weight"])
+    def _candidate_table(
+        self,
+        context: Dict[str, Any],
+        selected_model: str,
+        reason_code: Optional[str] = None,
+    ) -> List[RoutingCandidate]:
+        """Every loaded model with its reject reason, or its score if eligible.
 
-        # Context length compatibility: the prompt plus its output
-        needed_tokens = int(context["token_count"] or 0) + model_config.output_tokens(
-            context.get("max_tokens")
+        Eligibility uses the filter of the routing path that chose
+        ``reason_code`` (rules skip the capability check). Scores are what
+        _select_best_model ranks by, over all eligible models; when the
+        decision bypassed guardrails every model may show a guardrail reason.
+        """
+        check_capability = reason_code not in REASON_CODES_WITHOUT_CAPABILITY_CHECK
+        model_names = list(self.models)
+        reasons = self._model_reject_reasons(
+            model_names, context, check_capability=check_capability
         )
-        window = model_config.window_tokens()
-        if needed_tokens <= window * 0.8:
-            score += float(self.scoring["context_fit_full_weight"])
-        elif needed_tokens <= window:
-            score += float(self.scoring["context_fit_partial_weight"])
+        table: List[RoutingCandidate] = []
+        for model_name in model_names:
+            reason = reasons.get(model_name)
+            score: Optional[float] = None
+            breakdown: Dict[str, float] = {}
+            if reason is None:
+                score = round(self._adjusted_score(model_name, context), 4)
+                breakdown = {
+                    name: round(float(value), 4)
+                    for name, value in self._score_components(
+                        model_name, context
+                    ).items()
+                }
+                penalty = self._warn_penalty(model_name, context)
+                if penalty:
+                    breakdown["warn_penalty"] = -penalty
+            table.append(
+                RoutingCandidate(
+                    model=model_name,
+                    provider=self.models[model_name].provider,
+                    eligible=reason is None,
+                    reject_reason=reason,
+                    score=score,
+                    score_breakdown=breakdown,
+                    selected=model_name == selected_model,
+                )
+            )
+        return table
 
-        score += self._contextual_model_bonus(model_name, context)
-        return score
+    def _safe_candidate_table(
+        self,
+        context: Dict[str, Any],
+        selected_model: str,
+        reason_code: Optional[str] = None,
+    ) -> List[RoutingCandidate]:
+        """The candidate table, or none: explaining must never fail routing."""
+        try:
+            return self._candidate_table(context, selected_model, reason_code)
+        except Exception:
+            logger.warning("Could not build the routing candidate table", exc_info=True)
+            return []
 
     def _contextual_model_bonus(
         self, model_name: str, context: Dict[str, Any]
@@ -2144,6 +2287,7 @@ class ModelRouter:
             model_name=selected_model,
             confidence=0.6,
             reason=eligible.reason("Round-robin selection"),
+            reason_code="round_robin",
         )
 
     def _weighted_routing(self, context: Dict[str, Any]) -> ModelSelection:
@@ -2174,6 +2318,7 @@ class ModelRouter:
             model_name=selected_model,
             confidence=0.7,
             reason=eligible.reason("Weighted random selection"),
+            reason_code="weighted",
         )
 
     def _fallback_routing(self, context: Dict[str, Any]) -> ModelSelection:
@@ -2184,11 +2329,13 @@ class ModelRouter:
                 model_name=selected_model,
                 confidence=0.4,
                 reason="Fallback routing",
+                reason_code="default_model",
             )
         return ModelSelection(
             model_name=selected_model,
             confidence=0.4,
             reason=eligible.reason("Fallback routing (default model not eligible)"),
+            reason_code="fallback_best",
         )
 
     def _default_or_best_model(

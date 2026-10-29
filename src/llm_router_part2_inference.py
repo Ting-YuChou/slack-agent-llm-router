@@ -4840,6 +4840,28 @@ class InferenceEngine:
             response,
             routing_decision=routing_decision,
         )
+        await self._publish_routing_decision_event(request, response, routing_decision)
+
+    async def _publish_routing_decision_event(
+        self,
+        request: QueryRequest,
+        response: InferenceResponse,
+        routing_decision: Optional[Any] = None,
+    ):
+        """Best-effort routing.decisions event for the request's final decision.
+
+        It carries the router's candidate table and the fallback chain that
+        was actually tried; requests that never got a decision have none.
+        """
+        if not self.event_producer or routing_decision is None:
+            return
+        publish_method = getattr(self.event_producer, "produce_routing_decision", None)
+        if publish_method is None:
+            return
+        try:
+            await publish_method(request, routing_decision, response)
+        except Exception as exc:
+            logger.warning(f"Failed to publish routing decision event: {exc}")
 
     async def _update_stats(
         self, model_name: str, response: InferenceResponse, inference_time: float

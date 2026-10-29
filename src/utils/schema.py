@@ -325,6 +325,20 @@ class RoutingDecisionFeatures(BaseModel):
     classification_confidence: float = Field(0.0, ge=0.0, le=1.0)
 
 
+class RoutingCandidate(BaseModel):
+    """One model the router considered, and why it was or was not eligible."""
+
+    model: str = Field(..., min_length=1)
+    provider: Optional[str] = None
+    eligible: bool = False
+    # Why the model was filtered out: tier, capability, context_window,
+    # avoid_model, blocked_model, avoid_provider or blocked_provider.
+    reject_reason: Optional[str] = None
+    score: Optional[float] = None
+    score_breakdown: Dict[str, float] = Field(default_factory=dict)
+    selected: bool = False
+
+
 class RoutingDecision(BaseModel):
     # Core routing decision
     selected_model: str = Field(..., min_length=1)
@@ -349,12 +363,19 @@ class RoutingDecision(BaseModel):
     policy_source: str = "none"
     hint_reason: Optional[str] = None
     features: RoutingDecisionFeatures = Field(default_factory=RoutingDecisionFeatures)
+    # Structured counterpart of routing_reason (which keeps its free text):
+    # the routing path that chose the model, e.g. rule or capability.
+    reason_code: Optional[str] = None
+    # Every model the router considered. fallback_models stays the chain
+    # inference actually tried.
+    candidates: List[RoutingCandidate] = Field(default_factory=list)
 
 
 class ModelSelection(BaseModel):
     model_name: str = Field(..., min_length=1)
     confidence: float = Field(ge=0.0, le=1.0)
     reason: str = Field(..., min_length=1)
+    reason_code: Optional[str] = None
 
 
 class ModelConfig(BaseModel):

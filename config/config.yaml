@@ -612,6 +612,7 @@ kafka:
     analytics_model_metrics_1m: analytics.model_metrics_1m
     routing_guardrails: routing.guardrails
     routing_policy_state: routing.policy_state
+    routing_decisions: routing.decisions
     alerts: alerts
     errors: llm-errors
   producer:

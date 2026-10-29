@@ -318,6 +318,84 @@ def build_inference_completed_event(
     }
 
 
+# Fields of a routing.decisions candidate entry; anything else is dropped.
+ROUTING_CANDIDATE_FIELDS = (
+    "model",
+    "provider",
+    "eligible",
+    "reject_reason",
+    "score",
+    "score_breakdown",
+    "selected",
+)
+
+
+def _routing_candidate_payload(candidate: Any) -> Dict[str, Any]:
+    if hasattr(candidate, "model_dump"):
+        candidate = candidate.model_dump()
+    if not isinstance(candidate, dict):
+        candidate = dict(vars(candidate))
+    payload = {name: candidate.get(name) for name in ROUTING_CANDIDATE_FIELDS}
+    payload["eligible"] = bool(payload["eligible"])
+    payload["selected"] = bool(payload["selected"])
+    payload["score_breakdown"] = {
+        str(name): float(value)
+        for name, value in dict(payload["score_breakdown"] or {}).items()
+    }
+    return payload
+
+
+def build_routing_decision_event(
+    query_request: QueryRequest,
+    routing_decision: Any,
+    inference_response: Optional[InferenceResponse] = None,
+) -> Dict[str, Any]:
+    """Build the routing.decisions event: why the router chose the model.
+
+    An explicit field list (X6): the routing context holds the raw query, so
+    nothing from it is copied wholesale. Decisions built by tests or older
+    callers may lack fields; those default.
+    """
+    features = getattr(routing_decision, "features", None)
+    timestamp = getattr(routing_decision, "timestamp", None)
+    return {
+        "event_type": "routing.decision",
+        "event_version": EVENT_SCHEMA_VERSION,
+        "emitted_at": _isoformat_utc(),
+        "decided_at": _isoformat_utc(
+            timestamp if isinstance(timestamp, datetime) else None
+        ),
+        "request_id": query_request.request_id,
+        "user_tier": _enum_value(
+            getattr(routing_decision, "user_tier", None) or query_request.user_tier
+        ),
+        "selected_model": getattr(routing_decision, "selected_model", None),
+        "served_model": getattr(inference_response, "model_name", None),
+        "query_type": _enum_value(getattr(routing_decision, "query_type", None)),
+        "routing_strategy": getattr(routing_decision, "routing_strategy", None),
+        "reason_code": getattr(routing_decision, "reason_code", None),
+        "routing_reason": getattr(routing_decision, "routing_reason", None),
+        "policy_source": getattr(routing_decision, "policy_source", None),
+        "token_count": getattr(routing_decision, "token_count", None),
+        "estimated_cost": getattr(routing_decision, "estimated_cost", None),
+        "confidence": getattr(routing_decision, "confidence", None),
+        "classifier_confidence": getattr(features, "classification_confidence", None),
+        "query_complexity": getattr(features, "query_complexity", None),
+        "routing_time_ms": getattr(routing_decision, "routing_time_ms", None),
+        "route_to_fast_lane": bool(
+            getattr(routing_decision, "route_to_fast_lane", False)
+        ),
+        "actual_fast_lane_hit": bool(
+            getattr(routing_decision, "actual_fast_lane_hit", False)
+        ),
+        "fallback_models": list(getattr(routing_decision, "fallback_models", []) or []),
+        "candidates": [
+            _routing_candidate_payload(candidate)
+            for candidate in list(getattr(routing_decision, "candidates", []) or [])
+        ],
+    }
+
+
 @dataclass
 class QueryLogEntry:
     """Structure for query log entries"""
@@ -577,6 +655,62 @@ class RoutingPolicyStateEntry:
             "avoid_models": list(self.avoid_models),
             "avoid_providers": list(self.avoid_providers),
             "payload_json": self.payload_json,
+            "kafka_topic": self.kafka_topic,
+            "kafka_partition": self.kafka_partition,
+            "kafka_offset": self.kafka_offset,
+        }
+
+
+@dataclass
+class RoutingDecisionEntry:
+    """Structure for persisted routing.decisions events (no query, no context)."""
+
+    timestamp: datetime
+    request_id: str
+    selected_model: str = ""
+    served_model: str = ""
+    user_tier: str = ""
+    query_type: str = ""
+    routing_strategy: str = ""
+    reason_code: str = ""
+    routing_reason: str = ""
+    policy_source: str = ""
+    token_count: int = 0
+    estimated_cost: float = 0.0
+    confidence: float = 0.0
+    classifier_confidence: float = 0.0
+    route_to_fast_lane: bool = False
+    actual_fast_lane_hit: bool = False
+    fallback_models: List[str] = field(default_factory=list)
+    candidates_json: str = "[]"
+    event_id: str = ""
+    kafka_topic: str = ""
+    kafka_partition: int = -1
+    kafka_offset: int = -1
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for database insertion."""
+        return {
+            # One decision per request: a replayed event replaces its row.
+            "event_id": self.event_id or self.request_id,
+            "timestamp": self.timestamp,
+            "request_id": self.request_id,
+            "selected_model": self.selected_model,
+            "served_model": self.served_model,
+            "user_tier": self.user_tier,
+            "query_type": self.query_type,
+            "routing_strategy": self.routing_strategy,
+            "reason_code": self.reason_code,
+            "routing_reason": self.routing_reason,
+            "policy_source": self.policy_source,
+            "token_count": self.token_count,
+            "estimated_cost": self.estimated_cost,
+            "confidence": self.confidence,
+            "classifier_confidence": self.classifier_confidence,
+            "route_to_fast_lane": self.route_to_fast_lane,
+            "actual_fast_lane_hit": self.actual_fast_lane_hit,
+            "fallback_models": list(self.fallback_models),
+            "candidates_json": self.candidates_json,
             "kafka_topic": self.kafka_topic,
             "kafka_partition": self.kafka_partition,
             "kafka_offset": self.kafka_offset,
@@ -875,6 +1009,22 @@ class KafkaProducerManager:
                 query_request,
                 inference_response,
                 routing_decision=routing_decision,
+            ),
+        )
+
+    async def produce_routing_decision(
+        self,
+        query_request: QueryRequest,
+        routing_decision: Any,
+        inference_response: Optional[InferenceResponse] = None,
+    ):
+        """Produce a routing.decisions event, keyed by request_id."""
+        return self._enqueue_message(
+            "routing_decisions",
+            "routing.decisions",
+            key=query_request.request_id,
+            value=build_routing_decision_event(
+                query_request, routing_decision, inference_response
             ),
         )
 
@@ -1293,6 +1443,38 @@ class ClickHouseManager:
             database=self.database
         )
 
+        routing_decisions_sql = """
+        CREATE TABLE IF NOT EXISTS {database}.routing_decisions (
+            event_id String,
+            timestamp DateTime64(3),
+            request_id String,
+            selected_model String,
+            served_model String,
+            user_tier String,
+            query_type String,
+            routing_strategy String,
+            reason_code String,
+            routing_reason String,
+            policy_source String,
+            token_count UInt32,
+            estimated_cost Float64,
+            confidence Float32,
+            classifier_confidence Float32,
+            route_to_fast_lane Boolean,
+            actual_fast_lane_hit Boolean,
+            fallback_models Array(String),
+            candidates_json String,
+            kafka_topic String DEFAULT '',
+            kafka_partition Int32 DEFAULT -1,
+            kafka_offset Int64 DEFAULT -1
+        ) ENGINE = ReplacingMergeTree()
+        PARTITION BY toYYYYMMDD(timestamp)
+        ORDER BY (timestamp, event_id)
+        TTL toDateTime(timestamp) + INTERVAL 30 DAY
+        """.format(
+            database=self.database
+        )
+
         # Execute table creation
         tables = [
             ("query_logs", query_logs_sql),
@@ -1301,6 +1483,7 @@ class ClickHouseManager:
             ("user_analytics", user_analytics_sql),
             ("alert_events", alert_events_sql),
             ("routing_policy_state_events", routing_policy_state_sql),
+            ("routing_decisions", routing_decisions_sql),
         ]
 
         for table_name, sql in tables:
@@ -1459,6 +1642,25 @@ class ClickHouseManager:
             ).inc(len(state_events))
         except Exception as e:
             logger.error(f"Failed to batch insert routing policy states: {e}")
+            PIPELINE_METRICS.insertion_errors.inc()
+            raise
+
+    async def batch_insert_routing_decisions(
+        self, decisions: List[RoutingDecisionEntry]
+    ):
+        """Batch insert routing.decisions events."""
+        if not decisions:
+            return
+
+        try:
+            data = [decision.to_dict() for decision in decisions]
+            await self._insert_dict_rows("routing_decisions", data)
+            logger.info(f"Batch inserted {len(decisions)} routing decisions")
+            PIPELINE_METRICS.records_inserted.labels(table="routing_decisions").inc(
+                len(decisions)
+            )
+        except Exception as e:
+            logger.error(f"Failed to batch insert routing decisions: {e}")
             PIPELINE_METRICS.insertion_errors.inc()
             raise
 
@@ -1827,6 +2029,7 @@ class KafkaConsumerManager:
             "routing_guardrails",
             "routing_policy_state",
             "alerts",
+            "routing_decisions",
         )
         self.batch_buffer_states = {
             topic_key: BatchBufferState() for topic_key in batched_topics
@@ -1907,6 +2110,7 @@ class KafkaConsumerManager:
                     "routing_guardrails",
                     "routing_policy_state",
                     "alerts",
+                    "routing_decisions",
                 ]:
                     consumer = AIOKafkaConsumer(topic_name, **self.consumer_config)
                     await consumer.start()
@@ -2014,6 +2218,7 @@ class KafkaConsumerManager:
             "routing_guardrails": self._consume_routing_guardrails,
             "routing_policy_state": self._consume_routing_policy_state,
             "alerts": self._consume_alerts,
+            "routing_decisions": self._consume_routing_decisions,
         }
         handler = handlers.get(topic_key)
         if handler is None:
@@ -2571,6 +2776,75 @@ class KafkaConsumerManager:
             logger.error(f"routing.policy_state consumer error: {e}")
             raise
 
+    def _build_routing_decision_entry(
+        self,
+        data: Dict[str, Any],
+        kafka_metadata: Optional[Dict[str, Any]] = None,
+    ) -> RoutingDecisionEntry:
+        """Convert a routing.decisions payload to a ClickHouse row."""
+        request_id = str(data["request_id"])
+        metadata = dict(kafka_metadata or {})
+        # Keyed by request so a replay replaces the row instead of adding one.
+        metadata["event_id"] = request_id
+        return RoutingDecisionEntry(
+            timestamp=_parse_datetime(data.get("decided_at") or data.get("emitted_at")),
+            request_id=request_id,
+            selected_model=str(data.get("selected_model") or ""),
+            served_model=str(data.get("served_model") or ""),
+            user_tier=str(data.get("user_tier") or ""),
+            query_type=str(data.get("query_type") or ""),
+            routing_strategy=str(data.get("routing_strategy") or ""),
+            reason_code=str(data.get("reason_code") or ""),
+            routing_reason=str(data.get("routing_reason") or ""),
+            policy_source=str(data.get("policy_source") or ""),
+            token_count=int(data.get("token_count") or 0),
+            estimated_cost=float(data.get("estimated_cost") or 0.0),
+            confidence=float(data.get("confidence") or 0.0),
+            classifier_confidence=float(data.get("classifier_confidence") or 0.0),
+            route_to_fast_lane=bool(data.get("route_to_fast_lane", False)),
+            actual_fast_lane_hit=bool(data.get("actual_fast_lane_hit", False)),
+            fallback_models=[
+                str(model) for model in list(data.get("fallback_models") or [])
+            ],
+            candidates_json=_json_text(
+                [
+                    _routing_candidate_payload(candidate)
+                    for candidate in list(data.get("candidates") or [])
+                ]
+            ),
+            **metadata,
+        )
+
+    async def _consume_routing_decisions(self, consumer: AIOKafkaConsumer):
+        """Consume routing.decisions events into ClickHouse."""
+        try:
+            async for message in consumer:
+                try:
+                    data = self._decode_message_value(message)
+                    entry = self._build_routing_decision_entry(
+                        data,
+                        kafka_metadata=self._kafka_event_metadata(message),
+                    )
+                    await self._append_batched_row("routing_decisions", entry, message)
+                    self._record_successful_consume(
+                        "routing_decisions", consumer, message
+                    )
+
+                    PIPELINE_METRICS.messages_consumed.labels(
+                        topic="routing_decisions"
+                    ).inc()
+                except Exception as e:
+                    await self._handle_processing_failure(
+                        "routing_decisions",
+                        message,
+                        e,
+                        stage="consume",
+                        batched=True,
+                    )
+        except Exception as e:
+            logger.error(f"routing.decisions consumer error: {e}")
+            raise
+
     async def _batch_processor(self):
         """Process batches periodically"""
         while self.running:
@@ -2788,6 +3062,7 @@ class KafkaConsumerManager:
                 self.clickhouse.batch_insert_routing_policy_state,
             ),
             ("alerts", self.clickhouse.batch_insert_alert_events),
+            ("routing_decisions", self.clickhouse.batch_insert_routing_decisions),
         )
         semaphore = asyncio.Semaphore(self.max_concurrent_flushes)
 
