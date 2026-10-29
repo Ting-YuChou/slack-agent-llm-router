@@ -529,10 +529,16 @@ class ProviderCapacityScheduler:
             return window <= 0 or window < min_window
 
         while local_attempt < attempts:
-            budget.ensure_available()
             attempt_timeout = budget.attempt_timeout_seconds(
                 attempt_timeout_seconds, fallback_reserve_seconds
             )
+            if last_exc is not None and (
+                budget.remaining_seconds <= 0 or too_short(attempt_timeout)
+            ):
+                # The retry lost its window while waiting (backoff, retry
+                # budget): the failure that prompted it is the real one.
+                raise last_exc
+            budget.ensure_available()
             if too_short(attempt_timeout):
                 # Too little of the deadline is left (or the rest is held for
                 # the fallback) for a provider call to be worth starting.
@@ -638,7 +644,7 @@ class ProviderCapacityScheduler:
                 self._record_retry_metric(provider, model_name, "retry")
                 backoff = self._retry_backoff_seconds(local_attempt)
                 if backoff >= budget.remaining_seconds:
-                    raise asyncio.TimeoutError("request execution deadline exceeded")
+                    raise  # No time to retry: the real failure stands.
                 await self._sleep_func(backoff)
             finally:
                 await self.release(

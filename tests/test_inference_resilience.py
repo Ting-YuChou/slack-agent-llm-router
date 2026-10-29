@@ -523,6 +523,44 @@ async def test_retry_is_not_started_with_less_than_the_minimum_window_left():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("left_after_wait", [0.03, 0.0], ids=["sliver", "nothing"])
+async def test_retry_that_loses_its_window_while_waiting_raises_the_real_failure(
+    left_after_wait,
+):
+    scheduler = ProviderCapacityScheduler(
+        {
+            "min_attempt_window_seconds": 0.05,
+            "retry": {"max_attempts_per_request": 3, "initial_backoff_ms": 0},
+        },
+        _Admission(),
+    )
+    deadline = 0.2
+    operation = AsyncMock(side_effect=_StatusError(503))
+
+    async def slow_retry_budget(*_args):
+        # The retry-budget check (a Redis round trip) eats the window.
+        await asyncio.sleep(deadline - left_after_wait)
+        return True
+
+    scheduler._consume_retry_budget = slow_retry_budget
+
+    with pytest.raises(_StatusError):
+        await scheduler.run_provider_call(
+            request=_request(),
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+            operation=operation,
+            execution_budget=RequestExecutionBudget(
+                max_attempts=3, deadline_seconds=deadline
+            ),
+            attempt_timeout_seconds=5,
+        )
+
+    assert operation.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_slow_rag_does_not_open_healthy_providers_circuits():
     engine = _chain_engine(
         _router(),
