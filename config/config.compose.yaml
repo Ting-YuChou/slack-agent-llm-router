@@ -767,6 +767,8 @@ policy_cache:
   local_cache_max_entries: 4096
   # Routing waits this long for the policy, then routes without it.
   read_timeout_ms: 50
+  # This many deadline misses in a row start the Redis cooldown.
+  read_timeout_failure_threshold: 5
   recovery_cooldown_ms: 1000
   redis:
     host: redis

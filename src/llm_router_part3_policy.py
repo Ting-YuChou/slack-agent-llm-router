@@ -223,6 +223,74 @@ def _event_mapping(event: Dict[str, Any], field: str) -> Dict[str, Any]:
     return dict(value)
 
 
+class PolicyCacheWriteRejected(PolicyEventInvalid):
+    """Redis rejected one write deterministically (WRONGTYPE, a script or
+    argument error): retrying cannot help, so the event is dead-lettered or
+    skipped like a malformed one, and Redis is not marked failed."""
+
+
+# Error replies that mean "try again later", not "this write is wrong".
+_TRANSIENT_REPLY_CODES = frozenset(
+    {
+        "BUSY",
+        "LOADING",
+        "TRYAGAIN",
+        "MASTERDOWN",
+        "CLUSTERDOWN",
+        "READONLY",
+        "NOREPLICAS",
+        "MOVED",
+        "ASK",
+    }
+)
+
+
+def _is_rejected_by_redis(exc: BaseException) -> bool:
+    """A deterministic error reply, as opposed to an outage or a busy server."""
+    try:
+        from redis import exceptions as redis_exceptions
+    except ImportError:  # pragma: no cover - redis always ships
+        return False
+    if not isinstance(exc, redis_exceptions.ResponseError):
+        return False
+    transient_classes = tuple(
+        cls
+        for cls in (
+            getattr(redis_exceptions, name, None)
+            for name in (
+                "BusyLoadingError",
+                "ReadOnlyError",
+                "TryAgainError",
+                "ClusterDownError",
+                "MasterDownError",
+                "AskError",
+                "MovedError",
+            )
+        )
+        if isinstance(cls, type)
+    )
+    if transient_classes and isinstance(exc, transient_classes):
+        return False
+    words = str(exc).split()
+    return not (words and words[0].upper() in _TRANSIENT_REPLY_CODES)
+
+
+def _commit_lost_errors() -> Tuple[type, ...]:
+    """aiokafka's errors for a commit lost to a rebalance or a left group."""
+    try:
+        from aiokafka import errors as kafka_errors
+    except ImportError:  # pragma: no cover - aiokafka or its test stub
+        return ()
+    return tuple(
+        cls
+        for cls in (
+            getattr(kafka_errors, "CommitFailedError", None),
+            getattr(kafka_errors, "IllegalStateError", None),
+        )
+        if isinstance(cls, type) and issubclass(cls, BaseException)
+    )
+
+
 class PolicyCacheUnavailableError(RuntimeError):
     """The shared policy cache's Redis is unavailable or in its cooldown."""
 
@@ -261,6 +329,14 @@ class RoutingPolicyCache:
         # The router waits this long for get_effective_policy, then routes
         # without the shared policy.
         self.read_timeout_ms = max(1, int(self.config.get("read_timeout_ms", 50)))
+        # This many router deadline misses in a row, with no successful read
+        # between, start the cooldown: a black-holed Redis never answers
+        # within the 50 ms deadline, so its socket timeout never fires. One
+        # stall (GC, a busy loop) does not.
+        self.read_timeout_failure_threshold = max(
+            1, int(self.config.get("read_timeout_failure_threshold", 5))
+        )
+        self._consecutive_read_timeouts = 0
         self.request_ttl_seconds = int(self.config.get("request_ttl_seconds", 300))
         self.session_ttl_seconds = int(self.config.get("session_ttl_seconds", 600))
         self.user_ttl_seconds = int(self.config.get("user_ttl_seconds", 900))
@@ -391,7 +467,12 @@ class RoutingPolicyCache:
             awaitable, timeout=max(0.001, self.redis_socket_timeout_ms / 1000.0)
         )
 
+    def _note_redis_read(self) -> None:
+        """A read Redis answered: deadline misses are no longer consecutive."""
+        self._consecutive_read_timeouts = 0
+
     def _mark_redis_available(self) -> None:
+        self._consecutive_read_timeouts = 0
         self._redis_available = True
         self._redis_failure_at = None
         self._set_redis_state("available")
@@ -414,10 +495,13 @@ class RoutingPolicyCache:
         """Classify a Redis error; only a real failure starts the cooldown.
 
         Returns the unavailability reason: "pool_exhausted" when the local
-        connection pool is full, "redis_error" otherwise.
+        connection pool is full, "redis_rejected" for a deterministic error
+        reply (WRONGTYPE, script or argument errors), "redis_error" otherwise.
         """
         if self._is_pool_exhausted(exc):
             return "pool_exhausted"
+        if _is_rejected_by_redis(exc):
+            return "redis_rejected"
         self._mark_redis_failure(operation, exc)
         return "redis_error"
 
@@ -486,6 +570,27 @@ class RoutingPolicyCache:
         it does not mark Redis failed or start a cooldown.
         """
         POLICY_CACHE_UNAVAILABLE.labels(reason="timeout").inc()
+        self._consecutive_read_timeouts += 1
+        if (
+            self._consecutive_read_timeouts >= self.read_timeout_failure_threshold
+            and self._redis_enabled()
+            and self._redis_available
+        ):
+            self._mark_redis_failure(
+                "read",
+                TimeoutError(
+                    f"{self._consecutive_read_timeouts} policy reads in a row "
+                    "missed the router deadline"
+                ),
+            )
+
+    @staticmethod
+    def _write_error(reason: str, exc: BaseException) -> Exception:
+        if reason == "redis_rejected":
+            words = str(exc).split()
+            code = words[0] if words and words[0].isupper() else type(exc).__name__
+            return PolicyCacheWriteRejected(f"redis rejected the write: {code}")
+        return PolicyCacheUnavailableError(reason, str(exc))
 
     @staticmethod
     def _record_unavailable(reason: str) -> None:
@@ -598,6 +703,7 @@ class RoutingPolicyCache:
             return None
         try:
             payload = await self._run_redis_operation(self.redis_client.get(cache_key))
+            self._note_redis_read()
         except Exception as e:
             self._record_unavailable(self._note_redis_error("read", e))
             logger.warning(f"Failed to read routing policy cache key {cache_key}: {e}")
@@ -646,6 +752,7 @@ class RoutingPolicyCache:
             for scope_type in scope_types:
                 pipeline.smembers(self._guardrail_index_key(scope_type))
             results = list(await self._run_redis_operation(pipeline.execute()))
+            self._note_redis_read()
         except Exception as e:
             reason = self._note_redis_error("read", e)
             logger.warning(f"Failed to read routing policy cache: {e}")
@@ -752,7 +859,7 @@ class RoutingPolicyCache:
         except Exception as e:
             reason = self._note_redis_error("write", e)
             logger.warning(f"Failed to write routing policy cache key {cache_key}: {e}")
-            raise PolicyCacheUnavailableError(reason, str(e)) from e
+            raise self._write_error(reason, e) from e
         self._local_set(cache_key, value, ttl_seconds)
 
     async def get_request_policy(self, request_id: str) -> Optional[Dict[str, Any]]:
@@ -1114,7 +1221,7 @@ class RoutingPolicyCache:
             logger.warning(
                 f"Failed to update routing guardrail index {scope_type}:{scope_key}: {e}"
             )
-            raise PolicyCacheUnavailableError(reason, str(e)) from e
+            raise self._write_error(reason, e) from e
 
         self._local_set(cache_key, payload, ttl_seconds)
 
@@ -1166,7 +1273,7 @@ class RoutingPolicyCache:
                 logger.warning(
                     f"Failed to clear routing guardrail {scope_type}:{scope_key}: {e}"
                 )
-                raise PolicyCacheUnavailableError(reason, str(e)) from e
+                raise self._write_error(reason, e) from e
             if int(cleared or 0) != 1:
                 POLICY_CACHE_STALE_WRITES.labels(
                     namespace="guardrail", reason="older"
@@ -1521,18 +1628,68 @@ class PolicyMaterializer:
             raise RuntimeError(f"No policy materializer handler for {topic_key}")
         await handler(consumer)
 
+    @staticmethod
+    def _pause_assignment(consumer: Any) -> set:
+        assignment = getattr(consumer, "assignment", None)
+        pause = getattr(consumer, "pause", None)
+        if not callable(assignment) or not callable(pause):
+            return set()
+        try:
+            partitions = set(assignment() or ())
+            if partitions:
+                pause(*partitions)
+            return partitions
+        except Exception as e:
+            logger.warning("Failed to pause policy consumer partitions: %s", e)
+            return set()
+
+    @staticmethod
+    def _resume_assignment(consumer: Any, partitions: set) -> None:
+        resume = getattr(consumer, "resume", None)
+        if not partitions or not callable(resume):
+            return
+        try:
+            resume(*partitions)
+        except Exception as e:
+            logger.warning("Failed to resume policy consumer partitions: %s", e)
+
+    async def _wait_in_group(self, consumer: Any, seconds: float, paused: set) -> None:
+        """Wait while polling the paused consumer so it stays in its group.
+
+        aiokafka leaves the group when it is not polled for
+        max_poll_interval_ms; paused partitions return no records. Should a
+        poll return any anyway, the consumer is sought back to them.
+        """
+        getmany = getattr(consumer, "getmany", None)
+        if not paused or not callable(getmany):
+            await asyncio.sleep(seconds)
+            return
+        records = await getmany(timeout_ms=max(1, int(seconds * 1000)))
+        for partition, batch in (records or {}).items():
+            offsets = [
+                getattr(record, "offset", None)
+                for record in batch
+                if getattr(record, "offset", None) is not None
+            ]
+            if offsets:
+                consumer.seek(partition, min(offsets))
+
     async def _materialize_with_retry(
         self,
         topic_key: str,
         materialize: Any,
         payload: Dict[str, Any],
+        consumer: Any = None,
     ) -> bool:
         """Materialize one event, waiting out an unavailable cache.
 
-        Returns False when the materializer stops while waiting; the caller
-        then leaves the offset uncommitted.
+        While waiting the consumer's partitions are paused and it keeps
+        polling, so it stays in its group past max_poll_interval_ms. Returns
+        False when the materializer stops while waiting; the caller then
+        leaves the offset uncommitted.
         """
         backoff_seconds = max(0.0, self.redis_retry_initial_backoff_seconds)
+        paused: set = set()
         try:
             while True:
                 try:
@@ -1549,7 +1706,9 @@ class PolicyMaterializer:
                         e,
                         backoff_seconds,
                     )
-                    await asyncio.sleep(backoff_seconds)
+                    if not paused:
+                        paused = self._pause_assignment(consumer)
+                    await self._wait_in_group(consumer, backoff_seconds, paused)
                     if not self.running:
                         return False
                     backoff_seconds = min(
@@ -1560,6 +1719,7 @@ class PolicyMaterializer:
                         self.redis_retry_max_backoff_seconds,
                     )
         finally:
+            self._resume_assignment(consumer, paused)
             self._redis_backoff_topics.discard(topic_key)
 
     async def _commit_processed_message(self, consumer: AIOKafkaConsumer, message: Any):
@@ -1573,7 +1733,20 @@ class PolicyMaterializer:
         if topic is None or partition is None or offset is None:
             return
 
-        await consumer.commit({TopicPartition(topic, partition): int(offset) + 1})
+        try:
+            await consumer.commit({TopicPartition(topic, partition): int(offset) + 1})
+        except _commit_lost_errors() as e:
+            # The group moved on (a rebalance, or a long Redis wait): the
+            # message is redelivered and its rewrite is safe (A6), so carry
+            # on rather than restart the consumer.
+            logger.warning(
+                "Policy offset commit for %s[%s]@%s was lost; it will be "
+                "redelivered: %s",
+                topic,
+                partition,
+                offset,
+                type(e).__name__,
+            )
 
     @staticmethod
     def _decode_message_value(message: Any) -> Dict[str, Any]:
@@ -1693,6 +1866,7 @@ class PolicyMaterializer:
                         "requests_enriched",
                         self.policy_cache.materialize_request_enriched,
                         payload,
+                        consumer,
                     ):
                         break
                     await self._commit_processed_message(consumer, message)
@@ -1720,6 +1894,7 @@ class PolicyMaterializer:
                         "fast_lane_hints",
                         self.policy_cache.materialize_fast_lane_hint,
                         payload,
+                        consumer,
                     ):
                         break
                     await self._commit_processed_message(consumer, message)
@@ -1747,6 +1922,7 @@ class PolicyMaterializer:
                         "routing_guardrails",
                         self.policy_cache.materialize_routing_guardrail,
                         payload,
+                        consumer,
                     ):
                         break
                     await self._commit_processed_message(consumer, message)
@@ -1774,6 +1950,7 @@ class PolicyMaterializer:
                         "routing_policy_state",
                         self.policy_cache.materialize_routing_policy_state,
                         payload,
+                        consumer,
                     ):
                         break
                     await self._commit_processed_message(consumer, message)
