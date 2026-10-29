@@ -120,6 +120,22 @@ SCHEDULER_WAITABLE_REASONS = {
     "model_token_budget_exceeded",
 }
 
+# HTTP statuses worth another attempt. 529 is Anthropic's "overloaded".
+RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
+
+
+def _exception_status_code(exc: BaseException) -> Optional[int]:
+    """Read an HTTP status from ``status_code`` or ``response.status_code``.
+
+    Works for httpx and the openai/anthropic SDK errors without importing
+    the SDKs, which are absent in CI.
+    """
+    for carrier in (exc, getattr(exc, "response", None)):
+        status = getattr(carrier, "status_code", None)
+        if isinstance(status, int) and not isinstance(status, bool):
+            return status
+    return None
+
 
 @dataclass
 class CircuitPermit:
@@ -1362,9 +1378,10 @@ class ProviderCapacityScheduler:
             return True
         if isinstance(exc, httpx.TransportError):
             return True
-        if isinstance(exc, httpx.HTTPStatusError):
-            status = exc.response.status_code if exc.response else 0
-            return status in {408, 409, 425, 429, 500, 502, 503, 504}
+        # A status code is authoritative: digits in the message are not.
+        status = _exception_status_code(exc)
+        if status is not None:
+            return status in RETRYABLE_STATUS_CODES
         name = type(exc).__name__.lower()
         transient_names = (
             "ratelimit",
@@ -1384,11 +1401,6 @@ class ProviderCapacityScheduler:
                 "timeout",
                 "temporar",
                 "rate limit",
-                "429",
-                "500",
-                "502",
-                "503",
-                "504",
                 "overload",
                 "no healthy",
             )
