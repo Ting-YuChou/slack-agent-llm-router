@@ -206,7 +206,8 @@ async def test_clickhouse_ping_failure_marks_clickhouse_unhealthy():
     assert await pipeline.clickhouse_manager.ping() is False
 
     assert pipeline.get_health_status()["clickhouse_healthy"] is False
-    assert pipeline.is_healthy() is False
+    # Review round 1: a failed ping degrades analytics, not readiness.
+    assert pipeline.is_degraded() is True
 
     client.error = None
     assert await pipeline.clickhouse_manager.ping() is True

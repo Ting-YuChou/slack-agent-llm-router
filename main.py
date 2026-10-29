@@ -1043,8 +1043,11 @@ class LLMRouterPlatform:
             service_status[name] = getattr(service, "is_healthy", lambda: True)()
         return service_status
 
-    # Best-effort services: they never gate readiness, only report degraded.
-    _ANALYTICS_SERVICES = ("event_producer", "policy_cache", "policy_materializer")
+    # Best-effort services: they never gate readiness; unhealthy means degraded.
+    # Routing fails open without the policy cache or its materializer.
+    _BEST_EFFORT_SERVICES = ("event_producer", "policy_cache", "policy_materializer")
+    # Services whose degradation reports analytics as degraded.
+    _ANALYTICS_SERVICES = _BEST_EFFORT_SERVICES + ("pipeline",)
 
     @staticmethod
     def _degraded_services(
@@ -1056,8 +1059,11 @@ class LLMRouterPlatform:
         """List services that serve in a degraded mode without blocking chat."""
         degraded: List[str] = []
         for name, service in services.items():
-            if name == "event_producer" and (
-                not event_producer_ready or not service_status.get(name, True)
+            if name == "event_producer" and not event_producer_ready:
+                degraded.append(name)
+                continue
+            if name in LLMRouterPlatform._BEST_EFFORT_SERVICES and not (
+                service_status.get(name, True)
             ):
                 degraded.append(name)
                 continue
@@ -1083,7 +1089,6 @@ class LLMRouterPlatform:
         for optional_required in (
             "admission",
             "pipeline",
-            "policy_materializer",
             "rag",
         ):
             if optional_required in self.services:

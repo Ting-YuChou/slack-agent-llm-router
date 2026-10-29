@@ -3239,11 +3239,17 @@ class KafkaIngestionPipeline:
     def is_healthy(self) -> bool:
         """Return whether the pipeline can produce, consume, and persist events."""
         health = self.get_health_status()
+        # A failed ClickHouse ping only degrades analytics (see is_degraded);
+        # it must not take a chat-serving instance out of readiness.
         return bool(
             health["producer_healthy"]
             and health["consumer_healthy"]
-            and health["clickhouse_healthy"]
+            and self.clickhouse_manager.client is not None
         )
+
+    def is_degraded(self) -> bool:
+        """Return whether the pipeline runs but its last ClickHouse ping failed."""
+        return self.clickhouse_manager.last_ping_ok is False
 
     async def shutdown(self):
         """Shutdown the pipeline"""
