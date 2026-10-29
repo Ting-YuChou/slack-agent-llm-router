@@ -11,6 +11,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import (
     Awaitable,
@@ -251,6 +252,122 @@ def _nested_usage_value(
     if isinstance(parent, dict):
         return _safe_int(parent.get(field_name), default)
     return _safe_int(getattr(parent, field_name, None), default)
+
+
+def _first_nested_usage_value(
+    usage: Any, parent_names: Sequence[str], field_name: str, default: int = 0
+) -> int:
+    """Read a nested usage field from the first parent that reports it.
+
+    The Responses API reports ``input_tokens_details``; Chat-Completions-compatible
+    backends report ``prompt_tokens_details`` instead.
+    """
+    for parent_name in parent_names:
+        parent = (
+            usage.get(parent_name)
+            if isinstance(usage, dict)
+            else getattr(usage, parent_name, None)
+        )
+        if parent is None:
+            continue
+        value = (
+            parent.get(field_name)
+            if isinstance(parent, dict)
+            else getattr(parent, field_name, None)
+        )
+        if value is not None:
+            return _safe_int(value, default)
+    return default
+
+
+# Statuses that blame the request itself (bad input, too large, unprocessable),
+# matching the request-shaped set the failure-handling path uses.
+_REQUEST_SHAPED_STATUS_CODES = frozenset({400, 413, 422})
+
+
+def _exception_status_code(exc: BaseException) -> Optional[int]:
+    """HTTP status from SDK errors (exc.status_code) or httpx (exc.response)."""
+    for candidate in (exc, getattr(exc, "response", None)):
+        status_code = getattr(candidate, "status_code", None)
+        if isinstance(status_code, int) and not isinstance(status_code, bool):
+            return status_code
+    return None
+
+
+def classify_inference_error(exc: BaseException) -> str:
+    """Bucket a failed inference so analytics only blame providers for their faults.
+
+    Matches SDK and httpx errors by attribute and class name, so it works without
+    importing the provider SDKs.
+    """
+    class_names = {cls.__name__ for cls in type(exc).__mro__}
+    if isinstance(exc, AdmissionRejectedError):
+        # An open circuit (or a queue wait that ended on one) means the provider
+        # has been failing; other rejections are our own capacity policy.
+        decision = getattr(exc, "decision", None)
+        reason = str(getattr(decision, "reason", "") or "")
+        if reason == "scheduler_queue_timeout":
+            metadata = getattr(decision, "metadata", None) or {}
+            reason = str(metadata.get("last_reason") or "")
+        if reason == "circuit_open":
+            return "provider_error"
+        return "user_or_policy"
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or any(
+        "Timeout" in name for name in class_names
+    ):
+        return "timeout"
+    status_code = _exception_status_code(exc)
+    if status_code is not None and status_code >= 400:
+        if status_code == 408:
+            return "timeout"
+        if status_code == 429:
+            return "rate_limited"
+        if status_code in _REQUEST_SHAPED_STATUS_CODES:
+            return "user_or_policy"
+        # 5xx, and 4xx such as 401/403 (revoked key) or 404 (retired model).
+        return "provider_error"
+    if isinstance(exc, ConnectionError) or class_names & {
+        "APIConnectionError",
+        "TransportError",
+    }:
+        return "provider_error"
+    if isinstance(exc, json.JSONDecodeError):
+        # A provider answered with a body that is not JSON (an HTML error page,
+        # a truncated stream); JSONDecodeError is a ValueError, so check first.
+        return "provider_error"
+    if isinstance(exc, ValueError):
+        return "user_or_policy"
+    if isinstance(exc, RuntimeError):
+        return "provider_error"
+    return "internal"
+
+
+_PRIMARY_ATTEMPT_EXCEPTION_ATTR = "_primary_attempt_exception"
+
+
+def _primary_attempt_exception(exc: BaseException) -> BaseException:
+    """Return the primary model's failure that exc (or its cause chain) carries.
+
+    When every fallback also fails, the exception that surfaces belongs to the
+    last fallback, or to the request deadline. Failure analytics describe the
+    primary attempt, so the fallback chain attaches that attempt's exception.
+    """
+    seen = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        primary = getattr(current, _PRIMARY_ATTEMPT_EXCEPTION_ATTR, None)
+        if isinstance(primary, BaseException):
+            return primary
+        current = current.__cause__ or current.__context__
+    return exc
+
+
+def _openai_cached_input_tokens(usage: Any) -> int:
+    """Cached prompt tokens: the Responses API field first, then Chat Completions."""
+    return _first_nested_usage_value(
+        usage, ("input_tokens_details", "prompt_tokens_details"), "cached_tokens"
+    )
 
 
 @dataclass
@@ -842,8 +959,9 @@ class OpenAIProvider(BaseInferenceProvider):
 
             usage = response.usage
             generated_text = response.output_text
-            cached_tokens = _nested_usage_value(
-                usage, "prompt_tokens_details", "cached_tokens"
+            cached_tokens = _openai_cached_input_tokens(usage)
+            reasoning_tokens = _nested_usage_value(
+                usage, "output_tokens_details", "reasoning_tokens"
             )
             input_tokens = _usage_value(usage, "input_tokens")
             output_tokens = _usage_value(usage, "output_tokens")
@@ -858,6 +976,7 @@ class OpenAIProvider(BaseInferenceProvider):
                 token_count_output=output_tokens,
                 total_tokens=total_tokens,
                 provider_cached_input_tokens=cached_tokens,
+                reasoning_tokens=reasoning_tokens,
                 latency_ms=int((time.time() - start_time) * 1000),
                 tokens_per_second=(output_tokens / max(time.time() - start_time, 1e-6)),
                 cost_usd=self._calculate_cost(usage, model_name),
@@ -1013,10 +1132,7 @@ class OpenAIProvider(BaseInferenceProvider):
 
         input_tokens = _usage_value(usage, "input_tokens")
         output_tokens = _usage_value(usage, "output_tokens")
-        cached_tokens = min(
-            _nested_usage_value(usage, "prompt_tokens_details", "cached_tokens"),
-            input_tokens,
-        )
+        cached_tokens = min(_openai_cached_input_tokens(usage), input_tokens)
         uncached_tokens = max(input_tokens - cached_tokens, 0)
         cached_multiplier = float(
             self._prompt_cache_pricing().get("cached_input_multiplier", 0.5)
@@ -2158,16 +2274,29 @@ class InferenceEngine:
     async def _get_cached_inference_response(
         self, request: QueryRequest, model_name: str
     ) -> Optional[InferenceResponse]:
-        """Return an app-cache hit for a model, clearly separated from provider cache."""
+        """Return an app-cache hit for a model, clearly separated from provider cache.
+
+        The cached payload carries the original call's cost, latency and timestamp.
+        A hit costs nothing, takes only the lookup time and happens now, so those
+        fields are reset before every hit path publishes analytics.
+        """
         if self._response_cache_bypassed(request):
             return None
+        lookup_started_at = time.time()
         cache_key = self.cache.generate_cache_key(request, model_name)
         cached_response = await self.cache.get_cached_response(cache_key)
         if not cached_response:
             return None
 
-        cached_response["cached"] = True
-        return InferenceResponse(**cached_response)
+        return InferenceResponse(
+            **{
+                **cached_response,
+                "cached": True,
+                "cost_usd": 0.0,
+                "latency_ms": int((time.time() - lookup_started_at) * 1000),
+                "timestamp": datetime.now(timezone.utc),
+            }
+        )
 
     def _response_cache_bypassed(self, request: QueryRequest) -> bool:
         metadata = request.metadata or {}
@@ -2292,11 +2421,14 @@ class InferenceEngine:
             logger.exception(f"Inference failed for request {request_id}")
 
             # Return error response
+            failed_model = (
+                routing_decision.selected_model
+                if "routing_decision" in locals()
+                else "unknown"
+            )
             error_response = InferenceResponse(
                 response_text="Request processing failed",
-                model_name=routing_decision.selected_model
-                if "routing_decision" in locals()
-                else "unknown",
+                model_name=failed_model,
                 token_count_input=0,
                 token_count_output=0,
                 total_tokens=0,
@@ -2306,10 +2438,18 @@ class InferenceEngine:
                 provider="error",
                 cached=False,
                 error="inference_failed",
+                error_type=classify_inference_error(_primary_attempt_exception(exc)),
             )
+            # The caller keeps the "error" provider sentinel; analytics get the
+            # failed model's real provider so outages count against it.
+            failed_provider = self._configured_provider_name(failed_model)
             await self._publish_analytics_events(
                 request,
-                error_response,
+                (
+                    error_response.model_copy(update={"provider": failed_provider})
+                    if failed_provider
+                    else error_response
+                ),
                 routing_decision=routing_decision
                 if "routing_decision" in locals()
                 else None,
@@ -2327,11 +2467,14 @@ class InferenceEngine:
         inference_time = time.time() - started_at
         await self._update_stats(model_name, response, inference_time)
         self._record_provider_cache_metrics(model_name, response)
-        self.router.update_model_stats(
-            model_name=model_name,
-            success=True,
-            latency_ms=response.latency_ms,
-        )
+        if not response.cached:
+            # A cache hit served by a fallback model never ran that model, so
+            # its lookup time must not feed the router's latency and success.
+            self.router.update_model_stats(
+                model_name=model_name,
+                success=True,
+                latency_ms=response.latency_ms,
+            )
         INFERENCE_METRICS.requests_total.labels(
             model=model_name,
             provider=response.provider,
@@ -2839,6 +2982,17 @@ class InferenceEngine:
         for index in range(0, len(response.response_text), chunk_size):
             yield response.response_text[index : index + chunk_size]
 
+    def _configured_provider_name(self, model_name: str) -> Optional[str]:
+        """Return the provider configured for a model, or None when unknown."""
+        try:
+            model_info = self.router.get_model_info(model_name)
+        except Exception:
+            logger.debug("Provider lookup failed for %s", model_name, exc_info=True)
+            return None
+        config = model_info.get("config") if isinstance(model_info, dict) else None
+        provider = config.get("provider") if isinstance(config, dict) else None
+        return provider if isinstance(provider, str) and provider else None
+
     def _get_provider_for_model(
         self, model_name: str
     ) -> Optional[BaseInferenceProvider]:
@@ -2875,7 +3029,28 @@ class InferenceEngine:
         routing_decision: Any,
         execution_budget: Optional[RequestExecutionBudget] = None,
     ) -> Tuple[InferenceResponse, str, Any]:
-        """Generate a response and fall back to local models when cloud models fail."""
+        """Generate a response and fall back to local models when cloud models fail.
+
+        If the primary model fails and so does every recovery attempt, the last
+        attempt's exception is raised unchanged, carrying the primary's exception.
+        """
+        primary_failures: List[BaseException] = []
+        try:
+            return await self._generate_response_with_fallback_attempts(
+                request, routing_decision, execution_budget, primary_failures
+            )
+        except BaseException as exc:
+            if primary_failures and exc is not primary_failures[0]:
+                setattr(exc, _PRIMARY_ATTEMPT_EXCEPTION_ATTR, primary_failures[0])
+            raise
+
+    async def _generate_response_with_fallback_attempts(
+        self,
+        request: QueryRequest,
+        routing_decision: Any,
+        execution_budget: Optional[RequestExecutionBudget],
+        primary_failures: List[BaseException],
+    ) -> Tuple[InferenceResponse, str, Any]:
         primary_model = routing_decision.selected_model
         primary_started_at = time.time()
 
@@ -2885,6 +3060,7 @@ class InferenceEngine:
             )
             return response, primary_model, routing_decision
         except AdmissionRejectedError as exc:
+            primary_failures.append(exc)
             if not self.scheduler.allow_fallback_for_rejection(exc.decision):
                 raise
             fallback_models = self._get_local_fallback_models(
@@ -2955,6 +3131,7 @@ class InferenceEngine:
                 )
             raise last_exception
         except Exception as exc:
+            primary_failures.append(exc)
             self._record_failed_attempt(primary_model, exc, primary_started_at)
             fallback_models = self._get_local_fallback_models(
                 request,
@@ -3530,7 +3707,7 @@ class InferenceEngine:
         self, model_name: str, response: InferenceResponse
     ):
         """Record provider-side prompt cache usage separately from Redis hits."""
-        if response.cached or response.provider == "error":
+        if response.cached or response.error:
             return
 
         cached_tokens = int(response.provider_cached_input_tokens or 0)

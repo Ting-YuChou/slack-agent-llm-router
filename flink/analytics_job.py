@@ -116,10 +116,17 @@ from flink.logic import (
     build_model_metrics_window_event,
     build_routing_policy_state_event_from_aggregate,
     completion_event_timestamp_ms,
+    counts_toward_provider_health,
     detect_metric_anomalies,
     detect_model_routing_guardrails,
     detect_provider_routing_guardrails,
     merge_routing_policy_aggregate,
+    metric_cost_per_1k_tokens,
+    metric_has_priced_tokens,
+    metric_has_provider_latency_sample,
+    metric_has_uncached_sample,
+    metric_provider_avg_latency_ms,
+    metric_provider_failure_rate,
     validate_inference_completed_event,
 )
 
@@ -310,19 +317,58 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
             "total_tokens": 0,
             "total_cost_usd": 0.0,
             "cached_count": 0,
+            "latency_sample_count": 0,
+            "uncached_total_tokens": 0,
+            "uncached_cost_usd": 0.0,
+            "provider_request_count": 0,
+            "provider_failure_count": 0,
+            "provider_latency_sum_ms": 0.0,
+            "provider_latency_sample_count": 0,
         }
-        bucket["request_count"] += 1
-        bucket["success_count"] += 1 if value.get("status") == "success" else 0
-        bucket["error_count"] += 1 if value.get("status") != "success" else 0
-        bucket["latency_sum_ms"] += float(value.get("latency_ms", 0.0) or 0.0)
-        bucket["tokens_per_second_sum"] += float(
-            value.get("tokens_per_second", 0.0) or 0.0
+        # Buckets restored from older state averaged latency and priced tokens
+        # over every request and judged the provider by every request.
+        bucket.setdefault("latency_sample_count", bucket["request_count"])
+        bucket.setdefault("uncached_total_tokens", bucket["total_tokens"])
+        bucket.setdefault("uncached_cost_usd", bucket["total_cost_usd"])
+        bucket.setdefault("provider_request_count", bucket["request_count"])
+        bucket.setdefault("provider_failure_count", bucket["error_count"])
+        bucket.setdefault("provider_latency_sum_ms", bucket["latency_sum_ms"])
+        bucket.setdefault(
+            "provider_latency_sample_count", bucket["latency_sample_count"]
         )
+        failed = value.get("status") != "success"
+        cached = bool(value.get("cached_response"))
+        bucket["request_count"] += 1
+        bucket["success_count"] += 0 if failed else 1
+        bucket["error_count"] += 1 if failed else 0
+        # Provider health: cache hits never reached the provider, and
+        # user_or_policy or internal failures say nothing about it.
+        if not cached and counts_toward_provider_health(value):
+            bucket["provider_request_count"] += 1
+            bucket["provider_failure_count"] += 1 if failed else 0
+        # A failure's latency spans RAG, web search and every fallback, so only
+        # uncached successes time the provider.
+        if not cached and not failed:
+            bucket["provider_latency_sum_ms"] += float(
+                value.get("latency_ms", 0.0) or 0.0
+            )
+            bucket["provider_latency_sample_count"] += 1
+        # A cache hit's latency is the lookup, its throughput is the original
+        # call's and its tokens cost nothing; keep it out of the latency,
+        # throughput and cost-per-1k figures the detectors read.
+        if not cached:
+            bucket["latency_sum_ms"] += float(value.get("latency_ms", 0.0) or 0.0)
+            bucket["tokens_per_second_sum"] += float(
+                value.get("tokens_per_second", 0.0) or 0.0
+            )
+            bucket["latency_sample_count"] += 1
+            bucket["uncached_total_tokens"] += int(value.get("total_tokens", 0) or 0)
+            bucket["uncached_cost_usd"] += float(value.get("cost_usd", 0.0) or 0.0)
         bucket["token_count_input"] += int(value.get("token_count_input", 0) or 0)
         bucket["token_count_output"] += int(value.get("token_count_output", 0) or 0)
         bucket["total_tokens"] += int(value.get("total_tokens", 0) or 0)
         bucket["total_cost_usd"] += float(value.get("cost_usd", 0.0) or 0.0)
-        bucket["cached_count"] += 1 if value.get("cached_response") else 0
+        bucket["cached_count"] += 1 if cached else 0
         buckets[window_start_ms] = bucket
 
         ready_windows = [
@@ -419,6 +465,13 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
             total_tokens=int(bucket.get("total_tokens", 0) or 0),
             total_cost_usd=float(bucket.get("total_cost_usd", 0.0) or 0.0),
             cached_count=int(bucket.get("cached_count", 0) or 0),
+            latency_sample_count=bucket.get("latency_sample_count"),
+            provider_failure_count=bucket.get("provider_failure_count"),
+            uncached_total_tokens=bucket.get("uncached_total_tokens"),
+            uncached_cost_usd=bucket.get("uncached_cost_usd"),
+            provider_request_count=bucket.get("provider_request_count"),
+            provider_latency_sum_ms=bucket.get("provider_latency_sum_ms"),
+            provider_latency_sample_count=bucket.get("provider_latency_sample_count"),
         )
 
 
@@ -457,7 +510,8 @@ class ModelMetricsAnomalyDetector(KeyedProcessFunction):
         for alert in alerts:
             yield alert
 
-        latency_history.append(float(value.get("avg_latency_ms", 0.0) or 0.0))
+        if metric_has_uncached_sample(value):
+            latency_history.append(float(value.get("avg_latency_ms", 0.0) or 0.0))
         qps_history.append(float(value.get("queries_per_second", 0.0) or 0.0))
         error_rate_history.append(float(value.get("error_rate", 0.0) or 0.0))
 
@@ -518,17 +572,13 @@ class ModelRoutingGuardrailDetector(KeyedProcessFunction):
         for guardrail in guardrails:
             yield guardrail
 
-        total_tokens = max(0, int(value.get("total_tokens", 0) or 0))
-        total_cost_usd = float(value.get("total_cost_usd", 0.0) or 0.0)
-        cost_per_1k = (
-            (total_cost_usd * 1000.0 / total_tokens) if total_tokens > 0 else 0.0
-        )
-
-        latency_history.append(float(value.get("avg_latency_ms", 0.0) or 0.0))
+        if metric_has_uncached_sample(value):
+            latency_history.append(float(value.get("avg_latency_ms", 0.0) or 0.0))
+        if metric_has_priced_tokens(value):
+            cost_per_1k_history.append(metric_cost_per_1k_tokens(value))
         qps_history.append(float(value.get("queries_per_second", 0.0) or 0.0))
         error_rate_history.append(float(value.get("error_rate", 0.0) or 0.0))
         cache_hit_rate_history.append(float(value.get("cache_hit_rate", 0.0) or 0.0))
-        cost_per_1k_history.append(cost_per_1k)
 
         self.latency_history_state.update(latency_history[-self.history_size :])
         self.qps_history_state.update(qps_history[-self.history_size :])
@@ -576,8 +626,9 @@ class ProviderRoutingGuardrailDetector(KeyedProcessFunction):
         for guardrail in guardrails:
             yield guardrail
 
-        latency_history.append(float(value.get("avg_latency_ms", 0.0) or 0.0))
-        error_rate_history.append(float(value.get("error_rate", 0.0) or 0.0))
+        if metric_has_provider_latency_sample(value):
+            latency_history.append(metric_provider_avg_latency_ms(value))
+        error_rate_history.append(metric_provider_failure_rate(value))
 
         self.latency_history_state.update(latency_history[-self.history_size :])
         self.error_rate_history_state.update(error_rate_history[-self.history_size :])
@@ -873,7 +924,9 @@ class RollingScopePolicyEmitter(KeyedProcessFunction):
             "selected_model": value.get("selected_model"),
             "provider": value.get("provider"),
             "status": value.get("status"),
+            "error_type": value.get("error_type"),
             "latency_ms": value.get("latency_ms"),
+            "cached_response": bool(value.get("cached_response", False)),
             "total_tokens": value.get("total_tokens"),
             "cost_usd": value.get("cost_usd"),
             "actual_fast_lane_hit": bool(value.get("actual_fast_lane_hit", False)),
@@ -1075,6 +1128,8 @@ def create_flink_job(config: Dict[str, Any]):
     provider_guardrail_thresholds = dict(
         analytics_config.get("provider_guardrails", {}) or {}
     )
+    # Provider guardrails read provider_failure_rate from the same windows, so
+    # user_or_policy and internal failures don't count against the provider.
     provider_guardrail_stream = metrics_stream.key_by(
         lambda event: event.get("provider", "unknown")
     ).process(
