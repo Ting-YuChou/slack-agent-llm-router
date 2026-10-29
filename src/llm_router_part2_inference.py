@@ -746,6 +746,18 @@ class ResponseCache:
         }
 
 
+class RequestStageDeadlineError(Exception):
+    """The request deadline passed in a step before any model was called.
+
+    Retrieval or web search used up the time, so no model or provider is to
+    blame: the attributes keep it out of provider health and map it to 504.
+    """
+
+    error_type = "internal"
+    error_code = "timeout"
+    http_status = 504
+
+
 def _provider_http_timeout(read_seconds: float) -> httpx.Timeout:
     """Fail fast on connect and pool waits; allow the provider timeout per read."""
     return httpx.Timeout(connect=3.0, read=read_seconds, write=10.0, pool=2.0)
@@ -2348,7 +2360,9 @@ class InferenceEngine:
 
             # Step 3: Optionally enrich school-document requests with RAG context.
             rag_result = await self._within_request_deadline(
-                self._run_rag_if_needed(request, routing_decision), execution_budget
+                self._run_rag_if_needed(request, routing_decision),
+                execution_budget,
+                stage="rag",
             )
             if rag_result and rag_result.required_no_hits:
                 response = self._build_required_rag_no_hit_response(
@@ -2374,6 +2388,7 @@ class InferenceEngine:
             web_search_result = await self._within_request_deadline(
                 self._run_web_search_if_needed(request, routing_decision),
                 execution_budget,
+                stage="web_search",
             )
 
             # Step 5: Check full-response cache.
@@ -2431,8 +2446,10 @@ class InferenceEngine:
                 ).inc()
 
             # Update router stats
-            if "routing_decision" in locals() and not getattr(
-                exc, "_attempt_recorded", False
+            if (
+                "routing_decision" in locals()
+                and not getattr(exc, "_attempt_recorded", False)
+                and not isinstance(exc, RequestStageDeadlineError)
             ):
                 self.router.update_model_stats(
                     model_name=routing_decision.selected_model,
@@ -3031,13 +3048,24 @@ class InferenceEngine:
         self,
         awaitable: Awaitable[Any],
         execution_budget: Optional[RequestExecutionBudget],
+        stage: str,
     ) -> Any:
-        """Await a step before the model call, at most until the request deadline."""
+        """Await a step before the model call, at most until the request deadline.
+
+        Raises RequestStageDeadlineError when the deadline cuts the step off.
+        """
         if execution_budget is None:
             return await awaitable
-        return await asyncio.wait_for(
-            awaitable, timeout=execution_budget.remaining_seconds
-        )
+        try:
+            return await asyncio.wait_for(
+                awaitable, timeout=execution_budget.remaining_seconds
+            )
+        except asyncio.TimeoutError as exc:
+            if execution_budget.remaining_seconds > 0.01:
+                raise  # The step's own timeout, not the request deadline.
+            raise RequestStageDeadlineError(
+                f"request deadline reached during {stage}"
+            ) from exc
 
     async def _generate_response_with_fallback(
         self,

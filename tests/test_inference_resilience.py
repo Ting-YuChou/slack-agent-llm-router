@@ -602,6 +602,46 @@ async def test_hung_retrieval_is_capped_by_the_request_deadline(stage):
     provider.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["_run_rag_if_needed", "_run_web_search_if_needed"])
+async def test_retrieval_cut_off_by_the_deadline_is_not_the_models_failure(stage):
+    from src.llm_router_part3_pipeline import build_inference_completed_event
+
+    router = MagicMock()
+    router.get_model_info.return_value = {"config": {"provider": "openai"}}
+    router.update_model_stats = MagicMock()
+    router.route_query = AsyncMock(return_value=SimpleNamespace(selected_model="gpt-5"))
+    engine = InferenceEngine(
+        {"scheduler": {"request_deadline_seconds": 0.2}},
+        router,
+        event_producer=AsyncMock(),
+    )
+    engine.providers = {"openai": SimpleNamespace(generate_response=AsyncMock())}
+    setattr(engine, stage, _hang)
+    request = _request()
+
+    response = await asyncio.wait_for(engine.process_query(request), timeout=2)
+
+    assert response.error == "inference_failed"
+    router.update_model_stats.assert_not_called()
+    published = engine.event_producer.produce_inference_completed.await_args.args[1]
+    event = build_inference_completed_event(request, published)
+    assert event["error_type"] not in {"timeout", "provider_error", "rate_limited"}
+
+
+def test_request_stage_deadline_error_carries_its_http_mapping():
+    from src.llm_router_part2_inference import RequestStageDeadlineError
+
+    error = RequestStageDeadlineError("request deadline reached during rag")
+
+    assert not isinstance(error, (TimeoutError, asyncio.TimeoutError, RuntimeError))
+    assert (error.error_type, error.error_code, error.http_status) == (
+        "internal",
+        "timeout",
+        504,
+    )
+
+
 # --- I4: config-driven cross-provider fallback chains --------------------------
 
 _APIConnectionError = type("APIConnectionError", (Exception,), {})
