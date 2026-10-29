@@ -13,7 +13,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from aiokafka import AIOKafkaConsumer
 from aiokafka.structs import TopicPartition
@@ -23,6 +23,8 @@ from src.utils.metrics import PIPELINE_METRICS
 from src.utils.bounded_state import BoundedTTLMap
 
 logger = logging.getLogger(__name__)
+
+GUARDRAIL_SCOPE_TYPES: Tuple[str, ...] = ("model", "provider")
 
 
 class RoutingPolicyCache:
@@ -115,29 +117,55 @@ class RoutingPolicyCache:
     def _user_state_cache_key(self, user_id: str) -> str:
         return self._cache_key("user_state", user_id)
 
-    def _local_get(self, cache_key: str) -> Optional[Dict[str, Any]]:
+    def _local_lookup(self, cache_key: str) -> Tuple[bool, Any]:
+        """(hit, value) from L1; a hit may hold None, a cached absence."""
         record = self._local_cache.get(cache_key)
         if not record:
-            return None
+            return False, None
 
         if record["expires_at"] <= time.time():
             self._local_cache.pop(cache_key, None)
-            return None
+            return False, None
 
-        return dict(record["value"])
+        value = record["value"]
+        return True, dict(value) if isinstance(value, dict) else None
+
+    def _local_get(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        _hit, value = self._local_lookup(cache_key)
+        return value if isinstance(value, dict) else None
 
     def _local_set(self, cache_key: str, value: Dict[str, Any], ttl_seconds: int):
+        self._local_store(cache_key, dict(value), ttl_seconds)
+
+    def _local_store(self, cache_key: str, value: Any, ttl_seconds: int):
+        """Store an L1 value: a record, or None for a cached absence."""
         ttl_seconds = max(1, ttl_seconds)
         self._local_cache.set(
             cache_key,
-            {"value": dict(value), "expires_at": time.time() + ttl_seconds},
+            {"value": value, "expires_at": time.time() + ttl_seconds},
             ttl_seconds=ttl_seconds,
         )
 
+    def _decode_record(self, cache_key: str, payload: Any) -> Optional[Dict[str, Any]]:
+        """Decode a Redis payload and cache it in L1, absences included."""
+        if not payload:
+            self._local_store(cache_key, None, self.local_cache_ttl_seconds)
+            return None
+        try:
+            value = json.loads(payload)
+        except json.JSONDecodeError:
+            logger.warning(f"Invalid JSON payload in routing policy cache: {cache_key}")
+            return None
+        if not isinstance(value, dict):
+            logger.warning(f"Ignoring non-object routing policy payload: {cache_key}")
+            return None
+        self._local_set(cache_key, value, self.local_cache_ttl_seconds)
+        return value
+
     async def _get_json(self, cache_key: str) -> Optional[Dict[str, Any]]:
-        cached = self._local_get(cache_key)
-        if cached is not None:
-            return cached
+        hit, cached = self._local_lookup(cache_key)
+        if hit:
+            return cached if isinstance(cached, dict) else None
 
         if not self.enabled or not self.redis_client:
             return None
@@ -148,16 +176,62 @@ class RoutingPolicyCache:
             logger.warning(f"Failed to read routing policy cache key {cache_key}: {e}")
             return None
 
-        if not payload:
-            return None
+        return self._decode_record(cache_key, payload)
+
+    async def _read_policy_state(
+        self, record_keys: List[str], scope_types: Tuple[str, ...]
+    ) -> Tuple[Dict[str, Optional[Dict[str, Any]]], Dict[str, List[str]]]:
+        """Read policy records and guardrail index members in one round trip.
+
+        Records in L1, absences included, are not read again. The guardrail
+        indexes are read from Redis every time, so a guardrail another replica
+        sets or lifts applies at once. Returns the records by key and the
+        index members by scope type. Without Redis the records come from L1
+        and the members from the local guardrail index.
+        """
+        records: Dict[str, Optional[Dict[str, Any]]] = {}
+        members: Dict[str, List[str]] = {}
+        if not self.enabled or not self.redis_client:
+            for cache_key in record_keys:
+                records[cache_key] = self._local_get(cache_key)
+            for scope_type in scope_types:
+                members[scope_type] = sorted(
+                    self._local_guardrail_index.get(scope_type, set())
+                )
+            return records, members
+
+        pending_keys = []
+        for cache_key in record_keys:
+            hit, value = self._local_lookup(cache_key)
+            if hit:
+                records[cache_key] = value if isinstance(value, dict) else None
+            else:
+                pending_keys.append(cache_key)
+        if not pending_keys and not scope_types:
+            return records, members
 
         try:
-            value = json.loads(payload)
-            self._local_set(cache_key, value, self.local_cache_ttl_seconds)
-            return value
-        except json.JSONDecodeError:
-            logger.warning(f"Invalid JSON payload in routing policy cache: {cache_key}")
-            return None
+            pipeline = self.redis_client.pipeline(transaction=False)
+            for cache_key in pending_keys:
+                pipeline.get(cache_key)
+            for scope_type in scope_types:
+                pipeline.smembers(self._guardrail_index_key(scope_type))
+            results = list(await pipeline.execute())
+        except Exception as e:
+            logger.warning(f"Failed to read routing policy cache: {e}")
+            for cache_key in pending_keys:
+                records[cache_key] = None
+            for scope_type in scope_types:
+                members[scope_type] = []
+            return records, members
+
+        for cache_key, payload in zip(pending_keys, results):
+            records[cache_key] = self._decode_record(cache_key, payload)
+        for scope_type, scope_members in zip(scope_types, results[len(pending_keys) :]):
+            members[scope_type] = sorted(
+                str(member) for member in (scope_members or [])
+            )
+        return records, members
 
     async def _set_json(self, cache_key: str, value: Dict[str, Any], ttl_seconds: int):
         if not self.enabled or not self.redis_client:
@@ -178,20 +252,18 @@ class RoutingPolicyCache:
         return await self._get_json(self._cache_key("request", request_id))
 
     async def get_user_policy(self, user_id: str) -> Optional[Dict[str, Any]]:
-        """Get the merged user-scoped policy view."""
+        """Get the user-scoped policy view: the rolling routing.policy_state.
+
+        Single fast-lane hints stay request-scoped (see
+        materialize_fast_lane_hint), so no user_hint key is ever written or
+        read on the routing path.
+        """
         if not user_id:
             return None
-        user_state_policy = await self.get_user_state_policy(user_id)
-        user_hint_policy = await self.get_user_hint_policy(user_id)
-
-        if user_state_policy and user_hint_policy:
-            return self._merge_policy_records(user_state_policy, user_hint_policy)
-        if user_hint_policy:
-            return user_hint_policy
-        return user_state_policy
+        return await self.get_user_state_policy(user_id)
 
     async def get_user_hint_policy(self, user_id: str) -> Optional[Dict[str, Any]]:
-        """Get user-scoped fast-lane hint policy if present."""
+        """Get user-scoped fast-lane hint policy if present (never written)."""
         if not user_id:
             return None
         return await self._get_json(self._user_hint_cache_key(user_id))
@@ -214,11 +286,22 @@ class RoutingPolicyCache:
         user_id: Optional[str],
         session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Merge request, session, user, and guardrail policy views for the router."""
-        request_policy = await self.get_request_policy(request_id or "")
-        session_policy = await self.get_session_policy(session_id or "")
-        user_policy = await self.get_user_policy(user_id or "")
-        active_guardrails = await self.get_active_guardrails()
+        """Merge request, session, user, and guardrail policy views for the router.
+
+        One Redis round trip reads the three records and the guardrail
+        indexes; guardrail payloads not in L1 take one MGET more.
+        """
+        request_key = self._cache_key("request", request_id) if request_id else None
+        session_key = self._cache_key("session", session_id) if session_id else None
+        user_key = self._user_state_cache_key(user_id) if user_id else None
+        records, members = await self._read_policy_state(
+            [key for key in (request_key, session_key, user_key) if key],
+            GUARDRAIL_SCOPE_TYPES,
+        )
+        request_policy = records.get(request_key) if request_key else None
+        session_policy = records.get(session_key) if session_key else None
+        user_policy = records.get(user_key) if user_key else None
+        active_guardrails = await self._guardrail_policy(members)
         merged: Dict[str, Any] = {}
         policy_sources: List[str] = []
 
@@ -488,10 +571,14 @@ class RoutingPolicyCache:
 
     async def get_active_guardrails(self) -> Dict[str, Any]:
         """Return active model/provider guardrails for router candidate filtering."""
-        active_model_guardrails = await self._read_guardrail_scope("model")
-        active_provider_guardrails = await self._read_guardrail_scope("provider")
+        _records, members = await self._read_policy_state([], GUARDRAIL_SCOPE_TYPES)
+        return await self._guardrail_policy(members)
 
-        policy = {
+    async def _guardrail_policy(self, members: Dict[str, List[str]]) -> Dict[str, Any]:
+        """The guardrail lists for the router, from the index members read."""
+        active_guardrails = await self._read_guardrail_payloads(members)
+
+        policy: Dict[str, Any] = {
             "blocked_models": [],
             "warn_models": [],
             "blocked_providers": [],
@@ -499,11 +586,8 @@ class RoutingPolicyCache:
             "guardrail_reasons": {},
         }
 
-        for scope_type, guardrails in [
-            ("model", active_model_guardrails),
-            ("provider", active_provider_guardrails),
-        ]:
-            for scope_key, payload in guardrails.items():
+        for scope_type in GUARDRAIL_SCOPE_TYPES:
+            for scope_key, payload in active_guardrails.get(scope_type, {}).items():
                 guardrail_action = str(
                     payload.get("guardrail_action", "avoid") or "avoid"
                 )
@@ -526,46 +610,81 @@ class RoutingPolicyCache:
 
         return policy
 
-    async def _read_guardrail_scope(self, scope_type: str) -> Dict[str, Dict[str, Any]]:
-        """Read active guardrails for one scope and prune expired entries."""
-        active: Dict[str, Dict[str, Any]] = {}
+    async def _read_guardrail_payloads(
+        self, members: Dict[str, List[str]]
+    ) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """Active guardrail payloads by scope; expired index members are pruned.
+
+        Payloads in L1 are not read again; the rest take one MGET.
+        """
+        active: Dict[str, Dict[str, Dict[str, Any]]] = {
+            scope_type: {} for scope_type in members
+        }
 
         if not self.enabled or not self.redis_client:
-            for scope_key in list(self._local_guardrail_index.get(scope_type, set())):
-                payload = self._local_get(
-                    self._guardrail_cache_key(scope_type, scope_key)
-                )
-                if payload is None:
-                    self._local_guardrail_index.setdefault(scope_type, set()).discard(
-                        scope_key
+            for scope_type, scope_keys in members.items():
+                for scope_key in scope_keys:
+                    payload = self._local_get(
+                        self._guardrail_cache_key(scope_type, scope_key)
                     )
-                    continue
-                active[scope_key] = payload
+                    if payload is None:
+                        self._local_guardrail_index.setdefault(
+                            scope_type, set()
+                        ).discard(scope_key)
+                        continue
+                    active[scope_type][scope_key] = payload
             return active
 
-        index_key = self._guardrail_index_key(scope_type)
+        pending: List[Tuple[str, str, str]] = []
+        for scope_type, scope_keys in members.items():
+            for scope_key in scope_keys:
+                cache_key = self._guardrail_cache_key(scope_type, scope_key)
+                payload = self._local_get(cache_key)
+                if payload is not None:
+                    active[scope_type][scope_key] = payload
+                else:
+                    pending.append((scope_type, scope_key, cache_key))
+        if not pending:
+            return active
+
         try:
-            members = await self.redis_client.smembers(index_key)
+            payloads = list(
+                await self.redis_client.mget([cache_key for *_, cache_key in pending])
+            )
         except Exception as e:
-            logger.warning(f"Failed to read routing guardrail index {scope_type}: {e}")
+            logger.warning(f"Failed to read routing guardrails: {e}")
             return active
 
-        for member in members:
-            scope_key = str(member)
-            payload = await self._get_json(
-                self._guardrail_cache_key(scope_type, scope_key)
-            )
-            if payload is None:
-                try:
-                    await self.redis_client.srem(index_key, scope_key)
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to prune expired routing guardrail {scope_type}:{scope_key}: {e}"
-                    )
+        expired: List[Tuple[str, str]] = []
+        for (scope_type, scope_key, cache_key), raw_payload in zip(pending, payloads):
+            if not raw_payload:
+                expired.append((scope_type, scope_key))
                 continue
-            active[scope_key] = payload
+            try:
+                payload = json.loads(raw_payload)
+            except json.JSONDecodeError:
+                logger.warning(
+                    f"Invalid JSON payload in routing policy cache: {cache_key}"
+                )
+                continue
+            if not isinstance(payload, dict):
+                continue
+            self._local_set(cache_key, payload, self.local_cache_ttl_seconds)
+            active[scope_type][scope_key] = payload
 
+        if expired:
+            await self._prune_expired_guardrails(expired)
         return active
+
+    async def _prune_expired_guardrails(self, expired: List[Tuple[str, str]]) -> None:
+        """Drop index members whose payload expired from the Redis index."""
+        try:
+            pipeline = self.redis_client.pipeline(transaction=False)
+            for scope_type, scope_key in expired:
+                pipeline.srem(self._guardrail_index_key(scope_type), scope_key)
+            await pipeline.execute()
+        except Exception as e:
+            logger.warning(f"Failed to prune expired routing guardrails: {e}")
 
     async def shutdown(self):
         """Shutdown the shared policy cache."""

@@ -990,7 +990,23 @@ class LLMRouterPlatform:
         ready = (
             not missing_services and not unhealthy_services and api_key_auth_configured
         )
+        payload: Dict[str, Any] = {}
+        # Detail only: without a tokenizer, routing estimates token counts.
+        tokenizer_status = getattr(
+            self.services.get("router"), "tokenizer_status", None
+        )
+        if callable(tokenizer_status):
+            try:
+                status = tokenizer_status()
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "Tokenizer status unavailable", exc_info=True
+                )
+            else:
+                if isinstance(status, dict):
+                    payload["tokenizer"] = status
         return {
+            **payload,
             "status": "ready" if ready else "not_ready",
             "services": service_status,
             "required_services": required_services,

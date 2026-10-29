@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Annotated, Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional
 import uuid
 
 from pydantic import (
@@ -16,6 +16,10 @@ from pydantic import (
 def utc_now() -> datetime:
     """Return the current time as a timezone-aware UTC datetime."""
     return datetime.now(timezone.utc)
+
+
+# Reasoning effort levels the OpenAI Responses API accepts.
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
 
 
 class UserTier(str, Enum):
@@ -121,6 +125,10 @@ BoundedName = Annotated[str, Field(max_length=256)]
 
 class QueryRequest(BaseModel):
     _rag_images: List[Any] = PrivateAttr(default_factory=list)
+    # Set after routing: the decision's features and query type, so providers
+    # can match per-query settings (reasoning effort) to how it was routed.
+    _routing_features: Optional[Any] = PrivateAttr(default=None)
+    _routing_query_type: Optional[str] = PrivateAttr(default=None)
 
     # Required fields
     query: str = Field(..., min_length=1, max_length=50000)
@@ -164,6 +172,10 @@ class QueryRequest(BaseModel):
     conversation_id: Optional[str] = Field(None, max_length=256)
     metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
+    # The router's per-request work (classification, token counts, policy),
+    # keyed by the inputs each depends on, so routing it again is cheap.
+    _routing_memo: Dict[Any, Any] = PrivateAttr(default_factory=dict)
+
     @field_validator("query")
     @classmethod
     def validate_query(cls, v: str) -> str:
@@ -193,6 +205,8 @@ class InferenceResponse(BaseModel):
     provider_cache_creation_input_tokens: int = Field(default=0, ge=0)
     provider_cache_read_input_tokens: int = Field(default=0, ge=0)
     reasoning_tokens: int = Field(default=0, ge=0)
+    # Reasoning effort sent to the provider; None when it took no such setting.
+    reasoning_effort: Optional[str] = None
     # Failure bucket for analytics: provider_error, timeout, rate_limited,
     # user_or_policy or internal. None on success.
     error_type: Optional[str] = None
@@ -351,6 +365,12 @@ class ModelConfig(BaseModel):
 
     # Capacity settings
     max_tokens: int = Field(ge=1)
+    # Tokens of input plus output the model accepts (vLLM's max_model_len);
+    # unset, it is max_tokens, which configs have always set to the window.
+    context_window: Optional[int] = Field(None, ge=1)
+    # The most output tokens the model generates; unset means no cap below
+    # the window. request.max_tokens is clamped to it.
+    max_output_tokens: Optional[int] = Field(None, ge=1)
     cost_per_token: float = Field(ge=0.0)
     priority: int = Field(ge=1)
 
@@ -366,6 +386,19 @@ class ModelConfig(BaseModel):
     # Entitlement: the tiers that may use this model. None keeps the old rule,
     # which derived access from priority (see entitled_tiers).
     allowed_tiers: Optional[List[UserTier]] = None
+
+    # Reasoning effort sent to the provider: reasoning_effort for most
+    # queries, reasoning_effort_high for queries routed as complex reasoning.
+    # None keeps the name rule (gpt-5* uses minimal and high, others send none).
+    reasoning_effort: Optional[ReasoningEffort] = None
+    reasoning_effort_high: Optional[ReasoningEffort] = None
+    # Output tokens added on top of the caller's max_tokens when the effort is
+    # above low, so reasoning does not eat the visible answer's budget. None
+    # keeps the name rule (4096 for gpt-5*, 0 otherwise).
+    reasoning_output_headroom_tokens: Optional[int] = Field(None, ge=0)
+    # Whether the provider accepts a temperature. None keeps the name rule
+    # (gpt-5* reasoning models only use their default sampling).
+    supports_temperature: Optional[bool] = None
 
     def entitled_tiers(self) -> List[UserTier]:
         """Tiers that may use this model.
@@ -385,6 +418,38 @@ class ModelConfig(BaseModel):
             for tier, minimum in minimum_priority.items()
             if self.priority >= minimum
         ]
+
+    @model_validator(mode="after")
+    def default_context_window(self) -> "ModelConfig":
+        if self.context_window is None:
+            self.context_window = self.max_tokens
+        if (
+            self.max_output_tokens is not None
+            and self.max_output_tokens > self.context_window
+        ):
+            raise ValueError(
+                f"max_output_tokens ({self.max_output_tokens}) exceeds "
+                f"context_window ({self.context_window})"
+            )
+        return self
+
+    def window_tokens(self) -> int:
+        """The context window: input plus output tokens."""
+        return self.context_window or self.max_tokens
+
+    def output_tokens(self, requested: Any) -> int:
+        """The output tokens a request for ``requested`` gets from this model."""
+        tokens = max(0, int(requested or 0))
+        if self.max_output_tokens is not None:
+            return min(tokens, self.max_output_tokens)
+        return tokens
+
+    def fits_context(self, input_tokens: Any, requested_output: Any) -> bool:
+        """Whether the prompt and its output fit the context window together."""
+        return (
+            int(input_tokens or 0) + self.output_tokens(requested_output)
+            <= self.window_tokens()
+        )
 
     @field_validator("capabilities")
     @classmethod

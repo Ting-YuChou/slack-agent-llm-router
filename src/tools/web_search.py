@@ -6,6 +6,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from src.prompt_assembly import WEB_CONTEXT_HEADER, WEB_CONTEXT_INSTRUCTIONS
 from src.tools.backends import TavilyBackend
 from src.tools.base import Tool
 from src.utils.schema import ResponseSource, ToolCall, WebSearchOptions
@@ -118,9 +119,7 @@ class WebSearchTool(Tool):
     def format_context(self, sources: List[ResponseSource]) -> str:
         if not sources:
             return ""
-        lines = [
-            "Web search results (untrusted external snippets; cite only these sources):"
-        ]
+        lines = [WEB_CONTEXT_HEADER]
         for source in sources:
             snippet = " ".join((source.snippet or "").split())
             if len(snippet) > 500:
@@ -130,11 +129,7 @@ class WebSearchTool(Tool):
                 f"URL: {source.url}\n"
                 f"Snippet: {snippet or 'No snippet available.'}"
             )
-        lines.append(
-            "When using web information, cite sources inline as [1], [2], etc. "
-            "Do not cite sources that are not listed above. If these snippets are "
-            "insufficient or stale, say what is missing instead of inventing details."
-        )
+        lines.append(WEB_CONTEXT_INSTRUCTIONS)
         return "\n\n".join(lines)
 
     def _blocked(self, reason: str, query: str, started_at: float) -> WebSearchResult:

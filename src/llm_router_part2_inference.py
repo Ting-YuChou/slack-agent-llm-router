@@ -33,7 +33,19 @@ import openai
 import anthropic
 
 from src.admission import AdmissionRejectedError
-from src.llm_router_part1_router import ModelRouter
+from src.llm_router_part1_router import (
+    ModelNotEntitledError,
+    ModelRouter,
+    PromptTooLargeError,
+)
+from src.prompt_assembly import (
+    RAG_UNAVAILABLE_STATUSES,
+    SYSTEM_PROMPT,
+    PromptSections,
+    build_prompt_sections,
+    join_prompt_sections,
+    with_system_prompt,
+)
 from src.provider_scheduler import (
     REQUEST_SHAPED_STATUS_CODES,
     ProviderCapacityScheduler,
@@ -45,10 +57,12 @@ from src.provider_scheduler import provider_error_text as _provider_error_text
 from src.utils.metrics import INFERENCE_METRICS, RAG_METRICS
 from src.utils.schema import (
     AttachmentType,
+    ModelConfig,
     QueryRequest,
     InferenceResponse,
     QueryType,
     RagPolicy,
+    RoutingDecisionFeatures,
     ToolCall,
     ToolPolicy,
 )
@@ -71,15 +85,6 @@ class _LazyRedisNamespace:
 
 
 redis = _LazyRedisNamespace()
-
-
-@dataclass
-class PromptSections:
-    """Provider prompt sections split by cache stability."""
-
-    static_cache_prefix: List[str]
-    dynamic_context: List[str]
-    query: str
 
 
 @dataclass
@@ -629,26 +634,17 @@ def _exception_provider_request_id(exc: BaseException) -> Optional[str]:
     return _header_value(headers, "x-request-id")
 
 
-# Prompt line for a live web search that failed, or that a REQUIRED tool
-# policy needed but that found nothing: no web context reached the model.
-WEB_SEARCH_UNAVAILABLE_NOTICE = (
-    "Live web search failed or returned no results for this request, so no "
-    "current web information is included. Say that you cannot verify the "
-    "latest information, and do not present older knowledge as current."
-)
-# Retrieval outcomes that mean nobody knows what the documents say.
-_RAG_UNAVAILABLE_STATUSES = ("timeout", "error")
-# Prompt line for rag_policy AUTO when document search timed out or failed.
-RAG_UNAVAILABLE_NOTICE = (
-    "Document search was unavailable for this request, so this answer is not "
-    "grounded in the knowledge base. If the question depends on those "
-    "documents, say so instead of guessing what they contain."
-)
 # inference.retrieval_budget_ratio when unset or invalid.
 _DEFAULT_RETRIEVAL_BUDGET_RATIO = 0.5
 # Least time a retrieval step leaves before the request deadline, so its own
 # timeout always fires before the _within_request_deadline backstop.
 _RETRIEVAL_BACKSTOP_MARGIN_SECONDS = 0.05
+
+
+def _enrichment_snapshot(request: QueryRequest) -> Tuple[Any, ...]:
+    """The context RAG and web search add to a request, to see if they did."""
+    metadata = request.metadata or {}
+    return (metadata.get("rag_context"), metadata.get("web_search_context"))
 
 
 def _merge_rag_warnings(rag_result: Any, request: QueryRequest) -> None:
@@ -1045,6 +1041,11 @@ class ResponseCache:
             "metadata": self._cacheable_metadata(request.metadata or {}),
             "attachments": attachment_signatures,
             "rag_images": rag_image_signatures,
+            # Which reasoning effort level the provider gets, so an answer
+            # made with the default effort is not served for a high one.
+            "reasoning_effort_level": (
+                "high" if _routed_as_complex_reasoning(request) else "default"
+            ),
         }
         if self.scope != "shared":
             key_payload["user_id"] = request.user_id
@@ -1076,6 +1077,55 @@ class RequestStageDeadlineError(Exception):
 def _provider_http_timeout(read_seconds: float) -> httpx.Timeout:
     """Fail fast on connect and pool waits; allow the provider timeout per read."""
     return httpx.Timeout(connect=3.0, read=read_seconds, write=10.0, pool=2.0)
+
+
+# Query types that get a model's high reasoning effort on their own.
+_HIGH_EFFORT_QUERY_TYPES = frozenset({"reasoning", "math"})
+# Query types that get it only when the router also scored the request
+# complex. The router's requires_high_reasoning feature is not read: it is set
+# for every query of these types and callers can set it through metadata.
+_HIGH_EFFORT_WHEN_COMPLEX_QUERY_TYPES = frozenset(
+    {"analysis", "planning", "code_analysis"}
+)
+# Efforts whose reasoning fits in the caller's output budget; higher ones get
+# extra output tokens (headroom) so reasoning does not crowd out the answer.
+_LIGHT_REASONING_EFFORTS = frozenset({"none", "minimal", "low"})
+_DEFAULT_REASONING_OUTPUT_HEADROOM_TOKENS = 4096
+
+
+def remember_routing_features(request: QueryRequest, routing_decision: Any) -> None:
+    """Keep the routing decision's features and query type on the request.
+
+    Decisions without real features (test doubles, older callers) leave the
+    features unset, so providers use their default settings.
+    """
+    query_type = getattr(routing_decision, "query_type", None)
+    query_type = getattr(query_type, "value", query_type)
+    features = getattr(routing_decision, "features", None)
+    request._routing_features = (
+        features if isinstance(features, RoutingDecisionFeatures) else None
+    )
+    request._routing_query_type = (
+        str(query_type).lower() if isinstance(query_type, str) else None
+    )
+
+
+def _routed_as_complex_reasoning(request: QueryRequest) -> bool:
+    """Whether the router's own classification calls for deep reasoning.
+
+    Uses only what the router derived from the request (query type and
+    complexity score), never caller-supplied metadata: reasoning and math
+    queries, and analysis, planning or code_analysis queries scored complex.
+    """
+    query_type = getattr(request, "_routing_query_type", None)
+    if query_type in _HIGH_EFFORT_QUERY_TYPES:
+        return True
+    features = getattr(request, "_routing_features", None)
+    return (
+        query_type in _HIGH_EFFORT_WHEN_COMPLEX_QUERY_TYPES
+        and isinstance(features, RoutingDecisionFeatures)
+        and features.query_complexity == "complex"
+    )
 
 
 class BaseInferenceProvider(ABC):
@@ -1132,48 +1182,16 @@ class BaseInferenceProvider(ABC):
         pass
 
     def _build_prompt(self, request: QueryRequest) -> str:
-        """Build a provider prompt that includes context plus extracted attachment content."""
-        sections = self._build_prompt_sections(request)
-        prompt_sections = [
-            *sections.static_cache_prefix,
-            *sections.dynamic_context,
-            sections.query,
-        ]
-        return "\n\n".join(section for section in prompt_sections if section)
+        """Build the user prompt: context, retrieved data, attachments, query.
+
+        The system prompt is not part of it; each provider sends that in its
+        own system slot (see `src.prompt_assembly`).
+        """
+        return join_prompt_sections(self._build_prompt_sections(request))
 
     def _build_prompt_sections(self, request: QueryRequest) -> PromptSections:
         """Split prompt into stable cache prefix, dynamic context, and user query."""
-        static_cache_prefix = []
-        dynamic_context = []
-
-        response_style_instructions = (request.metadata or {}).get(
-            "response_style_instructions"
-        )
-        if response_style_instructions:
-            static_cache_prefix.append(
-                f"Response style instructions:\n{response_style_instructions}"
-            )
-
-        attachment_prompt = self._build_attachment_prompt(request)
-        if attachment_prompt:
-            dynamic_context.append(attachment_prompt)
-        if request.context:
-            dynamic_context.append(f"Context: {request.context}")
-        rag_context = (request.metadata or {}).get("rag_context")
-        if rag_context:
-            dynamic_context.append(str(rag_context))
-        if (request.metadata or {}).get("rag_unavailable") in _RAG_UNAVAILABLE_STATUSES:
-            dynamic_context.append(RAG_UNAVAILABLE_NOTICE)
-        web_search_context = (request.metadata or {}).get("web_search_context")
-        if web_search_context:
-            dynamic_context.append(str(web_search_context))
-        if (request.metadata or {}).get("web_search_unavailable") is True:
-            dynamic_context.append(WEB_SEARCH_UNAVAILABLE_NOTICE)
-        return PromptSections(
-            static_cache_prefix=static_cache_prefix,
-            dynamic_context=dynamic_context,
-            query=f"Query: {request.query}",
-        )
+        return build_prompt_sections(request, self._build_attachment_prompt(request))
 
     def _prompt_cache_config(self) -> Dict[str, Any]:
         """Return provider prompt-cache config without assuming it exists."""
@@ -1273,6 +1291,18 @@ class BaseInferenceProvider(ABC):
 class OpenAIProvider(BaseInferenceProvider):
     """OpenAI API provider implementation"""
 
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        model_configs: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(config)
+        # The router's model configs, read for per-model reasoning effort and
+        # temperature support. A model missing here keeps the name rules.
+        self.model_configs: Dict[str, Any] = (
+            model_configs if isinstance(model_configs, dict) else {}
+        )
+
     async def initialize(self):
         """Initialize OpenAI client"""
         api_key = self.config.get("api_key")
@@ -1322,6 +1352,7 @@ class OpenAIProvider(BaseInferenceProvider):
                 total_tokens=total_tokens,
                 provider_cached_input_tokens=cached_tokens,
                 reasoning_tokens=reasoning_tokens,
+                reasoning_effort=(request_kwargs.get("reasoning") or {}).get("effort"),
                 latency_ms=int((time.time() - start_time) * 1000),
                 tokens_per_second=(output_tokens / max(time.time() - start_time, 1e-6)),
                 cost_usd=self._calculate_cost(usage, model_name),
@@ -1387,11 +1418,15 @@ class OpenAIProvider(BaseInferenceProvider):
         request_kwargs: Dict[str, Any] = {
             "model": model_name,
             "input": provider_input,
-            "instructions": None,
+            "instructions": SYSTEM_PROMPT,
             "max_output_tokens": request.max_tokens,
         }
-        if self._supports_reasoning_effort(model_name):
-            request_kwargs["reasoning"] = {"effort": "minimal"}
+        reasoning_effort = self._reasoning_effort(request, model_name)
+        if reasoning_effort:
+            request_kwargs["reasoning"] = {"effort": reasoning_effort}
+            request_kwargs["max_output_tokens"] = self._reasoning_output_budget(
+                request.max_tokens, model_name, reasoning_effort
+            )
         if self._supports_temperature(model_name):
             request_kwargs["temperature"] = request.temperature
 
@@ -1408,11 +1443,62 @@ class OpenAIProvider(BaseInferenceProvider):
 
     def _supports_temperature(self, model_name: str) -> bool:
         """Some reasoning models only support their default sampling settings."""
+        configured = getattr(
+            self.model_configs.get(model_name), "supports_temperature", None
+        )
+        if configured is not None:
+            return bool(configured)
         return not model_name.startswith("gpt-5")
 
     def _supports_reasoning_effort(self, model_name: str) -> bool:
-        """Keep GPT-5 short-answer requests from spending the full budget reasoning."""
+        """Whether the name rule gives the model a reasoning effort (gpt-5*)."""
         return model_name.startswith("gpt-5")
+
+    def _reasoning_effort(
+        self, request: QueryRequest, model_name: str
+    ) -> Optional[str]:
+        """The reasoning effort for this request on this model, or None.
+
+        Queries routed as complex reasoning use the model's high effort, the
+        rest its default. GPT-5 defaults to minimal so short answers do not
+        spend the budget reasoning; config overrides either level per model.
+        """
+        model_config = self.model_configs.get(model_name)
+        name_rule = self._supports_reasoning_effort(model_name)
+        default_effort = getattr(model_config, "reasoning_effort", None) or (
+            "minimal" if name_rule else None
+        )
+        if not _routed_as_complex_reasoning(request):
+            return default_effort
+        high_effort = getattr(model_config, "reasoning_effort_high", None) or (
+            "high" if name_rule else None
+        )
+        return high_effort or default_effort
+
+    def _reasoning_output_budget(
+        self, answer_tokens: int, model_name: str, reasoning_effort: str
+    ) -> int:
+        """max_output_tokens for a reasoning call: the answer plus headroom.
+
+        Reasoning tokens count against max_output_tokens, so efforts above low
+        get the model's headroom on top of the caller's answer budget, capped
+        at the model's output limit when one is configured.
+        """
+        if reasoning_effort in _LIGHT_REASONING_EFFORTS:
+            return answer_tokens
+        model_config = self.model_configs.get(model_name)
+        headroom = getattr(model_config, "reasoning_output_headroom_tokens", None)
+        if headroom is None:
+            headroom = (
+                _DEFAULT_REASONING_OUTPUT_HEADROOM_TOKENS
+                if self._supports_reasoning_effort(model_name)
+                else 0
+            )
+        budget = answer_tokens + max(0, int(headroom))
+        output_limit = getattr(model_config, "max_output_tokens", None)
+        if isinstance(output_limit, int) and output_limit > 0:
+            budget = min(budget, max(output_limit, answer_tokens))
+        return budget
 
     def _build_prompt_cache_key(self, request: QueryRequest) -> Optional[str]:
         """Build a stable, non-PII key that helps OpenAI route similar prompts."""
@@ -1533,6 +1619,7 @@ class AnthropicProvider(BaseInferenceProvider):
                 model=model_name,
                 max_tokens=request.max_tokens,
                 temperature=request.temperature,
+                system=self._build_system(),
                 messages=messages,
             )
 
@@ -1584,6 +1671,7 @@ class AnthropicProvider(BaseInferenceProvider):
                 model=model_name,
                 max_tokens=request.max_tokens,
                 temperature=request.temperature,
+                system=self._build_system(),
                 messages=messages,
             ) as stream:
                 async for text in stream.text_stream:
@@ -1640,6 +1728,13 @@ class AnthropicProvider(BaseInferenceProvider):
             )
         content.append({"type": "text", "text": sections.query})
         return [{"role": "user", "content": content}]
+
+    def _build_system(self) -> List[Dict[str, Any]]:
+        """The stable system prompt, cached with the prefix when enabled."""
+        block: Dict[str, Any] = {"type": "text", "text": SYSTEM_PROMPT}
+        if self._prompt_cache_enabled():
+            block["cache_control"] = self._anthropic_cache_control()
+        return [block]
 
     def _anthropic_cache_control(self) -> Dict[str, str]:
         """Build Anthropic cache_control while only allowing supported TTLs."""
@@ -2008,6 +2103,14 @@ class vLLMProvider(BaseInferenceProvider):
                 "logprobs": None,
             },
         )
+
+    def _build_prompt(self, request: QueryRequest) -> str:
+        """Lead the one user message with the system prompt.
+
+        Some chat templates (Mistral's) reject a system role, so vLLM gets
+        no separate system message; completions mode uses the same text.
+        """
+        return with_system_prompt(super()._build_prompt(request))
 
     def _build_chat_messages(self, prompt: str) -> List[Dict[str, str]]:
         """Build OpenAI-compatible chat messages for vLLM chat templates."""
@@ -2565,7 +2668,9 @@ class InferenceEngine:
             and openai_config.get("enabled", True)
             and self._router_uses_provider("openai")
         ):
-            self.providers["openai"] = OpenAIProvider(openai_config)
+            self.providers["openai"] = OpenAIProvider(
+                openai_config, model_configs=getattr(self.router, "models", None)
+            )
             await self.providers["openai"].initialize()
 
         anthropic_config = dict(self.config.get("anthropic", {}) or {})
@@ -2690,7 +2795,9 @@ class InferenceEngine:
         try:
             # Step 1: Route query to appropriate model
             routing_decision = await self.router.route_query(request)
+            remember_routing_features(request, routing_decision)
             model_name = routing_decision.selected_model
+            routed_enrichment = _enrichment_snapshot(request)
 
             # Step 2: Context compression before cache lookup keeps keys stable.
             compressed_context = await self._compress_request_context_if_needed(request)
@@ -2737,6 +2844,16 @@ class InferenceEngine:
                 execution_budget,
                 stage="web_search",
             )
+
+            # Step 4b: RAG and web context came after routing; re-check that
+            # the enriched prompt still fits the model, re-routing if not.
+            routing_decision = await self._fit_enriched_prompt(
+                request,
+                routing_decision,
+                rag_result,
+                routed_enrichment=routed_enrichment,
+            )
+            model_name = routing_decision.selected_model
 
             # Step 5: Check full-response cache.
             response = await self._get_cached_inference_response(request, model_name)
@@ -2801,13 +2918,20 @@ class InferenceEngine:
                     error_type=type(exc).__name__,
                 ).inc()
 
-            # Update router stats; a retrieval outage or a deadline spent
-            # before any model call is not the model's fault.
+            # Update router stats; a retrieval outage, a deadline spent before
+            # any model call or an enriched prompt no model fits is not the
+            # model's fault.
             if (
                 "routing_decision" in locals()
                 and not getattr(exc, "_attempt_recorded", False)
                 and not isinstance(
-                    exc, (RetrievalUnavailableError, RequestStageDeadlineError)
+                    exc,
+                    (
+                        RetrievalUnavailableError,
+                        RequestStageDeadlineError,
+                        PromptTooLargeError,
+                        ModelNotEntitledError,
+                    ),
                 )
             ):
                 self.router.update_model_stats(
@@ -3036,7 +3160,7 @@ class InferenceEngine:
             min_score=min_score,
         )
         results = list(outcome.results)
-        rag_unavailable = outcome.status in _RAG_UNAVAILABLE_STATUSES
+        rag_unavailable = outcome.status in RAG_UNAVAILABLE_STATUSES
         latency_ms = int((time.time() - started_at) * 1000)
         tool_call = self.rag_service.tool_call_from_results(
             request.query,
@@ -3285,6 +3409,48 @@ class InferenceEngine:
             RAG_METRICS.vision_outcomes.labels("selected_model").inc()
         request._rag_images = images
         return routing_decision
+
+    async def _fit_enriched_prompt(
+        self,
+        request: QueryRequest,
+        routing_decision: Any,
+        rag_result: Optional[SimpleNamespace],
+        routed_enrichment: Optional[Tuple[Any, ...]] = None,
+    ) -> Any:
+        """The routing decision re-checked against the enriched prompt.
+
+        Raises PromptTooLargeError (a 413) when no model the tier may use fits.
+        A vision request that no vision model fits is answered from the text.
+        ``routed_enrichment`` is the enrichment routing saw; when RAG and web
+        search added nothing since, the decision already fits.
+        """
+        if not isinstance(self.router, ModelRouter) or not hasattr(
+            routing_decision, "model_copy"
+        ):
+            return routing_decision  # A stub router has no windows to check.
+        if (
+            routed_enrichment is not None
+            and _enrichment_snapshot(request) == routed_enrichment
+        ):
+            return routing_decision
+        if not getattr(request, "_rag_images", []):
+            return await self.router.refit_routing_decision(request, routing_decision)
+        try:
+            return await self.router.refit_routing_decision(
+                request, routing_decision, required_capability="vision"
+            )
+        except (PromptTooLargeError, ModelNotEntitledError):
+            request._rag_images = []
+            request.metadata = dict(request.metadata or {})
+            request.metadata["rag_warnings"] = [
+                *request.metadata.get("rag_warnings", []),
+                "rag_vision_fallback: no vision model fits the enriched prompt; "
+                "used text only",
+            ]
+            if rag_result is not None:
+                _merge_rag_warnings(rag_result, request)
+            RAG_METRICS.vision_outcomes.labels("text_only_context_window").inc()
+            return await self.router.refit_routing_decision(request, routing_decision)
 
     def _build_capability_routing_decision(
         self, routing_decision: Any, original_model: str, selected_model: str
@@ -4028,6 +4194,30 @@ class InferenceEngine:
         ]
         if not allowed:
             raise ValueError("No text-only model is open to the user's tier")
+        router = getattr(self, "router", None)
+        if isinstance(router, ModelRouter):
+            # The candidate lists predate web search: check them against the
+            # enriched prompt, which the routing decision now counts.
+            fit_context = self._build_local_fallback_context(request, routing_decision)
+            fitting = [
+                name
+                for name in allowed
+                if self._fits_enriched_window(name, fit_context)
+            ]
+            if not fitting:
+                windows = [
+                    model_config.window_tokens()
+                    for model_config in map(self._router_model_config, allowed)
+                    if model_config is not None
+                ]
+                raise PromptTooLargeError(
+                    "No text-only model fits the enriched prompt "
+                    f"(~{fit_context['token_count']} tokens plus output)",
+                    user_tier=router._entitlement_tier(request.user_tier).value,
+                    token_count=int(fit_context["token_count"]),
+                    max_context_tokens=max(windows, default=0),
+                )
+            allowed = fitting
         model_name = allowed[0]
         call_options: Dict[str, Any] = {"execution_budget": execution_budget}
         if started_calls is not None:
@@ -4113,6 +4303,7 @@ class InferenceEngine:
         provider = self._get_provider_for_model(model_name)
         if not provider:
             raise ValueError(f"No provider available for model: {model_name}")
+        request = self._request_within_output_cap(request, model_name)
 
         model_info = self.router.get_model_info(model_name) or {}
         provider_name = (
@@ -4131,30 +4322,90 @@ class InferenceEngine:
                 started_calls.append(model_name)
             return await provider.generate_response(request, model_name)
 
-        return await self.single_flight.run(
-            request,
-            provider,
-            model_name,
-            lambda: self.scheduler.run_provider_call(
+        async def admitted_call() -> InferenceResponse:
+            estimated_input_tokens = await self._admission_input_tokens(
+                request, model_name
+            )
+            return await self.scheduler.run_provider_call(
                 request=request,
                 model_name=model_name,
                 provider=str(provider_name),
-                estimated_input_tokens=self._estimate_provider_admission_input_tokens(
-                    request
-                ),
+                estimated_input_tokens=estimated_input_tokens,
                 operation=call_provider,
                 execution_budget=execution_budget,
                 attempt_timeout_seconds=attempt_timeout_seconds,
                 fallback_reserve_seconds=fallback_reserve_seconds,
                 reserve_attempts=reserve_attempts,
-            ),
+            )
+
+        return await self.single_flight.run(
+            request, provider, model_name, admitted_call
         )
 
-    def _estimate_provider_admission_input_tokens(self, request: QueryRequest) -> int:
-        """Estimate provider input tokens for admission budget reservation."""
+    async def _admission_input_tokens(
+        self, request: QueryRequest, model_name: str
+    ) -> int:
+        """The admission estimate; an uncached long prompt counts in a thread."""
+        if isinstance(
+            self.router, ModelRouter
+        ) and self.router.request_token_count_needs_thread(request, model_name):
+            return await asyncio.to_thread(
+                self._estimate_provider_admission_input_tokens, request, model_name
+            )
+        return self._estimate_provider_admission_input_tokens(request, model_name)
+
+    def _request_within_output_cap(
+        self, request: QueryRequest, model_name: str
+    ) -> QueryRequest:
+        """The request with max_tokens clamped to the model's max_output_tokens.
+
+        A copy, so a fallback to another model still sees the caller's value.
+        """
+        model_config = self._router_model_config(model_name)
+        if model_config is None:
+            return request
+        output_tokens = model_config.output_tokens(request.max_tokens)
+        if output_tokens >= request.max_tokens:
+            return request
+        return request.model_copy(update={"max_tokens": max(1, output_tokens)})
+
+    def _router_model_config(self, model_name: str) -> Optional[ModelConfig]:
+        models = getattr(self.router, "models", None)
+        model_config = models.get(model_name) if isinstance(models, dict) else None
+        return model_config if isinstance(model_config, ModelConfig) else None
+
+    def _fits_enriched_window(self, model_name: str, context: Dict[str, Any]) -> bool:
+        """Whether a router model fits; listed before enrichment, it may not."""
+        model_config = self._router_model_config(model_name)
+        return model_config is None or self._fits_context_window(model_config, context)
+
+    @staticmethod
+    def _fits_context_window(model_config: Any, context: Dict[str, Any]) -> bool:
+        """Whether the request's prompt and output fit a model's window."""
+        if isinstance(model_config, ModelConfig):
+            return model_config.fits_context(
+                context["token_count"], context.get("max_tokens")
+            )
+        return int(context["token_count"]) <= int(model_config.max_tokens)
+
+    def _estimate_provider_admission_input_tokens(
+        self, request: QueryRequest, model_name: Optional[str] = None
+    ) -> int:
+        """Estimate provider input tokens for admission budget reservation.
+
+        The router counts with the called model's encoding when it is known.
+        """
         estimator = getattr(self.router, "_estimate_request_token_count", None)
         if estimator is not None:
             try:
+                if isinstance(self.router, ModelRouter):
+                    # Memoized per encoding: routing's cl100k count is reused,
+                    # but a model with its own encoding (gpt-5: o200k) is
+                    # counted once more (in a thread when long, see
+                    # _admission_input_tokens).
+                    return max(
+                        0, int(self.router.request_token_count(request, model_name))
+                    )
                 return max(0, int(estimator(request)))
             except Exception:
                 logger.debug("Provider admission token estimator failed", exc_info=True)
@@ -4242,6 +4493,7 @@ class InferenceEngine:
                     and not self._ruled_out_by_policy(
                         model_name, self._configured_provider_name(model_name), context
                     )
+                    and self._fits_enriched_window(model_name, context)
                 ]
             ranked = []
             for model_name, model_config in getattr(self.router, "models", {}).items():
@@ -4257,7 +4509,7 @@ class InferenceEngine:
                     continue
                 if model_config.provider not in self.providers:
                     continue
-                if context["token_count"] > model_config.max_tokens:
+                if not self._fits_context_window(model_config, context):
                     continue
                 if not self.router._check_user_access(
                     model_config, context["user_tier"]
@@ -4486,7 +4738,7 @@ class InferenceEngine:
             return False
         if self._ruled_out_by_policy(model_name, model_config.provider, context):
             return False
-        if context["token_count"] > model_config.max_tokens:
+        if not self._fits_context_window(model_config, context):
             return False
         if hasattr(self.router, "_has_capability") and not self.router._has_capability(
             model_config,
