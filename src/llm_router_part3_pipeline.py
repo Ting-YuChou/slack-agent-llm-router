@@ -651,9 +651,26 @@ def _dead_letter_row_payload(row: Any) -> Dict[str, Any]:
     return payload
 
 
+class AckTimeoutError(asyncio.TimeoutError):
+    """The record may already be on the broker: we only stopped waiting for its ack."""
+
+
 def _is_ack_timeout(error: BaseException) -> bool:
-    """Return whether a send failed only because we stopped waiting for its ack."""
-    return isinstance(error, (asyncio.TimeoutError, TimeoutError))
+    """Return whether a send failed after the record may have been written.
+
+    A timeout before the record reached the producer's accumulator (metadata
+    or buffer wait) is a plain TimeoutError and is safe to retry.
+    """
+    return isinstance(error, AckTimeoutError)
+
+
+def _has_two_phase_send(producer: Any) -> bool:
+    """Return whether ``producer.send`` enqueues and returns a delivery future.
+
+    True for aiokafka's producer, whose class defines ``async def send``. Test
+    doubles that only mock ``send_and_wait`` use the single-call path.
+    """
+    return inspect.iscoroutinefunction(getattr(type(producer), "send", None))
 
 
 class KafkaProducerManager:
@@ -911,13 +928,33 @@ class KafkaProducerManager:
         if self.producer is None:
             raise RuntimeError("Kafka producer has not been initialized")
 
+        if self.wait_for_ack and _has_two_phase_send(self.producer):
+            # Phase 1: wait for metadata and buffer space. A timeout here means
+            # the record was never enqueued, so the caller may retry it.
+            delivery = await asyncio.wait_for(
+                self.producer.send(topic=topic, key=key, value=value),
+                timeout=self.send_timeout_seconds,
+            )
+            # Phase 2: the record is in the accumulator; the idempotent
+            # producer retries delivery itself, so never resend after this.
+            try:
+                return await asyncio.wait_for(
+                    delivery, timeout=self.send_timeout_seconds
+                )
+            except asyncio.TimeoutError as exc:
+                raise AckTimeoutError(str(exc)) from exc
+
         if self.wait_for_ack:
             send_and_wait = getattr(self.producer, "send_and_wait", None)
             if callable(send_and_wait):
-                return await asyncio.wait_for(
-                    send_and_wait(topic=topic, key=key, value=value),
-                    timeout=self.send_timeout_seconds,
-                )
+                try:
+                    return await asyncio.wait_for(
+                        send_and_wait(topic=topic, key=key, value=value),
+                        timeout=self.send_timeout_seconds,
+                    )
+                except asyncio.TimeoutError as exc:
+                    # Cannot tell which phase timed out: do not resend.
+                    raise AckTimeoutError(str(exc)) from exc
 
         send_result = await self.producer.send(topic=topic, key=key, value=value)
         if self.wait_for_ack and inspect.isawaitable(send_result):
@@ -2486,24 +2523,52 @@ class KafkaConsumerManager:
     ) -> AlertEventEntry:
         """Convert an alert event payload to a ClickHouse row."""
         event_type = str(data.get("event_type", "") or "")
+        alert_type = str(
+            data.get("alert_type") or data.get("trigger_type") or "unknown"
+        )
+        anomaly_type = str(data.get("anomaly_type") or data.get("trigger_type", ""))
+        source_event_type = str(data.get("original_event_type") or event_type)
+        model_name = str(data.get("model_name", "") or "")
+        provider = str(data.get("provider", "") or "")
+        window_start_ms = int(data.get("window_start_ms", 0) or 0)
+        window_end_ms = int(data.get("window_end_ms", 0) or 0)
+        timestamp = _parse_datetime(data.get("emitted_at"))
+        metadata = dict(kafka_metadata or {})
+        if window_start_ms and window_end_ms:
+            # Window alerts and guardrails are re-emitted with a new emitted_at
+            # and offset when Flink restores; key them on what they describe.
+            timestamp = datetime.fromtimestamp(window_end_ms / 1000, tz=timezone.utc)
+            metadata["event_id"] = ":".join(
+                str(part)
+                for part in (
+                    event_type,
+                    data.get("scope_type", "") or "",
+                    data.get("scope_key", "") or "",
+                    alert_type,
+                    anomaly_type,
+                    data.get("guardrail_action", "") or "",
+                    model_name,
+                    provider,
+                    window_start_ms,
+                    window_end_ms,
+                )
+            )
         return AlertEventEntry(
-            timestamp=_parse_datetime(data.get("emitted_at")),
-            alert_type=str(
-                data.get("alert_type") or data.get("trigger_type") or "unknown"
-            ),
+            timestamp=timestamp,
+            alert_type=alert_type,
             severity=str(data.get("severity", "warning")),
             description=str(data.get("description", "")),
-            anomaly_type=str(data.get("anomaly_type") or data.get("trigger_type", "")),
-            source_event_type=str(data.get("original_event_type") or event_type),
+            anomaly_type=anomaly_type,
+            source_event_type=source_event_type,
             request_id=str(data.get("request_id", "") or ""),
             query_id=str(data.get("query_id", "") or ""),
             user_id=str(data.get("user_id", "") or ""),
-            model_name=str(data.get("model_name", "") or ""),
-            provider=str(data.get("provider", "") or ""),
-            window_start_ms=int(data.get("window_start_ms", 0) or 0),
-            window_end_ms=int(data.get("window_end_ms", 0) or 0),
+            model_name=model_name,
+            provider=provider,
+            window_start_ms=window_start_ms,
+            window_end_ms=window_end_ms,
             payload_json=_json_text(_alert_payload(data), default=str),
-            **(kafka_metadata or {}),
+            **metadata,
         )
 
     def _build_routing_policy_state_entry(
