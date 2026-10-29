@@ -1220,7 +1220,10 @@ class ModelRouter:
             shadow_context["policy_source"] = self._combine_policy_sources(
                 shadow_policy.get("policy_source", "none"), routing_features
             )
-            context[SHADOW_ROUTING_CONTEXT_KEY] = shadow_context
+            if self._routing_view(shadow_context) == self._routing_view(context):
+                context[SHADOW_SKIP_KEY] = "skipped_empty"
+            else:
+                context[SHADOW_ROUTING_CONTEXT_KEY] = shadow_context
 
         return context
 
@@ -1611,6 +1614,8 @@ class ModelRouter:
                 ),
             }
 
+        # A1 shadow mode counts a failed fetch as unavailable.
+        policy_fetch_failed = False
         try:
             policy = await get_policy(
                 request.request_id,
@@ -1625,11 +1630,13 @@ class ModelRouter:
                     f"Failed to load routing policy for request {request.request_id}: {e}"
                 )
                 policy = {}
+                policy_fetch_failed = True
         except Exception as e:
             logger.warning(
                 f"Failed to load routing policy for request {request.request_id}: {e}"
             )
             policy = {}
+            policy_fetch_failed = True
         if not isinstance(policy, dict):
             logger.warning(
                 "Ignoring routing policy for request %s: expected a mapping, got %s",
@@ -1717,20 +1724,18 @@ class ModelRouter:
         # --- A1 shadow mode (kept apart from the policy fetch above) ---
         # Routing gets only the request-metadata hints, as with no policy
         # cache; the policy's context is stashed for route_query to replay.
-        # A policy that is unavailable, or has nothing that changes routing,
-        # is not replayed; route_query counts it as unavailable/skipped_empty.
+        # An unavailable policy is not replayed (route_query counts it);
+        # _build_query_context skips one that would not change routing.
         if self._policy_cache_mode() == "shadow":
             shadow_context = self._metadata_policy_context(
                 metadata_preferred_models,
                 metadata_avoid_models,
                 metadata_avoid_providers,
             )
-            if self._policy_unavailable(policy):
+            if policy_fetch_failed or self._policy_unavailable(policy):
                 shadow_context[SHADOW_SKIP_KEY] = "unavailable"
-            elif self._policy_is_actionable(policy):
-                shadow_context[SHADOW_POLICY_CONTEXT_KEY] = policy_context
             else:
-                shadow_context[SHADOW_SKIP_KEY] = "skipped_empty"
+                shadow_context[SHADOW_POLICY_CONTEXT_KEY] = policy_context
             return shadow_context
         # --- end A1 shadow mode ---
         return policy_context
@@ -1741,33 +1746,43 @@ class ModelRouter:
         sources = str(policy.get("policy_source") or "").split("+")
         return "unavailable" in sources
 
-    def _policy_is_actionable(self, policy: Dict[str, Any]) -> bool:
-        """Whether applying the cached policy could change the routed model.
+    @staticmethod
+    def _routing_view(context: Dict[str, Any]) -> Tuple[Any, ...]:
+        """What routing reads from a context that a policy can change.
 
-        get_effective_policy always returns the guardrail lists, empty or not;
-        only entries in them, or Flink hints routing reads, count.
+        Two contexts with the same view route the same request alike, so
+        shadow mode need not replay a policy whose context matches the base.
+        Sensitivities only matter when "high"; session hotness when "hot".
         """
-        list_fields = (
-            "preferred_models",
-            "avoid_models",
-            "avoid_providers",
-            "blocked_models",
-            "blocked_providers",
-            "warn_models",
-            "warn_providers",
-        )
-        if any(
-            self._name_entries(policy.get(name), f"policy.{name}")
-            for name in list_fields
-        ):
-            return True
-        if policy.get("route_to_fast_lane") is True:
-            return True
-        if policy.get("requires_low_latency") is True:
-            return True
-        return any(
-            str(policy.get(name) or "").lower() == "high"
-            for name in ("cost_sensitivity", "error_sensitivity")
+
+        def names(key: str) -> Tuple[str, ...]:
+            return tuple(str(name) for name in list(context.get(key) or []))
+
+        def high(key: str) -> bool:
+            return str(context.get(key) or "").lower() == "high"
+
+        return (
+            names("preferred_models"),
+            *(
+                tuple(sorted(names(key)))
+                for key in (*GUARDRAIL_CONTEXT_KEYS, "warn_models", "warn_providers")
+            ),
+            *(
+                bool(context.get(key, False))
+                for key in (
+                    "route_to_fast_lane",
+                    "requires_low_latency",
+                    "requires_high_reasoning",
+                    "long_context",
+                    "attachment_heavy",
+                    "code_heavy",
+                )
+            ),
+            high("cost_sensitivity"),
+            high("error_sensitivity"),
+            str(context.get("session_hotness") or "").lower() == "hot",
+            context.get("query_complexity"),
+            str(context.get("policy_query_type") or "").lower(),
         )
 
     def _policy_cache_mode(self) -> str:
