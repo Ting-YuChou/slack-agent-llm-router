@@ -167,6 +167,22 @@ async def test_rejected_blocks_update_is_retried_as_text(inference_response_fact
 
 
 @pytest.mark.asyncio
+async def test_update_failing_for_other_reasons_is_not_retried_as_text(
+    inference_response_factory,
+):
+    # A timeout or 5xx may have been applied: resending as text would
+    # overwrite the formatted answer. Post the answer instead.
+    bot = delivery_bot(answering(inference_response_factory, "**four**"))
+    bot.web_client.chat_update.side_effect = [TimeoutError("read timed out")]
+
+    await bot._process_message(top_level())
+
+    assert bot.web_client.chat_update.await_count == 1
+    posts = [call.kwargs for call in bot.web_client.chat_postMessage.await_args_list]
+    assert [post["text"] for post in posts] == [SLACK_THINKING_TEXT, "**four**"]
+
+
+@pytest.mark.asyncio
 async def test_rejected_blocks_post_is_retried_as_text(inference_response_factory):
     bot = delivery_bot(answering(inference_response_factory, "four"), chat_update=False)
     bot.web_client.chat_postMessage.side_effect = [

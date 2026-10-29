@@ -4347,23 +4347,27 @@ class SlackBot:
     ) -> bool:
         """Turn the placeholder into `message`; False when Slack refused.
 
-        A refused update is tried once more as plain text, without blocks.
+        An update refused for its blocks is tried once more as plain text.
+        Any other failure (a timeout, a 5xx) may have been applied, so it is
+        not resent here: the caller posts the message instead.
         """
-        attempts = [message]
-        if "blocks" in message:
-            attempts.append(_without_blocks(message))
-        for attempt in attempts:
-            try:
-                await self.web_client.chat_update(
-                    channel=channel_id, ts=placeholder_ts, **attempt
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Could not update the Slack progress placeholder: %s", exc
-                )
-                continue
+        try:
+            await self.web_client.chat_update(
+                channel=channel_id, ts=placeholder_ts, **message
+            )
             return True
-        return False
+        except Exception as exc:
+            logger.warning("Could not update the Slack progress placeholder: %s", exc)
+            if "blocks" not in message or not _is_block_rejection(exc):
+                return False
+        try:
+            await self.web_client.chat_update(
+                channel=channel_id, ts=placeholder_ts, **_without_blocks(message)
+            )
+        except Exception as exc:
+            logger.warning("Could not update the Slack progress placeholder: %s", exc)
+            return False
+        return True
 
     async def _post_reply(
         self, channel_id: Optional[str], thread_ts: Optional[str], **message: Any
