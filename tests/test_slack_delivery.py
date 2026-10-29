@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 import yaml
 
-from slack.bot_real import SLACK_THINKING_TEXT, SlackBot
+from slack.bot_real import SLACK_EMPTY_ANSWER_MESSAGE, SLACK_THINKING_TEXT, SlackBot
 
 
 def delivery_bot(process_query=None, *, chat_update=True, **config):
@@ -134,6 +134,83 @@ async def test_failed_update_falls_back_to_posting_the_answer(
 
     posts = [call.kwargs for call in bot.web_client.chat_postMessage.await_args_list]
     assert [post["text"] for post in posts] == [SLACK_THINKING_TEXT, "four"]
+    assert posts[1]["thread_ts"] == "100.0"
+
+
+class FakeSlackApiError(Exception):
+    """Shaped like slack_sdk's SlackApiError: the API error is on `response`."""
+
+    def __init__(self, error):
+        super().__init__(f"The request to the Slack API failed. ({error})")
+        self.response = {"ok": False, "error": error}
+
+
+@pytest.mark.asyncio
+async def test_rejected_blocks_update_is_retried_as_text(inference_response_factory):
+    bot = delivery_bot(answering(inference_response_factory, "**four**"))
+    bot.web_client.chat_update.side_effect = [
+        FakeSlackApiError("invalid_blocks"),
+        {"ok": True},
+    ]
+
+    await bot._process_message(top_level())
+
+    first, second = [call.kwargs for call in bot.web_client.chat_update.await_args_list]
+    assert "blocks" in first
+    assert second == {"channel": "C1", "ts": "500.0", "text": "**four**"}
+    assert bot.web_client.chat_postMessage.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_rejected_blocks_post_is_retried_as_text(inference_response_factory):
+    bot = delivery_bot(answering(inference_response_factory, "four"), chat_update=False)
+    bot.web_client.chat_postMessage.side_effect = [
+        FakeSlackApiError("invalid_blocks"),
+        {"ok": True, "ts": "501.0"},
+    ]
+
+    await bot._process_message(top_level())
+
+    first, second = [
+        call.kwargs for call in bot.web_client.chat_postMessage.await_args_list
+    ]
+    assert "blocks" in first
+    assert second == {"channel": "C1", "thread_ts": "100.0", "text": "four"}
+
+
+@pytest.mark.asyncio
+async def test_other_post_failures_are_not_resent(inference_response_factory):
+    bot = delivery_bot(answering(inference_response_factory, "four"), chat_update=False)
+    bot.web_client.chat_postMessage.side_effect = [
+        FakeSlackApiError("channel_not_found"),
+        {"ok": True, "ts": "501.0"},
+    ]
+
+    await bot._process_message(top_level())
+
+    texts = [
+        call.kwargs["text"] for call in bot.web_client.chat_postMessage.await_args_list
+    ]
+    assert texts == ["four", bot._build_user_safe_error_message()]
+
+
+@pytest.mark.asyncio
+async def test_empty_answer_is_posted_when_the_placeholder_cannot_be_updated(
+    monkeypatch,
+):
+    bot = delivery_bot()
+    monkeypatch.setattr(
+        bot.message_handler, "handle_message", AsyncMock(return_value=None)
+    )
+    bot.web_client.chat_update.side_effect = RuntimeError("message_not_found")
+
+    await bot._process_message(top_level())
+
+    posts = [call.kwargs for call in bot.web_client.chat_postMessage.await_args_list]
+    assert [post["text"] for post in posts] == [
+        SLACK_THINKING_TEXT,
+        SLACK_EMPTY_ANSWER_MESSAGE,
+    ]
     assert posts[1]["thread_ts"] == "100.0"
 
 

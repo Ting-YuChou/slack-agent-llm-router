@@ -603,6 +603,27 @@ def _fence_is_open(text: str) -> bool:
 
 
 SLACK_RATE_LIMIT_RETRIES = 2
+# Slack API errors that reject a message's blocks, not the message.
+SLACK_BLOCK_REJECTION_ERRORS = frozenset(
+    {"invalid_blocks", "invalid_blocks_format", "msg_blocks_too_long"}
+)
+
+
+def _is_block_rejection(exc: Exception) -> bool:
+    """Whether Slack refused a message for its blocks (a SlackApiError's code)."""
+    response = getattr(exc, "response", None)
+    getter = getattr(response, "get", None)
+    try:
+        error = getter("error") if callable(getter) else None
+    except Exception:
+        return False
+    return error in SLACK_BLOCK_REJECTION_ERRORS
+
+
+def _without_blocks(message: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in message.items() if key != "blocks"}
+
+
 # Slack's limit on the text of one `markdown` block.
 SLACK_MARKDOWN_BLOCK_CHARS = 12000
 
@@ -4109,20 +4130,19 @@ class SlackBot:
                         placeholder_ts = None
                         if replaced:
                             continue
-                    await self.web_client.chat_postMessage(
-                        channel=channel_id,
-                        thread_ts=thread_ts,
-                        **message,
-                    )
+                    await self._post_reply(channel_id, thread_ts, **message)
 
                 if thread_ts:
                     self._mark_thread_active(channel_id, thread_ts)
                     state_changed = True
                     active_thread_key = self._thread_key(channel_id, thread_ts)
             elif placeholder_ts:
-                await self._replace_placeholder(
+                if not await self._replace_placeholder(
                     channel_id, placeholder_ts, text=SLACK_EMPTY_ANSWER_MESSAGE
-                )
+                ):
+                    await self._post_reply(
+                        channel_id, reply_thread_ts, text=SLACK_EMPTY_ANSWER_MESSAGE
+                    )
             elif self._is_agent_thread(channel_id, agent_thread_ts):
                 # The handler posted the reply itself: an Agent run's status message.
                 state_changed = True
@@ -4234,15 +4254,44 @@ class SlackBot:
     async def _replace_placeholder(
         self, channel_id: Optional[str], placeholder_ts: str, **message: Any
     ) -> bool:
-        """Turn the placeholder into `message`; False when Slack refused."""
+        """Turn the placeholder into `message`; False when Slack refused.
+
+        A refused update is tried once more as plain text, without blocks.
+        """
+        attempts = [message]
+        if "blocks" in message:
+            attempts.append(_without_blocks(message))
+        for attempt in attempts:
+            try:
+                await self.web_client.chat_update(
+                    channel=channel_id, ts=placeholder_ts, **attempt
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not update the Slack progress placeholder: %s", exc
+                )
+                continue
+            return True
+        return False
+
+    async def _post_reply(
+        self, channel_id: Optional[str], thread_ts: Optional[str], **message: Any
+    ) -> None:
+        """Post one reply message; as plain text if Slack refuses its blocks.
+
+        Only a block rejection is resent: any other failure may have posted.
+        """
         try:
-            await self.web_client.chat_update(
-                channel=channel_id, ts=placeholder_ts, **message
+            await self.web_client.chat_postMessage(
+                channel=channel_id, thread_ts=thread_ts, **message
             )
         except Exception as exc:
-            logger.warning("Could not update the Slack progress placeholder: %s", exc)
-            return False
-        return True
+            if "blocks" not in message or not _is_block_rejection(exc):
+                raise
+            logger.warning("Slack refused the answer's blocks; posting text: %s", exc)
+            await self.web_client.chat_postMessage(
+                channel=channel_id, thread_ts=thread_ts, **_without_blocks(message)
+            )
 
     def _reply_thread_ts(
         self, event: Dict[str, Any], user_prefs: Dict[str, Any]
