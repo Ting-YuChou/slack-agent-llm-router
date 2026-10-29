@@ -40,6 +40,8 @@ from src.provider_scheduler import (
     RequestExecutionBudget,
     _exception_status_code,
 )
+from src.provider_scheduler import is_billing_exhausted as _is_billing_exhausted
+from src.provider_scheduler import provider_error_text as _provider_error_text
 from src.utils.metrics import INFERENCE_METRICS, RAG_METRICS
 from src.utils.schema import (
     AttachmentType,
@@ -312,10 +314,6 @@ _CONTEXT_LENGTH_MARKERS = (
     "longer than the maximum model length",
     "context window",
 )
-# An exhausted billing account: OpenAI's 429 code insufficient_quota and
-# Anthropic's 400 "credit balance is too low". Retrying will not help.
-_INSUFFICIENT_QUOTA_CODE = "insufficient_quota"
-_LOW_CREDIT_BALANCE_MARKER = "credit balance is too low"
 
 
 def _string_attribute(exc: BaseException, name: str) -> Optional[str]:
@@ -350,31 +348,11 @@ def _is_connection_exception(exc: BaseException) -> bool:
     )
 
 
-def _provider_error_text(exc: BaseException) -> str:
-    """The error message plus the response body, which httpx leaves out."""
-    parts = [str(exc)]
-    response = getattr(exc, "response", None)
-    try:
-        body = getattr(response, "text", None)
-    except Exception:  # httpx raises ResponseNotRead for an unread stream
-        body = None
-    if isinstance(body, str):
-        parts.append(body[:2000])
-    return " ".join(parts).lower()
-
-
 def _is_context_length_error(exc: BaseException) -> bool:
     if getattr(exc, "code", None) == "context_length_exceeded":
         return True
     text = _provider_error_text(exc)
     return any(marker in text for marker in _CONTEXT_LENGTH_MARKERS)
-
-
-def _is_billing_exhausted(exc: BaseException) -> bool:
-    if getattr(exc, "code", None) == _INSUFFICIENT_QUOTA_CODE:
-        return True
-    text = _provider_error_text(exc)
-    return _INSUFFICIENT_QUOTA_CODE in text or _LOW_CREDIT_BALANCE_MARKER in text
 
 
 def classify_inference_error(exc: BaseException) -> str:
