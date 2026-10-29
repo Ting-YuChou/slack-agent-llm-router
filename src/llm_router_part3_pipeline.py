@@ -226,6 +226,8 @@ def build_inference_completed_event(
         "policy_source": policy_source,
         "hint_reason": hint_reason,
         "fallback_models": list(getattr(routing_decision, "fallback_models", []) or []),
+        "fallback_from_model": getattr(inference_response, "fallback_from_model", None),
+        "attempts": getattr(inference_response, "attempts", 1),
         "tools_used": [getattr(tool_call, "name", "") for tool_call in tool_calls],
         "web_search_result_count": len(sources),
         "web_search_latency_ms": getattr(web_search_call, "latency_ms", 0)

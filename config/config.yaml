@@ -286,6 +286,12 @@ inference:
       password_env: REDIS_PASSWORD
   single_flight:
     enabled: true
+  fallback:
+    chains:
+      gpt-5:
+      - claude-sonnet-4-6
+      claude-sonnet-4-6:
+      - gpt-5
   scheduler:
     enabled: true
     queue_enabled: true
@@ -299,6 +305,9 @@ inference:
     allow_fallback_on_provider_rejection: true
     key_prefix: provider_scheduler
     request_deadline_seconds: 60
+    fallback_reserve_ratio: 0.3
+    min_attempt_window_seconds: 1.0
+    circuit_timeout_min_window_ratio: 0.5
     retry:
       max_attempts_per_request: 3
       initial_backoff_ms: 100

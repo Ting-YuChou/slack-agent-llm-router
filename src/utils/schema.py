@@ -201,6 +201,11 @@ class InferenceResponse(BaseModel):
     # System flags
     cached: bool = False
     compressed_context: bool = False
+    # Set when a fallback answered: the routed model whose failure it replaced.
+    fallback_from_model: Optional[str] = None
+    # Models whose provider was called for this answer, the one that gave it
+    # included; 0 when it came from the response cache.
+    attempts: int = Field(default=1, ge=0)
 
     # Tool output
     sources: List[ResponseSource] = Field(default_factory=list)
@@ -697,6 +702,16 @@ class ProviderSchedulerConfig(ConfigModel):
     allow_fallback_on_provider_rejection: bool = True
     key_prefix: str = "provider_scheduler"
     request_deadline_seconds: float = Field(60.0, gt=0)
+    # Share of the time left when model calls start that a primary model
+    # leaves for its fallback route, when it has one.
+    fallback_reserve_ratio: float = Field(0.3, ge=0.0, lt=1.0)
+    # A provider attempt (or retry) is not started with less time than this
+    # left (capped at the provider timeout); it fails as a deadline timeout.
+    min_attempt_window_seconds: float = Field(1.0, ge=0.0)
+    # An attempt timeout counts against the provider's circuit only when the
+    # attempt had at least this share of the longest window the request could
+    # give it: the provider timeout, capped at the deadline less any reserve.
+    circuit_timeout_min_window_ratio: float = Field(0.5, ge=0.0, le=1.0)
     retry: SchedulerRetryConfig = Field(default_factory=SchedulerRetryConfig)
     circuit_breaker: SchedulerCircuitBreakerConfig = Field(
         default_factory=SchedulerCircuitBreakerConfig
@@ -711,6 +726,13 @@ class ProviderSchedulerConfig(ConfigModel):
         return normalized
 
 
+class InferenceFallbackConfig(ConfigModel):
+    # Models to try, in order, when a model is unavailable (retryable errors,
+    # circuit or capacity rejections, attempt timeouts). Each must still pass
+    # the user's tier, the context window and the routing guardrails.
+    chains: Dict[str, List[str]] = Field(default_factory=dict)
+
+
 class InferenceConfig(ConfigModel):
     vllm: ProviderEndpointConfig = Field(default_factory=ProviderEndpointConfig)
     openai: ProviderEndpointConfig = Field(default_factory=ProviderEndpointConfig)
@@ -720,6 +742,7 @@ class InferenceConfig(ConfigModel):
     batching: BatchingConfig = Field(default_factory=BatchingConfig)
     single_flight: SingleFlightConfig = Field(default_factory=SingleFlightConfig)
     scheduler: ProviderSchedulerConfig = Field(default_factory=ProviderSchedulerConfig)
+    fallback: InferenceFallbackConfig = Field(default_factory=InferenceFallbackConfig)
 
     @model_validator(mode="before")
     @classmethod

@@ -1088,8 +1088,15 @@ def add_routing_policy_event(
     selected_model = str(event.get("selected_model", "") or "")
     if selected_model:
         _increment_count(aggregate.setdefault("model_all_counts", {}), selected_model)
-        target = "model_success_counts" if succeeded else "failed_model_counts"
-        _increment_count(aggregate.setdefault(target, {}), selected_model)
+        if succeeded:
+            _increment_count(
+                aggregate.setdefault("model_success_counts", {}), selected_model
+            )
+        elif counts_toward_provider_health(event):
+            # A failure the caller, policy or our code caused is not the model's.
+            _increment_count(
+                aggregate.setdefault("failed_model_counts", {}), selected_model
+            )
     provider = str(event.get("provider", "") or "").lower()
     if provider and not succeeded and counts_toward_provider_health(event):
         _increment_count(aggregate.setdefault("failed_provider_counts", {}), provider)
