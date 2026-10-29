@@ -256,3 +256,69 @@ async def test_auto_rag_with_embeddings_down_and_no_keyword_hits_tells_the_model
     assert "rag_unavailable" in response.warnings
     sent = engine.providers["openai"].generate_response.await_args.args[0]
     assert _RAG_NOTICE in OpenAIProvider({})._build_prompt(sent)
+
+
+# --- Cross-branch review: a hung embedding server, and visual-RAG warnings ---
+
+
+class _HungEmbedder:
+    async def embed(self, _text):
+        await asyncio.sleep(10)
+        return [1.0]
+
+
+@pytest.mark.asyncio
+async def test_hung_embedding_leaves_the_keyword_branch_time():
+    # The embedding timeout (30 s by default) is far past the 0.4 s deadline.
+    service = _service(
+        _Redis(keyword_hit=True), deadline_seconds=0.4, embedder=_HungEmbedder()
+    )
+
+    started = time.monotonic()
+    outcome = await service.retrieve_with_outcome("tuition payment")
+
+    assert outcome.status == "hits"
+    assert outcome.degraded is True
+    assert "vector" in outcome.detail
+    assert time.monotonic() - started < 0.4
+
+
+@pytest.mark.asyncio
+async def test_required_rag_with_a_hung_embedding_answers_from_keyword_hits():
+    engine = _engine(
+        rag_service=_service(
+            _Redis(keyword_hit=True), deadline_seconds=30, embedder=_HungEmbedder()
+        )
+    )
+    request = _request(rag_policy=RagPolicy.REQUIRED)
+
+    response, elapsed = await _process(engine, request)
+
+    assert response.error is None
+    assert "rag_degraded" in response.warnings
+    assert "Tuition payment is due on May 1." in request.metadata["rag_context"]
+    assert elapsed < 0.9
+
+
+@pytest.mark.asyncio
+async def test_visual_rag_warnings_keep_the_retrieval_warnings():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    rag_service = _service(_Redis(keyword_hit=True))
+    rag_service.materialize_image_inputs = AsyncMock(
+        return_value=([], ["figure fig-1 asset missing"])
+    )
+    engine = _engine(rag_service=rag_service)
+    request = _request(knowledge_base_ids=["school"])
+    rag_result = SimpleNamespace(results=["hit"], warnings=["rag_degraded"])
+
+    await engine._prepare_rag_images(
+        request, SimpleNamespace(selected_model="gpt-5"), rag_result
+    )
+
+    assert rag_result.warnings[0] == "rag_degraded"
+    assert "figure fig-1 asset missing" in rag_result.warnings
+    assert any(
+        warning.startswith("rag_vision_fallback") for warning in rag_result.warnings
+    )

@@ -651,6 +651,23 @@ _DEFAULT_RETRIEVAL_BUDGET_RATIO = 0.5
 _RETRIEVAL_BACKSTOP_MARGIN_SECONDS = 0.05
 
 
+def _merge_rag_warnings(rag_result: Any, request: QueryRequest) -> None:
+    """Add the request's rag_warnings to rag_result.warnings, keeping its own.
+
+    rag_result.warnings already holds retrieval warnings (rag_degraded,
+    rag_unavailable) that rag_warnings does not.
+    """
+    existing = list(getattr(rag_result, "warnings", None) or [])
+    rag_result.warnings = [
+        *existing,
+        *(
+            warning
+            for warning in (request.metadata or {}).get("rag_warnings", [])
+            if warning not in existing
+        ),
+    ]
+
+
 def _drop_metadata_key(request: QueryRequest, key: str) -> None:
     """Remove a key the engine owns from caller-supplied request metadata."""
     if request.metadata and key in request.metadata:
@@ -3184,7 +3201,7 @@ class InferenceEngine:
                 *request.metadata.get("rag_warnings", []),
                 *warnings,
             ]
-            rag_result.warnings = list(request.metadata["rag_warnings"])
+            _merge_rag_warnings(rag_result, request)
         if not images:
             if warnings:
                 warning = (
@@ -3194,7 +3211,7 @@ class InferenceEngine:
                     *request.metadata.get("rag_warnings", []),
                     warning,
                 ]
-                rag_result.warnings = list(request.metadata["rag_warnings"])
+                _merge_rag_warnings(rag_result, request)
                 RAG_METRICS.vision_outcomes.labels(
                     "text_only_materialization_failure"
                 ).inc()
@@ -3232,7 +3249,7 @@ class InferenceEngine:
                     *request.metadata.get("rag_warnings", []),
                     "rag_vision_fallback: no policy-eligible vision model",
                 ]
-                rag_result.warnings = list(request.metadata["rag_warnings"])
+                _merge_rag_warnings(rag_result, request)
                 RAG_METRICS.vision_outcomes.labels("text_only_no_model").inc()
                 return routing_decision
             request.metadata["rag_original_model"] = selected

@@ -94,6 +94,9 @@ class RagQueuePreDurabilityError(RuntimeError):
 # cancels the whole search.
 _STORE_DEADLINE_MARGIN_RATIO = 0.1
 _STORE_DEADLINE_MARGIN_MAX_SECONDS = 0.25
+# Share of the retrieval time left that the query embedding may use: the
+# keyword branch needs the rest even when the embedding server hangs.
+_EMBEDDING_DEADLINE_SHARE = 0.5
 
 RAG_HITS = "hits"
 RAG_NO_HITS = "no_hits"
@@ -1043,7 +1046,15 @@ class RagService:
         min_score: Optional[float] = None,
         deadline_at: Optional[float] = None,
     ) -> List[RagSearchResult]:
-        embedding = await self._safe_embed(query)
+        embedding = await self._safe_embed(
+            query,
+            timeout=(
+                None
+                if deadline_at is None
+                else max(0.0, deadline_at - time.monotonic())
+                * _EMBEDDING_DEADLINE_SHARE
+            ),
+        )
         if embedding is None and not isinstance(
             self.embedding_provider, NoOpEmbeddingProvider
         ):
@@ -2325,11 +2336,22 @@ class RagService:
             raise RuntimeError("; ".join(warnings))
         return warnings, asset_refs
 
-    async def _safe_embed(self, text: str) -> Optional[List[float]]:
+    async def _safe_embed(
+        self, text: str, *, timeout: Optional[float] = None
+    ) -> Optional[List[float]]:
+        """Embed text, or None when the provider fails or runs out of time.
+
+        ``timeout`` can only shorten the configured embedding timeout.
+        """
+        configured_timeout = float(self.embedding_config.get("timeout", 30))
         try:
             return await asyncio.wait_for(
                 self.embedding_provider.embed(text),
-                timeout=float(self.embedding_config.get("timeout", 30)),
+                timeout=(
+                    configured_timeout
+                    if timeout is None
+                    else min(configured_timeout, timeout)
+                ),
             )
         except Exception as exc:
             logger.info("RAG embedding unavailable; using keyword-only search: %s", exc)
