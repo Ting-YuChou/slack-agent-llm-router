@@ -321,6 +321,27 @@ def classify_inference_error(exc: BaseException) -> str:
     return "internal"
 
 
+_PRIMARY_ATTEMPT_EXCEPTION_ATTR = "_primary_attempt_exception"
+
+
+def _primary_attempt_exception(exc: BaseException) -> BaseException:
+    """Return the primary model's failure that exc (or its cause chain) carries.
+
+    When every fallback also fails, the exception that surfaces belongs to the
+    last fallback, or to the request deadline. Failure analytics describe the
+    primary attempt, so the fallback chain attaches that attempt's exception.
+    """
+    seen = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        primary = getattr(current, _PRIMARY_ATTEMPT_EXCEPTION_ATTR, None)
+        if isinstance(primary, BaseException):
+            return primary
+        current = current.__cause__ or current.__context__
+    return exc
+
+
 def _openai_cached_input_tokens(usage: Any) -> int:
     """Cached prompt tokens: the Responses API field first, then Chat Completions."""
     return _first_nested_usage_value(
@@ -2365,7 +2386,7 @@ class InferenceEngine:
                 provider="error",
                 cached=False,
                 error="inference_failed",
-                error_type=classify_inference_error(exc),
+                error_type=classify_inference_error(_primary_attempt_exception(exc)),
             )
             # The caller keeps the "error" provider sentinel; analytics get the
             # failed model's real provider so outages count against it.
@@ -2953,7 +2974,28 @@ class InferenceEngine:
         routing_decision: Any,
         execution_budget: Optional[RequestExecutionBudget] = None,
     ) -> Tuple[InferenceResponse, str, Any]:
-        """Generate a response and fall back to local models when cloud models fail."""
+        """Generate a response and fall back to local models when cloud models fail.
+
+        If the primary model fails and so does every recovery attempt, the last
+        attempt's exception is raised unchanged, carrying the primary's exception.
+        """
+        primary_failures: List[BaseException] = []
+        try:
+            return await self._generate_response_with_fallback_attempts(
+                request, routing_decision, execution_budget, primary_failures
+            )
+        except BaseException as exc:
+            if primary_failures and exc is not primary_failures[0]:
+                setattr(exc, _PRIMARY_ATTEMPT_EXCEPTION_ATTR, primary_failures[0])
+            raise
+
+    async def _generate_response_with_fallback_attempts(
+        self,
+        request: QueryRequest,
+        routing_decision: Any,
+        execution_budget: Optional[RequestExecutionBudget],
+        primary_failures: List[BaseException],
+    ) -> Tuple[InferenceResponse, str, Any]:
         primary_model = routing_decision.selected_model
         primary_started_at = time.time()
 
@@ -2963,6 +3005,7 @@ class InferenceEngine:
             )
             return response, primary_model, routing_decision
         except AdmissionRejectedError as exc:
+            primary_failures.append(exc)
             if not self.scheduler.allow_fallback_for_rejection(exc.decision):
                 raise
             fallback_models = self._get_local_fallback_models(
@@ -3033,6 +3076,7 @@ class InferenceEngine:
                 )
             raise last_exception
         except Exception as exc:
+            primary_failures.append(exc)
             self._record_failed_attempt(primary_model, exc, primary_started_at)
             fallback_models = self._get_local_fallback_models(
                 request,

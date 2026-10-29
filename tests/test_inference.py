@@ -1,5 +1,6 @@
 import asyncio
 import builtins
+import json
 import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -2704,6 +2705,213 @@ class TestInferenceEngine:
 
         published = event_producer.produce_inference_completed.await_args.args[1]
         assert published.error_type == "user_or_policy"
+
+    @staticmethod
+    def _cloud_router_with_local_fallback():
+        from src.llm_router_part1_router import ModelRouter
+
+        router = ModelRouter(
+            {
+                "default_model": "gpt-5",
+                "routing_strategy": "intelligent",
+                "models": {
+                    "gpt-5": {
+                        "provider": "openai",
+                        "max_tokens": 128000,
+                        "cost_per_token": 0.00003,
+                        "priority": 2,
+                        "capabilities": ["general", "reasoning", "coding", "analysis"],
+                    },
+                    "mistral-7b": {
+                        "provider": "vllm",
+                        "model_path": "/models/mistral",
+                        "max_tokens": 4096,
+                        "cost_per_token": 0.0,
+                        "priority": 3,
+                        "capabilities": ["general", "coding"],
+                    },
+                },
+                "routing_rules": [],
+            }
+        )
+        router.route_query = AsyncMock(
+            return_value=SimpleNamespace(
+                selected_model="gpt-5",
+                query_type=QueryType.GENERAL,
+                token_count=64,
+                routing_reason="Capability-based selection",
+            )
+        )
+        router.update_model_stats = MagicMock()
+        return router
+
+    @staticmethod
+    def _published_failure(event_producer, request):
+        from src.llm_router_part3_pipeline import build_inference_completed_event
+
+        event_producer.produce_inference_completed.assert_awaited_once()
+        published = event_producer.produce_inference_completed.await_args.args[1]
+        event = build_inference_completed_event(request, published)
+        return event["selected_model"], event["provider"], event["error_type"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("primary_exc", "fallback_exc", "expected_error_type"),
+        [
+            pytest.param(
+                _StatusError(400),
+                RuntimeError("No healthy vLLM endpoint can serve model mistral-7b"),
+                "user_or_policy",
+                id="primary-400-fallback-no-healthy-endpoint",
+            ),
+            pytest.param(
+                _StatusError(503),
+                json.JSONDecodeError("Expecting value", "", 0),
+                "provider_error",
+                id="primary-503-fallback-bad-json",
+            ),
+        ],
+    )
+    async def test_failure_event_describes_primary_attempt_when_fallbacks_fail(
+        self,
+        inference_config,
+        sample_query_request,
+        primary_exc,
+        fallback_exc,
+        expected_error_type,
+    ):
+        router = self._cloud_router_with_local_fallback()
+        event_producer = AsyncMock()
+        event_producer.produce_inference_completed = AsyncMock()
+        event_producer.produce_query_log = AsyncMock()
+        engine = InferenceEngine(
+            inference_config, router, event_producer=event_producer
+        )
+        engine.providers = {"openai": AsyncMock(), "vllm": AsyncMock()}
+        engine.providers["openai"].generate_response = AsyncMock(
+            side_effect=primary_exc
+        )
+        engine.providers["vllm"].generate_response = AsyncMock(side_effect=fallback_exc)
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+
+        response = await engine.process_query(sample_query_request)
+
+        assert response.error == "inference_failed"
+        engine.providers["vllm"].generate_response.assert_awaited()
+        assert self._published_failure(event_producer, sample_query_request) == (
+            "gpt-5",
+            "openai",
+            expected_error_type,
+        )
+
+    @pytest.mark.asyncio
+    async def test_failure_event_describes_admission_rejected_primary(
+        self,
+        inference_config,
+        sample_query_request,
+    ):
+        router = self._cloud_router_with_local_fallback()
+        event_producer = AsyncMock()
+        event_producer.produce_inference_completed = AsyncMock()
+        event_producer.produce_query_log = AsyncMock()
+        engine = InferenceEngine(
+            inference_config,
+            router,
+            admission_controller=RejectingAdmissionController(
+                ["provider_active_requests_exceeded", None]
+            ),
+            event_producer=event_producer,
+        )
+        engine.providers = {"openai": AsyncMock(), "vllm": AsyncMock()}
+        engine.providers["vllm"].generate_response = AsyncMock(
+            side_effect=RuntimeError("No healthy vLLM endpoint can serve model")
+        )
+        engine.cache.get_cached_response = AsyncMock(return_value=None)
+
+        response = await engine.process_query(sample_query_request)
+
+        assert response.error == "inference_failed"
+        engine.providers["openai"].generate_response.assert_not_called()
+        engine.providers["vllm"].generate_response.assert_awaited()
+        assert self._published_failure(event_producer, sample_query_request) == (
+            "gpt-5",
+            "openai",
+            "user_or_policy",
+        )
+
+    @pytest.mark.asyncio
+    async def test_failure_event_describes_primary_when_text_only_retry_fails(
+        self,
+        inference_config,
+        sample_query_request,
+    ):
+        router = self._cloud_router_with_local_fallback()
+        event_producer = AsyncMock()
+        event_producer.produce_inference_completed = AsyncMock()
+        event_producer.produce_query_log = AsyncMock()
+        engine = InferenceEngine(
+            inference_config, router, event_producer=event_producer
+        )
+        engine.providers = {"openai": AsyncMock(), "vllm": AsyncMock()}
+        engine.providers["openai"].generate_response = AsyncMock(
+            side_effect=_StatusError(400)
+        )
+        engine.providers["vllm"].generate_response = AsyncMock(
+            side_effect=RuntimeError("No healthy vLLM endpoint can serve model")
+        )
+        engine._get_cached_inference_response = AsyncMock(return_value=None)
+
+        async def prepare(request, route, _rag_result):
+            request._rag_images = [object()]
+            request.metadata = {
+                **(request.metadata or {}),
+                "rag_vision_fallback_models": [],
+                "rag_text_fallback_models": ["mistral-7b"],
+            }
+            return route
+
+        engine._prepare_rag_images = AsyncMock(side_effect=prepare)
+
+        response = await engine.process_query(sample_query_request)
+
+        assert response.error == "inference_failed"
+        engine.providers["vllm"].generate_response.assert_awaited()
+        assert self._published_failure(event_producer, sample_query_request) == (
+            "gpt-5",
+            "openai",
+            "user_or_policy",
+        )
+
+    @pytest.mark.asyncio
+    async def test_deadline_during_fallback_keeps_primary_failure(
+        self, sample_query_request
+    ):
+        from src.llm_router_part2_inference import (
+            _primary_attempt_exception,
+            classify_inference_error,
+        )
+
+        primary_exc = _StatusError(400)
+        engine = InferenceEngine({}, MagicMock())
+        engine._execute_model_request = AsyncMock(side_effect=[primary_exc])
+        engine._get_local_fallback_models = MagicMock(return_value=["fallback"])
+
+        async def slow_cache(*_args):
+            await asyncio.sleep(0.05)
+            return None
+
+        engine._get_cached_inference_response = slow_cache
+        budget = RequestExecutionBudget(max_attempts=2, deadline_seconds=0.01)
+
+        with pytest.raises(asyncio.TimeoutError) as raised:
+            await engine._generate_response_with_fallback(
+                sample_query_request,
+                SimpleNamespace(selected_model="primary"),
+                execution_budget=budget,
+            )
+
+        assert _primary_attempt_exception(raised.value) is primary_exc
+        assert classify_inference_error(raised.value) == "timeout"
 
     def test_provider_cache_metrics_skip_failed_responses(
         self,
