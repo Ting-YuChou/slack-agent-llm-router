@@ -17,7 +17,11 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from src.memory import EmbeddingProvider, build_embedding_provider
+from src.memory import (
+    EmbeddingProvider,
+    NoOpEmbeddingProvider,
+    build_embedding_provider,
+)
 from src.rag.chunker import DocumentChunk, build_chunker
 from src.rag.normalizer import DocumentLayoutNormalizer
 from src.rag.parser import build_document_parser
@@ -31,7 +35,12 @@ from src.rag.storage import (
     S3ObjectStore,
     S3RagAssetStore,
 )
-from src.rag.vector_store import RagSearchResult, build_vector_store
+from src.rag.vector_store import (
+    RagSearchResult,
+    build_vector_store,
+    capture_search_report,
+    report_search_branch,
+)
 from src.rag.visual import (
     FigureCropper,
     VisualProcessor,
@@ -77,6 +86,42 @@ class RagQueuePreDurabilityError(RuntimeError):
     """A queue submission failure proven to precede every durable side effect."""
 
     safe_to_cleanup_staging = True
+
+
+# The vector store's branches get the retrieval deadline minus this margin
+# (a share of the time left, at most the cap), so they can return the
+# branches that answered, and say which timed out, before the outer deadline
+# cancels the whole search.
+_STORE_DEADLINE_MARGIN_RATIO = 0.1
+_STORE_DEADLINE_MARGIN_MAX_SECONDS = 0.25
+# Share of the retrieval time left that the query embedding may use: the
+# keyword branch needs the rest even when the embedding server hangs.
+_EMBEDDING_DEADLINE_SHARE = 0.5
+
+RAG_HITS = "hits"
+RAG_NO_HITS = "no_hits"
+RAG_TIMEOUT = "timeout"
+RAG_ERROR = "error"
+
+
+@dataclass
+class RagRetrievalOutcome:
+    """One retrieval: hits, no_hits, or a failure (timeout / error).
+
+    ``no_hits`` means the store answered and nothing matched; a timeout or
+    an error means nobody knows whether something would have matched.
+    ``degraded`` hits came back while another branch failed or timed out,
+    so a better match may be missing.
+    """
+
+    status: str
+    results: List[RagSearchResult] = field(default_factory=list)
+    detail: Optional[str] = None
+    degraded: bool = False
+
+    @property
+    def unavailable(self) -> bool:
+        return self.status in (RAG_TIMEOUT, RAG_ERROR)
 
 
 @dataclass(frozen=True)
@@ -889,9 +934,7 @@ class RagService:
     ) -> List[RagSearchResult]:
         if not self.enabled:
             return []
-        deadline_seconds = max(
-            0.001, float(self.retrieval_config.get("deadline_seconds", 30))
-        )
+        deadline_seconds = self._retrieval_deadline_seconds()
         try:
             return await asyncio.wait_for(
                 self._retrieve_within_deadline(
@@ -900,6 +943,7 @@ class RagService:
                     max_results=max_results,
                     candidate_count=candidate_count,
                     min_score=min_score,
+                    deadline_at=time.monotonic() + deadline_seconds,
                 ),
                 timeout=deadline_seconds,
             )
@@ -910,6 +954,88 @@ class RagService:
             )
             return []
 
+    async def retrieve_with_outcome(
+        self,
+        query: str,
+        *,
+        knowledge_base_ids: Optional[Sequence[str]] = None,
+        max_results: Optional[int] = None,
+        candidate_count: Optional[int] = None,
+        min_score: Optional[float] = None,
+        deadline_seconds: Optional[float] = None,
+    ) -> RagRetrievalOutcome:
+        """Retrieve like ``retrieve``, but tell "no hits" apart from a failure.
+
+        ``retrieve`` answers [] for a timeout and lets other errors escape;
+        here both become typed outcomes, and so does a vector store that
+        swallowed its own failures (see RagSearchReport).
+
+        ``deadline_seconds`` (the caller's share of its own deadline) can only
+        shorten the configured retrieval deadline.
+        """
+        if not self.enabled:
+            return RagRetrievalOutcome(status=RAG_NO_HITS)
+        configured_deadline = self._retrieval_deadline_seconds()
+        deadline_seconds = (
+            configured_deadline
+            if deadline_seconds is None
+            else max(0.001, min(configured_deadline, float(deadline_seconds)))
+        )
+        with capture_search_report() as report:
+            try:
+                results = await asyncio.wait_for(
+                    self._retrieve_within_deadline(
+                        query,
+                        knowledge_base_ids=knowledge_base_ids,
+                        max_results=max_results,
+                        candidate_count=candidate_count,
+                        min_score=min_score,
+                        deadline_at=time.monotonic() + deadline_seconds,
+                    ),
+                    timeout=deadline_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "RAG retrieval exceeded its %.3fs shared deadline",
+                    deadline_seconds,
+                )
+                return RagRetrievalOutcome(
+                    status=RAG_TIMEOUT,
+                    detail=f"deadline {deadline_seconds:.3f}s",
+                )
+            except Exception as exc:
+                logger.warning("RAG retrieval failed: %s", exc, exc_info=True)
+                return RagRetrievalOutcome(status=RAG_ERROR, detail=type(exc).__name__)
+        broken_branches = report.timed_out | report.unanswered_failures
+        detail = (
+            "branches " + ",".join(sorted(broken_branches)) if broken_branches else None
+        )
+        if results:
+            return RagRetrievalOutcome(
+                status=RAG_HITS,
+                results=list(results),
+                detail=detail,
+                degraded=bool(broken_branches),
+            )
+        if report.timed_out:
+            return RagRetrievalOutcome(status=RAG_TIMEOUT, detail=detail)
+        if report.unanswered_failures:
+            return RagRetrievalOutcome(status=RAG_ERROR, detail=detail)
+        return RagRetrievalOutcome(status=RAG_NO_HITS)
+
+    def _retrieval_deadline_seconds(self) -> float:
+        return max(0.001, float(self.retrieval_config.get("deadline_seconds", 30)))
+
+    @staticmethod
+    def _store_deadline_seconds(deadline_at: float) -> float:
+        """Time the store's branches get: what is left, minus a small margin."""
+        remaining = max(0.0, deadline_at - time.monotonic())
+        margin = min(
+            _STORE_DEADLINE_MARGIN_MAX_SECONDS,
+            remaining * _STORE_DEADLINE_MARGIN_RATIO,
+        )
+        return remaining - margin
+
     async def _retrieve_within_deadline(
         self,
         query: str,
@@ -918,8 +1044,23 @@ class RagService:
         max_results: Optional[int] = None,
         candidate_count: Optional[int] = None,
         min_score: Optional[float] = None,
+        deadline_at: Optional[float] = None,
     ) -> List[RagSearchResult]:
-        embedding = await self._safe_embed(query)
+        embedding = await self._safe_embed(
+            query,
+            timeout=(
+                None
+                if deadline_at is None
+                else max(0.0, deadline_at - time.monotonic())
+                * _EMBEDDING_DEADLINE_SHARE
+            ),
+        )
+        if embedding is None and not isinstance(
+            self.embedding_provider, NoOpEmbeddingProvider
+        ):
+            # Vector search is configured but the embedding service failed:
+            # the vector branch cannot run, which is not "nothing matched".
+            report_search_branch("vector", failed=True)
         effective_kbs = self._effective_knowledge_base_ids(knowledge_base_ids)
         top_k = int(max_results or self.retrieval_config.get("top_k", 5))
         first_stage_candidate_count = int(
@@ -932,6 +1073,11 @@ class RagService:
             if rerank_enabled
             else top_k
         )
+        store_deadline: Dict[str, float] = {}
+        if deadline_at is not None:
+            store_deadline["deadline_seconds"] = self._store_deadline_seconds(
+                deadline_at
+            )
         results = await self.vector_store.search(
             query,
             embedding,
@@ -946,6 +1092,7 @@ class RagService:
                 if min_score is not None
                 else self.retrieval_config.get("min_score", 0.0)
             ),
+            **store_deadline,
         )
         if rerank_enabled:
             results = await self._rerank_results(query, results, top_k, rerank_top_n)
@@ -2189,11 +2336,22 @@ class RagService:
             raise RuntimeError("; ".join(warnings))
         return warnings, asset_refs
 
-    async def _safe_embed(self, text: str) -> Optional[List[float]]:
+    async def _safe_embed(
+        self, text: str, *, timeout: Optional[float] = None
+    ) -> Optional[List[float]]:
+        """Embed text, or None when the provider fails or runs out of time.
+
+        ``timeout`` can only shorten the configured embedding timeout.
+        """
+        configured_timeout = float(self.embedding_config.get("timeout", 30))
         try:
             return await asyncio.wait_for(
                 self.embedding_provider.embed(text),
-                timeout=float(self.embedding_config.get("timeout", 30)),
+                timeout=(
+                    configured_timeout
+                    if timeout is None
+                    else min(configured_timeout, timeout)
+                ),
             )
         except Exception as exc:
             logger.info("RAG embedding unavailable; using keyword-only search: %s", exc)

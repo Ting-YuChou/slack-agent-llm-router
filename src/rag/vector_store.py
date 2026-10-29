@@ -8,9 +8,11 @@ import logging
 import math
 import os
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from src.memory import tokenize
 from src.rag.chunker import DocumentChunk
@@ -179,6 +181,52 @@ class RagSearchResult:
     updated_at: Optional[datetime] = None
 
 
+@dataclass
+class RagSearchReport:
+    """Which retrieval branches answered, failed or ran out of time.
+
+    The Redis store degrades a failed branch to "no results" so one broken
+    branch cannot sink a search. The report keeps the difference visible:
+    a branch that only failed never said there was nothing to find.
+    """
+
+    answered: Set[str] = field(default_factory=set)
+    failed: Set[str] = field(default_factory=set)
+    timed_out: Set[str] = field(default_factory=set)
+
+    @property
+    def unanswered_failures(self) -> Set[str]:
+        """Branches that failed and never answered (a fallback query can)."""
+        return self.failed - self.answered
+
+
+_ACTIVE_SEARCH_REPORT: ContextVar[Optional[RagSearchReport]] = ContextVar(
+    "rag_search_report", default=None
+)
+
+
+@contextmanager
+def capture_search_report() -> Iterator[RagSearchReport]:
+    """Collect a RagSearchReport for the searches run inside the block.
+
+    Tasks started inside the block (the store's branches, ``asyncio.wait_for``)
+    copy the context, so they write to the same report.
+    """
+    report = RagSearchReport()
+    token = _ACTIVE_SEARCH_REPORT.set(report)
+    try:
+        yield report
+    finally:
+        _ACTIVE_SEARCH_REPORT.reset(token)
+
+
+def report_search_branch(branch: str, *, failed: bool) -> None:
+    """Record that a branch ("keyword", "vector") answered or failed."""
+    report = _ACTIVE_SEARCH_REPORT.get()
+    if report is not None:
+        (report.failed if failed else report.answered).add(branch)
+
+
 class InMemoryRagVectorStore:
     """Deterministic vector store for local tests and lightweight development."""
 
@@ -281,6 +329,7 @@ class InMemoryRagVectorStore:
         vector_weight: float,
         recency_weight: float,
         min_score: float,
+        deadline_seconds: Optional[float] = None,  # in-process: nothing to cut off
     ) -> List[RagSearchResult]:
         tokens = tokenize(query)
         allowed_kbs = set(knowledge_base_ids or [])
@@ -808,7 +857,19 @@ class RedisStackRagVectorStore:
         vector_weight: float,
         recency_weight: float,
         min_score: float,
+        deadline_seconds: Optional[float] = None,
     ) -> List[RagSearchResult]:
+        """Run the keyword and vector branches concurrently and merge them.
+
+        A branch still running after ``deadline_seconds`` (default: the
+        configured retrieval deadline) is cut off and reported timed out; the
+        other branch's results are still returned.
+        """
+        branch_deadline = (
+            float(self.retrieval_config.get("deadline_seconds", 30))
+            if deadline_seconds is None
+            else max(0.0, float(deadline_seconds))
+        )
         semaphore = asyncio.Semaphore(
             max(1, int(self.retrieval_config.get("max_concurrent_branches", 3)))
         )
@@ -819,6 +880,7 @@ class RedisStackRagVectorStore:
                     return await factory()
                 except Exception as exc:
                     logger.warning("Redis RAG %s retrieval failed: %s", name, exc)
+                    report_search_branch(name, failed=True)
                     return []
 
         tasks = [
@@ -842,10 +904,7 @@ class RedisStackRagVectorStore:
         done: set[asyncio.Task] = set()
         pending: set[asyncio.Task] = set(tasks)
         try:
-            done, pending = await asyncio.wait(
-                tasks,
-                timeout=float(self.retrieval_config.get("deadline_seconds", 30)),
-            )
+            done, pending = await asyncio.wait(tasks, timeout=branch_deadline)
         finally:
             unfinished = [task for task in tasks if not task.done()]
             for task in unfinished:
@@ -856,6 +915,13 @@ class RedisStackRagVectorStore:
             logger.warning(
                 "Redis RAG retrieval deadline expired for %s branches", len(pending)
             )
+            report = _ACTIVE_SEARCH_REPORT.get()
+            if report is not None:
+                report.timed_out.update(
+                    name
+                    for name, task in zip(("keyword", "vector"), tasks)
+                    if task in pending
+                )
         branch_results: List[List[RagSearchResult]] = []
         for task in tasks:
             if task in done and not task.cancelled():
@@ -929,10 +995,13 @@ class RedisStackRagVectorStore:
         knowledge_base_ids: Sequence[str],
         limit: int,
     ) -> List[RagSearchResult]:
+        # No embedding: keyword-only by configuration, or the embedding
+        # service is down (RagService reports that outage itself).
         if not self.client or not embedding:
             return []
         if len(embedding) != self.dimensions:
             logger.warning("Skipping RAG vector search due to dimension mismatch")
+            report_search_branch("vector", failed=True)
             return []
         filter_query = self._filter_query(knowledge_base_ids)
         base_query = "*" if filter_query == "*" else f"({filter_query})"
@@ -974,8 +1043,13 @@ class RedisStackRagVectorStore:
             )
         except Exception as exc:
             logger.warning("Redis RAG vector search failed: %s", exc)
+            report_search_branch("vector", failed=True)
             return []
-        return self._parse_results(raw_results, "vector")
+        # Only a reply that parses counts as an answer; a parse error
+        # reaches run_branch and is reported there as a failure.
+        results = self._parse_results(raw_results, "vector")
+        report_search_branch("vector", failed=False)
+        return results
 
     async def _search(
         self,
@@ -1022,14 +1096,17 @@ class RedisStackRagVectorStore:
             if raise_on_error:
                 raise
             logger.warning("Redis RAG keyword search failed: %s", exc)
+            report_search_branch(source, failed=True)
             return []
-        return self._parse_results(
+        results = self._parse_results(
             raw_results,
             source,
             tokens=tokens,
             with_scores=with_scores,
             normalize_scores=normalize_scores,
         )
+        report_search_branch(source, failed=False)
+        return results
 
     def _parse_results(
         self,

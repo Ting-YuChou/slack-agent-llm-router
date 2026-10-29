@@ -133,6 +133,43 @@ def _is_retryable_status(status: int) -> bool:
     return status in RETRYABLE_CLIENT_STATUS_CODES
 
 
+# Statuses that blame the request itself (bad input, too large, unprocessable):
+# every endpoint would reject it the same way, so it is neither retried
+# elsewhere nor counted against the provider.
+REQUEST_SHAPED_STATUS_CODES = frozenset({400, 413, 422})
+
+
+# An exhausted billing account: OpenAI's 429 code insufficient_quota and
+# Anthropic's 400 "credit balance is too low". Retrying will not help.
+_INSUFFICIENT_QUOTA_CODE = "insufficient_quota"
+_LOW_CREDIT_BALANCE_MARKER = "credit balance is too low"
+
+
+def provider_error_text(exc: BaseException) -> str:
+    """The error message plus the response body, which httpx leaves out."""
+    parts = [str(exc)]
+    response = getattr(exc, "response", None)
+    try:
+        body = getattr(response, "text", None)
+    except Exception:  # httpx raises ResponseNotRead for an unread stream
+        body = None
+    if isinstance(body, str):
+        parts.append(body[:2000])
+    return " ".join(parts).lower()
+
+
+def is_billing_exhausted(exc: BaseException) -> bool:
+    """Whether the provider account has run out of credit or quota.
+
+    That fails every request to the provider until someone pays, so it is
+    an outage of the provider (fallback, circuit), never worth a retry.
+    """
+    if getattr(exc, "code", None) == _INSUFFICIENT_QUOTA_CODE:
+        return True
+    text = provider_error_text(exc)
+    return _INSUFFICIENT_QUOTA_CODE in text or _LOW_CREDIT_BALANCE_MARKER in text
+
+
 def _exception_status_code(exc: BaseException) -> Optional[int]:
     """Read an HTTP status from ``status_code`` or ``response.status_code``.
 
@@ -797,11 +834,14 @@ class ProviderCapacityScheduler:
     def is_availability_failure(self, exc: BaseException) -> bool:
         """Whether exc says the model is unavailable, not that the request is bad.
 
-        Retryable errors (attempt timeouts included) and circuit or capacity
-        rejections qualify; 400/413/422 and ValueError never do.
+        Retryable errors (attempt timeouts included), an exhausted billing
+        account and circuit or capacity rejections qualify; other 400/413/422
+        and ValueError never do.
         """
         if isinstance(exc, AdmissionRejectedError):
             return self.allow_fallback_for_rejection(exc.decision)
+        if isinstance(exc, Exception) and is_billing_exhausted(exc):
+            return True
         return isinstance(exc, Exception) and self._is_retryable_exception(exc)
 
     async def record_success(
@@ -841,7 +881,8 @@ class ProviderCapacityScheduler:
     ) -> None:
         if not bool(self.circuit_config.get("enabled", False)):
             return
-        if not self._is_retryable_exception(error):
+        # An empty account is not retried, but it is the provider's outage.
+        if not (self._is_retryable_exception(error) or is_billing_exhausted(error)):
             return
 
         result = await self._circuit_transition_with_fallback(
@@ -1547,6 +1588,8 @@ class ProviderCapacityScheduler:
             return False
         if isinstance(exc, (ValueError, KeyError, TypeError)):
             return False
+        if is_billing_exhausted(exc):
+            return False  # Even OpenAI's 429: the same account fails again.
         if isinstance(exc, httpx.TimeoutException):
             return True
         if isinstance(exc, httpx.TransportError):

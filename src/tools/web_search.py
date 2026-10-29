@@ -1,5 +1,6 @@
 """Application-side web search tool."""
 
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -10,6 +11,11 @@ from src.tools.base import Tool
 from src.utils.schema import ResponseSource, ToolCall, WebSearchOptions
 from src.utils.bounded_state import BoundedTTLMap
 
+logger = logging.getLogger(__name__)
+
+# Response warning for a search backend that failed (not one we skipped).
+WEB_SEARCH_UNAVAILABLE_WARNING = "web_search_unavailable"
+
 
 @dataclass
 class WebSearchResult:
@@ -17,6 +23,7 @@ class WebSearchResult:
     tool_call: Optional[ToolCall] = None
     context: str = ""
     blocked_reason: Optional[str] = None
+    warnings: List[str] = field(default_factory=list)
 
 
 class WebSearchTool(Tool):
@@ -90,6 +97,11 @@ class WebSearchTool(Tool):
             )
         except Exception as exc:
             latency_ms = int((time.time() - started_at) * 1000)
+            logger.warning(
+                "Web search backend %s failed: %s",
+                getattr(self.backend, "provider_name", "unknown"),
+                exc,
+            )
             return WebSearchResult(
                 tool_call=ToolCall(
                     name=self.name,
@@ -100,6 +112,7 @@ class WebSearchTool(Tool):
                     error=str(exc),
                 ),
                 blocked_reason="web_search_error",
+                warnings=[WEB_SEARCH_UNAVAILABLE_WARNING],
             )
 
     def format_context(self, sources: List[ResponseSource]) -> str:

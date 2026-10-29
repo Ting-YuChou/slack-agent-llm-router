@@ -47,7 +47,7 @@ from src.admission import (
 )
 from src.agent_runtime import AgentRuntimeClient
 from src.llm_router_part1_router import ModelRouter
-from src.llm_router_part2_inference import InferenceEngine
+from src.llm_router_part2_inference import InferenceEngine, route_response_status
 from src.rag.service import (
     RagIdempotencyConflict,
     RagPayloadTooLarge,
@@ -1835,10 +1835,11 @@ class LLMRouterPlatform:
 
                 await self._publish_request_raw_event(query_data)
                 result = await self.services["inference"].process_query(query_data)
-                status_code = 502 if result.error else 200
+                status_code, error_headers = route_response_status(result)
                 return JSONResponse(
                     status_code=status_code,
                     content=jsonable_encoder(result),
+                    headers=error_headers,
                 )
             except AdmissionRejectedError as exc:
                 status_code = exc.decision.status_code

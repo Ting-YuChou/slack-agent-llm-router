@@ -190,6 +190,12 @@ class InferenceResponse(BaseModel):
     # Failure bucket for analytics: provider_error, timeout, rate_limited,
     # user_or_policy or internal. None on success.
     error_type: Optional[str] = None
+    # What the caller can act on: context_length_exceeded, prompt_too_large,
+    # model_not_entitled, rate_limited, provider_unavailable, timeout or
+    # retrieval_unavailable. None on success and for unclassified failures.
+    error_code: Optional[str] = None
+    # Seconds the provider asked callers to wait before retrying, when it said.
+    retry_after_seconds: Optional[int] = Field(default=None, ge=0)
 
     # Performance metrics
     latency_ms: int = Field(ge=0)
@@ -220,6 +226,9 @@ class InferenceResponse(BaseModel):
     error: Optional[str] = None
     finish_reason: str = "stop"
     warnings: List[str] = Field(default_factory=list)
+    # The provider's id for the call (OpenAI x-request-id, Anthropic
+    # request-id, vLLM X-Request-Id) to quote in support tickets and logs.
+    provider_request_id: Optional[str] = None
 
     # Timestamps
     timestamp: datetime = Field(default_factory=utc_now)
@@ -743,6 +752,10 @@ class InferenceConfig(ConfigModel):
     single_flight: SingleFlightConfig = Field(default_factory=SingleFlightConfig)
     scheduler: ProviderSchedulerConfig = Field(default_factory=ProviderSchedulerConfig)
     fallback: InferenceFallbackConfig = Field(default_factory=InferenceFallbackConfig)
+    # Share of the time left in the request deadline that one retrieval step
+    # (RAG, then web search) may use, so the model call keeps the rest (and
+    # never less than scheduler.min_attempt_window_seconds).
+    retrieval_budget_ratio: float = Field(0.5, gt=0.0, lt=1.0)
 
     @model_validator(mode="before")
     @classmethod

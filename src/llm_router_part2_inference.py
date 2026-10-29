@@ -5,8 +5,10 @@ Handles inference requests across OpenAI, Anthropic, and vLLM providers
 
 import asyncio
 import base64
+import email.utils
 import json
 import logging
+import math
 import os
 import time
 from abc import ABC, abstractmethod
@@ -32,7 +34,14 @@ import anthropic
 
 from src.admission import AdmissionRejectedError
 from src.llm_router_part1_router import ModelRouter
-from src.provider_scheduler import ProviderCapacityScheduler, RequestExecutionBudget
+from src.provider_scheduler import (
+    REQUEST_SHAPED_STATUS_CODES,
+    ProviderCapacityScheduler,
+    RequestExecutionBudget,
+    _exception_status_code,
+)
+from src.provider_scheduler import is_billing_exhausted as _is_billing_exhausted
+from src.provider_scheduler import provider_error_text as _provider_error_text
 from src.utils.metrics import INFERENCE_METRICS, RAG_METRICS
 from src.utils.schema import (
     AttachmentType,
@@ -44,6 +53,7 @@ from src.utils.schema import (
     ToolPolicy,
 )
 from src.tools import ToolRegistry, WebSearchTool, WebSearchResult
+from src.tools.web_search import WEB_SEARCH_UNAVAILABLE_WARNING
 
 logger = logging.getLogger(__name__)
 
@@ -280,41 +290,88 @@ def _first_nested_usage_value(
     return default
 
 
-# Statuses that blame the request itself (bad input, too large, unprocessable),
-# matching the request-shaped set the failure-handling path uses.
-_REQUEST_SHAPED_STATUS_CODES = frozenset({400, 413, 422})
+# HTTP status /route answers for each error_code; other failures stay 502.
+ERROR_CODE_HTTP_STATUS: Dict[str, int] = {
+    "context_length_exceeded": 413,
+    "prompt_too_large": 413,
+    "model_not_entitled": 403,
+    "rate_limited": 429,
+    "provider_unavailable": 503,
+    "retrieval_unavailable": 503,
+    "timeout": 504,
+}
+# Statuses whose responses may carry Retry-After (RFC 9110 section 10.2.3).
+_RETRY_AFTER_HTTP_STATUSES = frozenset({429, 503})
+# Phrases providers use for a prompt over the model's context window: OpenAI's
+# error code and "context window"; Anthropic's "prompt is too long" and
+# "input length and `max_tokens` exceed context limit"; vLLM's "maximum
+# context length is N tokens" and "is longer than the maximum model length".
+_CONTEXT_LENGTH_MARKERS = (
+    "context_length_exceeded",
+    "prompt is too long",
+    "exceed context limit",
+    "maximum context length",
+    "longer than the maximum model length",
+    "context window",
+)
 
 
-def _exception_status_code(exc: BaseException) -> Optional[int]:
-    """HTTP status from SDK errors (exc.status_code) or httpx (exc.response)."""
-    for candidate in (exc, getattr(exc, "response", None)):
-        status_code = getattr(candidate, "status_code", None)
-        if isinstance(status_code, int) and not isinstance(status_code, bool):
-            return status_code
-    return None
+def _string_attribute(exc: BaseException, name: str) -> Optional[str]:
+    """A non-empty string attribute that a typed exception sets on purpose."""
+    value = getattr(exc, name, None)
+    return value if isinstance(value, str) and value else None
+
+
+def _admission_rejection_reason(exc: AdmissionRejectedError) -> str:
+    """The rejection reason, looking through a queue wait to what it waited on."""
+    decision = getattr(exc, "decision", None)
+    reason = str(getattr(decision, "reason", "") or "")
+    if reason == "scheduler_queue_timeout":
+        metadata = getattr(decision, "metadata", None) or {}
+        reason = str(metadata.get("last_reason") or "")
+    return reason
+
+
+def _class_names(exc: BaseException) -> set:
+    return {cls.__name__ for cls in type(exc).__mro__}
+
+
+def _is_timeout_exception(exc: BaseException) -> bool:
+    return isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or any(
+        "Timeout" in name for name in _class_names(exc)
+    )
+
+
+def _is_connection_exception(exc: BaseException) -> bool:
+    return isinstance(exc, ConnectionError) or bool(
+        _class_names(exc) & {"APIConnectionError", "TransportError"}
+    )
+
+
+def _is_context_length_error(exc: BaseException) -> bool:
+    if getattr(exc, "code", None) == "context_length_exceeded":
+        return True
+    text = _provider_error_text(exc)
+    return any(marker in text for marker in _CONTEXT_LENGTH_MARKERS)
 
 
 def classify_inference_error(exc: BaseException) -> str:
     """Bucket a failed inference so analytics only blame providers for their faults.
 
     Matches SDK and httpx errors by attribute and class name, so it works without
-    importing the provider SDKs.
+    importing the provider SDKs. A typed exception that sets ``error_type``
+    decides for itself.
     """
-    class_names = {cls.__name__ for cls in type(exc).__mro__}
+    explicit_error_type = _string_attribute(exc, "error_type")
+    if explicit_error_type:
+        return explicit_error_type
     if isinstance(exc, AdmissionRejectedError):
         # An open circuit (or a queue wait that ended on one) means the provider
         # has been failing; other rejections are our own capacity policy.
-        decision = getattr(exc, "decision", None)
-        reason = str(getattr(decision, "reason", "") or "")
-        if reason == "scheduler_queue_timeout":
-            metadata = getattr(decision, "metadata", None) or {}
-            reason = str(metadata.get("last_reason") or "")
-        if reason == "circuit_open":
+        if _admission_rejection_reason(exc) == "circuit_open":
             return "provider_error"
         return "user_or_policy"
-    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or any(
-        "Timeout" in name for name in class_names
-    ):
+    if _is_timeout_exception(exc):
         return "timeout"
     status_code = _exception_status_code(exc)
     if status_code is not None and status_code >= 400:
@@ -322,14 +379,14 @@ def classify_inference_error(exc: BaseException) -> str:
             return "timeout"
         if status_code == 429:
             return "rate_limited"
-        if status_code in _REQUEST_SHAPED_STATUS_CODES:
+        if status_code in REQUEST_SHAPED_STATUS_CODES:
+            # An exhausted account fails every request, whatever it says.
+            if _is_billing_exhausted(exc):
+                return "provider_error"
             return "user_or_policy"
         # 5xx, and 4xx such as 401/403 (revoked key) or 404 (retired model).
         return "provider_error"
-    if isinstance(exc, ConnectionError) or class_names & {
-        "APIConnectionError",
-        "TransportError",
-    }:
+    if _is_connection_exception(exc):
         return "provider_error"
     if isinstance(exc, json.JSONDecodeError):
         # A provider answered with a body that is not JSON (an HTML error page,
@@ -340,6 +397,121 @@ def classify_inference_error(exc: BaseException) -> str:
     if isinstance(exc, RuntimeError):
         return "provider_error"
     return "internal"
+
+
+def inference_error_code(exc: BaseException) -> Optional[str]:
+    """Name a failure specifically enough for the caller to act on it.
+
+    Typed exceptions (the router's entitlement and size rejections, retrieval
+    failures) carry ``error_code`` themselves. Returns None when nothing more
+    specific than "inference failed" is known.
+    """
+    explicit_error_code = _string_attribute(exc, "error_code")
+    if explicit_error_code:
+        return explicit_error_code
+    if isinstance(exc, AdmissionRejectedError):
+        decision_status = getattr(getattr(exc, "decision", None), "status_code", 0)
+        if _admission_rejection_reason(exc) == "circuit_open" or (
+            isinstance(decision_status, int) and decision_status >= 500
+        ):
+            return "provider_unavailable"
+        return "rate_limited"
+    if _is_timeout_exception(exc):
+        return "timeout"
+    status_code = _exception_status_code(exc)
+    if status_code is not None and status_code >= 400:
+        if status_code == 408:
+            return "timeout"
+        if status_code == 429:
+            # An exhausted billing quota does not clear in seconds.
+            if _is_billing_exhausted(exc):
+                return "provider_unavailable"
+            return "rate_limited"
+        if status_code in REQUEST_SHAPED_STATUS_CODES:
+            if _is_billing_exhausted(exc):
+                return "provider_unavailable"
+            if _is_context_length_error(exc):
+                return "context_length_exceeded"
+            return "prompt_too_large" if status_code == 413 else None
+        # 401/403/404 mean our credentials or model name are wrong: a 502.
+        return "provider_unavailable" if status_code >= 500 else None
+    if _is_connection_exception(exc):
+        return "provider_unavailable"
+    if isinstance(exc, RuntimeError) and "no healthy" in str(exc).lower():
+        return "provider_unavailable"
+    return None
+
+
+class RetrievalUnavailableError(RuntimeError):
+    """rag_policy is REQUIRED, but document retrieval timed out or failed.
+
+    The answer must come from the documents, so the request fails instead of
+    answering without them. Neither the model nor its provider is at fault.
+    """
+
+    error_code = "retrieval_unavailable"
+    error_type = "internal"
+    http_status = 503
+
+    def __init__(self, status: str, detail: Optional[str] = None):
+        super().__init__(
+            f"Document retrieval {status}" + (f" ({detail})" if detail else "")
+        )
+        self.status = status
+
+
+def _header_value(headers: Any, name: str) -> Optional[str]:
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    for candidate in (name, name.title()):
+        value = getter(candidate)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _retry_after_seconds(exc: BaseException) -> Optional[int]:
+    """How long the provider (or our admission control) asked callers to wait."""
+    if isinstance(exc, AdmissionRejectedError):
+        seconds = getattr(getattr(exc, "decision", None), "retry_after_seconds", None)
+        if isinstance(seconds, int) and not isinstance(seconds, bool):
+            return max(0, seconds)
+        return None
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers is None or _is_billing_exhausted(exc):
+        # A quota error's Retry-After would only invite futile retries.
+        return None
+    try:
+        milliseconds = _header_value(headers, "retry-after-ms")
+        if milliseconds is not None:
+            return max(0, math.ceil(float(milliseconds) / 1000))
+        value = _header_value(headers, "retry-after")
+        if value is None:
+            return None
+        try:
+            return max(0, math.ceil(float(value)))
+        except ValueError:
+            retry_at = email.utils.parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+            return max(0, math.ceil(delay))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def route_response_status(response: Any) -> Tuple[int, Dict[str, str]]:
+    """The HTTP status (and headers) /route answers for an engine response."""
+    if not getattr(response, "error", None):
+        return 200, {}
+    error_code = getattr(response, "error_code", None)
+    status_code = ERROR_CODE_HTTP_STATUS.get(error_code or "", 502)
+    headers: Dict[str, str] = {}
+    retry_after = getattr(response, "retry_after_seconds", None)
+    if status_code in _RETRY_AFTER_HTTP_STATUSES and isinstance(retry_after, int):
+        headers["Retry-After"] = str(retry_after)
+    return status_code, headers
 
 
 _PRIMARY_ATTEMPT_EXCEPTION_ATTR = "_primary_attempt_exception"
@@ -368,6 +540,149 @@ def _openai_cached_input_tokens(usage: Any) -> int:
     return _first_nested_usage_value(
         usage, ("input_tokens_details", "prompt_tokens_details"), "cached_tokens"
     )
+
+
+# finish_reason values: "stop" for a complete answer, "length" when a token
+# limit cut it off, "content_filter" when the provider refused or filtered it.
+# Anything that is not a string (a mocked SDK object) counts as unknown: "stop".
+_OPENAI_INCOMPLETE_REASONS = {
+    "max_output_tokens": "length",
+    "content_filter": "content_filter",
+}
+_ANTHROPIC_STOP_REASONS = {
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "max_tokens": "length",
+    "model_context_window_exceeded": "length",
+    "refusal": "content_filter",
+    "tool_use": "tool_calls",
+}
+# Warnings for answers that are returned but must not be cached; any other
+# finish_reason but "stop" (vLLM abort, OpenAI failed or cancelled) gets
+# the generic one.
+_FINISH_REASON_WARNINGS = {
+    "length": "response_truncated",
+    "content_filter": "response_filtered",
+}
+_UNFINISHED_RESPONSE_WARNING = "response_incomplete"
+
+
+def _field_value(container: Any, name: str) -> Any:
+    if isinstance(container, dict):
+        return container.get(name)
+    return getattr(container, name, None)
+
+
+def _openai_refused(response: Any) -> bool:
+    """Whether a Responses API answer contains a refusal content part."""
+    output = getattr(response, "output", None)
+    if not isinstance(output, (list, tuple)):
+        return False
+    for item in output:
+        content = _field_value(item, "content")
+        if not isinstance(content, (list, tuple)):
+            continue
+        if any(_field_value(part, "type") == "refusal" for part in content):
+            return True
+    return False
+
+
+def _openai_finish_reason(response: Any) -> str:
+    status = getattr(response, "status", None)
+    if not isinstance(status, str):
+        return "stop"
+    if status == "incomplete":
+        reason = _field_value(getattr(response, "incomplete_details", None), "reason")
+        if isinstance(reason, str):
+            return _OPENAI_INCOMPLETE_REASONS.get(reason, reason)
+        return "incomplete"
+    if status != "completed":
+        return status
+    return "content_filter" if _openai_refused(response) else "stop"
+
+
+def _anthropic_finish_reason(response: Any) -> str:
+    stop_reason = getattr(response, "stop_reason", None)
+    if not isinstance(stop_reason, str):
+        return "stop"
+    return _ANTHROPIC_STOP_REASONS.get(stop_reason, stop_reason)
+
+
+def _vllm_finish_reason(data: Any) -> str:
+    choices = data.get("choices") if isinstance(data, dict) else None
+    first_choice = choices[0] if isinstance(choices, list) and choices else None
+    reason = _field_value(first_choice, "finish_reason")
+    return reason if isinstance(reason, str) and reason else "stop"
+
+
+def _sdk_request_id(response: Any) -> Optional[str]:
+    """The SDK's ``_request_id``, taken from the provider's request-id header."""
+    return _string_attribute(response, "_request_id")
+
+
+def _exception_provider_request_id(exc: BaseException) -> Optional[str]:
+    """The provider's request id on a failed call: SDK errors, then httpx."""
+    request_id = _string_attribute(exc, "request_id")
+    if request_id:
+        return request_id
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    return _header_value(headers, "x-request-id")
+
+
+# Prompt line for a live web search that failed, or that a REQUIRED tool
+# policy needed but that found nothing: no web context reached the model.
+WEB_SEARCH_UNAVAILABLE_NOTICE = (
+    "Live web search failed or returned no results for this request, so no "
+    "current web information is included. Say that you cannot verify the "
+    "latest information, and do not present older knowledge as current."
+)
+# Retrieval outcomes that mean nobody knows what the documents say.
+_RAG_UNAVAILABLE_STATUSES = ("timeout", "error")
+# Prompt line for rag_policy AUTO when document search timed out or failed.
+RAG_UNAVAILABLE_NOTICE = (
+    "Document search was unavailable for this request, so this answer is not "
+    "grounded in the knowledge base. If the question depends on those "
+    "documents, say so instead of guessing what they contain."
+)
+# inference.retrieval_budget_ratio when unset or invalid.
+_DEFAULT_RETRIEVAL_BUDGET_RATIO = 0.5
+# Least time a retrieval step leaves before the request deadline, so its own
+# timeout always fires before the _within_request_deadline backstop.
+_RETRIEVAL_BACKSTOP_MARGIN_SECONDS = 0.05
+
+
+def _merge_rag_warnings(rag_result: Any, request: QueryRequest) -> None:
+    """Add the request's rag_warnings to rag_result.warnings, keeping its own.
+
+    rag_result.warnings already holds retrieval warnings (rag_degraded,
+    rag_unavailable) that rag_warnings does not.
+    """
+    existing = list(getattr(rag_result, "warnings", None) or [])
+    rag_result.warnings = [
+        *existing,
+        *(
+            warning
+            for warning in (request.metadata or {}).get("rag_warnings", [])
+            if warning not in existing
+        ),
+    ]
+
+
+def _drop_metadata_key(request: QueryRequest, key: str) -> None:
+    """Remove a key the engine owns from caller-supplied request metadata."""
+    if request.metadata and key in request.metadata:
+        request.metadata = {
+            name: value for name, value in request.metadata.items() if name != key
+        }
+
+
+async def _await_within(
+    awaitable: Awaitable[Any], time_limit_seconds: Optional[float]
+) -> Any:
+    """Await, raising asyncio.TimeoutError after time_limit_seconds (None: no limit)."""
+    if time_limit_seconds is None:
+        return await awaitable
+    return await asyncio.wait_for(awaitable, timeout=max(0.0, time_limit_seconds))
 
 
 @dataclass
@@ -847,9 +1162,13 @@ class BaseInferenceProvider(ABC):
         rag_context = (request.metadata or {}).get("rag_context")
         if rag_context:
             dynamic_context.append(str(rag_context))
+        if (request.metadata or {}).get("rag_unavailable") in _RAG_UNAVAILABLE_STATUSES:
+            dynamic_context.append(RAG_UNAVAILABLE_NOTICE)
         web_search_context = (request.metadata or {}).get("web_search_context")
         if web_search_context:
             dynamic_context.append(str(web_search_context))
+        if (request.metadata or {}).get("web_search_unavailable") is True:
+            dynamic_context.append(WEB_SEARCH_UNAVAILABLE_NOTICE)
         return PromptSections(
             static_cache_prefix=static_cache_prefix,
             dynamic_context=dynamic_context,
@@ -1008,6 +1327,8 @@ class OpenAIProvider(BaseInferenceProvider):
                 cost_usd=self._calculate_cost(usage, model_name),
                 provider="openai",
                 cached=False,
+                finish_reason=_openai_finish_reason(response),
+                provider_request_id=_sdk_request_id(response),
             )
 
         except Exception as e:
@@ -1244,6 +1565,8 @@ class AnthropicProvider(BaseInferenceProvider):
                 cost_usd=self._calculate_cost(usage, model_name),
                 provider="anthropic",
                 cached=False,
+                finish_reason=_anthropic_finish_reason(response),
+                provider_request_id=_sdk_request_id(response),
             )
 
         except Exception as e:
@@ -1505,6 +1828,10 @@ class vLLMProvider(BaseInferenceProvider):
                     cost_usd=0.0,  # Self-hosted models have no API cost
                     provider="vllm",
                     cached=False,
+                    finish_reason=_vllm_finish_reason(data),
+                    provider_request_id=_header_value(
+                        getattr(response, "headers", None), "x-request-id"
+                    ),
                 )
 
             except Exception as e:
@@ -1734,7 +2061,7 @@ class vLLMProvider(BaseInferenceProvider):
         """
         if not isinstance(error, httpx.HTTPStatusError):
             return False
-        return error.response.status_code in (400, 413, 422)
+        return error.response.status_code in REQUEST_SHAPED_STATUS_CODES
 
     async def _mark_endpoint_failure(
         self, endpoint: VLLMEndpointState, error: Exception
@@ -2347,10 +2674,8 @@ class InferenceEngine:
         """Process query through the complete inference pipeline"""
         start_time = time.time()
 
-        # Generate request ID for tracking
-        request_id = hashlib.md5(
-            f"{request.user_id}:{request.query}:{time.time()}".encode()
-        ).hexdigest()
+        # Log with the caller's request id so logs join the analytics events.
+        request_id = request.request_id
         # One deadline for the whole request: time spent on retrieval comes out
         # of the model calls' share instead of extending the request.
         execution_budget = (
@@ -2358,6 +2683,9 @@ class InferenceEngine:
             if "scheduler" in self.config
             else None
         )
+        # Models whose provider was called, kept even if the deadline cancels
+        # the fallback chain, so a failure reports the calls it made.
+        started_calls: List[str] = []
 
         try:
             # Step 1: Route query to appropriate model
@@ -2368,8 +2696,14 @@ class InferenceEngine:
             compressed_context = await self._compress_request_context_if_needed(request)
 
             # Step 3: Optionally enrich school-document requests with RAG context.
+            # Retrieval gets a share of the time left, so its own outcome
+            # handling runs; the request deadline is only the backstop.
             rag_result = await self._within_request_deadline(
-                self._run_rag_if_needed(request, routing_decision),
+                self._run_rag_if_needed(
+                    request,
+                    routing_decision,
+                    self._retrieval_time_limit(execution_budget),
+                ),
                 execution_budget,
                 stage="rag",
             )
@@ -2395,7 +2729,11 @@ class InferenceEngine:
 
             # Step 4: Optionally enrich current-info requests with web search.
             web_search_result = await self._within_request_deadline(
-                self._run_web_search_if_needed(request, routing_decision),
+                self._run_web_search_if_needed(
+                    request,
+                    routing_decision,
+                    self._retrieval_time_limit(execution_budget),
+                ),
                 execution_budget,
                 stage="web_search",
             )
@@ -2420,17 +2758,26 @@ class InferenceEngine:
                 request,
                 routing_decision,
                 execution_budget=execution_budget,
+                started_calls=started_calls,
             )
             response.compressed_context = compressed_context
             self._attach_rag_result(response, rag_result)
             self._attach_web_search_result(response, web_search_result)
 
-            # Step 7: Cache response
-            if not response.cached and not self._response_cache_bypassed(request):
+            response_complete = self._flag_incomplete_response(request, response)
+
+            # Step 7: Cache response; truncated, filtered or empty answers are
+            # returned but not cached, so a retry can do better.
+            if (
+                response_complete
+                and not response.cached
+                and not self._response_cache_bypassed(request)
+            ):
                 cache_key = self.cache.generate_cache_key(request, model_name)
+                # A cache hit makes no provider call: no provider request id.
                 await self.cache.cache_response(
                     cache_key,
-                    response.model_dump(mode="json"),
+                    response.model_dump(mode="json", exclude={"provider_request_id"}),
                 )
 
             await self._finalize_successful_response(
@@ -2454,11 +2801,14 @@ class InferenceEngine:
                     error_type=type(exc).__name__,
                 ).inc()
 
-            # Update router stats
+            # Update router stats; a retrieval outage or a deadline spent
+            # before any model call is not the model's fault.
             if (
                 "routing_decision" in locals()
                 and not getattr(exc, "_attempt_recorded", False)
-                and not isinstance(exc, RequestStageDeadlineError)
+                and not isinstance(
+                    exc, (RetrievalUnavailableError, RequestStageDeadlineError)
+                )
             ):
                 self.router.update_model_stats(
                     model_name=routing_decision.selected_model,
@@ -2474,6 +2824,7 @@ class InferenceEngine:
                 if "routing_decision" in locals()
                 else "unknown"
             )
+            primary_exc = _primary_attempt_exception(exc)
             error_response = InferenceResponse(
                 response_text="Request processing failed",
                 model_name=failed_model,
@@ -2486,7 +2837,12 @@ class InferenceEngine:
                 provider="error",
                 cached=False,
                 error="inference_failed",
-                error_type=classify_inference_error(_primary_attempt_exception(exc)),
+                error_type=classify_inference_error(primary_exc),
+                error_code=inference_error_code(primary_exc),
+                retry_after_seconds=_retry_after_seconds(primary_exc),
+                provider_request_id=_exception_provider_request_id(primary_exc),
+                finish_reason="error",
+                attempts=len(set(started_calls)),
             )
             # The caller keeps the "error" provider sentinel; analytics get the
             # failed model's real provider so outages count against it.
@@ -2503,6 +2859,35 @@ class InferenceEngine:
                 else None,
             )
             return error_response
+
+    def _flag_incomplete_response(
+        self, request: QueryRequest, response: InferenceResponse
+    ) -> bool:
+        """Warn about a truncated, filtered or empty answer; True if complete."""
+        warnings = []
+        if response.finish_reason != "stop":
+            warnings.append(
+                _FINISH_REASON_WARNINGS.get(
+                    response.finish_reason, _UNFINISHED_RESPONSE_WARNING
+                )
+            )
+        if not (response.response_text or "").strip():
+            warnings.append("empty_response")
+        complete = response.finish_reason == "stop" and not warnings
+        if not complete:
+            logger.warning(
+                "Model %s returned an incomplete answer for request %s "
+                "(finish_reason=%s, empty=%s)",
+                response.model_name,
+                request.request_id,
+                response.finish_reason,
+                "empty_response" in warnings,
+            )
+        response.warnings = [
+            *response.warnings,
+            *(warning for warning in warnings if warning not in response.warnings),
+        ]
+        return complete
 
     async def _finalize_successful_response(
         self,
@@ -2541,7 +2926,15 @@ class InferenceEngine:
         self,
         request: QueryRequest,
         routing_decision: Any,
+        time_limit_seconds: Optional[float] = None,
     ) -> Optional[WebSearchResult]:
+        """Run web search when the request needs it, within time_limit_seconds.
+
+        Running out of time is a failed search (warning, prompt notice, no
+        cache), not a request failure.
+        """
+        # Likewise only this method sets web_search_unavailable.
+        _drop_metadata_key(request, "web_search_unavailable")
         if not self._should_run_web_search(request, routing_decision):
             return None
 
@@ -2557,11 +2950,36 @@ class InferenceEngine:
                 blocked_reason="web_search_not_configured",
             )
         else:
-            result = await self.web_search_tool.search(
-                request.query,
-                user_id=request.user_id,
-                options=request.web_search_options,
-            )
+            started_at = time.time()
+            try:
+                result = await _await_within(
+                    self.web_search_tool.search(
+                        request.query,
+                        user_id=request.user_id,
+                        options=request.web_search_options,
+                    ),
+                    time_limit_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Web search for request %s ran out of its %ss share of the "
+                    "request deadline",
+                    request.request_id,
+                    time_limit_seconds,
+                )
+                backend = getattr(self.web_search_tool, "backend", None)
+                result = WebSearchResult(
+                    tool_call=ToolCall(
+                        name="web_search",
+                        provider=str(getattr(backend, "provider_name", "unknown")),
+                        arguments={"query": request.query},
+                        result_count=0,
+                        latency_ms=int((time.time() - started_at) * 1000),
+                        error="web_search_timeout",
+                    ),
+                    blocked_reason="web_search_timeout",
+                    warnings=[WEB_SEARCH_UNAVAILABLE_WARNING],
+                )
 
         if result.context:
             request.metadata["web_search_context"] = result.context
@@ -2571,13 +2989,32 @@ class InferenceEngine:
         elif result.blocked_reason:
             request.metadata["web_search_blocked_reason"] = result.blocked_reason
             request.metadata["web_search_cache_bypass"] = True
+        search_failed = WEB_SEARCH_UNAVAILABLE_WARNING in (
+            getattr(result, "warnings", None) or []
+        )
+        if search_failed or (
+            request.tool_policy == ToolPolicy.REQUIRED and not result.context
+        ):
+            # The prompt tells the model not to pass older knowledge off as
+            # current; such an answer is not worth caching either.
+            request.metadata["web_search_unavailable"] = True
+            request.metadata["web_search_cache_bypass"] = True
         return result
 
     async def _run_rag_if_needed(
         self,
         request: QueryRequest,
         routing_decision: Any,
+        time_limit_seconds: Optional[float] = None,
     ) -> Optional[SimpleNamespace]:
+        """Retrieve documents when the request needs them, within time_limit_seconds.
+
+        Running out of time is a retrieval timeout: rag_policy AUTO answers
+        without documents, REQUIRED raises RetrievalUnavailableError.
+        """
+        # Only this method decides whether the prompt says retrieval failed,
+        # so a caller's own rag_unavailable never reaches the prompt.
+        _drop_metadata_key(request, "rag_unavailable")
         if not self._should_run_rag(request, routing_decision):
             return None
 
@@ -2591,22 +3028,51 @@ class InferenceEngine:
         min_score = (
             options.min_score if options and options.min_score is not None else None
         )
-        results = await self.rag_service.retrieve(
-            request.query,
-            knowledge_base_ids=request.knowledge_base_ids,
+        outcome = await self._retrieve_rag_outcome(
+            request,
+            time_limit_seconds=time_limit_seconds,
             max_results=max_results,
             candidate_count=candidate_count,
             min_score=min_score,
         )
+        results = list(outcome.results)
+        rag_unavailable = outcome.status in _RAG_UNAVAILABLE_STATUSES
         latency_ms = int((time.time() - started_at) * 1000)
         tool_call = self.rag_service.tool_call_from_results(
             request.query,
             results,
             latency_ms,
         )
+        if rag_unavailable and isinstance(tool_call, ToolCall):
+            tool_call = tool_call.model_copy(update={"error": f"rag_{outcome.status}"})
         sources = self.rag_service.sources_from_results(results)
+        warnings: List[str] = []
 
-        if results:
+        if rag_unavailable:
+            request.metadata["rag_hit_count"] = 0
+            request.metadata["rag_unavailable"] = outcome.status
+            request.metadata["rag_cache_bypass"] = True
+            if request.rag_policy == RagPolicy.REQUIRED:
+                raise RetrievalUnavailableError(
+                    outcome.status, getattr(outcome, "detail", None)
+                )
+            logger.warning(
+                "RAG retrieval %s for request %s; answering without documents",
+                outcome.status,
+                request.request_id,
+            )
+            warnings.append("rag_unavailable")
+        elif results:
+            if getattr(outcome, "degraded", False) is True:
+                # Hits, but a failed branch may have held a better match:
+                # answer with them, without caching the answer for the TTL.
+                logger.warning(
+                    "RAG retrieval for request %s degraded (%s)",
+                    request.request_id,
+                    getattr(outcome, "detail", None),
+                )
+                request.metadata["rag_cache_bypass"] = True
+                warnings.append("rag_degraded")
             request.metadata["rag_context"] = self.rag_service.build_context(results)
             request.metadata["rag_hit_count"] = len(results)
             request.metadata["rag_chunk_ids"] = [
@@ -2629,7 +3095,90 @@ class InferenceEngine:
             tool_call=tool_call,
             latency_ms=latency_ms,
             required_no_hits=request.rag_policy == RagPolicy.REQUIRED and not results,
+            warnings=warnings,
         )
+
+    async def _retrieve_rag_outcome(
+        self,
+        request: QueryRequest,
+        *,
+        time_limit_seconds: Optional[float] = None,
+        **retrieve_kwargs: Any,
+    ) -> Any:
+        """Retrieve with a typed outcome: hits, no_hits, timeout or error.
+
+        time_limit_seconds (this step's share of the request deadline) can
+        only shorten the RAG service's own deadline. The service works to it
+        itself, so a hung branch still leaves the answered branch's hits; a
+        timer around the call would cancel those too.
+
+        RAG services without ``retrieve_with_outcome`` only answer a list, so
+        a raised error is the only failure signal they can give.
+        """
+        retrieve_with_outcome = getattr(self.rag_service, "retrieve_with_outcome", None)
+        if callable(retrieve_with_outcome):
+            return await retrieve_with_outcome(
+                request.query,
+                knowledge_base_ids=request.knowledge_base_ids,
+                deadline_seconds=time_limit_seconds,
+                **retrieve_kwargs,
+            )
+        try:
+            results = await _await_within(
+                self.rag_service.retrieve(
+                    request.query,
+                    knowledge_base_ids=request.knowledge_base_ids,
+                    **retrieve_kwargs,
+                ),
+                time_limit_seconds,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "RAG retrieval for request %s timed out (share of the request "
+                "deadline: %ss)",
+                request.request_id,
+                time_limit_seconds,
+            )
+            return SimpleNamespace(status="timeout", results=[], detail=None)
+        except Exception as exc:
+            logger.warning("RAG retrieval failed: %s", exc, exc_info=True)
+            return SimpleNamespace(
+                status="error", results=[], detail=type(exc).__name__
+            )
+        return SimpleNamespace(
+            status="hits" if results else "no_hits",
+            results=list(results or []),
+            detail=None,
+        )
+
+    def _retrieval_time_limit(
+        self, execution_budget: Optional[RequestExecutionBudget]
+    ) -> Optional[float]:
+        """Seconds one retrieval step may use: a share of the request time left.
+
+        At least the scheduler's minimum attempt window stays for the model;
+        with less than that left, retrieval gets no time.
+        """
+        if execution_budget is None:
+            return None
+        try:
+            ratio = float(
+                self.config.get(
+                    "retrieval_budget_ratio", _DEFAULT_RETRIEVAL_BUDGET_RATIO
+                )
+            )
+        except (TypeError, ValueError):
+            ratio = _DEFAULT_RETRIEVAL_BUDGET_RATIO
+        if not 0.0 < ratio < 1.0:
+            ratio = _DEFAULT_RETRIEVAL_BUDGET_RATIO
+        # The step must end on its own clock before the request deadline's
+        # backstop fires, or the backstop wins and the outcome is lost.
+        model_window = max(
+            _RETRIEVAL_BACKSTOP_MARGIN_SECONDS,
+            float(getattr(self.scheduler, "min_attempt_window_seconds", 1.0)),
+        )
+        remaining = execution_budget.remaining_seconds
+        return max(0.0, min(remaining * ratio, remaining - model_window))
 
     async def _prepare_rag_images(
         self,
@@ -2657,7 +3206,7 @@ class InferenceEngine:
                 *request.metadata.get("rag_warnings", []),
                 *warnings,
             ]
-            rag_result.warnings = list(request.metadata["rag_warnings"])
+            _merge_rag_warnings(rag_result, request)
         if not images:
             if warnings:
                 warning = (
@@ -2667,7 +3216,7 @@ class InferenceEngine:
                     *request.metadata.get("rag_warnings", []),
                     warning,
                 ]
-                rag_result.warnings = list(request.metadata["rag_warnings"])
+                _merge_rag_warnings(rag_result, request)
                 RAG_METRICS.vision_outcomes.labels(
                     "text_only_materialization_failure"
                 ).inc()
@@ -2705,7 +3254,7 @@ class InferenceEngine:
                     *request.metadata.get("rag_warnings", []),
                     "rag_vision_fallback: no policy-eligible vision model",
                 ]
-                rag_result.warnings = list(request.metadata["rag_warnings"])
+                _merge_rag_warnings(rag_result, request)
                 RAG_METRICS.vision_outcomes.labels("text_only_no_model").inc()
                 return routing_decision
             request.metadata["rag_original_model"] = selected
@@ -3081,10 +3630,15 @@ class InferenceEngine:
         request: QueryRequest,
         routing_decision: Any,
         execution_budget: Optional[RequestExecutionBudget] = None,
+        started_calls: Optional[List[str]] = None,
     ) -> Tuple[InferenceResponse, str, Any]:
+        """Generate with fallbacks; ``started_calls`` collects the models called."""
         if execution_budget is None:
             return await self._generate_response_with_fallback_unbounded(
-                request, routing_decision, execution_budget=None
+                request,
+                routing_decision,
+                execution_budget=None,
+                started_calls=started_calls,
             )
         if execution_budget.remaining_seconds <= 0:
             # Routing, compression, image prep or the cache lookup used the
@@ -3095,7 +3649,10 @@ class InferenceEngine:
         execution_budget.ensure_available()
         return await asyncio.wait_for(
             self._generate_response_with_fallback_unbounded(
-                request, routing_decision, execution_budget=execution_budget
+                request,
+                routing_decision,
+                execution_budget=execution_budget,
+                started_calls=started_calls,
             ),
             timeout=execution_budget.remaining_seconds,
         )
@@ -3105,6 +3662,7 @@ class InferenceEngine:
         request: QueryRequest,
         routing_decision: Any,
         execution_budget: Optional[RequestExecutionBudget] = None,
+        started_calls: Optional[List[str]] = None,
     ) -> Tuple[InferenceResponse, str, Any]:
         """Generate a response and fall back to local models when cloud models fail.
 
@@ -3114,7 +3672,11 @@ class InferenceEngine:
         primary_failures: List[BaseException] = []
         try:
             return await self._generate_response_with_fallback_attempts(
-                request, routing_decision, execution_budget, primary_failures
+                request,
+                routing_decision,
+                execution_budget,
+                primary_failures,
+                [] if started_calls is None else started_calls,
             )
         except BaseException as exc:
             if primary_failures and exc is not primary_failures[0]:
@@ -3127,6 +3689,7 @@ class InferenceEngine:
         routing_decision: Any,
         execution_budget: Optional[RequestExecutionBudget],
         primary_failures: List[BaseException],
+        started_calls: List[str],
     ) -> Tuple[InferenceResponse, str, Any]:
         primary_model = routing_decision.selected_model
         primary_started_at = time.time()
@@ -3142,7 +3705,6 @@ class InferenceEngine:
         ):
             fallback_reserve_seconds = execution_budget.fallback_reserve_seconds()
             reserve_attempts = 1
-        started_calls: List[str] = []
 
         try:
             response = await self._execute_model_request(
