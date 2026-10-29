@@ -70,6 +70,7 @@ from slack.files import (
 )
 from src.admission import AdmissionRejectedError
 from src.memory import MemoryManager, build_memory_scope
+from src.prompt_assembly import protect_untrusted_boundary
 from src.utils.schema import (
     Attachment,
     AttachmentType,
@@ -187,6 +188,8 @@ RATE_LIMIT_BURST_WINDOW_SECONDS = 300
 CHAT_MESSAGE_SUBTYPES = frozenset(AgentBootstrapBuilder._INCLUDED_SUBTYPES)
 # How the bot's own messages appear in the Slack history a request sees.
 SLACK_OWN_MESSAGE_SENDER = "assistant (you)"
+# Fence name for fetched Slack history: `<untrusted_slack_history>`.
+SLACK_HISTORY_FENCE = "slack_history"
 # Most characters of per-user conversation summary a request carries.
 CONVERSATION_SUMMARY_MAX_CHARS = 8000
 SLACK_PRIORITY_WORK_KINDS = frozenset({"interactive"})
@@ -3076,11 +3079,13 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             request_context = self._join_context_sections(
                 [slack_context.context, conversation_context]
             )
+            # Memory hits change with every query, so they ride in metadata
+            # and inference places them after the history, not before it.
+            memory_context = ""
             if memory_results:
                 try:
-                    request_context = self.bot.memory_manager.build_context(
-                        memory_results,
-                        request_context,
+                    memory_context = self.bot.memory_manager.build_context(
+                        memory_results, ""
                     )
                 except Exception:
                     logger.exception("Failed to build Slack memory context")
@@ -3111,6 +3116,8 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             )
             query_metadata.update(dict(routing_metadata or {}))
             self._add_slack_context_metadata(query_metadata, slack_context)
+            if memory_context:
+                query_metadata["memory_context"] = memory_context
 
             query_request = QueryRequest(
                 query=text,
@@ -4323,15 +4330,22 @@ class SlackBot:
         header = (
             "Slack thread context:" if source == "thread" else "Recent channel context:"
         )
+        # Other people's messages are data for the model, never instructions:
+        # fenced, with any look-alike of the fence's tags escaped.
         candidate_lines = [
-            f"{self._slack_context_sender(message)}: "
-            f"{self._slack_context_message_text(message)}"
+            protect_untrusted_boundary(
+                f"{self._slack_context_sender(message)}: "
+                f"{self._slack_context_message_text(message)}"
+            )
             for message in messages
         ]
+        opening = f"<untrusted_{SLACK_HISTORY_FENCE}>"
+        closing = f"</untrusted_{SLACK_HISTORY_FENCE}>"
 
         max_chars = int(self.context_settings.get("max_context_chars", 4000))
         body, included_count, truncated = bounded_join_newest(
-            candidate_lines, max_chars - len(header) - 1
+            candidate_lines,
+            max_chars - len(header) - len(opening) - len(closing) - 3,
         )
         if included_count < len(candidate_lines):
             truncated = True
@@ -4339,7 +4353,7 @@ class SlackBot:
             return SlackFetchedContext(source=source, truncated=True)
 
         return SlackFetchedContext(
-            context=f"{header}\n{body}",
+            context=f"{header}\n{opening}\n{body}\n{closing}",
             source=source,
             message_count=included_count,
             truncated=truncated,

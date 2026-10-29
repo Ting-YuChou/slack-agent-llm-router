@@ -11,6 +11,11 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, NamedTuple, NoReturn, Optional, Tuple
 
+from src.prompt_assembly import (
+    SYSTEM_PROMPT,
+    build_prompt_sections,
+    join_prompt_sections,
+)
 from src.routing_features import build_routing_features
 from src.utils.metrics import ROUTER_METRICS
 from src.utils.schema import (
@@ -989,29 +994,15 @@ class ModelRouter:
         return query_type == QueryType.WEB_RESEARCH
 
     def _estimate_request_token_count(self, request: QueryRequest) -> int:
-        """Approximate the prompt shape used by inference providers for routing."""
-        prompt_parts = []
-        response_style_instructions = (request.metadata or {}).get(
-            "response_style_instructions"
-        )
-        if response_style_instructions:
-            prompt_parts.append(
-                f"Response style instructions:\n{response_style_instructions}"
-            )
-
-        attachment_prompt = self._estimate_attachment_prompt(request)
-        if attachment_prompt:
-            prompt_parts.append(attachment_prompt)
-
-        if request.context:
-            prompt_parts.append(f"Context: {request.context}")
-        rag_context = (request.metadata or {}).get("rag_context")
-        if rag_context:
-            prompt_parts.append(str(rag_context))
-        web_search_context = (request.metadata or {}).get("web_search_context")
-        if web_search_context:
-            prompt_parts.append(str(web_search_context))
-        prompt_parts.append(f"Query: {request.query}")
+        """Count the prompt inference providers send, system prompt included."""
+        prompt_parts = [
+            SYSTEM_PROMPT,
+            join_prompt_sections(
+                build_prompt_sections(
+                    request, self._estimate_attachment_prompt(request)
+                )
+            ),
+        ]
 
         return self.token_counter.count_tokens("\n\n".join(prompt_parts))
 
