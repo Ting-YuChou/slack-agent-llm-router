@@ -465,8 +465,8 @@ def rejection_id(rejection):
     )
 
 
-async def reply_to(rejection):
-    bot = chat_bot(AsyncMock(side_effect=rejection))
+async def reply_to(rejection, **config):
+    bot = chat_bot(AsyncMock(side_effect=rejection), **config)
     await bot._process_message(top_level(ts="200.0"))
     assert history(bot, "200.0") == []
     return bot.web_client.chat_postMessage.await_args.kwargs["text"]
@@ -478,9 +478,7 @@ async def reply_to(rejection):
     [
         admission_rejection("user_request_rate_exceeded"),
         admission_rejection("identity_request_rate_exceeded"),
-        admission_rejection("tier_request_rate_exceeded"),
         admission_rejection("user_token_budget_exceeded"),
-        admission_rejection("tier_token_budget_exceeded"),
         # A queue wait that ended on the user's own budget.
         admission_rejection(
             "scheduler_queue_timeout", last_reason="user_token_budget_exceeded"
@@ -491,9 +489,35 @@ async def reply_to(rejection):
 async def test_an_admission_rejection_of_the_users_own_quota_says_so(rejection):
     text = await reply_to(rejection)
 
-    assert "quota" in text
+    assert "You've reached your" in text and "quota" in text
     assert "busy" not in text.lower()
     assert "Please try again in 2 minutes." in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rejection,quota",
+    [
+        (admission_rejection("tier_request_rate_exceeded"), "request"),
+        (admission_rejection("tier_token_budget_exceeded"), "token"),
+        (
+            admission_rejection(
+                "scheduler_queue_timeout", last_reason="tier_token_budget_exceeded"
+            ),
+            "token",
+        ),
+    ],
+    ids=lambda value: rejection_id(value) if not isinstance(value, str) else value,
+)
+async def test_a_tier_quota_rejection_reads_as_a_shared_limit(rejection, quota):
+    # Every user of the tier fills one bucket: this user may have sent nothing.
+    text = await reply_to(rejection, user_tiers={"default": "premium"})
+
+    assert (
+        f"The Premium tier's shared {quota} quota is used up right now. "
+        "Please try again in 2 minutes."
+    ) in text
+    assert "You've" not in text and "your" not in text
 
 
 @pytest.mark.asyncio

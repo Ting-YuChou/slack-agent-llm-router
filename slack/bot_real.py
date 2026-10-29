@@ -1264,18 +1264,30 @@ def _response_warning_label(warnings: Any) -> str:
     return f"[{'; '.join(labels)}]" if labels else ""
 
 
-# Admission reasons that are the user's own quota (src/admission.py), and how
-# to name it. Every other rejection is shared capacity: the router is busy.
-ADMISSION_QUOTA_REASONS = {
-    "identity_request_rate_exceeded": "your request quota",
-    "user_request_rate_exceeded": "your request quota",
-    "user_token_budget_exceeded": "your token quota",
-    "tier_request_rate_exceeded": "your tier's request quota",
-    "tier_token_budget_exceeded": "your tier's token quota",
+# Admission reasons that are a quota rather than capacity (src/admission.py),
+# by the kind of quota. The user's own:
+ADMISSION_USER_QUOTA_REASONS = {
+    "identity_request_rate_exceeded": "request",
+    "user_request_rate_exceeded": "request",
+    "user_token_budget_exceeded": "token",
 }
+# One bucket shared by every user of a tier, so not this user's doing:
+ADMISSION_TIER_QUOTA_REASONS = {
+    "tier_request_rate_exceeded": "request",
+    "tier_token_budget_exceeded": "token",
+}
+# Every other rejection is shared capacity: the router is busy.
 
 
-def _admission_rejection_text(decision: Any) -> str:
+def _busy_text(wait: Optional[str]) -> str:
+    if wait:
+        return f"⏳ The LLM Router is busy right now. Please try again in {wait}."
+    return SLACK_BUSY_MESSAGE
+
+
+def _admission_rejection_text(
+    decision: Any, user_tier: Optional[UserTier] = None
+) -> str:
     """The reply when admission turns a query away: a quota, or capacity."""
     reason = str(getattr(decision, "reason", "") or "")
     if reason == "scheduler_queue_timeout":
@@ -1283,13 +1295,15 @@ def _admission_rejection_text(decision: Any) -> str:
         metadata = getattr(decision, "metadata", None) or {}
         reason = str(metadata.get("last_reason") or "")
     wait = _retry_wait(getattr(decision, "retry_after_seconds", None))
-    quota = ADMISSION_QUOTA_REASONS.get(reason)
-    if quota:
-        when = f"Please try again in {wait}." if wait else "Please try again later."
-        return f"⏳ You've reached {quota} for now. {when}"
-    if wait:
-        return f"⏳ The LLM Router is busy right now. Please try again in {wait}."
-    return SLACK_BUSY_MESSAGE
+    when = f"Please try again in {wait}." if wait else "Please try again later."
+    if reason in ADMISSION_USER_QUOTA_REASONS:
+        quota = ADMISSION_USER_QUOTA_REASONS[reason]
+        return f"⏳ You've reached your {quota} quota for now. {when}"
+    if reason in ADMISSION_TIER_QUOTA_REASONS:
+        quota = ADMISSION_TIER_QUOTA_REASONS[reason]
+        tier = f"The {user_tier.value.title()} tier's" if user_tier else "A tier's"
+        return f"⏳ {tier} shared {quota} quota is used up right now. {when}"
+    return _busy_text(wait)
 
 
 class UserManager:
@@ -3153,7 +3167,9 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 e.decision.reason,
             )
             SLACK_METRICS.errors.labels(error_type=type(e).__name__).inc()
-            return _admission_rejection_text(e.decision)
+            return _admission_rejection_text(
+                e.decision, self.bot.user_manager.get_user_tier(user_id)
+            )
         except Exception as e:
             logger.error(f"Error processing query: {e}")
             SLACK_METRICS.errors.labels(error_type=type(e).__name__).inc()
