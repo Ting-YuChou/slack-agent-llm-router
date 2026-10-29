@@ -1357,6 +1357,11 @@ class vLLMProvider(BaseInferenceProvider):
                 )
 
             except Exception as e:
+                if self._is_request_rejection(e):
+                    logger.warning(
+                        "vLLM endpoint %s rejected the request: %s", endpoint.name, e
+                    )
+                    raise
                 last_error = e
                 excluded_endpoints.add(endpoint.name)
                 await self._mark_endpoint_failure(endpoint, e)
@@ -1401,6 +1406,9 @@ class vLLMProvider(BaseInferenceProvider):
             await self._mark_endpoint_success(endpoint, prefix_key)
 
         except Exception as e:
+            if self._is_request_rejection(e):
+                logger.warning("vLLM endpoint rejected the stream request: %s", e)
+                raise
             if endpoint is not None:
                 await self._mark_endpoint_failure(endpoint, e)
             logger.error(f"vLLM streaming error: {e}")
@@ -1553,6 +1561,18 @@ class vLLMProvider(BaseInferenceProvider):
                     endpoint.name,
                     time.time() + self.prefix_affinity_ttl_seconds,
                 )
+
+    @staticmethod
+    def _is_request_rejection(error: Exception) -> bool:
+        """A 4xx other than 408/429 faults the request, not the endpoint.
+
+        Every endpoint would reject it the same way, so it is neither retried
+        elsewhere nor counted against the endpoint's health.
+        """
+        if not isinstance(error, httpx.HTTPStatusError):
+            return False
+        status = error.response.status_code
+        return 400 <= status < 500 and status not in (408, 429)
 
     async def _mark_endpoint_failure(
         self, endpoint: VLLMEndpointState, error: Exception
