@@ -571,11 +571,14 @@ _ANTHROPIC_STOP_REASONS = {
     "refusal": "content_filter",
     "tool_use": "tool_calls",
 }
-# Warnings for answers that are returned but must not be cached.
+# Warnings for answers that are returned but must not be cached; any other
+# finish_reason but "stop" (vLLM abort, OpenAI failed or cancelled) gets
+# the generic one.
 _FINISH_REASON_WARNINGS = {
     "length": "response_truncated",
     "content_filter": "response_filtered",
 }
+_UNFINISHED_RESPONSE_WARNING = "response_incomplete"
 
 
 def _field_value(container: Any, name: str) -> Any:
@@ -2750,6 +2753,7 @@ class InferenceEngine:
                 error_code=inference_error_code(primary_exc),
                 retry_after_seconds=_retry_after_seconds(primary_exc),
                 provider_request_id=_exception_provider_request_id(primary_exc),
+                finish_reason="error",
             )
             # The caller keeps the "error" provider sentinel; analytics get the
             # failed model's real provider so outages count against it.
@@ -2772,9 +2776,12 @@ class InferenceEngine:
     ) -> bool:
         """Warn about a truncated, filtered or empty answer; True if complete."""
         warnings = []
-        finish_warning = _FINISH_REASON_WARNINGS.get(response.finish_reason)
-        if finish_warning:
-            warnings.append(finish_warning)
+        if response.finish_reason != "stop":
+            warnings.append(
+                _FINISH_REASON_WARNINGS.get(
+                    response.finish_reason, _UNFINISHED_RESPONSE_WARNING
+                )
+            )
         if not (response.response_text or "").strip():
             warnings.append("empty_response")
         complete = response.finish_reason == "stop" and not warnings

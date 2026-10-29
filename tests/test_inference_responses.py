@@ -330,6 +330,39 @@ async def test_error_response_reads_x_request_id_from_httpx_errors(
     assert response.provider_request_id == "vllm-failed-1"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "finish_reason",
+    ["abort", "failed", "cancelled", "incomplete", "tool_calls"],
+)
+async def test_other_unfinished_answers_get_a_generic_warning(
+    sample_query_request, inference_response_factory, finish_reason
+):
+    engine, event_producer = _engine(
+        inference_response_factory(finish_reason=finish_reason)
+    )
+
+    response = await engine.process_query(sample_query_request)
+
+    assert response.finish_reason == finish_reason
+    assert "response_incomplete" in response.warnings
+    assert "response_truncated" not in response.warnings
+    engine.cache.cache_response.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_request_reports_finish_reason_error(sample_query_request):
+    engine, event_producer = _engine(side_effect=_SDKStatusError(503, "req_3"))
+
+    response = await engine.process_query(sample_query_request)
+
+    assert response.finish_reason == "error"
+    published = event_producer.produce_inference_completed.await_args.args[1]
+    event = build_inference_completed_event(sample_query_request, published)
+    assert event["status"] == "error"
+    assert event["finish_reason"] == "error"
+
+
 # Real SDK objects: CI has no openai/anthropic SDK, so these run locally only.
 
 
