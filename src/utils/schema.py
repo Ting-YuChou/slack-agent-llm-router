@@ -151,10 +151,10 @@ class QueryRequest(BaseModel):
 
     # Core fields with proper types
     user_tier: UserTier = UserTier.FREE
+    # Only its length is checked, as before; X-Request-ID is held to
+    # REQUEST_ID_PATTERN (main.py).
     request_id: str = Field(
-        default_factory=lambda: str(uuid.uuid4()),
-        max_length=REQUEST_ID_MAX_LENGTH,
-        pattern=REQUEST_ID_PATTERN,
+        default_factory=lambda: str(uuid.uuid4()), max_length=REQUEST_ID_MAX_LENGTH
     )
     timestamp: datetime = Field(default_factory=utc_now)
 

@@ -174,12 +174,12 @@ def _alert_payload(data: Dict[str, Any]) -> Any:
     return redact({key: data[key] for key in ALERT_PAYLOAD_FIELDS if key in data})
 
 
-REQUEST_SURFACES = frozenset({"mention", "thread", "slash", "api"})
+REQUEST_SURFACES = frozenset({"mention", "thread", "dm", "slash", "api"})
 
 
 def request_source_and_surface(query_request: Any) -> Tuple[str, Optional[str]]:
-    """Where a request came from: ("slack", "mention" | "thread" | "slash")
-    or ("api", "api").
+    """Where a request came from: ("slack", "mention" | "thread" | "dm" |
+    "slash") or ("api", "api").
 
     Only the server writes these metadata keys (external /route metadata is
     allowlisted), so a request without them came through the API.

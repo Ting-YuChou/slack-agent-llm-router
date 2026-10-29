@@ -741,7 +741,7 @@ class SlackQueryTrace:
     """What ties a Slack chat query to its logs, events and feedback."""
 
     request_id: Optional[str] = None
-    # mention | thread | slash
+    # mention | thread | dm | slash
     surface: Optional[str] = None
     event_id: Optional[str] = None
 
@@ -749,11 +749,14 @@ class SlackQueryTrace:
     def for_message(
         cls, event: Dict[str, Any], *, team_id: Optional[str]
     ) -> "SlackQueryTrace":
-        surface = (
-            "thread"
-            if event.get("type") == "message" and event.get("thread_ts")
-            else "mention"
-        )
+        thread_ts = event.get("thread_ts")
+        if event.get("channel_type") == "im":
+            surface = "dm"
+        elif thread_ts and thread_ts != event.get("ts"):
+            # A reply in a thread, mentioning the bot or not.
+            surface = "thread"
+        else:
+            surface = "mention"
         event_id = event.get("_event_id")
         return cls(
             request_id=slack_chat_request_id(

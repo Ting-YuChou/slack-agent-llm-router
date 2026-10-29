@@ -6,13 +6,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import ValidationError
 
 import main
 from slack.bot_real import SlackBot
 from src.llm_router_part3_pipeline import build_inference_completed_event
 from src.utils.logger import request_id_context
-from src.utils.schema import InferenceResponse, QueryRequest
+from src.utils.schema import InferenceResponse, QueryRequest, is_valid_request_id
 
 from test_inference_resilience import _ENTERPRISE, _chain_engine, _request, _response
 from test_inference_resilience import _router
@@ -82,12 +81,10 @@ def test_route_rejects_an_invalid_x_request_id(tmp_path, patched_platform_deps, 
     assert inference.processed_requests == []
 
 
-@pytest.mark.parametrize("bad_id", ["has space", "a/b", "line\nbreak", ""])
-def test_query_request_id_charset_is_checked(bad_id):
-    with pytest.raises(ValidationError):
-        QueryRequest(query="hi", user_id="u1", request_id=bad_id)
-
-    QueryRequest(query="hi", user_id="u1", request_id="slash:1.2.abc-DEF_9")
+@pytest.mark.parametrize("bad_id", ["has space", "a/b", "line\nbreak", "", None])
+def test_the_header_request_id_charset_is_checked(bad_id):
+    assert not is_valid_request_id(bad_id)
+    assert is_valid_request_id("slash:1.2.abc-DEF_9")
 
 
 def test_route_rejection_still_carries_the_request_id_header(

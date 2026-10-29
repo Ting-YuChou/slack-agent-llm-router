@@ -54,7 +54,7 @@ from src.provider_scheduler import (
 )
 from src.provider_scheduler import is_billing_exhausted as _is_billing_exhausted
 from src.provider_scheduler import provider_error_text as _provider_error_text
-from src.utils.logger import set_request_context
+from src.utils.logger import RequestContextManager
 from src.utils.metrics import INFERENCE_METRICS, RAG_METRICS
 from src.utils.schema import (
     AttachmentType,
@@ -1054,13 +1054,26 @@ class ResponseCache:
             json.dumps(key_payload, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
 
+    # Trace fields that name the asking message, not what it asks.
+    TRACE_METADATA_KEYS = {"surface"}
+    SLACK_TRACE_METADATA_KEYS = {"message_ts", "event_id"}
+
     def _cacheable_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
         """Drop analytics-only fields that should not fragment response cache keys."""
-        return {
+        cacheable = {
             key: value
             for key, value in metadata.items()
             if key not in self.ANALYTICS_METADATA_KEYS
+            and key not in self.TRACE_METADATA_KEYS
         }
+        slack = cacheable.get("slack")
+        if isinstance(slack, dict):
+            cacheable["slack"] = {
+                key: value
+                for key, value in slack.items()
+                if key not in self.SLACK_TRACE_METADATA_KEYS
+            }
+        return cacheable
 
 
 class RequestStageDeadlineError(Exception):
@@ -2780,15 +2793,17 @@ class InferenceEngine:
 
     async def process_query(self, request: QueryRequest) -> InferenceResponse:
         """Process query through the complete inference pipeline"""
+        # Logs carry this request's ids while it runs, and only then.
+        with RequestContextManager(
+            request.request_id, request.user_id, request.session_id
+        ):
+            return await self._process_query(request)
+
+    async def _process_query(self, request: QueryRequest) -> InferenceResponse:
         start_time = time.time()
 
         # Log with the caller's request id so logs join the analytics events.
         request_id = request.request_id
-        set_request_context(
-            request_id=request_id,
-            user_id=request.user_id,
-            session_id=request.session_id,
-        )
         # One deadline for the whole request: time spent on retrieval comes out
         # of the model calls' share instead of extending the request.
         execution_budget = (
