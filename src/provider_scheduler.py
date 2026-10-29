@@ -120,8 +120,17 @@ SCHEDULER_WAITABLE_REASONS = {
     "model_token_budget_exceeded",
 }
 
-# HTTP statuses worth another attempt. 529 is Anthropic's "overloaded".
-RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
+# 4xx statuses worth another attempt. Every 5xx is too (529 is Anthropic's
+# "overloaded", 520-524 and 530 come from Cloudflare in front of a provider)
+# except the two that say the server will never handle the request.
+RETRYABLE_CLIENT_STATUS_CODES = frozenset({408, 409, 425, 429})
+PERMANENT_SERVER_STATUS_CODES = frozenset({501, 505})
+
+
+def _is_retryable_status(status: int) -> bool:
+    if status >= 500:
+        return status not in PERMANENT_SERVER_STATUS_CODES
+    return status in RETRYABLE_CLIENT_STATUS_CODES
 
 
 def _exception_status_code(exc: BaseException) -> Optional[int]:
@@ -1383,7 +1392,7 @@ class ProviderCapacityScheduler:
         # the 200 of the stream) says nothing, so the heuristics below decide.
         status = _exception_status_code(exc)
         if status is not None and 400 <= status <= 599:
-            return status in RETRYABLE_STATUS_CODES
+            return _is_retryable_status(status)
         name = type(exc).__name__.lower()
         transient_names = (
             "ratelimit",

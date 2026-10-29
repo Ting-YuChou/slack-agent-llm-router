@@ -981,7 +981,11 @@ async def test_client_error_status_is_not_retried_and_keeps_circuit_closed(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error_type", [StatusCodeError, ResponseStatusError])
-@pytest.mark.parametrize("status_code", [408, 409, 425, 429, 500, 502, 503, 504, 529])
+@pytest.mark.parametrize(
+    "status_code",
+    # 520-524 and 530 are Cloudflare's, in front of the providers.
+    [408, 409, 425, 429, 500, 502, 503, 504, 520, 522, 524, 529, 530],
+)
 async def test_transient_status_is_retryable_and_counts_toward_circuit(
     error_type, status_code
 ):
@@ -1018,6 +1022,31 @@ async def test_transient_status_is_retryable_and_counts_toward_circuit(
         )
     state = await scheduler._read_circuit_state("openai", "gpt-5")
     assert state["state"] == "open"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [StatusCodeError, ResponseStatusError])
+@pytest.mark.parametrize("status_code", [501, 505])
+async def test_permanent_server_status_is_not_retried(error_type, status_code):
+    clock = Clock()
+    scheduler = _circuit_scheduler(
+        clock, retry={"max_attempts_per_request": 3, "initial_backoff_ms": 0}
+    )
+    error = error_type("upstream refused the request", status_code)
+    operation = AsyncMock(side_effect=error)
+
+    assert scheduler._is_retryable_exception(error) is False
+    with pytest.raises(error_type):
+        await scheduler.run_provider_call(
+            request=QueryRequest(query="hello", user_id="u1"),
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+            operation=operation,
+        )
+
+    assert operation.await_count == 1
+    await _assert_circuit_closed_and_admitting(scheduler)
 
 
 @pytest.mark.asyncio
@@ -1144,6 +1173,9 @@ def test_real_sdk_errors_are_classified_by_status_code():
         openai.APIStatusError(
             "model gpt-5-0503 not found", response=response(404), body=None
         ),
+        openai.InternalServerError(
+            "not implemented", response=response(501), body=None
+        ),
     ]
     retryable = [
         openai.APIStatusError(
@@ -1154,6 +1186,9 @@ def test_real_sdk_errors_are_classified_by_status_code():
         ),
         openai.RateLimitError("slow down", response=response(429), body=None),
         anthropic.InternalServerError("oops", response=response(500), body=None),
+        openai.InternalServerError(
+            "origin did not answer", response=response(524), body=None
+        ),
         openai.APIConnectionError(request=request),
         openai.APITimeoutError(request=request),
         anthropic.APIConnectionError(request=request),
