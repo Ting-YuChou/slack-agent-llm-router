@@ -197,17 +197,27 @@ _PAYLOADS = [
 ]
 
 
-def test_provider_guardrail_input_excludes_non_provider_failures(job_graph):
+def test_provider_guardrail_reads_the_shared_model_metrics_windows(job_graph):
     (detector,) = [
         node
         for node in job_graph
         if node.kind == "process"
         and isinstance(node.fn, analytics_job.ProviderRoutingGuardrailDetector)
     ]
+    (sink,) = [
+        node
+        for node in job_graph
+        if node.kind == "sink" and node.sink_name == "Model Metrics 1m Sink"
+    ]
+    aggregators = [
+        node
+        for node in job_graph
+        if node.kind == "process"
+        and isinstance(node.fn, analytics_job.ModelMetricsWindowAggregator)
+    ]
 
-    reached = _request_ids_reaching(_aggregator_feeding(detector), _PAYLOADS)
-
-    assert reached == {"success", "provider_error", "legacy"}
+    assert aggregators == [_aggregator_feeding(sink)]
+    assert _aggregator_feeding(detector) is aggregators[0]
 
 
 def test_model_metrics_still_count_every_failure(job_graph):
@@ -220,3 +230,104 @@ def test_model_metrics_still_count_every_failure(job_graph):
     reached = _request_ids_reaching(_aggregator_feeding(sink), _PAYLOADS)
 
     assert reached == {"success", "provider_error", "user_or_policy", "legacy"}
+
+
+def _metric_event(error_count, provider_failure_count):
+    return logic.build_model_metrics_window_event(
+        model_name="gpt-5",
+        provider="openai",
+        window_start_ms=1_710_000_000_000,
+        window_end_ms=1_710_000_060_000,
+        window_size_seconds=60,
+        request_count=10,
+        success_count=10 - error_count,
+        error_count=error_count,
+        latency_sum_ms=10_000.0,
+        tokens_per_second_sum=500.0,
+        token_count_input=100,
+        token_count_output=200,
+        total_tokens=300,
+        total_cost_usd=0.1,
+        cached_count=0,
+        provider_failure_count=provider_failure_count,
+        timestamp=datetime(2026, 10, 28, 12, 0, 0),
+    )
+
+
+def test_metric_event_reports_provider_failures_beside_all_errors():
+    metric_event = _metric_event(error_count=6, provider_failure_count=2)
+
+    assert metric_event["error_rate"] == pytest.approx(0.6)
+    assert metric_event["provider_failure_count"] == 2
+    assert metric_event["provider_failure_rate"] == pytest.approx(0.2)
+
+
+def test_metric_event_without_provider_failure_count_treats_every_error_as_one():
+    metric_event = logic.build_model_metrics_window_event(
+        model_name="gpt-5",
+        provider="openai",
+        window_start_ms=0,
+        window_end_ms=60_000,
+        window_size_seconds=60,
+        request_count=4,
+        success_count=3,
+        error_count=1,
+        latency_sum_ms=400.0,
+        tokens_per_second_sum=0.0,
+        token_count_input=0,
+        token_count_output=0,
+        total_tokens=0,
+        total_cost_usd=0.0,
+        cached_count=0,
+    )
+
+    assert metric_event["provider_failure_count"] == 1
+    assert metric_event["provider_failure_rate"] == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize(
+    ("error_count", "provider_failure_count", "tripped"),
+    [
+        pytest.param(6, 0, False, id="caller-errors-only"),
+        pytest.param(6, 6, True, id="provider-failures"),
+    ],
+)
+def test_provider_guardrail_trips_on_provider_failures_only(
+    error_count, provider_failure_count, tripped
+):
+    guardrails = logic.detect_provider_routing_guardrails(
+        _metric_event(error_count, provider_failure_count),
+        latency_history=[],
+        error_rate_history=[],
+        timestamp=datetime(2026, 10, 28, 12, 1, 0),
+    )
+
+    assert (
+        any(g["trigger_type"] == "provider_high_error_rate" for g in guardrails)
+        is tripped
+    )
+
+
+class _HistoryState:
+    def __init__(self):
+        self.values = []
+
+    def get(self):
+        return list(self.values)
+
+    def update(self, values):
+        self.values = list(values)
+
+
+def test_provider_guardrail_history_tracks_provider_failure_rate():
+    detector = analytics_job.ProviderRoutingGuardrailDetector()
+    detector.latency_history_state = _HistoryState()
+    detector.error_rate_history_state = _HistoryState()
+
+    list(
+        detector.process_element(
+            _metric_event(error_count=6, provider_failure_count=2), ctx=None
+        )
+    )
+
+    assert detector.error_rate_history_state.values == [pytest.approx(0.2)]

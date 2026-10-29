@@ -335,16 +335,24 @@ def build_model_metrics_window_event(
     total_cost_usd: float,
     cached_count: int,
     latency_sample_count: int | None = None,
+    provider_failure_count: int | None = None,
     timestamp: datetime | None = None,
 ) -> Dict[str, Any]:
     """Build a 1-minute model metrics aggregate event.
 
     latency_sample_count is the number of requests in latency_sum_ms (cache hits
-    are left out); it defaults to request_count.
+    are left out); it defaults to request_count. provider_failure_count is the
+    errors that count against the provider (see counts_toward_provider_health);
+    it defaults to error_count.
     """
     request_count = max(0, int(request_count))
     success_count = max(0, int(success_count))
     error_count = max(0, int(error_count))
+    provider_failures = (
+        error_count
+        if provider_failure_count is None
+        else max(0, int(provider_failure_count))
+    )
     latency_samples = (
         request_count
         if latency_sample_count is None
@@ -357,6 +365,9 @@ def build_model_metrics_window_event(
     )
     success_rate = success_count / request_count if request_count > 0 else 0.0
     error_rate = error_count / request_count if request_count > 0 else 0.0
+    provider_failure_rate = (
+        provider_failures / request_count if request_count > 0 else 0.0
+    )
     cache_hit_rate = cached_count / request_count if request_count > 0 else 0.0
     queries_per_second = request_count / max(1, window_size_seconds)
 
@@ -374,6 +385,8 @@ def build_model_metrics_window_event(
         "error_count": error_count,
         "success_rate": success_rate,
         "error_rate": error_rate,
+        "provider_failure_count": provider_failures,
+        "provider_failure_rate": provider_failure_rate,
         "avg_latency_ms": avg_latency_ms,
         "avg_tokens_per_second": avg_tokens_per_second,
         "queries_per_second": queries_per_second,
@@ -702,6 +715,17 @@ def detect_model_routing_guardrails(
     return guardrails
 
 
+def metric_provider_failure_rate(metric_event: Dict[str, Any]) -> float:
+    """Failure rate that counts against the provider, from a metrics window.
+
+    Windows emitted before provider_failure_rate existed fall back to error_rate.
+    """
+    rate = metric_event.get("provider_failure_rate")
+    if rate is None:
+        rate = metric_event.get("error_rate")
+    return _safe_float(rate, 0.0)
+
+
 def detect_provider_routing_guardrails(
     metric_event: Dict[str, Any],
     *,
@@ -718,7 +742,7 @@ def detect_provider_routing_guardrails(
 
     provider = str(metric_event.get("provider", "unknown") or "unknown")
     current_latency = float(metric_event.get("avg_latency_ms", 0.0) or 0.0)
-    current_error_rate = float(metric_event.get("error_rate", 0.0) or 0.0)
+    current_error_rate = metric_provider_failure_rate(metric_event)
     high_error_rate_threshold = _safe_float(config.get("high_error_rate"), 0.20)
     high_latency_ms = _safe_float(config.get("high_latency_ms"), 6000)
     regression_error_floor = _safe_float(

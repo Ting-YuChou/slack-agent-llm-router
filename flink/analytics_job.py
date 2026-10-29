@@ -121,6 +121,7 @@ from flink.logic import (
     detect_model_routing_guardrails,
     detect_provider_routing_guardrails,
     merge_routing_policy_aggregate,
+    metric_provider_failure_rate,
     validate_inference_completed_event,
 )
 
@@ -312,12 +313,18 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
             "total_cost_usd": 0.0,
             "cached_count": 0,
             "latency_sample_count": 0,
+            "provider_failure_count": 0,
         }
-        # Buckets restored from older state averaged latency over every request.
+        # Buckets restored from older state averaged latency over every request
+        # and counted every error against the provider.
         bucket.setdefault("latency_sample_count", bucket["request_count"])
+        bucket.setdefault("provider_failure_count", bucket["error_count"])
+        failed = value.get("status") != "success"
         bucket["request_count"] += 1
-        bucket["success_count"] += 1 if value.get("status") == "success" else 0
-        bucket["error_count"] += 1 if value.get("status") != "success" else 0
+        bucket["success_count"] += 0 if failed else 1
+        bucket["error_count"] += 1 if failed else 0
+        if failed and counts_toward_provider_health(value):
+            bucket["provider_failure_count"] += 1
         # A cache hit's latency is the lookup, not the model; keep it out of
         # the latency average that guardrails and anomaly detection read.
         if not value.get("cached_response"):
@@ -428,6 +435,7 @@ class ModelMetricsWindowAggregator(KeyedProcessFunction):
             total_cost_usd=float(bucket.get("total_cost_usd", 0.0) or 0.0),
             cached_count=int(bucket.get("cached_count", 0) or 0),
             latency_sample_count=bucket.get("latency_sample_count"),
+            provider_failure_count=bucket.get("provider_failure_count"),
         )
 
 
@@ -586,7 +594,7 @@ class ProviderRoutingGuardrailDetector(KeyedProcessFunction):
             yield guardrail
 
         latency_history.append(float(value.get("avg_latency_ms", 0.0) or 0.0))
-        error_rate_history.append(float(value.get("error_rate", 0.0) or 0.0))
+        error_rate_history.append(metric_provider_failure_rate(value))
 
         self.latency_history_state.update(latency_history[-self.history_size :])
         self.error_rate_history_state.update(error_rate_history[-self.history_size :])
@@ -1084,26 +1092,9 @@ def create_flink_job(config: Dict[str, Any]):
     provider_guardrail_thresholds = dict(
         analytics_config.get("provider_guardrails", {}) or {}
     )
-    # Provider guardrails get their own metrics windows over events that say
-    # something about the provider; user_or_policy and internal failures would
-    # otherwise count as provider errors. Model metrics above still count them.
-    provider_health_metrics_stream = (
-        valid_completions_stream.filter(counts_toward_provider_health)
-        .key_by(
-            lambda event: _model_provider_stream_key(
-                event.get("selected_model", "unknown"),
-                event.get("provider", "unknown"),
-            )
-        )
-        .process(
-            ModelMetricsWindowAggregator(
-                window_size_seconds=window_size_seconds,
-                allowed_lateness_seconds=allowed_lateness_seconds,
-            ),
-            output_type=Types.PICKLED_BYTE_ARRAY(),
-        )
-    )
-    provider_guardrail_stream = provider_health_metrics_stream.key_by(
+    # Provider guardrails read provider_failure_rate from the same windows, so
+    # user_or_policy and internal failures don't count against the provider.
+    provider_guardrail_stream = metrics_stream.key_by(
         lambda event: event.get("provider", "unknown")
     ).process(
         ProviderRoutingGuardrailDetector(

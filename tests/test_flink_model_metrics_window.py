@@ -157,3 +157,45 @@ def test_window_restored_from_older_state_keeps_averaging_every_request():
 
     assert metric["request_count"] == 3
     assert metric["avg_latency_ms"] == pytest.approx(5000.0 / 3)
+
+
+def test_window_counts_provider_attributable_failures_beside_all_errors():
+    metric = _window_metric(
+        [
+            _completion(offset_ms=1_000),
+            _completion(offset_ms=2_000, status="error", error_type="provider_error"),
+            _completion(offset_ms=3_000, status="error", error_type="timeout"),
+            _completion(offset_ms=4_000, status="error", error_type="user_or_policy"),
+            _completion(offset_ms=5_000, status="error", error_type="internal"),
+            # Older producers sent no error_type; their failures still count.
+            _completion(offset_ms=6_000, status="error"),
+        ]
+    )
+
+    assert metric["error_count"] == 5
+    assert metric["provider_failure_count"] == 3
+    assert metric["provider_failure_rate"] == pytest.approx(3 / 6)
+
+
+def test_window_restored_from_older_state_counts_its_errors_as_provider_failures():
+    legacy_bucket = {
+        "window_start_ms": WINDOW_START_MS,
+        "request_count": 2,
+        "success_count": 0,
+        "error_count": 2,
+        "latency_sum_ms": 200.0,
+        "tokens_per_second_sum": 0.0,
+        "token_count_input": 0,
+        "token_count_output": 0,
+        "total_tokens": 0,
+        "total_cost_usd": 0.0,
+        "cached_count": 0,
+    }
+
+    metric = _window_metric(
+        [_completion(status="error", error_type="user_or_policy")],
+        restored_buckets=[legacy_bucket],
+    )
+
+    assert metric["error_count"] == 3
+    assert metric["provider_failure_count"] == 2
