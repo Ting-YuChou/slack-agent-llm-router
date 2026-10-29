@@ -4185,24 +4185,37 @@ class InferenceEngine:
                 started_calls.append(model_name)
             return await provider.generate_response(request, model_name)
 
-        return await self.single_flight.run(
-            request,
-            provider,
-            model_name,
-            lambda: self.scheduler.run_provider_call(
+        async def admitted_call() -> InferenceResponse:
+            estimated_input_tokens = await self._admission_input_tokens(
+                request, model_name
+            )
+            return await self.scheduler.run_provider_call(
                 request=request,
                 model_name=model_name,
                 provider=str(provider_name),
-                estimated_input_tokens=self._estimate_provider_admission_input_tokens(
-                    request, model_name
-                ),
+                estimated_input_tokens=estimated_input_tokens,
                 operation=call_provider,
                 execution_budget=execution_budget,
                 attempt_timeout_seconds=attempt_timeout_seconds,
                 fallback_reserve_seconds=fallback_reserve_seconds,
                 reserve_attempts=reserve_attempts,
-            ),
+            )
+
+        return await self.single_flight.run(
+            request, provider, model_name, admitted_call
         )
+
+    async def _admission_input_tokens(
+        self, request: QueryRequest, model_name: str
+    ) -> int:
+        """The admission estimate; an uncached long prompt counts in a thread."""
+        if isinstance(
+            self.router, ModelRouter
+        ) and self.router.request_token_count_needs_thread(request, model_name):
+            return await asyncio.to_thread(
+                self._estimate_provider_admission_input_tokens, request, model_name
+            )
+        return self._estimate_provider_admission_input_tokens(request, model_name)
 
     def _request_within_output_cap(
         self, request: QueryRequest, model_name: str
@@ -4249,7 +4262,10 @@ class InferenceEngine:
         if estimator is not None:
             try:
                 if isinstance(self.router, ModelRouter):
-                    # Memoized: routing usually counted this prompt already.
+                    # Memoized per encoding: routing's cl100k count is reused,
+                    # but a model with its own encoding (gpt-5: o200k) is
+                    # counted once more (in a thread when long, see
+                    # _admission_input_tokens).
                     return max(
                         0, int(self.router.request_token_count(request, model_name))
                     )

@@ -4,6 +4,7 @@ import builtins
 import logging
 import sys
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -98,6 +99,73 @@ class TestOfflineFallback:
         request = QueryRequest(query="中" * 1000, user_id="u1")
 
         assert router._fallback_token_estimate(request) >= 1000
+
+    def test_text_without_spaces_counts_four_chars_per_token(self):
+        counter = TokenCounter(enabled=False)
+
+        # base64 or minified JSON is one "word" however long it is.
+        assert counter.count_tokens("QUJD" * 15_000) >= 15_000
+        assert counter.count_tokens('{"a":1,"b":[2,3]}' * 1000) >= 4000
+
+    def test_cjk_and_unspaced_text_both_count(self):
+        counter = TokenCounter(enabled=False)
+
+        assert counter.count_tokens("中" * 1000 + "x" * 4000) == 1000 + 1000
+
+
+class TestAdmissionEstimateOffTheLoop:
+    @pytest.mark.asyncio
+    async def test_long_gpt5_admission_estimate_runs_in_a_thread(
+        self, router_config, monkeypatch, inference_response_factory
+    ):
+        router = ModelRouter(router_config)
+        engine = InferenceEngine({}, router)
+        provider = SimpleNamespace(
+            generate_response=AsyncMock(return_value=inference_response_factory())
+        )
+        engine.providers = {"openai": provider}
+        request = QueryRequest(query="Summarize", user_id="u1", context="word " * 5000)
+        # Routing counted the prompt under cl100k; gpt-5 admission needs o200k.
+        await router._build_query_context(request)
+        threaded = []
+
+        async def to_thread(func, *args, **kwargs):
+            threaded.append(getattr(func, "__name__", repr(func)))
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "src.llm_router_part2_inference.asyncio.to_thread", to_thread
+        )
+
+        await engine._execute_model_request(request, "gpt-5")
+
+        assert "_estimate_provider_admission_input_tokens" in threaded
+
+    @pytest.mark.asyncio
+    async def test_short_or_memoized_admission_estimates_stay_inline(
+        self, router_config, monkeypatch, inference_response_factory
+    ):
+        router = ModelRouter(router_config)
+        engine = InferenceEngine({}, router)
+        provider = SimpleNamespace(
+            generate_response=AsyncMock(return_value=inference_response_factory())
+        )
+        engine.providers = {"openai": provider}
+        threaded = []
+
+        async def to_thread(func, *args, **kwargs):
+            threaded.append(func)
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "src.llm_router_part2_inference.asyncio.to_thread", to_thread
+        )
+
+        await engine._execute_model_request(
+            QueryRequest(query="Short question", user_id="u1"), "gpt-5"
+        )
+
+        assert threaded == []
 
 
 class TestModelEncodings:

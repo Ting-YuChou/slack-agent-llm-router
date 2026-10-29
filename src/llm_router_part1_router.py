@@ -415,10 +415,16 @@ _CJK_CHARACTER = re.compile("[⺀-⿟　-〿぀-ヿ㄀-ㇿ㐀-䶿" "一-鿿가-�
 
 
 def approximate_token_count(text: str) -> int:
-    """Count tokens without a tokenizer: CJK characters plus 1.3 per other word."""
+    """Count tokens without a tokenizer.
+
+    One per CJK character, plus for the rest 1.3 per word or one per four
+    non-space characters, whichever is more: text without spaces (base64,
+    minified JSON) is one "word" however long it is.
+    """
     cjk_characters = len(_CJK_CHARACTER.findall(text))
-    other_words = len(_CJK_CHARACTER.sub(" ", text).split())
-    return cjk_characters + int(other_words * 1.3)
+    other_words = _CJK_CHARACTER.sub(" ", text).split()
+    other_chars = sum(len(word) for word in other_words)
+    return cjk_characters + max(int(len(other_words) * 1.3), other_chars // 4)
 
 
 class TokenCounter:
@@ -1104,10 +1110,16 @@ class ModelRouter:
         return (id(self), "tokens", encoding, fingerprint)
 
     def _count_request_tokens(self, request: QueryRequest, model: Optional[str]) -> int:
+        # Pass the model on only when it changes the encoding, so estimators
+        # that take just the request keep working.
         default_encoding = self.token_counter.encoding_name("default")
-        if model is None or self.token_counter.encoding_name(model) == default_encoding:
-            return self._estimate_request_token_count(request)
-        return self._estimate_request_token_count(request, model)
+        model_args = (
+            (model,)
+            if model is not None
+            and self.token_counter.encoding_name(model) != default_encoding
+            else ()
+        )
+        return self._estimate_request_token_count(request, *model_args)
 
     @staticmethod
     def _prompt_chars(request: QueryRequest) -> int:
@@ -1118,34 +1130,54 @@ class ModelRouter:
         )
         return len(request.query) + len(request.context or "") + metadata_chars
 
+    def _cached_token_count(
+        self, request: QueryRequest, model: Optional[str]
+    ) -> Tuple[Optional[Tuple[Any, ...]], Optional[int]]:
+        """(memo key, memoized count or None); the key is None when unmemoizable."""
+        memo = self._routing_memo(request)
+        key = self._token_memo_key(request, model) if memo is not None else None
+        if memo is None or key is None:
+            return None, None
+        return key, memo.get(key)
+
+    def _store_token_count(
+        self, request: QueryRequest, key: Optional[Tuple[Any, ...]], count: int
+    ) -> int:
+        memo = self._routing_memo(request)
+        if memo is not None and key is not None:
+            memo[key] = count
+        return count
+
+    def request_token_count_needs_thread(
+        self, request: QueryRequest, model: Optional[str] = None
+    ) -> bool:
+        """Whether counting would tokenize a long prompt the memo lacks."""
+        _key, cached = self._cached_token_count(request, model)
+        return cached is None and self._prompt_chars(request) > THREADED_TOKENIZE_CHARS
+
     async def _request_token_count(
         self, request: QueryRequest, model: Optional[str] = None
     ) -> int:
         """The memoized prompt estimate; long prompts tokenize off the loop."""
-        memo = self._routing_memo(request)
-        key = self._token_memo_key(request, model)
-        if memo is not None and key is not None and key in memo:
-            return memo[key]
+        key, cached = self._cached_token_count(request, model)
+        if cached is not None:
+            return cached
         if self._prompt_chars(request) > THREADED_TOKENIZE_CHARS:
             count = await asyncio.to_thread(self._count_request_tokens, request, model)
         else:
             count = self._count_request_tokens(request, model)
-        if memo is not None and key is not None:
-            memo[key] = count
-        return count
+        return self._store_token_count(request, key, count)
 
     def request_token_count(
         self, request: QueryRequest, model: Optional[str] = None
     ) -> int:
         """The prompt estimate for a model, memoized like routing's (sync)."""
-        memo = self._routing_memo(request)
-        key = self._token_memo_key(request, model)
-        if memo is not None and key is not None and key in memo:
-            return memo[key]
-        count = self._count_request_tokens(request, model)
-        if memo is not None and key is not None:
-            memo[key] = count
-        return count
+        key, cached = self._cached_token_count(request, model)
+        if cached is not None:
+            return cached
+        return self._store_token_count(
+            request, key, self._count_request_tokens(request, model)
+        )
 
     async def _request_policy_context(self, request: QueryRequest) -> Dict[str, Any]:
         """The policy context, read once per request for routing.
