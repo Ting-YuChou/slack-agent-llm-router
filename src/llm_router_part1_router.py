@@ -19,6 +19,7 @@ from src.utils.schema import (
     QueryRequest,
     QueryType,
     RoutingDecision,
+    RoutingDecisionFeatures,
     ToolPolicy,
     UserTier,
 )
@@ -610,6 +611,9 @@ class ModelRouter:
                 ),
                 policy_source=str(query_context.get("policy_source", "none") or "none"),
                 hint_reason=query_context.get("hint_reason"),
+                routing_strategy=self.routing_strategy,
+                user_tier=self._entitlement_tier(request.user_tier),
+                features=self._decision_features(query_context),
             )
 
             # Update metrics
@@ -635,9 +639,10 @@ class ModelRouter:
         Tier and context-window checks still apply, and the token count stays an
         estimate so the inference fallback limits keep working.
         """
-        context = {
+        token_count = self._fallback_token_estimate(request)
+        context: Dict[str, Any] = {
             "query_type": QueryType.GENERAL.value,
-            "token_count": self._fallback_token_estimate(request),
+            "token_count": token_count,
             "user_tier": self._normalize_user_tier(request.user_tier),
             "max_tokens": request.max_tokens,
             "has_attachments": bool(request.attachments),
@@ -659,12 +664,43 @@ class ModelRouter:
         return RoutingDecision(
             selected_model=selected_model,
             query_type=QueryType.GENERAL,
-            token_count=context["token_count"],
+            token_count=token_count,
             estimated_cost=0.0,
             routing_reason="Fallback due to routing error",
             routing_time_ms=int((time.time() - start_time) * 1000),
             confidence=0.0,
+            routing_strategy=self.routing_strategy,
+            user_tier=self._entitlement_tier(request.user_tier),
+            features=self._routing_error_features(request, token_count),
         )
+
+    def _decision_features(self, context: Dict[str, Any]) -> RoutingDecisionFeatures:
+        """The request features that checks after routing read from the decision."""
+        query_complexity = context.get("query_complexity")
+        confidence = float(context.get("classification_confidence", 0.0) or 0.0)
+        return RoutingDecisionFeatures(
+            query_complexity=str(query_complexity) if query_complexity else None,
+            requires_high_reasoning=bool(context.get("requires_high_reasoning", False)),
+            long_context=bool(context.get("long_context", False)),
+            classification_confidence=min(max(confidence, 0.0), 1.0),
+        )
+
+    def _routing_error_features(
+        self, request: QueryRequest, token_count: int
+    ) -> RoutingDecisionFeatures:
+        """Best-effort features after a routing error, with zero confidence."""
+        try:
+            # An empty query_type lets the feature builder infer one from the
+            # text, since the classifier may be what failed.
+            features = build_routing_features(
+                self._build_routing_feature_payload(
+                    request=request, query_type="", token_count=token_count
+                )
+            )
+        except Exception:
+            logger.exception("Routing features failed after a routing error")
+            features = {}
+        return self._decision_features({**features, "classification_confidence": 0.0})
 
     def _fallback_token_estimate(self, request: QueryRequest) -> int:
         """The routing token estimate, or a word count if that fails too."""

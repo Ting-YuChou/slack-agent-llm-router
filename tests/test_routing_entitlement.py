@@ -1,18 +1,21 @@
-"""Tier entitlement on every routing path (R3)."""
+"""Tier entitlement on every routing path (R3) and the decision it records (R11a)."""
 
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import yaml
 
 import src.llm_router_part1_router as router_module
 from src.llm_router_part1_router import ModelRouter
-from src.llm_router_part2_inference import classify_inference_error
+from src.llm_router_part2_inference import InferenceEngine, classify_inference_error
 from src.utils.schema import (
     ModelConfig,
     PlatformConfig,
     QueryRequest,
     QueryType,
+    RoutingDecision,
     UserTier,
 )
 
@@ -311,6 +314,213 @@ def test_select_best_model_never_returns_a_model_the_tier_cannot_use(router_conf
         "user_tier": "free",
     }
 
-    assert router._select_best_model(["gpt-5", "mistral-7b"], context) == ("mistral-7b")
+    selected = router._select_best_model(["gpt-5", "mistral-7b"], context)
+
+    assert selected == "mistral-7b"
     with pytest.raises(router_module.ModelNotEntitledError):
         router._select_best_model(["gpt-5"], context)
+
+
+# R11a: the decision carries the tier, strategy and request features, and the
+# inference fallback reads them from the decision.
+
+LOCAL_VLLM_ROUTER_CONFIG = {
+    "default_model": "qwen3.6-27b-fast",
+    "routing_strategy": "intelligent",
+    "tokenizer_enabled": False,
+    "classifier": {"semantic_enabled": False},
+    "models": {
+        "qwen3.6-27b-fast": {
+            "provider": "vllm",
+            "model_path": "Qwen/Qwen3.6-27B-FP8",
+            "max_tokens": 32768,
+            "cost_per_token": 0.0,
+            "priority": 3,
+            "capabilities": ["general", "coding", "reasoning"],
+        },
+        "mistral-7b": {
+            "provider": "vllm",
+            "model_path": "/models/mistral",
+            "max_tokens": 8192,
+            "cost_per_token": 0.0,
+            "priority": 3,
+            "capabilities": ["general", "coding"],
+        },
+    },
+    "routing_rules": [],
+}
+
+VLLM_MODEL_FALLBACK_CONFIG = {
+    "compression": {"max_context_tokens": 4096, "compression_ratio": 0.5},
+    "cache": {"enabled": True, "ttl": 3600, "max_size": "1GB"},
+    "batching": {"enabled": False},
+    "vllm": {
+        "model_fallback": {
+            "enabled": True,
+            "fallbacks": {"qwen3.6-27b-fast": ["mistral-7b"]},
+            "allowed_query_types": ["general", "code_generation"],
+            "max_input_tokens": 2048,
+            "max_output_tokens": 1024,
+            "disallow_attachments": True,
+            "disallow_complex_reasoning": True,
+        }
+    },
+}
+
+
+@pytest.mark.asyncio
+async def test_decision_records_tier_strategy_and_features(router_config):
+    router = _stub_router(ModelRouter(router_config), query_type=QueryType.ANALYSIS)
+
+    decision = await router.route_query(
+        _request("enterprise", query="Compare the tradeoffs of both designs")
+    )
+
+    assert decision.user_tier == UserTier.ENTERPRISE
+    assert decision.routing_strategy == "intelligent"
+    assert decision.features.query_complexity == "moderate"
+    assert decision.features.requires_high_reasoning is True
+    assert decision.features.long_context is False
+    assert decision.features.classification_confidence == pytest.approx(0.9)
+
+
+@pytest.mark.asyncio
+async def test_decision_records_long_context_and_configured_strategy(router_config):
+    router = _stub_router(
+        ModelRouter({**router_config, "routing_strategy": "round_robin"})
+    )
+
+    decision = await router.route_query(_request("premium", max_tokens=4096))
+
+    assert decision.user_tier == UserTier.PREMIUM
+    assert decision.routing_strategy == "round_robin"
+    assert decision.features.long_context is True
+    assert decision.features.requires_high_reasoning is False
+
+
+@pytest.mark.asyncio
+async def test_routing_error_decision_records_tier_strategy_and_features():
+    router = _stub_router(ModelRouter(LOCAL_VLLM_ROUTER_CONFIG), token_count=2000)
+
+    def broken_classifier(_query):
+        raise RuntimeError("classifier exploded")
+
+    router.classifier.classify_query = broken_classifier
+
+    decision = await router.route_query(
+        _request("premium", query="Investigate the root cause of this incident")
+    )
+
+    assert "routing error" in decision.routing_reason.lower()
+    assert decision.user_tier == UserTier.PREMIUM
+    assert decision.routing_strategy == "intelligent"
+    # The request is still read as complex, so the vLLM fallback stays closed.
+    assert decision.features.query_complexity == "complex"
+    assert decision.features.requires_high_reasoning is True
+    assert decision.features.classification_confidence == 0.0
+
+
+def _vllm_fallback_engine(router):
+    engine = InferenceEngine(VLLM_MODEL_FALLBACK_CONFIG, router)
+    engine.providers = {"vllm": AsyncMock()}
+    engine.providers["vllm"].generate_response = AsyncMock(
+        side_effect=RuntimeError("qwen temporarily unavailable")
+    )
+    engine.cache.get_cached_response = AsyncMock(return_value=None)
+    return engine
+
+
+@pytest.mark.asyncio
+async def test_complex_request_routed_to_qwen_does_not_fall_back_to_mistral():
+    # A general query the router itself reads as complex: 2,000 tokens plus a
+    # "root cause" marker. The client sends no complexity metadata.
+    router = _stub_router(
+        ModelRouter(LOCAL_VLLM_ROUTER_CONFIG),
+        query_type=QueryType.GENERAL,
+        token_count=2000,
+    )
+    request = _request("premium", query="Investigate the root cause of this incident")
+    assert not request.metadata
+    # The routing process_query will repeat, checked before stats change.
+    decision = await router.route_query(request)
+    assert decision.selected_model == "qwen3.6-27b-fast"
+    assert decision.query_type == QueryType.GENERAL
+    engine = _vllm_fallback_engine(router)
+
+    response = await engine.process_query(request)
+
+    assert response.error == "inference_failed"
+    assert [
+        call.args[1]
+        for call in engine.providers["vllm"].generate_response.await_args_list
+    ] == ["qwen3.6-27b-fast"]
+    assert decision.features.query_complexity == "complex"
+
+
+def test_routing_decision_features_default_and_validate():
+    decision_fields = {
+        "selected_model": "gpt-5",
+        "query_type": QueryType.GENERAL,
+        "routing_reason": "Capability-based selection",
+        "token_count": 1,
+        "estimated_cost": 0.0,
+        "routing_time_ms": 0,
+        "confidence": 0.5,
+    }
+
+    features = RoutingDecision(**decision_fields).features
+
+    assert features.query_complexity is None
+    assert features.requires_high_reasoning is False
+    assert features.long_context is False
+    assert features.classification_confidence == 0.0
+    with pytest.raises(ValueError):
+        RoutingDecision(**decision_fields, features={"classification_confidence": 1.5})
+
+
+@pytest.mark.parametrize(
+    ("features", "allowed"),
+    [
+        pytest.param({}, True, id="simple"),
+        pytest.param({"query_complexity": "complex"}, False, id="complex"),
+        pytest.param({"requires_high_reasoning": True}, False, id="high-reasoning"),
+    ],
+)
+def test_vllm_model_fallback_reads_decision_features(features, allowed):
+    router = ModelRouter(LOCAL_VLLM_ROUTER_CONFIG)
+    engine = InferenceEngine(VLLM_MODEL_FALLBACK_CONFIG, router)
+    request = _request("premium", query="Explain this", max_tokens=256)
+    decision = RoutingDecision(
+        selected_model="qwen3.6-27b-fast",
+        query_type=QueryType.GENERAL,
+        routing_reason="Capability-based selection",
+        token_count=64,
+        estimated_cost=0.0,
+        routing_time_ms=1,
+        confidence=0.8,
+        features=features,
+    )
+    context = engine._build_local_fallback_context(request, decision)
+
+    assert (
+        engine._vllm_model_fallback_allowed(
+            engine._vllm_model_fallback_config(), request, decision, context
+        )
+        is allowed
+    )
+
+
+def test_vllm_model_fallback_accepts_decisions_without_features():
+    router = ModelRouter(LOCAL_VLLM_ROUTER_CONFIG)
+    engine = InferenceEngine(VLLM_MODEL_FALLBACK_CONFIG, router)
+    request = _request("premium", query="Explain this", max_tokens=256)
+    decision = SimpleNamespace(
+        selected_model="qwen3.6-27b-fast",
+        query_type=QueryType.GENERAL,
+        token_count=64,
+    )
+    context = engine._build_local_fallback_context(request, decision)
+
+    assert engine._vllm_model_fallback_allowed(
+        engine._vllm_model_fallback_config(), request, decision, context
+    )

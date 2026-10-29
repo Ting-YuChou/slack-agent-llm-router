@@ -282,6 +282,15 @@ class RagBatchRequest(BaseModel):
     documents: List[RagBatchDocument] = Field(..., min_length=1, max_length=1000)
 
 
+class RoutingDecisionFeatures(BaseModel):
+    """How the router read the request, for checks made after routing."""
+
+    query_complexity: Optional[str] = None  # simple, moderate or complex
+    requires_high_reasoning: bool = False
+    long_context: bool = False
+    classification_confidence: float = Field(0.0, ge=0.0, le=1.0)
+
+
 class RoutingDecision(BaseModel):
     # Core routing decision
     selected_model: str = Field(..., min_length=1)
@@ -305,6 +314,7 @@ class RoutingDecision(BaseModel):
     actual_fast_lane_hit: bool = False
     policy_source: str = "none"
     hint_reason: Optional[str] = None
+    features: RoutingDecisionFeatures = Field(default_factory=RoutingDecisionFeatures)
 
 
 class ModelSelection(BaseModel):

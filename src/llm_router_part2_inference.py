@@ -3526,13 +3526,18 @@ class InferenceEngine:
 
         if bool(policy.get("disallow_complex_reasoning", True)):
             metadata = request.metadata or {}
+            # The router's reading of the request; top-level decision attributes
+            # and client metadata can only make the check stricter.
+            features = getattr(routing_decision, "features", None)
             query_complexity = (
-                getattr(routing_decision, "query_complexity", None)
+                getattr(features, "query_complexity", None)
+                or getattr(routing_decision, "query_complexity", None)
                 or metadata.get("query_complexity")
                 or ""
             )
             requires_high_reasoning = bool(
-                getattr(routing_decision, "requires_high_reasoning", False)
+                getattr(features, "requires_high_reasoning", False)
+                or getattr(routing_decision, "requires_high_reasoning", False)
                 or metadata.get("requires_high_reasoning", False)
             )
             if str(query_complexity).lower() == "complex":
