@@ -233,20 +233,38 @@ def normalize_external_attachments(request: Any, *, max_attachment_bytes: int) -
 
 # JSON fields around an inline document (filename, metadata, ids).
 RAG_JSON_DOCUMENT_OVERHEAD_BYTES = 64 * 1024
+# JSON encoders may legally escape base64's "+" (.NET: +, +5 bytes) and
+# "/" (PHP: \/, +1 byte). Each is 1/64 of the characters of base64 of arbitrary
+# bytes, so escaped text runs about 9.4% longer; allow 10%.
+RAG_JSON_ESCAPING_PERCENT = 110
 # Multipart boundaries, part headers and the other form fields.
 RAG_MULTIPART_OVERHEAD_BYTES = 1024 * 1024
 # A batch carries one inline document at most this large plus up to 1000
 # document entries; larger sets go through presigned /rag/uploads.
 RAG_BATCH_OVERHEAD_BYTES = 1024 * 1024
+RAG_BODY_LIMIT_HINTS = {
+    "/rag/documents": (
+        "Upload larger documents with POST /rag/uploads (presigned upload)."
+    ),
+    "/rag/batches": (
+        "Upload large or many documents with POST /rag/uploads (presigned "
+        "upload) and reference them by storage_ref in the batch."
+    ),
+}
 
 
 def _base64_length(decoded_bytes: int) -> int:
     return 4 * math.ceil(decoded_bytes / 3)
 
 
+def _escaped_json_base64_length(decoded_bytes: int) -> int:
+    encoded = _base64_length(decoded_bytes)
+    return -(-encoded * RAG_JSON_ESCAPING_PERCENT // 100)
+
+
 def rag_request_body_limits(upload_config: Dict[str, Any]) -> Dict[str, Dict[str, int]]:
     """Body caps for the RAG ingestion paths, sized from their own limits."""
-    json_document = _base64_length(
+    json_document = _escaped_json_base64_length(
         int(upload_config.get("json_max_decoded_bytes") or 10_000_000)
     )
     multipart_document = int(upload_config.get("multipart_max_bytes") or 100_000_000)
@@ -276,6 +294,7 @@ class RequestBodyLimitMiddleware:
         *,
         max_body_bytes: int,
         path_limits: Optional[Dict[str, Dict[str, int]]] = None,
+        hints: Optional[Dict[str, str]] = None,
     ):
         self.app = app
         self.max_body_bytes = int(max_body_bytes)
@@ -283,6 +302,8 @@ class RequestBodyLimitMiddleware:
             path: {str(media).lower(): int(limit) for media, limit in limits.items()}
             for path, limits in (path_limits or {}).items()
         }
+        # Per-path advice appended to the 413 message.
+        self.hints = dict(hints or {})
 
     def limit_for(self, scope: Dict[str, Any]) -> int:
         by_media_type = self.path_limits.get(str(scope.get("path") or ""))
@@ -301,9 +322,10 @@ class RequestBodyLimitMiddleware:
             return
         limit = self.limit_for(scope)
 
+        hint = self.hints.get(str(scope.get("path") or ""))
         declared = _declared_content_length(scope)
         if declared is not None and declared > limit:
-            await self._reject(send, limit)
+            await self._reject(send, limit, hint)
             return
 
         # Count the body as the app pulls it instead of reading it up front:
@@ -326,7 +348,7 @@ class RequestBodyLimitMiddleware:
             overflowed = True
             if not response_started:
                 response_started = rejected = True
-                await self._reject(send, limit)
+                await self._reject(send, limit, hint)
             # Stop the app reading; whatever it answers is dropped below.
             return {"type": "http.disconnect"}
 
@@ -340,13 +362,13 @@ class RequestBodyLimitMiddleware:
 
         await self.app(scope, counting_receive, guarded_send)
 
-    async def _reject(self, send: Send, limit: int) -> None:
-        payload = json.dumps(
-            {
-                "error": "request_too_large",
-                "message": f"Request body exceeds the {limit}-byte limit",
-            }
-        ).encode("utf-8")
+    async def _reject(self, send: Send, limit: int, hint: Optional[str]) -> None:
+        message = f"Request body exceeds the {limit}-byte limit"
+        if hint:
+            message = f"{message}. {hint}"
+        payload = json.dumps({"error": "request_too_large", "message": message}).encode(
+            "utf-8"
+        )
         await send(
             {
                 "type": "http.response.start",
@@ -361,10 +383,19 @@ class RequestBodyLimitMiddleware:
         await send({"type": "http.response.body", "body": payload})
 
 
+def parse_media_type(content_type: Optional[str]) -> str:
+    """Return the media type of a Content-Type value, without parameters.
+
+    Use this wherever a body parser is chosen, so it agrees with the cap the
+    body-limit middleware applied.
+    """
+    return (content_type or "").split(";", 1)[0].strip().lower()
+
+
 def _media_type(scope: Dict[str, Any]) -> str:
     for name, value in scope.get("headers") or []:
         if name.lower() == b"content-type":
-            return value.decode("latin-1").split(";", 1)[0].strip().lower()
+            return parse_media_type(value.decode("latin-1"))
     return ""
 
 

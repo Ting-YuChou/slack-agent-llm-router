@@ -2,6 +2,7 @@ import base64
 import asyncio
 import hashlib
 import json
+import logging
 import signal
 from pathlib import Path
 from types import SimpleNamespace
@@ -1455,7 +1456,7 @@ class TestApiApp:
         self, path, body_size, tmp_path, patched_platform_deps
     ):
         # json_max_decoded_bytes=3000: a document's base64 is at most 4000 bytes,
-        # so /rag/documents allows 4000 + 64 KiB and /rag/batches 4000 + 1 MiB.
+        # so /rag/documents allows 4400 + 64 KiB and /rag/batches 4400 + 1 MiB.
         platform = _admission_platform(
             tmp_path,
             overrides={
@@ -1535,6 +1536,111 @@ class TestApiApp:
 
         assert response.status_code == 413
         assert admission.http_calls == []
+
+    def test_rag_document_parser_follows_the_media_type_the_cap_used(
+        self, tmp_path, patched_platform_deps
+    ):
+        platform = _admission_platform(tmp_path)
+        platform.services["admission"] = DummyAdmissionController()
+        rag = DummyRagService({"enabled": True})
+        platform.services["rag"] = rag
+        app = platform._create_fastapi_app()
+        body = json.dumps(
+            {"filename": "a.txt", "content_base64": base64.b64encode(b"hi").decode()}
+        )
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/rag/documents",
+                content=body,
+                # The multipart cap applies, so this must not be parsed as JSON.
+                headers={
+                    "Content-Type": "multipart/form-data; charset=application/json"
+                },
+            )
+
+        assert 400 <= response.status_code < 500
+        assert rag.jobs == {}
+
+    def test_rag_json_document_with_escaped_base64_at_the_limit_is_accepted(
+        self, tmp_path, patched_platform_deps
+    ):
+        # 1/64 of the characters are "+" and 1/64 are "/", as in base64 of
+        # arbitrary bytes, escaped the way .NET ("+" -> +) and PHP
+        # ("/" -> \/) encoders do: about 9.4% longer than the raw base64.
+        encoded = "".join(
+            "+" if i % 64 == 0 else "/" if i % 64 == 32 else "A"
+            for i in range(1_200_000)
+        )
+        decoded_limit = len(encoded) * 3 // 4
+        upload = {"json_max_decoded_bytes": decoded_limit}
+        platform = _admission_platform(
+            tmp_path, overrides={"rag": {"enabled": False, "upload": upload}}
+        )
+        platform.services["admission"] = DummyAdmissionController()
+        rag = DummyRagService({"enabled": True, "upload": upload})
+        platform.services["rag"] = rag
+        app = platform._create_fastapi_app()
+        escaped = encoded.replace("/", "\\/").replace("+", "\\u002B")
+        body = '{"filename": "a.bin", "content_base64": "' + escaped + '"}'
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/rag/documents",
+                content=body.encode("ascii"),
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert response.status_code == 200
+        assert len(rag.jobs) == 1
+
+    @pytest.mark.asyncio
+    async def test_rag_json_upload_cut_off_at_the_cap_is_not_logged_as_a_failure(
+        self, tmp_path, patched_platform_deps, caplog
+    ):
+        platform = _admission_platform(
+            tmp_path,
+            overrides={
+                "rag": {"enabled": False, "upload": {"json_max_decoded_bytes": 3000}}
+            },
+        )
+        platform.services["admission"] = DummyAdmissionController()
+        platform.services["rag"] = DummyRagService({"enabled": True})
+        app = platform._create_fastapi_app()
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"x" * 50_000, "more_body": True}
+
+        async def send(message):
+            sent.append(message)
+
+        scope = _asgi_scope(
+            "POST", "/rag/documents", headers=[(b"transfer-encoding", b"chunked")]
+        )
+        with caplog.at_level(logging.INFO):
+            await asyncio.wait_for(app(scope, receive, send), timeout=2)
+
+        assert sent[0]["status"] == 413
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+        assert [r for r in caplog.records if r.exc_info] == []
+
+    def test_rag_batch_over_its_cap_points_to_presigned_uploads(
+        self, tmp_path, patched_platform_deps
+    ):
+        platform = _admission_platform(tmp_path)
+        platform.services["admission"] = DummyAdmissionController()
+        app = platform._create_fastapi_app()
+        documents = [
+            {"filename": f"{i}.txt", "content_base64": "A" * 4_000_000}
+            for i in range(4)
+        ]
+
+        with TestClient(app) as client:
+            response = client.post("/rag/batches", json={"documents": documents})
+
+        assert response.status_code == 413
+        assert "/rag/uploads" in response.json()["message"]
 
     def test_route_strips_server_only_metadata_from_external_requests(
         self, tmp_path, patched_platform_deps

@@ -110,24 +110,25 @@ def test_request_body_limits_normalize_media_types():
 
 
 def test_rag_body_limits_derive_from_the_rag_upload_limits():
+    # 3000 decoded bytes are 4000 base64 characters, 4400 with escaping room.
     limits = rag_request_body_limits(
         {"json_max_decoded_bytes": 3000, "multipart_max_bytes": 500_000}
     )
 
     assert limits == {
         "/rag/documents": {
-            "application/json": 4000 + 64 * 1024,
+            "application/json": 4400 + 64 * 1024,
             "multipart/form-data": 500_000 + 1024 * 1024,
         },
-        "/rag/batches": {"application/json": 4000 + 1024 * 1024},
+        "/rag/batches": {"application/json": 4400 + 1024 * 1024},
     }
 
 
 def test_rag_body_limits_use_the_rag_defaults():
     limits = rag_request_body_limits({})
 
-    # base64 of a 10 MB document is 13_333_336 bytes.
-    assert limits["/rag/documents"]["application/json"] == 13_333_336 + 64 * 1024
+    # base64 of a 10 MB document is 13_333_336 bytes; +10% for JSON escaping.
+    assert limits["/rag/documents"]["application/json"] == 14_666_670 + 64 * 1024
     assert limits["/rag/documents"]["multipart/form-data"] == (
         100_000_000 + 1024 * 1024
     )

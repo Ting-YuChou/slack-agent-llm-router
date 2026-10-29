@@ -34,6 +34,7 @@ from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.requests import ClientDisconnect
 from pydantic import ValidationError
 from prometheus_client import start_http_server
 
@@ -46,6 +47,7 @@ from src.admission import (
 )
 from src.agent_runtime import AgentRuntimeClient
 from src.api_security import (
+    RAG_BODY_LIMIT_HINTS,
     ApiPrincipal,
     AttachmentRejected,
     RequestBodyLimitMiddleware,
@@ -53,6 +55,7 @@ from src.api_security import (
     apply_principal_entitlements,
     filter_external_metadata,
     normalize_external_attachments,
+    parse_media_type,
     rag_request_body_limits,
     resolve_api_principal,
 )
@@ -1248,8 +1251,10 @@ class LLMRouterPlatform:
             or rag_config.get("upload", {})
             or {}
         )
-        content_type = request.headers.get("content-type", "").lower()
-        if "application/json" in content_type:
+        # Decide by the exact media type, as the body-limit middleware does:
+        # a substring match would parse a multipart-capped body as JSON.
+        media_type = parse_media_type(request.headers.get("content-type"))
+        if media_type == "application/json":
             payload = await request.json()
             filename = str(payload.get("filename") or "").strip()
             encoded = payload.get("content_base64")
@@ -1302,7 +1307,7 @@ class LLMRouterPlatform:
                 "document_id": document_id,
             }
 
-        if "multipart/form-data" in content_type:
+        if media_type == "multipart/form-data":
             try:
                 form = await request.form()
             except Exception as exc:
@@ -1892,6 +1897,7 @@ class LLMRouterPlatform:
                 security_config.get("max_request_body_bytes") or 2 * 1024 * 1024
             ),
             path_limits=self._request_body_path_limits(),
+            hints=RAG_BODY_LIMIT_HINTS,
         )
 
         @app.get("/")
@@ -2157,6 +2163,17 @@ class LLMRouterPlatform:
                 return JSONResponse(
                     status_code=400,
                     content={"error": "invalid_rag_document", "message": str(exc)},
+                )
+            except ClientDisconnect:
+                # The client went away, or the body-limit middleware cut the
+                # body off and has already answered 413.
+                self.logger.info("RAG document upload ended before its body was read")
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "request_body_incomplete",
+                        "message": "The request body was not received in full",
+                    },
                 )
             except Exception:
                 self.logger.exception("RAG document ingestion failed")
