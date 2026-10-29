@@ -1024,18 +1024,26 @@ class ModelRouter:
         if policy_selection is not None:
             return policy_selection
 
-        # Apply rule-based routing first
+        # Apply rule-based routing first. Rule candidates and the rule fallback
+        # pass the same guardrail, tier and context-window filter as every other
+        # path; a rule with nothing eligible defers to the next rule.
         for rule in self.routing_rules:
-            if rule.matches(context):
-                available_models = [m for m in rule.models if m in self.models]
-                if available_models:
-                    # Select best model from rule candidates
-                    best_model = self._select_best_model(available_models, context)
-                    return ModelSelection(
-                        model_name=best_model,
-                        confidence=0.9,
-                        reason=f"Rule-based selection: {rule.condition}",
-                    )
+            if not rule.matches(context):
+                continue
+            available_models = self._filter_models_for_context(rule.models, context)
+            if available_models:
+                best_model = self._select_best_model(available_models, context)
+                return ModelSelection(
+                    model_name=best_model,
+                    confidence=0.9,
+                    reason=f"Rule-based selection: {rule.condition}",
+                )
+            if self._filter_models_for_context([rule.fallback], context):
+                return ModelSelection(
+                    model_name=rule.fallback,
+                    confidence=0.9,
+                    reason=f"Rule-based selection (fallback): {rule.condition}",
+                )
 
         # Fallback to capability-based routing
         return self._capability_based_routing(context)

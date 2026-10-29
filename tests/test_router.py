@@ -900,3 +900,141 @@ class TestModelRouter:
         decision = await router.route_query(request)
 
         assert decision.selected_model == "mistral-7b"
+
+
+class TestRuleBasedRoutingFilters:
+    """Rule candidates go through the same guardrail, tier and window filter."""
+
+    def _build_router(self, config, policy, token_count=128):
+        class PolicyCacheStub:
+            async def get_effective_policy(self, request_id, user_id):
+                return dict(policy)
+
+        router = ModelRouter(config, policy_cache=PolicyCacheStub())
+        router.classifier.classify_query = lambda _query: (
+            QueryType.CODE_GENERATION,
+            0.95,
+        )
+        router.token_counter.count_tokens = lambda _query, _model="default": token_count
+        # gpt-5 scores best, then qwen3.6-27b-fast, then mistral-7b.
+        router.model_stats["gpt-5"] = {"success_rate": 0.99, "avg_latency": 100}
+        router.model_stats["qwen3.6-27b-fast"] = {
+            "success_rate": 0.95,
+            "avg_latency": 1200,
+        }
+        router.model_stats["mistral-7b"] = {"success_rate": 0.80, "avg_latency": 1500}
+        return router
+
+    async def _route(self, router, user_tier=UserTier.PREMIUM):
+        request = QueryRequest(
+            query="Write a Python helper", user_id="u1", user_tier=user_tier
+        )
+        decision = await router.route_query(request)
+        context = await router._build_query_context(request)
+        eligible = router._filter_models_for_context(list(router.models), context)
+        return decision, eligible
+
+    @pytest.mark.asyncio
+    async def test_rule_routing_skips_blocked_model(self, router_config):
+        router = self._build_router(router_config, {"blocked_models": ["gpt-5"]})
+
+        decision, eligible = await self._route(router)
+
+        assert decision.selected_model != "gpt-5"
+        assert decision.selected_model in eligible
+
+    @pytest.mark.asyncio
+    async def test_rule_routing_skips_blocked_provider(self, router_config):
+        router = self._build_router(router_config, {"blocked_providers": ["openai"]})
+
+        decision, eligible = await self._route(router)
+
+        assert router.models[decision.selected_model].provider != "openai"
+        assert decision.selected_model in eligible
+
+    @pytest.mark.asyncio
+    async def test_rule_routing_respects_free_tier_access(self, router_config):
+        router = self._build_router(router_config, {})
+
+        decision, eligible = await self._route(router, user_tier=UserTier.FREE)
+
+        assert router.models[decision.selected_model].priority >= 3
+        assert decision.selected_model in eligible
+
+    @pytest.mark.asyncio
+    async def test_rule_routing_respects_context_window(self, router_config):
+        router = self._build_router(router_config, {}, token_count=6000)
+        # mistral-7b (4096-token window) now outscores gpt-5 among rule models.
+        router.model_stats["mistral-7b"] = {"success_rate": 0.99, "avg_latency": 50}
+
+        decision, eligible = await self._route(router, user_tier=UserTier.FREE)
+
+        assert router.models[decision.selected_model].max_tokens >= 6000
+        assert decision.selected_model in eligible
+
+    @pytest.mark.asyncio
+    async def test_rule_routing_uses_fallback_when_rule_models_filtered(
+        self, router_config
+    ):
+        config = dict(router_config)
+        config["routing_rules"] = [
+            {
+                "condition": "query_type == 'code_generation'",
+                "models": ["gpt-5"],
+                "fallback": "mistral-7b",
+            }
+        ]
+        router = self._build_router(config, {"blocked_models": ["gpt-5"]})
+
+        decision, eligible = await self._route(router)
+
+        # Capability routing would pick qwen3.6-27b-fast; the rule fallback wins.
+        assert decision.selected_model == "mistral-7b"
+        assert "query_type == 'code_generation'" in decision.routing_reason
+        assert "fallback" in decision.routing_reason.lower()
+        assert decision.selected_model in eligible
+
+    @pytest.mark.asyncio
+    async def test_rule_routing_moves_to_next_rule_when_fallback_filtered(
+        self, router_config
+    ):
+        config = dict(router_config)
+        config["routing_rules"] = [
+            {
+                "condition": "query_type == 'code_generation'",
+                "models": ["gpt-5"],
+                "fallback": "gpt-5",
+            },
+            {
+                "condition": "query_type == 'code_generation' and token_count < 1000",
+                "models": ["mistral-7b"],
+                "fallback": "mistral-7b",
+            },
+        ]
+        router = self._build_router(config, {"blocked_models": ["gpt-5"]})
+
+        decision, eligible = await self._route(router)
+
+        assert decision.selected_model == "mistral-7b"
+        assert "token_count < 1000" in decision.routing_reason
+        assert decision.selected_model in eligible
+
+    @pytest.mark.asyncio
+    async def test_rule_routing_falls_through_to_capability_routing(
+        self, router_config
+    ):
+        config = dict(router_config)
+        config["routing_rules"] = [
+            {
+                "condition": "query_type == 'code_generation'",
+                "models": ["gpt-5"],
+                "fallback": "gpt-5",
+            }
+        ]
+        router = self._build_router(config, {"blocked_providers": ["openai"]})
+
+        decision, eligible = await self._route(router)
+
+        assert decision.selected_model != "gpt-5"
+        assert "Capability-based selection" in decision.routing_reason
+        assert decision.selected_model in eligible
