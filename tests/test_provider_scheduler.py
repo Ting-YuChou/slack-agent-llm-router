@@ -1109,6 +1109,31 @@ async def test_mid_stream_error_on_a_200_response_falls_back_to_markers(error_ty
     assert scheduler._is_retryable_exception(other) is False
 
 
+@pytest.mark.parametrize("status_code", [301, 302, 307, 308])
+def test_redirect_status_is_not_retryable_even_when_the_message_says_temporary(
+    status_code,
+):
+    import httpx
+
+    # The vLLM clients do not follow redirects, so another attempt gets the
+    # same redirect. httpx words a 307 as "Temporary Redirect", which the
+    # "temporar" marker would otherwise match.
+    scheduler = ProviderCapacityScheduler({}, RecordingAdmission())
+    request = httpx.Request("POST", "http://127.0.0.1:8001/v1/completions")
+    response = httpx.Response(
+        status_code,
+        request=request,
+        headers={"location": "http://127.0.0.1:8001/v2/completions"},
+    )
+    with pytest.raises(httpx.HTTPStatusError) as exc:
+        response.raise_for_status()
+
+    assert scheduler._is_retryable_exception(exc.value) is False
+    for error_type in (StatusCodeError, ResponseStatusError):
+        error = error_type("Temporary Redirect, timeout, overloaded", status_code)
+        assert scheduler._is_retryable_exception(error) is False, error_type
+
+
 def test_real_anthropic_mid_stream_overloaded_error_is_retryable():
     anthropic = pytest.importorskip("anthropic", minversion="0.20")
     import httpx

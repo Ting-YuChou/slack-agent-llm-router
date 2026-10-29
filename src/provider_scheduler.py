@@ -128,7 +128,7 @@ PERMANENT_SERVER_STATUS_CODES = frozenset({501, 505})
 
 
 def _is_retryable_status(status: int) -> bool:
-    if status >= 500:
+    if 500 <= status <= 599:
         return status not in PERMANENT_SERVER_STATUS_CODES
     return status in RETRYABLE_CLIENT_STATUS_CODES
 
@@ -1387,11 +1387,13 @@ class ProviderCapacityScheduler:
             return True
         if isinstance(exc, httpx.TransportError):
             return True
-        # An HTTP error status is authoritative: digits in the message are
-        # not. Any other status (Anthropic raises mid-stream SSE errors with
-        # the 200 of the stream) says nothing, so the heuristics below decide.
+        # A status of 300 or more is authoritative: digits or words in the
+        # message are not (httpx calls a 307 a "Temporary Redirect", and the
+        # clients do not follow redirects). A lower status says nothing
+        # (Anthropic raises mid-stream SSE errors with the 200 of the
+        # stream), so the heuristics below decide.
         status = _exception_status_code(exc)
-        if status is not None and 400 <= status <= 599:
+        if status is not None and status >= 300:
             return _is_retryable_status(status)
         name = type(exc).__name__.lower()
         transient_names = (
