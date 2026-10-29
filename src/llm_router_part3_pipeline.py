@@ -54,21 +54,23 @@ def _enum_value(value: Any) -> Any:
 def _parse_datetime(
     value: Optional[Any], *, default: Optional[datetime] = None
 ) -> datetime:
-    """Parse ISO timestamps emitted by the platform into timezone-aware datetimes."""
+    """Parse platform timestamps into aware UTC datetimes; naive values are UTC."""
+    parsed: Optional[datetime] = None
     if isinstance(value, datetime):
-        if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value
-
-    if isinstance(value, str) and value:
+        parsed = value
+    elif isinstance(value, str) and value:
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             logger.debug(f"Failed to parse datetime value: {value}")
-        else:
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
+
+    if parsed is not None:
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        try:
             return parsed.astimezone(timezone.utc)
+        except (OverflowError, ValueError):
+            logger.debug(f"Datetime value is out of range in UTC: {value}")
 
     return default or datetime.now(timezone.utc)
 

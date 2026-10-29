@@ -158,6 +158,30 @@ def test_parse_datetime_keeps_naive_as_utc_contract(taipei_tz):
     assert _parse_datetime("2026-10-28T15:50:00+08:00").utcoffset() == timedelta(0)
 
 
+def test_parse_datetime_converts_aware_datetimes_to_utc(taipei_tz):
+    taipei = timezone(timedelta(hours=8))
+
+    parsed = _parse_datetime(datetime(2026, 10, 28, 15, 50, tzinfo=taipei))
+
+    assert parsed == datetime(2026, 10, 28, 7, 50, tzinfo=timezone.utc)
+    assert parsed.utcoffset() == timedelta(0)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "0001-01-01T00:00:00+01:00",
+        datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=1))),
+    ],
+    ids=["string", "datetime"],
+)
+def test_parse_datetime_falls_back_when_utc_conversion_overflows(taipei_tz, value):
+    fallback = datetime(2026, 10, 28, 7, 50, tzinfo=timezone.utc)
+
+    assert _parse_datetime(value, default=fallback) is fallback
+    _assert_true_utc(_parse_datetime(value))
+
+
 def _record_stream_events(collector: MetricsCollector, emitted_at: str) -> None:
     collector.record_stream_model_metrics(
         {
