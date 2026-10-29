@@ -1425,9 +1425,18 @@ class vLLMProvider(BaseInferenceProvider):
                 endpoint.last_error = "Endpoint disabled"
                 continue
 
+            # Connect fast, but let requests wait for a pooled connection and
+            # send their body as long as they may wait for a reply: one
+            # endpoint serves many concurrent generations.
+            timeout_seconds = self.timeout_seconds()
             endpoint.client = httpx.AsyncClient(
                 base_url=endpoint.base_url,
-                timeout=_provider_http_timeout(self.timeout_seconds()),
+                timeout=httpx.Timeout(
+                    connect=3.0,
+                    read=timeout_seconds,
+                    write=timeout_seconds,
+                    pool=timeout_seconds,
+                ),
             )
             if self.http_client is None:
                 self.http_client = endpoint.client

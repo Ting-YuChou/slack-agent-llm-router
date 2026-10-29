@@ -544,9 +544,11 @@ async def test_cloud_clients_get_short_connect_and_provider_read_timeout(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("configured", "read"), [(120, 120), (None, 300)])
-async def test_vllm_client_gets_short_connect_and_provider_read_timeout(
+async def test_vllm_client_gets_short_connect_and_provider_timeout_elsewhere(
     configured, read
 ):
+    # Local endpoints queue many concurrent generations on one connection
+    # pool: a 2 s pool wait would fail healthy requests (and trip circuits).
     provider = vLLMProvider(
         {"base_url": "http://127.0.0.1:8001", "timeout": configured}
     )
@@ -557,7 +559,7 @@ async def test_vllm_client_gets_short_connect_and_provider_read_timeout(
         await provider.initialize()
 
     assert client.call_args.kwargs["timeout"] == httpx.Timeout(
-        connect=3, read=read, write=10, pool=2
+        connect=3, read=read, write=read, pool=read
     )
 
 
