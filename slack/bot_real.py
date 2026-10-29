@@ -126,7 +126,6 @@ MEMORY_SLASH_ONLY_MESSAGE = (
     "Use `/llm remember`, `/llm memories`, or `/llm forget`."
 )
 SLACK_BUSY_MESSAGE = "The LLM Router is busy right now. Please retry in a moment."
-SLACK_THINKING_TEXT = "_Thinking…_"
 SLACK_SLASH_WORKING_TEXT = "Working on it…"
 # Commands that answer through the model, though they spend no query quota.
 MODEL_BACKED_COMMANDS = frozenset({"web", "fast"})
@@ -224,7 +223,7 @@ SLACK_OWN_MESSAGE_SENDER = "assistant (you)"
 # part of a transcript: it says nothing, and one left behind when the update
 # failed would read as an answer.
 SLACK_THINKING_TEXT = "_Thinking…_"
-# What the placeholder becomes when the message went to an Agent run instead.
+# A handoff notice the bot no longer posts; still kept out of transcripts.
 SLACK_AGENT_HANDOFF_TEXT = "_Passed to the Agent run in this thread._"
 SLACK_GENERIC_ERROR_MESSAGE = (
     "❌ Sorry, I couldn't process that request right now. Please try again in a "
