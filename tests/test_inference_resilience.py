@@ -342,7 +342,7 @@ async def test_retry_timing_out_in_the_queue_is_not_a_provider_failure():
 
 
 class _ControlledBudget(RequestExecutionBudget):
-    """A budget whose deadline passes when the test says so."""
+    """A budget with 5 s left until the test says the deadline passed."""
 
     expired = False
 
@@ -353,11 +353,21 @@ class _ControlledBudget(RequestExecutionBudget):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "deadline_passed", [True, False], ids=["deadline", "caller-went-away"]
+    ("deadline_seconds", "deadline_passed", "expected_failures"),
+    [
+        # The deadline cancelled a call that had the whole 5 s deadline.
+        pytest.param(5, True, 1, id="deadline-after-full-window"),
+        # Earlier steps had spent 45 s of a 50 s deadline: a sliver.
+        pytest.param(50, True, 0, id="deadline-after-cut-short-window"),
+        # Cancelled with time left: the caller went away, not the provider.
+        pytest.param(5, False, 0, id="caller-went-away"),
+    ],
 )
-async def test_cancelled_call_is_not_a_circuit_failure(deadline_passed):
+async def test_cancelled_call_counts_only_when_the_deadline_ended_a_full_window(
+    deadline_seconds, deadline_passed, expected_failures
+):
     scheduler = ProviderCapacityScheduler(_CIRCUIT, _Admission())
-    budget = _ControlledBudget(max_attempts=1, deadline_seconds=5)
+    budget = _ControlledBudget(max_attempts=1, deadline_seconds=deadline_seconds)
     started = asyncio.Event()
 
     async def hang():
@@ -380,9 +390,41 @@ async def test_cancelled_call_is_not_a_circuit_failure(deadline_passed):
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    # A deadline that cancels a call cut its window short, like the reserve.
     state = await scheduler._read_circuit_state("openai", "gpt-5")
-    assert state.get("failure_count", 0) == 0
+    assert state.get("failure_count", 0) == expected_failures
+
+
+@pytest.mark.asyncio
+async def test_hung_primary_without_fallback_counts_when_the_outer_deadline_wins():
+    # Single-flight off (the default) and no fallback: the scheduler's attempt
+    # timeout and the request's own deadline fire together, and the outer
+    # cancel usually wins.
+    counted = 0
+    for _ in range(5):
+        engine = _chain_engine(
+            _router(("gpt-5",)),
+            None,
+            chains={},
+            scheduler={
+                "request_deadline_seconds": 0.1,
+                "min_attempt_window_seconds": 0,
+                **_CIRCUIT,
+                **_RETRY,
+            },
+            admission=_Admission(),
+        )
+        assert engine.single_flight.enabled is False
+        engine.providers = {"openai": _TimedProvider("openai", None, timeout=0.1)}
+
+        response = await asyncio.wait_for(
+            engine.process_query(_request(**_ENTERPRISE)), timeout=3
+        )
+
+        assert response.error == "inference_failed"
+        state = await engine.scheduler._read_circuit_state("openai", "gpt-5")
+        counted += state.get("failure_count", 0)
+
+    assert counted == 5
 
 
 @pytest.mark.asyncio

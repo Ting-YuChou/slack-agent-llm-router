@@ -337,6 +337,10 @@ class _QueuePollCoordinator:
             self._wake_best(state)
 
 
+# A cancellation this close to the request deadline is the deadline's doing.
+_DEADLINE_SLACK_SECONDS = 0.01
+
+
 @dataclass
 class RequestExecutionBudget:
     """One monotonic deadline and transport-attempt budget for a request."""
@@ -569,6 +573,29 @@ class ProviderCapacityScheduler:
                     self._record_retry_metric(provider, model_name, "success")
                 return response
             except asyncio.CancelledError:
+                # Without single-flight the request's own deadline and this
+                # attempt's timeout fire together, and the outer cancel tends
+                # to win: a hang that had a full window counts all the same.
+                if (
+                    operation_started
+                    and not window_cut_short
+                    and budget.remaining_seconds <= _DEADLINE_SLACK_SECONDS
+                ):
+                    try:
+                        await self.record_failure(
+                            provider=provider,
+                            model_name=model_name,
+                            error=asyncio.TimeoutError(
+                                "request execution deadline exceeded"
+                            ),
+                            request_started_at_ms=request_started_at_ms,
+                            circuit_permit=lease.circuit_permit if lease else None,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Circuit failure transition failed after a provider hang",
+                            exc_info=True,
+                        )
                 raise
             except Exception as exc:
                 last_exc = exc
