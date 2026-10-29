@@ -17,7 +17,6 @@ import json
 import logging
 import multiprocessing as mp
 import os
-import secrets
 import signal
 import sys
 import time
@@ -35,6 +34,7 @@ from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.requests import ClientDisconnect
 from pydantic import ValidationError
 from prometheus_client import start_http_server
 
@@ -46,6 +46,19 @@ from src.admission import (
     RedisAdmissionController,
 )
 from src.agent_runtime import AgentRuntimeClient
+from src.api_security import (
+    RAG_BODY_LIMIT_HINTS,
+    ApiPrincipal,
+    AttachmentRejected,
+    RequestBodyLimitMiddleware,
+    api_key_clients_configured,
+    apply_principal_entitlements,
+    filter_external_metadata,
+    normalize_external_attachments,
+    parse_media_type,
+    rag_request_body_limits,
+    resolve_api_principal,
+)
 from src.llm_router_part1_router import ModelRouter
 from src.llm_router_part2_inference import InferenceEngine, route_response_status
 from src.rag.service import (
@@ -84,6 +97,9 @@ WEB_SEARCH_ENABLED_ENV_VAR = "LLM_ROUTER_WEB_SEARCH_ENABLED"
 RAG_ENABLED_ENV_VAR = "LLM_ROUTER_RAG_ENABLED"
 RAG_QUEUE_ENABLED_ENV_VAR = "LLM_ROUTER_RAG_QUEUE_ENABLED"
 PUBLIC_ENDPOINTS = {"/", "/live", "/ready", "/health"}
+# Responses sent before the request body is read: closing the connection keeps
+# the server from reading and discarding an arbitrarily large body.
+REJECTED_BEFORE_BODY_HEADERS = {"Connection": "close"}
 
 # Optional infrastructure is imported only when its feature is enabled. Keeping
 # these names patchable also supports the existing isolated service tests.
@@ -155,6 +171,7 @@ class LLMRouterPlatform:
         self._shutdown_complete = False
         self._signal_count = 0
         self._service_tasks: set[asyncio.Task] = set()
+        self._admission_release_tasks: set[asyncio.Future] = set()
         self._api_server: Optional[uvicorn.Server] = None
         shutdown_config = dict(self.config.get("shutdown", {}) or {})
         self.shutdown_grace_period_seconds = float(
@@ -234,7 +251,7 @@ class LLMRouterPlatform:
                 "CORS is configured with a wildcard origin; restrict allow_origins before production rollout."
             )
 
-        if self._api_key_auth_enabled() and not self._configured_api_keys():
+        if not self._api_key_auth_configured():
             self.logger.warning(
                 "API key authentication is enabled but no keys were loaded from %s.",
                 self._api_key_env_var_name(),
@@ -737,7 +754,11 @@ class LLMRouterPlatform:
 
     def _api_key_auth_configured(self) -> bool:
         """Return whether auth is either disabled or fully configured."""
-        return not self._api_key_auth_enabled() or bool(self._configured_api_keys())
+        return (
+            not self._api_key_auth_enabled()
+            or bool(self._configured_api_keys())
+            or api_key_clients_configured(self._api_keys_config())
+        )
 
     def _request_path_is_public(self, path: str) -> bool:
         """Return whether the request path is publicly accessible."""
@@ -756,15 +777,19 @@ class LLMRouterPlatform:
 
         return None
 
-    def _is_valid_api_key(self, provided_key: Optional[str]) -> bool:
-        """Return whether the provided API key matches a configured key."""
-        if not provided_key:
-            return False
+    def _resolve_api_principal(
+        self, provided_key: Optional[str]
+    ) -> Optional[ApiPrincipal]:
+        """Return the principal for a valid API key, or None.
 
-        for expected_key in self._configured_api_keys():
-            if secrets.compare_digest(provided_key, expected_key):
-                return True
-        return False
+        Keys under ``security.api_keys.clients`` carry their configured
+        entitlements; other accepted keys are clamped to the free tier.
+        """
+        return resolve_api_principal(
+            provided_key,
+            self._api_keys_config(),
+            self._configured_api_keys(),
+        )
 
     def _admission_identifier(self, request: Request) -> Optional[str]:
         """Build a stable non-secret identity for protected non-route admission."""
@@ -793,17 +818,67 @@ class LLMRouterPlatform:
         return self._build_admission_response(decision), None
 
     async def _admit_route_request(
-        self, query_data: QueryRequest
+        self, query_data: QueryRequest, principal: Optional[ApiPrincipal] = None
     ) -> tuple[Optional[JSONResponse], Optional[AdmissionReservation]]:
         """Apply full route-level admission after QueryRequest validation."""
         admission = self._get_admission_controller()
         if admission is None:
             return self._missing_admission_response("route"), None
 
-        decision = await admission.acquire_route(query_data)
+        if principal is None:
+            decision = await admission.acquire_route(query_data)
+        else:
+            decision = await admission.acquire_route(query_data, principal)
         if decision.allowed:
             return None, decision.reservation
         return self._build_admission_response(decision), None
+
+    def _request_body_path_limits(self) -> Dict[str, Dict[str, int]]:
+        """Per-path body caps: RAG ingestion sized from rag.upload, then config."""
+        upload_config = dict((self.config.get("rag", {}) or {}).get("upload", {}) or {})
+        limits = rag_request_body_limits(upload_config)
+        configured = self._security_config().get("request_body_limits") or {}
+        limits.update({path: dict(caps) for path, caps in configured.items()})
+        return limits
+
+    def _apply_route_boundary_guards(
+        self, query_data: QueryRequest, principal: Optional[ApiPrincipal] = None
+    ) -> Optional[JSONResponse]:
+        """Sanitize an external /route request before admission and inference.
+
+        Only POST /route runs this: the Slack bot builds its requests (and
+        their server-side metadata) in-process. With API key auth, the tier,
+        priority and latency hints are clamped to the caller's principal.
+        """
+        removed = filter_external_metadata(query_data)
+        if removed:
+            self.logger.info(
+                "Dropped non-client metadata keys from external request %s: %s",
+                query_data.request_id,
+                ", ".join(removed),
+            )
+        if principal is not None:
+            changes = apply_principal_entitlements(query_data, principal)
+            if changes:
+                self.logger.info(
+                    "Clamped request %s to the entitlements of client %s: %s",
+                    query_data.request_id,
+                    principal.client_id,
+                    "; ".join(changes),
+                )
+        max_attachment_bytes = int(
+            self._security_config().get("max_attachment_bytes") or 1024 * 1024
+        )
+        try:
+            normalize_external_attachments(
+                query_data, max_attachment_bytes=max_attachment_bytes
+            )
+        except AttachmentRejected as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"error": exc.error, "message": exc.message},
+            )
+        return None
 
     async def _release_admission_reservation(
         self,
@@ -811,10 +886,36 @@ class LLMRouterPlatform:
         *,
         actual_tokens: Optional[int] = None,
     ):
+        """Release an admission slot, surviving cancellation of the caller.
+
+        The release runs in its own task under ``asyncio.shield`` so a
+        cancelled handler still frees its slot, and it is retried once.
+        """
         admission = self._get_admission_controller()
         if admission is None or reservation is None:
             return
-        await admission.release(reservation, actual_tokens=actual_tokens)
+
+        async def release_with_retry():
+            for attempt in range(2):
+                try:
+                    await admission.release(reservation, actual_tokens=actual_tokens)
+                    return
+                except Exception as exc:
+                    if attempt == 0:
+                        self.logger.warning(
+                            "Admission release failed, retrying: %s", exc
+                        )
+                        continue
+                    self.logger.warning(
+                        "Admission release failed; the active slot expires "
+                        "with its time bucket: %s",
+                        exc,
+                    )
+
+        task = asyncio.ensure_future(release_with_retry())
+        self._admission_release_tasks.add(task)
+        task.add_done_callback(self._admission_release_tasks.discard)
+        await asyncio.shield(task)
 
     def _missing_admission_response(self, stage: str) -> Optional[JSONResponse]:
         if not self._admission_enabled():
@@ -1153,8 +1254,10 @@ class LLMRouterPlatform:
             or rag_config.get("upload", {})
             or {}
         )
-        content_type = request.headers.get("content-type", "").lower()
-        if "application/json" in content_type:
+        # Decide by the exact media type, as the body-limit middleware does:
+        # a substring match would parse a multipart-capped body as JSON.
+        media_type = parse_media_type(request.headers.get("content-type"))
+        if media_type == "application/json":
             payload = await request.json()
             filename = str(payload.get("filename") or "").strip()
             encoded = payload.get("content_base64")
@@ -1207,7 +1310,7 @@ class LLMRouterPlatform:
                 "document_id": document_id,
             }
 
-        if "multipart/form-data" in content_type:
+        if media_type == "multipart/form-data":
             try:
                 form = await request.form()
             except Exception as exc:
@@ -1713,6 +1816,8 @@ class LLMRouterPlatform:
 
         response, reservation = await self._admit_http_request(request)
         if response is not None:
+            # Sent before the body is read: close rather than drain it.
+            response.headers["Connection"] = "close"
             return response
 
         try:
@@ -1765,9 +1870,12 @@ class LLMRouterPlatform:
                         "error": "auth_unavailable",
                         "message": "API authentication is enabled but no API keys are configured",
                     },
+                    headers=REJECTED_BEFORE_BODY_HEADERS,
                 )
 
-            if self._is_valid_api_key(self._extract_api_key(request)):
+            principal = self._resolve_api_principal(self._extract_api_key(request))
+            if principal is not None:
+                request.state.api_principal = principal
                 return await self._call_with_http_admission(request, call_next)
 
             security_logger.log_authentication_attempt(
@@ -1784,7 +1892,20 @@ class LLMRouterPlatform:
                     "error": "unauthorized",
                     "message": "A valid API key is required",
                 },
+                headers=REJECTED_BEFORE_BODY_HEADERS,
             )
+
+        # Added last, so it is the outermost middleware: oversized bodies are
+        # rejected before authentication, admission or JSON parsing.
+        security_config = self._security_config()
+        app.add_middleware(
+            RequestBodyLimitMiddleware,
+            max_body_bytes=int(
+                security_config.get("max_request_body_bytes") or 2 * 1024 * 1024
+            ),
+            path_limits=self._request_body_path_limits(),
+            hints=RAG_BODY_LIMIT_HINTS,
+        )
 
         @app.get("/")
         async def service_index():
@@ -1812,7 +1933,7 @@ class LLMRouterPlatform:
 
         # Model routing endpoint
         @app.post("/route")
-        async def route_query(query_data: QueryRequest):
+        async def route_query(query_data: QueryRequest, request: Request):
             endpoint = "/route"
             method = "POST"
             start_time = time.perf_counter()
@@ -1822,8 +1943,17 @@ class LLMRouterPlatform:
             active_requests = getattr(SYSTEM_METRICS, "active_requests", None)
 
             try:
+                # Set by the auth middleware; None when API key auth is off.
+                principal = getattr(request.state, "api_principal", None)
+                boundary_response = self._apply_route_boundary_guards(
+                    query_data, principal
+                )
+                if boundary_response is not None:
+                    status_code = boundary_response.status_code
+                    return boundary_response
+
                 admission_response, route_reservation = await self._admit_route_request(
-                    query_data
+                    query_data, principal
                 )
                 if admission_response is not None:
                     status_code = admission_response.status_code
@@ -1855,6 +1985,11 @@ class LLMRouterPlatform:
                     },
                 )
             finally:
+                # Free the admission slot first: metrics publishing can be slow
+                # or cancelled, and the slot must not wait on it.
+                if active_requests is not None and active_request_recorded:
+                    active_requests.labels(endpoint=endpoint).dec()
+                await self._release_admission_reservation(route_reservation)
                 await self._record_api_metrics(
                     endpoint=endpoint,
                     method=method,
@@ -1862,9 +1997,6 @@ class LLMRouterPlatform:
                     duration_seconds=time.perf_counter() - start_time,
                     error_type="RouteError" if status_code >= 500 else None,
                 )
-                if active_requests is not None and active_request_recorded:
-                    active_requests.labels(endpoint=endpoint).dec()
-                await self._release_admission_reservation(route_reservation)
 
         @app.post("/rag/uploads")
         async def create_rag_upload(
@@ -2039,6 +2171,17 @@ class LLMRouterPlatform:
                 return JSONResponse(
                     status_code=400,
                     content={"error": "invalid_rag_document", "message": str(exc)},
+                )
+            except ClientDisconnect:
+                # The client went away, or the body-limit middleware cut the
+                # body off and has already answered 413.
+                self.logger.info("RAG document upload ended before its body was read")
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "request_body_incomplete",
+                        "message": "The request body was not received in full",
+                    },
                 )
             except Exception:
                 self.logger.exception("RAG document ingestion failed")

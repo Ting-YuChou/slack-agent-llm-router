@@ -141,6 +141,8 @@ policy_cache:
   enabled: false
 
 security:
+  # With API key auth off there is no principal: /route keeps the caller's
+  # tier and priority. Enable it (see config.yaml) before exposing the API.
   api_keys:
     enabled: false
   cors:

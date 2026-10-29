@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 import uuid
 
 from pydantic import (
@@ -60,12 +60,15 @@ class AttachmentType(str, Enum):
 
 
 class Attachment(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    name: str
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), max_length=128)
+    name: str = Field(..., max_length=1024)
     type: AttachmentType
+    # Declared size. POST /route replaces it with len(content) when content is
+    # sent; in-process callers build attachments directly, so the schema does
+    # not compare them.
     size_bytes: int
-    mime_type: str
-    url: Optional[str] = None
+    mime_type: str = Field(..., max_length=255)
+    url: Optional[str] = Field(None, max_length=4096)
     content: Optional[bytes] = None
 
     @field_validator("size_bytes")
@@ -113,16 +116,19 @@ class ToolCall(BaseModel):
     error: Optional[str] = None
 
 
+BoundedName = Annotated[str, Field(max_length=256)]
+
+
 class QueryRequest(BaseModel):
     _rag_images: List[Any] = PrivateAttr(default_factory=list)
 
     # Required fields
     query: str = Field(..., min_length=1, max_length=50000)
-    user_id: str = Field(..., min_length=1)
+    user_id: str = Field(..., min_length=1, max_length=256)
 
     # Core fields with proper types
     user_tier: UserTier = UserTier.FREE
-    request_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    request_id: str = Field(default_factory=lambda: str(uuid.uuid4()), max_length=128)
     timestamp: datetime = Field(default_factory=utc_now)
 
     # Optional context and settings
@@ -145,17 +151,17 @@ class QueryRequest(BaseModel):
 
     # Tool handling
     tool_policy: ToolPolicy = ToolPolicy.AUTO
-    allowed_tools: List[str] = Field(default_factory=list)
+    allowed_tools: List[BoundedName] = Field(default_factory=list, max_length=32)
     web_search_options: Optional[WebSearchOptions] = None
 
     # RAG handling
     rag_policy: RagPolicy = RagPolicy.AUTO
-    knowledge_base_ids: List[str] = Field(default_factory=list)
+    knowledge_base_ids: List[BoundedName] = Field(default_factory=list, max_length=32)
     rag_options: Optional["RagOptions"] = None
 
     # Additional metadata
-    session_id: Optional[str] = None
-    conversation_id: Optional[str] = None
+    session_id: Optional[str] = Field(None, max_length=256)
+    conversation_id: Optional[str] = Field(None, max_length=256)
     metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
     @field_validator("query")
@@ -527,6 +533,10 @@ class ApiRateLimitingConfig(ConfigModel):
     providers: Dict[str, ApiRateLimitScopeConfig] = Field(default_factory=dict)
     models: Dict[str, ApiRateLimitScopeConfig] = Field(default_factory=dict)
     token_budget: ApiTokenBudgetConfig = Field(default_factory=ApiTokenBudgetConfig)
+    # Active-request counters live in time buckets of this length. Keep it above
+    # the longest request (deadline plus grace): a slot whose release is lost
+    # stops counting after at most two windows.
+    active_window_ms: int = Field(180_000, ge=1000)
 
     @field_validator("failure_mode")
     @classmethod
@@ -1046,10 +1056,47 @@ class PolicyCacheConfig(ConfigModel):
     consumer: Dict[str, Any] = Field(default_factory=dict)
 
 
+class ApiKeyClientConfig(ConfigModel):
+    """An API key mapped to a client and what that client may ask for."""
+
+    client_id: str = Field(..., min_length=1, max_length=128)
+    # Exactly one key reference: an environment variable holding the key, or
+    # the hex SHA-256 of the key.
+    key_env: Optional[str] = Field(None, min_length=1)
+    sha256: Optional[str] = Field(None, pattern=r"^[0-9a-fA-F]{64}$")
+    # Highest user_tier the client may request; higher tiers are clamped.
+    max_tier: UserTier = UserTier.FREE
+    # Per-client request rate (0 disables it); burst defaults to rpm.
+    rpm: int = Field(60, ge=0)
+    burst: Optional[int] = Field(None, ge=1)
+    # Per-client concurrent /route requests (0 disables it).
+    active: int = Field(10, ge=0)
+    # Whether the client's priority and latency metadata are honoured.
+    allow_priority: bool = False
+
+    @model_validator(mode="after")
+    def validate_key_reference(self) -> "ApiKeyClientConfig":
+        if bool(self.key_env) == bool(self.sha256):
+            raise ValueError("set exactly one of key_env or sha256")
+        return self
+
+
 class ApiKeysSecurityConfig(ConfigModel):
     enabled: bool = False
     header_name: str = "X-API-Key"
+    # Keys listed here without a client entry authenticate as an unmapped
+    # principal: max_tier free, no priority, the unmapped_* limits below.
     env_var: str = "LLM_ROUTER_API_KEYS"
+    clients: List[ApiKeyClientConfig] = Field(default_factory=list)
+    unmapped_rpm: int = Field(60, ge=0)
+    unmapped_active: int = Field(10, ge=0)
+
+    @model_validator(mode="after")
+    def validate_unique_clients(self) -> "ApiKeysSecurityConfig":
+        client_ids = [client.client_id for client in self.clients]
+        if len(client_ids) != len(set(client_ids)):
+            raise ValueError("api_keys.clients client_id values must be unique")
+        return self
 
 
 class JwtSecurityConfig(ConfigModel):
@@ -1071,6 +1118,36 @@ class SecurityConfig(ConfigModel):
     api_keys: ApiKeysSecurityConfig = Field(default_factory=ApiKeysSecurityConfig)
     jwt: JwtSecurityConfig = Field(default_factory=JwtSecurityConfig)
     cors: CorsSecurityConfig = Field(default_factory=CorsSecurityConfig)
+    # Request bodies above this size get 413 before they are parsed.
+    max_request_body_bytes: int = Field(2 * 1024 * 1024, ge=1)
+    # Per-path caps by media type ("*" matches any), e.g.
+    # {"/rag/batches": {"application/json": 20000000}}. A path listed here
+    # replaces its default; /rag/documents and /rag/batches otherwise get caps
+    # derived from rag.upload. Other media types use max_request_body_bytes.
+    request_body_limits: Dict[str, Dict[str, int]] = Field(default_factory=dict)
+    # POST /route rejects an attachment whose inline content is above this size.
+    max_attachment_bytes: int = Field(1024 * 1024, ge=1)
+
+    @field_validator("request_body_limits")
+    @classmethod
+    def validate_request_body_limits(
+        cls, value: Dict[str, Dict[str, int]]
+    ) -> Dict[str, Dict[str, int]]:
+        for path, by_media_type in value.items():
+            if not path.startswith("/"):
+                raise ValueError(f"request_body_limits path must start with /: {path}")
+            for media_type, limit in by_media_type.items():
+                if limit < 1:
+                    raise ValueError(
+                        f"request_body_limits[{path}][{media_type}] must be >= 1"
+                    )
+        return {
+            path: {
+                media_type.strip().lower(): limit
+                for media_type, limit in by_media_type.items()
+            }
+            for path, by_media_type in value.items()
+        }
 
 
 class DatabasePoolConfig(ConfigModel):

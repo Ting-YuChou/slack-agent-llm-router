@@ -48,6 +48,8 @@ def _is_max_connections_error(exc: Exception) -> bool:
 
 
 QUEUE_PRIORITY_STRIDE = 1_000_000_000_000
+# Request deadline (60 s) plus generous grace for queueing, retrieval and drain.
+DEFAULT_ACTIVE_WINDOW_MS = 3 * 60 * 1000
 
 
 ADMIT_SCRIPT = """
@@ -117,22 +119,28 @@ local reservation_ttl_ms = tonumber(ARGV[7])
 local bucket_ttl_ms = tonumber(ARGV[8])
 local now_ms = tonumber(ARGV[9])
 local active_count = tonumber(ARGV[10])
-local arg_index = 11
+local active_ttl_ms = tonumber(ARGV[11])
+local arg_index = 12
 
+-- Each active scope is a pair of time-bucketed counters: KEYS[2i] is the
+-- current bucket and KEYS[2i + 1] the previous one. A slot whose release is
+-- lost stops counting once its bucket ages out, even under steady traffic.
 for index = 1, active_count do
     local limit = tonumber(ARGV[arg_index])
     arg_index = arg_index + 1
     if limit and limit > 0 then
-        local current = tonumber(redis.call("GET", KEYS[1 + index]) or "0")
+        local current_key = KEYS[2 * index]
+        local current = math.max(0, tonumber(redis.call("GET", current_key) or "0"))
+            + math.max(0, tonumber(redis.call("GET", KEYS[2 * index + 1]) or "0"))
         if current >= limit then
-            return {0, "active_limit", 100, KEYS[1 + index], queue_depth, pruned_count, queue_score}
+            return {0, "active_limit", 100, current_key, queue_depth, pruned_count, queue_score}
         end
     end
 end
 
 local bucket_count = tonumber(ARGV[arg_index])
 arg_index = arg_index + 1
-local bucket_key_start = 2 + active_count
+local bucket_key_start = 2 + (2 * active_count)
 local next_tokens = {}
 local bucket_capacities = {}
 
@@ -180,9 +188,9 @@ if not reservation_created then
 end
 
 for index = 1, active_count do
-    local active_key = KEYS[1 + index]
+    local active_key = KEYS[2 * index]
     redis.call("INCR", active_key)
-    redis.call("PEXPIRE", active_key, reservation_ttl_ms)
+    redis.call("PEXPIRE", active_key, active_ttl_ms)
 end
 
 for index = 1, bucket_count do
@@ -246,13 +254,17 @@ local active_count = tonumber(ARGV[3])
 local token_count = tonumber(ARGV[4])
 local arg_index = 5
 
+-- KEYS[1 + index] is the time bucket the reservation incremented. A bucket
+-- that already expired no longer counts, so there is nothing to undo.
 for index = 1, active_count do
     local active_key = KEYS[1 + index]
-    local current = tonumber(redis.call("GET", active_key) or "0")
-    if current <= 1 then
-        redis.call("DEL", active_key)
-    else
-        redis.call("DECR", active_key)
+    local current = tonumber(redis.call("GET", active_key))
+    if current ~= nil then
+        if current <= 1 then
+            redis.call("DEL", active_key)
+        else
+            redis.call("DECR", active_key)
+        end
     end
 end
 
@@ -297,6 +309,7 @@ class BucketSpec:
 
 @dataclass
 class ActiveSpec:
+    # Base key: requests are counted in time buckets at f"{key}:{bucket}".
     key: str
     limit: int
     reason: str
@@ -326,6 +339,8 @@ class AdmissionReservation:
     token_specs: List[BucketSpec] = field(default_factory=list)
     reserved_tokens: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # The time-bucket keys this reservation incremented, one per active spec.
+    active_keys: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -407,6 +422,13 @@ class RedisAdmissionController:
             self.config.get("reservation_ttl_ms", 15 * 60 * 1000)
         )
         self.bucket_ttl_ms = int(self.config.get("bucket_ttl_ms", 60 * 60 * 1000))
+        # Active slots are counted in time buckets of this length; the count is
+        # the current plus the previous bucket. It must cover the longest
+        # request (deadline plus grace): a slot whose release is lost stops
+        # counting after at most two windows.
+        self.active_window_ms = max(
+            1, int(self.config.get("active_window_ms") or DEFAULT_ACTIVE_WINDOW_MS)
+        )
         self.redis_client = redis_client
         self._owns_redis_client = redis_client is None
         self._redis_available = redis_client is not None
@@ -516,13 +538,31 @@ class RedisAdmissionController:
             metadata=metadata,
         )
 
-    async def acquire_route(self, request: Any) -> AdmissionDecision:
-        """Acquire request-level admission after /route body validation."""
+    async def acquire_route(
+        self, request: Any, principal: Optional[Any] = None
+    ) -> AdmissionDecision:
+        """Acquire request-level admission after /route body validation.
+
+        ``principal`` is the authenticated API client (``client_id``, ``rpm``,
+        ``burst``, ``active``). It adds a per-client rate bucket and active
+        scope, and scopes the per-user bucket to ``client_id:user_id``.
+        """
         active_specs = self._global_active_specs()
         bucket_specs = self._global_request_bucket_specs()
+        metadata = {
+            "user_tier": self._tier_value(request.user_tier),
+            "request_id": str(getattr(request, "request_id", "")),
+        }
+        user_key = str(request.user_id)
+        if principal is not None:
+            client_id = str(principal.client_id)
+            active_specs.extend(self._principal_active_specs(principal))
+            bucket_specs.extend(self._principal_request_bucket_specs(principal))
+            user_key = f"{client_id}:{user_key}"
+            metadata["client_id"] = client_id
         bucket_specs.extend(
             self._user_and_tier_request_bucket_specs(
-                user_id=str(request.user_id),
+                user_id=user_key,
                 user_tier=self._tier_value(request.user_tier),
             )
         )
@@ -532,10 +572,7 @@ class RedisAdmissionController:
             bucket_specs=bucket_specs,
             token_specs=[],
             reserved_tokens=0,
-            metadata={
-                "user_tier": self._tier_value(request.user_tier),
-                "request_id": str(getattr(request, "request_id", "")),
-            },
+            metadata=metadata,
         )
 
     async def acquire_provider(
@@ -603,47 +640,60 @@ class RedisAdmissionController:
 
         keys = (
             [self._reservation_key(reservation.reservation_id)]
-            + [spec.key for spec in reservation.active_specs]
+            + list(reservation.active_keys)
             + token_keys
         )
         args = [
             str(self._now_ms()),
             str(self.bucket_ttl_ms),
-            str(len(reservation.active_specs)),
+            str(len(reservation.active_keys)),
             str(len(token_keys)),
             *token_args,
         ]
 
-        try:
-            result = await self._eval(RELEASE_SCRIPT, keys, args)
-            released = bool(int(self._result_value(result, 0, 0)))
-            if released:
-                for active_spec in reservation.active_specs:
-                    ADMISSION_METRICS.active_reservations.labels(
-                        stage=reservation.stage,
-                        scope=active_spec.scope,
-                    ).dec()
-                if reservation.reserved_tokens > 0:
+        result: Optional[Sequence[Any]] = None
+        for attempt in range(2):
+            try:
+                result = await self._eval(RELEASE_SCRIPT, keys, args)
+                break
+            except Exception as exc:
+                ADMISSION_METRICS.redis_errors.labels(operation="release").inc()
+                self._mark_redis_failure("release", exc)
+                if attempt == 0:
+                    # The script is idempotent: a retry after a lost reply
+                    # finds the reservation gone and changes nothing.
+                    logger.warning("Admission release failed, retrying: %s", exc)
+                    continue
+                logger.warning(
+                    "Admission release failed; the active slot expires with "
+                    "its time bucket: %s",
+                    exc,
+                )
+                return False
+
+        released = bool(int(self._result_value(result or [], 0, 0)))
+        if released:
+            for active_spec in reservation.active_specs:
+                ADMISSION_METRICS.active_reservations.labels(
+                    stage=reservation.stage,
+                    scope=active_spec.scope,
+                ).dec()
+            if reservation.reserved_tokens > 0:
+                ADMISSION_METRICS.tokens.labels(
+                    stage=reservation.stage,
+                    token_type="actual",
+                ).inc(max(0, int(actual_tokens or reservation.reserved_tokens)))
+                if delta > 0:
                     ADMISSION_METRICS.tokens.labels(
                         stage=reservation.stage,
-                        token_type="actual",
-                    ).inc(max(0, int(actual_tokens or reservation.reserved_tokens)))
-                    if delta > 0:
-                        ADMISSION_METRICS.tokens.labels(
-                            stage=reservation.stage,
-                            token_type="refunded",
-                        ).inc(delta)
-                    elif delta < 0:
-                        ADMISSION_METRICS.tokens.labels(
-                            stage=reservation.stage,
-                            token_type="overage",
-                        ).inc(abs(delta))
-            return released
-        except Exception as exc:
-            ADMISSION_METRICS.redis_errors.labels(operation="release").inc()
-            self._mark_redis_failure("release", exc)
-            logger.warning("Admission release failed: %s", exc)
-            return False
+                        token_type="refunded",
+                    ).inc(delta)
+                elif delta < 0:
+                    ADMISSION_METRICS.tokens.labels(
+                        stage=reservation.stage,
+                        token_type="overage",
+                    ).inc(abs(delta))
+        return released
 
     async def _acquire(
         self,
@@ -783,8 +833,12 @@ class RedisAdmissionController:
         queue_request: Optional[QueueAdmissionRequest] = None,
     ) -> AdmissionDecision:
         reservation_id = uuid.uuid4().hex
+        now_ms = self._now_ms()
+        active_bucket = now_ms // self.active_window_ms
+        active_keys = [f"{spec.key}:{active_bucket}" for spec in active_specs]
         keys = [self._reservation_key(reservation_id)]
-        keys.extend(spec.key for spec in active_specs)
+        for spec, current_key in zip(active_specs, active_keys):
+            keys.extend([current_key, f"{spec.key}:{active_bucket - 1}"])
         keys.extend(spec.key for spec in bucket_specs)
 
         if queue_request is not None:
@@ -806,8 +860,9 @@ class RedisAdmissionController:
             str(queue_request.max_depth if queue_request else 0),
             str(self.reservation_ttl_ms),
             str(self.bucket_ttl_ms),
-            str(self._now_ms()),
+            str(now_ms),
             str(len(active_specs)),
+            str(2 * self.active_window_ms),
         ]
         args.extend(str(spec.limit) for spec in active_specs)
         args.append(str(len(bucket_specs)))
@@ -863,7 +918,14 @@ class RedisAdmissionController:
                         "queue_score": queue_score,
                     },
                 )
-            denial_reason = self._normalize_denial_reason(reason, denied_key)
+            denied_spec_reasons = {
+                active_key: spec.reason
+                for spec, active_key in zip(active_specs, active_keys)
+            }
+            if reason == "active_limit" and denied_key in denied_spec_reasons:
+                denial_reason = denied_spec_reasons[denied_key]
+            else:
+                denial_reason = self._normalize_denial_reason(reason, denied_key)
             decision = self._deny_rate_limited(
                 stage,
                 denial_reason,
@@ -885,6 +947,7 @@ class RedisAdmissionController:
             token_specs=token_specs,
             reserved_tokens=reserved_tokens,
             metadata=metadata,
+            active_keys=active_keys,
         )
         self._record_decision(stage, "allowed", "allowed")
         for active_spec in active_specs:
@@ -935,6 +998,10 @@ class RedisAdmissionController:
 
     @staticmethod
     def _is_waitable_denial(reason: str) -> bool:
+        # A client at its own active limit must not hold the shared queue head
+        # and block every other client behind it.
+        if reason == "principal_active_requests_exceeded":
+            return False
         return reason.endswith("_active_requests_exceeded") or reason in {
             "active_limit",
             "queue_wait",
@@ -1067,12 +1134,43 @@ class RedisAdmissionController:
             return []
         return [
             ActiveSpec(
-                key=self._key("active", "global"),
+                key=self._key("global", "active"),
                 limit=limit,
                 reason="global_active_requests_exceeded",
                 scope="global",
             )
         ]
+
+    def _principal_active_specs(self, principal: Any) -> List[ActiveSpec]:
+        limit = int(getattr(principal, "active", 0) or 0)
+        if limit <= 0:
+            return []
+        return [
+            ActiveSpec(
+                key=self._key(
+                    "principal", self._hash_id(str(principal.client_id)), "active"
+                ),
+                limit=limit,
+                reason="principal_active_requests_exceeded",
+                scope="principal",
+            )
+        ]
+
+    def _principal_request_bucket_specs(self, principal: Any) -> List[BucketSpec]:
+        requests_per_minute = int(getattr(principal, "rpm", 0) or 0)
+        spec = self._request_bucket_spec(
+            key=self._key(
+                "bucket",
+                "requests",
+                "principal",
+                self._hash_id(str(principal.client_id)),
+            ),
+            requests_per_minute=requests_per_minute,
+            burst_size=int(getattr(principal, "burst", 0) or requests_per_minute),
+            reason="principal_request_rate_exceeded",
+            scope="principal",
+        )
+        return [spec] if spec else []
 
     def _model_provider_active_specs(
         self, *, model_name: str, provider: str
@@ -1085,7 +1183,7 @@ class RedisAdmissionController:
         if provider_limit:
             specs.append(
                 ActiveSpec(
-                    key=self._key("active", "provider", provider),
+                    key=self._key("provider", provider, "active"),
                     limit=int(provider_limit),
                     reason="provider_active_requests_exceeded",
                     scope=f"provider:{provider}",
@@ -1094,7 +1192,7 @@ class RedisAdmissionController:
         if model_limit:
             specs.append(
                 ActiveSpec(
-                    key=self._key("active", "model", model_name),
+                    key=self._key("model", model_name, "active"),
                     limit=int(model_limit),
                     reason="model_active_requests_exceeded",
                     scope=f"model:{model_name}",
@@ -1323,6 +1421,8 @@ class RedisAdmissionController:
             return "provider_active_requests_exceeded"
         if ":model:" in redis_key:
             return "model_active_requests_exceeded"
+        if ":principal:" in redis_key:
+            return "principal_active_requests_exceeded"
         return "global_active_requests_exceeded"
 
     def _reservation_key(self, reservation_id: str) -> str:

@@ -1,5 +1,6 @@
 import asyncio
 import time
+from types import SimpleNamespace
 
 import pytest
 from redis.exceptions import MaxConnectionsError
@@ -10,7 +11,7 @@ from src.admission import (
     RedisAdmissionController,
 )
 from src.utils.metrics import ADMISSION_METRICS, metric_value_for_labels
-from src.utils.schema import QueryRequest, UserTier
+from src.utils.schema import ApiRateLimitingConfig, QueryRequest, UserTier
 
 
 class FakeRedis:
@@ -127,17 +128,21 @@ class FakeRedis:
                     return [0, "queue_wait", 0, order_key, queue_depth, pruned]
 
         active_count = int(args[9])
-        arg_index = 10
+        arg_index = 11
         for index in range(active_count):
             limit = int(args[arg_index])
             arg_index += 1
-            current = int(self.values.get(keys[1 + index], 0))
+            current_key = keys[1 + 2 * index]
+            previous_key = keys[2 + 2 * index]
+            current = int(self.values.get(current_key, 0)) + int(
+                self.values.get(previous_key, 0)
+            )
             if limit > 0 and current >= limit:
-                return [0, "active_limit", 100, keys[1 + index], queue_depth, pruned]
+                return [0, "active_limit", 100, current_key, queue_depth, pruned]
 
         bucket_count = int(args[arg_index])
         arg_index += 1
-        bucket_key_start = 1 + active_count
+        bucket_key_start = 1 + 2 * active_count
         next_tokens = []
         for index in range(bucket_count):
             capacity = float(args[arg_index])
@@ -170,7 +175,7 @@ class FakeRedis:
             ]
         self.values[reservation_key] = 1
         for index in range(active_count):
-            active_key = keys[1 + index]
+            active_key = keys[1 + 2 * index]
             self.values[active_key] = int(self.values.get(active_key, 0)) + 1
         for bucket_key, tokens in next_tokens:
             self.hashes[bucket_key] = {
@@ -199,7 +204,9 @@ class FakeRedis:
         arg_index = 4
         for index in range(active_count):
             active_key = keys[1 + index]
-            current = int(self.values.get(active_key, 0))
+            if active_key not in self.values:
+                continue
+            current = int(self.values[active_key])
             if current <= 1:
                 self.values.pop(active_key, None)
             else:
@@ -774,3 +781,224 @@ async def test_real_redis_operation_timeout_does_not_include_client_queue_delay(
 
     assert result == "healthy redis response"
     assert time.monotonic() - started >= 0.14
+
+
+class FlakyReleaseRedis(FakeRedis):
+    def __init__(self, failures=1):
+        super().__init__()
+        self.release_failures = failures
+        self.release_calls = 0
+
+    async def eval(self, script, numkeys, *keys_and_args):
+        if "admission:release" in script:
+            self.release_calls += 1
+            if self.release_failures:
+                self.release_failures -= 1
+                raise ConnectionError("connection reset during release")
+        return await super().eval(script, numkeys, *keys_and_args)
+
+
+def test_active_window_defaults_to_request_deadline_plus_grace():
+    assert ApiRateLimitingConfig().active_window_ms == 180_000
+    assert RedisAdmissionController({"enabled": True}).active_window_ms == 180_000
+    assert _controller({"active_window_ms": 5000}).active_window_ms == 5000
+
+
+@pytest.mark.asyncio
+async def test_leaked_active_slot_expires_with_its_bucket_under_continuous_traffic():
+    clock = Clock()
+    controller = _controller(
+        {"global_limits": {"active_requests": 2}, "active_window_ms": 1000},
+        clock=clock,
+    )
+    leaked = await controller.acquire_route(QueryRequest(query="leak", user_id="leak"))
+    assert leaked.allowed is True  # its release is lost: never released
+
+    # Traffic never stops, so no TTL on a shared counter could ever lapse.
+    for step in range(25):
+        clock.now += 0.1
+        decision = await controller.acquire_route(
+            QueryRequest(query="steady", user_id=f"u{step}")
+        )
+        assert decision.allowed is True
+        assert await controller.release(decision.reservation) is True
+
+    first = await controller.acquire_route(QueryRequest(query="a", user_id="a"))
+    second = await controller.acquire_route(QueryRequest(query="b", user_id="b"))
+
+    assert first.allowed is True
+    assert second.allowed is True
+
+
+@pytest.mark.asyncio
+async def test_unreleased_active_slot_counts_for_at_least_one_window():
+    clock = Clock()
+    clock.now = 1000.999  # admitted just before its bucket rolls over
+    controller = _controller(
+        {"global_limits": {"active_requests": 1}, "active_window_ms": 1000},
+        clock=clock,
+    )
+    holder = await controller.acquire_route(QueryRequest(query="hold", user_id="h"))
+
+    clock.now = 1001.998
+    still_held = await controller.acquire_route(QueryRequest(query="x", user_id="x"))
+    clock.now = 1002.0
+    freed = await controller.acquire_route(QueryRequest(query="y", user_id="y"))
+
+    assert holder.allowed is True
+    assert still_held.allowed is False
+    assert still_held.reason == "global_active_requests_exceeded"
+    assert freed.allowed is True
+
+
+@pytest.mark.asyncio
+async def test_release_after_bucket_rollover_frees_the_slot():
+    clock = Clock()
+    controller = _controller(
+        {"global_limits": {"active_requests": 2}, "active_window_ms": 1000},
+        clock=clock,
+    )
+    early = await controller.acquire_route(QueryRequest(query="one", user_id="u1"))
+    clock.now += 1.0
+    late = await controller.acquire_route(QueryRequest(query="two", user_id="u2"))
+    blocked = await controller.acquire_route(QueryRequest(query="three", user_id="u3"))
+
+    released = await controller.release(early.reservation)
+    after_release = await controller.acquire_route(
+        QueryRequest(query="three", user_id="u3")
+    )
+
+    assert early.allowed is True
+    assert late.allowed is True
+    assert blocked.allowed is False
+    assert released is True
+    assert after_release.allowed is True
+
+
+@pytest.mark.asyncio
+async def test_release_retries_once_after_a_transient_redis_error():
+    client = FlakyReleaseRedis(failures=1)
+    controller = _controller(
+        {"global_limits": {"active_requests": 1}}, redis_client=client
+    )
+    first = await controller.acquire_route(QueryRequest(query="one", user_id="u1"))
+
+    released = await controller.release(first.reservation)
+    after_release = await controller.acquire_route(
+        QueryRequest(query="two", user_id="u2")
+    )
+
+    assert released is True
+    assert client.release_calls == 2
+    assert after_release.allowed is True
+
+
+@pytest.mark.asyncio
+async def test_release_gives_up_after_one_retry():
+    client = FlakyReleaseRedis(failures=5)
+    controller = _controller(
+        {"global_limits": {"active_requests": 1}}, redis_client=client
+    )
+    first = await controller.acquire_route(QueryRequest(query="one", user_id="u1"))
+
+    released = await controller.release(first.reservation)
+
+    assert released is False
+    assert client.release_calls == 2
+
+
+def _principal(client_id, *, rpm=0, burst=0, active=0):
+    return SimpleNamespace(client_id=client_id, rpm=rpm, burst=burst, active=active)
+
+
+@pytest.mark.asyncio
+async def test_one_key_rotating_200_user_ids_hits_the_per_key_rate_limit():
+    controller = _controller(
+        {
+            "requests_per_minute": 1000,
+            "burst_size": 1000,
+            "per_user": {"requests_per_minute": 1, "burst_size": 1},
+        }
+    )
+    principal = _principal("partner", rpm=50, burst=50)
+
+    decisions = [
+        await controller.acquire_route(
+            QueryRequest(query="hi", user_id=f"user-{index}"), principal
+        )
+        for index in range(200)
+    ]
+
+    assert sum(decision.allowed for decision in decisions) == 50
+    assert {decision.reason for decision in decisions[50:]} == {
+        "principal_request_rate_exceeded"
+    }
+
+
+@pytest.mark.asyncio
+async def test_user_buckets_are_scoped_by_client():
+    controller = _controller({"per_user": {"requests_per_minute": 1, "burst_size": 1}})
+    request = QueryRequest(query="hi", user_id="u1")
+
+    first_a = await controller.acquire_route(request, _principal("client-a"))
+    first_b = await controller.acquire_route(request, _principal("client-b"))
+    second_a = await controller.acquire_route(request, _principal("client-a"))
+
+    assert first_a.allowed is True
+    assert first_b.allowed is True
+    assert second_a.allowed is False
+    assert second_a.reason == "user_request_rate_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_principal_active_limit_rejects_without_queueing():
+    clock = Clock()
+    redis_client = FakeRedis()
+    controller = _controller(
+        {
+            "queue": {"enabled": True, "timeout_ms": 1000, "poll_interval_ms": 5},
+            "global_limits": {"active_requests": 10},
+        },
+        clock=clock,
+        redis_client=redis_client,
+    )
+    partner = _principal("partner", active=1)
+    started = clock.now
+
+    first = await controller.acquire_route(
+        QueryRequest(query="a", user_id="u1"), partner
+    )
+    second = await controller.acquire_route(
+        QueryRequest(query="b", user_id="u2"), partner
+    )
+    other = await controller.acquire_route(
+        QueryRequest(query="c", user_id="u3"), _principal("other", active=1)
+    )
+
+    assert first.allowed is True
+    assert second.allowed is False
+    assert second.reason == "principal_active_requests_exceeded"
+    assert clock.now == started  # no queue wait behind its own limit
+    assert other.allowed is True
+    assert await controller.release(first.reservation) is True
+    third = await controller.acquire_route(
+        QueryRequest(query="d", user_id="u4"), partner
+    )
+    assert third.allowed is True
+
+
+@pytest.mark.asyncio
+async def test_route_admission_without_principal_keeps_unscoped_buckets():
+    redis_client = FakeRedis()
+    controller = _controller(
+        {"per_user": {"requests_per_minute": 10, "burst_size": 10}},
+        redis_client=redis_client,
+    )
+
+    decision = await controller.acquire_route(QueryRequest(query="hi", user_id="u1"))
+
+    assert decision.allowed is True
+    assert controller._key("bucket", "requests", "user", controller._hash_id("u1")) in (
+        redis_client.hashes
+    )
+    assert not any(":principal:" in key for key in redis_client.hashes)

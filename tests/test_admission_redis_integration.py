@@ -4,6 +4,7 @@ import asyncio
 import os
 import time
 import uuid
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
@@ -484,6 +485,105 @@ async def test_provider_queue_bypasses_global_queue(redis_client):
 
     assert decision.allowed
     assert await redis_client.get(f"{global_prefix}:depth") == "1"
+
+
+def _clocked_controller(redis_client, clock, *, active_requests):
+    prefix = f"test:admission:{uuid.uuid4().hex}"
+    controller = RedisAdmissionController(
+        {
+            "enabled": True,
+            "failure_mode": "closed",
+            "redis": {"key_prefix": prefix},
+            "queue": {"enabled": False},
+            "active_window_ms": 1000,
+            "global_limits": {"active_requests": active_requests},
+        },
+        redis_client=redis_client,
+        time_func=lambda: clock["now"],
+    )
+    return controller, prefix
+
+
+@pytest.mark.asyncio
+async def test_leaked_active_slot_heals_within_two_windows(redis_client):
+    clock = {"now": time.time()}
+    controller, prefix = _clocked_controller(redis_client, clock, active_requests=2)
+    leaked = await controller.acquire_route(QueryRequest(query="leak", user_id="leak"))
+    assert leaked.allowed  # its release is lost: never released
+
+    for step in range(25):
+        clock["now"] += 0.1
+        decision = await controller.acquire_route(
+            QueryRequest(query="steady", user_id=f"u{step}")
+        )
+        assert decision.allowed
+        assert await controller.release(decision.reservation)
+
+    first = await controller.acquire_route(QueryRequest(query="a", user_id="a"))
+    second = await controller.acquire_route(QueryRequest(query="b", user_id="b"))
+
+    assert first.allowed
+    assert second.allowed
+    active_keys = [key async for key in redis_client.scan_iter(f"{prefix}:*active*")]
+    assert active_keys
+    for key in active_keys:
+        assert 0 < await redis_client.pttl(key) <= 2000
+
+
+@pytest.mark.asyncio
+async def test_release_of_expired_bucket_never_goes_negative(redis_client):
+    clock = {"now": time.time()}
+    controller, prefix = _clocked_controller(redis_client, clock, active_requests=2)
+    holder = await controller.acquire_route(QueryRequest(query="hold", user_id="h"))
+    for key in [key async for key in redis_client.scan_iter(f"{prefix}:*active*")]:
+        await redis_client.delete(key)  # the bucket expired before the release
+
+    released = await controller.release(holder.reservation)
+    first = await controller.acquire_route(QueryRequest(query="a", user_id="a"))
+    second = await controller.acquire_route(QueryRequest(query="b", user_id="b"))
+    third = await controller.acquire_route(QueryRequest(query="c", user_id="c"))
+
+    assert released
+    assert first.allowed and second.allowed
+    assert not third.allowed
+    assert third.reason == "global_active_requests_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_one_key_rotating_user_ids_hits_the_per_key_limit(redis_client):
+    controller = RedisAdmissionController(
+        {
+            "enabled": True,
+            "failure_mode": "closed",
+            "redis": {"key_prefix": f"test:admission:{uuid.uuid4().hex}"},
+            "queue": {"enabled": False},
+            "global_limits": {"active_requests": 1000},
+            "requests_per_minute": 1000,
+            "burst_size": 1000,
+            "per_user": {"requests_per_minute": 1, "burst_size": 1},
+        },
+        redis_client=redis_client,
+    )
+    partner = SimpleNamespace(client_id="partner", rpm=50, burst=50, active=2)
+    other = SimpleNamespace(client_id="other", rpm=50, burst=50, active=2)
+
+    decisions = []
+    for index in range(200):
+        decision = await controller.acquire_route(
+            QueryRequest(query="hi", user_id=f"user-{index}"), partner
+        )
+        decisions.append(decision)
+        if decision.allowed:
+            await controller.release(decision.reservation)
+    held = [
+        await controller.acquire_route(QueryRequest(query="x", user_id=f"o{i}"), other)
+        for i in range(3)
+    ]
+
+    assert sum(decision.allowed for decision in decisions) == 50
+    assert decisions[-1].reason == "principal_request_rate_exceeded"
+    assert [decision.allowed for decision in held] == [True, True, False]
+    assert held[-1].reason == "principal_active_requests_exceeded"
 
 
 def test_scheduler_uses_deterministic_priority_band_without_local_time():
