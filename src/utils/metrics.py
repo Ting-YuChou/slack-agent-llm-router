@@ -305,6 +305,21 @@ class RouterMetrics:
             ["outcome"],
         )
 
+        # policy_cache.mode shadow (A1): whether the policy would have chosen
+        # the routed model (agree, differ) or the shadow run failed (error)
+        self.shadow_policy_decisions = Counter(
+            "llm_router_shadow_policy_decisions_total",
+            "Shadow-mode policy selections compared with the routed model",
+            ["outcome"],
+        )
+
+        # Paid models with no configured price (1 = unpriced; X8)
+        self.unpriced_models = Gauge(
+            "llm_router_unpriced_models",
+            "Loaded paid models without pricing (cost falls back to cost_per_token)",
+            ["model"],
+        )
+
         # Tokenizer encodings the router could load (0 = token counts estimated)
         self.tokenizer_available = Gauge(
             "llm_router_tokenizer_available",
@@ -321,6 +336,13 @@ class InferenceMetrics:
         self.requests_total = Counter(
             "llm_router_inference_requests_total",
             "Total inference requests",
+            ["model", "provider"],
+        )
+
+        # Responses costed without a configured price (X8)
+        self.unpriced_cost_calculations = Counter(
+            "llm_router_inference_unpriced_cost_total",
+            "Responses whose cost was computed without a configured price",
             ["model", "provider"],
         )
 

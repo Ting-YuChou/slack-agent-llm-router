@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -18,6 +19,7 @@ from src.prompt_assembly import (
     build_prompt_sections,
     join_prompt_sections,
 )
+from src.pricing import per_token, resolve_model_pricing
 from src.routing_features import build_routing_features
 from src.utils.metrics import ROUTER_METRICS
 from src.utils.schema import (
@@ -25,6 +27,7 @@ from src.utils.schema import (
     ModelSelection,
     QueryRequest,
     QueryType,
+    RoutingCandidate,
     RoutingDecision,
     RoutingDecisionFeatures,
     ToolPolicy,
@@ -112,6 +115,54 @@ GUARDRAIL_CONTEXT_KEYS = (
 GUARDRAIL_BYPASS_NOTE = (
     "routing guardrails bypassed (fail-open): they exclude every model "
     "available to the tier"
+)
+
+# Why _filter_models_for_context excludes a model (RoutingCandidate.reject_reason).
+REJECT_AVOID_MODEL = "avoid_model"
+REJECT_BLOCKED_MODEL = "blocked_model"
+REJECT_AVOID_PROVIDER = "avoid_provider"
+REJECT_BLOCKED_PROVIDER = "blocked_provider"
+REJECT_CAPABILITY = "capability"
+REJECT_CONTEXT_WINDOW = "context_window"
+REJECT_TIER = "tier"
+
+# Output tokens expected per query type, for cost estimates and the cost
+# score; router.scoring.output_token_estimates overrides them.
+DEFAULT_OUTPUT_TOKEN_ESTIMATES: Dict[str, int] = {
+    "general": 400,
+    "question_answering": 400,
+    "translation": 500,
+    "summarization": 500,
+    "brainstorming": 700,
+    "planning": 800,
+    "math": 800,
+    "analysis": 900,
+    "reasoning": 900,
+    "web_research": 900,
+    "code_analysis": 900,
+    "creative_writing": 1200,
+    "code_generation": 1200,
+}
+# policy_cache.mode shadow (A1): the policy's context, stashed by
+# _get_policy_context, and the routing context with it applied.
+SHADOW_POLICY_CONTEXT_KEY = "shadow_policy_context"
+SHADOW_ROUTING_CONTEXT_KEY = "shadow_routing_context"
+# Why shadow mode had nothing to replay: unavailable or skipped_empty.
+SHADOW_SKIP_KEY = "shadow_skipped"
+# Context key carrying the cheapest eligible candidate's request cost.
+COST_REFERENCE_KEY = "cost_reference"
+
+# Routing paths whose candidates skip the query-type capability check.
+REASON_CODES_WITHOUT_CAPABILITY_CHECK = frozenset(
+    {"rule", "rule_fallback", "no_capability_match", "routing_error", "default_model"}
+)
+GUARDRAIL_REJECT_REASONS = frozenset(
+    {
+        REJECT_AVOID_MODEL,
+        REJECT_BLOCKED_MODEL,
+        REJECT_AVOID_PROVIDER,
+        REJECT_BLOCKED_PROVIDER,
+    }
 )
 
 
@@ -568,9 +619,19 @@ class ModelRouter:
             "priority_weight": 2.0,
             "context_fit_full_weight": 10.0,
             "context_fit_partial_weight": 5.0,
+            # Score lost per 10x the request cost of the cheapest eligible
+            # candidate (X8); a free candidate leaves paid ones no cost score.
+            "cost_log_ratio_weight": 4.0,
+            # Output tokens a request is expected to produce, by query type,
+            # for cost estimates (capped by max_tokens).
+            "output_token_estimates": dict(DEFAULT_OUTPUT_TOKEN_ESTIMATES),
             "default_model_bonus": 4.0,
+            # Models that get each bonus (the names used to be hard-coded).
+            "default_bonus_models": ["gpt-5"],
             "gpt5_default_bonus": 3.0,
+            "enterprise_bonus_models": ["claude-sonnet-4-6"],
             "sonnet_enterprise_bonus": 12.0,
+            "difficult_task_bonus_models": ["claude-sonnet-4-6"],
             "sonnet_difficult_task_bonus": 10.0,
             "difficult_task_token_threshold": 50000,
             "local_simple_task_bonus": 12.0,
@@ -658,6 +719,15 @@ class ModelRouter:
             except Exception as e:
                 logger.error(f"Failed to load model {model_name}: {e}")
 
+        for model_name in self.unpriced_models():
+            ROUTER_METRICS.unpriced_models.labels(model=model_name).set(1)
+            logger.warning(
+                "Model %s has no pricing (router.models.%s.pricing); its cost "
+                "falls back to cost_per_token for input and output",
+                model_name,
+                model_name,
+            )
+
         # Config validation requires a model per tier, but credential gating or
         # a bad model entry can still leave a tier without one.
         uncovered_tiers = [
@@ -671,6 +741,19 @@ class ModelRouter:
                 "rejected as model_not_entitled",
                 ", ".join(uncovered_tiers),
             )
+
+    def unpriced_models(self) -> List[str]:
+        """Loaded paid models with no pricing of their own or by prefix.
+
+        Self-hosted (vLLM) models cost nothing unless priced, so they never
+        count as unpriced.
+        """
+        return [
+            model_name
+            for model_name, model_config in self.models.items()
+            if model_config.provider.lower() != "vllm"
+            and resolve_model_pricing(self.models, model_name) is None
+        ]
 
     def _load_routing_rules(self):
         """Load routing rules from configuration"""
@@ -702,6 +785,10 @@ class ModelRouter:
             else:
                 model_selection = self._fallback_routing(query_context)
 
+            shadow_model, shadow_policy_source = await self._shadow_selection(
+                query_context, model_selection.model_name
+            )
+
             # Create routing decision
             query_type = query_context["query_type"]
             query_type_value = (
@@ -725,6 +812,14 @@ class ModelRouter:
                 routing_strategy=self.routing_strategy,
                 user_tier=self._entitlement_tier(request.user_tier),
                 features=self._decision_features(query_context),
+                reason_code=model_selection.reason_code,
+                candidates=self._safe_candidate_table(
+                    query_context,
+                    model_selection.model_name,
+                    model_selection.reason_code,
+                ),
+                shadow_selected_model=shadow_model,
+                shadow_policy_source=shadow_policy_source,
             )
 
             # Update metrics
@@ -766,6 +861,7 @@ class ModelRouter:
             context[key] = list(policy_context.get(key) or [])
 
         routing_reason = "Fallback due to routing error"
+        scoring_context = context
         try:
             selected_model, eligible = self._default_or_best_model(context)
             if eligible is not None:
@@ -786,6 +882,7 @@ class ModelRouter:
             routing_reason = (
                 f"{routing_reason} (model selection failed; guardrails ignored)"
             )
+            scoring_context = last_resort_context
 
         return RoutingDecision(
             selected_model=selected_model,
@@ -803,6 +900,10 @@ class ModelRouter:
             user_tier=self._entitlement_tier(request.user_tier),
             features=self._decision_features(
                 {**routing_features, "classification_confidence": 0.0}
+            ),
+            reason_code="routing_error",
+            candidates=self._safe_candidate_table(
+                scoring_context, selected_model, "routing_error"
             ),
         )
 
@@ -964,6 +1065,12 @@ class ModelRouter:
                     "routing_reason": reason,
                     "confidence": confidence,
                     "estimated_cost": self._estimate_cost(selection, scoring_context),
+                    "reason_code": "refit_reroute",
+                    "candidates": self._safe_candidate_table(
+                        context,
+                        best_model,
+                        None if capable else "no_capability_match",
+                    ),
                     "actual_fast_lane_hit": bool(decision.route_to_fast_lane)
                     and best_model in self._get_fast_lane_candidates(),
                 }
@@ -1011,9 +1118,10 @@ class ModelRouter:
         )
         if not candidates:
             return []
+        scoring_context = self._with_cost_reference(candidates, context)
         return sorted(
             candidates,
-            key=lambda model_name: self._score_model(model_name, context),
+            key=lambda model_name: self._score_model(model_name, scoring_context),
             reverse=True,
         )
 
@@ -1037,9 +1145,10 @@ class ModelRouter:
             ],
             context,
         )
+        scoring_context = self._with_cost_reference(candidates, context)
         return sorted(
             candidates,
-            key=lambda model_name: self._score_model(model_name, context),
+            key=lambda model_name: self._score_model(model_name, scoring_context),
             reverse=True,
         )
 
@@ -1093,12 +1202,28 @@ class ModelRouter:
         context.update(routing_features)
 
         policy_context = await self._request_policy_context(request)
+        shadow_policy = policy_context.pop(SHADOW_POLICY_CONTEXT_KEY, None)
+        shadow_skipped = policy_context.pop(SHADOW_SKIP_KEY, None)
         context.update(policy_context)
+        if shadow_skipped:
+            context[SHADOW_SKIP_KEY] = shadow_skipped
         self._restore_current_request_features(context, routing_features)
         context["policy_source"] = self._combine_policy_sources(
             policy_context.get("policy_source", "none"),
             routing_features,
         )
+        if isinstance(shadow_policy, dict):
+            # A1 shadow mode: the same request with the policy applied, for
+            # route_query to see what the policy would have chosen.
+            shadow_context = {**context, **shadow_policy}
+            self._restore_current_request_features(shadow_context, routing_features)
+            shadow_context["policy_source"] = self._combine_policy_sources(
+                shadow_policy.get("policy_source", "none"), routing_features
+            )
+            if self._routing_view(shadow_context) == self._routing_view(context):
+                context[SHADOW_SKIP_KEY] = "skipped_empty"
+            else:
+                context[SHADOW_ROUTING_CONTEXT_KEY] = shadow_context
 
         return context
 
@@ -1518,6 +1643,8 @@ class ModelRouter:
                 ),
             }
 
+        # A1 shadow mode counts a failed fetch as unavailable.
+        policy_fetch_failed = False
         policy_timeout = self._policy_read_timeout_seconds()
         try:
             policy = await asyncio.wait_for(
@@ -1542,11 +1669,13 @@ class ModelRouter:
                     f"Failed to load routing policy for request {request.request_id}: {e}"
                 )
                 policy = {}
+                policy_fetch_failed = True
         except Exception as e:
             logger.warning(
                 f"Failed to load routing policy for request {request.request_id}: {e}"
             )
             policy = {}
+            policy_fetch_failed = True
         if not isinstance(policy, dict):
             logger.warning(
                 "Ignoring routing policy for request %s: expected a mapping, got %s",
@@ -1588,7 +1717,7 @@ class ModelRouter:
                 else "request_metadata"
             )
 
-        return {
+        policy_context = {
             "policy_source": policy_source,
             "route_to_fast_lane": bool(policy.get("route_to_fast_lane", False)),
             "preferred_models": combined_preferred_models,
@@ -1630,6 +1759,145 @@ class ModelRouter:
                 policy.get("burst_protection_active", False)
             ),
         }
+
+        # --- A1 shadow mode (kept apart from the policy fetch above) ---
+        # Routing gets only the request-metadata hints, as with no policy
+        # cache; the policy's context is stashed for route_query to replay.
+        # An unavailable policy is not replayed (route_query counts it);
+        # _build_query_context skips one that would not change routing.
+        if self._policy_cache_mode() == "shadow":
+            shadow_context = self._metadata_policy_context(
+                metadata_preferred_models,
+                metadata_avoid_models,
+                metadata_avoid_providers,
+            )
+            if policy_fetch_failed or self._policy_unavailable(policy):
+                shadow_context[SHADOW_SKIP_KEY] = "unavailable"
+            else:
+                shadow_context[SHADOW_POLICY_CONTEXT_KEY] = policy_context
+            return shadow_context
+        # --- end A1 shadow mode ---
+        return policy_context
+
+    @staticmethod
+    def _policy_unavailable(policy: Dict[str, Any]) -> bool:
+        """Whether the policy cache reported it could not be read."""
+        sources = str(policy.get("policy_source") or "").split("+")
+        return "unavailable" in sources
+
+    @staticmethod
+    def _routing_view(context: Dict[str, Any]) -> Tuple[Any, ...]:
+        """What routing reads from a context that a policy can change.
+
+        Two contexts with the same view route the same request alike, so
+        shadow mode need not replay a policy whose context matches the base.
+        Sensitivities only matter when "high"; session hotness when "hot".
+        """
+
+        def names(key: str) -> Tuple[str, ...]:
+            return tuple(str(name) for name in list(context.get(key) or []))
+
+        def high(key: str) -> bool:
+            return str(context.get(key) or "").lower() == "high"
+
+        return (
+            names("preferred_models"),
+            *(
+                tuple(sorted(names(key)))
+                for key in (*GUARDRAIL_CONTEXT_KEYS, "warn_models", "warn_providers")
+            ),
+            *(
+                bool(context.get(key, False))
+                for key in (
+                    "route_to_fast_lane",
+                    "requires_low_latency",
+                    "requires_high_reasoning",
+                    "long_context",
+                    "attachment_heavy",
+                    "code_heavy",
+                )
+            ),
+            high("cost_sensitivity"),
+            high("error_sensitivity"),
+            str(context.get("session_hotness") or "").lower() == "hot",
+            context.get("query_complexity"),
+            str(context.get("policy_query_type") or "").lower(),
+        )
+
+    def _policy_cache_mode(self) -> str:
+        """policy_cache.mode: enforce (the default) or shadow."""
+        mode = getattr(self.policy_cache, "mode", None)
+        if mode is None:
+            config = getattr(self.policy_cache, "config", None)
+            if isinstance(config, dict):
+                mode = config.get("mode")
+        return "shadow" if str(mode or "").strip().lower() == "shadow" else "enforce"
+
+    @staticmethod
+    def _metadata_policy_context(
+        preferred_models: List[str],
+        avoid_models: List[str],
+        avoid_providers: List[str],
+    ) -> Dict[str, Any]:
+        """The policy context from request metadata alone (no policy cache)."""
+        return {
+            "policy_source": "request_metadata" if preferred_models else "none",
+            "route_to_fast_lane": False,
+            "preferred_models": list(preferred_models),
+            "avoid_models": list(avoid_models),
+            "avoid_providers": list(avoid_providers),
+            "blocked_models": [],
+            "blocked_providers": [],
+            "warn_models": [],
+            "warn_providers": [],
+            "hint_reason": (
+                "preferred_models from request metadata" if preferred_models else None
+            ),
+        }
+
+    async def _shadow_selection(
+        self, context: Dict[str, Any], routed_model: str
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """(model, policy_source) the policy would have chosen, in shadow mode.
+
+        Runs the routing strategy again on the context with the stashed
+        policy applied. Any failure is logged and counted, never raised:
+        shadow mode must not change routing.
+        """
+        shadow_context = context.get(SHADOW_ROUTING_CONTEXT_KEY)
+        if not isinstance(shadow_context, dict):
+            skipped = context.get(SHADOW_SKIP_KEY)
+            if skipped in {"unavailable", "skipped_empty"}:
+                ROUTER_METRICS.shadow_policy_decisions.labels(outcome=skipped).inc()
+            return None, None
+        try:
+            selection = await self._run_shadow_strategy(shadow_context)
+        except Exception:
+            logger.warning("Shadow policy routing failed", exc_info=True)
+            ROUTER_METRICS.shadow_policy_decisions.labels(outcome="error").inc()
+            return None, None
+        if selection is None:
+            return None, None
+        ROUTER_METRICS.shadow_policy_decisions.labels(
+            outcome="agree" if selection.model_name == routed_model else "differ"
+        ).inc()
+        return selection.model_name, str(
+            shadow_context.get("policy_source", "none") or "none"
+        )
+
+    async def _run_shadow_strategy(
+        self, context: Dict[str, Any]
+    ) -> Optional[ModelSelection]:
+        """The routing strategy's choice for a shadow context.
+
+        Round-robin and weighted routing are stateful or random, so a second
+        run would not show what the policy changes; they get no shadow.
+        """
+        if self.routing_strategy == "intelligent":
+            return await self._intelligent_routing(context)
+        if self.routing_strategy in {"round_robin", "weighted"}:
+            return None
+        return self._fallback_routing(context)
 
     def _name_entries(
         self, value: Any, field_name: str, *, lowercase: bool = False
@@ -1687,6 +1955,7 @@ class ModelRouter:
                     model_name=best_model,
                     confidence=0.9,
                     reason=f"Rule-based selection: {rule.condition}",
+                    reason_code="rule",
                 )
             if self._filter_models_for_context(
                 [rule.fallback], context, check_capability=False
@@ -1695,6 +1964,7 @@ class ModelRouter:
                     model_name=rule.fallback,
                     confidence=0.9,
                     reason=f"Rule-based selection (fallback): {rule.condition}",
+                    reason_code="rule_fallback",
                 )
 
         # Fallback to capability-based routing
@@ -1726,6 +1996,7 @@ class ModelRouter:
                 model_name=selected_model,
                 confidence=confidence,
                 reason=f"{reason_prefix} ({policy_source}): {hint_reason}",
+                reason_code="preferred_model",
             )
 
         if route_to_fast_lane:
@@ -1746,6 +2017,7 @@ class ModelRouter:
             model_name=selected_model,
             confidence=confidence,
             reason=(f"{reason_prefix} ({policy_source}): {hint_reason}"),
+            reason_code="fast_lane",
         )
 
     def _selection_reason_prefix(self, policy_source: str) -> str:
@@ -1823,7 +2095,7 @@ class ModelRouter:
         """Return models ordered from cheapest to most expensive."""
         ranked = sorted(
             self.models.items(),
-            key=lambda item: (item[1].cost_per_token, item[1].priority),
+            key=lambda item: (sum(self._unit_rates(item[1])), item[1].priority),
         )
         return [model_name for model_name, _model_config in ranked]
 
@@ -1833,7 +2105,9 @@ class ModelRouter:
         best_model = self._select_best_model(eligible.models, eligible.context)
         if eligible.capability_match:
             reason, confidence = "Capability-based selection", 0.8
+            reason_code = "capability"
         else:
+            reason_code = "no_capability_match"
             reason = (
                 "No model has the capability for this query type; "
                 "best model available to the tier"
@@ -1845,6 +2119,7 @@ class ModelRouter:
             model_name=best_model,
             confidence=confidence,
             reason=eligible.reason(reason),
+            reason_code=reason_code,
         )
 
     def _eligible_models(self, context: Dict[str, Any]) -> EligibleModels:
@@ -1943,6 +2218,28 @@ class ModelRouter:
         query-type capability check, for routing rules that name models
         explicitly.
         """
+        reasons = self._model_reject_reasons(
+            candidate_models, context, check_capability=check_capability
+        )
+        return [
+            model_name
+            for model_name in candidate_models
+            if model_name in reasons and reasons[model_name] is None
+        ]
+
+    def _model_reject_reasons(
+        self,
+        candidate_models: List[str],
+        context: Dict[str, Any],
+        *,
+        check_capability: bool = True,
+    ) -> Dict[str, Optional[str]]:
+        """Why each known candidate is excluded (None when it is eligible).
+
+        The checks run in the order _filter_models_for_context has always
+        applied them; the first that fails names the reason. Unknown model
+        names are left out.
+        """
         query_type = context["query_type"]
         token_count = context["token_count"]
         user_tier = context["user_tier"]
@@ -1957,25 +2254,31 @@ class ModelRouter:
             for provider in list(context.get("blocked_providers", []) or [])
         }
 
-        suitable_models = []
+        reasons: Dict[str, Optional[str]] = {}
         for model_name in candidate_models:
             model_config = self.models.get(model_name)
-            if not model_config:
-                continue
-            if model_name in avoid_models or model_name in blocked_models:
+            if not model_config or model_name in reasons:
                 continue
             provider_name = model_config.provider.lower()
-            if provider_name in avoid_providers or provider_name in blocked_providers:
-                continue
-            if check_capability and not self._has_capability(model_config, query_type):
-                continue
-            if not model_config.fits_context(token_count, context.get("max_tokens")):
-                continue
-            if not self._check_user_access(model_config, user_tier):
-                continue
-            suitable_models.append(model_name)
-
-        return suitable_models
+            reason: Optional[str] = None
+            if model_name in avoid_models:
+                reason = REJECT_AVOID_MODEL
+            elif model_name in blocked_models:
+                reason = REJECT_BLOCKED_MODEL
+            elif provider_name in avoid_providers:
+                reason = REJECT_AVOID_PROVIDER
+            elif provider_name in blocked_providers:
+                reason = REJECT_BLOCKED_PROVIDER
+            elif check_capability and not self._has_capability(
+                model_config, query_type
+            ):
+                reason = REJECT_CAPABILITY
+            elif not model_config.fits_context(token_count, context.get("max_tokens")):
+                reason = REJECT_CONTEXT_WINDOW
+            elif not self._check_user_access(model_config, user_tier):
+                reason = REJECT_TIER
+            reasons[model_name] = reason
+        return reasons
 
     def _get_fast_lane_candidates(self) -> List[str]:
         """Resolve the configured fast-lane models for synchronous low-latency routing."""
@@ -2051,31 +2354,44 @@ class ModelRouter:
             self._raise_no_eligible_model(context, candidates)
         candidates = eligible
 
-        scores = {}
+        scoring_context = self._with_cost_reference(candidates, context)
+        scores = {
+            model_name: self._adjusted_score(model_name, scoring_context)
+            for model_name in candidates
+        }
+
+        # Return model with highest score
+        return max(candidates, key=lambda x: scores.get(x, 0))
+
+    def _warn_penalty(self, model_name: str, context: Dict[str, Any]) -> float:
+        """The score taken off a model the policy cache warns about."""
         warn_models = set(context.get("warn_models", []) or [])
         warn_providers = {
             str(provider).lower()
             for provider in list(context.get("warn_providers", []) or [])
         }
+        penalty = 0.0
+        if model_name in warn_models:
+            penalty += 15
+        if self.models[model_name].provider.lower() in warn_providers:
+            penalty += 12
+        return penalty
 
-        for model_name in candidates:
-            score = self._score_model(model_name, context)
-            model_config = self.models[model_name]
-
-            if model_name in warn_models:
-                score -= 15
-            if model_config.provider.lower() in warn_providers:
-                score -= 12
-
-            scores[model_name] = score
-
-        # Return model with highest score
-        return max(candidates, key=lambda x: scores.get(x, 0))
+    def _adjusted_score(self, model_name: str, context: Dict[str, Any]) -> float:
+        """The score _select_best_model ranks by: _score_model less warnings."""
+        return self._score_model(model_name, context) - self._warn_penalty(
+            model_name, context
+        )
 
     def _score_model(self, model_name: str, context: Dict[str, Any]) -> float:
         """Score a single model for the provided routing context."""
+        return float(sum(self._score_components(model_name, context).values()))
+
+    def _score_components(
+        self, model_name: str, context: Dict[str, Any]
+    ) -> Dict[str, float]:
+        """The terms of a model's score, by name; _score_model is their sum."""
         model_config = self.models[model_name]
-        score = 0.0
 
         # Performance-based scoring
         model_stats = self.model_stats.get(model_name, {})
@@ -2087,41 +2403,197 @@ class ModelRouter:
         if error_sensitivity == "high":
             reliability_weight += 10.0
 
-        score += success_rate * reliability_weight
         latency_weight = float(self.scoring["latency_weight"])
         if bool(context.get("requires_low_latency", False)):
             latency_weight += float(self.scoring.get("low_latency_weight_bonus", 0.0))
-        score += max(
-            0, latency_weight - avg_latency / 100
-        )  # Speed weight (lower latency = higher score)
-
-        # Cost efficiency (inverse relationship)
-        cost_per_token = model_config.cost_per_token
-        cost_sensitivity = str(context.get("cost_sensitivity", "")).lower()
-        cost_weight_cap = float(self.scoring["cost_weight_cap"])
-        if cost_sensitivity == "high":
-            cost_weight_cap += 10.0
-        if cost_per_token > 0:
-            cost_score = 1 / (cost_per_token * 1000000)  # Normalize
-            score += min(cost_score, cost_weight_cap)
-        else:
-            score += cost_weight_cap
-
-        # Priority-based scoring
-        score += (10 - model_config.priority) * float(self.scoring["priority_weight"])
 
         # Context length compatibility: the prompt plus its output
         needed_tokens = int(context["token_count"] or 0) + model_config.output_tokens(
             context.get("max_tokens")
         )
         window = model_config.window_tokens()
+        context_fit = 0.0
         if needed_tokens <= window * 0.8:
-            score += float(self.scoring["context_fit_full_weight"])
+            context_fit = float(self.scoring["context_fit_full_weight"])
         elif needed_tokens <= window:
-            score += float(self.scoring["context_fit_partial_weight"])
+            context_fit = float(self.scoring["context_fit_partial_weight"])
 
-        score += self._contextual_model_bonus(model_name, context)
-        return score
+        return {
+            "reliability": success_rate * reliability_weight,
+            # Speed weight (lower latency = higher score)
+            "latency": max(0, latency_weight - avg_latency / 100),
+            "cost": self._cost_score(model_config, context),
+            "priority": (10 - model_config.priority)
+            * float(self.scoring["priority_weight"]),
+            "context_fit": context_fit,
+            "model_bonus": self._contextual_model_bonus(model_name, context),
+        }
+
+    def _unit_rates(self, model_config: ModelConfig) -> Tuple[float, float]:
+        """(input, output) USD per token: pricing, else cost_per_token for both."""
+        pricing = resolve_model_pricing(self.models, model_config.name)
+        if pricing is None and model_config.pricing is not None:
+            pricing = model_config.pricing
+        if pricing is None:
+            return model_config.cost_per_token, model_config.cost_per_token
+        return per_token(pricing.input), per_token(pricing.output)
+
+    def _expected_output_tokens(self, context: Dict[str, Any]) -> int:
+        """Output tokens the request is expected to produce, by query type."""
+        estimates = dict(DEFAULT_OUTPUT_TOKEN_ESTIMATES)
+        estimates.update(dict(self.scoring.get("output_token_estimates") or {}))
+        query_type = str(context.get("query_type") or QueryType.GENERAL.value)
+        estimate = int(estimates.get(query_type, estimates["general"]))
+        max_tokens = context.get("max_tokens")
+        if isinstance(max_tokens, int) and not isinstance(max_tokens, bool):
+            if max_tokens > 0:
+                estimate = min(estimate, max_tokens)
+        return max(estimate, 0)
+
+    def _request_cost(
+        self, model_config: ModelConfig, context: Dict[str, Any]
+    ) -> float:
+        """Expected USD cost of this request on the model."""
+        input_rate, output_rate = self._unit_rates(model_config)
+        input_tokens = int(context.get("token_count", 0) or 0)
+        return (
+            input_tokens * input_rate
+            + self._expected_output_tokens(context) * output_rate
+        )
+
+    def _with_cost_reference(
+        self, candidates: List[str], context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """The context with the cheapest candidate's request cost to score against."""
+        costs = [
+            self._request_cost(self.models[name], context)
+            for name in candidates
+            if name in self.models
+        ]
+        if not costs:
+            return context
+        return {**context, COST_REFERENCE_KEY: min(costs)}
+
+    def _cost_reference(
+        self, model_config: ModelConfig, context: Dict[str, Any]
+    ) -> float:
+        reference = context.get(COST_REFERENCE_KEY)
+        if isinstance(reference, (int, float)) and not isinstance(reference, bool):
+            return float(reference)
+        # Scored alone: against every model this request may use.
+        eligible = self._filter_models_for_context(
+            list(self.models), context, check_capability=False
+        )
+        costs = [self._request_cost(self.models[name], context) for name in eligible]
+        costs.append(self._request_cost(model_config, context))
+        return min(costs)
+
+    def _cost_score(self, model_config: ModelConfig, context: Dict[str, Any]) -> float:
+        """Cost efficiency, log-normalised against the cheapest candidate (X8).
+
+        The cheapest candidate gets the full cost_weight_cap; each 10x on its
+        request cost takes cost_log_ratio_weight off, down to 0. A free
+        candidate is infinitely cheaper, so paid ones then score 0.
+        """
+        cost_sensitivity = str(context.get("cost_sensitivity", "")).lower()
+        cost_weight_cap = float(self.scoring["cost_weight_cap"])
+        if cost_sensitivity == "high":
+            cost_weight_cap += 10.0
+        cost = self._request_cost(model_config, context)
+        if cost <= 0:
+            return cost_weight_cap
+        reference = self._cost_reference(model_config, context)
+        if reference <= 0:
+            return 0.0
+        weight = float(self.scoring.get("cost_log_ratio_weight", 4.0))
+        penalty = weight * math.log10(max(cost / reference, 1.0))
+        return max(0.0, cost_weight_cap - penalty)
+
+    def _candidate_table(
+        self,
+        context: Dict[str, Any],
+        selected_model: str,
+        reason_code: Optional[str] = None,
+    ) -> List[RoutingCandidate]:
+        """Every loaded model with its reject reason, or its score if eligible.
+
+        Eligibility uses the filter of the routing path that chose
+        ``reason_code`` (rules skip the capability check). Scores are what
+        _select_best_model ranks by, over all eligible models. The selected
+        model is always eligible: if it lacks the capability, the path did
+        not check it; if a guardrail excludes it, routing failed open, so
+        the table is scored without guardrails and each row a guardrail
+        would have excluded names it in bypassed_guardrail.
+        """
+        check_capability = reason_code not in REASON_CODES_WITHOUT_CAPABILITY_CHECK
+        model_names = list(self.models)
+        reasons = self._model_reject_reasons(
+            model_names, context, check_capability=check_capability
+        )
+        bypassed: Dict[str, Optional[str]] = {}
+        if reasons.get(selected_model) in GUARDRAIL_REJECT_REASONS:
+            bypassed = {
+                name: reason
+                for name, reason in reasons.items()
+                if reason in GUARDRAIL_REJECT_REASONS
+            }
+            context = self._without_guardrails(context)
+            reasons = self._model_reject_reasons(
+                model_names, context, check_capability=check_capability
+            )
+        # As _eligible_models falls back to models without the capability.
+        if check_capability and reasons.get(selected_model) == REJECT_CAPABILITY:
+            check_capability = False
+            reasons = self._model_reject_reasons(
+                model_names, context, check_capability=False
+            )
+        context = self._with_cost_reference(
+            [name for name in model_names if reasons.get(name) is None], context
+        )
+        table: List[RoutingCandidate] = []
+        for model_name in model_names:
+            reason = reasons.get(model_name)
+            score: Optional[float] = None
+            breakdown: Dict[str, float] = {}
+            if reason is None:
+                score = round(self._adjusted_score(model_name, context), 4)
+                breakdown = {
+                    name: round(float(value), 4)
+                    for name, value in self._score_components(
+                        model_name, context
+                    ).items()
+                }
+                penalty = self._warn_penalty(model_name, context)
+                if penalty:
+                    breakdown["warn_penalty"] = -penalty
+            table.append(
+                RoutingCandidate(
+                    model=model_name,
+                    provider=self.models[model_name].provider,
+                    eligible=reason is None,
+                    reject_reason=reason,
+                    score=score,
+                    score_breakdown=breakdown,
+                    selected=model_name == selected_model,
+                    bypassed_guardrail=(
+                        bypassed.get(model_name) if reason is None else None
+                    ),
+                )
+            )
+        return table
+
+    def _safe_candidate_table(
+        self,
+        context: Dict[str, Any],
+        selected_model: str,
+        reason_code: Optional[str] = None,
+    ) -> List[RoutingCandidate]:
+        """The candidate table, or none: explaining must never fail routing."""
+        try:
+            return self._candidate_table(context, selected_model, reason_code)
+        except Exception:
+            logger.warning("Could not build the routing candidate table", exc_info=True)
+            return []
 
     def _contextual_model_bonus(
         self, model_name: str, context: Dict[str, Any]
@@ -2143,21 +2615,27 @@ class ModelRouter:
         if model_name == self.default_model:
             bonus += float(self.scoring["default_model_bonus"])
 
-        if model_name == "gpt-5" and user_tier_value != "enterprise":
+        default_bonus_models = set(self.scoring.get("default_bonus_models") or [])
+        enterprise_bonus_models = set(self.scoring.get("enterprise_bonus_models") or [])
+        difficult_task_bonus_models = set(
+            self.scoring.get("difficult_task_bonus_models") or []
+        )
+
+        if model_name in default_bonus_models and user_tier_value != "enterprise":
             if (
                 query_type not in {"analysis", "reasoning"}
                 or token_count <= difficult_threshold
             ):
                 bonus += float(self.scoring["gpt5_default_bonus"])
 
-        if model_name == "claude-sonnet-4-6":
-            if user_tier_value == "enterprise":
-                bonus += float(self.scoring["sonnet_enterprise_bonus"])
-            if (
-                query_type in {"analysis", "reasoning"}
-                and token_count > difficult_threshold
-            ):
-                bonus += float(self.scoring["sonnet_difficult_task_bonus"])
+        if model_name in enterprise_bonus_models and user_tier_value == "enterprise":
+            bonus += float(self.scoring["sonnet_enterprise_bonus"])
+        if (
+            model_name in difficult_task_bonus_models
+            and query_type in {"analysis", "reasoning"}
+            and token_count > difficult_threshold
+        ):
+            bonus += float(self.scoring["sonnet_difficult_task_bonus"])
 
         if (
             model_provider == "vllm"
@@ -2183,6 +2661,7 @@ class ModelRouter:
             model_name=selected_model,
             confidence=0.6,
             reason=eligible.reason("Round-robin selection"),
+            reason_code="round_robin",
         )
 
     def _weighted_routing(self, context: Dict[str, Any]) -> ModelSelection:
@@ -2213,6 +2692,7 @@ class ModelRouter:
             model_name=selected_model,
             confidence=0.7,
             reason=eligible.reason("Weighted random selection"),
+            reason_code="weighted",
         )
 
     def _fallback_routing(self, context: Dict[str, Any]) -> ModelSelection:
@@ -2223,11 +2703,13 @@ class ModelRouter:
                 model_name=selected_model,
                 confidence=0.4,
                 reason="Fallback routing",
+                reason_code="default_model",
             )
         return ModelSelection(
             model_name=selected_model,
             confidence=0.4,
             reason=eligible.reason("Fallback routing (default model not eligible)"),
+            reason_code="fallback_best",
         )
 
     def _default_or_best_model(
@@ -2253,14 +2735,7 @@ class ModelRouter:
         if not model_config:
             return 0.0
 
-        input_tokens = context["token_count"]
-        # Estimate output tokens (rough approximation)
-        estimated_output_tokens = min(
-            input_tokens * 0.5, context.get("max_tokens", 1000)
-        )
-
-        total_tokens = input_tokens + estimated_output_tokens
-        return total_tokens * model_config.cost_per_token
+        return self._request_cost(model_config, context)
 
     def update_model_stats(self, model_name: str, success: bool, latency_ms: int):
         """Update model performance statistics"""
