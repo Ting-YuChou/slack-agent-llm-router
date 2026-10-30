@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated, Any, Dict, List, Literal, Optional
+import re
 import uuid
 
 from pydantic import (
@@ -122,6 +123,20 @@ class ToolCall(BaseModel):
 
 BoundedName = Annotated[str, Field(max_length=256)]
 
+# What a request id may hold: it is echoed in X-Request-ID, logged, and used
+# as a Kafka and Redis key.
+REQUEST_ID_PATTERN = r"^[A-Za-z0-9._:-]+$"
+REQUEST_ID_MAX_LENGTH = 128
+_REQUEST_ID_RE = re.compile(REQUEST_ID_PATTERN)
+
+
+def is_valid_request_id(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) <= REQUEST_ID_MAX_LENGTH
+        and _REQUEST_ID_RE.fullmatch(value) is not None
+    )
+
 
 class QueryRequest(BaseModel):
     _rag_images: List[Any] = PrivateAttr(default_factory=list)
@@ -136,7 +151,11 @@ class QueryRequest(BaseModel):
 
     # Core fields with proper types
     user_tier: UserTier = UserTier.FREE
-    request_id: str = Field(default_factory=lambda: str(uuid.uuid4()), max_length=128)
+    # Only its length is checked, as before; X-Request-ID is held to
+    # REQUEST_ID_PATTERN (main.py).
+    request_id: str = Field(
+        default_factory=lambda: str(uuid.uuid4()), max_length=REQUEST_ID_MAX_LENGTH
+    )
     timestamp: datetime = Field(default_factory=utc_now)
 
     # Optional context and settings
@@ -249,6 +268,9 @@ class InferenceResponse(BaseModel):
     # The provider's id for the call (OpenAI x-request-id, Anthropic
     # request-id, vLLM X-Request-Id) to quote in support tickets and logs.
     provider_request_id: Optional[str] = None
+    # The request this answers (QueryRequest.request_id). Never cached: a
+    # cache hit answers with the id of the request it served.
+    request_id: Optional[str] = None
 
     # Timestamps
     timestamp: datetime = Field(default_factory=utc_now)
@@ -1009,6 +1031,8 @@ class SlackResponseSettingsConfig(ConfigModel):
     typing_indicator: bool = True
     # A context line under each answer: model, latency and "cached".
     answer_footer: bool = True
+    # Thumbs up / down under mention and thread answers, sent as chat.feedback.
+    feedback_buttons: bool = False
     thread_replies: bool = True
 
 

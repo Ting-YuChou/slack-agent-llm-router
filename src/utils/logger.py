@@ -421,19 +421,17 @@ def set_request_context(
     request_id: str = None, user_id: str = None, session_id: str = None
 ):
     """
-    Set request context for logging
+    Set request context for logging; a missing value clears the old one, so
+    one request never logs under another's ids.
 
     Args:
         request_id: Request identifier
         user_id: User identifier
         session_id: Session identifier
     """
-    if request_id:
-        request_id_context.set(request_id)
-    if user_id:
-        user_id_context.set(user_id)
-    if session_id:
-        session_id_context.set(session_id)
+    request_id_context.set(request_id or None)
+    user_id_context.set(user_id or None)
+    session_id_context.set(session_id or None)
 
 
 def clear_request_context():

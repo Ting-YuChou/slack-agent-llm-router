@@ -554,6 +554,7 @@ kafka:
     metrics: llm-metrics
     requests_raw: requests.raw
     inference_completed: inference.completed
+    chat_feedback: chat.feedback
     requests_enriched: requests.enriched
     fast_lane_hints: fast_lane_hints
     analytics_model_metrics_1m: analytics.model_metrics_1m
@@ -663,6 +664,7 @@ slack:
     max_response_length: 3900
     typing_indicator: true
     answer_footer: true
+    feedback_buttons: true
     thread_replies: true
   rate_limiting:
     requests_per_hour: 100

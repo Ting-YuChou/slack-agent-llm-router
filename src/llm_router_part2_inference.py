@@ -55,6 +55,7 @@ from src.provider_scheduler import (
 )
 from src.provider_scheduler import is_billing_exhausted as _is_billing_exhausted
 from src.provider_scheduler import provider_error_text as _provider_error_text
+from src.utils.logger import RequestContextManager
 from src.utils.metrics import INFERENCE_METRICS, RAG_METRICS
 from src.utils.schema import (
     AttachmentType,
@@ -1055,13 +1056,26 @@ class ResponseCache:
             json.dumps(key_payload, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
 
+    # Trace fields that name the asking message, not what it asks.
+    TRACE_METADATA_KEYS = {"surface"}
+    SLACK_TRACE_METADATA_KEYS = {"message_ts", "event_id"}
+
     def _cacheable_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
         """Drop analytics-only fields that should not fragment response cache keys."""
-        return {
+        cacheable = {
             key: value
             for key, value in metadata.items()
             if key not in self.ANALYTICS_METADATA_KEYS
+            and key not in self.TRACE_METADATA_KEYS
         }
+        slack = cacheable.get("slack")
+        if isinstance(slack, dict):
+            cacheable["slack"] = {
+                key: value
+                for key, value in slack.items()
+                if key not in self.SLACK_TRACE_METADATA_KEYS
+            }
+        return cacheable
 
 
 class RequestStageDeadlineError(Exception):
@@ -2833,6 +2847,8 @@ class InferenceEngine:
                 # The fallback that produced the cached answer is history.
                 "fallback_from_model": None,
                 "attempts": 0,
+                # The answer is to this request, not to the one cached.
+                "request_id": request.request_id,
             }
         )
 
@@ -2845,6 +2861,13 @@ class InferenceEngine:
 
     async def process_query(self, request: QueryRequest) -> InferenceResponse:
         """Process query through the complete inference pipeline"""
+        # Logs carry this request's ids while it runs, and only then.
+        with RequestContextManager(
+            request.request_id, request.user_id, request.session_id
+        ):
+            return await self._process_query(request)
+
+    async def _process_query(self, request: QueryRequest) -> InferenceResponse:
         start_time = time.time()
 
         # Log with the caller's request id so logs join the analytics events.
@@ -2946,6 +2969,7 @@ class InferenceEngine:
                 started_calls=started_calls,
             )
             response.compressed_context = compressed_context
+            response.request_id = request.request_id
             self._attach_rag_result(response, rag_result)
             self._attach_web_search_result(response, web_search_result)
 
@@ -2959,10 +2983,13 @@ class InferenceEngine:
                 and not self._response_cache_bypassed(request)
             ):
                 cache_key = self.cache.generate_cache_key(request, model_name)
-                # A cache hit makes no provider call: no provider request id.
+                # A cache hit makes no provider call: no provider request id;
+                # and it answers another request: no request id.
                 await self.cache.cache_response(
                     cache_key,
-                    response.model_dump(mode="json", exclude={"provider_request_id"}),
+                    response.model_dump(
+                        mode="json", exclude={"provider_request_id", "request_id"}
+                    ),
                 )
 
             await self._finalize_successful_response(
@@ -3035,6 +3062,7 @@ class InferenceEngine:
                 provider_request_id=_exception_provider_request_id(primary_exc),
                 finish_reason="error",
                 attempts=len(set(started_calls)),
+                request_id=request_id,
             )
             # The caller keeps the "error" provider sentinel; analytics get the
             # failed model's real provider so outages count against it.
@@ -3634,6 +3662,7 @@ class InferenceEngine:
             tool_calls=[rag_result.tool_call],
             tool_latency_ms=rag_result.latency_ms,
             finish_reason="rag_no_hits",
+            request_id=request.request_id,
         )
 
     def _should_run_web_search(

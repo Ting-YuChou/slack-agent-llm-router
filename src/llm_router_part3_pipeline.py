@@ -211,12 +211,198 @@ def _alert_payload(data: Dict[str, Any]) -> Any:
     return redact({key: data[key] for key in ALERT_PAYLOAD_FIELDS if key in data})
 
 
+REQUEST_SURFACES = frozenset({"mention", "thread", "dm", "slash", "api"})
+
+
+def request_source_and_surface(query_request: Any) -> Tuple[str, Optional[str]]:
+    """Where a request came from: ("slack", "mention" | "thread" | "dm" |
+    "slash") or ("api", "api").
+
+    Only the server writes these metadata keys (external /route metadata is
+    allowlisted), so a request without them came through the API.
+    """
+    metadata = getattr(query_request, "metadata", None) or {}
+    source = metadata.get("source")
+    if not isinstance(source, str) or not source:
+        return "api", "api"
+    surface = metadata.get("surface")
+    if surface not in REQUEST_SURFACES:
+        surface = None
+    return source, surface
+
+
+def thread_key_hash(query_request: Any) -> Optional[str]:
+    """A Slack thread's key, hashed: requests of one thread share it."""
+    metadata = getattr(query_request, "metadata", None) or {}
+    slack = metadata.get("slack")
+    if not isinstance(slack, dict):
+        return None
+    channel_id = slack.get("channel_id")
+    thread_ts = slack.get("thread_ts")
+    if not channel_id or not thread_ts:
+        return None
+    key = f"slack:{slack.get('team_id') or ''}:{channel_id}:{thread_ts}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+
+
+def _first_event_time(data: Dict[str, Any], *keys: str) -> datetime:
+    """The first of keys that holds a valid timestamp, never the consume time.
+
+    An event with none of them is malformed: ValueError, a permanent failure.
+    """
+    for key in keys:
+        try:
+            return _parse_datetime(data.get(key), strict=True)
+        except ValueError:
+            continue
+    raise ValueError(f"Event has no valid timestamp in {', '.join(keys)}")
+
+
+def _uint_or_none(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return max(0, int(value))
+
+
+def build_chat_request_row(
+    data: Dict[str, Any], kafka_metadata: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """One chat_requests row from an inference.completed event.
+
+    An explicit field list: no query text, context or attachment names.
+    """
+    request_id = str(data.get("request_id") or data.get("query_id") or "")
+    if not request_id:
+        raise ValueError("inference.completed event has no request_id")
+    # Only the event's own times: a replay must get the same ts and version.
+    completed_at = _first_event_time(data, "completion_timestamp", "emitted_at")
+    ts = _first_event_time(
+        data, "request_timestamp", "completion_timestamp", "emitted_at"
+    )
+    emitted_at = _first_event_time(data, "emitted_at", "completion_timestamp")
+    return {
+        "request_id": request_id,
+        "ts": ts,
+        "completed_at": completed_at,
+        # The latest completion of a request id wins on merge; a replay of
+        # the same event has the same version.
+        "version": int(emitted_at.timestamp() * 1000),
+        "user_id": str(data.get("user_id") or ""),
+        "tier": str(data.get("user_tier") or ""),
+        "source": str(data.get("source") or "api"),
+        "surface": str(data.get("surface") or ""),
+        "thread_key_hash": str(data.get("thread_key_hash") or ""),
+        "query_type": str(data.get("query_type") or ""),
+        "model": str(data.get("selected_model") or ""),
+        "provider": str(data.get("provider") or ""),
+        "status": str(data.get("status") or ""),
+        "error_type": str(data.get("error_type") or ""),
+        "error_code": str(data.get("error_code") or ""),
+        "finish_reason": str(data.get("finish_reason") or ""),
+        "fallback_from_model": str(data.get("fallback_from_model") or ""),
+        "attempts": _uint_or_none(data.get("attempts")) or 0,
+        "cached": bool(data.get("cached_response", False)),
+        "routing_strategy": str(data.get("routing_strategy") or ""),
+        "policy_source": str(data.get("policy_source") or ""),
+        "reasoning_effort": str(data.get("reasoning_effort") or ""),
+        "latency_ms": _uint_or_none(data.get("latency_ms")) or 0,
+        "routing_ms": _uint_or_none(data.get("routing_ms")),
+        "queue_wait_ms": _uint_or_none(data.get("queue_wait_ms")),
+        "ttft_ms": _uint_or_none(data.get("ttft_ms")),
+        "token_count_input": _uint_or_none(data.get("token_count_input")) or 0,
+        "token_count_output": _uint_or_none(data.get("token_count_output")) or 0,
+        "reasoning_tokens": _uint_or_none(data.get("reasoning_tokens")) or 0,
+        "provider_cached_input_tokens": (
+            _uint_or_none(data.get("provider_cached_input_tokens")) or 0
+        ),
+        "cost_usd": float(data.get("cost_usd") or 0.0),
+        "event_id": "",
+        "kafka_topic": "",
+        "kafka_partition": -1,
+        "kafka_offset": -1,
+        **(kafka_metadata or {}),
+    }
+
+
+CHAT_FEEDBACK_RATINGS = frozenset({"up", "down"})
+
+
+def build_chat_feedback_event(
+    *,
+    request_id: str,
+    user_id: str,
+    rating: str,
+    click_id: str,
+    source: str = "slack",
+) -> Dict[str, Any]:
+    """A user's rating of one chat answer; an explicit field list, no text."""
+    if rating not in CHAT_FEEDBACK_RATINGS:
+        raise ValueError(f"Unknown chat feedback rating: {rating!r}")
+    return {
+        "event_type": "chat.feedback",
+        "event_version": EVENT_SCHEMA_VERSION,
+        "emitted_at": _isoformat_utc(),
+        "request_id": request_id,
+        "user_id": user_id,
+        "rating": rating,
+        "click_id": click_id,
+        "source": source,
+    }
+
+
+def build_chat_feedback_row(
+    data: Dict[str, Any], kafka_metadata: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """One chat_feedback row from a chat.feedback event."""
+    request_id = str(data.get("request_id") or "")
+    rating = str(data.get("rating") or "")
+    if not request_id or rating not in CHAT_FEEDBACK_RATINGS:
+        raise ValueError("chat.feedback event needs a request_id and a rating")
+    clicked_at = _first_event_time(data, "emitted_at")
+    return {
+        "request_id": request_id,
+        "user_id": str(data.get("user_id") or ""),
+        "rating": rating,
+        "click_id": str(data.get("click_id") or ""),
+        "source": str(data.get("source") or ""),
+        "clicked_at": clicked_at,
+        "version": int(clicked_at.timestamp() * 1000),
+        "event_id": "",
+        "kafka_topic": "",
+        "kafka_partition": -1,
+        "kafka_offset": -1,
+        **(kafka_metadata or {}),
+    }
+
+
+def _event_query_text(query_request: QueryRequest) -> str:
+    """The query as events carry it: redacted, and for Slack without the
+    attached files' names (a file-only message asks about them by name)."""
+    query = query_request.query
+    if (query_request.metadata or {}).get("source") == "slack":
+        for attachment in query_request.attachments:
+            if attachment.name:
+                query = query.replace(attachment.name, "[attachment]")
+    return redact_text(query)
+
+
+def _without_attachment_names(slack_metadata: Any) -> Any:
+    if not isinstance(slack_metadata, dict):
+        return slack_metadata
+    return {
+        key: value for key, value in slack_metadata.items() if key != "attachment_names"
+    }
+
+
 def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
     """Build the pre-inference event emitted by the API request path."""
+    # A Slack file's name can say what is in it (X6): Slack requests send
+    # only each file's type and size. /route keeps its existing shape.
+    from_slack = (query_request.metadata or {}).get("source") == "slack"
     attachments = [
         {
             "id": attachment.id,
-            "name": attachment.name,
+            **({} if from_slack else {"name": attachment.name}),
             "type": _enum_value(attachment.type),
             "size_bytes": attachment.size_bytes,
             "mime_type": attachment.mime_type,
@@ -233,7 +419,7 @@ def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
         "user_id": query_request.user_id,
         "user_tier": _enum_value(query_request.user_tier),
         "request_timestamp": _isoformat_utc(query_request.timestamp),
-        "query_text": redact_text(query_request.query),
+        "query_text": _event_query_text(query_request),
         # Other people's Slack messages ride in `context`; send only its shape.
         **context_summary(query_request.context),
         "query_token_estimate": estimate_query_tokens(
@@ -252,7 +438,11 @@ def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
         # Prompt content assembled in process (Slack memory hits) stays out.
         "metadata": redact(
             {
-                key: value
+                key: (
+                    _without_attachment_names(value)
+                    if from_slack and key == "slack"
+                    else value
+                )
                 for key, value in (query_request.metadata or {}).items()
                 if key not in PROMPT_CONTENT_METADATA_KEYS
             }
@@ -291,6 +481,8 @@ def build_inference_completed_event(
         for domain in (getattr(source, "source_domain", None) for source in sources)
         if domain
     ]
+    source, surface = request_source_and_surface(query_request)
+    routing_ms = getattr(routing_decision, "routing_time_ms", None)
 
     return {
         "event_type": "inference.completed",
@@ -302,9 +494,12 @@ def build_inference_completed_event(
         "user_tier": _enum_value(query_request.user_tier),
         "session_id": query_request.session_id,
         "conversation_id": query_request.conversation_id,
+        "source": source,
+        "surface": surface,
+        "thread_key_hash": thread_key_hash(query_request),
         "request_timestamp": _isoformat_utc(query_request.timestamp),
         "completion_timestamp": _isoformat_utc(inference_response.timestamp),
-        "query_text": redact_text(query_request.query),
+        "query_text": _event_query_text(query_request),
         "query_type": _enum_value(query_type),
         "selected_model": inference_response.model_name,
         "provider": inference_response.provider,
@@ -315,6 +510,15 @@ def build_inference_completed_event(
         "finish_reason": inference_response.finish_reason,
         "provider_request_id": inference_response.provider_request_id,
         "latency_ms": inference_response.latency_ms,
+        # Where the time went: routing; the provider queue (not measured
+        # per request yet); time to first token (no streaming yet).
+        "routing_ms": (
+            int(routing_ms)
+            if isinstance(routing_ms, (int, float)) and not isinstance(routing_ms, bool)
+            else None
+        ),
+        "queue_wait_ms": None,
+        "ttft_ms": None,
         "token_count_input": inference_response.token_count_input,
         "token_count_output": inference_response.token_count_output,
         "total_tokens": inference_response.total_tokens,
@@ -1210,6 +1414,30 @@ class KafkaProducerManager:
             ),
         )
 
+    async def produce_chat_feedback(
+        self,
+        *,
+        request_id: str,
+        user_id: str,
+        rating: str,
+        click_id: str,
+        source: str = "slack",
+    ):
+        """Produce a chat.feedback event, keyed by the request it rates."""
+        event = build_chat_feedback_event(
+            request_id=request_id,
+            user_id=user_id,
+            rating=rating,
+            click_id=click_id,
+            source=source,
+        )
+        return self._enqueue_message(
+            "chat_feedback",
+            "chat.feedback",
+            key=request_id,
+            value=event,
+        )
+
     async def produce_routing_decision(
         self,
         query_request: QueryRequest,
@@ -1719,6 +1947,54 @@ class ClickHouseManager:
             database=self.database
         )
 
+        # One row per chat request (inference.completed): no query text, no
+        # context. A replay of one request (same id and ts) collapses to its
+        # latest version; distinct calls that reuse an id keep their rows.
+        chat_requests_sql = """
+        CREATE TABLE IF NOT EXISTS {database}.chat_requests (
+            request_id String,
+            ts DateTime64(3),
+            completed_at DateTime64(3),
+            version UInt64,
+            user_id String,
+            tier LowCardinality(String),
+            source LowCardinality(String),
+            surface LowCardinality(String),
+            thread_key_hash String,
+            query_type LowCardinality(String),
+            model LowCardinality(String),
+            provider LowCardinality(String),
+            status LowCardinality(String),
+            error_type LowCardinality(String),
+            error_code LowCardinality(String),
+            finish_reason LowCardinality(String),
+            fallback_from_model LowCardinality(String),
+            attempts UInt8,
+            cached Boolean,
+            routing_strategy LowCardinality(String),
+            policy_source LowCardinality(String),
+            reasoning_effort LowCardinality(String),
+            latency_ms UInt32,
+            routing_ms Nullable(UInt32),
+            queue_wait_ms Nullable(UInt32),
+            ttft_ms Nullable(UInt32),
+            token_count_input UInt32,
+            token_count_output UInt32,
+            reasoning_tokens UInt32,
+            provider_cached_input_tokens UInt32,
+            cost_usd Float64,
+            event_id String,
+            kafka_topic String DEFAULT '',
+            kafka_partition Int32 DEFAULT -1,
+            kafka_offset Int64 DEFAULT -1
+        ) ENGINE = ReplacingMergeTree(version)
+        PARTITION BY toYYYYMMDD(ts)
+        ORDER BY (toStartOfHour(ts), request_id, ts)
+        TTL toDateTime(ts) + INTERVAL 90 DAY
+        """.format(
+            database=self.database
+        )
+
         routing_decisions_sql = """
         CREATE TABLE IF NOT EXISTS {database}.routing_decisions (
             event_id String,
@@ -1754,7 +2030,30 @@ class ClickHouseManager:
             database=self.database
         )
 
-        # Execute table creation
+        # A rating of a chat answer by the user who clicked it; each click
+        # is one row, the latest per user and request is their rating.
+        chat_feedback_sql = """
+        CREATE TABLE IF NOT EXISTS {database}.chat_feedback (
+            request_id String,
+            user_id String,
+            rating LowCardinality(String),
+            click_id String,
+            source LowCardinality(String),
+            clicked_at DateTime64(3),
+            version UInt64,
+            event_id String,
+            kafka_topic String DEFAULT '',
+            kafka_partition Int32 DEFAULT -1,
+            kafka_offset Int64 DEFAULT -1
+        ) ENGINE = ReplacingMergeTree(version)
+        PARTITION BY toYYYYMM(clicked_at)
+        ORDER BY (request_id, user_id, click_id)
+        TTL toDateTime(clicked_at) + INTERVAL 90 DAY
+        """.format(
+            database=self.database
+        )
+
+        # Execute table creation; new tables go at the end.
         tables = [
             ("query_logs", query_logs_sql),
             ("system_metrics", metrics_sql),
@@ -1762,6 +2061,8 @@ class ClickHouseManager:
             ("user_analytics", user_analytics_sql),
             ("alert_events", alert_events_sql),
             ("routing_policy_state_events", routing_policy_state_sql),
+            ("chat_requests", chat_requests_sql),
+            ("chat_feedback", chat_feedback_sql),
             ("routing_decisions", routing_decisions_sql),
         ]
 
@@ -1907,6 +2208,34 @@ class ClickHouseManager:
             )
         except Exception as e:
             logger.error(f"Failed to batch insert alert events: {e}")
+            PIPELINE_METRICS.insertion_errors.inc()
+            raise
+
+    async def batch_insert_chat_requests(self, rows: List[Dict[str, Any]]):
+        """Batch insert chat_requests rows (see build_chat_request_row)."""
+        if not rows:
+            return
+        try:
+            await self._insert_dict_rows("chat_requests", rows)
+            PIPELINE_METRICS.records_inserted.labels(table="chat_requests").inc(
+                len(rows)
+            )
+        except Exception as e:
+            logger.error(f"Failed to batch insert chat requests: {e}")
+            PIPELINE_METRICS.insertion_errors.inc()
+            raise
+
+    async def batch_insert_chat_feedback(self, rows: List[Dict[str, Any]]):
+        """Batch insert chat_feedback rows (see build_chat_feedback_row)."""
+        if not rows:
+            return
+        try:
+            await self._insert_dict_rows("chat_feedback", rows)
+            PIPELINE_METRICS.records_inserted.labels(table="chat_feedback").inc(
+                len(rows)
+            )
+        except Exception as e:
+            logger.error(f"Failed to batch insert chat feedback: {e}")
             PIPELINE_METRICS.insertion_errors.inc()
             raise
 
@@ -2321,6 +2650,8 @@ class KafkaConsumerManager:
             "routing_guardrails",
             "routing_policy_state",
             "alerts",
+            "inference_completed",
+            "chat_feedback",
             "routing_decisions",
         )
         self.batch_buffer_states: Dict[str, BatchBufferState] = {}
@@ -2421,6 +2752,8 @@ class KafkaConsumerManager:
                     "routing_guardrails",
                     "routing_policy_state",
                     "alerts",
+                    "inference_completed",
+                    "chat_feedback",
                     "routing_decisions",
                 ]:
                     consumer = await self._create_consumer(topic_key, topic_name)
@@ -2525,6 +2858,8 @@ class KafkaConsumerManager:
             "routing_guardrails": self._consume_routing_guardrails,
             "routing_policy_state": self._consume_routing_policy_state,
             "alerts": self._consume_alerts,
+            "inference_completed": self._consume_inference_completed,
+            "chat_feedback": self._consume_chat_feedback,
             "routing_decisions": self._consume_routing_decisions,
         }
         handler = handlers.get(topic_key)
@@ -3060,6 +3395,45 @@ class KafkaConsumerManager:
             logger.error(f"Analytics model metrics consumer error: {e}")
             raise
 
+    async def _consume_batched_rows(
+        self,
+        topic_key: str,
+        consumer: AIOKafkaConsumer,
+        build_row: Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]],
+    ):
+        """Batch each event of topic_key as the row build_row makes of it."""
+        try:
+            async for message in consumer:
+                try:
+                    data = self._decode_message_value(message)
+                    row = build_row(data, self._kafka_event_metadata(message))
+                    await self._append_batched_row(topic_key, row, message)
+                    self._record_successful_consume(topic_key, consumer, message)
+                    PIPELINE_METRICS.messages_consumed.labels(topic=topic_key).inc()
+                except Exception as e:
+                    await self._handle_processing_failure(
+                        topic_key,
+                        message,
+                        e,
+                        stage="consume",
+                        batched=True,
+                    )
+        except Exception as e:
+            logger.error(f"{topic_key} consumer error: {e}")
+            raise
+
+    async def _consume_inference_completed(self, consumer: AIOKafkaConsumer):
+        """Persist inference.completed events as chat_requests rows."""
+        await self._consume_batched_rows(
+            "inference_completed", consumer, build_chat_request_row
+        )
+
+    async def _consume_chat_feedback(self, consumer: AIOKafkaConsumer):
+        """Persist chat.feedback events as chat_feedback rows."""
+        await self._consume_batched_rows(
+            "chat_feedback", consumer, build_chat_feedback_row
+        )
+
     async def _consume_alerts(self, consumer: AIOKafkaConsumer):
         """Consume Flink and platform alert events."""
         try:
@@ -3577,6 +3951,8 @@ class KafkaConsumerManager:
                 self.clickhouse.batch_insert_routing_policy_state,
             ),
             ("alerts", self.clickhouse.batch_insert_alert_events),
+            ("inference_completed", self.clickhouse.batch_insert_chat_requests),
+            ("chat_feedback", self.clickhouse.batch_insert_chat_feedback),
             ("routing_decisions", self.clickhouse.batch_insert_routing_decisions),
         )
 

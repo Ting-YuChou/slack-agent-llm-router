@@ -93,6 +93,7 @@ from src.utils.schema import (
     QueryRequest,
     ToolPolicy,
     UserTier,
+    is_valid_request_id,
 )
 from src.utils.bounded_state import BoundedTTLMap
 from src.utils.metrics import SLACK_METRICS
@@ -693,6 +694,99 @@ def _without_blocks(message: Dict[str, Any]) -> Dict[str, Any]:
 SLACK_MARKDOWN_BLOCK_CHARS = 12000
 
 
+def slack_chat_request_id(
+    team_id: Optional[str], channel_id: Optional[str], message_ts: Optional[str]
+) -> Optional[str]:
+    """The request id of a chat query asked by the Slack message at message_ts.
+
+    Deterministic, so a redelivered event gets the id it had the first time.
+    """
+    if not channel_id or not message_ts:
+        return None
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL, f"slack:{team_id or ''}:{channel_id}:{message_ts}"
+        )
+    )
+
+
+# Thumbs up / down under a chat answer; the value is the answered request id.
+CHAT_FEEDBACK_ACTIONS = {"chat_feedback_up": "up", "chat_feedback_down": "down"}
+CHAT_FEEDBACK_THANKS_TEXT = "Thanks for the feedback."
+CHAT_FEEDBACK_NOT_RECORDED_TEXT = (
+    "Sorry, your feedback could not be recorded right now. Please try again."
+)
+CHAT_FEEDBACK_CLICKS_LIMIT = 1000
+
+
+def _chat_feedback_block(request_id: str) -> Dict[str, Any]:
+    return {
+        "type": "actions",
+        "block_id": "chat_feedback",
+        "elements": [
+            {
+                "type": "button",
+                "action_id": action_id,
+                "text": {"type": "plain_text", "text": emoji, "emoji": True},
+                "value": request_id,
+                "accessibility_label": label,
+            }
+            for action_id, emoji, label in (
+                ("chat_feedback_up", "👍", "Good answer"),
+                ("chat_feedback_down", "👎", "Bad answer"),
+            )
+        ],
+    }
+
+
+@dataclass(frozen=True)
+class SlackQueryTrace:
+    """What ties a Slack chat query to its logs, events and feedback."""
+
+    request_id: Optional[str] = None
+    # mention | thread | dm | slash
+    surface: Optional[str] = None
+    event_id: Optional[str] = None
+
+    @classmethod
+    def for_message(
+        cls, event: Dict[str, Any], *, team_id: Optional[str]
+    ) -> "SlackQueryTrace":
+        thread_ts = event.get("thread_ts")
+        if event.get("channel_type") == "im":
+            surface = "dm"
+        elif thread_ts and thread_ts != event.get("ts"):
+            # A reply in a thread, mentioning the bot or not.
+            surface = "thread"
+        else:
+            surface = "mention"
+        event_id = event.get("_event_id")
+        return cls(
+            request_id=slack_chat_request_id(
+                team_id, event.get("channel"), event.get("ts")
+            ),
+            surface=surface,
+            event_id=event_id if isinstance(event_id, str) else None,
+        )
+
+    @classmethod
+    def for_slash(cls, request_id: Optional[str]) -> "SlackQueryTrace":
+        return cls(
+            request_id=request_id if is_valid_request_id(request_id) else None,
+            surface="slash",
+        )
+
+    def add_metadata(
+        self, metadata: Dict[str, Any], *, message_ts: Optional[str]
+    ) -> None:
+        if self.surface:
+            metadata["surface"] = self.surface
+        slack = metadata.get("slack")
+        if isinstance(slack, dict):
+            slack["message_ts"] = message_ts
+            slack["event_id"] = self.event_id
+
+
 class SlackAnswer(str):
     """A model's answer text, carrying what the Slack footer shows about it."""
 
@@ -700,6 +794,8 @@ class SlackAnswer(str):
     latency_ms: Optional[float]
     cached: bool
     trailer_lines: FrozenSet[str]
+    # The request it answers: what a feedback click rates.
+    request_id: Optional[str]
 
     def __new__(
         cls,
@@ -709,11 +805,13 @@ class SlackAnswer(str):
         latency_ms: Optional[float] = None,
         cached: bool = False,
         trailer_lines: Iterable[str] = (),
+        request_id: Optional[str] = None,
     ) -> "SlackAnswer":
         answer = super().__new__(cls, text)
         answer.model_name = model_name
         answer.latency_ms = latency_ms
         answer.cached = cached
+        answer.request_id = request_id if is_valid_request_id(request_id) else None
         # The bot's own lines after the model's text: notes and sources.
         answer.trailer_lines = frozenset(line for line in trailer_lines if line)
         return answer
@@ -1885,6 +1983,7 @@ class SlackMessageHandler:
         message_ts = event.get("ts")
         team_id = self.bot._extract_team_id(event)
         attachments = list(event.get("_query_attachments", []) or [])
+        trace = SlackQueryTrace.for_message(event, team_id=team_id)
 
         # The bot decides chat or Agent once per message, before it shows
         # progress or downloads files; a thread that became an Agent thread
@@ -1916,6 +2015,7 @@ class SlackMessageHandler:
                 attachments=attachments,
                 team_id=team_id,
                 message_ts=message_ts,
+                trace=trace,
             )
 
         if not text and attachments:
@@ -1973,6 +2073,7 @@ class SlackMessageHandler:
             attachments=attachments,
             team_id=team_id,
             message_ts=message_ts,
+            trace=trace,
         )
 
     @staticmethod
@@ -2041,6 +2142,7 @@ class SlackMessageHandler:
         team_id: Optional[str] = None,
         command_surface: str = "message",
         message_ts: Optional[str] = None,
+        trace: Optional["SlackQueryTrace"] = None,
     ) -> str:
         """Handle inline `/llm` / `!llm` payloads as commands or free-form queries."""
         return await self._handle_command(
@@ -2053,6 +2155,7 @@ class SlackMessageHandler:
             team_id=team_id,
             command_surface=command_surface,
             message_ts=message_ts,
+            trace=trace,
         )
 
     async def _handle_command(
@@ -2067,6 +2170,7 @@ class SlackMessageHandler:
         command_surface: str = "message",
         message_ts: Optional[str] = None,
         request_id: Optional[str] = None,
+        trace: Optional["SlackQueryTrace"] = None,
     ) -> str:
         """Handle bot commands, falling back to a free-form query when appropriate."""
         parts = command_text.split()
@@ -2075,6 +2179,9 @@ class SlackMessageHandler:
 
         command = parts[0].lower()
         args = parts[1:] if len(parts) > 1 else []
+        if command_surface == "slash":
+            # Slack resends a slash command with the same trigger_id.
+            trace = SlackQueryTrace.for_slash(request_id)
 
         if command in self.commands:
             if command == "web":
@@ -2087,6 +2194,7 @@ class SlackMessageHandler:
                     attachments=attachments,
                     team_id=team_id,
                     message_ts=message_ts,
+                    trace=trace,
                 )
             if command == "fast":
                 return await self._handle_fast_command(
@@ -2098,6 +2206,7 @@ class SlackMessageHandler:
                     attachments=attachments,
                     team_id=team_id,
                     message_ts=message_ts,
+                    trace=trace,
                 )
             if command in {"remember", "memories", "forget"}:
                 return await self.commands[command](
@@ -2131,6 +2240,7 @@ class SlackMessageHandler:
             attachments=attachments,
             team_id=team_id,
             message_ts=message_ts,
+            trace=trace,
         )
 
     async def _handle_web_command(
@@ -2143,6 +2253,7 @@ class SlackMessageHandler:
         attachments: Optional[List[Attachment]] = None,
         team_id: Optional[str] = None,
         message_ts: Optional[str] = None,
+        trace: Optional["SlackQueryTrace"] = None,
     ) -> str:
         """Handle `/llm web <query>` by requiring the web_search tool."""
         query = " ".join(args).strip()
@@ -2159,6 +2270,7 @@ class SlackMessageHandler:
             tool_policy=ToolPolicy.REQUIRED,
             allowed_tools=["web_search"],
             message_ts=message_ts,
+            trace=trace,
         )
 
     async def _handle_fast_command(
@@ -2171,6 +2283,7 @@ class SlackMessageHandler:
         attachments: Optional[List[Attachment]] = None,
         team_id: Optional[str] = None,
         message_ts: Optional[str] = None,
+        trace: Optional["SlackQueryTrace"] = None,
     ) -> str:
         """Handle `/llm fast <query>` by marking this request low-latency."""
         query = " ".join(args).strip()
@@ -2190,6 +2303,7 @@ class SlackMessageHandler:
                 "routing_intent_source": "slack_fast_command",
             },
             message_ts=message_ts,
+            trace=trace,
         )
 
     async def _handle_agent_command(
@@ -3317,8 +3431,10 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         allowed_tools: Optional[List[str]] = None,
         routing_metadata: Optional[Dict[str, Any]] = None,
         message_ts: Optional[str] = None,
+        trace: Optional["SlackQueryTrace"] = None,
     ) -> str:
         """Handle regular query through inference engine"""
+        trace = trace or SlackQueryTrace()
         try:
             # Get or create conversation context
             context = self.bot.conversation_manager.get_or_create_context(
@@ -3394,8 +3510,12 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             self._add_slack_context_metadata(query_metadata, slack_context)
             if memory_context:
                 query_metadata["memory_context"] = memory_context
+            # Server-written trace keys: an external /route caller cannot set
+            # them (they are not client metadata keys).
+            trace.add_metadata(query_metadata, message_ts=message_ts)
 
             query_request = QueryRequest(
+                **({"request_id": trace.request_id} if trace.request_id else {}),
                 query=text,
                 user_id=user_id,
                 user_tier=user_tier,
@@ -3410,12 +3530,18 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 metadata=query_metadata,
             )
 
-            # Process through inference engine
-            response = await self.bot.inference_engine.process_query(query_request)
+            # Process through the ingress /route shares (requests.raw, API
+            # metrics, error mapping); the per-user limiter already admitted it.
+            ingress = (getattr(self.bot, "services", None) or {}).get("chat_ingress")
+            if ingress is not None and callable(getattr(ingress, "handle", None)):
+                response = await ingress.handle(query_request, source="slack")
+            else:
+                response = await self.bot.inference_engine.process_query(query_request)
 
             if getattr(response, "error", None):
                 logger.error(
-                    "Slack query failed for user %s in channel %s: %s",
+                    "Slack query %s failed for user %s in channel %s: %s",
+                    query_request.request_id,
                     user_id,
                     channel_id,
                     response.error,
@@ -3462,7 +3588,9 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             SLACK_METRICS.messages_processed.labels(user_tier=user_tier.value).inc()
             SLACK_METRICS.response_time.observe(response.latency_ms / 1000)
 
-            return self._format_response_with_sources(response, answer)
+            return self._format_response_with_sources(
+                response, answer, request_id=query_request.request_id
+            )
 
         except AdmissionRejectedError as e:
             logger.warning(
@@ -3611,11 +3739,16 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
             metadata["slack_context_error"] = slack_context.error
 
     def _format_response_with_sources(
-        self, response: Any, response_text: Optional[str] = None
+        self,
+        response: Any,
+        response_text: Optional[str] = None,
+        *,
+        request_id: Optional[str] = None,
     ) -> str:
         """Append compact source links for web-search enriched answers.
 
         `response_text` replaces the response's own text, e.g. with notes added.
+        `request_id` is the request answered, for feedback on the answer.
         """
         if response_text is None:
             response_text = getattr(response, "response_text", "") or ""
@@ -3649,6 +3782,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 else None
             ),
             cached=getattr(response, "cached", False) is True,
+            request_id=request_id or getattr(response, "request_id", None),
         )
 
     def _get_max_tokens_for_user(
@@ -3783,6 +3917,8 @@ class SlackBot:
         # "channel:ts" of messages already handled, oldest first. Slack sends
         # both a message and an app_mention event for one mention.
         self.handled_messages: Dict[str, None] = {}
+        # Feedback clicks already recorded, by action_ts (bounded).
+        self._chat_feedback_clicks: Dict[str, None] = {}
         # "channel:ts" of messages already given a busy reply, so a mention's
         # message and app_mention events get one between them.
         self.busy_replied_messages: Dict[str, None] = {}
@@ -4032,6 +4168,11 @@ class SlackBot:
                 team_id = self._extract_team_id(req.payload)
                 if team_id and "_team_id" not in event:
                     event["_team_id"] = team_id
+                # The envelope's event id, kept for tracing: a retry of the
+                # same event carries the same id.
+                event_id = req.payload.get("event_id")
+                if isinstance(event_id, str) and event_id and "_event_id" not in event:
+                    event["_event_id"] = event_id
                 await self._enqueue_work(
                     SlackWorkItem(
                         kind="event",
@@ -4056,11 +4197,17 @@ class SlackBot:
                 # trigger_id expires after ~3s, so the modal cannot wait in the queue.
                 if await self._open_agent_feedback_modal(req.payload):
                     return
+                actions = req.payload.get("actions") or [{}]
+                chat_feedback = actions[0].get("action_id") in CHAT_FEEDBACK_ACTIONS
                 await self._enqueue_work(
                     SlackWorkItem(
                         kind="interactive",
                         payload=req.payload,
-                        name="slack_agent_approval",
+                        name=(
+                            "slack_chat_feedback"
+                            if chat_feedback
+                            else "slack_agent_approval"
+                        ),
                     )
                 )
             elif (
@@ -4531,16 +4678,17 @@ class SlackBot:
         if len(markdown) > SLACK_MARKDOWN_BLOCK_CHARS:
             return message
         blocks: List[Dict[str, Any]] = [{"type": "markdown", "text": markdown}]
+        response_settings = self.config.get("response_settings", {})
         footer = answer.footer() if last else None
-        if footer and self.config.get("response_settings", {}).get(
-            "answer_footer", True
-        ):
+        if footer and response_settings.get("answer_footer", True):
             blocks.append(
                 {
                     "type": "context",
                     "elements": [{"type": "plain_text", "text": footer}],
                 }
             )
+        if last and answer.request_id and response_settings.get("feedback_buttons"):
+            blocks.append(_chat_feedback_block(answer.request_id))
         message["blocks"] = blocks
         return message
 
@@ -6612,11 +6760,83 @@ class SlackBot:
                 text="\n".join(part for part in (response, *details) if part),
             )
 
+    async def _handle_chat_feedback(
+        self, payload: Dict[str, Any], action: Dict[str, Any]
+    ) -> None:
+        """Record a thumbs up / down on a chat answer, once per click.
+
+        Anyone who sees the answer may rate it; the event names who clicked.
+        """
+        rating = CHAT_FEEDBACK_ACTIONS[action["action_id"]]
+        request_id = action.get("value")
+        user_id = (payload.get("user") or {}).get("id")
+        channel_id = (payload.get("channel") or {}).get("id")
+        click_id = str(action.get("action_ts") or payload.get("trigger_id") or "")
+        if not is_valid_request_id(request_id) or not user_id or not click_id:
+            return
+        # Slack may deliver one click twice; a replay is not a second vote.
+        # The click is claimed while it is being recorded and kept only once
+        # it was, so a click that failed can be recorded when retried.
+        clicks = self._chat_feedback_clicks
+        if click_id in clicks:
+            return
+        clicks[click_id] = None
+
+        recorded = False
+        producer = (getattr(self, "services", None) or {}).get("event_producer")
+        produce = getattr(producer, "produce_chat_feedback", None)
+        if not callable(produce):
+            logger.warning(
+                "No event producer: chat feedback for request %s not recorded",
+                request_id,
+            )
+        else:
+            try:
+                recorded = bool(
+                    await produce(
+                        request_id=request_id,
+                        user_id=str(user_id),
+                        rating=rating,
+                        click_id=click_id,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to record chat feedback for request %s", request_id
+                )
+            else:
+                if not recorded:
+                    logger.warning(
+                        "Chat feedback for request %s was not accepted for " "delivery",
+                        request_id,
+                    )
+        if not recorded:
+            clicks.pop(click_id, None)
+        while len(clicks) > CHAT_FEEDBACK_CLICKS_LIMIT:
+            clicks.pop(next(iter(clicks)))
+        if channel_id and hasattr(self.web_client, "chat_postEphemeral"):
+            container = payload.get("container") or {}
+            message = payload.get("message") or {}
+            thread_ts = container.get("thread_ts") or message.get("thread_ts")
+            await self.web_client.chat_postEphemeral(
+                channel=channel_id,
+                user=user_id,
+                text=(
+                    CHAT_FEEDBACK_THANKS_TEXT
+                    if recorded
+                    else CHAT_FEEDBACK_NOT_RECORDED_TEXT
+                ),
+                **({"thread_ts": thread_ts} if thread_ts else {}),
+            )
+
     async def _handle_agent_interactive(self, payload: Dict[str, Any]):
         actions = payload.get("actions") or []
         if not actions:
             return
         action = actions[0]
+        if action.get("action_id") in CHAT_FEEDBACK_ACTIONS:
+            await self._handle_chat_feedback(payload, action)
+            return
         if action.get("action_id") in {
             "pi_agent_download_patch",
             "pi_agent_resume_from_patch",

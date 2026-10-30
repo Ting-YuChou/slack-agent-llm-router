@@ -25,7 +25,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import click
 import uvicorn
@@ -81,11 +81,14 @@ from src.utils.metrics import (
     sum_metric_values,
 )
 from src.utils.schema import (
+    REQUEST_ID_MAX_LENGTH,
+    InferenceResponse,
     PlatformConfig,
     QueryRequest,
     RagBatchRequest,
     RagQueryRequest,
     RagUploadRequest,
+    is_valid_request_id,
 )
 from slack.bot import SlackBot
 
@@ -100,6 +103,85 @@ PUBLIC_ENDPOINTS = {"/", "/live", "/ready", "/health"}
 # Responses sent before the request body is read: closing the connection keeps
 # the server from reading and discarding an arbitrarily large body.
 REJECTED_BEFORE_BODY_HEADERS = {"Connection": "close"}
+# The request id a /route caller may choose, echoed on every /route response.
+REQUEST_ID_HEADER = "X-Request-ID"
+
+
+def _with_request_id(result: Any, request_id: str) -> Any:
+    """The engine's answer, naming the request it answers."""
+    if isinstance(result, InferenceResponse) and result.request_id != request_id:
+        return result.model_copy(update={"request_id": request_id})
+    return result
+
+
+class ChatIngress:
+    """The chat request path /route and Slack share.
+
+    It publishes requests.raw, runs inference, maps the answer to an HTTP
+    status and records the API metrics. Each caller keeps its own boundary
+    and admission: /route its guards, metadata allowlist and route admission,
+    Slack its per-user limiter.
+    """
+
+    def __init__(self, platform: "LLMRouterPlatform"):
+        self._platform = platform
+
+    async def process(self, query_request: QueryRequest) -> Tuple[Any, int, Dict]:
+        """requests.raw, inference and the status: (result, status, headers)."""
+        platform = self._platform
+        await platform._publish_request_raw_event(query_request)
+        result = await platform.services["inference"].process_query(query_request)
+        result = _with_request_id(result, query_request.request_id)
+        status_code, headers = route_response_status(result)
+        return result, status_code, headers
+
+    async def record(
+        self,
+        *,
+        endpoint: str,
+        method: str,
+        status_code: int,
+        started_at: float,
+        component: str = "api",
+        error_type: str = "RouteError",
+    ) -> None:
+        await self._platform._record_api_metrics(
+            endpoint=endpoint,
+            method=method,
+            status_code=status_code,
+            duration_seconds=time.perf_counter() - started_at,
+            error_type=error_type if status_code >= 500 else None,
+            component=component,
+        )
+
+    async def handle(self, query_request: QueryRequest, *, source: str) -> Any:
+        """process() and its metrics in one call, for in-process callers.
+
+        `source` (e.g. "slack") labels the metrics: endpoint, method and
+        error component, so in-process traffic never counts as HTTP /route
+        traffic. Exceptions propagate, with the status /route would give.
+        """
+        started_at = time.perf_counter()
+        status_code = 500
+        try:
+            result, status_code, _headers = await self.process(query_request)
+            return result
+        except AdmissionRejectedError as exc:
+            status_code = exc.decision.status_code
+            raise
+        finally:
+            await self.record(
+                endpoint=source,
+                method=source,
+                status_code=status_code,
+                started_at=started_at,
+                component=source,
+                error_type=f"{source.capitalize()}ChatError",
+            )
+
+    def is_healthy(self) -> bool:
+        return True
+
 
 # Optional infrastructure is imported only when its feature is enabled. Keeping
 # these names patchable also supports the existing isolated service tests.
@@ -164,6 +246,8 @@ class LLMRouterPlatform:
         self.logger = logging.getLogger(__name__)
         self.config = self._load_config()
         self.services: Dict[str, Any] = {}
+        # Shared by /route and, through services["chat_ingress"], Slack.
+        self.chat_ingress = ChatIngress(self)
         self.processes: List[mp.Process] = []
         self.shutdown_event = asyncio.Event()
         self.force_shutdown_event = asyncio.Event()
@@ -507,6 +591,9 @@ class LLMRouterPlatform:
             await self.services["monitoring"].initialize()
 
         if self._service_enabled("slack"):
+            # Slack chat queries take the /route ingress (requests.raw,
+            # metrics, error mapping) but not its admission.
+            self.services["chat_ingress"] = self.chat_ingress
             self.services["slack_bot"] = SlackBot(
                 config=self.config.get("slack", {}),
                 agent_config=self.config.get("agent", {}),
@@ -751,8 +838,10 @@ class LLMRouterPlatform:
         status_code: int,
         duration_seconds: float,
         error_type: Optional[str] = None,
+        component: str = "api",
     ):
-        """Record request-level API metrics."""
+        """Record request-level metrics; `component` names the caller's surface
+        (the HTTP API, or an in-process one such as Slack)."""
         requests_total = getattr(SYSTEM_METRICS, "requests_total", None)
         request_duration = getattr(SYSTEM_METRICS, "request_duration", None)
 
@@ -773,7 +862,7 @@ class LLMRouterPlatform:
             errors_total = getattr(SYSTEM_METRICS, "errors_total", None)
             if errors_total is not None:
                 errors_total.labels(
-                    component="api",
+                    component=component,
                     error_type=error_type,
                 ).inc()
 
@@ -783,24 +872,24 @@ class LLMRouterPlatform:
             "status": str(status_code),
         }
         await self._publish_system_metric_event(
-            service="api",
+            service=component,
             metric_name="requests_total",
             metric_value=1.0,
             labels=metric_labels,
         )
         await self._publish_system_metric_event(
-            service="api",
+            service=component,
             metric_name="request_duration_seconds",
             metric_value=duration_seconds,
             labels=metric_labels,
         )
         if error_type:
             await self._publish_system_metric_event(
-                service="api",
+                service=component,
                 metric_name="errors_total",
                 metric_value=1.0,
                 labels={
-                    "component": "api",
+                    "component": component,
                     "error_type": error_type,
                     **metric_labels,
                 },
@@ -920,6 +1009,31 @@ class LLMRouterPlatform:
         configured = self._security_config().get("request_body_limits") or {}
         limits.update({path: dict(caps) for path, caps in configured.items()})
         return limits
+
+    def _apply_request_id_header(
+        self, query_data: QueryRequest, request: Request
+    ) -> Optional[JSONResponse]:
+        """Adopt the caller's X-Request-ID, or reject one that is not valid.
+
+        A valid id replaces the body's request_id, so logs, events and the
+        response all carry the id the caller chose.
+        """
+        header_value = request.headers.get(REQUEST_ID_HEADER)
+        if header_value is None:
+            return None
+        if not is_valid_request_id(header_value):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_request_id",
+                    "message": (
+                        f"{REQUEST_ID_HEADER} must be 1-{REQUEST_ID_MAX_LENGTH} "
+                        "characters of A-Z, a-z, 0-9, '.', '_', ':' or '-'"
+                    ),
+                },
+            )
+        query_data.request_id = header_value
+        return None
 
     def _apply_route_boundary_guards(
         self, query_data: QueryRequest, principal: Optional[ApiPrincipal] = None
@@ -2091,7 +2205,20 @@ class LLMRouterPlatform:
             active_request_recorded = False
             active_requests = getattr(SYSTEM_METRICS, "active_requests", None)
 
+            def tagged(response: JSONResponse) -> JSONResponse:
+                # Every answer names its request, errors included, when the
+                # id is a safe header value (a body id is checked for length
+                # only; it still comes back in the body).
+                if is_valid_request_id(query_data.request_id):
+                    response.headers[REQUEST_ID_HEADER] = query_data.request_id
+                return response
+
             try:
+                request_id_response = self._apply_request_id_header(query_data, request)
+                if request_id_response is not None:
+                    status_code = request_id_response.status_code
+                    return request_id_response
+
                 # Set by the auth middleware; None when API key auth is off.
                 principal = getattr(request.state, "api_principal", None)
                 boundary_response = self._apply_route_boundary_guards(
@@ -2099,39 +2226,43 @@ class LLMRouterPlatform:
                 )
                 if boundary_response is not None:
                     status_code = boundary_response.status_code
-                    return boundary_response
+                    return tagged(boundary_response)
 
                 admission_response, route_reservation = await self._admit_route_request(
                     query_data, principal
                 )
                 if admission_response is not None:
                     status_code = admission_response.status_code
-                    return admission_response
+                    return tagged(admission_response)
 
                 if active_requests is not None:
                     active_requests.labels(endpoint=endpoint).inc()
                     active_request_recorded = True
 
-                await self._publish_request_raw_event(query_data)
-                result = await self.services["inference"].process_query(query_data)
-                status_code, error_headers = route_response_status(result)
-                return JSONResponse(
-                    status_code=status_code,
-                    content=jsonable_encoder(result),
-                    headers=error_headers,
+                result, status_code, error_headers = await self.chat_ingress.process(
+                    query_data
+                )
+                return tagged(
+                    JSONResponse(
+                        status_code=status_code,
+                        content=jsonable_encoder(result),
+                        headers=error_headers,
+                    )
                 )
             except AdmissionRejectedError as exc:
                 status_code = exc.decision.status_code
-                return self._build_admission_response(exc.decision)
+                return tagged(self._build_admission_response(exc.decision))
             except Exception:
                 status_code = 500
                 self.logger.exception("Query processing error")
-                return JSONResponse(
-                    status_code=status_code,
-                    content={
-                        "error": "internal_server_error",
-                        "message": "Request processing failed",
-                    },
+                return tagged(
+                    JSONResponse(
+                        status_code=status_code,
+                        content={
+                            "error": "internal_server_error",
+                            "message": "Request processing failed",
+                        },
+                    )
                 )
             finally:
                 # Free the admission slot first: metrics publishing can be slow
@@ -2139,12 +2270,11 @@ class LLMRouterPlatform:
                 if active_requests is not None and active_request_recorded:
                     active_requests.labels(endpoint=endpoint).dec()
                 await self._release_admission_reservation(route_reservation)
-                await self._record_api_metrics(
+                await self.chat_ingress.record(
                     endpoint=endpoint,
                     method=method,
                     status_code=status_code,
-                    duration_seconds=time.perf_counter() - start_time,
-                    error_type="RouteError" if status_code >= 500 else None,
+                    started_at=start_time,
                 )
 
         @app.post("/rag/uploads")
