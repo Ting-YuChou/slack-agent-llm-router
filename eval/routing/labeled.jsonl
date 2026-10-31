@@ -1,0 +1,204 @@
+{"query": "Hi there, how are you doing?", "label": "general", "lang": "en", "split": "dev"}
+{"query": "Thanks, that was really helpful", "label": "general", "lang": "en", "split": "dev"}
+{"query": "explain how recursion works now", "label": "general", "lang": "en", "split": "dev"}
+{"query": "What is the difference between TCP and UDP?", "label": "general", "lang": "en", "split": "dev"}
+{"query": "What does idempotent mean in REST APIs?", "label": "general", "lang": "en", "split": "dev"}
+{"query": "Can you tell me what a Kubernetes pod is?", "label": "general", "lang": "en", "split": "dev"}
+{"query": "How do I add a new member to our Slack channel?", "label": "general", "lang": "en", "split": "dev"}
+{"query": "What is the current state of the project?", "label": "general", "lang": "en", "split": "test"}
+{"query": "Explain what a vector database is in simple terms", "label": "general", "lang": "en", "split": "test"}
+{"query": "Good morning! Who are you?", "label": "general", "lang": "en", "split": "test"}
+{"query": "你好，可以介紹一下你自己嗎？", "label": "general", "lang": "zh", "split": "dev"}
+{"query": "什麼是機器學習？", "label": "general", "lang": "zh", "split": "dev"}
+{"query": "謝謝你的幫忙！", "label": "general", "lang": "zh", "split": "dev"}
+{"query": "我現在想了解 Docker 和虛擬機有什麼不同", "label": "general", "lang": "zh", "split": "dev"}
+{"query": "請解釋一下什麼是 OAuth", "label": "general", "lang": "zh", "split": "dev"}
+{"query": "什麼是 RESTful API？", "label": "general", "lang": "zh", "split": "test"}
+{"query": "現在可以問你問題嗎？", "label": "general", "lang": "zh", "split": "test"}
+{"query": "Write a Python function to sort a list", "label": "code_generation", "lang": "en", "split": "dev"}
+{"query": "Can you implement a binary search algorithm in Rust?", "label": "code_generation", "lang": "en", "split": "dev"}
+{"query": "write a python 3.12 script to parse logs", "label": "code_generation", "lang": "en", "split": "dev"}
+{"query": "Write a node.js function", "label": "code_generation", "lang": "en", "split": "dev"}
+{"query": "Create a SQL query that returns the top 10 customers by revenue", "label": "code_generation", "lang": "en", "split": "dev"}
+{"query": "Generate a bash script that backs up /var/log every night", "label": "code_generation", "lang": "en", "split": "dev"}
+{"query": "Write unit tests for the parse_config function using pytest", "label": "code_generation", "lang": "en", "split": "dev"}
+{"query": "Implement a rate limiter class in Go using a token bucket", "label": "code_generation", "lang": "en", "split": "test"}
+{"query": "Write a regex that matches ISO 8601 dates", "label": "code_generation", "lang": "en", "split": "test"}
+{"query": "Build a React component that shows a paginated table", "label": "code_generation", "lang": "en", "split": "test"}
+{"query": "幫我寫一個 Python 函式，計算兩個日期之間的工作天數", "label": "code_generation", "lang": "zh", "split": "dev"}
+{"query": "請用 JavaScript 寫一個 debounce 函式", "label": "code_generation", "lang": "zh", "split": "dev"}
+{"query": "寫一段 SQL 查詢每個月的活躍使用者數", "label": "code_generation", "lang": "zh", "split": "dev"}
+{"query": "幫我產生一個 Dockerfile，用來部署 FastAPI 服務", "label": "code_generation", "lang": "zh", "split": "dev"}
+{"query": "用 Go 實作一個簡單的 HTTP server", "label": "code_generation", "lang": "zh", "split": "dev"}
+{"query": "請寫一個 shell 腳本，把目錄裡的 .log 檔壓縮起來", "label": "code_generation", "lang": "zh", "split": "test"}
+{"query": "幫我寫一個 Python 類別來管理 Redis 連線池", "label": "code_generation", "lang": "zh", "split": "test"}
+{"query": "Please review this code and fix the bug in my parser function", "label": "code_analysis", "lang": "en", "split": "dev"}
+{"query": "What does this code do? def add(a, b): return a + b", "label": "code_analysis", "lang": "en", "split": "dev"}
+{"query": "fix the bug in utils.py function", "label": "code_analysis", "lang": "en", "split": "dev"}
+{"query": "Why does this function throw a KeyError? def get(d): return d['id']", "label": "code_analysis", "lang": "en", "split": "dev"}
+{"query": "Here is my stack trace: TypeError: 'NoneType' object is not subscriptable. How do I fix it?", "label": "code_analysis", "lang": "en", "split": "dev"}
+{"query": "Refactor this class to remove the duplicated validation logic", "label": "code_analysis", "lang": "en", "split": "dev"}
+{"query": "Can you optimize this SQL query? It takes 30 seconds on a 10M row table", "label": "code_analysis", "lang": "en", "split": "dev"}
+{"query": "Review my pull request diff for race conditions", "label": "code_analysis", "lang": "en", "split": "test"}
+{"query": "This Python script leaks memory after a few hours, help me debug it", "label": "code_analysis", "lang": "en", "split": "test"}
+{"query": "Explain what this regex does: ^(?=.*\\d)(?=.*[a-z]).{8,}$", "label": "code_analysis", "lang": "en", "split": "test"}
+{"query": "幫我看一下這段程式碼哪裡有 bug", "label": "code_analysis", "lang": "zh", "split": "dev"}
+{"query": "這個函式為什麼會回傳 None？", "label": "code_analysis", "lang": "zh", "split": "dev"}
+{"query": "請幫我重構這段 JavaScript，讓它更好讀", "label": "code_analysis", "lang": "zh", "split": "dev"}
+{"query": "這段 SQL 跑很慢，可以幫我優化嗎？", "label": "code_analysis", "lang": "zh", "split": "dev"}
+{"query": "執行時出現 Traceback: ModuleNotFoundError，要怎麼修？", "label": "code_analysis", "lang": "zh", "split": "dev"}
+{"query": "請 review 這個 PR 的程式碼，看有沒有安全性問題", "label": "code_analysis", "lang": "zh", "split": "test"}
+{"query": "這段 Python 程式碼在做什麼？", "label": "code_analysis", "lang": "zh", "split": "test"}
+{"query": "Analyze the sales data and compare the trends across regions", "label": "analysis", "lang": "en", "split": "dev"}
+{"query": "Compare Postgres and MongoDB for our analytics workload", "label": "analysis", "lang": "en", "split": "dev"}
+{"query": "Evaluate the pros and cons of moving our services to Kubernetes", "label": "analysis", "lang": "en", "split": "dev"}
+{"query": "Analyze the sentiment of customer reviews for our product", "label": "analysis", "lang": "en", "split": "dev"}
+{"query": "Investigate the incident report and assess the impact on customers", "label": "analysis", "lang": "en", "split": "dev"}
+{"query": "Assess the risks of launching without a staging environment", "label": "analysis", "lang": "en", "split": "dev"}
+{"query": "What patterns do you see in these support ticket categories?", "label": "analysis", "lang": "en", "split": "dev"}
+{"query": "Compare the tradeoffs of Redis vs Kafka for the session store", "label": "analysis", "lang": "en", "split": "test"}
+{"query": "Perform a SWOT analysis for our expansion into Japan", "label": "analysis", "lang": "en", "split": "test"}
+{"query": "Evaluate our churn numbers for Q3 and identify the main drivers", "label": "analysis", "lang": "en", "split": "test"}
+{"query": "請分析這份使用者調查的結果", "label": "analysis", "lang": "zh", "split": "dev"}
+{"query": "比較 AWS 和 GCP 在成本上的差異", "label": "analysis", "lang": "zh", "split": "dev"}
+{"query": "評估我們目前的監控架構有哪些不足", "label": "analysis", "lang": "zh", "split": "dev"}
+{"query": "分析一下上個月 API 延遲上升的趨勢", "label": "analysis", "lang": "zh", "split": "dev"}
+{"query": "幫我比較這三家供應商的報價與服務", "label": "analysis", "lang": "zh", "split": "dev"}
+{"query": "請評估導入微服務架構的風險", "label": "analysis", "lang": "zh", "split": "test"}
+{"query": "分析這份銷售報表，找出成長最快的產品線", "label": "analysis", "lang": "zh", "split": "test"}
+{"query": "Summarize the key points of this meeting transcript", "label": "summarization", "lang": "en", "split": "dev"}
+{"query": "Give me a TL;DR of this thread", "label": "summarization", "lang": "en", "split": "dev"}
+{"query": "Summarize this thread", "label": "summarization", "lang": "en", "split": "dev"}
+{"query": "Please summarize this design document", "label": "summarization", "lang": "en", "split": "dev"}
+{"query": "Can you condense this article into three bullet points?", "label": "summarization", "lang": "en", "split": "dev"}
+{"query": "What are the main ideas of this research paper? Keep it short.", "label": "summarization", "lang": "en", "split": "dev"}
+{"query": "Write a brief overview of the attached quarterly report", "label": "summarization", "lang": "en", "split": "dev"}
+{"query": "Summarize the quarterly earnings report and key insights", "label": "summarization", "lang": "en", "split": "test"}
+{"query": "tl;dr please, this email is way too long", "label": "summarization", "lang": "en", "split": "test"}
+{"query": "Give me a short recap of today's standup notes", "label": "summarization", "lang": "en", "split": "test"}
+{"query": "請幫我總結這份設計文件，重點放在延遲與成本。", "label": "summarization", "lang": "zh", "split": "dev"}
+{"query": "幫我摘要這篇文章", "label": "summarization", "lang": "zh", "split": "dev"}
+{"query": "這個討論串的重點是什麼？", "label": "summarization", "lang": "zh", "split": "dev"}
+{"query": "把這份會議紀錄整理成三個重點", "label": "summarization", "lang": "zh", "split": "dev"}
+{"query": "簡單總結一下這封信的內容", "label": "summarization", "lang": "zh", "split": "dev"}
+{"query": "請摘要這份報告的主要結論", "label": "summarization", "lang": "zh", "split": "test"}
+{"query": "幫我整理這段對話的重點", "label": "summarization", "lang": "zh", "split": "test"}
+{"query": "Write a short story about a robot who learns to paint", "label": "creative_writing", "lang": "en", "split": "dev"}
+{"query": "Compose a poem about autumn leaves", "label": "creative_writing", "lang": "en", "split": "dev"}
+{"query": "Write a poem about the sea", "label": "creative_writing", "lang": "en", "split": "dev"}
+{"query": "Write a blog post announcing our new dark mode feature", "label": "creative_writing", "lang": "en", "split": "dev"}
+{"query": "Draft a fun welcome message for new members of the #design channel", "label": "creative_writing", "lang": "en", "split": "dev"}
+{"query": "Write a haiku about Monday mornings", "label": "creative_writing", "lang": "en", "split": "dev"}
+{"query": "Create a bedtime story for a five year old about a brave turtle", "label": "creative_writing", "lang": "en", "split": "dev"}
+{"query": "Write a limerick about a developer who forgot to commit", "label": "creative_writing", "lang": "en", "split": "test"}
+{"query": "Write a short speech for my colleague's farewell party", "label": "creative_writing", "lang": "en", "split": "test"}
+{"query": "Craft a fictional dialogue between a cat and a dragon", "label": "creative_writing", "lang": "en", "split": "test"}
+{"query": "寫一首關於秋天的詩", "label": "creative_writing", "lang": "zh", "split": "dev"}
+{"query": "幫我寫一個關於太空探險的短篇故事", "label": "creative_writing", "lang": "zh", "split": "dev"}
+{"query": "請寫一篇部落格文章介紹我們的新產品", "label": "creative_writing", "lang": "zh", "split": "dev"}
+{"query": "幫我寫一段生日祝福給同事", "label": "creative_writing", "lang": "zh", "split": "dev"}
+{"query": "寫一首關於下雨天的現代詩", "label": "creative_writing", "lang": "zh", "split": "dev"}
+{"query": "幫我寫一個小故事，主角是一隻會說話的貓", "label": "creative_writing", "lang": "zh", "split": "test"}
+{"query": "請寫一段歡迎新同事的有趣訊息", "label": "creative_writing", "lang": "zh", "split": "test"}
+{"query": "What are some good ideas for a team offsite?", "label": "brainstorming", "lang": "en", "split": "dev"}
+{"query": "Help me think of names for my new coffee shop", "label": "brainstorming", "lang": "en", "split": "dev"}
+{"query": "Brainstorm ten blog post topics about observability", "label": "brainstorming", "lang": "en", "split": "dev"}
+{"query": "Give me some suggestions for reducing meeting fatigue", "label": "brainstorming", "lang": "en", "split": "dev"}
+{"query": "What are some alternatives to Jira for a small team?", "label": "brainstorming", "lang": "en", "split": "dev"}
+{"query": "List a few ideas for our hackathon project", "label": "brainstorming", "lang": "en", "split": "dev"}
+{"query": "Suggest some catchy names for our internal CLI tool", "label": "brainstorming", "lang": "en", "split": "dev"}
+{"query": "Brainstorm ways to increase sign-ups for our newsletter", "label": "brainstorming", "lang": "en", "split": "test"}
+{"query": "Give me some ideas for a team-building activity under $500", "label": "brainstorming", "lang": "en", "split": "test"}
+{"query": "What are some creative ways to celebrate a product launch?", "label": "brainstorming", "lang": "en", "split": "test"}
+{"query": "幫我想幾個新產品的名字", "label": "brainstorming", "lang": "zh", "split": "dev"}
+{"query": "有什麼點子可以提升團隊士氣？", "label": "brainstorming", "lang": "zh", "split": "dev"}
+{"query": "腦力激盪一下，週年活動可以辦什麼？", "label": "brainstorming", "lang": "zh", "split": "dev"}
+{"query": "給我一些降低客服工單量的建議", "label": "brainstorming", "lang": "zh", "split": "dev"}
+{"query": "請列出幾個部落格主題的點子", "label": "brainstorming", "lang": "zh", "split": "dev"}
+{"query": "幫我想一些團隊聚餐的點子", "label": "brainstorming", "lang": "zh", "split": "test"}
+{"query": "有哪些方法可以讓新人更快上手？請給我幾個建議", "label": "brainstorming", "lang": "zh", "split": "test"}
+{"query": "How to plan a product launch roadmap with clear milestones", "label": "planning", "lang": "en", "split": "dev"}
+{"query": "Create a project plan for migrating our database to Postgres", "label": "planning", "lang": "en", "split": "dev"}
+{"query": "Make a two-week study schedule for the AWS certification", "label": "planning", "lang": "en", "split": "dev"}
+{"query": "What are the steps to roll out SSO across the company?", "label": "planning", "lang": "en", "split": "dev"}
+{"query": "Draft a timeline for the Q1 hiring process", "label": "planning", "lang": "en", "split": "dev"}
+{"query": "Help me plan a three-day trip to Kyoto", "label": "planning", "lang": "en", "split": "dev"}
+{"query": "Outline the phases for rebuilding our onboarding flow", "label": "planning", "lang": "en", "split": "dev"}
+{"query": "Plan the rollout of the new billing system with milestones", "label": "planning", "lang": "en", "split": "test"}
+{"query": "Create an agenda for next week's planning offsite", "label": "planning", "lang": "en", "split": "test"}
+{"query": "Give me a step-by-step migration plan from Heroku to AWS", "label": "planning", "lang": "en", "split": "test"}
+{"query": "幫我規劃下一季的產品路線圖", "label": "planning", "lang": "zh", "split": "dev"}
+{"query": "請幫我排一個為期一個月的學習計畫", "label": "planning", "lang": "zh", "split": "dev"}
+{"query": "我們要搬遷資料中心，請列出步驟與時程", "label": "planning", "lang": "zh", "split": "dev"}
+{"query": "幫我規劃三天兩夜的台南旅遊行程", "label": "planning", "lang": "zh", "split": "dev"}
+{"query": "制定一個上線新功能的時間表", "label": "planning", "lang": "zh", "split": "dev"}
+{"query": "請規劃一個資料庫升級的執行計畫", "label": "planning", "lang": "zh", "split": "test"}
+{"query": "幫我安排下週的工作排程", "label": "planning", "lang": "zh", "split": "test"}
+{"query": "Translate this sentence into French", "label": "translation", "lang": "en", "split": "dev"}
+{"query": "translate 'good morning' to Japanese", "label": "translation", "lang": "en", "split": "dev"}
+{"query": "How do you say 'thank you for your patience' in German?", "label": "translation", "lang": "en", "split": "dev"}
+{"query": "Translate the following release notes into Traditional Chinese", "label": "translation", "lang": "en", "split": "dev"}
+{"query": "Can you translate this error message from Korean to English?", "label": "translation", "lang": "en", "split": "dev"}
+{"query": "Please translate our FAQ page into Spanish", "label": "translation", "lang": "en", "split": "dev"}
+{"query": "What is 'deadline' in Chinese?", "label": "translation", "lang": "en", "split": "dev"}
+{"query": "Translate this paragraph from English to Italian", "label": "translation", "lang": "en", "split": "test"}
+{"query": "Convert this to English: 我們明天上線", "label": "translation", "lang": "en", "split": "test"}
+{"query": "Translate the product description into Japanese and Korean", "label": "translation", "lang": "en", "split": "test"}
+{"query": "把這段話翻譯成英文", "label": "translation", "lang": "zh", "split": "dev"}
+{"query": "請幫我翻成日文：明天的會議延期了", "label": "translation", "lang": "zh", "split": "dev"}
+{"query": "這句英文是什麼意思？翻譯成中文：The build is flaky", "label": "translation", "lang": "zh", "split": "dev"}
+{"query": "幫我把這封信翻譯成英文", "label": "translation", "lang": "zh", "split": "dev"}
+{"query": "「技術債」的英文怎麼說？", "label": "translation", "lang": "zh", "split": "dev"}
+{"query": "請將以下內容翻譯成英文", "label": "translation", "lang": "zh", "split": "test"}
+{"query": "幫我把這份文件翻成韓文", "label": "translation", "lang": "zh", "split": "test"}
+{"query": "Solve the equation 3x + 5 = 20", "label": "math", "lang": "en", "split": "dev"}
+{"query": "Calculate the derivative of x^2 * sin(x)", "label": "math", "lang": "en", "split": "dev"}
+{"query": "What is 15% of 2,340?", "label": "math", "lang": "en", "split": "dev"}
+{"query": "What is the probability of rolling two sixes with two dice?", "label": "math", "lang": "en", "split": "dev"}
+{"query": "Compute the integral of 1/x from 1 to e", "label": "math", "lang": "en", "split": "dev"}
+{"query": "If a server handles 120 requests per second, how many requests is that per day?", "label": "math", "lang": "en", "split": "dev"}
+{"query": "Calculate the compound interest on $10,000 at 5% for 3 years", "label": "math", "lang": "en", "split": "dev"}
+{"query": "Solve for x: 2x^2 - 8 = 0", "label": "math", "lang": "en", "split": "test"}
+{"query": "What's the standard deviation of 2, 4, 4, 4, 5, 5, 7, 9?", "label": "math", "lang": "en", "split": "test"}
+{"query": "Calculate 1234 * 5678", "label": "math", "lang": "en", "split": "test"}
+{"query": "請計算 125 乘以 48 等於多少", "label": "math", "lang": "zh", "split": "dev"}
+{"query": "解這個方程式：2x + 7 = 19", "label": "math", "lang": "zh", "split": "dev"}
+{"query": "擲三次硬幣都是正面的機率是多少？", "label": "math", "lang": "zh", "split": "dev"}
+{"query": "求 f(x) = x^3 的導數", "label": "math", "lang": "zh", "split": "dev"}
+{"query": "一個月 30 天，每天 2 萬次請求，總共多少次？", "label": "math", "lang": "zh", "split": "dev"}
+{"query": "幫我算一下 3.5 的平方根", "label": "math", "lang": "zh", "split": "test"}
+{"query": "求 x^2 從 0 到 2 的積分", "label": "math", "lang": "zh", "split": "test"}
+{"query": "Why is that the case, and how can we conclude the argument is valid?", "label": "reasoning", "lang": "en", "split": "dev"}
+{"query": "If all A are B and some B are C, can we deduce that some A are C?", "label": "reasoning", "lang": "en", "split": "dev"}
+{"query": "Reason through why our cache hit rate dropped after the deploy", "label": "reasoning", "lang": "en", "split": "dev"}
+{"query": "Think step by step: three switches, one bulb in another room, how do I find which switch controls it?", "label": "reasoning", "lang": "en", "split": "dev"}
+{"query": "What is the root cause if the queue keeps growing while consumers are idle?", "label": "reasoning", "lang": "en", "split": "dev"}
+{"query": "Is this argument logically valid: if it rains the road is wet; the road is wet; so it rained?", "label": "reasoning", "lang": "en", "split": "dev"}
+{"query": "Why would p99 latency rise while average latency stays flat?", "label": "reasoning", "lang": "en", "split": "dev"}
+{"query": "Explain the logic behind this conclusion and whether the premise supports it", "label": "reasoning", "lang": "en", "split": "test"}
+{"query": "Walk me through the reasoning: if every deploy needs approval and Bob deployed, who approved it?", "label": "reasoning", "lang": "en", "split": "test"}
+{"query": "Why might a retry storm happen after a brief database outage?", "label": "reasoning", "lang": "en", "split": "test"}
+{"query": "請一步一步推理：甲比乙高，乙比丙高，誰最矮？", "label": "reasoning", "lang": "zh", "split": "dev"}
+{"query": "為什麼快取命中率突然下降？請推論可能的原因", "label": "reasoning", "lang": "zh", "split": "dev"}
+{"query": "這個論證有沒有邏輯漏洞？", "label": "reasoning", "lang": "zh", "split": "dev"}
+{"query": "如果所有工程師都會寫程式，而小明會寫程式，能推出小明是工程師嗎？", "label": "reasoning", "lang": "zh", "split": "dev"}
+{"query": "請分析這個推論是否成立", "label": "reasoning", "lang": "zh", "split": "dev"}
+{"query": "為什麼重試太多次反而會讓系統更慢？請推理原因", "label": "reasoning", "lang": "zh", "split": "test"}
+{"query": "請用邏輯推論找出誰說謊：A 說 B 說謊，B 說 C 說謊，C 說 A 和 B 都說謊", "label": "reasoning", "lang": "zh", "split": "test"}
+{"query": "What is the latest news about the NVIDIA stock price today?", "label": "web_research", "lang": "en", "split": "dev"}
+{"query": "What is the latest AI news today?", "label": "web_research", "lang": "en", "split": "dev"}
+{"query": "Search the web for the release date of Python 3.14", "label": "web_research", "lang": "en", "split": "dev"}
+{"query": "What happened in the tech industry this week?", "label": "web_research", "lang": "en", "split": "dev"}
+{"query": "Look up the current price of Bitcoin", "label": "web_research", "lang": "en", "split": "dev"}
+{"query": "Is GitHub down right now?", "label": "web_research", "lang": "en", "split": "dev"}
+{"query": "Find recent articles about the EU AI Act", "label": "web_research", "lang": "en", "split": "dev"}
+{"query": "What are today's top headlines?", "label": "web_research", "lang": "en", "split": "test"}
+{"query": "Search online for the latest Kubernetes release notes", "label": "web_research", "lang": "en", "split": "test"}
+{"query": "What is the weather in Taipei today?", "label": "web_research", "lang": "en", "split": "test"}
+{"query": "最新的 AI 新聞是什麼？", "label": "web_research", "lang": "zh", "split": "dev"}
+{"query": "幫我搜尋今天台積電的股價", "label": "web_research", "lang": "zh", "split": "dev"}
+{"query": "查詢網頁：最近有哪些資安事件？", "label": "web_research", "lang": "zh", "split": "dev"}
+{"query": "今天有什麼科技新聞？", "label": "web_research", "lang": "zh", "split": "dev"}
+{"query": "上網查一下 iPhone 最新機型的價格", "label": "web_research", "lang": "zh", "split": "dev"}
+{"query": "搜尋一下最近的 OpenAI 新聞", "label": "web_research", "lang": "zh", "split": "test"}
+{"query": "今天台北的天氣如何？", "label": "web_research", "lang": "zh", "split": "test"}
