@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from collections import OrderedDict
 from types import SimpleNamespace
-from typing import Dict, List, Mapping, Optional, Any, Callable, Tuple
+from typing import Dict, List, Mapping, Optional, Any, Callable, Set, Tuple
 from dataclasses import dataclass, asdict, field
 import uuid
 
@@ -29,6 +29,7 @@ except ImportError:  # pragma: no cover - CI stubs aiokafka without it
 import clickhouse_connect
 from clickhouse_connect.driver import Client
 
+from src.analytics_schema import TABLES as ANALYTICS_TABLES
 from src.kafka_topics import dead_letter_topic_name, dlq_enabled
 from src.prompt_assembly import PROMPT_CONTENT_METADATA_KEYS
 from src.redaction import context_summary, redact, redact_text
@@ -201,6 +202,24 @@ def _dead_letter_payload(value: Any, error: BaseException) -> Any:
         "sha256_prefix": hashlib.sha256(raw).hexdigest()[:16],
         "reason": type(error).__name__,
     }
+
+
+# Fields that change when the same policy state is re-emitted or re-read.
+_POLICY_STATE_VOLATILE_KEYS = frozenset(
+    {"emitted_at", "event_id", "kafka_topic", "kafka_partition", "kafka_offset"}
+)
+
+
+def _policy_state_content_hash(data: Dict[str, Any]) -> str:
+    """A short hash of a policy state's content, without its volatile fields."""
+    content = {
+        key: value
+        for key, value in data.items()
+        if key not in _POLICY_STATE_VOLATILE_KEYS
+    }
+    text = json.dumps(content, sort_keys=True, default=str)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return digest[:16]
 
 
 def _alert_payload(data: Dict[str, Any]) -> Any:
@@ -380,9 +399,23 @@ def _event_query_text(query_request: QueryRequest) -> str:
     attached files' names (a file-only message asks about them by name)."""
     query = query_request.query
     if (query_request.metadata or {}).get("source") == "slack":
-        for attachment in query_request.attachments:
-            if attachment.name:
-                query = query.replace(attachment.name, "[attachment]")
+        names = sorted(
+            {
+                attachment.name
+                for attachment in query_request.attachments
+                if attachment.name
+            },
+            key=len,
+            reverse=True,
+        )
+        if names:
+            # Whole names only, longest first: a file called "a" or "notes"
+            # must not rewrite the words around it, and "plan.txt" must not
+            # leave ".bak" of "plan.txt.bak".
+            pattern = re.compile(
+                r"(?<!\w)(?:" + "|".join(re.escape(name) for name in names) + r")(?!\w)"
+            )
+            query = pattern.sub("[attachment]", query)
     return redact_text(query)
 
 
@@ -819,6 +852,9 @@ class AlertEventEntry:
     window_start_ms: int = 0
     window_end_ms: int = 0
     payload_json: str = "{}"
+    # When the event was emitted, or else ingested: orders rows that share a
+    # timestamp, such as an avoid and its clear for one window.
+    emitted_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     event_id: str = ""
     kafka_topic: str = ""
     kafka_partition: int = -1
@@ -847,6 +883,7 @@ class AlertEventEntry:
             "window_start_ms": self.window_start_ms,
             "window_end_ms": self.window_end_ms,
             "payload_json": self.payload_json,
+            "emitted_at": self.emitted_at,
             "kafka_topic": self.kafka_topic,
             "kafka_partition": self.kafka_partition,
             "kafka_offset": self.kafka_offset,
@@ -879,6 +916,7 @@ class RoutingPolicyStateEntry:
     avoid_models: List[str] = field(default_factory=list)
     avoid_providers: List[str] = field(default_factory=list)
     payload_json: str = "{}"
+    emitted_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     event_id: str = ""
     kafka_topic: str = ""
     kafka_partition: int = -1
@@ -913,6 +951,7 @@ class RoutingPolicyStateEntry:
             "avoid_models": list(self.avoid_models),
             "avoid_providers": list(self.avoid_providers),
             "payload_json": self.payload_json,
+            "emitted_at": self.emitted_at,
             "kafka_topic": self.kafka_topic,
             "kafka_partition": self.kafka_partition,
             "kafka_offset": self.kafka_offset,
@@ -1467,7 +1506,8 @@ class KafkaProducerManager:
             timestamp=_parse_datetime(inference_response.timestamp),
             user_id=query_request.user_id,
             user_tier=query_request.user_tier,
-            query_text=query_request.query,
+            # Redacted, and for Slack without attached files' names (X6).
+            query_text=_event_query_text(query_request),
             query_type=query_type.value
             if hasattr(query_type, "value")
             else str(query_type),
@@ -1479,9 +1519,8 @@ class KafkaProducerManager:
             status="error" if inference_response.error else "success",
             error_message=getattr(inference_response, "error", ""),
             context_compressed=getattr(inference_response, "compressed_context", False),
-            compression_ratio=0.3
-            if getattr(inference_response, "compressed_context", False)
-            else 0.0,
+            # Never measured; kept as a column for older readers.
+            compression_ratio=0.0,
             cached_response=inference_response.cached,
         )
 
@@ -1606,7 +1645,6 @@ class ClickHouseManager:
         self.config = config
         self.client: Optional[Client] = None
         self.database = config.get("database", "llm_router")
-        self.tables = config.get("tables", {})
 
         # Connection settings
         self.connection_params = {
@@ -1620,17 +1658,6 @@ class ClickHouseManager:
             # rejects overlapping queries that reuse one generated session id.
             "autogenerate_session_id": False,
         }
-
-        # Batch insertion settings
-        self.batch_size = 1000
-        self.batch_timeout = 30  # seconds
-        self.pending_batches = {
-            "query_logs": [],
-            "metrics": [],
-            "model_performance": [],
-            "alert_events": [],
-        }
-        self.last_batch_time = time.time()
 
         # Cached liveness ping. ``None`` means no ping has run yet, which reads
         # as healthy so a freshly connected client is not reported down.
@@ -1777,349 +1804,57 @@ class ClickHouseManager:
             raise
 
     async def _create_tables(self):
-        """Create all required tables"""
-        # Query logs table
-        query_logs_sql = """
-        CREATE TABLE IF NOT EXISTS {database}.query_logs (
-            event_id String,
-            query_id String,
-            timestamp DateTime64(3),
-            user_id String,
-            user_tier Enum8('free' = 1, 'premium' = 2, 'enterprise' = 3),
-            query_text String,
-            query_type String,
-            selected_model String,
-            token_count_input UInt32,
-            token_count_output UInt32,
-            latency_ms UInt32,
-            cost_usd Float64,
-            status Enum8('success' = 1, 'error' = 2, 'timeout' = 3),
-            error_message String,
-            context_compressed Boolean,
-            compression_ratio Float32,
-            cached_response Boolean,
-            kafka_topic String DEFAULT '',
-            kafka_partition Int32 DEFAULT -1,
-            kafka_offset Int64 DEFAULT -1
-        ) ENGINE = ReplacingMergeTree()
-        PARTITION BY toYYYYMM(timestamp)
-        ORDER BY (timestamp, event_id)
-        TTL toDateTime(timestamp) + INTERVAL 90 DAY
-        """.format(
-            database=self.database
-        )
-
-        # System metrics table
-        metrics_sql = """
-        CREATE TABLE IF NOT EXISTS {database}.system_metrics (
-            event_id String,
-            timestamp DateTime64(3),
-            service String,
-            metric_name String,
-            metric_value Float64,
-            labels Map(String, String),
-            kafka_topic String DEFAULT '',
-            kafka_partition Int32 DEFAULT -1,
-            kafka_offset Int64 DEFAULT -1
-        ) ENGINE = ReplacingMergeTree()
-        PARTITION BY toYYYYMMDD(timestamp)
-        ORDER BY (timestamp, service, metric_name, event_id)
-        TTL toDateTime(timestamp) + INTERVAL 30 DAY
-        """.format(
-            database=self.database
-        )
-
-        # Model performance table
-        performance_sql = """
-        CREATE TABLE IF NOT EXISTS {database}.model_performance (
-            event_id String,
-            timestamp DateTime64(3),
-            model_name String,
-            provider String DEFAULT '',
-            window_start_ms UInt64 DEFAULT 0,
-            window_end_ms UInt64 DEFAULT 0,
-            window_size_seconds UInt32 DEFAULT 60,
-            requests_count UInt32,
-            success_count UInt32 DEFAULT 0,
-            success_rate Float32,
-            avg_latency_ms Float32,
-            avg_tokens_per_second Float32,
-            error_count UInt32,
-            total_tokens UInt32 DEFAULT 0,
-            total_cost_usd Float64,
-            queries_per_second Float32 DEFAULT 0,
-            cache_hit_rate Float32 DEFAULT 0,
-            cached_count UInt32 DEFAULT 0,
-            gpu_utilization Float32,
-            memory_usage_gb Float32,
-            kafka_topic String DEFAULT '',
-            kafka_partition Int32 DEFAULT -1,
-            kafka_offset Int64 DEFAULT -1
-        ) ENGINE = ReplacingMergeTree()
-        PARTITION BY toYYYYMMDD(timestamp)
-        ORDER BY (timestamp, model_name, provider, event_id)
-        TTL toDateTime(timestamp) + INTERVAL 60 DAY
-        """.format(
-            database=self.database
-        )
-
-        # User analytics table
-        user_analytics_sql = """
-        CREATE TABLE IF NOT EXISTS {database}.user_analytics (
-            user_id String,
-            date Date,
-            total_queries UInt32,
-            total_tokens UInt32,
-            total_cost_usd Float64,
-            avg_query_length Float32,
-            most_used_model String,
-            query_types Array(String),
-            satisfaction_score Float32
-        ) ENGINE = SummingMergeTree()
-        PARTITION BY toYYYYMM(date)
-        ORDER BY (user_id, date)
-        TTL date + INTERVAL 180 DAY
-        """.format(
-            database=self.database
-        )
-
-        alert_events_sql = """
-        CREATE TABLE IF NOT EXISTS {database}.alert_events (
-            event_id String,
-            timestamp DateTime64(3),
-            alert_type String,
-            severity String,
-            description String,
-            anomaly_type String,
-            source_event_type String,
-            request_id String,
-            query_id String,
-            user_id String,
-            model_name String,
-            provider String,
-            window_start_ms UInt64,
-            window_end_ms UInt64,
-            payload_json String,
-            kafka_topic String DEFAULT '',
-            kafka_partition Int32 DEFAULT -1,
-            kafka_offset Int64 DEFAULT -1
-        ) ENGINE = ReplacingMergeTree()
-        PARTITION BY toYYYYMMDD(timestamp)
-        ORDER BY (source_event_type, timestamp, event_id)
-        TTL toDateTime(timestamp) + INTERVAL 30 DAY
-        """.format(
-            database=self.database
-        )
-
-        routing_policy_state_sql = """
-        CREATE TABLE IF NOT EXISTS {database}.routing_policy_state_events (
-            event_id String,
-            timestamp DateTime64(3),
-            scope_type String,
-            scope_key String,
-            user_id String,
-            session_id String,
-            user_tier String,
-            hint_reason String,
-            recent_request_count UInt32,
-            recent_error_rate Float32,
-            avg_latency_ms Float32,
-            fast_lane_hit_rate Float32,
-            dominant_query_type String,
-            query_complexity String,
-            requires_low_latency Boolean,
-            requires_high_reasoning Boolean,
-            route_to_fast_lane Boolean,
-            burst_protection_active Boolean,
-            enterprise_priority_active Boolean,
-            preferred_models Array(String),
-            avoid_models Array(String),
-            avoid_providers Array(String),
-            payload_json String,
-            kafka_topic String DEFAULT '',
-            kafka_partition Int32 DEFAULT -1,
-            kafka_offset Int64 DEFAULT -1
-        ) ENGINE = ReplacingMergeTree()
-        PARTITION BY toYYYYMMDD(timestamp)
-        ORDER BY (timestamp, scope_type, scope_key, event_id)
-        TTL toDateTime(timestamp) + INTERVAL 30 DAY
-        """.format(
-            database=self.database
-        )
-
-        # One row per chat request (inference.completed): no query text, no
-        # context. A replay of one request (same id and ts) collapses to its
-        # latest version; distinct calls that reuse an id keep their rows.
-        chat_requests_sql = """
-        CREATE TABLE IF NOT EXISTS {database}.chat_requests (
-            request_id String,
-            ts DateTime64(3),
-            completed_at DateTime64(3),
-            version UInt64,
-            user_id String,
-            tier LowCardinality(String),
-            source LowCardinality(String),
-            surface LowCardinality(String),
-            thread_key_hash String,
-            query_type LowCardinality(String),
-            model LowCardinality(String),
-            provider LowCardinality(String),
-            status LowCardinality(String),
-            error_type LowCardinality(String),
-            error_code LowCardinality(String),
-            finish_reason LowCardinality(String),
-            fallback_from_model LowCardinality(String),
-            attempts UInt8,
-            cached Boolean,
-            routing_strategy LowCardinality(String),
-            policy_source LowCardinality(String),
-            reasoning_effort LowCardinality(String),
-            latency_ms UInt32,
-            routing_ms Nullable(UInt32),
-            queue_wait_ms Nullable(UInt32),
-            ttft_ms Nullable(UInt32),
-            token_count_input UInt32,
-            token_count_output UInt32,
-            reasoning_tokens UInt32,
-            provider_cached_input_tokens UInt32,
-            cost_usd Float64,
-            event_id String,
-            kafka_topic String DEFAULT '',
-            kafka_partition Int32 DEFAULT -1,
-            kafka_offset Int64 DEFAULT -1
-        ) ENGINE = ReplacingMergeTree(version)
-        PARTITION BY toYYYYMMDD(ts)
-        ORDER BY (toStartOfHour(ts), request_id, ts)
-        TTL toDateTime(ts) + INTERVAL 90 DAY
-        """.format(
-            database=self.database
-        )
-
-        routing_decisions_sql = """
-        CREATE TABLE IF NOT EXISTS {database}.routing_decisions (
-            event_id String,
-            timestamp DateTime64(3),
-            request_id String,
-            selected_model String,
-            served_model String,
-            fallback_from_model String,
-            user_tier String,
-            query_type String,
-            routing_strategy String,
-            reason_code String,
-            routing_reason String,
-            policy_source String,
-            token_count UInt32,
-            estimated_cost Float64,
-            confidence Float32,
-            classifier_confidence Float32,
-            route_to_fast_lane Boolean,
-            actual_fast_lane_hit Boolean,
-            fallback_models Array(String),
-            shadow_selected_model String,
-            shadow_policy_source String,
-            candidates_json String,
-            kafka_topic String DEFAULT '',
-            kafka_partition Int32 DEFAULT -1,
-            kafka_offset Int64 DEFAULT -1
-        ) ENGINE = ReplacingMergeTree()
-        PARTITION BY toYYYYMMDD(timestamp)
-        ORDER BY (timestamp, event_id)
-        TTL toDateTime(timestamp) + INTERVAL 30 DAY
-        """.format(
-            database=self.database
-        )
-
-        # A rating of a chat answer by the user who clicked it; each click
-        # is one row, the latest per user and request is their rating.
-        chat_feedback_sql = """
-        CREATE TABLE IF NOT EXISTS {database}.chat_feedback (
-            request_id String,
-            user_id String,
-            rating LowCardinality(String),
-            click_id String,
-            source LowCardinality(String),
-            clicked_at DateTime64(3),
-            version UInt64,
-            event_id String,
-            kafka_topic String DEFAULT '',
-            kafka_partition Int32 DEFAULT -1,
-            kafka_offset Int64 DEFAULT -1
-        ) ENGINE = ReplacingMergeTree(version)
-        PARTITION BY toYYYYMM(clicked_at)
-        ORDER BY (request_id, user_id, click_id)
-        TTL toDateTime(clicked_at) + INTERVAL 90 DAY
-        """.format(
-            database=self.database
-        )
-
-        # Execute table creation; new tables go at the end.
-        tables = [
-            ("query_logs", query_logs_sql),
-            ("system_metrics", metrics_sql),
-            ("model_performance", performance_sql),
-            ("user_analytics", user_analytics_sql),
-            ("alert_events", alert_events_sql),
-            ("routing_policy_state_events", routing_policy_state_sql),
-            ("chat_requests", chat_requests_sql),
-            ("chat_feedback", chat_feedback_sql),
-            ("routing_decisions", routing_decisions_sql),
-        ]
-
-        for table_name, sql in tables:
+        """Create every analytics table, then add columns older tables lack."""
+        for table in ANALYTICS_TABLES:
             try:
-                await self._run_blocking(self.client.command, sql)
-                logger.info(f"Table {table_name} created/verified")
+                await self._run_blocking(
+                    self.client.command, table.create_sql(self.database)
+                )
+                logger.info(f"Table {table.name} created/verified")
             except Exception as e:
-                logger.error(f"Failed to create table {table_name}: {e}")
+                logger.error(f"Failed to create table {table.name}: {e}")
                 raise RuntimeError(
-                    f"Failed to create required ClickHouse table {table_name}"
+                    f"Failed to create required ClickHouse table {table.name}"
                 ) from e
 
-        alter_statements = [
-            f"ALTER TABLE {self.database}.query_logs ADD COLUMN IF NOT EXISTS event_id String DEFAULT query_id",
-            f"ALTER TABLE {self.database}.query_logs ADD COLUMN IF NOT EXISTS kafka_topic String DEFAULT ''",
-            f"ALTER TABLE {self.database}.query_logs ADD COLUMN IF NOT EXISTS kafka_partition Int32 DEFAULT -1",
-            f"ALTER TABLE {self.database}.query_logs ADD COLUMN IF NOT EXISTS kafka_offset Int64 DEFAULT -1",
-            f"ALTER TABLE {self.database}.system_metrics ADD COLUMN IF NOT EXISTS event_id String DEFAULT concat(service, ':', metric_name, ':', toString(timestamp))",
-            f"ALTER TABLE {self.database}.system_metrics ADD COLUMN IF NOT EXISTS kafka_topic String DEFAULT ''",
-            f"ALTER TABLE {self.database}.system_metrics ADD COLUMN IF NOT EXISTS kafka_partition Int32 DEFAULT -1",
-            f"ALTER TABLE {self.database}.system_metrics ADD COLUMN IF NOT EXISTS kafka_offset Int64 DEFAULT -1",
-            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS event_id String DEFAULT concat(model_name, ':', toString(timestamp))",
-            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS provider String DEFAULT ''",
-            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS window_start_ms UInt64 DEFAULT 0",
-            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS window_end_ms UInt64 DEFAULT 0",
-            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS window_size_seconds UInt32 DEFAULT 60",
-            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS success_count UInt32 DEFAULT 0",
-            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS total_tokens UInt32 DEFAULT 0",
-            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS queries_per_second Float32 DEFAULT 0",
-            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS cache_hit_rate Float32 DEFAULT 0",
-            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS cached_count UInt32 DEFAULT 0",
-            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS kafka_topic String DEFAULT ''",
-            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS kafka_partition Int32 DEFAULT -1",
-            f"ALTER TABLE {self.database}.model_performance ADD COLUMN IF NOT EXISTS kafka_offset Int64 DEFAULT -1",
-            f"ALTER TABLE {self.database}.alert_events ADD COLUMN IF NOT EXISTS event_id String DEFAULT concat(source_event_type, ':', alert_type, ':', request_id, ':', query_id, ':', model_name, ':', provider, ':', toString(timestamp))",
-            f"ALTER TABLE {self.database}.alert_events ADD COLUMN IF NOT EXISTS kafka_topic String DEFAULT ''",
-            f"ALTER TABLE {self.database}.alert_events ADD COLUMN IF NOT EXISTS kafka_partition Int32 DEFAULT -1",
-            f"ALTER TABLE {self.database}.alert_events ADD COLUMN IF NOT EXISTS kafka_offset Int64 DEFAULT -1",
-            f"ALTER TABLE {self.database}.routing_policy_state_events ADD COLUMN IF NOT EXISTS event_id String DEFAULT concat(scope_type, ':', scope_key, ':', toString(timestamp))",
-            f"ALTER TABLE {self.database}.routing_policy_state_events ADD COLUMN IF NOT EXISTS kafka_topic String DEFAULT ''",
-            f"ALTER TABLE {self.database}.routing_policy_state_events ADD COLUMN IF NOT EXISTS kafka_partition Int32 DEFAULT -1",
-            f"ALTER TABLE {self.database}.routing_policy_state_events ADD COLUMN IF NOT EXISTS kafka_offset Int64 DEFAULT -1",
-            f"ALTER TABLE {self.database}.routing_decisions ADD COLUMN IF NOT EXISTS fallback_from_model String DEFAULT ''",
-        ]
+        existing = await self._existing_columns()
+        for table in ANALYTICS_TABLES:
+            for sql in table.alter_sql(self.database, existing.get(table.name)):
+                try:
+                    await self._run_blocking(self.client.command, sql)
+                except Exception as e:
+                    # ADD COLUMN IF NOT EXISTS is idempotent, so a failure here
+                    # means every insert using the column would fail. Fail
+                    # startup instead.
+                    logger.error(f"Failed schema migration on {table.name}: {e}")
+                    raise RuntimeError(
+                        "Failed to apply ClickHouse schema migration for "
+                        f"{self.database}.{table.name}"
+                    ) from e
 
-        for sql in alter_statements:
-            try:
-                await self._run_blocking(self.client.command, sql)
-            except Exception as e:
-                # ADD COLUMN IF NOT EXISTS is idempotent, so a failure here means
-                # every insert using the column would fail. Fail startup instead.
-                table_name = sql.split()[2]
-                logger.error(f"Failed schema migration on {table_name}: {e}")
-                raise RuntimeError(
-                    f"Failed to apply ClickHouse schema migration for {table_name}"
-                ) from e
+    async def _existing_columns(self) -> Dict[str, Set[str]]:
+        """Columns of this database's tables, read once from system.columns.
+
+        Empty when the lookup fails or returns nothing usable; every ALTER
+        then runs, as ADD COLUMN IF NOT EXISTS is idempotent.
+        """
+        try:
+            result = await self._run_blocking(
+                self.client.query,
+                "SELECT table, name FROM system.columns "
+                "WHERE database = {database:String}",
+                parameters={"database": self.database},
+            )
+            rows = list(getattr(result, "result_rows", None) or [])
+        except Exception as e:
+            logger.warning(f"Could not read ClickHouse columns, altering all: {e}")
+            return {}
+        columns: Dict[str, Set[str]] = {}
+        for row in rows:
+            if len(row) != 2 or not all(isinstance(value, str) for value in row):
+                return {}
+            columns.setdefault(row[0], set()).add(row[1])
+        return columns
 
     async def insert_query_log(self, query_log: QueryLogEntry):
         """Insert single query log entry"""
@@ -2423,7 +2158,7 @@ class ClickHouseManager:
             FROM {self.database}.alert_events FINAL
             WHERE timestamp >= now() - INTERVAL {{hours:UInt32}} HOUR
               AND source_event_type = 'routing.guardrails'
-            ORDER BY timestamp DESC
+            ORDER BY timestamp DESC, emitted_at DESC, kafka_offset DESC
             LIMIT 50
             """
 
@@ -2496,8 +2231,10 @@ class ClickHouseManager:
                 avoid_providers,
                 payload_json
             FROM {self.database}.routing_policy_state_events FINAL
-            WHERE timestamp >= now() - INTERVAL {{hours:UInt32}} HOUR
-            ORDER BY timestamp DESC
+            -- timestamp is the newest event a state covers: filter on when
+            -- it was emitted, so a fresh state for a quiet scope shows.
+            WHERE emitted_at >= now() - INTERVAL {{hours:UInt32}} HOUR
+            ORDER BY timestamp DESC, emitted_at DESC, kafka_offset DESC
             LIMIT 50
             """
 
@@ -2567,7 +2304,6 @@ class BatchBufferState:
     pending_offsets: Dict[TopicPartition, int] = field(default_factory=dict)
     awaiting_commit_offsets: Dict[TopicPartition, int] = field(default_factory=dict)
     inflight_rows: int = 0
-    oldest_enqueued_at: Optional[float] = None
     paused: bool = False
     paused_partitions: set[TopicPartition] = field(default_factory=set)
     flush_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -3299,6 +3035,8 @@ class KafkaConsumerManager:
             window_start_ms=window_start_ms,
             window_end_ms=window_end_ms,
             payload_json=_json_text(_alert_payload(data), default=str),
+            # Falls back to the ingest time.
+            emitted_at=_parse_datetime(data.get("emitted_at")),
             **metadata,
         )
 
@@ -3308,10 +3046,31 @@ class KafkaConsumerManager:
         kafka_metadata: Optional[Dict[str, Any]] = None,
     ) -> RoutingPolicyStateEntry:
         """Convert a routing.policy_state payload to a ClickHouse row."""
+        scope_type = str(data.get("scope_type", "unknown") or "unknown")
+        scope_key = str(data.get("scope_key", "") or "")
+        # Event time, which a replay leaves unchanged. A missing or
+        # unparseable latest_event_at counts as absent: the row's time is
+        # then emitted_at, which is kept out of the id.
+        try:
+            latest_event_at: Optional[datetime] = _parse_datetime(
+                data.get("latest_event_at"), strict=True
+            )
+        except ValueError:
+            latest_event_at = None
+        timestamp = latest_event_at or _parse_datetime(data.get("emitted_at"))
+        event_time = latest_event_at.isoformat() if latest_event_at else ""
+        metadata = dict(kafka_metadata or {})
+        # A replay has a new offset and emitted_at but the same state: key the
+        # row on what it describes. The content hash keeps apart distinct
+        # states with one latest_event_at (counts drop as old buckets expire).
+        metadata["event_id"] = (
+            f"policy_state:{scope_type}:{scope_key}:{event_time}:"
+            f"{_policy_state_content_hash(data)}"
+        )
         return RoutingPolicyStateEntry(
-            timestamp=_parse_datetime(data.get("emitted_at")),
-            scope_type=str(data.get("scope_type", "unknown") or "unknown"),
-            scope_key=str(data.get("scope_key", "") or ""),
+            timestamp=timestamp,
+            scope_type=scope_type,
+            scope_key=scope_key,
             user_id=str(data.get("user_id", "") or ""),
             session_id=str(data.get("session_id", "") or ""),
             user_tier=str(data.get("user_tier", "") or ""),
@@ -3333,7 +3092,8 @@ class KafkaConsumerManager:
             avoid_models=list(data.get("avoid_models", []) or []),
             avoid_providers=list(data.get("avoid_providers", []) or []),
             payload_json=_json_text(data, default=str),
-            **(kafka_metadata or {}),
+            emitted_at=_parse_datetime(data.get("emitted_at")),
+            **metadata,
         )
 
     async def _consume_requests_enriched(self, consumer: AIOKafkaConsumer):
@@ -3712,8 +3472,6 @@ class KafkaConsumerManager:
         """Append one row and apply lossless consumer backpressure."""
         state = self.batch_buffer_states[topic_key]
         state.pending_rows.append(row)
-        if state.oldest_enqueued_at is None:
-            state.oldest_enqueued_at = time.monotonic()
         self._track_commit_offset(topic_key, message)
         await self._refresh_batch_backpressure(topic_key)
 
@@ -3773,7 +3531,6 @@ class KafkaConsumerManager:
             self._replace_pending_rows(topic_key, [])
             self._replace_pending_offsets(topic_key, {})
             state.inflight_rows = len(batch)
-            state.oldest_enqueued_at = None
             await self._refresh_batch_backpressure(topic_key)
 
             try:
@@ -3817,7 +3574,6 @@ class KafkaConsumerManager:
                 offset, current_offsets.get(partition, offset)
             )
         state.inflight_rows = 0
-        state.oldest_enqueued_at = time.monotonic()
 
     def _record_flush_failure(self, topic_key: str, kind: str) -> None:
         """Back off this topic's periodic flush exponentially, up to a cap."""
