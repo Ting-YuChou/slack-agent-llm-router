@@ -29,7 +29,7 @@ from typing import (
     Tuple,
 )
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from slack_sdk.http_retry.builtin_async_handlers import (
     AsyncRateLimitErrorRetryHandler,
@@ -747,6 +747,9 @@ class SlackQueryTrace:
     # mention | thread | dm | slash
     surface: Optional[str] = None
     event_id: Optional[str] = None
+    # How long the event waited in the bot's work queue before a worker
+    # took it (ms); inference adds its own scheduler wait to it.
+    queue_wait_ms: Optional[int] = None
 
     @classmethod
     def for_message(
@@ -767,13 +770,17 @@ class SlackQueryTrace:
             ),
             surface=surface,
             event_id=event_id if isinstance(event_id, str) else None,
+            queue_wait_ms=_queue_wait_ms(event.get(SLACK_QUEUE_WAIT_KEY)),
         )
 
     @classmethod
-    def for_slash(cls, request_id: Optional[str]) -> "SlackQueryTrace":
+    def for_slash(
+        cls, request_id: Optional[str], *, queue_wait_ms: Any = None
+    ) -> "SlackQueryTrace":
         return cls(
             request_id=request_id if is_valid_request_id(request_id) else None,
             surface="slash",
+            queue_wait_ms=_queue_wait_ms(queue_wait_ms),
         )
 
     def add_metadata(
@@ -781,6 +788,8 @@ class SlackQueryTrace:
     ) -> None:
         if self.surface:
             metadata["surface"] = self.surface
+        if self.queue_wait_ms is not None:
+            metadata["ingress_queue_wait_ms"] = self.queue_wait_ms
         slack = metadata.get("slack")
         if isinstance(slack, dict):
             slack["message_ts"] = message_ts
@@ -949,6 +958,33 @@ class SlackWorkItem:
     kind: str
     payload: Dict[str, Any]
     name: str
+    # time.monotonic() when the item was queued; None if it never was.
+    enqueued_at: Optional[float] = None
+
+
+# The event key a worker stamps with the item's queue wait at pickup.
+SLACK_QUEUE_WAIT_KEY = "_ingress_queue_wait_ms"
+
+
+def _stamp_queue_wait(item: SlackWorkItem) -> None:
+    """Put the item's wait so far (queued and parked) on its payload, in ms.
+
+    Only the bot's own stamp counts: a value already there is dropped.
+    """
+    payload = item.payload
+    if not isinstance(payload, dict):
+        return
+    payload.pop(SLACK_QUEUE_WAIT_KEY, None)
+    if item.enqueued_at is None:
+        return
+    waited = time.monotonic() - item.enqueued_at
+    payload[SLACK_QUEUE_WAIT_KEY] = max(0, int(waited * 1000))
+
+
+def _queue_wait_ms(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 @dataclass
@@ -2206,6 +2242,7 @@ class SlackMessageHandler:
         message_ts: Optional[str] = None,
         request_id: Optional[str] = None,
         trace: Optional["SlackQueryTrace"] = None,
+        queue_wait_ms: Optional[int] = None,
     ) -> str:
         """Handle bot commands, falling back to a free-form query when appropriate."""
         parts = command_text.split()
@@ -2216,7 +2253,7 @@ class SlackMessageHandler:
         args = parts[1:] if len(parts) > 1 else []
         if command_surface == "slash":
             # Slack resends a slash command with the same trigger_id.
-            trace = SlackQueryTrace.for_slash(request_id)
+            trace = SlackQueryTrace.for_slash(request_id, queue_wait_ms=queue_wait_ms)
 
         if command in self.commands:
             if command == "web":
@@ -4557,6 +4594,7 @@ class SlackBot:
                 return
 
         trigger_id = command.get("trigger_id")
+        queue_wait_ms = _queue_wait_ms(command.get(SLACK_QUEUE_WAIT_KEY))
         response_text = await self.message_handler._handle_command(
             command_text,
             user_id,
@@ -4567,6 +4605,7 @@ class SlackBot:
             command_surface="slash",
             # Slack resends a slash command with the same trigger_id.
             request_id=f"slash:{trigger_id}" if trigger_id else None,
+            **({"queue_wait_ms": queue_wait_ms} if queue_wait_ms is not None else {}),
         )
 
         if response_text:
@@ -7443,6 +7482,7 @@ class SlackBot:
             if item.kind in SLACK_PRIORITY_WORK_KINDS
             else self._work_queue
         )
+        item = replace(item, enqueued_at=time.monotonic())
         try:
             if queue is self._work_queue and self._work_queue_full():
                 raise asyncio.QueueFull
@@ -7475,6 +7515,7 @@ class SlackBot:
             SLACK_METRICS.work_running.set(self._work_running)
             try:
                 if item.kind == "slash":
+                    _stamp_queue_wait(item)
                     await self._handle_slash_command(item.payload)
                 elif item.kind == "interactive":
                     await self._handle_agent_interactive(item.payload)
@@ -7535,6 +7576,7 @@ class SlackBot:
         """
         key = self._chat_thread_key(item.payload)
         if key is None:
+            _stamp_queue_wait(item)
             await self._handle_event(item.payload)
             return
         if key in self._busy_threads:
@@ -7556,6 +7598,8 @@ class SlackBot:
         try:
             current = item
             while True:
+                # Time parked behind the thread's earlier events counts.
+                _stamp_queue_wait(current)
                 try:
                     await self._handle_event(current.payload)
                 except asyncio.CancelledError:
