@@ -842,6 +842,41 @@ class SlackAnswer(str):
         return " · ".join(fields) or None
 
 
+# Slack's limit on the text of one `section` block.
+SLACK_SECTION_TEXT_CHARS = 3000
+
+
+class SlackNotice(str):
+    """An error reply's text, carrying a short reference to its request.
+
+    The text is what the user always saw; the reference (the request id's
+    first 8 characters) shows under it so a report can be matched to logs.
+    """
+
+    reference: Optional[str]
+
+    def __new__(cls, text: str, *, request_id: Optional[str] = None) -> "SlackNotice":
+        notice = super().__new__(cls, text)
+        notice.reference = (
+            request_id[:8] if is_valid_request_id(request_id) and request_id else None
+        )
+        return notice
+
+    def blocks(self, part: str) -> Optional[List[Dict[str, Any]]]:
+        """`part` as a section with the reference under it; None without one."""
+        if not self.reference or len(part) > SLACK_SECTION_TEXT_CHARS:
+            return None
+        return [
+            {"type": "section", "text": {"type": "mrkdwn", "text": part}},
+            {
+                "type": "context",
+                "elements": [
+                    {"type": "mrkdwn", "text": f"Reference: `{self.reference}`"}
+                ],
+            },
+        ]
+
+
 def _add_rate_limit_retry(client: Any) -> None:
     """Retry Slack 429s (honouring Retry-After) instead of failing the post."""
     retry_handlers = getattr(client, "retry_handlers", None)
@@ -3551,6 +3586,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                     getattr(response, "error_type", None),
                     getattr(response, "error_code", None),
                     retry_after_seconds=getattr(response, "retry_after_seconds", None),
+                    request_id=query_request.request_id,
                 )
 
             warnings = getattr(response, "warnings", None)
@@ -3605,9 +3641,25 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         except Exception as e:
             logger.error(f"Error processing query: {e}")
             SLACK_METRICS.errors.labels(error_type=type(e).__name__).inc()
-            return self._inference_error_message(None)
+            return self._inference_error_message(None, request_id=trace.request_id)
 
     def _inference_error_message(
+        self,
+        error_type: Optional[str],
+        error_code: Optional[str] = None,
+        *,
+        retry_after_seconds: Any = None,
+        request_id: Optional[str] = None,
+    ) -> str:
+        """What a failed answer tells the user, with the request's reference."""
+        return SlackNotice(
+            self._inference_error_text(
+                error_type, error_code, retry_after_seconds=retry_after_seconds
+            ),
+            request_id=request_id,
+        )
+
+    def _inference_error_text(
         self,
         error_type: Optional[str],
         error_code: Optional[str] = None,
@@ -4650,25 +4702,44 @@ class SlackBot:
 
         except Exception as e:
             logger.error(f"Error processing message: {e}")
-            error_text = self._build_user_safe_error_message()
+            error_text = SlackNotice(
+                self._build_user_safe_error_message(),
+                request_id=self._event_request_id(event),
+            )
+            error_message = self._answer_message(error_text, error_text, last=True)
             if placeholder_ts and await self._replace_placeholder(
-                event.get("channel"), placeholder_ts, text=error_text
+                event.get("channel"), placeholder_ts, **error_message
             ):
                 return
-            await self.web_client.chat_postMessage(
-                channel=event.get("channel"),
-                text=error_text,
-                thread_ts=event.get("thread_ts") or event.get("ts"),
+            await self._post_reply(
+                event.get("channel"),
+                event.get("thread_ts") or event.get("ts"),
+                **error_message,
             )
+
+    def _event_request_id(self, event: Dict[str, Any]) -> Optional[str]:
+        """The chat request id of a message, as its trace computed it."""
+        try:
+            return slack_chat_request_id(
+                self._extract_team_id(event), event.get("channel"), event.get("ts")
+            )
+        except Exception:
+            return None
 
     def _answer_message(self, part: str, answer: str, *, last: bool) -> Dict[str, Any]:
         """The message fields for one part of a reply.
 
         A model's answer renders as a Markdown block, with the plain text
         kept as the notification fallback, and its last part carries the
-        footer. Command replies and errors stay plain text.
+        footer. An error's last part carries its reference; command replies
+        stay plain text.
         """
         message: Dict[str, Any] = {"text": part}
+        if isinstance(answer, SlackNotice):
+            notice_blocks = answer.blocks(part) if last else None
+            if notice_blocks:
+                message["blocks"] = notice_blocks
+            return message
         if (
             not isinstance(answer, SlackAnswer)
             or len(part) > SLACK_MARKDOWN_BLOCK_CHARS
