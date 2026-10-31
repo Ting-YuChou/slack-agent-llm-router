@@ -60,45 +60,62 @@ class DedupeClaim:
     """Answer of ``AlertDedupeStore.try_claim``."""
 
     notify: bool
-    # When held: the level that already paged and the cooldown left on it.
+    # When held: the level that already paged, the TTL left on its key and
+    # (wall-clock ms) when that page happened.
     stored_level: Optional[Tuple[int, int]] = None
     remaining_seconds: Optional[float] = None
+    notified_at_ms: Optional[int] = None
+
+
+@dataclass
+class _PendingRelease:
+    keys: set
+    cleared_ms: int
+    attempts: int = 0
+
+
+def _is_response_error(exc: BaseException) -> bool:
+    """Redis answered with an error (WRONGTYPE, ACL, ...): retrying won't help."""
+    return any(cls.__name__ == "ResponseError" for cls in type(exc).__mro__)
 
 
 class AlertDedupeStore:
     """Shared record of notified stream-alert incidents, kept in Redis.
 
-    One key per incident ``(source, type, scope)`` holding the paged level
-    ``"<action rank>,<severity rank>"`` with a TTL of the dedupe cooldown,
-    so a restarted (or second) process sees that the incident already
-    paged. Claiming is one compare-and-set script: it pages only when the
-    key is missing or holds a lower level. Each scope keeps a set of its
-    incident keys so a clear can close every avoid incident of the scope.
+    One key per incident ``(source, type, scope)`` holding
+    ``"<action rank>,<severity rank>,<paged at ms>"`` with a TTL of at most
+    the dedupe cooldown, so a restarted (or second) process sees that the
+    incident already paged, and when. Claiming is one compare-and-set
+    script: it pages only when the key is missing or holds a lower level.
+    Each scope keeps a set of its incident keys so a clear can close every
+    avoid incident of the scope; the release reports which keys it removed.
     Every call returns ``None`` when Redis is unavailable, and the caller
     falls back to its in-memory dedupe; after a failure Redis is skipped for
     ``retry_after_seconds``. Releases Redis could not take are retried
-    before the next claim.
+    before the next claim, up to ``max_release_attempts``.
     """
 
-    # KEYS: incident, scope set. ARGV: action rank, severity rank, ttl ms.
-    # Returns {1} to page, or {0, action, severity, pttl} when already held
-    # at the same or a higher level.
+    # KEYS: incident, scope set. ARGV: action rank, severity rank, ttl ms,
+    # now ms. Returns {1} to page, or {0, action, severity, pttl, paged ms
+    # (-1 if unknown)} when already held at the same or a higher level.
     CLAIM_SCRIPT = """
 local current = redis.call('GET', KEYS[1])
 local action = tonumber(ARGV[1])
 local severity = tonumber(ARGV[2])
 if current then
-  local held_action, held_severity = string.match(current, '^(%d+),(%d+)$')
+  local held_action, held_severity = string.match(current, '^(%d+),(%d+)')
   if held_action then
     held_action = tonumber(held_action)
     held_severity = tonumber(held_severity)
     if action < held_action
       or (action == held_action and severity <= held_severity) then
-      return {0, held_action, held_severity, redis.call('PTTL', KEYS[1])}
+      local paged = tonumber(string.match(current, '^%d+,%d+,(%d+)$') or '-1')
+      return {0, held_action, held_severity, redis.call('PTTL', KEYS[1]), paged}
     end
   end
 end
-redis.call('SET', KEYS[1], ARGV[1] .. ',' .. ARGV[2], 'PX', ARGV[3])
+redis.call('SET', KEYS[1], ARGV[1] .. ',' .. ARGV[2] .. ',' .. ARGV[4],
+  'PX', ARGV[3])
 redis.call('SADD', KEYS[2], KEYS[1])
 if redis.call('PTTL', KEYS[2]) < tonumber(ARGV[3]) then
   redis.call('PEXPIRE', KEYS[2], ARGV[3])
@@ -106,23 +123,40 @@ end
 return {1}
 """
 
-    # KEYS: scope set. ARGV: avoid action rank, then incident keys to close.
-    # Closes every avoid incident of the scope plus the named ones.
+    # KEYS: scope set. ARGV: avoid action rank, clear time ms, then incident
+    # keys to close. Closes every avoid incident of the scope plus the named
+    # ones, but only those paged at or before the clear (a replayed release
+    # must not close a newer incident). Returns the keys it deleted.
     RELEASE_SCRIPT = """
-local removed = 0
+local removed = {}
 local prefix = ARGV[1] .. ','
+local cleared = tonumber(ARGV[2])
+local function paged_before(value)
+  local paged = string.match(value, '^%d+,%d+,(%d+)$')
+  return (not paged) or tonumber(paged) <= cleared
+end
+local function drop(name)
+  if redis.call('DEL', name) == 1 then
+    table.insert(removed, name)
+  end
+  redis.call('SREM', KEYS[1], name)
+end
 for _, member in ipairs(redis.call('SMEMBERS', KEYS[1])) do
   local value = redis.call('GET', member)
   if not value then
     redis.call('SREM', KEYS[1], member)
-  elseif string.sub(value, 1, string.len(prefix)) == prefix then
-    removed = removed + redis.call('DEL', member)
-    redis.call('SREM', KEYS[1], member)
+  elseif string.sub(value, 1, string.len(prefix)) == prefix
+    and paged_before(value) then
+    drop(member)
   end
 end
-for i = 2, #ARGV do
-  removed = removed + redis.call('DEL', ARGV[i])
-  redis.call('SREM', KEYS[1], ARGV[i])
+for i = 3, #ARGV do
+  local value = redis.call('GET', ARGV[i])
+  if not value then
+    redis.call('SREM', KEYS[1], ARGV[i])
+  elseif paged_before(value) then
+    drop(ARGV[i])
+  end
 end
 return removed
 """
@@ -160,8 +194,9 @@ return 1
         self.max_pending_releases = max(
             1, int(config.get("max_pending_releases", 1024))
         )
-        # scope set key -> incident keys still to delete.
-        self._pending_releases: "OrderedDict[str, set]" = OrderedDict()
+        self.max_release_attempts = max(1, int(config.get("max_release_attempts", 5)))
+        # scope set key -> release still to apply.
+        self._pending_releases: "OrderedDict[str, _PendingRelease]" = OrderedDict()
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -209,6 +244,10 @@ return 1
             )
         except Exception as exc:
             ALERT_DEDUPE_STORE_ERRORS.labels(operation=operation).inc()
+            if _is_response_error(exc):
+                # Redis is up and refused this command; no backoff.
+                logger.warning("Alert dedupe store rejected %s: %s", operation, exc)
+                raise _StoreUnavailable() from exc
             self._retry_at = now + self.retry_after_seconds
             if not self._unavailable_logged:
                 self._unavailable_logged = True
@@ -227,26 +266,67 @@ return 1
         self._retry_at = None
         return result
 
-    async def _flush_pending_releases(self) -> None:
-        """Retry releases that failed earlier; raise if Redis is still out."""
-        while self._pending_releases:
-            scope_key, keys = next(iter(self._pending_releases.items()))
-            await self._call(
-                "release",
-                lambda client: client.eval(
-                    self.RELEASE_SCRIPT,
-                    1,
-                    scope_key,
-                    self.avoid_rank,
-                    *sorted(keys),
-                ),
-            )
+    async def _apply_release(self, scope_key: str, pending: _PendingRelease) -> Any:
+        return await self._call(
+            "release",
+            lambda client: client.eval(
+                self.RELEASE_SCRIPT,
+                1,
+                scope_key,
+                self.avoid_rank,
+                int(pending.cleared_ms),
+                *sorted(pending.keys),
+            ),
+        )
+
+    async def _flush_pending_releases(self) -> Dict[str, List[str]]:
+        """Apply queued releases; return the keys each removed.
+
+        Raises ``_StoreUnavailable`` while Redis cannot take them. A release
+        Redis rejects, or one that failed ``max_release_attempts`` times, is
+        dropped (and logged) so it cannot keep the shared dedupe off.
+        """
+        removed: Dict[str, List[str]] = {}
+        for scope_key in list(self._pending_releases):
+            pending = self._pending_releases.get(scope_key)
+            if pending is None:
+                continue
+            try:
+                result = await self._apply_release(scope_key, pending)
+            except _StoreUnavailable as exc:
+                cause = exc.__cause__
+                if cause is None:
+                    raise  # skipped during the backoff: not an attempt
+                pending.attempts += 1
+                if (
+                    _is_response_error(cause)
+                    or pending.attempts >= self.max_release_attempts
+                ):
+                    self._pending_releases.pop(scope_key, None)
+                    logger.warning(
+                        "Alert dedupe store dropped a release after %d "
+                        "attempt(s); its incidents expire with their TTL: %s",
+                        pending.attempts,
+                        cause,
+                    )
+                    continue
+                raise
             self._pending_releases.pop(scope_key, None)
+            removed[scope_key] = [str(name) for name in (result or [])]
+        return removed
+
+    @staticmethod
+    def _now_ms(now_ms: Optional[int]) -> int:
+        return int(time.time() * 1000) if now_ms is None else int(now_ms)
 
     async def try_claim(
-        self, incident: tuple, level: Tuple[int, int], ttl_seconds: float
+        self,
+        incident: tuple,
+        level: Tuple[int, int],
+        ttl_seconds: float,
+        now_ms: Optional[int] = None,
     ) -> Optional[DedupeClaim]:
-        """Atomically record that ``incident`` pages at ``level``.
+        """Atomically record that ``incident`` pages at ``level`` at ``now_ms``.
 
         Returns whether this caller should page (the incident is not held, or
         held at a lower level), or ``None`` when Redis cannot answer, in
@@ -254,6 +334,7 @@ return 1
         """
         ttl_ms = max(1, int(math.ceil(ttl_seconds * 1000)))
         key, scope_key = self.key(incident), self.scope_key(incident)
+        paged_ms = self._now_ms(now_ms)
         try:
             await self._flush_pending_releases()
             result = await self._call(
@@ -266,6 +347,7 @@ return 1
                     int(level[0]),
                     int(level[1]),
                     ttl_ms,
+                    paged_ms,
                 ),
             )
         except _StoreUnavailable:
@@ -275,11 +357,15 @@ return 1
                 return DedupeClaim(notify=True)
             stored = (int(result[1]), int(result[2]))
             remaining = max(0, int(result[3])) / 1000.0
+            notified = int(result[4]) if len(result) > 4 else -1
         except (TypeError, ValueError, IndexError):
             logger.debug("Unexpected dedupe store reply: %r", result)
             return None
         return DedupeClaim(
-            notify=False, stored_level=stored, remaining_seconds=remaining
+            notify=False,
+            stored_level=stored,
+            remaining_seconds=remaining,
+            notified_at_ms=None if notified < 0 else notified,
         )
 
     async def claim(
@@ -305,22 +391,34 @@ return 1
         except _StoreUnavailable:
             return
 
-    async def release(self, incident: tuple, targets: Sequence[tuple] = ()) -> None:
+    async def release(
+        self,
+        incident: tuple,
+        targets: Sequence[tuple] = (),
+        cleared_ms: Optional[int] = None,
+    ) -> Optional[List[str]]:
         """Close a scope: its avoid incidents, ``incident`` and ``targets``.
 
-        A release Redis cannot take (an error or the backoff) is kept and
-        retried before the next claim, so a cleared incident pages again.
+        Returns the incident keys this call removed, or ``None`` when Redis
+        did not take the release. Such a release is kept and retried before
+        the next claim, so a cleared incident pages again; it still only
+        closes incidents paged at or before ``cleared_ms``.
         """
         scope_key = self.scope_key(incident)
-        keys = set(self._pending_releases.pop(scope_key, set()))
-        keys.update(self.key(item) for item in [incident, *targets])
-        self._pending_releases[scope_key] = keys
+        cleared = self._now_ms(cleared_ms)
+        pending = self._pending_releases.pop(scope_key, None)
+        if pending is None:
+            pending = _PendingRelease(keys=set(), cleared_ms=cleared)
+        pending.keys.update(self.key(item) for item in [incident, *targets])
+        pending.cleared_ms = max(pending.cleared_ms, cleared)
+        self._pending_releases[scope_key] = pending
         while len(self._pending_releases) > self.max_pending_releases:
             self._pending_releases.pop(next(iter(self._pending_releases)))
         try:
-            await self._flush_pending_releases()
+            removed = await self._flush_pending_releases()
         except _StoreUnavailable:
-            return
+            return None
+        return removed.get(scope_key)
 
     async def close(self) -> None:
         client, self._client = self._client, None
@@ -336,6 +434,10 @@ return 1
 
 class _StoreUnavailable(Exception):
     """The alert dedupe store could not answer; fall back to memory."""
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def _parse_event_timestamp(value: Any) -> datetime:
@@ -1098,17 +1200,28 @@ class AlertManager:
         # Take the targets out before any await, so a concurrent handler
         # evicting one cannot break the resolve.
         closed = [
-            active
-            for active in (
-                self._active_external_alerts.pop(key, None) for key in targets
+            (key, active)
+            for key, active in (
+                (key, self._active_external_alerts.pop(key, None)) for key in targets
             )
             if active is not None
         ]
+        removed: Optional[List[str]] = None
         if self.dedupe_store is not None:
             # The store closes every avoid incident of the scope and the
             # clear's own, which a restarted process may not hold in memory.
-            await self.dedupe_store.release(incident, targets)
-        for active in closed:
+            removed = await self.dedupe_store.release(
+                incident, targets, cleared_ms=int(self._wall_clock() * 1000)
+            )
+        for key, active in closed:
+            # With the store, only the replica whose release removed the
+            # incident's key announces the resolve; the others close their
+            # copy quietly. Without Redis, every replica announces its own.
+            announce = (
+                removed is None
+                or self.dedupe_store is None
+                or self.dedupe_store.key(key) in removed
+            )
             resolved = {
                 **{k: v for k, v in active.items() if not k.startswith("_")},
                 "description": f"Resolved: {active.get('description')}",
@@ -1117,7 +1230,8 @@ class AlertManager:
                 "status": "resolved",
             }
             self._append_alert_to_history(resolved)
-            await self._dispatch_alert(resolved)
+            if announce:
+                await self._dispatch_alert(resolved)
 
     async def record_external_alert(self, alert_data: Dict[str, Any]):
         """Record and optionally notify on alert events emitted by the stream layer.
@@ -1228,13 +1342,17 @@ class AlertManager:
             entry = self._active_external_alerts[incident]
             if claim.stored_level is not None:
                 entry["_notified_level"] = claim.stored_level
-            if claim.remaining_seconds is not None:
-                # The page happened when the key was set, not now; a bounded
-                # key also caps how long this process stays quiet.
+            if claim.notified_at_ms is not None:
+                # The page happened when the key was set, not now.
+                elapsed = self._wall_clock() - claim.notified_at_ms / 1000
+                entry["_notified_at"] = now - max(0.0, elapsed)
+            elif claim.remaining_seconds is not None:
+                # A key without its page time: assume a full-cooldown TTL.
                 elapsed = self.dedupe_cooldown_seconds - claim.remaining_seconds
                 entry["_notified_at"] = now - max(0.0, elapsed)
-                if bound is not None:
-                    entry["_expires_at"] = now + claim.remaining_seconds
+            if bound is not None and claim.remaining_seconds is not None:
+                # The key's TTL is the incident's remaining life.
+                entry["_expires_at"] = now + claim.remaining_seconds
         self._active_external_alerts.move_to_end(incident)
         while len(self._active_external_alerts) > self.dedupe_max_entries:
             self._active_external_alerts.popitem(last=False)
@@ -1254,24 +1372,24 @@ class AlertManager:
         return max(level, stored) if stored is not None else level
 
     def _incident_bound_seconds(self, alert_data: Dict[str, Any]) -> Optional[float]:
-        """Seconds an avoid incident lives without another avoid, if known.
+        """Seconds an avoid incident lives, from receipt, without another avoid.
 
-        Flink drops an entered scope at ``active_until_ms`` (window end +
-        active TTL); dedupe must not outlive it plus a grace, or a missed
-        clear would silence the scope's next avoid for the whole cooldown.
+        Flink drops an entered scope ``active_ttl`` after its last avoid
+        window; dedupe must not outlive that (plus a grace), or a missed clear
+        would silence the scope's next avoid for the whole cooldown. Measured
+        from when the event is received, never against the event time, so
+        consumer lag does not shorten it.
         """
         if alert_data.get("guardrail_action") != "avoid":
             return None
-        expiry_ms = alert_data.get("active_until_ms")
-        if not isinstance(expiry_ms, (int, float)) or isinstance(expiry_ms, bool):
-            window_end_ms = alert_data.get("window_end_ms")
-            if self.incident_ttl_seconds is None or not isinstance(
-                window_end_ms, (int, float)
-            ):
-                return None
-            expiry_ms = window_end_ms + self.incident_ttl_seconds * 1000
-        left = (float(expiry_ms) - self._wall_clock() * 1000) / 1000
-        return max(1.0, left + self.incident_ttl_grace_seconds)
+        ttl = self.incident_ttl_seconds
+        active_until_ms = alert_data.get("active_until_ms")
+        window_end_ms = alert_data.get("window_end_ms")
+        if _is_number(active_until_ms) and _is_number(window_end_ms):
+            ttl = (float(active_until_ms) - float(window_end_ms)) / 1000
+        if ttl is None:
+            return None
+        return max(1.0, ttl + self.incident_ttl_grace_seconds)
 
     async def _claim_in_dedupe_store(
         self, incident: tuple, alert: Dict[str, Any], ttl_seconds: float
@@ -1287,7 +1405,12 @@ class AlertManager:
         store = self.dedupe_store
         if store is None or self.dedupe_cooldown_seconds <= 0:
             return None
-        return await store.try_claim(incident, self._alert_level(alert), ttl_seconds)
+        return await store.try_claim(
+            incident,
+            self._alert_level(alert),
+            ttl_seconds,
+            now_ms=int(self._wall_clock() * 1000),
+        )
 
     def _get_current_value(self, rule: AlertRule, metrics: Dict[str, float]) -> float:
         """Get current value for the metric being alerted on"""
@@ -2154,6 +2277,11 @@ class MonitoringService:
     async def initialize(self):
         """Initialize monitoring service"""
         logger.info("Initializing monitoring service...")
+        if self.alert_manager.dedupe_store is None:
+            logger.warning(
+                "Monitoring is on without alerts.dedupe_store: multiple worker "
+                "replicas will each page every stream alert"
+            )
         # Monitoring service is ready immediately
         logger.info("Monitoring service initialized successfully")
 

@@ -645,9 +645,8 @@ monitoring:
     latency_threshold_ms: 5000
     memory_usage_threshold: 0.9
     disk_usage_threshold: 0.8
-    # Avoid-incident dedupe ends with Flink's guardrail state (window end +
-    # this + grace) unless another avoid extends it. Keep equal to
-    # flink...active_ttl_seconds.
+    # Avoid-incident dedupe ends this long (plus the grace) after the last
+    # avoid was received. Keep equal to flink...active_ttl_seconds.
     incident_ttl_seconds: 180
     incident_ttl_grace_seconds: 60
     # Restart-safe stream alert dedupe (used once monitoring is enabled).
