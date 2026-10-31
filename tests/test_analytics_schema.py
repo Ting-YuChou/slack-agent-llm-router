@@ -173,3 +173,51 @@ async def test_create_tables_runs_the_generated_creates_then_the_alters():
         "ALTER TABLE llm_router.query_logs ADD COLUMN IF NOT EXISTS "
         "event_id String DEFAULT query_id"
     ) in statements
+
+
+# Every ALTER fc64233 issued, so older deployments still migrate.
+FC64233_ALTERS = [
+    "ALTER TABLE test_db.query_logs ADD COLUMN IF NOT EXISTS event_id String DEFAULT query_id",
+    "ALTER TABLE test_db.query_logs ADD COLUMN IF NOT EXISTS kafka_topic String DEFAULT ''",
+    "ALTER TABLE test_db.query_logs ADD COLUMN IF NOT EXISTS kafka_partition Int32 DEFAULT -1",
+    "ALTER TABLE test_db.query_logs ADD COLUMN IF NOT EXISTS kafka_offset Int64 DEFAULT -1",
+    "ALTER TABLE test_db.system_metrics ADD COLUMN IF NOT EXISTS event_id String DEFAULT concat(service, ':', metric_name, ':', toString(timestamp))",
+    "ALTER TABLE test_db.system_metrics ADD COLUMN IF NOT EXISTS kafka_topic String DEFAULT ''",
+    "ALTER TABLE test_db.system_metrics ADD COLUMN IF NOT EXISTS kafka_partition Int32 DEFAULT -1",
+    "ALTER TABLE test_db.system_metrics ADD COLUMN IF NOT EXISTS kafka_offset Int64 DEFAULT -1",
+    "ALTER TABLE test_db.model_performance ADD COLUMN IF NOT EXISTS event_id String DEFAULT concat(model_name, ':', toString(timestamp))",
+    "ALTER TABLE test_db.model_performance ADD COLUMN IF NOT EXISTS provider String DEFAULT ''",
+    "ALTER TABLE test_db.model_performance ADD COLUMN IF NOT EXISTS window_start_ms UInt64 DEFAULT 0",
+    "ALTER TABLE test_db.model_performance ADD COLUMN IF NOT EXISTS window_end_ms UInt64 DEFAULT 0",
+    "ALTER TABLE test_db.model_performance ADD COLUMN IF NOT EXISTS window_size_seconds UInt32 DEFAULT 60",
+    "ALTER TABLE test_db.model_performance ADD COLUMN IF NOT EXISTS success_count UInt32 DEFAULT 0",
+    "ALTER TABLE test_db.model_performance ADD COLUMN IF NOT EXISTS total_tokens UInt32 DEFAULT 0",
+    "ALTER TABLE test_db.model_performance ADD COLUMN IF NOT EXISTS queries_per_second Float32 DEFAULT 0",
+    "ALTER TABLE test_db.model_performance ADD COLUMN IF NOT EXISTS cache_hit_rate Float32 DEFAULT 0",
+    "ALTER TABLE test_db.model_performance ADD COLUMN IF NOT EXISTS cached_count UInt32 DEFAULT 0",
+    "ALTER TABLE test_db.model_performance ADD COLUMN IF NOT EXISTS kafka_topic String DEFAULT ''",
+    "ALTER TABLE test_db.model_performance ADD COLUMN IF NOT EXISTS kafka_partition Int32 DEFAULT -1",
+    "ALTER TABLE test_db.model_performance ADD COLUMN IF NOT EXISTS kafka_offset Int64 DEFAULT -1",
+    "ALTER TABLE test_db.alert_events ADD COLUMN IF NOT EXISTS event_id String DEFAULT concat(source_event_type, ':', alert_type, ':', request_id, ':', query_id, ':', model_name, ':', provider, ':', toString(timestamp))",
+    "ALTER TABLE test_db.alert_events ADD COLUMN IF NOT EXISTS kafka_topic String DEFAULT ''",
+    "ALTER TABLE test_db.alert_events ADD COLUMN IF NOT EXISTS kafka_partition Int32 DEFAULT -1",
+    "ALTER TABLE test_db.alert_events ADD COLUMN IF NOT EXISTS kafka_offset Int64 DEFAULT -1",
+    "ALTER TABLE test_db.routing_policy_state_events ADD COLUMN IF NOT EXISTS event_id String DEFAULT concat(scope_type, ':', scope_key, ':', toString(timestamp))",
+    "ALTER TABLE test_db.routing_policy_state_events ADD COLUMN IF NOT EXISTS kafka_topic String DEFAULT ''",
+    "ALTER TABLE test_db.routing_policy_state_events ADD COLUMN IF NOT EXISTS kafka_partition Int32 DEFAULT -1",
+    "ALTER TABLE test_db.routing_policy_state_events ADD COLUMN IF NOT EXISTS kafka_offset Int64 DEFAULT -1",
+    "ALTER TABLE test_db.routing_decisions ADD COLUMN IF NOT EXISTS fallback_from_model String DEFAULT ''",
+]
+
+
+def _normalized(sql):
+    return " ".join(sql.split())
+
+
+def test_every_alter_from_before_the_generated_schema_is_still_issued():
+    generated = {
+        _normalized(sql) for table in TABLES for sql in table.alter_sql("test_db")
+    }
+
+    missing = [sql for sql in FC64233_ALTERS if _normalized(sql) not in generated]
+    assert missing == []

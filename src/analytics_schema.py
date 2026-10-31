@@ -141,7 +141,8 @@ MODEL_PERFORMANCE = Table(
         ),
         Column("timestamp", "DateTime64(3)"),
         Column("model_name", "String"),
-        Column("provider", "String", default="''"),
+        # A sorting-key column that older tables lack.
+        Column("provider", "String", default="''", backfill="''"),
         Column("window_start_ms", "UInt64", default="0"),
         Column("window_end_ms", "UInt64", default="0"),
         Column("window_size_seconds", "UInt32", default="60"),
