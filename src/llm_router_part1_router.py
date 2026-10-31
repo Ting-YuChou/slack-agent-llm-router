@@ -145,8 +145,12 @@ DEFAULT_OUTPUT_TOKEN_ESTIMATES: Dict[str, int] = {
 }
 # Half-life of the recent_* model stats the score prefers (R13).
 DEFAULT_STATS_HALF_LIFE_SECONDS = 300.0
-# Latency at which the latency term gives half its weight: w * ref / (ref + avg).
-LATENCY_REFERENCE_MS = 1000.0
+# Requests' worth of prior pulling recent_success_rate toward the lifetime rate
+# (0.95 with no history), so one failure after an idle spell does not sink it.
+DEFAULT_STATS_PRIOR_WEIGHT = 3.0
+# The latency term is w * ref / (ref + avg). ref is chosen so the term at 1 s
+# equals the old max(0, w - avg / 100), i.e. w - 10, keeping its scale.
+LATENCY_TERM_AT_ONE_SECOND_LOSS = 10.0
 # policy_cache.mode shadow (A1): the policy's context, stashed by
 # _get_policy_context, and the routing context with it applied.
 SHADOW_POLICY_CONTEXT_KEY = "shadow_policy_context"
@@ -435,6 +439,11 @@ class ModelRouter:
         )
         if self.stats_half_life_seconds <= 0:
             raise ValueError("router.stats_half_life_seconds must be positive")
+        self.stats_prior_weight = float(
+            config.get("stats_prior_weight", DEFAULT_STATS_PRIOR_WEIGHT)
+        )
+        if self.stats_prior_weight < 0:
+            raise ValueError("router.stats_prior_weight must not be negative")
         self._stats_clock = stats_clock
         self.request_cache: Dict[str, RoutingDecision] = {}
         self._initialized = False
@@ -2218,11 +2227,7 @@ class ModelRouter:
 
         return {
             "reliability": success_rate * reliability_weight,
-            # Lower latency scores higher, smoothly: half the weight at
-            # LATENCY_REFERENCE_MS, never quite 0 for a slow model.
-            "latency": latency_weight
-            * LATENCY_REFERENCE_MS
-            / (LATENCY_REFERENCE_MS + max(0.0, float(avg_latency))),
+            "latency": self._latency_score(latency_weight, float(avg_latency)),
             "cost": self._cost_score(model_config, context),
             "priority": (10 - model_config.priority)
             * float(self.scoring["priority_weight"]),
@@ -2538,6 +2543,20 @@ class ModelRouter:
 
         return self._request_cost(model_config, context)
 
+    @staticmethod
+    def _latency_score(weight: float, avg_latency_ms: float) -> float:
+        """Lower latency scores higher, smoothly, on the old term's scale.
+
+        w * ref / (ref + avg) with ref = 100 * (w - 10): w at 0 ms, w - 10 at
+        1 s like the old max(0, w - avg / 100), and never 0 for a slow model.
+        A weight of 10 or less keeps the old linear term.
+        """
+        avg_latency_ms = max(0.0, avg_latency_ms)
+        if weight <= LATENCY_TERM_AT_ONE_SECOND_LOSS:
+            return max(0.0, weight - avg_latency_ms / 100)
+        reference_ms = 100.0 * (weight - LATENCY_TERM_AT_ONE_SECOND_LOSS)
+        return weight * reference_ms / (reference_ms + avg_latency_ms)
+
     def update_model_stats(self, model_name: str, success: bool, latency_ms: int):
         """Update model performance statistics"""
         if model_name not in self.model_stats:
@@ -2550,6 +2569,7 @@ class ModelRouter:
             }
 
         stats = self.model_stats[model_name]
+        prior_success_rate = float(stats["success_rate"])
         stats["total_requests"] += 1
         stats["total_latency"] += latency_ms
 
@@ -2565,20 +2585,27 @@ class ModelRouter:
         now = self._stats_clock()
         elapsed = max(0.0, now - stats.get("recent_updated_at", now))
         decay = 0.5 ** (elapsed / self.stats_half_life_seconds)
+        stats["recent_updated_at"] = now
         stats["recent_weight"] = stats.get("recent_weight", 0.0) * decay + 1.0
         stats["recent_success_weight"] = stats.get(
             "recent_success_weight", 0.0
         ) * decay + (1.0 if success else 0.0)
-        stats["recent_latency_weight"] = (
-            stats.get("recent_latency_weight", 0.0) * decay + latency_ms
-        )
-        stats["recent_updated_at"] = now
+        # A prior of stats_prior_weight requests at the lifetime rate before
+        # this one: a lone failure after an idle spell moves it, not sinks it.
+        prior = self.stats_prior_weight
         stats["recent_success_rate"] = (
-            stats["recent_success_weight"] / stats["recent_weight"]
-        )
-        stats["recent_latency_ms"] = (
-            stats["recent_latency_weight"] / stats["recent_weight"]
-        )
+            stats["recent_success_weight"] + prior * prior_success_rate
+        ) / (stats["recent_weight"] + prior)
+        # Latency from successes only: a fast 4xx or 429 is not a fast model.
+        stats["recent_latency_weight"] = stats.get("recent_latency_weight", 0.0) * decay
+        stats["recent_latency_total"] = stats.get("recent_latency_total", 0.0) * decay
+        if success:
+            stats["recent_latency_weight"] += 1.0
+            stats["recent_latency_total"] += latency_ms
+        if stats["recent_latency_weight"] > 0:
+            stats["recent_latency_ms"] = (
+                stats["recent_latency_total"] / stats["recent_latency_weight"]
+            )
 
     def get_model_info(self, model_name: str) -> Optional[Dict[str, Any]]:
         """Get comprehensive information about a model"""

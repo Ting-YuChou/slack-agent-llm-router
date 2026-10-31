@@ -715,6 +715,8 @@ class RouterConfig(ConfigModel):
     tokenizer_enabled: bool = True
     # Half-life of the time-decayed model stats routing scores with (R13).
     stats_half_life_seconds: float = Field(300.0, gt=0)
+    # Requests' worth of prior toward the lifetime success rate (R13 review).
+    stats_prior_weight: float = Field(3.0, ge=0)
     credential_gating: bool = False
     fast_lane_models: List[str] = Field(default_factory=list)
     models: Dict[str, ModelConfig] = Field(default_factory=dict)

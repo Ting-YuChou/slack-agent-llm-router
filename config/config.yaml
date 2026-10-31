@@ -102,6 +102,8 @@ router:
   routing_strategy: intelligent
   # Half-life of the time-decayed model stats that routing scores with.
   stats_half_life_seconds: 300
+  # Requests' worth of prior pulling the recent success rate to the lifetime one.
+  stats_prior_weight: 3
   fast_lane_models:
   - qwen3.6-27b-fast
   scoring:
