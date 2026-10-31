@@ -1342,10 +1342,8 @@ class DevelopmentConfig(ConfigModel):
 class FeatureFlagsConfig(ConfigModel):
     context_compression: bool = True
     semantic_caching: bool = True
-    batch_processing: bool = True
     multi_modal: bool = False
     function_calling: bool = True
-    streaming_responses: bool = True
 
 
 class PipelineConfig(ConfigModel):

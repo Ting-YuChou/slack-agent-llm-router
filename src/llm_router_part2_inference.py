@@ -22,7 +22,6 @@ from typing import (
     List,
     Optional,
     Any,
-    AsyncIterator,
     Tuple,
     Sequence,
 )
@@ -1195,13 +1194,6 @@ class BaseInferenceProvider(ABC):
         pass
 
     @abstractmethod
-    async def stream_response(
-        self, request: QueryRequest, model_name: str
-    ) -> AsyncIterator[str]:
-        """Stream response for the given request"""
-        pass
-
-    @abstractmethod
     def get_health_status(self) -> Dict[str, Any]:
         """Get provider health status"""
         pass
@@ -1325,14 +1317,6 @@ class BaseInferenceProvider(ABC):
             marker in mime_type for marker in self.TEXT_MIME_MARKERS
         )
 
-    async def generate_batch_responses(
-        self, requests: List[QueryRequest], model_name: str
-    ) -> List[InferenceResponse]:
-        """Generate responses for a batch of requests."""
-        return await asyncio.gather(
-            *(self.generate_response(request, model_name) for request in requests)
-        )
-
 
 class OpenAIProvider(BaseInferenceProvider):
     """OpenAI API provider implementation"""
@@ -1408,26 +1392,6 @@ class OpenAIProvider(BaseInferenceProvider):
 
         except Exception as e:
             logger.error(f"OpenAI inference error: {e}")
-            raise
-
-    async def stream_response(
-        self, request: QueryRequest, model_name: str
-    ) -> AsyncIterator[str]:
-        """Stream response using OpenAI API"""
-        try:
-            prompt = self._build_prompt(request)
-            request_kwargs = self._build_response_request_kwargs(
-                request,
-                model_name,
-                prompt,
-            )
-            async with self.client.responses.stream(**request_kwargs) as stream:
-                async for event in stream:
-                    if event.type == "response.output_text.delta":
-                        yield event.delta
-
-        except Exception as e:
-            logger.error(f"OpenAI streaming error: {e}")
             raise
 
     def _build_response_request_kwargs(
@@ -1699,27 +1663,6 @@ class AnthropicProvider(BaseInferenceProvider):
             logger.error(f"Anthropic inference error: {e}")
             raise
 
-    async def stream_response(
-        self, request: QueryRequest, model_name: str
-    ) -> AsyncIterator[str]:
-        """Stream response using Anthropic API"""
-        try:
-            messages = self._build_messages(request)
-
-            async with self.client.messages.stream(
-                model=model_name,
-                max_tokens=request.max_tokens,
-                temperature=request.temperature,
-                system=self._build_system(),
-                messages=messages,
-            ) as stream:
-                async for text in stream.text_stream:
-                    yield text
-
-        except Exception as e:
-            logger.error(f"Anthropic streaming error: {e}")
-            raise
-
     def _build_messages(self, request: QueryRequest) -> List[Dict[str, Any]]:
         """Build Anthropic messages with an optional cache breakpoint."""
         rag_images = getattr(request, "_rag_images", [])
@@ -1958,7 +1901,7 @@ class vLLMProvider(BaseInferenceProvider):
         start_time = time.time()
         prompt = self._build_prompt(request)
         endpoint_path, payload = self._build_request_payload(
-            prompt, model_name, request, stream=False
+            prompt, model_name, request
         )
         prefix_key = self._prompt_prefix_fingerprint(model_name, prompt)
         excluded_endpoints: set[str] = set()
@@ -2026,57 +1969,6 @@ class vLLMProvider(BaseInferenceProvider):
         if last_error:
             raise last_error
         raise RuntimeError(f"No healthy vLLM endpoint can serve model {model_name}")
-
-    async def stream_response(
-        self, request: QueryRequest, model_name: str
-    ) -> AsyncIterator[str]:
-        """Stream response using vLLM"""
-        endpoint: Optional[VLLMEndpointState] = None
-        try:
-            prompt = self._build_prompt(request)
-            endpoint_path, payload = self._build_request_payload(
-                prompt, model_name, request, stream=True
-            )
-            prefix_key = self._prompt_prefix_fingerprint(model_name, prompt)
-            endpoint = await self._reserve_endpoint(model_name, prefix_key, set())
-            client = self._endpoint_client(endpoint)
-            if client is None:
-                raise RuntimeError(f"vLLM endpoint {endpoint.name} has no client")
-
-            async with client.stream("POST", endpoint_path, json=payload) as response:
-                if response.status_code >= 400:
-                    # Read the error body so the HTTPStatusError carries it.
-                    await response.aread()
-                    response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    raw_data = line[6:]
-                    if raw_data == "[DONE]":
-                        break
-                    data = json.loads(raw_data)
-                    delta = self._extract_stream_delta(data)
-                    if delta:
-                        yield delta
-            await self._mark_endpoint_success(endpoint, prefix_key)
-
-        except Exception as e:
-            if self._is_request_rejection(e):
-                logger.warning("vLLM endpoint rejected the stream request: %s", e)
-                raise
-            if endpoint is not None:
-                await self._mark_endpoint_failure(endpoint, e)
-            logger.error(f"vLLM streaming error: {e}")
-            if isinstance(e, httpx.HTTPStatusError):
-                # str(e) names the internal endpoint URL; the chunk reaches
-                # the user, so it carries only the status.
-                yield f"Error: upstream returned HTTP {e.response.status_code}"
-            else:
-                yield f"Error: {str(e)}"
-
-        finally:
-            if endpoint is not None:
-                await self._release_endpoint(endpoint)
 
     def _build_endpoint_states(self, config: Dict[str, Any]) -> List[VLLMEndpointState]:
         endpoint_configs = config.get("endpoints") or []
@@ -2155,8 +2047,6 @@ class vLLMProvider(BaseInferenceProvider):
         prompt: str,
         model_name: str,
         request: QueryRequest,
-        *,
-        stream: bool,
     ) -> Tuple[str, Dict[str, Any]]:
         if self.api_mode == "chat_completions":
             return (
@@ -2166,7 +2056,7 @@ class vLLMProvider(BaseInferenceProvider):
                     "messages": self._build_chat_messages(prompt),
                     "max_tokens": request.max_tokens,
                     "temperature": request.temperature,
-                    "stream": stream,
+                    "stream": False,
                 },
             )
 
@@ -2177,7 +2067,7 @@ class vLLMProvider(BaseInferenceProvider):
                 "prompt": prompt,
                 "max_tokens": request.max_tokens,
                 "temperature": request.temperature,
-                "stream": stream,
+                "stream": False,
                 "logprobs": None,
             },
         )
@@ -2476,15 +2366,6 @@ class vLLMProvider(BaseInferenceProvider):
         choice = data["choices"][0]
         if self.api_mode == "chat_completions":
             return self._coerce_chat_content(choice.get("message", {}))
-        return str(choice.get("text", ""))
-
-    def _extract_stream_delta(self, data: Dict[str, Any]) -> str:
-        choices = data.get("choices") or []
-        if not choices:
-            return ""
-        choice = choices[0]
-        if self.api_mode == "chat_completions":
-            return self._coerce_chat_content(choice.get("delta", {}))
         return str(choice.get("text", ""))
 
     def _coerce_chat_content(self, message: Any) -> str:
@@ -3719,137 +3600,6 @@ class InferenceEngine:
         if result.tool_call:
             response.tool_calls = [*response.tool_calls, result.tool_call]
             response.tool_latency_ms += result.latency_ms
-
-    async def stream_query(self, request: QueryRequest) -> AsyncIterator[str]:
-        """Stream query response"""
-        start_time = time.time()
-        try:
-            # Route query
-            routing_decision = await self.router.route_query(request)
-            model_name = routing_decision.selected_model
-            await self._compress_request_context_if_needed(request)
-            rag_result = await self._run_rag_if_needed(request, routing_decision)
-            if rag_result and rag_result.required_no_hits:
-                response = self._build_required_rag_no_hit_response(
-                    request,
-                    model_name,
-                    rag_result,
-                    start_time,
-                )
-                await self._finalize_successful_response(
-                    request,
-                    response,
-                    model_name,
-                    routing_decision,
-                    start_time,
-                )
-                yield "文件庫沒有足夠資訊可以回答這個問題。"
-                return
-            routing_decision = await self._prepare_rag_images(
-                request, routing_decision, rag_result
-            )
-            model_name = routing_decision.selected_model
-            await self._run_web_search_if_needed(request, routing_decision)
-
-            cached_response = await self._get_cached_inference_response(
-                request,
-                model_name,
-            )
-            if cached_response:
-                await self._publish_analytics_events(
-                    request,
-                    cached_response,
-                    routing_decision=routing_decision,
-                )
-                async for chunk in self._stream_cached_response(cached_response):
-                    yield chunk
-                return
-
-            # Get provider
-            provider = self._get_provider_for_model(model_name)
-            if not provider:
-                if getattr(request, "_rag_images", []):
-                    response, _, _ = await self._execute_pre_token_vision_fallback(
-                        request, routing_decision, model_name
-                    )
-                    yield response.response_text
-                    return
-                yield f"Error: No provider available for model: {model_name}"
-                return
-
-            model_info = self.router.get_model_info(model_name) or {}
-            provider_name = (
-                model_info.get("config", {}).get("provider")
-                or getattr(provider, "provider_name", None)
-                or "unknown"
-            )
-            request_started_at_ms = int(time.time() * 1000)
-            lease = None
-            pre_token_failure: Optional[Exception] = None
-            emitted_token = False
-            try:
-                lease = await self.scheduler.acquire(
-                    request=request,
-                    model_name=model_name,
-                    provider=str(provider_name),
-                    estimated_input_tokens=self._estimate_provider_admission_input_tokens(
-                        request
-                    ),
-                )
-                try:
-                    async for chunk in provider.stream_response(request, model_name):
-                        emitted_token = True
-                        yield chunk
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    await self.scheduler.record_failure(
-                        provider=str(provider_name),
-                        model_name=model_name,
-                        error=exc,
-                        request_started_at_ms=request_started_at_ms,
-                        circuit_permit=lease.circuit_permit,
-                    )
-                    if emitted_token or not getattr(request, "_rag_images", []):
-                        raise
-                    pre_token_failure = exc
-                else:
-                    await self.scheduler.record_success(
-                        provider=str(provider_name),
-                        model_name=model_name,
-                        request_started_at_ms=request_started_at_ms,
-                        circuit_permit=lease.circuit_permit,
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                if not getattr(request, "_rag_images", []):
-                    raise
-                pre_token_failure = exc
-            finally:
-                if lease is not None:
-                    await self.scheduler.release(lease, actual_tokens=None)
-            if pre_token_failure is not None:
-                response, _, _ = await self._execute_pre_token_vision_fallback(
-                    request, routing_decision, model_name
-                )
-                yield response.response_text
-                return
-
-        except AdmissionRejectedError as exc:
-            yield f"Error: {exc.decision.reason}"
-        except Exception:
-            logger.exception("Streaming failed")
-            yield "Error: Request processing failed"
-
-    async def _stream_cached_response(
-        self, response: InferenceResponse
-    ) -> AsyncIterator[str]:
-        """Yield cached full responses in deterministic chunks for streaming clients."""
-        chunk_size = int(self.config.get("stream_cache_chunk_chars", 512) or 512)
-        chunk_size = max(chunk_size, 1)
-        for index in range(0, len(response.response_text), chunk_size):
-            yield response.response_text[index : index + chunk_size]
 
     def _configured_provider_name(self, model_name: str) -> Optional[str]:
         """Return the provider configured for a model, or None when unknown."""

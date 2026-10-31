@@ -1030,10 +1030,8 @@ development:
 features:
   context_compression: true
   semantic_caching: true
-  batch_processing: true
   multi_modal: false
   function_calling: true
-  streaming_responses: true
 pipeline:
   enabled: false
 shutdown:

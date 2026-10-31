@@ -167,10 +167,8 @@ security:
 features:
   context_compression: false
   semantic_caching: false
-  batch_processing: false
   multi_modal: false
   function_calling: false
-  streaming_responses: false
 
 pipeline:
   enabled: false
