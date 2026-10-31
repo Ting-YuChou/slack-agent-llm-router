@@ -9,7 +9,9 @@ import hashlib
 import inspect
 import json
 import logging
+import os
 import re
+import socket
 import time
 from datetime import datetime, timezone
 from collections import OrderedDict
@@ -30,6 +32,7 @@ import clickhouse_connect
 from clickhouse_connect.driver import Client
 
 from src.analytics_schema import TABLES as ANALYTICS_TABLES
+from src.event_version import check_event_version
 from src.kafka_topics import dead_letter_topic_name, dlq_enabled
 from src.prompt_assembly import PROMPT_CONTENT_METADATA_KEYS
 from src.redaction import context_summary, redact, redact_text
@@ -1531,15 +1534,6 @@ class KafkaProducerManager:
             value=query_log.to_dict(),
         )
 
-    async def produce_response_log(self, response_data: Dict[str, Any]):
-        """Produce response log message"""
-        return self._enqueue_message(
-            "responses",
-            "llm-responses",
-            key=response_data.get("query_id"),
-            value=response_data,
-        )
-
     async def produce_metric(
         self,
         service: str,
@@ -1561,17 +1555,6 @@ class KafkaProducerManager:
             "llm-metrics",
             key=f"{service}:{metric_name}",
             value=metric_entry.to_dict(),
-        )
-
-    async def produce_error(self, error_data: Dict[str, Any]):
-        """Produce error message"""
-        error_data["timestamp"] = datetime.now(timezone.utc)
-
-        return self._enqueue_message(
-            "errors",
-            "llm-errors",
-            key=error_data.get("error_id", str(uuid.uuid4())),
-            value=error_data,
         )
 
     def _serialize_message(self, message: Any) -> bytes:
@@ -2313,7 +2296,12 @@ class BatchBufferState:
 
 
 class _BatchBackpressureRebalanceListener(ConsumerRebalanceListener):
-    """Reapply topic backpressure as soon as partitions are assigned."""
+    """Reapply topic backpressure as soon as partitions are assigned, and
+    drop the lag series of partitions this consumer no longer owns.
+
+    Installed on every consumer; observer consumers have no buffer state, so
+    only the lag cleanup applies to them.
+    """
 
     def __init__(self, manager: "KafkaConsumerManager", topic_key: str, consumer):
         self.manager = manager
@@ -2321,6 +2309,8 @@ class _BatchBackpressureRebalanceListener(ConsumerRebalanceListener):
         self.consumer = consumer
 
     async def on_partitions_revoked(self, revoked):
+        for tp in revoked or ():
+            _remove_lag_series(tp, self.topic_key)
         state = self.manager.batch_buffer_states.get(self.topic_key)
         if state is None:
             return
@@ -2335,8 +2325,90 @@ class _BatchBackpressureRebalanceListener(ConsumerRebalanceListener):
         )
 
 
+# Topics whose events feed in-process observers (the monitoring service).
+OBSERVED_TOPIC_KEYS = (
+    "requests_enriched",
+    "analytics_model_metrics_1m",
+    "routing_guardrails",
+    "routing_policy_state",
+    "alerts",
+)
+# Observed topics without a ClickHouse sink: their only consumer is the
+# observer one, keyed by the topic key itself.
+OBSERVER_ONLY_TOPIC_KEYS = frozenset({"requests_enriched"})
+OBSERVER_CONSUMER_SUFFIX = "_observer"
+# Topics the ClickHouse sink group consumes.
+SINK_TOPIC_KEYS = (
+    "queries",
+    "metrics",
+    "analytics_model_metrics_1m",
+    "routing_guardrails",
+    "routing_policy_state",
+    "alerts",
+    "inference_completed",
+    "chat_feedback",
+    "routing_decisions",
+)
+
+
+def _remove_lag_series(tp: Any, topic_key: str) -> None:
+    """Forget a partition's lag so a revoked one cannot keep its old value."""
+    try:
+        PIPELINE_METRICS.consumer_lag.remove(
+            str(tp.topic), str(tp.partition), topic_key
+        )
+    except KeyError:
+        pass
+    except Exception as e:  # pragma: no cover - metrics are best effort
+        logger.debug(f"Failed to remove Kafka consumer lag series: {e}")
+
+
+def observer_group_id(prefix: str) -> str:
+    """A consumer group of its own for this process's observers.
+
+    Every replica's monitor needs every observed event, so replicas must not
+    share a group (they would split the partitions between them).
+    """
+    host = socket.gethostname().split(".")[0] or "host"
+    host = re.sub(r"[^A-Za-z0-9_-]", "-", host)[:64]
+    return f"{prefix}-{host}-{os.getpid()}"
+
+
+def _commit_lost_errors() -> Tuple[type, ...]:
+    """aiokafka's errors for a commit lost to a rebalance or a left group."""
+    try:
+        from aiokafka import errors as kafka_errors
+    except ImportError:  # pragma: no cover - aiokafka or its test stub
+        return ()
+    return tuple(
+        cls
+        for cls in (
+            getattr(kafka_errors, "CommitFailedError", None),
+            getattr(kafka_errors, "IllegalStateError", None),
+            getattr(kafka_errors, "RebalanceInProgressError", None),
+        )
+        if isinstance(cls, type) and issubclass(cls, BaseException)
+    )
+
+
+def observer_consumer_key(topic_key: str) -> str:
+    """The consumer key of the observer-group consumer for a topic."""
+    if topic_key in OBSERVER_ONLY_TOPIC_KEYS:
+        return topic_key
+    return f"{topic_key}{OBSERVER_CONSUMER_SUFFIX}"
+
+
 class KafkaConsumerManager:
-    """Manages Kafka message consumption"""
+    """Manages Kafka message consumption.
+
+    The ClickHouse sink consumes ``SINK_TOPIC_KEYS`` in ``consumer.group_id``.
+    In-process observers are fed by a per-process group,
+    ``<consumer.observer_group_prefix>-<host>-<pid>`` (prefix default
+    ``llm-router-observers``), starting at ``latest`` with auto-commit, so a
+    sink restart or replay never rebalances or floods the monitor and every
+    replica's monitor sees the whole stream. Observer consumers start only
+    for topics with observers, including ones registered while running (D4).
+    """
 
     def __init__(self, config: Dict[str, Any], clickhouse_manager: ClickHouseManager):
         self.config = config
@@ -2361,11 +2433,41 @@ class KafkaConsumerManager:
             "enable_auto_commit": consumer_section.get("enable_auto_commit", False),
             "max_poll_records": consumer_section.get("max_poll_records", 500),
         }
+        # Observers only need live events: the group is new on every start,
+        # begins at the end and needs no durable offsets.
+        self.observer_consumer_config = {
+            **self.consumer_config,
+            "group_id": observer_group_id(
+                str(
+                    consumer_section.get(
+                        "observer_group_prefix", "llm-router-observers"
+                    )
+                )
+            ),
+            "auto_offset_reset": consumer_section.get(
+                "observer_auto_offset_reset", "latest"
+            ),
+            "enable_auto_commit": bool(
+                consumer_section.get("observer_enable_auto_commit", True)
+            ),
+        }
+        # Observer consumer key -> source topic key, for started observers.
+        self.observer_consumer_keys: Dict[str, str] = {}
+        self._task_group: Optional[Any] = None
+        self._pending_observer_starts: set[str] = set()
         self.supervisor_initial_backoff_seconds = float(
             consumer_section.get("supervisor_initial_backoff_seconds", 1.0)
         )
         self.supervisor_max_backoff_seconds = float(
             consumer_section.get("supervisor_max_backoff_seconds", 30.0)
+        )
+        # Lag is also refreshed from the broker on this interval, so a consumer
+        # that stops consuming shows growing lag (0 disables it).
+        self.lag_refresh_interval_seconds = max(
+            0.0, float(consumer_section.get("lag_refresh_interval_seconds", 30))
+        )
+        self.lag_refresh_timeout_seconds = max(
+            0.1, float(consumer_section.get("lag_refresh_timeout_seconds", 10))
         )
         self.dlq_enabled = dlq_enabled(config)
         self.dlq_topic_suffix = str(dlq_section.get("topic_suffix", ".dlq"))
@@ -2379,17 +2481,7 @@ class KafkaConsumerManager:
         self.consumer_restart_counts: Dict[str, int] = {}
 
         # Batch processing
-        batched_topics = (
-            "queries",
-            "metrics",
-            "analytics_model_metrics_1m",
-            "routing_guardrails",
-            "routing_policy_state",
-            "alerts",
-            "inference_completed",
-            "chat_feedback",
-            "routing_decisions",
-        )
+        batched_topics = SINK_TOPIC_KEYS
         self.batch_buffer_states: Dict[str, BatchBufferState] = {}
         # Compatibility views retained for callers and diagnostics that inspect
         # the old public dictionaries. BatchBufferState remains authoritative.
@@ -2400,11 +2492,7 @@ class KafkaConsumerManager:
         for topic_key in batched_topics:
             self._add_batched_topic(topic_key)
         self.observers: Dict[str, List[Callable[[Dict[str, Any]], Any]]] = {
-            "requests_enriched": [],
-            "analytics_model_metrics_1m": [],
-            "routing_guardrails": [],
-            "routing_policy_state": [],
-            "alerts": [],
+            topic_key: [] for topic_key in OBSERVED_TOPIC_KEYS
         }
         self.batch_size = int(consumer_section.get("batch_size", 100))
         self.batch_high_watermark_rows = int(
@@ -2457,11 +2545,91 @@ class KafkaConsumerManager:
 
         Re-subscribing a running consumer races its fetcher, so the listener
         is installed before start() on first start and on every restart.
+        Observer consumers join the observer group; their listener only
+        cleans up lag series.
         """
-        consumer = AIOKafkaConsumer(**self.consumer_config)
+        if topic_key in self.observer_consumer_keys:
+            consumer = AIOKafkaConsumer(**self.observer_consumer_config)
+        else:
+            consumer = AIOKafkaConsumer(**self.consumer_config)
         self._install_rebalance_listener(topic_key, topic_name, consumer)
         await consumer.start()
         return consumer
+
+    def _track_consumer(
+        self, consumer_key: str, topic_name: str, consumer: AIOKafkaConsumer
+    ) -> None:
+        self.consumers[consumer_key] = consumer
+        self.topic_names_by_key[consumer_key] = topic_name
+        self.consumer_task_status[consumer_key] = {
+            "running": False,
+            "last_error": None,
+            "last_started_at": None,
+            "last_stopped_at": None,
+        }
+        logger.info(f"Consumer {consumer_key} for topic {topic_name} initialized")
+
+    async def _start_observer_consumers(self) -> None:
+        """Start an observer-group consumer for each observed topic.
+
+        Topics without a registered observer get none, so an instance
+        without a monitoring service runs no idle consumers.
+        """
+        for topic_key in OBSERVED_TOPIC_KEYS:
+            await self._start_observer_consumer(topic_key)
+
+    async def _start_observer_consumer(self, topic_key: str) -> Optional[str]:
+        """Start the observer consumer for one topic; return its key if new."""
+        topic_name = self.topics.get(topic_key)
+        if (
+            topic_key not in OBSERVED_TOPIC_KEYS
+            or not topic_name
+            or not self.observers.get(topic_key)
+        ):
+            return None
+        consumer_key = observer_consumer_key(topic_key)
+        if consumer_key in self.consumers:
+            return None
+        self.observer_consumer_keys[consumer_key] = topic_key
+        consumer = await self._create_consumer(consumer_key, topic_name)
+        self._track_consumer(consumer_key, topic_name, consumer)
+        return consumer_key
+
+    def _start_observer_while_running(self, topic_key: str) -> None:
+        """Give an observer registered after start_consuming() its consumer."""
+        if not self.running or topic_key not in OBSERVED_TOPIC_KEYS:
+            return
+        if not self.topics.get(topic_key):
+            return
+        consumer_key = observer_consumer_key(topic_key)
+        if consumer_key in self.consumers or consumer_key in (
+            self._pending_observer_starts
+        ):
+            return
+        if self._task_group is None:
+            logger.warning(
+                "Observer for %s registered while consuming without a task "
+                "group; it receives no events until the consumers restart",
+                topic_key,
+            )
+            return
+        self._pending_observer_starts.add(consumer_key)
+        self._task_group.create_task(
+            self._run_late_observer(topic_key, consumer_key),
+            name=f"kafka_consumer_{consumer_key}",
+        )
+
+    async def _run_late_observer(self, topic_key: str, consumer_key: str) -> None:
+        try:
+            started = await self._start_observer_consumer(topic_key)
+        except Exception as e:
+            # Do not take the sink down with a failed observer start.
+            logger.error("Failed to start the %s observer consumer: %s", topic_key, e)
+            return
+        finally:
+            self._pending_observer_starts.discard(consumer_key)
+        if started is not None:
+            await self._supervise_consumer(started, self.consumers[started])
 
     async def initialize(self):
         """Initialize Kafka consumers"""
@@ -2476,32 +2644,12 @@ class KafkaConsumerManager:
                 )
                 await self.dlq_producer.start()
 
-            # Create consumer for each topic
+            # One sink-group consumer per persisted topic. Observer-group
+            # consumers start with start_consuming(), once observers attach.
             for topic_key, topic_name in self.topics.items():
-                if topic_key in [
-                    "queries",
-                    "responses",
-                    "metrics",
-                    "errors",
-                    "requests_enriched",
-                    "analytics_model_metrics_1m",
-                    "routing_guardrails",
-                    "routing_policy_state",
-                    "alerts",
-                    "inference_completed",
-                    "chat_feedback",
-                    "routing_decisions",
-                ]:
+                if topic_key in SINK_TOPIC_KEYS:
                     consumer = await self._create_consumer(topic_key, topic_name)
-                    self.consumers[topic_key] = consumer
-                    self.topic_names_by_key[topic_key] = topic_name
-                    self.consumer_task_status[topic_key] = {
-                        "running": False,
-                        "last_error": None,
-                        "last_started_at": None,
-                        "last_stopped_at": None,
-                    }
-                    logger.info(f"Consumer for topic {topic_name} initialized")
+                    self._track_consumer(topic_key, topic_name, consumer)
 
             logger.info(f"Kafka consumers initialized for {len(self.consumers)} topics")
 
@@ -2512,13 +2660,24 @@ class KafkaConsumerManager:
     async def start_consuming(self):
         """Start consuming messages from all topics"""
         self.running = True
-        async with asyncio.TaskGroup() as task_group:
-            for topic_key, consumer in self.consumers.items():
+        await self._start_observer_consumers()
+        try:
+            async with asyncio.TaskGroup() as task_group:
+                self._task_group = task_group
+                for topic_key, consumer in list(self.consumers.items()):
+                    task_group.create_task(
+                        self._supervise_consumer(topic_key, consumer),
+                        name=f"kafka_consumer_{topic_key}",
+                    )
                 task_group.create_task(
-                    self._supervise_consumer(topic_key, consumer),
-                    name=f"kafka_consumer_{topic_key}",
+                    self._batch_processor(), name="kafka_batch_flush"
                 )
-            task_group.create_task(self._batch_processor(), name="kafka_batch_flush")
+                if self.lag_refresh_interval_seconds > 0:
+                    task_group.create_task(
+                        self._lag_refresher(), name="kafka_lag_refresh"
+                    )
+        finally:
+            self._task_group = None
 
     async def _supervise_consumer(self, topic_key: str, consumer: AIOKafkaConsumer):
         """Restart a topic consumer loop when it exits unexpectedly."""
@@ -2579,16 +2738,15 @@ class KafkaConsumerManager:
         topic_name = self.topic_names_by_key.get(topic_key) or self.topics[topic_key]
         consumer = await self._create_consumer(topic_key, topic_name)
         self.consumers[topic_key] = consumer
-        await self._refresh_batch_backpressure(topic_key)
+        if topic_key in self.batch_buffer_states:
+            await self._refresh_batch_backpressure(topic_key)
         return consumer
 
     async def _run_consumer(self, topic_key: str, consumer: AIOKafkaConsumer):
         """Dispatch to the topic-specific consumer implementation."""
         handlers = {
             "queries": self._consume_queries,
-            "responses": self._consume_responses,
             "metrics": self._consume_metrics,
-            "errors": self._consume_errors,
             "requests_enriched": self._consume_requests_enriched,
             "analytics_model_metrics_1m": self._consume_analytics_model_metrics,
             "routing_guardrails": self._consume_routing_guardrails,
@@ -2599,9 +2757,53 @@ class KafkaConsumerManager:
             "routing_decisions": self._consume_routing_decisions,
         }
         handler = handlers.get(topic_key)
+        observed_topic = self.observer_consumer_keys.get(topic_key)
+        if handler is None and observed_topic is not None:
+            await self._consume_observed_events(topic_key, observed_topic, consumer)
+            return
         if handler is None:
             raise RuntimeError(f"No Kafka consumer handler for topic key {topic_key}")
         await handler(consumer)
+
+    async def _consume_observed_events(
+        self, consumer_key: str, topic_key: str, consumer: AIOKafkaConsumer
+    ):
+        """Feed one observed topic's events to its observers (observer group).
+
+        A record the observers cannot read is logged and skipped, never
+        dead-lettered: the sink group (or the policy materializer, for
+        requests_enriched) owns dead-lettering. With auto-commit (the
+        default) nothing is committed here; otherwise a commit lost to a
+        rebalance is logged and the loop carries on.
+        """
+        try:
+            async for message in consumer:
+                try:
+                    data = self._decode_message_value(message)
+                    await self._notify_observers(topic_key, data)
+                except Exception as e:
+                    PIPELINE_METRICS.consumer_errors.inc()
+                    logger.warning(
+                        "Skipping unreadable %s event at %s[%s]@%s: %s",
+                        topic_key,
+                        getattr(message, "topic", None),
+                        getattr(message, "partition", None),
+                        getattr(message, "offset", None),
+                        type(e).__name__,
+                    )
+                try:
+                    await self._commit_processed_message(consumer_key, message)
+                except _commit_lost_errors() as e:
+                    logger.warning(
+                        "Observer commit for %s was lost: %s",
+                        consumer_key,
+                        type(e).__name__,
+                    )
+                self._record_successful_consume(consumer_key, consumer, message)
+                PIPELINE_METRICS.messages_consumed.labels(topic=consumer_key).inc()
+        except Exception as e:
+            logger.error(f"{consumer_key} consumer error: {e}")
+            raise
 
     async def _consume_queries(self, consumer: AIOKafkaConsumer):
         """Consume query log messages"""
@@ -2648,32 +2850,6 @@ class KafkaConsumerManager:
             logger.error(f"Query consumer error: {e}")
             raise
 
-    async def _consume_responses(self, consumer: AIOKafkaConsumer):
-        """Consume response log messages"""
-        try:
-            async for message in consumer:
-                try:
-                    data = self._decode_message_value(message)
-                    # Process response data (for future analytics)
-                    logger.debug(f"Processed response: {data.get('query_id')}")
-                    await self._commit_processed_message("responses", message)
-                    self._record_successful_consume("responses", consumer, message)
-
-                    PIPELINE_METRICS.messages_consumed.labels(topic="responses").inc()
-
-                except Exception as e:
-                    await self._handle_processing_failure(
-                        "responses",
-                        message,
-                        e,
-                        stage="consume",
-                        batched=False,
-                    )
-
-        except Exception as e:
-            logger.error(f"Response consumer error: {e}")
-            raise
-
     async def _consume_metrics(self, consumer: AIOKafkaConsumer):
         """Consume system metrics messages"""
         try:
@@ -2708,36 +2884,15 @@ class KafkaConsumerManager:
             logger.error(f"Metrics consumer error: {e}")
             raise
 
-    async def _consume_errors(self, consumer: AIOKafkaConsumer):
-        """Consume error messages"""
-        try:
-            async for message in consumer:
-                try:
-                    data = self._decode_message_value(message)
-                    logger.error(f"System error logged: {data}")
-                    await self._commit_processed_message("errors", message)
-                    self._record_successful_consume("errors", consumer, message)
-
-                    PIPELINE_METRICS.messages_consumed.labels(topic="errors").inc()
-
-                except Exception as e:
-                    await self._handle_processing_failure(
-                        "errors",
-                        message,
-                        e,
-                        stage="consume",
-                        batched=False,
-                    )
-
-        except Exception as e:
-            logger.error(f"Error consumer error: {e}")
-            raise
-
     def register_observer(
         self, topic_key: str, callback: Callable[[Dict[str, Any]], Any]
     ):
-        """Register an observer for consumed stream events."""
+        """Register an observer for consumed stream events.
+
+        Registered while consuming, its topic's observer consumer starts now.
+        """
         self.observers.setdefault(topic_key, []).append(callback)
+        self._start_observer_while_running(topic_key)
 
     async def _notify_observers(self, topic_key: str, payload: Dict[str, Any]):
         """Forward a consumed event to any registered in-process observers."""
@@ -2750,15 +2905,22 @@ class KafkaConsumerManager:
                 logger.warning(f"Observer for {topic_key} failed: {e}")
 
     def _decode_message_value(self, message: Any) -> Dict[str, Any]:
-        """Decode a Kafka message payload without letting poison pills kill a task."""
+        """Decode a Kafka message payload without letting poison pills kill a task.
+
+        An event with an unsupported ``event_version`` raises, so the consume
+        loop dead-letters it and commits past it (A12b).
+        """
         value = getattr(message, "value", None)
         if isinstance(value, dict):
-            return value
-        if isinstance(value, bytes):
-            return json.loads(value.decode("utf-8"))
-        if isinstance(value, str):
-            return json.loads(value)
-        raise ValueError(f"Unsupported Kafka message payload type: {type(value)}")
+            data = value
+        elif isinstance(value, bytes):
+            data = json.loads(value.decode("utf-8"))
+        elif isinstance(value, str):
+            data = json.loads(value)
+        else:
+            raise ValueError(f"Unsupported Kafka message payload type: {type(value)}")
+        check_event_version(data)
+        return data
 
     def _kafka_event_metadata(self, message: Any) -> Dict[str, Any]:
         """Build stable idempotency metadata from Kafka coordinates."""
@@ -2835,6 +2997,9 @@ class KafkaConsumerManager:
             "error_message": redact_text(str(error))[:2000],
             "payload": _dead_letter_payload(getattr(message, "value", None), error),
         }
+        failure_reason = getattr(error, "reason", None)
+        if isinstance(failure_reason, str) and failure_reason:
+            payload["failure_reason"] = failure_reason
         topic = self._dead_letter_topic(topic_key, message)
         key = metadata["event_id"] or str(uuid.uuid4())
         send_and_wait = getattr(self.dlq_producer, "send_and_wait", None)
@@ -2891,9 +3056,17 @@ class KafkaConsumerManager:
         """Update consumer observability after a message is handled."""
         now = time.time()
         self.last_consumed_at[topic_key] = now
-        PIPELINE_METRICS.last_consumed_timestamp.labels(topic=topic_key).set(now)
-
         topic = getattr(message, "topic", None)
+        PIPELINE_METRICS.last_consumed_timestamp.labels(
+            topic=str(
+                topic
+                or self.topic_names_by_key.get(topic_key)
+                or self.topics.get(topic_key)
+                or ""
+            ),
+            topic_key=topic_key,
+        ).set(now)
+
         partition = getattr(message, "partition", None)
         offset = getattr(message, "offset", None)
         if topic is None or partition is None or offset is None:
@@ -2911,9 +3084,49 @@ class KafkaConsumerManager:
             PIPELINE_METRICS.consumer_lag.labels(
                 topic=topic,
                 partition=str(partition),
+                topic_key=topic_key,
             ).set(lag)
         except Exception as e:
             logger.debug(f"Failed to update Kafka consumer lag: {e}")
+
+    async def _lag_refresher(self) -> None:
+        while self.running:
+            await asyncio.sleep(self.lag_refresh_interval_seconds)
+            await self._refresh_consumer_lag()
+
+    async def _refresh_consumer_lag(self) -> None:
+        """Set lag = broker end offset - position for every assigned partition.
+
+        Lag recorded per consumed message freezes when a consumer stops;
+        this keeps it current. Failures only skip that consumer.
+        """
+        for consumer_key, consumer in list(self.consumers.items()):
+            try:
+                assignment = getattr(consumer, "assignment", None)
+                end_offsets = getattr(consumer, "end_offsets", None)
+                position = getattr(consumer, "position", None)
+                if not all(map(callable, (assignment, end_offsets, position))):
+                    continue
+                partitions = list(assignment() or ())
+                if not partitions:
+                    continue
+                ends = await asyncio.wait_for(
+                    end_offsets(partitions), timeout=self.lag_refresh_timeout_seconds
+                )
+                for tp in partitions:
+                    end = (ends or {}).get(tp)
+                    if end is None:
+                        continue
+                    current = await asyncio.wait_for(
+                        position(tp), timeout=self.lag_refresh_timeout_seconds
+                    )
+                    PIPELINE_METRICS.consumer_lag.labels(
+                        topic=str(tp.topic),
+                        partition=str(tp.partition),
+                        topic_key=consumer_key,
+                    ).set(max(0, int(end) - int(current)))
+            except Exception as e:
+                logger.debug(f"Failed to refresh Kafka lag for {consumer_key}: {e}")
 
     def is_healthy(self) -> bool:
         """Return whether all configured consumer supervisors are running."""
@@ -3097,30 +3310,14 @@ class KafkaConsumerManager:
         )
 
     async def _consume_requests_enriched(self, consumer: AIOKafkaConsumer):
-        """Consume request-side Flink enrichment events for observers."""
-        try:
-            async for message in consumer:
-                try:
-                    data = self._decode_message_value(message)
-                    await self._notify_observers("requests_enriched", data)
-                    await self._commit_processed_message("requests_enriched", message)
-                    self._record_successful_consume(
-                        "requests_enriched", consumer, message
-                    )
-                    PIPELINE_METRICS.messages_consumed.labels(
-                        topic="requests_enriched"
-                    ).inc()
-                except Exception as e:
-                    await self._handle_processing_failure(
-                        "requests_enriched",
-                        message,
-                        e,
-                        stage="consume",
-                        batched=False,
-                    )
-        except Exception as e:
-            logger.error(f"requests.enriched consumer error: {e}")
-            raise
+        """Consume request-side Flink enrichment events for observers.
+
+        Observer-only: unreadable events are skipped, since the policy
+        materializer dead-letters the same records.
+        """
+        await self._consume_observed_events(
+            "requests_enriched", "requests_enriched", consumer
+        )
 
     async def _consume_analytics_model_metrics(self, consumer: AIOKafkaConsumer):
         """Consume Flink model metrics window events."""
@@ -3135,7 +3332,6 @@ class KafkaConsumerManager:
                     await self._append_batched_row(
                         "analytics_model_metrics_1m", metric_entry, message
                     )
-                    await self._notify_observers("analytics_model_metrics_1m", data)
                     self._record_successful_consume(
                         "analytics_model_metrics_1m", consumer, message
                     )
@@ -3205,7 +3401,6 @@ class KafkaConsumerManager:
                         kafka_metadata=self._kafka_event_metadata(message),
                     )
                     await self._append_batched_row("alerts", alert_entry, message)
-                    await self._notify_observers("alerts", data)
                     self._record_successful_consume("alerts", consumer, message)
 
                     PIPELINE_METRICS.messages_consumed.labels(topic="alerts").inc()
@@ -3234,7 +3429,6 @@ class KafkaConsumerManager:
                     await self._append_batched_row(
                         "routing_guardrails", guardrail_entry, message
                     )
-                    await self._notify_observers("routing_guardrails", data)
                     self._record_successful_consume(
                         "routing_guardrails", consumer, message
                     )
@@ -3267,7 +3461,6 @@ class KafkaConsumerManager:
                     await self._append_batched_row(
                         "routing_policy_state", state_entry, message
                     )
-                    await self._notify_observers("routing_policy_state", data)
                     self._record_successful_consume(
                         "routing_policy_state", consumer, message
                     )
@@ -3490,7 +3683,12 @@ class KafkaConsumerManager:
 
     async def _commit_offsets(self, topic_key: str, offsets: Dict[TopicPartition, int]):
         """Commit explicit offsets for a topic when manual commits are enabled."""
-        if self.consumer_config.get("enable_auto_commit", False) or not offsets:
+        config = (
+            self.observer_consumer_config
+            if topic_key in self.observer_consumer_keys
+            else self.consumer_config
+        )
+        if config.get("enable_auto_commit", False) or not offsets:
             return
 
         consumer = self.consumers.get(topic_key)
@@ -3873,10 +4071,6 @@ class KafkaIngestionPipeline:
         await self.producer_manager.produce_metric(
             service, metric_name, metric_value, labels
         )
-
-    async def log_error(self, error_data: Dict[str, Any]):
-        """Log error through the pipeline"""
-        await self.producer_manager.produce_error(error_data)
 
     async def get_analytics(
         self,
