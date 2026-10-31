@@ -321,7 +321,7 @@ jobs:
 
       - name: Run the integration tests
         run: |
-          python -m pytest tests/test_integration_pipeline.py tests/test_analytics_dedupe.py tests/test_clickhouse_poison_batches.py tests/test_policy_pause_poll_kafka.py -v -rs | tee chat-integration.log
+          python -m pytest tests/test_integration_pipeline.py tests/test_analytics_dedupe.py tests/test_clickhouse_poison_batches.py tests/test_policy_pause_poll_kafka.py tests/test_observer_review2.py -v -rs | tee chat-integration.log
           # A missing variable or service would skip these tests silently; this job exists to run them.
           if grep -qE "[0-9]+ skipped" chat-integration.log; then echo "Integration tests were skipped" >&2; exit 1; fi
 

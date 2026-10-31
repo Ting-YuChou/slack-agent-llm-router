@@ -29,6 +29,15 @@ CHAT_INTEGRATION_TESTS = (
 )
 
 
+def _chat_gated_tests():
+    """Every test file that opts in to a real service through a CHAT_TEST_ variable."""
+    return sorted(
+        path.relative_to(ROOT).as_posix()
+        for path in (ROOT / "tests").glob("test_*.py")
+        if re.search(r'os\.environ(?:\[|\.get\()"CHAT_TEST_', path.read_text())
+    )
+
+
 def _jobs():
     workflow = (ROOT / ".github/workflows/tests.yml").read_text()
     return yaml.safe_load(workflow)["jobs"]
@@ -80,7 +89,11 @@ def test_chat_integration_job_runs_the_real_service_tests_against_pinned_images(
 
     env = job["env"]
     text = "\n".join(_runs(job))
-    for path in CHAT_INTEGRATION_TESTS:
+    gated = _chat_gated_tests()
+    assert set(CHAT_INTEGRATION_TESTS) - {"tests/test_integration_pipeline.py"} <= set(
+        gated
+    ), gated
+    for path in sorted(set(CHAT_INTEGRATION_TESTS) | set(gated)):
         assert path in text, f"{path} does not run"
         source = (ROOT / path).read_text()
         # Every opt-in variable the test reads is set by the job.
