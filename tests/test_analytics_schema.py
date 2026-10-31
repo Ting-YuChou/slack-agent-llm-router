@@ -313,3 +313,33 @@ def test_every_alter_from_before_the_generated_schema_is_still_issued():
 
     missing = [sql for sql in FC64233_ALTERS if _normalized(sql) not in generated]
     assert missing == []
+
+
+# The table layout lives in src/analytics_schema.py; config no longer
+# carries a second, unused copy.
+
+CONFIGS = ["config.yaml", "config.compose.yaml", "config.demo.yaml"]
+
+
+@pytest.mark.parametrize("name", CONFIGS)
+def test_configs_load_without_a_clickhouse_tables_block(name):
+    from pathlib import Path
+
+    import yaml
+
+    from src.utils.schema import PlatformConfig
+
+    path = Path(__file__).resolve().parents[1] / "config" / name
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    assert "tables" not in (raw.get("clickhouse") or {})
+    PlatformConfig.model_validate(raw)
+
+
+def test_an_older_config_with_a_tables_block_still_loads():
+    from src.utils.schema import ClickHouseConfig
+
+    config = ClickHouseConfig.model_validate({"tables": {"queries": {}}})
+
+    assert config.database == "llm_router"
+    assert "tables" not in ClickHouseConfig.model_fields
