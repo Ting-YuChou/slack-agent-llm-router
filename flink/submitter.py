@@ -151,6 +151,10 @@ def record_job_id(checkpoint_root: Path, slug: str, job_id: str) -> None:
         previous = state.get(_evicted_key(slug), [])
         merged = evicted + [i for i in previous if i not in evicted]
         state[_evicted_key(slug)] = merged[:EVICTED_HISTORY]
+    _write_state(checkpoint_root, state)
+
+
+def _write_state(checkpoint_root: Path, state: Mapping[str, List[str]]) -> None:
     path = _state_path(checkpoint_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
@@ -186,13 +190,15 @@ def prune_job_checkpoints(
     """Delete checkpoint directories of superseded runs; return what was deleted.
 
     Only runs this submitter recorded are candidates (its history and the
-    runs evicted from it). Each job keeps the directories of its ``keep``
-    newest recorded runs; its older runs go only once its newest run has
+    runs evicted from it, newest first). Each job keeps the directories of
+    its ``keep`` newest recorded runs, evicted ones included when ``keep``
+    exceeds the history; its older runs go only once its newest run has
     completed a checkpoint, so a NO_CLAIM restore source survives until the
     new run no longer needs it. Active jobs, directories of job ids the
     submitter never recorded, ``savepoints/``, the state file and anything
     that is not a 32-hex job id directory are never touched. ``keep <= 0``
-    disables pruning.
+    disables pruning. Evicted runs whose directories are gone are dropped
+    from the state file.
     """
     if keep <= 0:
         return []
@@ -203,10 +209,11 @@ def prune_job_checkpoints(
     deletable = set()
     for job in JOBS:
         history = state.get(job.slug, [])
-        protected.update(history[:keep])
+        evicted = state.get(_evicted_key(job.slug), [])
+        runs = history + [i for i in evicted if i not in history]
+        protected.update(runs[:keep])
         if history and _has_completed_checkpoint(root, history[0]):
-            deletable.update(history[keep:])
-            deletable.update(state.get(_evicted_key(job.slug), []))
+            deletable.update(runs[keep:])
     deletable -= protected
 
     try:
@@ -231,7 +238,28 @@ def prune_job_checkpoints(
             len(deleted),
             ", ".join(path.name for path in deleted),
         )
+    _forget_pruned_evicted_runs(root, deletable)
     return deleted
+
+
+def _forget_pruned_evicted_runs(root: Path, deletable: Iterable[str]) -> None:
+    """Drop prunable evicted ids whose directories no longer exist."""
+    gone = {job_id for job_id in deletable if not (root / job_id).exists()}
+    if not gone:
+        return
+    state = _read_state(root)
+    changed = False
+    for job in JOBS:
+        key = _evicted_key(job.slug)
+        evicted = state.get(key)
+        if not evicted:
+            continue
+        kept = [job_id for job_id in evicted if job_id not in gone]
+        if kept != evicted:
+            state[key] = kept
+            changed = True
+    if changed:
+        _write_state(root, state)
 
 
 def _fetch_json(url: str) -> Any:
