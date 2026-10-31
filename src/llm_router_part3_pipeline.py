@@ -394,8 +394,15 @@ def _without_attachment_names(slack_metadata: Any) -> Any:
     }
 
 
-def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
-    """Build the pre-inference event emitted by the API request path."""
+def build_request_raw_event(
+    query_request: QueryRequest,
+    classification: Optional[Tuple[str, float]] = None,
+) -> Dict[str, Any]:
+    """Build the pre-inference event emitted by the API request path.
+
+    `classification` is the (query type, confidence) the chat ingress got from
+    the router, if any (R13).
+    """
     # A Slack file's name can say what is in it (X6): Slack requests send
     # only each file's type and size. /route keeps its existing shape.
     from_slack = (query_request.metadata or {}).get("source") == "slack"
@@ -449,6 +456,10 @@ def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
         ),
         "attachments": attachments,
         "attachments_count": len(attachments),
+        # The router's classification when the ingress got one (R13); Flink
+        # keeps it instead of inferring its own type.
+        "query_type": classification[0] if classification else None,
+        "classifier_confidence": classification[1] if classification else None,
     }
 
 
@@ -510,14 +521,16 @@ def build_inference_completed_event(
         "finish_reason": inference_response.finish_reason,
         "provider_request_id": inference_response.provider_request_id,
         "latency_ms": inference_response.latency_ms,
-        # Where the time went: routing; the provider queue (not measured
-        # per request yet); time to first token (no streaming yet).
+        # Where the time went: routing; the ingress and provider queues;
+        # time to first token (no streaming yet).
         "routing_ms": (
             int(routing_ms)
             if isinstance(routing_ms, (int, float)) and not isinstance(routing_ms, bool)
             else None
         ),
-        "queue_wait_ms": None,
+        "queue_wait_ms": _uint_or_none(
+            getattr(inference_response, "queue_wait_ms", None)
+        ),
         "ttft_ms": None,
         "token_count_input": inference_response.token_count_input,
         "token_count_output": inference_response.token_count_output,
@@ -1387,13 +1400,17 @@ class KafkaProducerManager:
             )
         return send_result
 
-    async def produce_request_raw(self, query_request: QueryRequest):
+    async def produce_request_raw(
+        self,
+        query_request: QueryRequest,
+        classification: Optional[Tuple[str, float]] = None,
+    ):
         """Produce a pre-inference API request event."""
         return self._enqueue_message(
             "requests_raw",
             "requests.raw",
             key=query_request.user_id,
-            value=build_request_raw_event(query_request),
+            value=build_request_raw_event(query_request, classification=classification),
         )
 
     async def produce_inference_completed(

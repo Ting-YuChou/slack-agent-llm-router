@@ -11,9 +11,18 @@ import math
 import os
 import re
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, List, NamedTuple, NoReturn, Optional, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    NamedTuple,
+    NoReturn,
+    Optional,
+    Tuple,
+)
 
+from src import query_classifier
 from src.prompt_assembly import (
     SYSTEM_PROMPT,
     build_prompt_sections,
@@ -21,6 +30,7 @@ from src.prompt_assembly import (
 )
 from src.pricing import per_token, resolve_model_pricing
 from src.routing_features import build_routing_features
+from src.routing_rules import RoutingRule, RoutingRuleError
 from src.utils.metrics import ROUTER_METRICS
 from src.utils.schema import (
     ModelConfig,
@@ -37,15 +47,6 @@ from src.utils.schema import (
 
 logger = logging.getLogger(__name__)
 
-# QueryRequest.query allows 50,000 chars. A query longer than head + tail is
-# classified on its first and last chars only, so a request typed after a long
-# paste still counts.
-CLASSIFIER_HEAD_CHARS = 2000
-CLASSIFIER_TAIL_CHARS = 2000
-# Bounded gap between keywords: like the old ".*" it stops at a newline (and so
-# crosses dots in "utils.py" or "3.12"), but it spans at most 80 chars, so the
-# classifier patterns cannot backtrack catastrophically on long input.
-_GAP = r"[^\n]{0,80}"
 # Prompts longer than this are tokenized in a worker thread (about 3 ms of
 # tiktoken per 20k chars), so routing does not stall the event loop.
 THREADED_TOKENIZE_CHARS = 20_000
@@ -130,7 +131,6 @@ REJECT_TIER = "tier"
 # score; router.scoring.output_token_estimates overrides them.
 DEFAULT_OUTPUT_TOKEN_ESTIMATES: Dict[str, int] = {
     "general": 400,
-    "question_answering": 400,
     "translation": 500,
     "summarization": 500,
     "brainstorming": 700,
@@ -143,6 +143,20 @@ DEFAULT_OUTPUT_TOKEN_ESTIMATES: Dict[str, int] = {
     "creative_writing": 1200,
     "code_generation": 1200,
 }
+# Half-life of the recent_* model stats the score prefers (R13).
+DEFAULT_STATS_HALF_LIFE_SECONDS = 300.0
+# Requests' worth of prior pulling recent_success_rate toward the lifetime rate
+# (0.95 with no history), so one failure after an idle spell does not sink it.
+DEFAULT_STATS_PRIOR_WEIGHT = 3.0
+# The latency term is w * ref / (ref + avg). ref is chosen so the term at 1 s
+# equals the old max(0, w - avg / 100), i.e. w - 10, keeping its scale for the
+# default weights (20 -> 10, 30 with the low-latency bonus -> 20); it never
+# drops below 1 s, so the term never shrinks as the weight grows.
+LATENCY_TERM_AT_ONE_SECOND_LOSS = 10.0
+MIN_LATENCY_REFERENCE_MS = 1000.0
+# Latency assumed for a model with no successful request to measure.
+DEFAULT_MODEL_LATENCY_MS = 1000.0
+DEFAULT_MODEL_SUCCESS_RATE = 0.95
 # policy_cache.mode shadow (A1): the policy's context, stashed by
 # _get_policy_context, and the routing context with it applied.
 SHADOW_POLICY_CONTEXT_KEY = "shadow_policy_context"
@@ -181,288 +195,38 @@ class EligibleModels(NamedTuple):
         return reason
 
 
-@dataclass
-class RoutingRule:
-    """Routing rule for model selection"""
-
-    condition: str
-    models: List[str]
-    fallback: str
-    weight: float = 1.0
-
-    def matches(self, query_context: Dict[str, Any]) -> bool:
-        """Check if this rule matches the given query context"""
-        try:
-            # Simple condition evaluation (in production, use a more robust parser)
-            normalized_condition = re.sub(r"\bAND\b", "and", self.condition)
-            normalized_condition = re.sub(r"\bOR\b", "or", normalized_condition)
-            normalized_condition = re.sub(r"\bNOT\b", "not", normalized_condition)
-            return eval(normalized_condition, {"__builtins__": {}}, query_context)
-        except Exception:
-            return False
-
-
 class QueryClassifier:
-    """Advanced query classification using multiple techniques"""
+    """The router's typed view of src.query_classifier, which Flink shares."""
 
     def __init__(self, semantic_enabled: bool = True):
+        # Deprecated no-op (R16c): no semantic model is loaded any more. Kept
+        # so configs that set classifier.semantic_enabled still load.
         self.semantic_enabled = semantic_enabled
         self.tokenizer = None
         self.model = None
-        self.tfidf_vectorizer = None
-        self.patterns = self._init_patterns()
+        # The shared rules' patterns by type (the regex performance tests run
+        # them on untruncated input).
         self._compiled_patterns: Dict[QueryType, List[re.Pattern[str]]] = {
-            query_type: [re.compile(pattern) for pattern in patterns]
-            for query_type, patterns in self.patterns.items()
+            QueryType(query_type): [pattern for pattern, _weight in rules]
+            for query_type, rules in query_classifier.COMPILED_RULES.items()
         }
+        # Router readiness (ModelRouter.is_healthy) waits for initialize();
+        # classification itself needs none.
         self._is_initialized = False
 
-    def _init_patterns(self) -> Dict[QueryType, List[str]]:
-        """Initialize regex patterns for query classification"""
-        return {
-            QueryType.CODE_GENERATION: [
-                rf"\b(write|create|generate|implement|build)\b{_GAP}\b(function|class|code|script|program)\b",
-                rf"\b(python|javascript|java|cpp|rust|go)\b{_GAP}\b(code|function|script)\b",
-                r"def\s+\w+|class\s+\w+|function\s+\w+",
-                r"\b(algorithm|implementation|coding)\b",
-            ],
-            QueryType.CODE_ANALYSIS: [
-                rf"\b(analyze|review|debug|fix|optimize|refactor)\b{_GAP}\b(code|function|script)\b",
-                rf"\b(bug|error|issue|problem)\b{_GAP}\b(code|function)\b",
-                r"\b(complexity|performance|optimization)\b",
-                rf"what{_GAP}does{_GAP}this{_GAP}code{_GAP}do",
-            ],
-            QueryType.ANALYSIS: [
-                r"\b(analyze|examination|study|research|investigate)\b",
-                r"\b(data analysis|statistical analysis|trend analysis)\b",
-                r"\b(compare|contrast|evaluate|assess)\b",
-                r"\b(insights|patterns|trends|correlation)\b",
-            ],
-            QueryType.SUMMARIZATION: [
-                r"\b(summarize|summary|brief|overview|synopsis)\b",
-                r"\b(key points|main ideas|highlights)\b",
-                r"tldr|tl;dr",
-                r"\b(condense|compress|shorten)\b",
-            ],
-            QueryType.CREATIVE_WRITING: [
-                r"\b(story|poem|essay|article|blog)\b",
-                r"\b(creative|imaginative|fictional)\b",
-                rf"\b(write|compose|craft)\b{_GAP}\b(story|poem|article)\b",
-                r"\b(character|plot|narrative|dialogue)\b",
-            ],
-            QueryType.BRAINSTORMING: [
-                r"\b(brainstorm|ideas|suggestions|alternatives)\b",
-                r"\b(creative thinking|ideation|innovation)\b",
-                rf"what are some{_GAP}ideas",
-                r"help me think of",
-            ],
-            QueryType.PLANNING: [
-                r"\b(plan|strategy|roadmap|timeline|schedule)\b",
-                r"\b(project planning|strategic planning)\b",
-                rf"how to{_GAP}plan",
-                r"\b(steps|phases|milestones)\b",
-            ],
-            QueryType.MATH: [
-                r"\b(calculate|solve|equation|formula|mathematics)\b",
-                r"\b(algebra|calculus|geometry|statistics)\b",
-                r"[0-9]+\s*[\+\-\*/\^]\s*[0-9]+",
-                r"\b(derivative|integral|probability)\b",
-            ],
-            QueryType.REASONING: [
-                r"\b(reasoning|logic|logical|deduce|infer)\b",
-                r"\b(because|therefore|hence|thus)\b",
-                rf"why{_GAP}is{_GAP}that|how{_GAP}can{_GAP}we{_GAP}conclude",
-                r"\b(premise|conclusion|argument)\b",
-            ],
-            QueryType.WEB_RESEARCH: [
-                r"\b(latest|today|current|recent|news|breaking|now)\b",
-                rf"\b(price|stock|release|launched|announced|update)\b{_GAP}\b(today|latest|current|recent|now|202[0-9])\b",
-                r"\b(search|look up|web|internet|online)\b",
-                r"\b(what happened|what is happening)\b",
-                r"(查詢網頁|搜尋|最新|現在|今天|新聞|即時)",
-            ],
-        }
-
     async def initialize(self):
-        """Initialize the classifier with pre-trained models"""
-        if not self.semantic_enabled:
-            self._is_initialized = True
-            logger.info("Semantic query classification is disabled")
-            return
-
-        try:
-            # Load a lightweight sentence transformer for semantic analysis
-            from sentence_transformers import SentenceTransformer
-            from sklearn.feature_extraction.text import TfidfVectorizer
-
-            self.model = SentenceTransformer("all-MiniLM-L6-v2")
-            self.tfidf_vectorizer = TfidfVectorizer(
-                max_features=5000, stop_words="english", ngram_range=(1, 2)
+        """Mark the classifier ready; the rules need no loading."""
+        if self.semantic_enabled:
+            logger.info(
+                "router.classifier.semantic_enabled is deprecated and ignored; "
+                "classification is rule based"
             )
-            self._is_initialized = True
-            logger.info("Query classifier initialized successfully")
-        except Exception as e:
-            logger.warning(f"Failed to initialize advanced classifier: {e}")
-            logger.info("Falling back to pattern-based classification")
-            self._is_initialized = True
+        self._is_initialized = True
 
     def classify_query(self, query: str) -> Tuple[QueryType, float]:
         """Classify query type with confidence score"""
-        if not self._is_initialized:
-            asyncio.create_task(self.initialize())
-
-        text = self._classification_text(query)
-
-        # Pattern-based classification
-        pattern_scores = {}
-        for query_type, patterns in self._compiled_patterns.items():
-            score = 0.0
-            for pattern in patterns:
-                score += len(pattern.findall(text))
-            if score > 0:
-                pattern_scores[query_type] = score / len(patterns)
-
-        # Keyword-based scoring
-        keyword_scores = self._keyword_classification(text)
-
-        # Combine scores
-        combined_scores = {}
-        for query_type in QueryType:
-            pattern_score = pattern_scores.get(query_type, 0)
-            keyword_score = keyword_scores.get(query_type, 0)
-            combined_scores[query_type] = pattern_score * 0.6 + keyword_score * 0.4
-
-        # Find best match
-        if combined_scores:
-            best_type = max(combined_scores.keys(), key=lambda x: combined_scores[x])
-            confidence = combined_scores[best_type]
-
-            # Minimum confidence threshold
-            if confidence > 0.1:
-                return best_type, min(confidence, 1.0)
-
-        return QueryType.GENERAL, 0.5
-
-    def _classification_text(self, query: str) -> str:
-        """Lowercased text to classify: the whole query, or its head and tail."""
-        if len(query) <= CLASSIFIER_HEAD_CHARS + CLASSIFIER_TAIL_CHARS:
-            return query.lower()
-        # The newline keeps a pattern gap or a word from spanning the cut.
-        head = query[:CLASSIFIER_HEAD_CHARS]
-        tail = query[-CLASSIFIER_TAIL_CHARS:]
-        return f"{head}\n{tail}".lower()
-
-    def _keyword_classification(self, query: str) -> Dict[QueryType, float]:
-        """Keyword-based classification"""
-        keywords = {
-            QueryType.CODE_GENERATION: [
-                "code",
-                "function",
-                "class",
-                "implement",
-                "write",
-                "create",
-                "develop",
-            ],
-            QueryType.CODE_ANALYSIS: [
-                "debug",
-                "fix",
-                "analyze",
-                "review",
-                "optimize",
-                "refactor",
-            ],
-            QueryType.ANALYSIS: [
-                "analyze",
-                "study",
-                "research",
-                "examine",
-                "evaluate",
-                "assess",
-            ],
-            QueryType.SUMMARIZATION: [
-                "summarize",
-                "summary",
-                "brief",
-                "overview",
-                "key points",
-            ],
-            QueryType.CREATIVE_WRITING: [
-                "story",
-                "poem",
-                "creative",
-                "write",
-                "compose",
-                "narrative",
-            ],
-            QueryType.BRAINSTORMING: [
-                "brainstorm",
-                "ideas",
-                "suggestions",
-                "think",
-                "creative",
-            ],
-            QueryType.PLANNING: [
-                "plan",
-                "strategy",
-                "roadmap",
-                "timeline",
-                "schedule",
-                "steps",
-            ],
-            QueryType.MATH: [
-                "calculate",
-                "solve",
-                "equation",
-                "formula",
-                "math",
-                "number",
-            ],
-            QueryType.REASONING: [
-                "why",
-                "because",
-                "reasoning",
-                "logic",
-                "explain",
-                "understand",
-            ],
-            QueryType.WEB_RESEARCH: [
-                "latest",
-                "today",
-                "current",
-                "recent",
-                "news",
-                "search",
-                "web",
-                "internet",
-                "online",
-                "price",
-                "release",
-                "now",
-                "最新",
-                "現在",
-                "今天",
-                "新聞",
-                "搜尋",
-                "查詢網頁",
-            ],
-        }
-
-        query_lower = query.lower()
-        query_words = set(query_lower.split())
-        scores = {}
-
-        for query_type, type_keywords in keywords.items():
-            matches = 0
-            for keyword in type_keywords:
-                if " " in keyword or any(ord(char) > 127 for char in keyword):
-                    matches += 1 if keyword.lower() in query_lower else 0
-                else:
-                    matches += 1 if keyword.lower() in query_words else 0
-            if matches > 0:
-                scores[query_type] = matches / len(type_keywords)
-
-        return scores
+        query_type, confidence = query_classifier.classify(query)
+        return QueryType(query_type), confidence
 
 
 # CJK ideographs, kana, hangul and full-width forms: tokenizers spend about one
@@ -590,7 +354,12 @@ class ModelRouter:
         "javascript",
     )
 
-    def __init__(self, config: Dict[str, Any], policy_cache: Optional[Any] = None):
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        policy_cache: Optional[Any] = None,
+        stats_clock: Callable[[], float] = time.monotonic,
+    ):
         self.config = config
         self.policy_cache = policy_cache
         self.models: Dict[str, ModelConfig] = {}
@@ -643,14 +412,24 @@ class ModelRouter:
                 "brainstorming",
                 "planning",
                 "translation",
-                "question_answering",
             ],
         }
         self.scoring.update(dict(config.get("scoring", {})))
 
-        # Performance tracking
+        # Performance tracking: lifetime totals plus time-decayed recent_* values
+        # whose weight halves every stats_half_life_seconds (R13).
         self.model_stats: Dict[str, Dict[str, float]] = {}
-        self.request_cache: Dict[str, RoutingDecision] = {}
+        self.stats_half_life_seconds = float(
+            config.get("stats_half_life_seconds", DEFAULT_STATS_HALF_LIFE_SECONDS)
+        )
+        if self.stats_half_life_seconds <= 0:
+            raise ValueError("router.stats_half_life_seconds must be positive")
+        self.stats_prior_weight = float(
+            config.get("stats_prior_weight", DEFAULT_STATS_PRIOR_WEIGHT)
+        )
+        if self.stats_prior_weight < 0:
+            raise ValueError("router.stats_prior_weight must not be negative")
+        self._stats_clock = stats_clock
         self._initialized = False
         self._missing_model_credentials: Dict[str, str] = {}
 
@@ -674,18 +453,18 @@ class ModelRouter:
         logger.info("Model router initialized successfully")
 
     def is_healthy(self) -> bool:
-        """Return whether the router is ready to serve traffic."""
+        """Return whether the router is ready to serve traffic.
+
+        The policy cache is best-effort and not consulted: routing works
+        without it, and readiness reports it under degraded_services (O4).
+        """
         default_model_loaded = self.default_model in self.models
         classifier_ready = getattr(self.classifier, "_is_initialized", False)
-        policy_cache_healthy = True
-        if self.policy_cache and hasattr(self.policy_cache, "is_healthy"):
-            policy_cache_healthy = self.policy_cache.is_healthy()
         return (
             self._initialized
             and classifier_ready
             and bool(self.models)
             and default_model_loaded
-            and policy_cache_healthy
         )
 
     def tokenizer_status(self) -> Dict[str, Any]:
@@ -755,17 +534,36 @@ class ModelRouter:
             and resolve_model_pricing(self.models, model_name) is None
         ]
 
-    def _load_routing_rules(self):
-        """Load routing rules from configuration"""
-        rules_config = self.config.get("routing_rules", [])
+    def _load_routing_rules(self) -> None:
+        """Load routing rules from configuration.
 
-        for rule_config in rules_config:
+        An invalid rule (bad syntax, an unknown name, a missing field) raises
+        RoutingRuleError: a rule that silently never matched hid config typos.
+        """
+        rules_config = self.config.get("routing_rules", []) or []
+
+        for index, rule_config in enumerate(rules_config):
+            if not isinstance(rule_config, dict):
+                raise RoutingRuleError(
+                    f"router.routing_rules[{index}] must be a mapping"
+                )
+            if "weight" in rule_config:
+                # RoutingRule.weight was never read; tolerate old configs.
+                rule_config = {k: v for k, v in rule_config.items() if k != "weight"}
+                logger.warning(
+                    "router.routing_rules[%d]: 'weight' is deprecated and "
+                    "ignored; remove it",
+                    index,
+                )
             try:
                 rule = RoutingRule(**rule_config)
-                self.routing_rules.append(rule)
-                logger.debug(f"Loaded routing rule: {rule.condition}")
-            except Exception as e:
-                logger.error(f"Failed to load routing rule: {e}")
+            except (RoutingRuleError, TypeError) as error:
+                # TypeError: a missing or unknown field in the rule entry.
+                raise RoutingRuleError(
+                    f"router.routing_rules[{index}]: {error}"
+                ) from None
+            self.routing_rules.append(rule)
+            logger.debug("Loaded routing rule: %s", rule.condition)
 
     async def route_query(self, request: QueryRequest) -> RoutingDecision:
         """Main routing logic - selects the best model for a query"""
@@ -1155,19 +953,16 @@ class ModelRouter:
     async def _build_query_context(self, request: QueryRequest) -> Dict[str, Any]:
         """Build comprehensive context for routing decisions"""
         # Classify query type
-        query_type, classification_confidence = self._classify_request(request)
+        (
+            query_type,
+            classification_confidence,
+            web_search_allowed,
+            needs_web_search,
+        ) = self._effective_classification(request)
 
         # Count the approximate provider prompt, not just the user query.
         token_count = await self._request_token_count(request)
         metadata = request.metadata or {}
-        web_search_allowed = self._web_search_allowed(request)
-        needs_web_search = self._request_needs_web_search(
-            request,
-            query_type,
-            web_search_allowed,
-        )
-        if needs_web_search:
-            query_type = QueryType.WEB_RESEARCH
         routing_features = build_routing_features(
             self._build_routing_feature_payload(
                 request=request,
@@ -1235,6 +1030,32 @@ class ModelRouter:
     def _routing_memo(self, request: QueryRequest) -> Optional[Dict[Any, Any]]:
         memo = getattr(request, "_routing_memo", None)
         return memo if isinstance(memo, dict) else None
+
+    def classify_request(self, request: QueryRequest) -> Tuple[QueryType, float]:
+        """The query type routing uses, and the classifier's confidence.
+
+        This is the classifier's type with the web search override routing
+        applies (a required web_search tool or metadata.enable_web_search
+        makes it web_research). The chat ingress calls it before publishing
+        requests.raw; the classification is memoized, so routing reuses it.
+        """
+        query_type, confidence, _allowed, _needs = self._effective_classification(
+            request
+        )
+        return query_type, confidence
+
+    def _effective_classification(
+        self, request: QueryRequest
+    ) -> Tuple[QueryType, float, bool, bool]:
+        """(query type, confidence, web search allowed, web search needed)."""
+        query_type, confidence = self._classify_request(request)
+        web_search_allowed = self._web_search_allowed(request)
+        needs_web_search = self._request_needs_web_search(
+            request, query_type, web_search_allowed
+        )
+        if needs_web_search:
+            query_type = QueryType.WEB_RESEARCH
+        return query_type, confidence, web_search_allowed, needs_web_search
 
     def _classify_request(self, request: QueryRequest) -> Tuple[QueryType, float]:
         memo = self._routing_memo(request)
@@ -1785,13 +1606,15 @@ class ModelRouter:
         sources = str(policy.get("policy_source") or "").split("+")
         return "unavailable" in sources
 
-    @staticmethod
-    def _routing_view(context: Dict[str, Any]) -> Tuple[Any, ...]:
+    def _routing_view(self, context: Dict[str, Any]) -> Tuple[Any, ...]:
         """What routing reads from a context that a policy can change.
 
         Two contexts with the same view route the same request alike, so
         shadow mode need not replay a policy whose context matches the base.
-        Sensitivities only matter when "high"; session hotness when "hot".
+        Scoring reads sensitivities only when "high" and session hotness only
+        when "hot". Rules count by outcome (RT2): a policy value that changes
+        no rule's match, such as a default the base context simply lacks,
+        does not force a replay.
         """
 
         def names(key: str) -> Tuple[str, ...]:
@@ -1822,6 +1645,7 @@ class ModelRouter:
             str(context.get("session_hotness") or "").lower() == "hot",
             context.get("query_complexity"),
             str(context.get("policy_query_type") or "").lower(),
+            tuple(rule.matches(context) for rule in self.routing_rules),
         )
 
     def _policy_cache_mode(self) -> str:
@@ -2304,7 +2128,6 @@ class ModelRouter:
             "reasoning": ["reasoning", "analysis", "general"],
             "planning": ["reasoning", "analysis", "general"],
             "brainstorming": ["creative", "writing", "general"],
-            "question_answering": ["reasoning", "analysis", "general"],
             "summarization": ["analysis", "writing", "general"],
             "creative_writing": ["writing", "creative", "general"],
             "math": ["reasoning", "analysis", "general"],
@@ -2394,9 +2217,7 @@ class ModelRouter:
         model_config = self.models[model_name]
 
         # Performance-based scoring
-        model_stats = self.model_stats.get(model_name, {})
-        success_rate = model_stats.get("success_rate", 0.95)
-        avg_latency = model_stats.get("avg_latency", 1000)  # ms
+        success_rate, avg_latency = self._scoring_stats(model_name)
 
         error_sensitivity = str(context.get("error_sensitivity", "")).lower()
         reliability_weight = float(self.scoring["reliability_weight"])
@@ -2420,8 +2241,7 @@ class ModelRouter:
 
         return {
             "reliability": success_rate * reliability_weight,
-            # Speed weight (lower latency = higher score)
-            "latency": max(0, latency_weight - avg_latency / 100),
+            "latency": self._latency_score(latency_weight, float(avg_latency)),
             "cost": self._cost_score(model_config, context),
             "priority": (10 - model_config.priority)
             * float(self.scoring["priority_weight"]),
@@ -2430,11 +2250,17 @@ class ModelRouter:
         }
 
     def _unit_rates(self, model_config: ModelConfig) -> Tuple[float, float]:
-        """(input, output) USD per token: pricing, else cost_per_token for both."""
+        """(input, output) USD per token, as inference bills them (RT1).
+
+        Pricing when it resolves; otherwise a self-hosted (vLLM) model costs
+        nothing and a paid model falls back to cost_per_token for both.
+        """
         pricing = resolve_model_pricing(self.models, model_config.name)
         if pricing is None and model_config.pricing is not None:
             pricing = model_config.pricing
         if pricing is None:
+            if model_config.provider.lower() == "vllm":
+                return 0.0, 0.0
             return model_config.cost_per_token, model_config.cost_per_token
         return per_token(pricing.input), per_token(pricing.output)
 
@@ -2737,6 +2563,56 @@ class ModelRouter:
 
         return self._request_cost(model_config, context)
 
+    @staticmethod
+    def _latency_score(weight: float, avg_latency_ms: float) -> float:
+        """Lower latency scores higher, smoothly, on the old term's scale.
+
+        w * ref / (ref + avg) with ref = max(1000, 100 * (w - 10)): w at 0 ms,
+        w - 10 at 1 s for w >= 20 like the old max(0, w - avg / 100), never 0
+        for a slow model, and never lower for a larger weight.
+        """
+        weight = max(0.0, weight)
+        reference_ms = max(
+            MIN_LATENCY_REFERENCE_MS,
+            100.0 * (weight - LATENCY_TERM_AT_ONE_SECOND_LOSS),
+        )
+        return weight * reference_ms / (reference_ms + max(0.0, avg_latency_ms))
+
+    def _scoring_stats(self, model_name: str) -> Tuple[float, float]:
+        """(success rate, latency ms) to score a model with, as of now.
+
+        Decayed sums from update_model_stats are decayed again to the stats
+        clock's now, so a model nobody has sent traffic to drifts back toward
+        its prior instead of keeping an outage's rate forever. With recent
+        stats but no measured latency (only fast failures so far) the default
+        latency is used, not the lifetime average those failures dragged down.
+        Stats set without decayed sums use recent_* if present, else lifetime.
+        """
+        stats = self.model_stats.get(model_name, {})
+        if "recent_weight" not in stats or "recent_updated_at" not in stats:
+            return (
+                stats.get(
+                    "recent_success_rate",
+                    stats.get("success_rate", DEFAULT_MODEL_SUCCESS_RATE),
+                ),
+                stats.get(
+                    "recent_latency_ms",
+                    stats.get("avg_latency", DEFAULT_MODEL_LATENCY_MS),
+                ),
+            )
+        elapsed = max(0.0, self._stats_clock() - float(stats["recent_updated_at"]))
+        decay = 0.5 ** (elapsed / self.stats_half_life_seconds)
+        prior = self.stats_prior_weight
+        prior_rate = float(stats.get("recent_prior_rate", DEFAULT_MODEL_SUCCESS_RATE))
+        weight = float(stats["recent_weight"]) * decay
+        successes = float(stats.get("recent_success_weight", 0.0)) * decay
+        if weight + prior > 0:
+            success_rate = (successes + prior * prior_rate) / (weight + prior)
+        else:
+            success_rate = prior_rate
+        latency = float(stats.get("recent_latency_ms", DEFAULT_MODEL_LATENCY_MS))
+        return success_rate, latency
+
     def update_model_stats(self, model_name: str, success: bool, latency_ms: int):
         """Update model performance statistics"""
         if model_name not in self.model_stats:
@@ -2749,6 +2625,7 @@ class ModelRouter:
             }
 
         stats = self.model_stats[model_name]
+        prior_success_rate = float(stats["success_rate"])
         stats["total_requests"] += 1
         stats["total_latency"] += latency_ms
 
@@ -2758,6 +2635,39 @@ class ModelRouter:
         # Update derived metrics
         stats["success_rate"] = stats["successful_requests"] / stats["total_requests"]
         stats["avg_latency"] = stats["total_latency"] / stats["total_requests"]
+
+        # Time-decayed sums: older requests lose half their weight every
+        # half-life, so a recent outage shows within minutes.
+        now = self._stats_clock()
+        elapsed = max(0.0, now - stats.get("recent_updated_at", now))
+        decay = 0.5 ** (elapsed / self.stats_half_life_seconds)
+        stats["recent_updated_at"] = now
+        stats["recent_weight"] = stats.get("recent_weight", 0.0) * decay + 1.0
+        stats["recent_success_weight"] = stats.get(
+            "recent_success_weight", 0.0
+        ) * decay + (1.0 if success else 0.0)
+        # A prior of stats_prior_weight requests at the lifetime rate before
+        # this one: a lone failure after an idle spell moves it, not sinks it.
+        # recent_success_rate is the value as of this update; scoring decays
+        # the sums again to its own now (_scoring_stats).
+        stats["recent_prior_rate"] = prior_success_rate
+        prior = self.stats_prior_weight
+        stats["recent_success_rate"] = (
+            stats["recent_success_weight"] + prior * prior_success_rate
+        ) / (stats["recent_weight"] + prior)
+        # Latency from successes, and from failures slower than the success
+        # average (timeouts): a fast 4xx or 429 is not a fast model, but a
+        # model that starts timing out is a slow one.
+        latency_reference = stats.get("recent_latency_ms", DEFAULT_MODEL_LATENCY_MS)
+        stats["recent_latency_weight"] = stats.get("recent_latency_weight", 0.0) * decay
+        stats["recent_latency_total"] = stats.get("recent_latency_total", 0.0) * decay
+        if success or latency_ms > latency_reference:
+            stats["recent_latency_weight"] += 1.0
+            stats["recent_latency_total"] += latency_ms
+        if stats["recent_latency_weight"] > 0:
+            stats["recent_latency_ms"] = (
+                stats["recent_latency_total"] / stats["recent_latency_weight"]
+            )
 
     def get_model_info(self, model_name: str) -> Optional[Dict[str, Any]]:
         """Get comprehensive information about a model"""
