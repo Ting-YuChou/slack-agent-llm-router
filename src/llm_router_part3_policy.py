@@ -23,6 +23,7 @@ from prometheus_client import Counter, Gauge
 import redis.asyncio as redis
 
 from src.event_version import UnsupportedEventVersionError, is_supported_event_version
+from src.kafka_topics import dead_letter_topic_name, dlq_enabled
 from src.redaction import redact_text
 from src.utils.metrics import PIPELINE_METRICS
 from src.utils.bounded_state import BoundedTTLMap
@@ -1476,15 +1477,14 @@ class PolicyMaterializer:
                 consumer_config.get("supervisor_max_backoff_seconds", 30.0),
             )
         )
-        # Malformed events go to <topic><suffix> when a DLQ is enabled;
-        # without one they are skipped. Either way the offset moves on.
+        # Malformed events go to a DLQ when one is enabled; without one they
+        # are skipped. Either way the offset moves on. The DLQ is on when the
+        # shared kafka setting says so (the one provisioning reads, so the
+        # topic exists); policy_cache.consumer.dlq_enabled can only turn it
+        # off (D7).
         dlq_config = dict(self.kafka_config.get("dlq", {}) or {})
-        self.dlq_enabled = bool(
-            materializer_config.get("dlq_enabled", dlq_config.get("enabled", False))
-        )
-        self.dlq_topic_suffix = str(dlq_config.get("topic_suffix", ".dlq"))
-        self.dead_letter_topics = dict(
-            self.kafka_config.get("dead_letter_topics", {}) or {}
+        self.dlq_enabled = dlq_enabled(self.kafka_config) and bool(
+            materializer_config.get("dlq_enabled", True)
         )
         self.dlq_send_timeout_seconds = float(
             dlq_config.get("send_timeout_seconds", 10.0)
@@ -1551,6 +1551,7 @@ class PolicyMaterializer:
             value_serializer=lambda value: json.dumps(value).encode("utf-8"),
             key_serializer=lambda key: key.encode("utf-8") if key else None,
             acks="all",
+            enable_idempotence=True,
         )
         try:
             await producer.start()
@@ -1835,17 +1836,8 @@ class PolicyMaterializer:
         return sorted(str(key) for key in value) if isinstance(value, dict) else []
 
     def _dead_letter_topic(self, topic_key: str, source_topic: str) -> str:
-        """The DLQ topic, resolved like the pipeline sink's.
-
-        kafka.dead_letter_topics[topic_key], then kafka.topics[<key>_dlq],
-        then <source topic><kafka.dlq.topic_suffix>.
-        """
-        if self.dead_letter_topics.get(topic_key):
-            return str(self.dead_letter_topics[topic_key])
-        configured = self.topics.get(f"{topic_key}_dlq")
-        if configured:
-            return str(configured)
-        return f"{source_topic}{self.dlq_topic_suffix}"
+        """The DLQ topic, resolved by the helper the sink and provisioning use."""
+        return dead_letter_topic_name(self.kafka_config, topic_key, source_topic)
 
     async def _publish_dead_letter(
         self, topic_key: str, message: Any, error: Exception
