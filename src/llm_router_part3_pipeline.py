@@ -204,6 +204,24 @@ def _dead_letter_payload(value: Any, error: BaseException) -> Any:
     }
 
 
+# Fields that change when the same policy state is re-emitted or re-read.
+_POLICY_STATE_VOLATILE_KEYS = frozenset(
+    {"emitted_at", "event_id", "kafka_topic", "kafka_partition", "kafka_offset"}
+)
+
+
+def _policy_state_content_hash(data: Dict[str, Any]) -> str:
+    """A short hash of a policy state's content, without its volatile fields."""
+    content = {
+        key: value
+        for key, value in data.items()
+        if key not in _POLICY_STATE_VOLATILE_KEYS
+    }
+    text = json.dumps(content, sort_keys=True, default=str)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
 def _alert_payload(data: Dict[str, Any]) -> Any:
     if data.get("event_type") == ROUTING_GUARDRAIL_EVENT_TYPE:
         # Built by Flink from metric windows; get_routing_guardrails reads
@@ -2978,10 +2996,25 @@ class KafkaConsumerManager:
         kafka_metadata: Optional[Dict[str, Any]] = None,
     ) -> RoutingPolicyStateEntry:
         """Convert a routing.policy_state payload to a ClickHouse row."""
+        scope_type = str(data.get("scope_type", "unknown") or "unknown")
+        scope_key = str(data.get("scope_key", "") or "")
+        # Event time, which a replay leaves unchanged; emitted_at for older
+        # states without it.
+        timestamp = _parse_datetime(
+            data.get("latest_event_at") or data.get("emitted_at")
+        )
+        metadata = dict(kafka_metadata or {})
+        # A replay has a new offset and emitted_at but the same state: key the
+        # row on what it describes. The content hash keeps apart distinct
+        # states with one latest_event_at (counts drop as old buckets expire).
+        metadata["event_id"] = (
+            f"policy_state:{scope_type}:{scope_key}:{timestamp.isoformat()}:"
+            f"{_policy_state_content_hash(data)}"
+        )
         return RoutingPolicyStateEntry(
-            timestamp=_parse_datetime(data.get("emitted_at")),
-            scope_type=str(data.get("scope_type", "unknown") or "unknown"),
-            scope_key=str(data.get("scope_key", "") or ""),
+            timestamp=timestamp,
+            scope_type=scope_type,
+            scope_key=scope_key,
             user_id=str(data.get("user_id", "") or ""),
             session_id=str(data.get("session_id", "") or ""),
             user_tier=str(data.get("user_tier", "") or ""),
@@ -3003,7 +3036,7 @@ class KafkaConsumerManager:
             avoid_models=list(data.get("avoid_models", []) or []),
             avoid_providers=list(data.get("avoid_providers", []) or []),
             payload_json=_json_text(data, default=str),
-            **(kafka_metadata or {}),
+            **metadata,
         )
 
     async def _consume_requests_enriched(self, consumer: AIOKafkaConsumer):
