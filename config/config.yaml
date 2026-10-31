@@ -277,6 +277,7 @@ inference:
       - general
       - code_generation
       - code_analysis
+      - translation
       max_input_tokens: 2048
       max_output_tokens: 1024
       disallow_attachments: true

@@ -774,6 +774,7 @@ class ProviderModelFallbackConfig(ConfigModel):
             QueryType.GENERAL.value,
             QueryType.CODE_GENERATION.value,
             QueryType.CODE_ANALYSIS.value,
+            QueryType.TRANSLATION.value,
         ]
     )
     max_input_tokens: int = Field(2048, ge=1)
