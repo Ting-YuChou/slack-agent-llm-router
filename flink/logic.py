@@ -8,7 +8,10 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from src.event_version import is_supported_event_version
+from src.event_version import (
+    EVENT_SCHEMA_VERSION as EVENT_SCHEMA_VERSION,
+    is_supported_event_version,
+)
 from src.redaction import context_summary
 from src.routing_features import (
     CODE_KEYWORDS as CODE_KEYWORDS,
@@ -22,7 +25,6 @@ from src.routing_features import (
     infer_query_type as infer_query_type,
 )
 
-EVENT_SCHEMA_VERSION = "1.0"
 REQUESTS_RAW_EVENT = "requests.raw"
 REQUESTS_ENRICHED_EVENT = "requests.enriched"
 INFERENCE_COMPLETED_EVENT = "inference.completed"

@@ -230,9 +230,9 @@ class InferenceCompletedMapper(MapFunction):
         if self.unsupported_version_counter is not None:
             self.unsupported_version_counter.inc()
         logger.warning(
-            "Dropping %s event with unsupported event_version %r",
+            "Dropping %s event with an unsupported event_version (type %s)",
             "inference.completed",
-            str(data.get("event_version"))[:32],
+            type(data.get("event_version")).__name__,
         )
         return dropped
 
