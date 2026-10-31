@@ -735,224 +735,6 @@ class InferenceContext:
     cached_response: bool = False
 
 
-class ContextCompressor:
-    """Advanced context compression for long sequences"""
-
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.enabled = bool(config.get("enabled", True))
-        self.compression_ratio = config.get("compression_ratio", 0.3)
-        self.max_context_tokens = config.get("max_context_tokens", 100000)
-        self.method = config.get("method", "semantic_graph")
-        self.tokenizer = None
-
-    async def initialize(self):
-        """Initialize compression components"""
-        if not self.enabled:
-            logger.info("Context compression is disabled")
-            return
-
-        try:
-            # Load tokenizer for token counting
-            from transformers import AutoTokenizer
-
-            self.tokenizer = AutoTokenizer.from_pretrained("microsoft/DialoGPT-medium")
-            logger.info("Context compressor initialized")
-        except Exception as e:
-            logger.warning(f"Failed to initialize context compressor: {e}")
-
-    async def compress_context(self, context: str, target_length: int) -> str:
-        """Compress context to target length while preserving key information"""
-        if not self.enabled:
-            return context
-        if not context or len(context) < target_length:
-            return context
-
-        if self.method == "semantic_graph":
-            return await self._semantic_graph_compression(context, target_length)
-        elif self.method == "sketch_based":
-            return await self._sketch_based_compression(context, target_length)
-        elif self.method == "attention_based":
-            return await self._attention_based_compression(context, target_length)
-        else:
-            return self._sliding_window_compression(context, target_length)
-
-    async def _semantic_graph_compression(
-        self, context: str, target_length: int
-    ) -> str:
-        """Semantic graph-based compression preserving key relationships"""
-        # Split into sentences
-        sentences = self._split_sentences(context)
-        if len(sentences) <= 3:
-            return context
-
-        # Score sentences by importance
-        sentence_scores = await self._score_sentences(sentences)
-
-        # Select top sentences maintaining order
-        selected_indices = sorted(
-            sorted(
-                range(len(sentences)), key=lambda i: sentence_scores[i], reverse=True
-            )[: max(3, int(len(sentences) * self.compression_ratio))]
-        )
-
-        compressed = " ".join(sentences[i] for i in selected_indices)
-
-        # Ensure target length
-        if len(compressed) > target_length:
-            compressed = compressed[:target_length] + "..."
-
-        return compressed
-
-    async def _sketch_based_compression(self, context: str, target_length: int) -> str:
-        """Sketch-based compression using key phrase extraction"""
-        # Extract key phrases and entities
-        key_phrases = self._extract_key_phrases(context)
-
-        # Build compressed version focusing on key information
-        sections = context.split("\n\n")
-        important_sections = []
-
-        for section in sections:
-            if any(phrase.lower() in section.lower() for phrase in key_phrases):
-                important_sections.append(section)
-
-        compressed = "\n\n".join(important_sections)
-
-        if len(compressed) > target_length:
-            compressed = compressed[:target_length] + "..."
-
-        return compressed or context[:target_length]
-
-    async def _attention_based_compression(
-        self, context: str, target_length: int
-    ) -> str:
-        """Attention-based compression (simplified implementation)"""
-        # This would ideally use a trained attention model
-        # For now, implement a heuristic approach
-
-        paragraphs = context.split("\n\n")
-        if len(paragraphs) <= 2:
-            return context[:target_length]
-
-        # Score paragraphs by length and keyword density
-        paragraph_scores = []
-        important_keywords = self._extract_keywords(context)
-
-        for para in paragraphs:
-            score = len(para)  # Length score
-            score += sum(para.lower().count(kw) for kw in important_keywords) * 50
-            paragraph_scores.append(score)
-
-        # Select top paragraphs
-        num_select = max(2, int(len(paragraphs) * self.compression_ratio))
-        top_indices = sorted(
-            range(len(paragraphs)), key=lambda i: paragraph_scores[i], reverse=True
-        )[:num_select]
-
-        # Maintain original order
-        selected_paragraphs = [paragraphs[i] for i in sorted(top_indices)]
-        compressed = "\n\n".join(selected_paragraphs)
-
-        if len(compressed) > target_length:
-            compressed = compressed[:target_length] + "..."
-
-        return compressed
-
-    def _sliding_window_compression(self, context: str, target_length: int) -> str:
-        """Simple sliding window compression"""
-        if len(context) <= target_length:
-            return context
-
-        # Take beginning and end, skip middle
-        keep_start = target_length // 2
-        keep_end = target_length - keep_start - 20  # Reserve space for separator
-
-        start_part = context[:keep_start]
-        end_part = context[-keep_end:]
-
-        return f"{start_part}\n...[COMPRESSED]...\n{end_part}"
-
-    def _split_sentences(self, text: str) -> List[str]:
-        """Split text into sentences"""
-        import re
-
-        sentences = re.split(r"[.!?]+", text)
-        return [s.strip() for s in sentences if s.strip()]
-
-    async def _score_sentences(self, sentences: List[str]) -> List[float]:
-        """Score sentences by importance"""
-        scores = []
-
-        # Simple heuristic scoring
-        for sentence in sentences:
-            score = 0
-
-            # Length factor (prefer medium-length sentences)
-            length = len(sentence.split())
-            if 10 <= length <= 30:
-                score += 2
-            elif length > 30:
-                score += 1
-
-            # Keyword density
-            keywords = ["important", "key", "main", "crucial", "significant", "primary"]
-            score += sum(sentence.lower().count(kw) for kw in keywords)
-
-            # Position factor (first and last sentences often important)
-            if sentences.index(sentence) in [0, len(sentences) - 1]:
-                score += 1
-
-            scores.append(score)
-
-        return scores
-
-    def _extract_key_phrases(self, text: str) -> List[str]:
-        """Extract key phrases from text"""
-        # Simple implementation - in production, use NLP libraries
-        words = text.lower().split()
-
-        # Find repeated phrases
-        phrases = {}
-        for i in range(len(words) - 1):
-            phrase = " ".join(words[i : i + 2])
-            phrases[phrase] = phrases.get(phrase, 0) + 1
-
-        # Return top phrases
-        return sorted(phrases.keys(), key=phrases.get, reverse=True)[:10]
-
-    def _extract_keywords(self, text: str) -> List[str]:
-        """Extract important keywords"""
-        words = text.lower().split()
-
-        # Filter out common words
-        stop_words = {
-            "the",
-            "a",
-            "an",
-            "and",
-            "or",
-            "but",
-            "in",
-            "on",
-            "at",
-            "to",
-            "for",
-            "of",
-            "with",
-            "by",
-        }
-        keywords = [w for w in words if len(w) > 3 and w not in stop_words]
-
-        # Count frequency
-        word_count = {}
-        for word in keywords:
-            word_count[word] = word_count.get(word, 0) + 1
-
-        # Return top keywords
-        return sorted(word_count.keys(), key=word_count.get, reverse=True)[:15]
-
-
 class ResponseCache:
     """Intelligent response caching system"""
 
@@ -2617,7 +2399,6 @@ class InferenceEngine:
         self.rag_service = rag_service
         self.admission_controller = admission_controller
         self.providers = {}
-        self.context_compressor = ContextCompressor(config.get("compression", {}))
         self.cache = ResponseCache(config.get("cache", {}))
         single_flight_config = config.get("single_flight")
         if single_flight_config is None:
@@ -2646,9 +2427,6 @@ class InferenceEngine:
     async def initialize(self):
         """Initialize all providers and components"""
         logger.info("Initializing inference engine...")
-
-        # Initialize context compressor
-        await self.context_compressor.initialize()
 
         # Initialize cache
         await self.cache.initialize()
@@ -2721,25 +2499,6 @@ class InferenceEngine:
         """Return whether the inference engine is ready to process requests."""
         return self._initialized and bool(self.providers)
 
-    async def _compress_request_context_if_needed(self, request: QueryRequest) -> bool:
-        """Canonicalize long context before cache keys are generated."""
-        if not (
-            request.context
-            and len(request.context) > self.context_compressor.max_context_tokens
-        ):
-            return False
-
-        original_length = len(request.context)
-        target_length = int(original_length * self.context_compressor.compression_ratio)
-        request.context = await self.context_compressor.compress_context(
-            request.context,
-            target_length,
-        )
-        logger.info(
-            f"Compressed context from {original_length} to {len(request.context)} chars"
-        )
-        return True
-
     async def _get_cached_inference_response(
         self, request: QueryRequest, model_name: str
     ) -> Optional[InferenceResponse]:
@@ -2811,10 +2570,7 @@ class InferenceEngine:
             model_name = routing_decision.selected_model
             routed_enrichment = _enrichment_snapshot(request)
 
-            # Step 2: Context compression before cache lookup keeps keys stable.
-            compressed_context = await self._compress_request_context_if_needed(request)
-
-            # Step 3: Optionally enrich school-document requests with RAG context.
+            # Step 2: Optionally enrich school-document requests with RAG context.
             # Retrieval gets a share of the time left, so its own outcome
             # handling runs; the request deadline is only the backstop.
             rag_result = await self._within_request_deadline(
@@ -2846,7 +2602,7 @@ class InferenceEngine:
             )
             model_name = routing_decision.selected_model
 
-            # Step 4: Optionally enrich current-info requests with web search.
+            # Step 3: Optionally enrich current-info requests with web search.
             web_search_result = await self._within_request_deadline(
                 self._run_web_search_if_needed(
                     request,
@@ -2857,7 +2613,7 @@ class InferenceEngine:
                 stage="web_search",
             )
 
-            # Step 4b: RAG and web context came after routing; re-check that
+            # Step 3b: RAG and web context came after routing; re-check that
             # the enriched prompt still fits the model, re-routing if not.
             routing_decision = await self._fit_enriched_prompt(
                 request,
@@ -2867,7 +2623,7 @@ class InferenceEngine:
             )
             model_name = routing_decision.selected_model
 
-            # Step 5: Check full-response cache.
+            # Step 4: Check full-response cache.
             response = await self._get_cached_inference_response(request, model_name)
             if response:
                 logger.info(f"Cache hit for request {request_id}")
@@ -2878,7 +2634,7 @@ class InferenceEngine:
                 )
                 return response
 
-            # Step 6: Generate response, falling back to local models for cloud outages
+            # Step 5: Generate response, falling back to local models for cloud outages
             (
                 response,
                 model_name,
@@ -2889,7 +2645,6 @@ class InferenceEngine:
                 execution_budget=execution_budget,
                 started_calls=started_calls,
             )
-            response.compressed_context = compressed_context
             response.request_id = request.request_id
             response.queue_wait_ms = request_queue_wait_ms(request)
             self._attach_rag_result(response, rag_result)
@@ -2897,7 +2652,7 @@ class InferenceEngine:
 
             response_complete = self._flag_incomplete_response(request, response)
 
-            # Step 7: Cache response; truncated, filtered or empty answers are
+            # Step 6: Cache response; truncated, filtered or empty answers are
             # returned but not cached, so a retry can do better.
             if (
                 response_complete
@@ -3707,7 +3462,7 @@ class InferenceEngine:
                 started_calls=started_calls,
             )
         if execution_budget.remaining_seconds <= 0:
-            # Routing, compression, image prep or the cache lookup used the
+            # Routing, image prep or the cache lookup used the
             # whole deadline: no model or provider is to blame.
             raise RequestStageDeadlineError(
                 "request deadline reached before the model call"
@@ -4849,7 +4604,6 @@ class InferenceEngine:
             "inference_engine": "healthy",
             "providers": provider_health,
             "cache_enabled": self.cache.enabled,
-            "compression_enabled": self.context_compressor.config.get("enabled", True),
             "web_search_enabled": bool(
                 self.web_search_tool and self.web_search_tool.enabled
             ),

@@ -808,13 +808,6 @@ class ProviderEndpointConfig(ConfigModel):
     )
 
 
-class CompressionConfig(ConfigModel):
-    enabled: bool = False
-    max_context_tokens: int = Field(100_000, ge=1)
-    compression_ratio: float = Field(0.3, gt=0.0, le=1.0)
-    method: str = "semantic_graph"
-
-
 class CacheConfig(ConfigModel):
     enabled: bool = False
     backend: str = "memory"
@@ -898,7 +891,6 @@ class InferenceConfig(ConfigModel):
     vllm: ProviderEndpointConfig = Field(default_factory=ProviderEndpointConfig)
     openai: ProviderEndpointConfig = Field(default_factory=ProviderEndpointConfig)
     anthropic: ProviderEndpointConfig = Field(default_factory=ProviderEndpointConfig)
-    compression: CompressionConfig = Field(default_factory=CompressionConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
     batching: BatchingConfig = Field(default_factory=BatchingConfig)
     single_flight: SingleFlightConfig = Field(default_factory=SingleFlightConfig)
@@ -1347,7 +1339,6 @@ class DevelopmentConfig(ConfigModel):
 
 
 class FeatureFlagsConfig(ConfigModel):
-    context_compression: bool = True
     semantic_caching: bool = True
     multi_modal: bool = False
     function_calling: bool = True

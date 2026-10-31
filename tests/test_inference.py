@@ -16,7 +16,6 @@ from src.admission import (
 from src.llm_router_part2_inference import (
     AnthropicProvider,
     BatchProcessor,
-    ContextCompressor,
     InferenceEngine,
     OpenAIProvider,
     ResponseCache,
@@ -1402,22 +1401,6 @@ class TestResponseCache:
 
 class TestInferenceEngine:
     @pytest.mark.asyncio
-    async def test_disabled_compression_does_not_import_transformers(self, monkeypatch):
-        real_import = builtins.__import__
-
-        def guarded_import(name, *args, **kwargs):
-            if name == "transformers":
-                raise AssertionError("transformers must not be imported")
-            return real_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", guarded_import)
-        compressor = ContextCompressor({"enabled": False})
-
-        await compressor.initialize()
-
-        assert compressor.tokenizer is None
-
-    @pytest.mark.asyncio
     async def test_initialize_only_registers_providers_used_by_router_models(self):
         router = MagicMock()
         router.models = {
@@ -1460,7 +1443,6 @@ class TestInferenceEngine:
             },
             router,
         )
-        engine.context_compressor.initialize = AsyncMock()
         engine.cache.initialize = AsyncMock()
 
         with (
@@ -1508,7 +1490,6 @@ class TestInferenceEngine:
     async def test_initialize_skips_vllm_when_endpoint_not_configured(self):
         router = MagicMock()
         engine = InferenceEngine({"vllm": {}}, router)
-        engine.context_compressor.initialize = AsyncMock()
         engine.cache.initialize = AsyncMock()
 
         await engine.initialize()
@@ -1544,13 +1525,11 @@ class TestInferenceEngine:
         )
         engine.cache.get_cached_response = AsyncMock(return_value=None)
         engine.cache.cache_response = AsyncMock()
-        engine.context_compressor.compress_context = AsyncMock(return_value="short ctx")
 
         request = sample_query_request.model_copy(update={"context": "x" * 32})
         response = await engine.process_query(request)
 
         assert response.response_text == "generated response"
-        assert request.context == "short ctx"
         router.update_model_stats.assert_called_once()
         engine.cache.cache_response.assert_awaited_once()
         cached_payload = engine.cache.cache_response.await_args.args[1]
@@ -2011,46 +1990,6 @@ class TestInferenceEngine:
         assert response.cached is True
         assert admission.provider_calls == []
         assert admission.releases == []
-
-    @pytest.mark.asyncio
-    async def test_process_query_checks_cache_after_context_compression(
-        self,
-        inference_config,
-        sample_query_request,
-    ):
-        router = MagicMock()
-        router.route_query = AsyncMock(
-            return_value=SimpleNamespace(selected_model="gpt-5")
-        )
-        router.get_model_info.return_value = {"config": {"provider": "openai"}}
-
-        engine = InferenceEngine(inference_config, router)
-        engine.context_compressor.compress_context = AsyncMock(return_value="short ctx")
-        seen_contexts = []
-        engine.cache.generate_cache_key = MagicMock(
-            side_effect=lambda request, _model: seen_contexts.append(request.context)
-            or "compressed-key"
-        )
-        engine.cache.get_cached_response = AsyncMock(
-            return_value={
-                "response_text": "from compressed cache",
-                "model_name": "gpt-5",
-                "provider": "openai",
-                "token_count_input": 3,
-                "token_count_output": 7,
-                "total_tokens": 10,
-                "latency_ms": 5,
-                "tokens_per_second": 200.0,
-                "cost_usd": 0.0,
-                "cached": False,
-            }
-        )
-
-        request = sample_query_request.model_copy(update={"context": "x" * 32})
-        response = await engine.process_query(request)
-
-        assert response.cached is True
-        assert seen_contexts == ["short ctx"]
 
     @staticmethod
     def _stale_cached_payload(**overrides):

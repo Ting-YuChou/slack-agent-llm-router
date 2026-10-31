@@ -66,8 +66,6 @@ inference:
     enabled: false
   vllm:
     enabled: false
-  compression:
-    enabled: false
   cache:
     enabled: false
     backend: memory
@@ -165,7 +163,6 @@ security:
     enabled: false
 
 features:
-  context_compression: false
   semantic_caching: false
   multi_modal: false
   function_calling: false

@@ -217,11 +217,6 @@ inference:
       pricing:
         cache_creation_input_multiplier: 1.25
         cache_read_input_multiplier: 0.1
-  compression:
-    enabled: true
-    max_context_tokens: 100000
-    compression_ratio: 0.3
-    method: semantic_graph
   cache:
     enabled: true
     backend: redis
@@ -884,7 +879,6 @@ development:
   mock_external_apis: false
 
 features:
-  context_compression: true
   semantic_caching: true
   multi_modal: false
   function_calling: true
