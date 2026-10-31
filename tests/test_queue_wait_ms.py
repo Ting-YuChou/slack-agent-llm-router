@@ -295,8 +295,11 @@ async def test_a_failed_queue_wait_counts_when_the_fallback_answers(
 async def test_single_flight_followers_report_the_leaders_scheduler_wait(
     inference_response_factory,
 ):
-    engine, _producer = _engine(inference_response_factory, leases=(0.03,))
+    engine, _producer = _engine(inference_response_factory)
     engine.single_flight.enabled = True
+    engine.scheduler.acquire = AsyncMock(
+        side_effect=_slow_queue(0.03, _leases(0.03)[0])
+    )
 
     async def slow_answer(_request, _model_name):
         await asyncio.sleep(0.05)
@@ -314,7 +317,67 @@ async def test_single_flight_followers_report_the_leaders_scheduler_wait(
     assert engine.providers["openai"].generate_response.await_count == 1
     assert engine.scheduler.acquire.await_count == 1
     assert leader.queue_wait_ms == 35
-    assert follower.queue_wait_ms == 39
+    # It joined at once, so it shares (nearly) all 30 ms of the queue wait.
+    assert 30 <= follower.queue_wait_ms <= 39
+
+
+@pytest.mark.asyncio
+async def test_a_follower_is_charged_only_the_queue_wait_it_overlapped(
+    inference_response_factory,
+):
+    engine, _producer = _engine(inference_response_factory)
+    engine.single_flight.enabled = True
+    acquires = []
+
+    async def queued_acquire(**_kwargs):
+        acquires.append(1)
+        await asyncio.sleep(0.2)
+        return _leases(0.2)[0]
+
+    async def slow_answer(_request, _model_name):
+        await asyncio.sleep(0.2)
+        return inference_response_factory()
+
+    engine.scheduler.acquire = queued_acquire
+    engine.providers["openai"].generate_response = AsyncMock(side_effect=slow_answer)
+    leader, early, late = _request(), _request(), _request()
+
+    async def join(request, delay):
+        await asyncio.sleep(delay)
+        return await engine._execute_model_request(request, "gpt-5")
+
+    await asyncio.gather(join(leader, 0.0), join(early, 0.1), join(late, 0.3))
+
+    assert len(acquires) == 1
+    assert engine.providers["openai"].generate_response.await_count == 1
+    assert request_queue_wait_ms(leader) == 200
+    # Joined 100 ms into the leader's 200 ms queue wait.
+    assert 60 <= request_queue_wait_ms(early) <= 140
+    # Joined after the lease was granted: no queue wait of its own.
+    assert request_queue_wait_ms(late) == 0
+
+
+@pytest.mark.asyncio
+async def test_followers_of_an_unscheduled_leader_report_no_wait(
+    inference_response_factory,
+):
+    engine, _producer = _engine(inference_response_factory)
+    engine.single_flight.enabled = True
+    engine.scheduler.enabled = False
+
+    async def slow_answer(_request, _model_name):
+        await asyncio.sleep(0.05)
+        return inference_response_factory()
+
+    engine.providers["openai"].generate_response = AsyncMock(side_effect=slow_answer)
+
+    leader, follower = await asyncio.gather(
+        engine.process_query(_request()), engine.process_query(_request())
+    )
+
+    assert engine.providers["openai"].generate_response.await_count == 1
+    assert leader.queue_wait_ms is None
+    assert follower.queue_wait_ms is None
 
 
 def test_ingress_wait_does_not_fragment_the_response_cache_key():
