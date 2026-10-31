@@ -683,6 +683,45 @@ async def _await_within(
     return await asyncio.wait_for(awaitable, timeout=max(0.0, time_limit_seconds))
 
 
+INGRESS_QUEUE_WAIT_METADATA_KEY = "ingress_queue_wait_ms"
+
+
+def _number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return max(0.0, float(value))
+
+
+def _add_scheduler_wait(request: Any, wait_seconds: Any) -> None:
+    """Add one provider-scheduler lease wait to the request's total (T2)."""
+    wait = _number(wait_seconds)
+    if wait is None:
+        return
+    previous = _number(getattr(request, "_scheduler_wait_seconds", None)) or 0.0
+    try:
+        request._scheduler_wait_seconds = previous + wait
+    except (AttributeError, TypeError, ValueError):
+        logger.debug("Cannot record the scheduler wait on %r", type(request))
+
+
+def request_queue_wait_ms(request: Any) -> Optional[int]:
+    """Ingress queue wait plus scheduler lease waits; None when neither is known.
+
+    The Slack bot sets metadata ingress_queue_wait_ms; /route strips it from
+    client metadata (it is not in CLIENT_METADATA_KEYS).
+    """
+    metadata = getattr(request, "metadata", None)
+    ingress_ms = (
+        _number(metadata.get(INGRESS_QUEUE_WAIT_METADATA_KEY))
+        if isinstance(metadata, dict)
+        else None
+    )
+    scheduler_seconds = _number(getattr(request, "_scheduler_wait_seconds", None))
+    if ingress_ms is None and scheduler_seconds is None:
+        return None
+    return int(round((ingress_ms or 0.0) + (scheduler_seconds or 0.0) * 1000))
+
+
 @dataclass
 class InferenceContext:
     """Context information for inference requests"""
@@ -2730,6 +2769,7 @@ class InferenceEngine:
                 "attempts": 0,
                 # The answer is to this request, not to the one cached.
                 "request_id": request.request_id,
+                "queue_wait_ms": request_queue_wait_ms(request),
             }
         )
 
@@ -2851,6 +2891,7 @@ class InferenceEngine:
             )
             response.compressed_context = compressed_context
             response.request_id = request.request_id
+            response.queue_wait_ms = request_queue_wait_ms(request)
             self._attach_rag_result(response, rag_result)
             self._attach_web_search_result(response, web_search_result)
 
@@ -2869,7 +2910,8 @@ class InferenceEngine:
                 await self.cache.cache_response(
                     cache_key,
                     response.model_dump(
-                        mode="json", exclude={"provider_request_id", "request_id"}
+                        mode="json",
+                        exclude={"provider_request_id", "request_id", "queue_wait_ms"},
                     ),
                 )
 
@@ -2944,6 +2986,7 @@ class InferenceEngine:
                 finish_reason="error",
                 attempts=len(set(started_calls)),
                 request_id=request_id,
+                queue_wait_ms=request_queue_wait_ms(request),
             )
             # The caller keeps the "error" provider sentinel; analytics get the
             # failed model's real provider so outages count against it.
@@ -3544,6 +3587,7 @@ class InferenceEngine:
             tool_latency_ms=rag_result.latency_ms,
             finish_reason="rag_no_hits",
             request_id=request.request_id,
+            queue_wait_ms=request_queue_wait_ms(request),
         )
 
     def _should_run_web_search(
@@ -4159,6 +4203,9 @@ class InferenceEngine:
         provider = self._get_provider_for_model(model_name)
         if not provider:
             raise ValueError(f"No provider available for model: {model_name}")
+        # Lease waits add up on the caller's request: the capped copy below
+        # lives only for this model's call.
+        caller_request = request
         request = self._request_within_output_cap(request, model_name)
 
         model_info = self.router.get_model_info(model_name) or {}
@@ -4192,6 +4239,9 @@ class InferenceEngine:
                 attempt_timeout_seconds=attempt_timeout_seconds,
                 fallback_reserve_seconds=fallback_reserve_seconds,
                 reserve_attempts=reserve_attempts,
+                on_queue_wait=lambda seconds: _add_scheduler_wait(
+                    caller_request, seconds
+                ),
             )
 
         return await self.single_flight.run(

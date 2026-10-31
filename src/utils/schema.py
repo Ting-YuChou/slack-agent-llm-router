@@ -144,6 +144,8 @@ class QueryRequest(BaseModel):
     # can match per-query settings (reasoning effort) to how it was routed.
     _routing_features: Optional[Any] = PrivateAttr(default=None)
     _routing_query_type: Optional[str] = PrivateAttr(default=None)
+    # Provider-scheduler lease waits of this request's attempts (T2).
+    _scheduler_wait_seconds: Optional[float] = PrivateAttr(default=None)
 
     # Required fields
     query: str = Field(..., min_length=1, max_length=50000)
@@ -239,6 +241,11 @@ class InferenceResponse(BaseModel):
     # Performance metrics
     latency_ms: int = Field(ge=0)
     tokens_per_second: float = Field(ge=0.0)
+    # Time this request spent queued: the Slack bot's ingress queue
+    # (metadata ingress_queue_wait_ms) plus provider-scheduler lease waits
+    # summed over every attempt, fallbacks included. None when neither was
+    # measured. Never cached: a cache hit reports its own request's wait.
+    queue_wait_ms: Optional[int] = Field(default=None, ge=0)
 
     # Cost tracking
     cost_usd: float = Field(ge=0.0)

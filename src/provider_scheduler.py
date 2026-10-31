@@ -517,6 +517,7 @@ class ProviderCapacityScheduler:
         attempt_timeout_seconds: Optional[float] = None,
         fallback_reserve_seconds: float = 0.0,
         reserve_attempts: int = 0,
+        on_queue_wait: Optional[Callable[[float], None]] = None,
     ) -> Any:
         """Run a non-streaming provider call under scheduler control.
 
@@ -534,6 +535,8 @@ class ProviderCapacityScheduler:
         the request could give it (see _circuit_timeout_window): one left a
         sliver by earlier steps (a slow RAG step, say) says nothing about
         the provider.
+
+        ``on_queue_wait`` gets each acquired lease's wait in seconds.
         """
         if not self.enabled:
             self._record_decision(provider, model_name, "allowed", "disabled")
@@ -597,6 +600,8 @@ class ProviderCapacityScheduler:
                         provider=provider,
                         estimated_input_tokens=estimated_input_tokens,
                     )
+                    if on_queue_wait is not None:
+                        on_queue_wait(lease.wait_seconds)
                     if not budget.consume_attempt():
                         budget.ensure_available()
                     local_attempt += 1
