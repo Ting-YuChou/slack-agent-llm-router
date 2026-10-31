@@ -13,6 +13,7 @@ This is the unified entry point that orchestrates all system components:
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import multiprocessing as mp
@@ -112,6 +113,23 @@ def _with_request_id(result: Any, request_id: str) -> Any:
     if isinstance(result, InferenceResponse) and result.request_id != request_id:
         return result.model_copy(update={"request_id": request_id})
     return result
+
+
+def _accepts_keyword(function: Any, name: str) -> bool:
+    """Whether `function` takes keyword `name` (or **kwargs)."""
+    try:
+        parameters = inspect.signature(function).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        or (
+            parameter.name == name
+            and parameter.kind
+            in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        )
+        for parameter in parameters
+    )
 
 
 class ChatIngress:
@@ -1304,8 +1322,9 @@ class LLMRouterPlatform:
     ):
         """Best-effort publication of pre-inference API events.
 
-        `classification` is passed on only when there is one, so producers
-        that take just the request keep working.
+        `classification` is passed on only when there is one and the
+        producer accepts it, so producers that take just the request keep
+        getting the event (without the type).
         """
         producer = self.services.get("event_producer")
         if producer is None:
@@ -1316,7 +1335,9 @@ class LLMRouterPlatform:
             return
 
         try:
-            if classification is None:
+            if classification is None or not _accepts_keyword(
+                publish_method, "classification"
+            ):
                 await publish_method(query_request)
             else:
                 await publish_method(query_request, classification=classification)

@@ -190,3 +190,18 @@ def test_build_request_raw_event_takes_the_classification_explicitly():
     assert event["query_type"] == "summarization"
     assert event["classifier_confidence"] == pytest.approx(0.8)
     assert not hasattr(request, "_query_classification")
+
+
+@pytest.mark.asyncio
+async def test_a_request_only_producer_still_gets_the_event(
+    tmp_path, router_config, patched_platform_deps
+):
+    router = _router(router_config)
+    platform, _producer = _platform(tmp_path, router)
+    producer = DummyEventProducer({})  # produce_request_raw(self, request)
+    platform.services["event_producer"] = producer
+    request = QueryRequest(query="Translate this into German", user_id="u1")
+
+    await main.ChatIngress(platform).process(request)
+
+    assert producer.request_events == [request]
