@@ -7,8 +7,9 @@ inform task type and complexity, but it must not imply urgency by itself.
 
 from __future__ import annotations
 
-import re
 from typing import Any, Dict
+
+from src.query_classifier import classify as classify_query
 
 EXPLICIT_LOW_LATENCY_SLA_VALUES = {"low", "interactive"}
 
@@ -26,106 +27,6 @@ CODE_KEYWORDS = [
     "traceback",
     "refactor",
     "bug",
-]
-
-QUERY_TYPE_RULES = [
-    (
-        "code_analysis",
-        [
-            "debug",
-            "fix this code",
-            "review this code",
-            "refactor",
-            "stack trace",
-            "traceback",
-            "optimize this function",
-        ],
-    ),
-    (
-        "code_generation",
-        [
-            "write a",
-            "implement",
-            "build a",
-            "create a function",
-            "generate code",
-            "script",
-            "class ",
-            "def ",
-            "```",
-        ],
-    ),
-    (
-        "translation",
-        [
-            "translate",
-            "translation",
-            "convert this to english",
-            "convert this to chinese",
-        ],
-    ),
-    (
-        "summarization",
-        [
-            "summarize",
-            "summary",
-            "tldr",
-            "tl;dr",
-            "brief overview",
-        ],
-    ),
-    (
-        "brainstorming",
-        [
-            "brainstorm",
-            "ideas",
-            "suggestions",
-            "alternatives",
-        ],
-    ),
-    (
-        "planning",
-        [
-            "plan",
-            "roadmap",
-            "milestones",
-            "timeline",
-            "strategy",
-        ],
-    ),
-    (
-        "math",
-        [
-            "calculate",
-            "equation",
-            "derivative",
-            "integral",
-            "probability",
-        ],
-    ),
-    (
-        "reasoning",
-        [
-            "why",
-            "reason through",
-            "step by step",
-            "root cause",
-            "tradeoff",
-            "deduce",
-        ],
-    ),
-    (
-        "analysis",
-        [
-            "analyze",
-            "investigate",
-            "evaluate",
-            "assess",
-            "compare",
-            "architecture",
-            "incident report",
-        ],
-    ),
 ]
 
 HIGH_REASONING_QUERY_TYPES = {
@@ -214,19 +115,10 @@ def estimate_query_tokens(query_text: str, context: str = "") -> int:
 
 
 def infer_query_type(query_text: str) -> str:
-    """Infer a coarse query type without depending on the API router runtime."""
-    normalized_query = (query_text or "").strip().lower()
-    if not normalized_query:
+    """The router's query type for a request whose event carries none (R13)."""
+    if not (query_text or "").strip():
         return "general"
-
-    for query_type, rules in QUERY_TYPE_RULES:
-        if any(rule in normalized_query for rule in rules):
-            return query_type
-
-    if re.search(r"\b(def|class|function)\b", normalized_query):
-        return "code_generation"
-
-    return "general"
+    return classify_query(query_text)[0]
 
 
 def calculate_query_complexity(

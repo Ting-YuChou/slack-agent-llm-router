@@ -4335,7 +4335,7 @@ class InferenceEngine:
                         QueryType.GENERAL.value,
                         QueryType.CODE_GENERATION.value,
                         QueryType.CODE_ANALYSIS.value,
-                        QueryType.QUESTION_ANSWERING.value,
+                        QueryType.TRANSLATION.value,
                     ],
                 )
             )
