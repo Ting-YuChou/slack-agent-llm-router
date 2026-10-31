@@ -51,7 +51,7 @@ _LANGUAGES = (
 _CODE_NOUNS = (
     r"(function|functions|code|script|program|regex|regexp|component|endpoint|"
     r"api|cli|dockerfile|unit tests?|module|algorithm|snippet|sql|diff|"
-    r"pull request|parser|bash script|shell script)"
+    r"pull request|parser|bash script|shell script|cron job|cronjob|webhook)"
 )
 # Nouns that are code only in a programming context ("class schedule", "query
 # letter", "test prep", "sales pipeline" are not): they add a weak cue only.
@@ -65,6 +65,14 @@ _PROGRAMMING_LANGUAGES = (
 _ZH_CODE_NOUNS = (
     r"(函式|函数|程式|程序|腳本|脚本|類別|类|查詢|查询|sql|api|server|服務|服务|"
     r"dockerfile|元件|組件|组件|正規表示式|正则)"
+)
+# Words after "is"/"are" that make "... down" internal or social, not an
+# outside service outage: pronouns, quantifiers and our own infrastructure.
+_NOT_OUTSIDE_SERVICES = (
+    r"(the|our|my|this|that|it|we|you|i|he|she|they|anyone|anybody|everyone|"
+    r"everybody|someone|somebody|nobody|people|prod|production|staging|stage|"
+    r"dev|qa|test|server|servers|jenkins|ci|db|database|cluster|vpn|wifi|network|"
+    r"internal|intranet)"
 )
 _FRESH_TIME = r"(today|today's|tonight|right now|currently|this week|this month)"
 _MARKET_NOUNS = r"(price|prices|stock|stocks|share price|exchange rate)"
@@ -96,10 +104,10 @@ RULES: Dict[str, Tuple[Tuple[str, float], ...]] = {
         (rf"\b{_MARKET_NOUNS}\b{_GAP}\b{_FRESH_TIME}\b", 2.0),
         (rf"\b(current|live|real-time|today's|latest)\s+{_MARKET_NOUNS}\b", 2.0),
         (r"\b(latest|newest|current)\s+(version|release)\b", 2.0),
-        # An outside service by name: "is github down", not "is the server down".
+        # An outside service by name: "is github down", not "is the server
+        # down", "is prod down" or "is anyone down for lunch".
         (
-            r"\b(is|are)\s+(?!(the|our|my|this|that|it|we|you)\b)"
-            r"[a-z0-9.\-]{2,30}\s+down\b",
+            rf"\b(is|are)\s+(?!{_NOT_OUTSIDE_SERVICES}\b)[a-z0-9.\-]{{2,30}}\s+down\b",
             2.0,
         ),
         # Hints: each needs company to reach MIN_SCORES.
@@ -159,6 +167,8 @@ RULES: Dict[str, Tuple[Tuple[str, float], ...]] = {
             1.0,
         ),
         (rf"\bwhat does this\b{_GAP}\b{_CODE_NOUNS}\b{_GAP}\bdo\b", 2.0),
+        # A stack-trace line ("TypeError: ...") is code on its own.
+        (r"\b[a-z]{3,}(error|exception):", 1.0),
         # Code-shaped text: weak alone ("return policy"), adds to other cues.
         (r"\b[a-z]{3,}(error|exception)\b", 0.5),
         (r"\bdef\s+\w+\s*\(|\bfunction\s+\w+\s*\(|\breturn\b|=>", 0.5),
@@ -179,6 +189,20 @@ RULES: Dict[str, Tuple[Tuple[str, float], ...]] = {
             rf"\b(write|create|generate|implement|build|make|code)\b{_GAP}"
             rf"\b{_AMBIGUOUS_CODE_NOUNS}\b",
             0.5,
+        ),
+        # An ambiguous noun with data-store context: "a query to update the
+        # orders table".
+        (
+            rf"\b(write|create|generate|build|make)\b{_GAP}"
+            rf"\b{_AMBIGUOUS_CODE_NOUNS}\b{_GAP}"
+            r"\b(table|tables|database|db|schema|cache|queue|records|rows|columns?)\b",
+            1.0,
+        ),
+        (
+            r"\b(write|add|generate|create)\s+(some\s+|more\s+)?"
+            r"(unit\s+|integration\s+|end-to-end\s+|e2e\s+)?tests?\s+"
+            r"(for|to cover)\b",
+            2.0,
         ),
         (r"\b(implement|implementation|algorithm)\b", 1.0),
         (_PROGRAMMING_LANGUAGES, 0.5),
@@ -253,9 +277,10 @@ RULES: Dict[str, Tuple[Tuple[str, float], ...]] = {
         (
             rf"\b(write|compose|craft|draft|create)\b{_GAP}\b(story|poem|blog|speech|"
             rf"message|essay|dialogue|haiku|limerick|letter|toast|note|announcement|"
-            rf"post|caption|update)\b",
+            rf"post|caption)\b",
             2.0,
         ),
+        (r"\b(standup|stand-up|status|weekly|team|project) update\b", 2.0),
         (r"\b(creative|imaginative|character|plot|narrative|dialogue)\b", 1.0),
         (r"詩|诗|故事|小說|小说|部落格|博客|祝福|賀詞|贺词|歌詞|歌词|講稿|讲稿|文案", 2.0),
         (
@@ -281,7 +306,9 @@ RULES: Dict[str, Tuple[Tuple[str, float], ...]] = {
 
 # Equal scores go to the type listed first (eval/routing/labels.json
 # tie-breaks). Planning and creative writing come before the code types, so an
-# ambiguous noun ("class schedule", "query letter") never wins a tie for code.
+# ambiguous noun ("class schedule", "query letter") never wins a tie for code;
+# but once a code type has a strong cue (STRONG_CODE_SCORE, e.g. "write a
+# function"), CODE_FIRST_ORDER lets code win the tie ("... to send a message").
 TIE_BREAK_ORDER: Tuple[str, ...] = (
     "translation",
     "web_research",
@@ -294,6 +321,21 @@ TIE_BREAK_ORDER: Tuple[str, ...] = (
     "reasoning",
     "brainstorming",
     "analysis",
+)
+
+CODE_TYPES = ("code_analysis", "code_generation")
+STRONG_CODE_SCORE = 2.0
+CODE_FIRST_ORDER: Tuple[str, ...] = (
+    "translation",
+    "web_research",
+    "summarization",
+    *CODE_TYPES,
+    *(
+        query_type
+        for query_type in TIE_BREAK_ORDER
+        if query_type
+        not in {"translation", "web_research", "summarization", *CODE_TYPES}
+    ),
 )
 
 COMPILED_RULES: Dict[str, List[Tuple["re.Pattern[str]", float]]] = {
@@ -336,8 +378,15 @@ def classify(query: str) -> Tuple[str, float]:
     }
     if not detected:
         return GENERAL, GENERAL_CONFIDENCE
-    # max() keeps the first of equal scores, and scores follow TIE_BREAK_ORDER.
-    best_type = max(detected, key=lambda query_type: detected[query_type])
+    strong_code = any(
+        scores.get(code_type, 0.0) >= STRONG_CODE_SCORE for code_type in CODE_TYPES
+    )
+    order = CODE_FIRST_ORDER if strong_code else TIE_BREAK_ORDER
+    # Highest score; equal scores go to the type earlier in `order`.
+    best_type = max(
+        detected,
+        key=lambda query_type: (detected[query_type], -order.index(query_type)),
+    )
     best = detected[best_type]
     # Stronger evidence and a larger share of all evidence raise confidence;
     # the result lies in (0.25, 0.95), above GENERAL_CONFIDENCE.
