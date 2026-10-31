@@ -838,6 +838,9 @@ class AlertEventEntry:
     window_start_ms: int = 0
     window_end_ms: int = 0
     payload_json: str = "{}"
+    # When the event was emitted: orders rows that share a timestamp, such
+    # as an avoid and its clear for one window.
+    emitted_at: Optional[datetime] = None
     event_id: str = ""
     kafka_topic: str = ""
     kafka_partition: int = -1
@@ -866,6 +869,7 @@ class AlertEventEntry:
             "window_start_ms": self.window_start_ms,
             "window_end_ms": self.window_end_ms,
             "payload_json": self.payload_json,
+            "emitted_at": self.emitted_at or self.timestamp,
             "kafka_topic": self.kafka_topic,
             "kafka_partition": self.kafka_partition,
             "kafka_offset": self.kafka_offset,
@@ -898,6 +902,7 @@ class RoutingPolicyStateEntry:
     avoid_models: List[str] = field(default_factory=list)
     avoid_providers: List[str] = field(default_factory=list)
     payload_json: str = "{}"
+    emitted_at: Optional[datetime] = None
     event_id: str = ""
     kafka_topic: str = ""
     kafka_partition: int = -1
@@ -932,6 +937,7 @@ class RoutingPolicyStateEntry:
             "avoid_models": list(self.avoid_models),
             "avoid_providers": list(self.avoid_providers),
             "payload_json": self.payload_json,
+            "emitted_at": self.emitted_at or self.timestamp,
             "kafka_topic": self.kafka_topic,
             "kafka_partition": self.kafka_partition,
             "kafka_offset": self.kafka_offset,
@@ -2112,7 +2118,7 @@ class ClickHouseManager:
             FROM {self.database}.alert_events FINAL
             WHERE timestamp >= now() - INTERVAL {{hours:UInt32}} HOUR
               AND source_event_type = 'routing.guardrails'
-            ORDER BY timestamp DESC
+            ORDER BY timestamp DESC, emitted_at DESC
             LIMIT 50
             """
 
@@ -2186,7 +2192,7 @@ class ClickHouseManager:
                 payload_json
             FROM {self.database}.routing_policy_state_events FINAL
             WHERE timestamp >= now() - INTERVAL {{hours:UInt32}} HOUR
-            ORDER BY timestamp DESC
+            ORDER BY timestamp DESC, emitted_at DESC
             LIMIT 50
             """
 
@@ -2987,6 +2993,8 @@ class KafkaConsumerManager:
             window_start_ms=window_start_ms,
             window_end_ms=window_end_ms,
             payload_json=_json_text(_alert_payload(data), default=str),
+            # Falls back to the ingest time.
+            emitted_at=_parse_datetime(data.get("emitted_at")),
             **metadata,
         )
 
@@ -3036,6 +3044,7 @@ class KafkaConsumerManager:
             avoid_models=list(data.get("avoid_models", []) or []),
             avoid_providers=list(data.get("avoid_providers", []) or []),
             payload_json=_json_text(data, default=str),
+            emitted_at=_parse_datetime(data.get("emitted_at")),
             **metadata,
         )
 

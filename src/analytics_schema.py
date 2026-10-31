@@ -211,6 +211,8 @@ ALERT_EVENTS = Table(
         Column("window_start_ms", "UInt64"),
         Column("window_end_ms", "UInt64"),
         Column("payload_json", "String"),
+        # Orders rows that share a timestamp; older rows take their timestamp.
+        Column("emitted_at", "DateTime64(3)", backfill="timestamp"),
         *_kafka_columns(),
     ),
     engine="ReplacingMergeTree()",
@@ -249,6 +251,8 @@ ROUTING_POLICY_STATE_EVENTS = Table(
         Column("avoid_models", "Array(String)"),
         Column("avoid_providers", "Array(String)"),
         Column("payload_json", "String"),
+        # Orders rows that share a timestamp; older rows take their timestamp.
+        Column("emitted_at", "DateTime64(3)", backfill="timestamp"),
         *_kafka_columns(),
     ),
     engine="ReplacingMergeTree()",
