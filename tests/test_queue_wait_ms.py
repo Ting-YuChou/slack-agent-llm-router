@@ -1,14 +1,24 @@
 """T2 (inference part): queue_wait_ms = ingress wait + provider scheduler wait."""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from src.admission import AdmissionDecision, AdmissionRejectedError
 from src.api_security import CLIENT_METADATA_KEYS, filter_external_metadata
-from src.llm_router_part2_inference import InferenceEngine, ResponseCache
+from src.llm_router_part2_inference import (
+    InferenceEngine,
+    ResponseCache,
+    request_queue_wait_ms,
+)
 from src.llm_router_part3_pipeline import build_inference_completed_event
-from src.provider_scheduler import ProviderCapacityScheduler, SchedulerLease
+from src.provider_scheduler import (
+    ProviderCapacityScheduler,
+    RequestExecutionBudget,
+    SchedulerLease,
+)
 from src.utils.schema import InferenceResponse, QueryRequest, UserTier
 
 
@@ -187,6 +197,98 @@ def test_inference_response_queue_wait_defaults_to_none():
     assert response.queue_wait_ms is None
     with pytest.raises(ValueError):
         response.model_validate({**response.model_dump(), "queue_wait_ms": -1})
+
+
+def _slow_queue(wait_seconds, outcome):
+    """An acquire that waits in the queue, then rejects or hands out a lease."""
+
+    async def acquire(**_kwargs):
+        await asyncio.sleep(wait_seconds)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    return acquire
+
+
+def _queue_rejection():
+    return AdmissionRejectedError(
+        AdmissionDecision.reject(
+            status_code=429,
+            error="scheduler_unavailable",
+            reason="provider_queue_timeout",
+            message="queue wait timed out",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_scheduler_reports_a_wait_that_timed_out_in_the_queue():
+    scheduler = _scheduler()
+    scheduler.acquire = _slow_queue(5.0, _leases(0.0)[0])
+    waits = []
+
+    with pytest.raises(asyncio.TimeoutError):
+        await scheduler.run_provider_call(
+            request=_request(),
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+            operation=AsyncMock(return_value="never"),
+            # The request deadline ends the wait; no time is left to retry.
+            execution_budget=RequestExecutionBudget(
+                max_attempts=1, deadline_seconds=0.05
+            ),
+            on_queue_wait=waits.append,
+        )
+
+    assert len(waits) == 1
+    assert 0.04 <= waits[0] < 1.0
+
+
+@pytest.mark.asyncio
+async def test_scheduler_reports_a_wait_that_ended_in_a_queue_rejection():
+    scheduler = _scheduler()
+    scheduler.acquire = _slow_queue(0.05, _queue_rejection())
+    waits = []
+
+    with pytest.raises(AdmissionRejectedError):
+        await scheduler.run_provider_call(
+            request=_request(),
+            model_name="gpt-5",
+            provider="openai",
+            estimated_input_tokens=1,
+            operation=AsyncMock(return_value="never"),
+            on_queue_wait=waits.append,
+        )
+
+    assert len(waits) == 1
+    assert 0.04 <= waits[0] < 1.0
+
+
+@pytest.mark.asyncio
+async def test_a_failed_queue_wait_counts_when_the_fallback_answers(
+    inference_response_factory,
+):
+    engine, _producer = _engine(inference_response_factory)
+    leases = iter([_queue_rejection(), _leases(0.01)[0]])
+
+    async def acquire(**_kwargs):
+        outcome = next(leases)
+        await asyncio.sleep(0.05 if isinstance(outcome, Exception) else 0.0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    engine.scheduler.acquire = acquire
+    request = _request(ingress_queue_wait_ms=5)
+
+    with pytest.raises(AdmissionRejectedError):
+        await engine._execute_model_request(request, "gpt-5")
+    await engine._execute_model_request(request, "gpt-5")
+
+    # 5 ms ingress + ~50 ms in the queue that gave up + 10 ms on the fallback.
+    assert 60 <= request_queue_wait_ms(request) < 1000
 
 
 def test_ingress_wait_does_not_fragment_the_response_cache_key():

@@ -536,7 +536,8 @@ class ProviderCapacityScheduler:
         sliver by earlier steps (a slow RAG step, say) says nothing about
         the provider.
 
-        ``on_queue_wait`` gets each acquired lease's wait in seconds.
+        ``on_queue_wait`` gets each attempt's scheduler wait in seconds: the
+        lease's wait, or the time spent in acquire when no lease came of it.
         """
         if not self.enabled:
             self._record_decision(provider, model_name, "allowed", "disabled")
@@ -594,14 +595,23 @@ class ProviderCapacityScheduler:
 
                 async def run_attempt():
                     nonlocal lease, local_attempt, operation_started
-                    lease = await self.acquire(
-                        request=request,
-                        model_name=model_name,
-                        provider=provider,
-                        estimated_input_tokens=estimated_input_tokens,
-                    )
-                    if on_queue_wait is not None:
-                        on_queue_wait(lease.wait_seconds)
+                    acquire_started_at = self._time_func()
+                    try:
+                        lease = await self.acquire(
+                            request=request,
+                            model_name=model_name,
+                            provider=provider,
+                            estimated_input_tokens=estimated_input_tokens,
+                        )
+                    finally:
+                        # A wait that ends without a lease (attempt timeout
+                        # in the queue, a queue rejection) still counts.
+                        if on_queue_wait is not None:
+                            on_queue_wait(
+                                lease.wait_seconds
+                                if lease is not None
+                                else max(0.0, self._time_func() - acquire_started_at)
+                            )
                     if not budget.consume_attempt():
                         budget.ensure_available()
                     local_attempt += 1
