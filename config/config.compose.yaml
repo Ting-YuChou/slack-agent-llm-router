@@ -633,6 +633,9 @@ clickhouse:
 monitoring:
   prometheus_port: 8000
   prometheus:
+    # Serve the workers' metrics (Kafka consumers) on prometheus_port even
+    # with monitoring disabled; scraped by the observability profile.
+    enabled: true
     scrape_interval: 15s
     evaluation_interval: 15s
   grafana:
@@ -644,6 +647,21 @@ monitoring:
     latency_threshold_ms: 5000
     memory_usage_threshold: 0.9
     disk_usage_threshold: 0.8
+    # Avoid-incident dedupe ends this long (plus the grace) after the last
+    # avoid was received. Keep equal to flink...active_ttl_seconds.
+    incident_ttl_seconds: 180
+    incident_ttl_grace_seconds: 60
+    # Restart-safe stream alert dedupe (used once monitoring is enabled).
+    dedupe_store:
+      enabled: true
+      host: redis
+      port: 6379
+      db: 5
+      password_env: REDIS_PASSWORD
+      key_prefix: "llm_router:alert_incident:"
+      connect_timeout_ms: 100
+      socket_timeout_ms: 100
+      retry_after_seconds: 30
   health_checks:
     interval_seconds: 30
     timeout_seconds: 10
