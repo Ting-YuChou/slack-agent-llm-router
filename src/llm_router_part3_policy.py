@@ -22,6 +22,7 @@ from aiokafka.structs import TopicPartition
 from prometheus_client import Counter, Gauge
 import redis.asyncio as redis
 
+from src.event_version import UnsupportedEventVersionError, is_supported_event_version
 from src.redaction import redact_text
 from src.utils.metrics import PIPELINE_METRICS
 from src.utils.bounded_state import BoundedTTLMap
@@ -238,6 +239,10 @@ def describe_policy_event_error(error: BaseException) -> str:
     if isinstance(error, UnicodeDecodeError):
         return f"UnicodeDecodeError at byte {error.start}"
     return type(error).__name__
+
+
+class UnsupportedPolicyEventVersion(PolicyEventInvalid, UnsupportedEventVersionError):
+    """A policy event with an unsupported ``event_version`` major (A12b)."""
 
 
 class PolicyCacheWriteRejected(PolicyEventInvalid):
@@ -1778,6 +1783,8 @@ class PolicyMaterializer:
             raise PolicyEventInvalid(
                 f"policy event must be a JSON object, got {type(value).__name__}"
             )
+        if not is_supported_event_version(value.get("event_version")):
+            raise UnsupportedPolicyEventVersion(value.get("event_version"))
         return value
 
     async def _skip_invalid_message(
@@ -1865,6 +1872,9 @@ class PolicyMaterializer:
             "error_message": redact_text(describe_policy_event_error(error))[:500],
             "payload_keys": self._payload_keys(message),
         }
+        failure_reason = getattr(error, "reason", None)
+        if isinstance(failure_reason, str) and failure_reason:
+            payload["failure_reason"] = failure_reason
         key = f"{source_topic}:{partition}:{offset}"
         await asyncio.wait_for(
             self.dlq_producer.send_and_wait(dlq_topic, key=key, value=payload),

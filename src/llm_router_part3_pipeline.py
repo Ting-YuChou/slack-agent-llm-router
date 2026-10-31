@@ -29,6 +29,7 @@ except ImportError:  # pragma: no cover - CI stubs aiokafka without it
 import clickhouse_connect
 from clickhouse_connect.driver import Client
 
+from src.event_version import check_event_version
 from src.kafka_topics import dead_letter_topic_name, dlq_enabled
 from src.prompt_assembly import PROMPT_CONTENT_METADATA_KEYS
 from src.redaction import context_summary, redact, redact_text
@@ -3014,15 +3015,22 @@ class KafkaConsumerManager:
                 logger.warning(f"Observer for {topic_key} failed: {e}")
 
     def _decode_message_value(self, message: Any) -> Dict[str, Any]:
-        """Decode a Kafka message payload without letting poison pills kill a task."""
+        """Decode a Kafka message payload without letting poison pills kill a task.
+
+        An event with an unsupported ``event_version`` raises, so the consume
+        loop dead-letters it and commits past it (A12b).
+        """
         value = getattr(message, "value", None)
         if isinstance(value, dict):
-            return value
-        if isinstance(value, bytes):
-            return json.loads(value.decode("utf-8"))
-        if isinstance(value, str):
-            return json.loads(value)
-        raise ValueError(f"Unsupported Kafka message payload type: {type(value)}")
+            data = value
+        elif isinstance(value, bytes):
+            data = json.loads(value.decode("utf-8"))
+        elif isinstance(value, str):
+            data = json.loads(value)
+        else:
+            raise ValueError(f"Unsupported Kafka message payload type: {type(value)}")
+        check_event_version(data)
+        return data
 
     def _kafka_event_metadata(self, message: Any) -> Dict[str, Any]:
         """Build stable idempotency metadata from Kafka coordinates."""
@@ -3099,6 +3107,9 @@ class KafkaConsumerManager:
             "error_message": redact_text(str(error))[:2000],
             "payload": _dead_letter_payload(getattr(message, "value", None), error),
         }
+        failure_reason = getattr(error, "reason", None)
+        if isinstance(failure_reason, str) and failure_reason:
+            payload["failure_reason"] = failure_reason
         topic = self._dead_letter_topic(topic_key, message)
         key = metadata["event_id"] or str(uuid.uuid4())
         send_and_wait = getattr(self.dlq_producer, "send_and_wait", None)
