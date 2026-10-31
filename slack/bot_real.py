@@ -63,6 +63,8 @@ from slack.formatting import (
     SLACK_THINKING_TEXT,
     SlackBotReplyMixin,
     SlackNotice,
+    _is_block_rejection,
+    _without_blocks,
     slack_chat_request_id,
 )
 from slack.users import (
@@ -778,11 +780,12 @@ class SlackBot(
                     active_thread_key=active_thread_key,
                 )
 
-        except Exception as e:
-            logger.error(f"Error processing message: {e}")
+        except Exception:
+            request_id = self._event_request_id(event)
+            # The reference the user sees is in the log line too.
+            logger.exception("Error processing Slack message %s", request_id)
             error_text = SlackNotice(
-                self._build_user_safe_error_message(),
-                request_id=self._event_request_id(event),
+                self._build_user_safe_error_message(), request_id=request_id
             )
             error_message = self._answer_message(error_text, error_text, last=True)
             if placeholder_ts and await self._replace_placeholder(
@@ -798,9 +801,9 @@ class SlackBot(
     def _event_request_id(self, event: Dict[str, Any]) -> Optional[str]:
         """The chat request id of a message, as its trace computed it."""
         try:
-            return slack_chat_request_id(
-                self._extract_team_id(event), event.get("channel"), event.get("ts")
-            )
+            return SlackQueryTrace.for_message(
+                event, team_id=self._extract_team_id(event)
+            ).request_id
         except Exception:
             return None
 
@@ -1307,17 +1310,35 @@ class SlackBot(
         responses = self._split_response(text, max_length)
 
         if hasattr(self.web_client, "chat_postEphemeral"):
-            for response_text in responses:
-                await self.web_client.chat_postEphemeral(
-                    channel=channel_id,
-                    user=user_id,
-                    text=response_text,
-                )
+            for index, response_text in enumerate(responses):
+                message: Dict[str, Any] = {"text": response_text}
+                # An error's last part carries its reference, as in a thread.
+                if isinstance(text, SlackNotice) and index == len(responses) - 1:
+                    blocks = text.blocks(response_text)
+                    if blocks:
+                        message["blocks"] = blocks
+                await self._post_ephemeral(channel_id, user_id, **message)
             return
 
         for response_text in responses:
             await self.web_client.chat_postMessage(
                 channel=channel_id, text=response_text
+            )
+
+    async def _post_ephemeral(
+        self, channel_id: str, user_id: str, **message: Any
+    ) -> None:
+        """Post one ephemeral reply; as plain text if Slack refuses its blocks."""
+        try:
+            await self.web_client.chat_postEphemeral(
+                channel=channel_id, user=user_id, **message
+            )
+        except Exception as exc:
+            if "blocks" not in message or not _is_block_rejection(exc):
+                raise
+            logger.warning("Slack refused the reply's blocks; posting text: %s", exc)
+            await self.web_client.chat_postEphemeral(
+                channel=channel_id, user=user_id, **_without_blocks(message)
             )
 
     def _spawn_background_task(self, coroutine, name: str):

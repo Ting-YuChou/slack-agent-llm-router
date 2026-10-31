@@ -338,9 +338,11 @@ class SlackNotice(str):
 
     def __new__(cls, text: str, *, request_id: Optional[str] = None) -> "SlackNotice":
         notice = super().__new__(cls, text)
-        notice.reference = (
-            request_id[:8] if is_valid_request_id(request_id) and request_id else None
-        )
+        notice.reference = None
+        if request_id and is_valid_request_id(request_id):
+            # A prefixed id (`slash:<trigger_id>`) is told apart by what
+            # follows the prefix; the prefix is the same for every one.
+            notice.reference = request_id.split(":", 1)[-1][:8] or None
         return notice
 
     def blocks(self, part: str) -> Optional[List[Dict[str, Any]]]:

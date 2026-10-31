@@ -1769,7 +1769,8 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 e.decision, self.bot.user_manager.get_user_tier(user_id)
             )
         except Exception as e:
-            logger.error(f"Error processing query: {e}")
+            # The reference the user sees is in the log line too.
+            logger.exception("Error processing Slack query %s", trace.request_id)
             SLACK_METRICS.errors.labels(error_type=type(e).__name__).inc()
             return self._inference_error_message(None, request_id=trace.request_id)
 
