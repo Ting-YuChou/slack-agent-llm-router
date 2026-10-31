@@ -74,3 +74,25 @@ async def test_a_policy_field_no_rule_reads_is_still_skipped(router_config):
 
     assert decision.shadow_selected_model is None
     assert _shadow_counter("skipped_empty") == skipped_before + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "condition, policy",
+    [
+        ("burst_protection_active == True", {"burst_protection_active": False}),
+        ("burst_protection_active == True", {}),
+        ("policy_priority == 'high'", {"priority": None}),
+        ("hint_reason == 'pin'", {"hint_reason": "other"}),
+    ],
+)
+async def test_a_policy_that_leaves_every_rule_outcome_alone_is_skipped(
+    router_config, condition, policy
+):
+    skipped_before = _shadow_counter("skipped_empty")
+    router = _router(router_config, {"policy_source": "request", **policy}, condition)
+
+    decision = await router.route_query(_request())
+
+    assert decision.shadow_selected_model is None
+    assert _shadow_counter("skipped_empty") == skipped_before + 1

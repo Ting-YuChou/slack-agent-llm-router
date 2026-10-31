@@ -149,8 +149,6 @@ SHADOW_POLICY_CONTEXT_KEY = "shadow_policy_context"
 SHADOW_ROUTING_CONTEXT_KEY = "shadow_routing_context"
 # Why shadow mode had nothing to replay: unavailable or skipped_empty.
 SHADOW_SKIP_KEY = "shadow_skipped"
-# What the shadow routing view records for a rule name the context lacks.
-_MISSING_RULE_NAME = "<missing>"
 # Context key carrying the cheapest eligible candidate's request cost.
 COST_REFERENCE_KEY = "cost_reference"
 
@@ -757,12 +755,6 @@ class ModelRouter:
                 ) from None
             self.routing_rules.append(rule)
             logger.debug("Loaded routing rule: %s", rule.condition)
-        # Every context name a rule reads, for the shadow routing view (RT2).
-        self._rule_names: Tuple[str, ...] = tuple(
-            sorted(
-                {name for rule in self.routing_rules for name in rule.referenced_names}
-            )
-        )
 
     async def route_query(self, request: QueryRequest) -> RoutingDecision:
         """Main routing logic - selects the best model for a query"""
@@ -1788,7 +1780,9 @@ class ModelRouter:
         Two contexts with the same view route the same request alike, so
         shadow mode need not replay a policy whose context matches the base.
         Scoring reads sensitivities only when "high" and session hotness only
-        when "hot"; rules read the raw value of every name they reference.
+        when "hot". Rules count by outcome (RT2): a policy value that changes
+        no rule's match, such as a default the base context simply lacks,
+        does not force a replay.
         """
 
         def names(key: str) -> Tuple[str, ...]:
@@ -1819,10 +1813,7 @@ class ModelRouter:
             str(context.get("session_hotness") or "").lower() == "hot",
             context.get("query_complexity"),
             str(context.get("policy_query_type") or "").lower(),
-            tuple(
-                (name, repr(context.get(name, _MISSING_RULE_NAME)))
-                for name in self._rule_names
-            ),
+            tuple(rule.matches(context) for rule in self.routing_rules),
         )
 
     def _policy_cache_mode(self) -> str:
