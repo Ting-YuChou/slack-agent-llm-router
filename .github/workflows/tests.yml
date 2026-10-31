@@ -97,7 +97,7 @@ jobs:
         run: python -m coverage report --show-missing --include="src/agent_runtime.py,src/agent_analytics.py" --fail-under=77
 
       # The chat path: router, inference, pipeline, policy, scheduler, admission, the Slack bot and the
-      # Phase 4 modules. Floor is 2 points below the measured coverage (87.04%); raise it as coverage grows.
+      # Phase 4 modules. Floor is 2 points below the measured coverage (87.15%); raise it as coverage grows.
       - name: Enforce chat coverage threshold
         run: >-
           python -m coverage report
