@@ -67,7 +67,7 @@ def _sink():
 
 
 @pytest.mark.asyncio
-async def test_sink_dead_letters_unsupported_version_and_commits():
+async def test_observer_skips_unsupported_version_and_commits():
     manager = _sink()
     seen = []
     manager.register_observer("requests_enriched", seen.append)
@@ -85,11 +85,10 @@ async def test_sink_dead_letters_unsupported_version_and_commits():
 
     await manager._consume_requests_enriched(consumer)
 
+    # Observer-only: skipped, not dead-lettered (D4 review); the sink loops
+    # dead-letter (test_sink_batched_loop_dead_letters_unsupported_version).
     assert seen == []
-    ((topic, payload),) = manager.dlq_producer.sent
-    assert topic == "requests.enriched.dlq"
-    assert payload["failure_reason"] == "unsupported_event_version"
-    assert "private question" not in json.dumps(payload)
+    assert manager.dlq_producer.sent == []
     consumer.commit.assert_awaited_once_with(
         {TopicPartition("requests.enriched", 0): 4}
     )

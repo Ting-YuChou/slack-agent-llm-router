@@ -661,8 +661,9 @@ kafka:
     auto_offset_reset: latest
     # ClickHouse sink only: a new or reset group replays the retained backlog.
     sink_auto_offset_reset: earliest
-    # In-process observers (the monitor) read live events in their own group.
-    observer_group_id: llm-router-observers
+    # In-process observers (the monitor) read live events in a group of
+    # their own per process: <prefix>-<host>-<pid>, auto-committed.
+    observer_group_prefix: llm-router-observers
     observer_auto_offset_reset: latest
     enable_auto_commit: false
     max_poll_records: 500

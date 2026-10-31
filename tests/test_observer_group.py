@@ -71,16 +71,20 @@ def _manager(**consumer):
 def test_observer_group_defaults_to_latest_and_sink_is_unchanged():
     manager = _manager()
 
-    assert manager.observer_consumer_config["group_id"] == "llm-router-observers"
+    assert manager.observer_consumer_config["group_id"].startswith(
+        "llm-router-observers-"
+    )
     assert manager.observer_consumer_config["auto_offset_reset"] == "latest"
     assert manager.consumer_config["group_id"] == "sink-group"
     assert manager.consumer_config["auto_offset_reset"] == "earliest"
 
 
 def test_observer_group_is_configurable():
-    manager = _manager(observer_group_id="obs", observer_auto_offset_reset="earliest")
+    manager = _manager(
+        observer_group_prefix="obs", observer_auto_offset_reset="earliest"
+    )
 
-    assert manager.observer_consumer_config["group_id"] == "obs"
+    assert manager.observer_consumer_config["group_id"].startswith("obs-")
     assert manager.observer_consumer_config["auto_offset_reset"] == "earliest"
 
 
@@ -89,9 +93,13 @@ def test_shipped_configs_name_the_observer_group(path):
     kafka = yaml.safe_load(path.read_text("utf-8"))["kafka"]
     manager = KafkaConsumerManager(kafka, MagicMock())
 
-    assert manager.observer_consumer_config["group_id"] == "llm-router-observers"
+    assert manager.observer_consumer_config["group_id"].startswith(
+        "llm-router-observers-"
+    )
     assert manager.observer_consumer_config["auto_offset_reset"] == "latest"
-    assert manager.consumer_config["group_id"] != "llm-router-observers"
+    assert manager.consumer_config["group_id"] != (
+        manager.observer_consumer_config["group_id"]
+    )
 
 
 @pytest.mark.asyncio
@@ -130,7 +138,7 @@ async def test_observer_consumers_start_only_for_observed_topics(fake_kafka):
     by_topic = {c.topics[0]: c.kwargs for c in fake_kafka.created}
     assert set(by_topic) == {"requests.enriched", "alerts"}
     for kwargs in by_topic.values():
-        assert kwargs["group_id"] == "llm-router-observers"
+        assert kwargs["group_id"] == manager.observer_consumer_config["group_id"]
         assert kwargs["auto_offset_reset"] == "latest"
     assert manager.observer_consumer_keys == {
         "requests_enriched": "requests_enriched",
@@ -139,7 +147,7 @@ async def test_observer_consumers_start_only_for_observed_topics(fake_kafka):
     # The sink consumer for alerts is still there, in the sink group.
     assert manager.consumers["alerts"].kwargs["group_id"] == "sink-group"
     assert manager.consumers["alerts_observer"].kwargs["group_id"] == (
-        "llm-router-observers"
+        manager.observer_consumer_config["group_id"]
     )
 
 
@@ -190,7 +198,7 @@ async def test_sink_loop_no_longer_notifies_observers():
 
 @pytest.mark.asyncio
 async def test_observer_loop_notifies_then_commits():
-    manager = _manager()
+    manager = _manager(observer_enable_auto_commit=False)
     seen = []
     manager.register_observer("alerts", lambda event: seen.append(event["alert_type"]))
     messages = _Messages([_alert()])
@@ -206,7 +214,7 @@ async def test_observer_loop_notifies_then_commits():
 
 @pytest.mark.asyncio
 async def test_observer_loop_skips_poison_without_dead_lettering():
-    manager = _manager()
+    manager = _manager(observer_enable_auto_commit=False)
     manager.dlq_producer = AsyncMock()
     manager.register_observer("alerts", lambda event: None)
     messages = _Messages([_alert(value=b"{bad")])
@@ -231,7 +239,9 @@ async def test_observer_restart_uses_the_observer_group(fake_kafka):
     await manager._restart_consumer("routing_guardrails_observer")
 
     (restarted,) = fake_kafka.created
-    assert restarted.kwargs["group_id"] == "llm-router-observers"
+    assert restarted.kwargs["group_id"] == (
+        manager.observer_consumer_config["group_id"]
+    )
     assert restarted.topics == ["routing.guardrails"]
 
 
