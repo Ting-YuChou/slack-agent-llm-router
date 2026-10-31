@@ -704,6 +704,13 @@ def _add_scheduler_wait(request: Any, wait_seconds: Any) -> None:
         logger.debug("Cannot record the scheduler wait on %r", type(request))
 
 
+def _set_response_scheduler_wait(response: Any, wait_seconds: float) -> None:
+    try:
+        response._scheduler_wait_seconds = wait_seconds
+    except (AttributeError, TypeError, ValueError):
+        logger.debug("Cannot carry the scheduler wait on %r", type(response))
+
+
 def request_queue_wait_ms(request: Any) -> Optional[int]:
     """Ingress queue wait plus scheduler lease waits; None when neither is known.
 
@@ -2363,7 +2370,12 @@ class SingleFlightCoordinator:
             else None,
             "session_id": request.session_id,
             "conversation_id": request.conversation_id,
-            "metadata": request.metadata,
+            # The ingress wait differs per request and changes no answer.
+            "metadata": {
+                key: value
+                for key, value in (request.metadata or {}).items()
+                if key != INGRESS_QUEUE_WAIT_METADATA_KEY
+            },
             "attachments": attachment_signatures,
             "rag_images": rag_image_signatures,
         }
@@ -3981,11 +3993,20 @@ class InferenceEngine:
                 started_calls.append(model_name)
             return await provider.generate_response(request, model_name)
 
+        led_call = False
+        leader_waits: List[float] = []
+
+        def record_wait(seconds: float) -> None:
+            leader_waits.append(seconds)
+            _add_scheduler_wait(caller_request, seconds)
+
         async def admitted_call() -> InferenceResponse:
+            nonlocal led_call
+            led_call = True
             estimated_input_tokens = await self._admission_input_tokens(
                 request, model_name
             )
-            return await self.scheduler.run_provider_call(
+            response = await self.scheduler.run_provider_call(
                 request=request,
                 model_name=model_name,
                 provider=str(provider_name),
@@ -3995,14 +4016,22 @@ class InferenceEngine:
                 attempt_timeout_seconds=attempt_timeout_seconds,
                 fallback_reserve_seconds=fallback_reserve_seconds,
                 reserve_attempts=reserve_attempts,
-                on_queue_wait=lambda seconds: _add_scheduler_wait(
-                    caller_request, seconds
-                ),
+                on_queue_wait=record_wait,
             )
+            # Single-flight followers share this response: it carries the
+            # leader's scheduler wait to them.
+            _set_response_scheduler_wait(response, sum(leader_waits))
+            return response
 
-        return await self.single_flight.run(
+        response = await self.single_flight.run(
             request, provider, model_name, admitted_call
         )
+        if not led_call:
+            # A follower waited on the leader's flight, queue included.
+            _add_scheduler_wait(
+                caller_request, getattr(response, "_scheduler_wait_seconds", None)
+            )
+        return response
 
     async def _admission_input_tokens(
         self, request: QueryRequest, model_name: str

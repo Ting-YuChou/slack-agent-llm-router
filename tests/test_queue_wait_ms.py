@@ -291,6 +291,32 @@ async def test_a_failed_queue_wait_counts_when_the_fallback_answers(
     assert 60 <= request_queue_wait_ms(request) < 1000
 
 
+@pytest.mark.asyncio
+async def test_single_flight_followers_report_the_leaders_scheduler_wait(
+    inference_response_factory,
+):
+    engine, _producer = _engine(inference_response_factory, leases=(0.03,))
+    engine.single_flight.enabled = True
+
+    async def slow_answer(_request, _model_name):
+        await asyncio.sleep(0.05)
+        return inference_response_factory()
+
+    engine.providers["openai"].generate_response = AsyncMock(side_effect=slow_answer)
+    engine.cache.get_cached_response = AsyncMock(return_value=None)
+
+    leader, follower = await asyncio.gather(
+        engine.process_query(_request(ingress_queue_wait_ms=5)),
+        engine.process_query(_request(ingress_queue_wait_ms=9)),
+    )
+
+    # One provider call: the follower joined the leader's flight.
+    assert engine.providers["openai"].generate_response.await_count == 1
+    assert engine.scheduler.acquire.await_count == 1
+    assert leader.queue_wait_ms == 35
+    assert follower.queue_wait_ms == 39
+
+
 def test_ingress_wait_does_not_fragment_the_response_cache_key():
     cache = ResponseCache({"enabled": False})
     keys = {
