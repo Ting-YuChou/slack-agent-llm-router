@@ -399,9 +399,23 @@ def _event_query_text(query_request: QueryRequest) -> str:
     attached files' names (a file-only message asks about them by name)."""
     query = query_request.query
     if (query_request.metadata or {}).get("source") == "slack":
-        for attachment in query_request.attachments:
-            if attachment.name:
-                query = query.replace(attachment.name, "[attachment]")
+        names = sorted(
+            {
+                attachment.name
+                for attachment in query_request.attachments
+                if attachment.name
+            },
+            key=len,
+            reverse=True,
+        )
+        if names:
+            # Whole names only, longest first: a file called "a" or "notes"
+            # must not rewrite the words around it, and "plan.txt" must not
+            # leave ".bak" of "plan.txt.bak".
+            pattern = re.compile(
+                r"(?<!\w)(?:" + "|".join(re.escape(name) for name in names) + r")(?!\w)"
+            )
+            query = pattern.sub("[attachment]", query)
     return redact_text(query)
 
 

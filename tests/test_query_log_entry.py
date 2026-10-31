@@ -78,3 +78,42 @@ async def test_api_query_log_keeps_its_existing_text():
     row = await _published_row(_slack_request(source="api"), _response())
 
     assert row["query_text"] == "what is in quarterly-layoffs-plan.pdf?"
+
+
+def _request_with_files(query, *names):
+    return QueryRequest(
+        query=query,
+        user_id="U1",
+        metadata={"source": "slack"},
+        attachments=[
+            Attachment(
+                type=AttachmentType.DOCUMENT,
+                name=name,
+                size_bytes=10,
+                mime_type="text/plain",
+            )
+            for name in names
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_short_attachment_names_replace_whole_words_only():
+    request = _request_with_files("summarize notes and a plan from notes", "notes", "a")
+
+    row = await _published_row(request, _response())
+
+    assert row["query_text"] == (
+        "summarize [attachment] and [attachment] plan from [attachment]"
+    )
+
+
+@pytest.mark.asyncio
+async def test_longer_attachment_names_are_replaced_first():
+    request = _request_with_files(
+        "compare plan.txt with plan.txt.bak", "plan.txt", "plan.txt.bak"
+    )
+
+    row = await _published_row(request, _response())
+
+    assert row["query_text"] == "compare [attachment] with [attachment]"
