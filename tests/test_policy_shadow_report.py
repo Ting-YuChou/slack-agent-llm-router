@@ -29,10 +29,11 @@ class FakeClient:
         self.closed = True
 
 
+# bucket, decisions, agree, differ, skipped, not_replayable
 ROWS = {
-    "'all'": [("all", 10, 6, 2, 2)],
-    "selected_model": [("gpt-5", 7, 5, 1, 1), ("qwen", 3, 1, 1, 1)],
-    "user_tier": [("free", 10, 6, 2, 2)],
+    "'all'": [("all", 12, 6, 2, 2, 2)],
+    "selected_model": [("gpt-5", 9, 5, 1, 1, 2), ("qwen", 3, 1, 1, 1, 0)],
+    "user_tier": [("free", 12, 6, 2, 2, 2)],
 }
 
 
@@ -57,12 +58,14 @@ def test_report_counts_and_rates():
     (overall,) = result["overall"]
     assert overall == {
         "bucket": "all",
-        "decisions": 10,
+        "decisions": 12,
         "agree": 6,
         "differ": 2,
         "skipped": 2,
+        "not_replayable": 2,
         "agree_rate": 0.75,
         "differ_rate": 0.25,
+        # Of the 10 decisions whose strategy shadow mode can replay.
         "skipped_rate": 0.2,
     }
     assert [row["bucket"] for row in result["by_model"]] == ["gpt-5", "qwen"]
@@ -71,7 +74,7 @@ def test_report_counts_and_rates():
 
 def test_empty_window_has_zero_rates():
     empty = {key: [] for key in ROWS}
-    empty["'all'"] = [("all", 0, 0, 0, 0)]
+    empty["'all'"] = [("all", 0, 0, 0, 0, 0)]
 
     result = report.build_report(FakeClient(empty), hours=1, database="db")
 
@@ -89,6 +92,21 @@ def test_output_has_counts_and_no_text_beyond_models_and_tiers():
     assert "75.0%" in text
     # skipped_empty and unavailable are one column in routing_decisions.
     assert "skipped_empty" in text and "unavailable" in text
+    assert "outside shadow mode" in text
+    assert "round_robin" in text and "not_replayable" in text
+
+
+def test_round_robin_and_weighted_are_counted_apart_from_skipped():
+    client = FakeClient(ROWS)
+
+    report.build_report(client, hours=6, database="llm_router")
+
+    sql = " ".join(client.calls[0][0].split())
+    assert "routing_strategy IN ('round_robin', 'weighted')" in sql
+    assert (
+        "countIf(shadow_selected_model = '' AND routing_strategy NOT IN "
+        "('round_robin', 'weighted')) AS skipped"
+    ) in sql
 
 
 def test_main_takes_the_password_from_the_environment(monkeypatch):

@@ -5,11 +5,15 @@ Reads ClickHouse routing_decisions over the last N hours and prints, overall,
 by selected model and by user tier, how many decisions the shadow policy
 agreed with, differed from, or skipped.
 
+Round-robin and weighted routing are never replayed; their decisions are
+counted as not_replayable, apart from the rest.
+
 routing_decisions records only the shadow model: skipped_empty (the policy
 would not change routing), unavailable (the policy cache could not be read)
 and a failed shadow replay all leave it empty, so they share the "skipped"
-column. The router's shadow_policy_decisions metric splits them. Rows written
-outside shadow mode are skipped too.
+column. The router's shadow_policy_decisions metric splits them. The table does
+not record the policy cache mode either, so decisions made outside shadow mode
+also count as skipped: run the report over a window when shadow mode was on.
 
 Connection settings come from CLICKHOUSE_HOST, CLICKHOUSE_PORT, CLICKHOUSE_USER
 and CLICKHOUSE_PASSWORD; the password is never taken from the command line.
@@ -22,6 +26,9 @@ import sys
 from typing import Any, Dict, List, Optional, Sequence
 
 IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Strategies shadow mode never replays (the router's _run_shadow_strategy).
+NOT_REPLAYABLE_STRATEGIES = "('round_robin', 'weighted')"
 
 # Report section -> the bucket expression; a fixed list, never user input.
 DIMENSIONS = {
@@ -38,7 +45,9 @@ SELECT
         AS agree,
     countIf(shadow_selected_model != '' AND shadow_selected_model != selected_model)
         AS differ,
-    countIf(shadow_selected_model = '') AS skipped
+    countIf(shadow_selected_model = '' AND routing_strategy NOT IN {not_replayable})
+        AS skipped,
+    countIf(routing_strategy IN {not_replayable}) AS not_replayable
 FROM {{database:Identifier}}.routing_decisions FINAL
 WHERE timestamp >= now() - INTERVAL {{hours:UInt32}} HOUR
 GROUP BY bucket
@@ -51,12 +60,13 @@ def _rate(count: int, total: int) -> float:
 
 
 def _summary(row: Sequence[Any]) -> Dict[str, Any]:
-    bucket, decisions, agree, differ, skipped = row
-    decisions, agree, differ, skipped = (
+    bucket, decisions, agree, differ, skipped, not_replayable = row
+    decisions, agree, differ, skipped, not_replayable = (
         int(decisions),
         int(agree),
         int(differ),
         int(skipped),
+        int(not_replayable),
     )
     replayed = agree + differ
     return {
@@ -65,11 +75,12 @@ def _summary(row: Sequence[Any]) -> Dict[str, Any]:
         "agree": agree,
         "differ": differ,
         "skipped": skipped,
+        "not_replayable": not_replayable,
         # Of the decisions the shadow policy replayed.
         "agree_rate": _rate(agree, replayed),
         "differ_rate": _rate(differ, replayed),
-        # Of all decisions.
-        "skipped_rate": _rate(skipped, decisions),
+        # Of the decisions whose strategy shadow mode can replay.
+        "skipped_rate": _rate(skipped, decisions - not_replayable),
     }
 
 
@@ -78,7 +89,10 @@ def build_report(client: Any, *, hours: int, database: str) -> Dict[str, Any]:
     parameters = {"hours": int(hours), "database": database}
     report: Dict[str, Any] = {}
     for section, dimension in DIMENSIONS.items():
-        result = client.query(QUERY.format(dimension=dimension), parameters=parameters)
+        sql = QUERY.format(
+            dimension=dimension, not_replayable=NOT_REPLAYABLE_STRATEGIES
+        )
+        result = client.query(sql, parameters=parameters)
         report[section] = [_summary(row) for row in result.result_rows]
     return report
 
@@ -90,8 +104,9 @@ def _percent(value: float) -> str:
 def format_report(report: Dict[str, Any], *, hours: int) -> str:
     lines = [
         f"Policy shadow report, last {hours} hours",
-        "skipped = skipped_empty, unavailable or a failed replay "
-        "(not split in routing_decisions)",
+        "skipped = skipped_empty, unavailable, a failed replay, or a decision "
+        "made outside shadow mode (routing_decisions does not split them)",
+        "not_replayable = round_robin or weighted routing, never replayed",
     ]
     titles = {
         "overall": "Overall",
@@ -100,7 +115,8 @@ def format_report(report: Dict[str, Any], *, hours: int) -> str:
     }
     header = (
         f"{'bucket':<32} {'decisions':>9} {'agree':>7} {'differ':>7} "
-        f"{'skipped':>7} {'agree%':>7} {'differ%':>8} {'skipped%':>9}"
+        f"{'skipped':>7} {'not_replayable':>14} {'agree%':>7} {'differ%':>8} "
+        f"{'skipped%':>9}"
     )
     for section, title in titles.items():
         lines.extend(["", title, header])
@@ -111,6 +127,7 @@ def format_report(report: Dict[str, Any], *, hours: int) -> str:
             lines.append(
                 f"{row['bucket'][:32]:<32} {row['decisions']:>9} "
                 f"{row['agree']:>7} {row['differ']:>7} {row['skipped']:>7} "
+                f"{row['not_replayable']:>14} "
                 f"{_percent(row['agree_rate']):>7} "
                 f"{_percent(row['differ_rate']):>8} "
                 f"{_percent(row['skipped_rate']):>9}"
