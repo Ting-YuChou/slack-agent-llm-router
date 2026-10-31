@@ -55,6 +55,7 @@ from slack.formatting import (
     CHAT_FEEDBACK_CLICKS_LIMIT,
     CHAT_FEEDBACK_NOT_RECORDED_TEXT,
     CHAT_FEEDBACK_THANKS_TEXT,
+    CHAT_FEEDBACK_UNCONFIRMED_TEXT,
     SLACK_BUSY_MESSAGE,
     SLACK_EMPTY_ANSWER_MESSAGE,
     SLACK_ERROR_CODE_MESSAGES,
@@ -1122,24 +1123,61 @@ class SlackBot(
         """Record a thumbs up / down on a chat answer, once per click.
 
         Anyone who sees the answer may rate it; the event names who clicked.
+        A producer that can confirm delivery is waited on in a background
+        task, so a priority worker is not held for the confirmation.
         """
         rating = CHAT_FEEDBACK_ACTIONS[action["action_id"]]
         request_id = action.get("value")
         user_id = (payload.get("user") or {}).get("id")
-        channel_id = (payload.get("channel") or {}).get("id")
         click_id = str(action.get("action_ts") or payload.get("trigger_id") or "")
         if not is_valid_request_id(request_id) or not user_id or not click_id:
             return
         # Slack may deliver one click twice; a replay is not a second vote.
-        # The click is claimed while it is being recorded and kept only once
-        # it was, so a click that failed can be recorded when retried.
+        # The click is claimed while it is being recorded and released only
+        # when recording failed, so that click can be recorded when retried.
         clicks = self._chat_feedback_clicks
         if click_id in clicks:
             return
         clicks[click_id] = None
+        while len(clicks) > CHAT_FEEDBACK_CLICKS_LIMIT:
+            clicks.pop(next(iter(clicks)))
 
-        recorded = False
         producer = (getattr(self, "services", None) or {}).get("event_producer")
+        confirm = getattr(producer, "confirms_chat_feedback_delivery", False) is True
+        record = self._record_chat_feedback(
+            payload,
+            producer,
+            request_id=str(request_id),
+            user_id=str(user_id),
+            rating=rating,
+            click_id=click_id,
+            confirm=confirm,
+        )
+        if confirm:
+            self._spawn_background_task(record, "chat_feedback_delivery")
+        else:
+            await record
+
+    async def _record_chat_feedback(
+        self,
+        payload: Dict[str, Any],
+        producer: Any,
+        *,
+        request_id: str,
+        user_id: str,
+        rating: str,
+        click_id: str,
+        confirm: bool,
+    ) -> None:
+        """Send one claimed click and tell the user how it went.
+
+        Delivered: thanked, the click stays claimed. Failed: the click is
+        released and the user may retry. Unconfirmed (a confirming producer
+        got no answer in time): the event may still arrive, so the click
+        stays claimed and the user is not asked to retry, which would be a
+        second click and so a second vote.
+        """
+        outcome: Optional[bool] = False
         produce = getattr(producer, "produce_chat_feedback", None)
         if not callable(produce):
             logger.warning(
@@ -1147,45 +1185,54 @@ class SlackBot(
                 request_id,
             )
         else:
-            # A producer that can confirm the send is asked to: the user is
-            # thanked, and the click kept, only once Kafka has the event.
-            confirm = getattr(producer, "confirms_chat_feedback_delivery", False)
+            fields: Dict[str, Any] = {
+                "request_id": request_id,
+                "user_id": user_id,
+                "rating": rating,
+                "click_id": click_id,
+            }
+            if confirm:
+                fields["wait_for_delivery"] = True
             try:
-                recorded = bool(
-                    await produce(
-                        request_id=request_id,
-                        user_id=str(user_id),
-                        rating=rating,
-                        click_id=click_id,
-                        **({"wait_for_delivery": True} if confirm is True else {}),
-                    )
-                )
+                result = await produce(**fields)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.exception(
                     "Failed to record chat feedback for request %s", request_id
                 )
             else:
-                if not recorded:
+                outcome = None if confirm and result is None else bool(result)
+                if outcome is None:
+                    logger.warning(
+                        "Chat feedback for request %s was not confirmed in time",
+                        request_id,
+                    )
+                elif not outcome:
                     logger.warning(
                         "Chat feedback for request %s was not delivered",
                         request_id,
                     )
-        if not recorded:
-            clicks.pop(click_id, None)
-        while len(clicks) > CHAT_FEEDBACK_CLICKS_LIMIT:
-            clicks.pop(next(iter(clicks)))
+        if outcome is False:
+            self._chat_feedback_clicks.pop(click_id, None)
+        channel_id = (payload.get("channel") or {}).get("id")
         if channel_id and hasattr(self.web_client, "chat_postEphemeral"):
             container = payload.get("container") or {}
             message = payload.get("message") or {}
             thread_ts = container.get("thread_ts") or message.get("thread_ts")
+            text = (
+                CHAT_FEEDBACK_THANKS_TEXT
+                if outcome
+                else (
+                    CHAT_FEEDBACK_UNCONFIRMED_TEXT
+                    if outcome is None
+                    else CHAT_FEEDBACK_NOT_RECORDED_TEXT
+                )
+            )
             await self.web_client.chat_postEphemeral(
                 channel=channel_id,
                 user=user_id,
-                text=(
-                    CHAT_FEEDBACK_THANKS_TEXT
-                    if recorded
-                    else CHAT_FEEDBACK_NOT_RECORDED_TEXT
-                ),
+                text=text,
                 **({"thread_ts": thread_ts} if thread_ts else {}),
             )
 

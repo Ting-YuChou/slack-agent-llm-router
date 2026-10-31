@@ -126,7 +126,8 @@ async def test_waiting_feedback_gives_up_after_its_timeout():
         kafka.release.set()
         await stop(manager)
 
-    assert delivered is False
+    # Not confirmed in time, and that send may still arrive: unknown.
+    assert delivered is None
 
 
 @pytest.mark.asyncio
@@ -207,6 +208,11 @@ def _click(action_ts="1700.1"):
     }
 
 
+async def _settle(bot):
+    """A confirming producer is waited on in a background task."""
+    await asyncio.gather(*list(bot.background_tasks), return_exceptions=True)
+
+
 def _ephemeral_texts(bot):
     return [
         call.kwargs["text"]
@@ -220,6 +226,7 @@ async def test_the_bot_does_not_thank_for_feedback_kafka_did_not_take():
     bot = _bot(manager)
     try:
         await bot._handle_agent_interactive(_click())
+        await _settle(bot)
     finally:
         await stop(manager)
 
@@ -234,6 +241,7 @@ async def test_the_bot_thanks_once_kafka_confirmed_the_feedback():
     bot = _bot(manager)
     try:
         await bot._handle_agent_interactive(_click())
+        await _settle(bot)
     finally:
         await stop(manager)
 
@@ -251,6 +259,7 @@ async def test_the_bot_asks_a_confirming_producer_to_wait_for_delivery():
     bot = _bot(producer)
 
     await bot._handle_agent_interactive(_click())
+    await _settle(bot)
 
     assert producer.produce_chat_feedback.await_args.kwargs["wait_for_delivery"]
     assert _ephemeral_texts(bot) == [CHAT_FEEDBACK_NOT_RECORDED_TEXT]

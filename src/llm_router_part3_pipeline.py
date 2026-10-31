@@ -1107,9 +1107,6 @@ def _has_two_phase_send(producer: Any) -> bool:
 class KafkaProducerManager:
     """Manages Kafka message production"""
 
-    # produce_chat_feedback can wait for Kafka to confirm the send.
-    confirms_chat_feedback_delivery = True
-
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.bootstrap_servers = config.get("bootstrap_servers", ["localhost:9092"])
@@ -1180,6 +1177,15 @@ class KafkaProducerManager:
         except Exception as e:
             logger.error(f"Failed to initialize Kafka producer: {e}")
             raise
+
+    @property
+    def confirms_chat_feedback_delivery(self) -> bool:
+        """Whether a send's success means the broker acked it.
+
+        Only then can produce_chat_feedback(wait_for_delivery=True) confirm
+        delivery; without acks a send succeeds once it is handed over.
+        """
+        return bool(getattr(self, "wait_for_ack", False))
 
     def is_healthy(self) -> bool:
         """Return whether the Kafka producer has been initialized."""
@@ -1269,14 +1275,18 @@ class KafkaProducerManager:
     async def _send_envelope(self, envelope) -> bool:
         topic_key = envelope.topic_key
         try:
-            return await self._send_message(
+            delivered = await self._send_message(
                 topic_key,
                 envelope.default_topic,
                 key=envelope.key,
                 value=envelope.value,
             )
         except Exception:
-            return False
+            delivered = False
+        # A waiting caller hears about its own send now, not once the whole
+        # dispatcher batch (which may hold a slow, retrying send) is done.
+        _resolve_delivery(envelope, delivered)
+        return delivered
 
     def _record_delivery(self, envelope, delivered: bool) -> None:
         _resolve_delivery(envelope, delivered)
@@ -1443,12 +1453,13 @@ class KafkaProducerManager:
         source: str = "slack",
         wait_for_delivery: bool = False,
         timeout: float = 2.0,
-    ):
+    ) -> Optional[bool]:
         """Produce a chat.feedback event, keyed by the request it rates.
 
         Without `wait_for_delivery` this is True once the event is queued.
-        With it, True only once Kafka confirmed the send within `timeout`
-        seconds; a send still pending then may yet be delivered.
+        With it: True once Kafka confirmed the send, False when it was not
+        queued or the send failed, and None when no answer came within
+        `timeout` seconds, since that send may still be delivered.
         """
         event = build_chat_feedback_event(
             request_id=request_id,
@@ -1483,7 +1494,7 @@ class KafkaProducerManager:
                 request_id,
                 timeout,
             )
-            return False
+            return None
 
     async def produce_routing_decision(
         self,

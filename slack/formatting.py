@@ -240,6 +240,11 @@ CHAT_FEEDBACK_THANKS_TEXT = "Thanks for the feedback."
 CHAT_FEEDBACK_NOT_RECORDED_TEXT = (
     "Sorry, your feedback could not be recorded right now. Please try again."
 )
+# The send was not confirmed in time but may still arrive: no retry prompt,
+# since a retry is a new click and would count as a second vote.
+CHAT_FEEDBACK_UNCONFIRMED_TEXT = (
+    "Your feedback was sent, but it may not have been recorded."
+)
 CHAT_FEEDBACK_CLICKS_LIMIT = 1000
 
 
