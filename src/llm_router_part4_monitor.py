@@ -127,6 +127,18 @@ end
 return removed
 """
 
+    # KEYS: incident, scope set. ARGV: ttl ms. Lengthens (never shortens)
+    # the TTL of keys that exist: a continuing incident stays deduplicated.
+    EXTEND_SCRIPT = """
+for _, name in ipairs(KEYS) do
+  local left = redis.call('PTTL', name)
+  if left ~= -2 and left < tonumber(ARGV[1]) then
+    redis.call('PEXPIRE', name, ARGV[1])
+  end
+end
+return 1
+"""
+
     def __init__(self, config: Dict[str, Any], avoid_rank: int = 2):
         self.host = str(config.get("host", "localhost"))
         self.port = int(config.get("port", 6379))
@@ -278,6 +290,20 @@ return removed
             level = tuple(int(part) for part in level.split(","))
         result = await self.try_claim(incident, level, ttl_seconds)
         return None if result is None else result.notify
+
+    async def extend(self, incident: tuple, ttl_seconds: float) -> None:
+        """Keep a held incident (and its scope set) for at least ``ttl_seconds``."""
+        ttl_ms = max(1, int(math.ceil(ttl_seconds * 1000)))
+        key, scope_key = self.key(incident), self.scope_key(incident)
+        try:
+            await self._call(
+                "extend",
+                lambda client: client.eval(
+                    self.EXTEND_SCRIPT, 2, key, scope_key, ttl_ms
+                ),
+            )
+        except _StoreUnavailable:
+            return
 
     async def release(self, incident: tuple, targets: Sequence[tuple] = ()) -> None:
         """Close a scope: its avoid incidents, ``incident`` and ``targets``.
@@ -561,6 +587,19 @@ class AlertManager:
         self.dedupe_max_entries = max(
             1, int(alerts_config.get("dedupe_max_entries", 4096))
         )
+        # An avoid incident lasts until Flink's guardrail state expires
+        # (window end + active TTL) unless re-entered. Its dedupe (memory and
+        # Redis) must not outlive that, or a missed clear would silence the
+        # next avoid of the scope for the whole cooldown. The event's
+        # active_until_ms wins; else window_end_ms + incident_ttl_seconds.
+        incident_ttl = alerts_config.get("incident_ttl_seconds")
+        self.incident_ttl_seconds: Optional[float] = (
+            None if incident_ttl is None else max(0.0, float(incident_ttl))
+        )
+        self.incident_ttl_grace_seconds = max(
+            0.0, float(alerts_config.get("incident_ttl_grace_seconds", 60))
+        )
+        self._wall_clock: Callable[[], float] = time.time
         self.notification_timeout_seconds = max(
             0.001, float(alerts_config.get("notification_timeout_seconds", 10))
         )
@@ -1153,32 +1192,49 @@ class AlertManager:
             return
 
         now = self._clock()
+        bound = self._incident_bound_seconds(alert_data)
         active = self._active_external_alerts.get(incident)
         if (
             active is not None
             and now - float(active["_notified_at"]) < self.dedupe_cooldown_seconds
+            and (active.get("_expires_at") is None or now < active["_expires_at"])
             and self._alert_level(normalized_alert) <= self._notified_level(active)
         ):
             # Same incident, no escalation: stay quiet but keep it fresh so
             # a storm does not evict the active incident first.
             self._active_external_alerts.move_to_end(incident)
             self.suppressed_alert_count += 1
+            if bound is not None:
+                # The incident goes on: so does its expiry, up to the cooldown.
+                active["_expires_at"] = max(active["_expires_at"] or 0, now + bound)
+                if self.dedupe_store is not None:
+                    left = self.dedupe_cooldown_seconds - (
+                        now - float(active["_notified_at"])
+                    )
+                    await self.dedupe_store.extend(incident, min(left, bound))
             return
 
-        claim = await self._claim_in_dedupe_store(incident, normalized_alert)
+        key_ttl = self.dedupe_cooldown_seconds
+        if bound is not None:
+            key_ttl = min(key_ttl, bound)
+        claim = await self._claim_in_dedupe_store(incident, normalized_alert, key_ttl)
 
         self._active_external_alerts[incident] = {
             **normalized_alert,
             "_notified_at": now,
+            "_expires_at": None if bound is None else now + key_ttl,
         }
         if claim is not None and not claim.notify:
             entry = self._active_external_alerts[incident]
             if claim.stored_level is not None:
                 entry["_notified_level"] = claim.stored_level
             if claim.remaining_seconds is not None:
-                # The page happened when the key was set, not now.
+                # The page happened when the key was set, not now; a bounded
+                # key also caps how long this process stays quiet.
                 elapsed = self.dedupe_cooldown_seconds - claim.remaining_seconds
                 entry["_notified_at"] = now - max(0.0, elapsed)
+                if bound is not None:
+                    entry["_expires_at"] = now + claim.remaining_seconds
         self._active_external_alerts.move_to_end(incident)
         while len(self._active_external_alerts) > self.dedupe_max_entries:
             self._active_external_alerts.popitem(last=False)
@@ -1197,8 +1253,28 @@ class AlertManager:
         stored = active.get("_notified_level")
         return max(level, stored) if stored is not None else level
 
+    def _incident_bound_seconds(self, alert_data: Dict[str, Any]) -> Optional[float]:
+        """Seconds an avoid incident lives without another avoid, if known.
+
+        Flink drops an entered scope at ``active_until_ms`` (window end +
+        active TTL); dedupe must not outlive it plus a grace, or a missed
+        clear would silence the scope's next avoid for the whole cooldown.
+        """
+        if alert_data.get("guardrail_action") != "avoid":
+            return None
+        expiry_ms = alert_data.get("active_until_ms")
+        if not isinstance(expiry_ms, (int, float)) or isinstance(expiry_ms, bool):
+            window_end_ms = alert_data.get("window_end_ms")
+            if self.incident_ttl_seconds is None or not isinstance(
+                window_end_ms, (int, float)
+            ):
+                return None
+            expiry_ms = window_end_ms + self.incident_ttl_seconds * 1000
+        left = (float(expiry_ms) - self._wall_clock() * 1000) / 1000
+        return max(1.0, left + self.incident_ttl_grace_seconds)
+
     async def _claim_in_dedupe_store(
-        self, incident: tuple, alert: Dict[str, Any]
+        self, incident: tuple, alert: Dict[str, Any], ttl_seconds: float
     ) -> Optional[DedupeClaim]:
         """Ask the shared store whether this page is still due.
 
@@ -1211,9 +1287,7 @@ class AlertManager:
         store = self.dedupe_store
         if store is None or self.dedupe_cooldown_seconds <= 0:
             return None
-        return await store.try_claim(
-            incident, self._alert_level(alert), self.dedupe_cooldown_seconds
-        )
+        return await store.try_claim(incident, self._alert_level(alert), ttl_seconds)
 
     def _get_current_value(self, rule: AlertRule, metrics: Dict[str, float]) -> float:
         """Get current value for the metric being alerted on"""

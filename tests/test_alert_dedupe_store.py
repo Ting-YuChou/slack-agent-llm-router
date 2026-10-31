@@ -60,7 +60,18 @@ class _FakeRedis:
             return self._claim(keys, argv)
         if script == AlertDedupeStore.RELEASE_SCRIPT:
             return self._release(keys, argv)
+        if script == AlertDedupeStore.EXTEND_SCRIPT:
+            return self._extend(keys, argv)
         raise AssertionError("unknown script")
+
+    def _extend(self, keys, argv):
+        ttl = int(argv[0]) / 1000
+        for name in keys:
+            if name in self.data or name in self.data.sets:
+                remaining = self.data.expires_at.get(name, 0) - self.data.now
+                if remaining < ttl:
+                    self.data.expires_at[name] = self.data.now + ttl
+        return 1
 
     def _claim(self, keys, argv):
         key, scope_set = keys
@@ -532,3 +543,152 @@ async def test_resolve_survives_targets_evicted_while_releasing():
     await manager.record_external_alert(_next_window(1, guardrail_action="clear"))
 
     assert [c["status"] for c in handler.calls] == ["firing", "resolved"]
+
+
+# --- review round 1 add-on: a missed clear must not outlive the incident ------
+
+
+class _Clocks:
+    """One fake time for the manager, the wall clock and the fake Redis."""
+
+    def __init__(self, redis, start_wall_seconds):
+        self.redis = redis
+        self.offset = 0.0
+        self.start_wall = start_wall_seconds
+
+    def attach(self, manager):
+        manager._clock = lambda: self.offset
+        manager._wall_clock = lambda: self.start_wall + self.offset
+        return manager
+
+    def tick(self, seconds):
+        self.offset += seconds
+        self.redis.data.now = self.offset
+
+
+def _ttl_manager(redis, clocks, **alerts):
+    manager = AlertManager(
+        {
+            "alerts": {
+                "dedupe_cooldown_seconds": 900,
+                "incident_ttl_seconds": 180,
+                "incident_ttl_grace_seconds": 60,
+                "dedupe_store": dict(STORE_CONFIG),
+                **alerts,
+            }
+        }
+    )
+    manager.dedupe_store._client = redis
+    handler = _RecordingHandler()
+    manager.notification_handlers = {"test": handler}
+    return clocks.attach(manager), handler
+
+
+def _avoid_ending_at(window_end_ms, **overrides):
+    return _guardrail(
+        guardrail_action="avoid",
+        severity="error",
+        window_start_ms=window_end_ms - 60_000,
+        window_end_ms=window_end_ms,
+        **overrides,
+    )
+
+
+@pytest.mark.asyncio
+async def test_avoid_key_expires_with_the_incident_not_the_cooldown():
+    redis = _FakeRedis()
+    end_ms = 1_710_000_060_000
+    clocks = _Clocks(redis, end_ms / 1000)
+    manager, _ = _ttl_manager(redis, clocks)
+
+    await manager.record_external_alert(_avoid_ending_at(end_ms))
+
+    (key,) = redis.data
+    # window end + active TTL (180 s) + grace (60 s), from the window end.
+    assert redis.ttls[key] == pytest.approx(240)
+
+
+@pytest.mark.asyncio
+async def test_missed_clear_does_not_suppress_a_new_avoid_after_the_incident_ttl():
+    redis = _FakeRedis()
+    end_ms = 1_710_000_060_000
+    clocks = _Clocks(redis, end_ms / 1000)
+    manager, handler = _ttl_manager(redis, clocks)
+    await manager.record_external_alert(_avoid_ending_at(end_ms))
+
+    # The clear never arrives. Past the incident's own expiry a new avoid
+    # pages again.
+    clocks.tick(241)
+    await manager.record_external_alert(_avoid_ending_at(end_ms + 241_000))
+
+    assert len(handler.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_missed_clear_does_not_suppress_a_restarted_process_either():
+    redis = _FakeRedis()
+    end_ms = 1_710_000_060_000
+    clocks = _Clocks(redis, end_ms / 1000)
+    before, _ = _ttl_manager(redis, clocks)
+    await before.record_external_alert(_avoid_ending_at(end_ms))
+
+    clocks.tick(241)
+    restarted, restarted_handler = _ttl_manager(_FakeRedis(redis.data), clocks)
+    await restarted.record_external_alert(_avoid_ending_at(end_ms + 241_000))
+
+    assert len(restarted_handler.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_continuing_avoid_incident_keeps_its_dedupe():
+    redis = _FakeRedis()
+    end_ms = 1_710_000_060_000
+    clocks = _Clocks(redis, end_ms / 1000)
+    manager, handler = _ttl_manager(redis, clocks)
+    await manager.record_external_alert(_avoid_ending_at(end_ms))
+
+    # Flink keeps re-entering the scope every minute: one page per cooldown,
+    # not one per incident TTL, here and in a restarted process.
+    for minute in range(1, 8):
+        clocks.tick(60)
+        await manager.record_external_alert(_avoid_ending_at(end_ms + minute * 60_000))
+    restarted, restarted_handler = _ttl_manager(_FakeRedis(redis.data), clocks)
+    clocks.tick(60)
+    await restarted.record_external_alert(_avoid_ending_at(end_ms + 480_000))
+
+    assert len(handler.calls) == 1
+    assert restarted_handler.calls == []
+
+
+@pytest.mark.asyncio
+async def test_event_active_until_bounds_the_key():
+    redis = _FakeRedis()
+    end_ms = 1_710_000_060_000
+    clocks = _Clocks(redis, end_ms / 1000)
+    manager, _ = _ttl_manager(redis, clocks, incident_ttl_seconds=None)
+
+    await manager.record_external_alert(
+        _avoid_ending_at(end_ms, active_until_ms=end_ms + 30_000)
+    )
+
+    (key,) = redis.data
+    assert redis.ttls[key] == pytest.approx(90)
+
+
+@pytest.mark.asyncio
+async def test_incident_ttl_never_extends_the_cooldown_or_touches_warns():
+    redis = _FakeRedis()
+    end_ms = 1_710_000_060_000
+    clocks = _Clocks(redis, end_ms / 1000)
+    manager, _ = _ttl_manager(redis, clocks, dedupe_cooldown_seconds=120)
+
+    await manager.record_external_alert(_avoid_ending_at(end_ms))
+    await manager.record_external_alert(
+        _guardrail(
+            scope_key="warn-only",
+            window_start_ms=end_ms - 60_000,
+            window_end_ms=end_ms,
+        )
+    )
+
+    assert sorted(redis.ttls.values()) == [120, 120]

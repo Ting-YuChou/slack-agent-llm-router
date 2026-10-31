@@ -765,6 +765,12 @@ monitoring:
     # Stream alerts older than this (emitted_at, else window end) are recorded
     # but do not notify, so a consumer replaying from earliest stays quiet.
     max_event_age_seconds: 900
+    # An avoid incident's dedupe ends with Flink's guardrail state (window end
+    # + this, plus the grace) unless another avoid extends it, so a missed
+    # clear cannot silence the scope for the whole cooldown. Keep equal to
+    # flink...active_ttl_seconds. An event's active_until_ms takes precedence.
+    incident_ttl_seconds: 180
+    incident_ttl_grace_seconds: 60
     # Shared record of paged stream incidents (SET NX EX cooldown), so a
     # restart or a second process does not page an active incident again.
     # On Redis errors the in-memory dedupe above still applies.
