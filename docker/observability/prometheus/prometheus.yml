@@ -10,6 +10,8 @@ rule_files:
   - /etc/prometheus/rules/llm-router-alerts.yml
 
 scrape_configs:
+  # The API process has no Prometheus exposition yet (its /metrics is JSON),
+  # so the Kafka producer rules only see the workers process.
   - job_name: llm-router-workers
     static_configs:
       - targets:
