@@ -3,62 +3,48 @@ set -euo pipefail
 
 service_name="${CLICKHOUSE_SERVICE:-clickhouse}"
 database_name="${CLICKHOUSE_DATABASE:-default}"
+python_bin="${PYTHON:-python3}"
+script_dir="$(dirname "${BASH_SOURCE[0]}")"
 
 # Runs inside the container and keeps the password off every command line.
-client_script="$(cat "$(dirname "${BASH_SOURCE[0]}")/clickhouse_client_in_container.sh")"
+client_script="$(cat "${script_dir}/clickhouse_client_in_container.sh")"
 
 run_query() {
   docker compose exec -T "${service_name}" sh -c "${client_script}" sh --query "$1"
 }
 
+# The router's own definition (src/analytics_schema.py), never a copy.
+alert_events_sql() {
+  "${python_bin}" "${script_dir}/alert_events_sql.py" "$@"
+}
+
 create_alert_events_table() {
-  run_query "
-    CREATE TABLE IF NOT EXISTS ${database_name}.alert_events (
-        timestamp DateTime64(3),
-        alert_type String,
-        severity String,
-        description String,
-        anomaly_type String,
-        source_event_type String,
-        request_id String,
-        query_id String,
-        user_id String,
-        model_name String,
-        provider String,
-        window_start_ms UInt64,
-        window_end_ms UInt64,
-        payload_json String
-    ) ENGINE = MergeTree()
-    PARTITION BY toYYYYMMDD(timestamp)
-    ORDER BY (
-        timestamp,
-        source_event_type,
-        severity,
-        alert_type,
-        request_id,
-        query_id,
-        model_name,
-        provider
-    )
-    TTL toDateTime(timestamp) + INTERVAL 30 DAY
-  "
+  run_query "$(alert_events_sql create "${database_name}")"
 }
 
 table_exists="$(run_query "EXISTS TABLE ${database_name}.alert_events" | tr -d '\r\n')"
 
 if [[ "${table_exists}" == "0" ]]; then
   create_alert_events_table
-  echo "Created ${database_name}.alert_events with the current MergeTree schema."
+  echo "Created ${database_name}.alert_events with the current ReplacingMergeTree schema."
   exit 0
 fi
 
 show_create_output="$(run_query "SHOW CREATE TABLE ${database_name}.alert_events")"
-if grep -Fq "ENGINE = MergeTree()" <<<"${show_create_output}" \
+if grep -Fq "ReplacingMergeTree" <<<"${show_create_output}"; then
+  echo "${database_name}.alert_events already uses the current schema (ReplacingMergeTree). No migration needed."
+  exit 0
+fi
+
+if grep -Fq "ENGINE = MergeTree" <<<"${show_create_output}" \
   && grep -Fq "request_id" <<<"${show_create_output}" \
   && grep -Fq "query_id" <<<"${show_create_output}" \
   && grep -Fq "model_name" <<<"${show_create_output}" \
   && grep -Fq "provider" <<<"${show_create_output}"; then
-  echo "${database_name}.alert_events already uses the current schema. No migration needed."
+  # The router adds the newer columns itself; moving the engine to
+  # ReplacingMergeTree is scripts/migrate_clickhouse_analytics_v2.py's job.
+  echo "${database_name}.alert_events already uses the current schema columns on a MergeTree engine. No migration needed here."
+  echo "Run scripts/migrate_clickhouse_analytics_v2.py --apply to move it to ReplacingMergeTree."
   exit 0
 fi
 
@@ -67,7 +53,8 @@ source_row_count="$(run_query "SELECT count() FROM ${database_name}.alert_events
 
 run_query "RENAME TABLE ${database_name}.alert_events TO ${database_name}.${backup_table_name}"
 create_alert_events_table
-run_query "INSERT INTO ${database_name}.alert_events SELECT * FROM ${database_name}.${backup_table_name}"
+backup_columns="$(run_query "SELECT name FROM system.columns WHERE database = '${database_name}' AND table = '${backup_table_name}' ORDER BY position" | tr -d '\r' | paste -sd, -)"
+run_query "$(alert_events_sql copy "${database_name}" "${backup_table_name}" "${backup_columns}")"
 
 migrated_row_count="$(run_query "SELECT count() FROM ${database_name}.alert_events" | tr -d '\r\n')"
 
