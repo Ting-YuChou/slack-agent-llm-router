@@ -361,7 +361,6 @@ class SlackMessageHandler:
         message_ts: Optional[str] = None,
         request_id: Optional[str] = None,
         trace: Optional["SlackQueryTrace"] = None,
-        queue_wait_ms: Optional[int] = None,
     ) -> str:
         """Handle bot commands, falling back to a free-form query when appropriate."""
         parts = command_text.split()
@@ -372,7 +371,7 @@ class SlackMessageHandler:
         args = parts[1:] if len(parts) > 1 else []
         if command_surface == "slash":
             # Slack resends a slash command with the same trigger_id.
-            trace = SlackQueryTrace.for_slash(request_id, queue_wait_ms=queue_wait_ms)
+            trace = SlackQueryTrace.for_slash(request_id)
 
         if command in self.commands:
             if command == "web":

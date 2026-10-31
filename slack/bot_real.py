@@ -79,13 +79,12 @@ from slack.state_store import (
 )
 from slack.conversation import (
     CHAT_MESSAGE_SUBTYPES,
-    SLACK_QUEUE_WAIT_KEY,
     ConversationContext,
     ConversationManager,
     SlackBotConversationMixin,
     SlackFetchedContext,
     SlackQueryTrace,
-    _queue_wait_ms,
+    ingress_queue_wait,
 )
 from slack.attachments import SlackBotAttachmentsMixin
 from slack.bot_agent import (
@@ -114,6 +113,8 @@ CHANNEL_ALLOWLIST_MISS_TTL_SECONDS = 300.0
 # A failed conversations.info call (a 429, a network error) is retried sooner.
 CHANNEL_ALLOWLIST_ERROR_TTL_SECONDS = 10.0
 SLACK_PRIORITY_WORK_KINDS = frozenset({"interactive"})
+# Work kinds a worker hands straight to their handler, never to chat.
+SLACK_DIRECT_WORK_KINDS = frozenset({"slash", "interactive", "agent_view"})
 
 
 SLACK_RATE_LIMIT_RETRIES = 2
@@ -137,19 +138,15 @@ class SlackWorkItem:
     enqueued_at: Optional[float] = None
 
 
-def _stamp_queue_wait(item: SlackWorkItem) -> None:
-    """Put the item's wait so far (queued and parked) on its payload, in ms.
+def _queue_wait(item: SlackWorkItem) -> Any:
+    """The scope that hands the item's wait so far (ms) to its handling.
 
-    Only the bot's own stamp counts: a value already there is dropped.
+    Queued and parked time both count; an item never queued has none.
     """
-    payload = item.payload
-    if not isinstance(payload, dict):
-        return
-    payload.pop(SLACK_QUEUE_WAIT_KEY, None)
     if item.enqueued_at is None:
-        return
+        return ingress_queue_wait(None)
     waited = time.monotonic() - item.enqueued_at
-    payload[SLACK_QUEUE_WAIT_KEY] = max(0, int(waited * 1000))
+    return ingress_queue_wait(max(0, int(waited * 1000)))
 
 
 @dataclass
@@ -635,7 +632,6 @@ class SlackBot(
                 return
 
         trigger_id = command.get("trigger_id")
-        queue_wait_ms = _queue_wait_ms(command.get(SLACK_QUEUE_WAIT_KEY))
         response_text = await self.message_handler._handle_command(
             command_text,
             user_id,
@@ -646,7 +642,6 @@ class SlackBot(
             command_surface="slash",
             # Slack resends a slash command with the same trigger_id.
             request_id=f"slash:{trigger_id}" if trigger_id else None,
-            **({"queue_wait_ms": queue_wait_ms} if queue_wait_ms is not None else {}),
         )
 
         if response_text:
@@ -1474,21 +1469,27 @@ class SlackBot(
             SLACK_METRICS.work_queue_depth.set(self._queued_work())
             SLACK_METRICS.work_running.set(self._work_running)
             try:
-                if item.kind == "slash":
-                    _stamp_queue_wait(item)
-                    await self._handle_slash_command(item.payload)
-                elif item.kind == "interactive":
-                    await self._handle_agent_interactive(item.payload)
-                elif item.kind == "agent_view":
-                    await self._handle_agent_view_submission(item.payload)
-                elif self._is_agent_request(item.payload):
-                    # Bootstrap and create_session can take minutes, like a
-                    # slash start's; the thread gets the status or the error.
-                    self._spawn_background_task(
-                        self._handle_event(item.payload), "pi_agent_start"
-                    )
-                else:
+                if item.kind not in SLACK_DIRECT_WORK_KINDS and not (
+                    self._is_agent_request(item.payload)
+                ):
+                    # Chat work scopes the wait per event: a parked event
+                    # is handled later, by the worker answering its thread.
                     await self._handle_chat_work(item)
+                    continue
+                # A task spawned here (an Agent start) inherits the scope.
+                with _queue_wait(item):
+                    if item.kind == "slash":
+                        await self._handle_slash_command(item.payload)
+                    elif item.kind == "interactive":
+                        await self._handle_agent_interactive(item.payload)
+                    elif item.kind == "agent_view":
+                        await self._handle_agent_view_submission(item.payload)
+                    else:
+                        # Bootstrap and create_session can take minutes, like
+                        # a slash start's; the thread gets the status or error.
+                        self._spawn_background_task(
+                            self._handle_event(item.payload), "pi_agent_start"
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1536,8 +1537,8 @@ class SlackBot(
         """
         key = self._chat_thread_key(item.payload)
         if key is None:
-            _stamp_queue_wait(item)
-            await self._handle_event(item.payload)
+            with _queue_wait(item):
+                await self._handle_event(item.payload)
             return
         if key in self._busy_threads:
             if await self._drops_before_thread(item.payload):
@@ -1558,10 +1559,10 @@ class SlackBot(
         try:
             current = item
             while True:
-                # Time parked behind the thread's earlier events counts.
-                _stamp_queue_wait(current)
                 try:
-                    await self._handle_event(current.payload)
+                    # Time parked behind the thread's earlier events counts.
+                    with _queue_wait(current):
+                        await self._handle_event(current.payload)
                 except asyncio.CancelledError:
                     raise
                 except Exception:

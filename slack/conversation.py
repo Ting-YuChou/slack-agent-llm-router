@@ -4,12 +4,15 @@ and the SlackBot mixin that fetches Slack history as context."""
 import asyncio
 import logging
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from typing import (
     Any,
     Awaitable,
     Callable,
     Dict,
+    Iterator,
     List,
     Optional,
 )
@@ -82,17 +85,15 @@ class SlackQueryTrace:
             ),
             surface=surface,
             event_id=event_id if isinstance(event_id, str) else None,
-            queue_wait_ms=_queue_wait_ms(event.get(SLACK_QUEUE_WAIT_KEY)),
+            queue_wait_ms=_INGRESS_QUEUE_WAIT_MS.get(),
         )
 
     @classmethod
-    def for_slash(
-        cls, request_id: Optional[str], *, queue_wait_ms: Any = None
-    ) -> "SlackQueryTrace":
+    def for_slash(cls, request_id: Optional[str]) -> "SlackQueryTrace":
         return cls(
             request_id=request_id if is_valid_request_id(request_id) else None,
             surface="slash",
-            queue_wait_ms=_queue_wait_ms(queue_wait_ms),
+            queue_wait_ms=_INGRESS_QUEUE_WAIT_MS.get(),
         )
 
     def add_metadata(
@@ -108,14 +109,23 @@ class SlackQueryTrace:
             slack["event_id"] = self.event_id
 
 
-# The event key a worker stamps with the item's queue wait at pickup.
-SLACK_QUEUE_WAIT_KEY = "_ingress_queue_wait_ms"
+# How long the work being handled waited in the bot's work queue (ms),
+# parked time included; None outside queued work. Set by the worker that
+# takes the item, so it reaches the query trace without riding on the
+# Slack event, and a task spawned for the item (an Agent start) inherits it.
+_INGRESS_QUEUE_WAIT_MS: ContextVar[Optional[int]] = ContextVar(
+    "slack_ingress_queue_wait_ms", default=None
+)
 
 
-def _queue_wait_ms(value: Any) -> Optional[int]:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return None
-    return value
+@contextmanager
+def ingress_queue_wait(wait_ms: Optional[int]) -> Iterator[None]:
+    """Handle the work inside this block as having waited `wait_ms`."""
+    token = _INGRESS_QUEUE_WAIT_MS.set(wait_ms)
+    try:
+        yield
+    finally:
+        _INGRESS_QUEUE_WAIT_MS.reset(token)
 
 
 @dataclass
