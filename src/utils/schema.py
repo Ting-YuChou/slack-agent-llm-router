@@ -687,7 +687,6 @@ class ApiConfig(ConfigModel):
     host: str = "0.0.0.0"
     port: int = Field(8080, ge=1, le=65535)
     log_level: str = "info"
-    cors_origins: List[str] = Field(default_factory=list)
     rate_limiting: ApiRateLimitingConfig = Field(default_factory=ApiRateLimitingConfig)
 
 
@@ -1250,13 +1249,6 @@ class ApiKeysSecurityConfig(ConfigModel):
         return self
 
 
-class JwtSecurityConfig(ConfigModel):
-    enabled: bool = False
-    secret_key_env: str = "JWT_SECRET_KEY"
-    algorithm: str = "HS256"
-    expiration_hours: int = Field(24, ge=1)
-
-
 class CorsSecurityConfig(ConfigModel):
     enabled: bool = False
     allow_origins: List[str] = Field(default_factory=list)
@@ -1267,7 +1259,6 @@ class CorsSecurityConfig(ConfigModel):
 
 class SecurityConfig(ConfigModel):
     api_keys: ApiKeysSecurityConfig = Field(default_factory=ApiKeysSecurityConfig)
-    jwt: JwtSecurityConfig = Field(default_factory=JwtSecurityConfig)
     cors: CorsSecurityConfig = Field(default_factory=CorsSecurityConfig)
     # Request bodies above this size get 413 before they are parsed.
     max_request_body_bytes: int = Field(2 * 1024 * 1024, ge=1)

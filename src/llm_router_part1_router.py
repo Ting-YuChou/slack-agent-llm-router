@@ -11,7 +11,6 @@ import math
 import os
 import re
 import time
-from dataclasses import dataclass
 from typing import Any, Dict, List, NamedTuple, NoReturn, Optional, Tuple
 
 from src.prompt_assembly import (
@@ -21,6 +20,7 @@ from src.prompt_assembly import (
 )
 from src.pricing import per_token, resolve_model_pricing
 from src.routing_features import build_routing_features
+from src.routing_rules import RoutingRule, RoutingRuleError
 from src.utils.metrics import ROUTER_METRICS
 from src.utils.schema import (
     ModelConfig,
@@ -179,27 +179,6 @@ class EligibleModels(NamedTuple):
         if self.guardrails_bypassed:
             return f"{reason}; {GUARDRAIL_BYPASS_NOTE}"
         return reason
-
-
-@dataclass
-class RoutingRule:
-    """Routing rule for model selection"""
-
-    condition: str
-    models: List[str]
-    fallback: str
-    weight: float = 1.0
-
-    def matches(self, query_context: Dict[str, Any]) -> bool:
-        """Check if this rule matches the given query context"""
-        try:
-            # Simple condition evaluation (in production, use a more robust parser)
-            normalized_condition = re.sub(r"\bAND\b", "and", self.condition)
-            normalized_condition = re.sub(r"\bOR\b", "or", normalized_condition)
-            normalized_condition = re.sub(r"\bNOT\b", "not", normalized_condition)
-            return eval(normalized_condition, {"__builtins__": {}}, query_context)
-        except Exception:
-            return False
 
 
 class QueryClassifier:
@@ -650,7 +629,6 @@ class ModelRouter:
 
         # Performance tracking
         self.model_stats: Dict[str, Dict[str, float]] = {}
-        self.request_cache: Dict[str, RoutingDecision] = {}
         self._initialized = False
         self._missing_model_credentials: Dict[str, str] = {}
 
@@ -756,16 +734,27 @@ class ModelRouter:
         ]
 
     def _load_routing_rules(self):
-        """Load routing rules from configuration"""
-        rules_config = self.config.get("routing_rules", [])
+        """Load routing rules from configuration.
 
-        for rule_config in rules_config:
+        An invalid rule (bad syntax, an unknown name, a missing field) raises
+        RoutingRuleError: a rule that silently never matched hid config typos.
+        """
+        rules_config = self.config.get("routing_rules", []) or []
+
+        for index, rule_config in enumerate(rules_config):
+            if not isinstance(rule_config, dict):
+                raise RoutingRuleError(
+                    f"router.routing_rules[{index}] must be a mapping"
+                )
             try:
                 rule = RoutingRule(**rule_config)
-                self.routing_rules.append(rule)
-                logger.debug(f"Loaded routing rule: {rule.condition}")
-            except Exception as e:
-                logger.error(f"Failed to load routing rule: {e}")
+            except (RoutingRuleError, TypeError) as error:
+                # TypeError: a missing or unknown field in the rule entry.
+                raise RoutingRuleError(
+                    f"router.routing_rules[{index}]: {error}"
+                ) from None
+            self.routing_rules.append(rule)
+            logger.debug("Loaded routing rule: %s", rule.condition)
 
     async def route_query(self, request: QueryRequest) -> RoutingDecision:
         """Main routing logic - selects the best model for a query"""
