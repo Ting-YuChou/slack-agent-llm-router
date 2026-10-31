@@ -1,0 +1,175 @@
+"""A12b: one declarative definition per ClickHouse table drives its CREATE,
+its ALTERs and the keys its row builder may write."""
+
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from src.analytics_schema import TABLES, Column, Table
+from src.llm_router_part3_pipeline import (
+    ClickHouseManager,
+    KafkaConsumerManager,
+    MetricEntry,
+    QueryLogEntry,
+    build_chat_feedback_row,
+    build_chat_request_row,
+)
+
+NOW = "2026-10-30T12:00:00+00:00"
+
+
+def _consumer():
+    return KafkaConsumerManager.__new__(KafkaConsumerManager)
+
+
+def _query_log_row():
+    return QueryLogEntry(
+        query_id="q-1",
+        timestamp=datetime.now(timezone.utc),
+        user_id="U1",
+        user_tier="free",
+        query_text="hello",
+        query_type="simple",
+        selected_model="m",
+        token_count_input=1,
+        token_count_output=2,
+        latency_ms=3,
+        cost_usd=0.1,
+        status="success",
+    ).to_dict()
+
+
+def _row_builders():
+    consumer = _consumer()
+    return {
+        "query_logs": _query_log_row(),
+        "system_metrics": MetricEntry(
+            timestamp=datetime.now(timezone.utc),
+            service="router",
+            metric_name="latency",
+            metric_value=1.0,
+            labels={},
+        ).to_dict(),
+        "model_performance": consumer._build_model_performance_entry(
+            {"model_name": "m", "window_start_ms": 1000, "window_end_ms": 2000}
+        ).to_dict(),
+        "alert_events": consumer._build_alert_event_entry(
+            {"event_type": "alert", "emitted_at": NOW}
+        ).to_dict(),
+        "routing_policy_state_events": consumer._build_routing_policy_state_entry(
+            {"scope_type": "user", "scope_key": "U1", "emitted_at": NOW}
+        ).to_dict(),
+        "chat_requests": build_chat_request_row(
+            {"request_id": "r-1", "emitted_at": NOW}
+        ),
+        "chat_feedback": build_chat_feedback_row(
+            {"request_id": "r-1", "rating": "up", "emitted_at": NOW}
+        ),
+        "routing_decisions": consumer._build_routing_decision_entry(
+            {"request_id": "r-1", "decided_at": NOW}
+        ).to_dict(),
+    }
+
+
+def test_tables_are_defined_in_creation_order():
+    assert [table.name for table in TABLES] == [
+        "query_logs",
+        "system_metrics",
+        "model_performance",
+        "user_analytics",
+        "alert_events",
+        "routing_policy_state_events",
+        "chat_requests",
+        "chat_feedback",
+        "routing_decisions",
+    ]
+
+
+@pytest.mark.parametrize("table_name", sorted(_row_builders()))
+def test_row_builder_keys_match_the_table_columns(table_name):
+    table = {table.name: table for table in TABLES}[table_name]
+    row = _row_builders()[table_name]
+    columns = {column.name: column for column in table.columns}
+
+    assert set(row) - set(columns) == set()
+    unfilled = [
+        name
+        for name, column in columns.items()
+        if name not in row and column.default is None
+    ]
+    assert unfilled == []
+
+
+def test_create_sql_lists_every_column_and_the_table_options():
+    table = Table(
+        name="demo",
+        columns=(
+            Column("ts", "DateTime64(3)"),
+            Column("id", "String"),
+            Column("note", "String", default="''"),
+        ),
+        engine="ReplacingMergeTree()",
+        partition_by="toYYYYMMDD(ts)",
+        order_by="(ts, id)",
+        ttl="toDateTime(ts) + INTERVAL 7 DAY",
+        settings="index_granularity = 8192",
+    )
+
+    sql = table.create_sql("db")
+
+    assert sql.startswith("CREATE TABLE IF NOT EXISTS db.demo (")
+    assert "note String DEFAULT ''" in sql
+    assert "ENGINE = ReplacingMergeTree()" in sql
+    assert "PARTITION BY toYYYYMMDD(ts)" in sql
+    assert "ORDER BY (ts, id)" in sql
+    assert "TTL toDateTime(ts) + INTERVAL 7 DAY" in sql
+    assert "SETTINGS index_granularity = 8192" in sql
+
+
+def test_alters_add_every_column_outside_the_sorting_and_partition_keys():
+    table = Table(
+        name="demo",
+        columns=(
+            Column("ts", "DateTime64(3)"),
+            Column("id", "String", backfill="concat('x', toString(ts))"),
+            Column("bucket", "String"),
+            Column("note", "String", default="''"),
+            Column("value", "UInt32"),
+        ),
+        engine="ReplacingMergeTree()",
+        partition_by="toYYYYMM(ts)",
+        order_by="(toStartOfHour(ts), bucket)",
+    )
+
+    assert table.alter_sql("db") == [
+        # A key column only with an explicit backfill for older tables.
+        "ALTER TABLE db.demo ADD COLUMN IF NOT EXISTS id String "
+        "DEFAULT concat('x', toString(ts))",
+        "ALTER TABLE db.demo ADD COLUMN IF NOT EXISTS note String DEFAULT ''",
+        "ALTER TABLE db.demo ADD COLUMN IF NOT EXISTS value UInt32",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_tables_runs_the_generated_creates_then_the_alters():
+    manager = ClickHouseManager({"database": "llm_router"})
+    manager.client = MagicMock()
+    manager._run_blocking = AsyncMock(return_value=None)
+
+    await manager._create_tables()
+
+    statements = [call.args[1] for call in manager._run_blocking.await_args_list]
+    expected = [table.create_sql("llm_router") for table in TABLES] + [
+        sql for table in TABLES for sql in table.alter_sql("llm_router")
+    ]
+    assert statements == expected
+    # Columns added after a table first shipped are still migrated.
+    assert (
+        "ALTER TABLE llm_router.chat_requests ADD COLUMN IF NOT EXISTS "
+        "queue_wait_ms Nullable(UInt32)"
+    ) in statements
+    assert (
+        "ALTER TABLE llm_router.query_logs ADD COLUMN IF NOT EXISTS "
+        "event_id String DEFAULT query_id"
+    ) in statements
