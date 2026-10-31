@@ -2627,6 +2627,28 @@ def _remove_lag_series(tp: Any, topic_key: str) -> None:
         logger.debug(f"Failed to remove Kafka consumer lag series: {e}")
 
 
+def _remove_lag_series_for_key(topic_key: str) -> None:
+    """Forget every lag series of one consumer key."""
+    try:
+        samples = [
+            sample
+            for metric in PIPELINE_METRICS.consumer_lag.collect()
+            for sample in metric.samples
+            if sample.labels.get("topic_key") == topic_key
+        ]
+    except Exception as e:  # pragma: no cover - metrics are best effort
+        logger.debug(f"Failed to list Kafka consumer lag series: {e}")
+        return
+    for sample in samples:
+        _remove_lag_series(
+            SimpleNamespace(
+                topic=sample.labels.get("topic", ""),
+                partition=sample.labels.get("partition", ""),
+            ),
+            topic_key,
+        )
+
+
 def observer_group_id(prefix: str) -> str:
     """A consumer group of its own for this process's observers.
 
@@ -2833,6 +2855,12 @@ class KafkaConsumerManager:
             "last_started_at": None,
             "last_stopped_at": None,
         }
+        # Seed the stall rule's timestamp: a consumer that never consumes
+        # would otherwise have lag but no last-consumed series to join.
+        if consumer_key not in self.last_consumed_at:
+            PIPELINE_METRICS.last_consumed_timestamp.labels(
+                topic=str(topic_name), topic_key=consumer_key
+            ).set(time.time())
         logger.info(f"Consumer {consumer_key} for topic {topic_name} initialized")
 
     async def _start_observer_consumers(self) -> None:
@@ -3013,6 +3041,9 @@ class KafkaConsumerManager:
         """Recreate a Kafka consumer after a task-level failure."""
         old_consumer = self.consumers.get(topic_key)
         if old_consumer is not None:
+            # stop() does not call on_partitions_revoked, so drop the old
+            # consumer's lag series here; the new one reports its own.
+            _remove_lag_series_for_key(topic_key)
             try:
                 await old_consumer.stop()
             except Exception as e:
