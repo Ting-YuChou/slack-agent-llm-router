@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.api_security import CLIENT_METADATA_KEYS, filter_external_metadata
-from src.llm_router_part2_inference import InferenceEngine
+from src.llm_router_part2_inference import InferenceEngine, ResponseCache
 from src.llm_router_part3_pipeline import build_inference_completed_event
 from src.provider_scheduler import ProviderCapacityScheduler, SchedulerLease
 from src.utils.schema import InferenceResponse, QueryRequest, UserTier
@@ -187,3 +187,17 @@ def test_inference_response_queue_wait_defaults_to_none():
     assert response.queue_wait_ms is None
     with pytest.raises(ValueError):
         response.model_validate({**response.model_dump(), "queue_wait_ms": -1})
+
+
+def test_ingress_wait_does_not_fragment_the_response_cache_key():
+    cache = ResponseCache({"enabled": False})
+    keys = {
+        cache.generate_cache_key(request, "gpt-5")
+        for request in (
+            _request(ingress_queue_wait_ms=12),
+            _request(ingress_queue_wait_ms=37),
+            _request(),
+        )
+    }
+
+    assert len(keys) == 1

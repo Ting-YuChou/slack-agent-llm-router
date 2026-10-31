@@ -877,7 +877,8 @@ class ResponseCache:
         ).hexdigest()
 
     # Trace fields that name the asking message, not what it asks.
-    TRACE_METADATA_KEYS = {"surface"}
+    # Per-request trace values; the answer does not depend on them.
+    TRACE_METADATA_KEYS = {"surface", INGRESS_QUEUE_WAIT_METADATA_KEY}
     SLACK_TRACE_METADATA_KEYS = {"message_ts", "event_id"}
 
     def _cacheable_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
