@@ -550,7 +550,6 @@ kafka:
     - kafka:29092
   topics:
     queries: llm-queries
-    responses: llm-responses
     metrics: llm-metrics
     requests_raw: requests.raw
     inference_completed: inference.completed
@@ -562,7 +561,6 @@ kafka:
     routing_policy_state: routing.policy_state
     routing_decisions: routing.decisions
     alerts: alerts
-    errors: llm-errors
   producer:
     acks: all
     retries: 3

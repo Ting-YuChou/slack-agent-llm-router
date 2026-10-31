@@ -1493,15 +1493,6 @@ class KafkaProducerManager:
             value=query_log.to_dict(),
         )
 
-    async def produce_response_log(self, response_data: Dict[str, Any]):
-        """Produce response log message"""
-        return self._enqueue_message(
-            "responses",
-            "llm-responses",
-            key=response_data.get("query_id"),
-            value=response_data,
-        )
-
     async def produce_metric(
         self,
         service: str,
@@ -1523,17 +1514,6 @@ class KafkaProducerManager:
             "llm-metrics",
             key=f"{service}:{metric_name}",
             value=metric_entry.to_dict(),
-        )
-
-    async def produce_error(self, error_data: Dict[str, Any]):
-        """Produce error message"""
-        error_data["timestamp"] = datetime.now(timezone.utc)
-
-        return self._enqueue_message(
-            "errors",
-            "llm-errors",
-            key=error_data.get("error_id", str(uuid.uuid4())),
-            value=error_data,
         )
 
     def _serialize_message(self, message: Any) -> bytes:
@@ -2745,9 +2725,7 @@ class KafkaConsumerManager:
             for topic_key, topic_name in self.topics.items():
                 if topic_key in [
                     "queries",
-                    "responses",
                     "metrics",
-                    "errors",
                     "requests_enriched",
                     "analytics_model_metrics_1m",
                     "routing_guardrails",
@@ -2851,9 +2829,7 @@ class KafkaConsumerManager:
         """Dispatch to the topic-specific consumer implementation."""
         handlers = {
             "queries": self._consume_queries,
-            "responses": self._consume_responses,
             "metrics": self._consume_metrics,
-            "errors": self._consume_errors,
             "requests_enriched": self._consume_requests_enriched,
             "analytics_model_metrics_1m": self._consume_analytics_model_metrics,
             "routing_guardrails": self._consume_routing_guardrails,
@@ -2913,32 +2889,6 @@ class KafkaConsumerManager:
             logger.error(f"Query consumer error: {e}")
             raise
 
-    async def _consume_responses(self, consumer: AIOKafkaConsumer):
-        """Consume response log messages"""
-        try:
-            async for message in consumer:
-                try:
-                    data = self._decode_message_value(message)
-                    # Process response data (for future analytics)
-                    logger.debug(f"Processed response: {data.get('query_id')}")
-                    await self._commit_processed_message("responses", message)
-                    self._record_successful_consume("responses", consumer, message)
-
-                    PIPELINE_METRICS.messages_consumed.labels(topic="responses").inc()
-
-                except Exception as e:
-                    await self._handle_processing_failure(
-                        "responses",
-                        message,
-                        e,
-                        stage="consume",
-                        batched=False,
-                    )
-
-        except Exception as e:
-            logger.error(f"Response consumer error: {e}")
-            raise
-
     async def _consume_metrics(self, consumer: AIOKafkaConsumer):
         """Consume system metrics messages"""
         try:
@@ -2971,31 +2921,6 @@ class KafkaConsumerManager:
 
         except Exception as e:
             logger.error(f"Metrics consumer error: {e}")
-            raise
-
-    async def _consume_errors(self, consumer: AIOKafkaConsumer):
-        """Consume error messages"""
-        try:
-            async for message in consumer:
-                try:
-                    data = self._decode_message_value(message)
-                    logger.error(f"System error logged: {data}")
-                    await self._commit_processed_message("errors", message)
-                    self._record_successful_consume("errors", consumer, message)
-
-                    PIPELINE_METRICS.messages_consumed.labels(topic="errors").inc()
-
-                except Exception as e:
-                    await self._handle_processing_failure(
-                        "errors",
-                        message,
-                        e,
-                        stage="consume",
-                        batched=False,
-                    )
-
-        except Exception as e:
-            logger.error(f"Error consumer error: {e}")
             raise
 
     def register_observer(
@@ -4128,10 +4053,6 @@ class KafkaIngestionPipeline:
         await self.producer_manager.produce_metric(
             service, metric_name, metric_value, labels
         )
-
-    async def log_error(self, error_data: Dict[str, Any]):
-        """Log error through the pipeline"""
-        await self.producer_manager.produce_error(error_data)
 
     async def get_analytics(
         self,
