@@ -654,18 +654,18 @@ class ModelRouter:
         logger.info("Model router initialized successfully")
 
     def is_healthy(self) -> bool:
-        """Return whether the router is ready to serve traffic."""
+        """Return whether the router is ready to serve traffic.
+
+        The policy cache is best-effort and not consulted: routing works
+        without it, and readiness reports it under degraded_services (O4).
+        """
         default_model_loaded = self.default_model in self.models
         classifier_ready = getattr(self.classifier, "_is_initialized", False)
-        policy_cache_healthy = True
-        if self.policy_cache and hasattr(self.policy_cache, "is_healthy"):
-            policy_cache_healthy = self.policy_cache.is_healthy()
         return (
             self._initialized
             and classifier_ready
             and bool(self.models)
             and default_model_loaded
-            and policy_cache_healthy
         )
 
     def tokenizer_status(self) -> Dict[str, Any]:
