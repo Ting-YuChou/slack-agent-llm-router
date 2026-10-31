@@ -411,9 +411,12 @@ def _event_query_text(query_request: QueryRequest) -> str:
         if names:
             # Whole names only, longest first: a file called "a" or "notes"
             # must not rewrite the words around it, and "plan.txt" must not
-            # leave ".bak" of "plan.txt.bak".
+            # leave ".bak" of "plan.txt.bak". Bounded by ASCII letters and
+            # digits only, so a name next to CJK text or "_" is still found.
             pattern = re.compile(
-                r"(?<!\w)(?:" + "|".join(re.escape(name) for name in names) + r")(?!\w)"
+                r"(?<![A-Za-z0-9])(?:"
+                + "|".join(re.escape(name) for name in names)
+                + r")(?![A-Za-z0-9])"
             )
             query = pattern.sub("[attachment]", query)
     return redact_text(query)
