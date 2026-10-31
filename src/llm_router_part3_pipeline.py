@@ -1283,8 +1283,11 @@ class KafkaProducerManager:
             )
         except Exception:
             delivered = False
-        # A waiting caller hears about its own send now, not once the whole
-        # dispatcher batch (which may hold a slow, retrying send) is done.
+        # A waiting caller hears about its own send now, not once the rest
+        # of its dispatcher batch is done. The dispatcher still takes no new
+        # envelopes until the whole batch is, so a slow batch can delay a
+        # click queued after it past its timeout ("may not have been
+        # recorded" in Slack).
         _resolve_delivery(envelope, delivered)
         return delivered
 
