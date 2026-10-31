@@ -49,6 +49,9 @@ logger = logging.getLogger("flink.submitter")
 WORKSPACE = Path(__file__).resolve().parents[1]
 STATE_FILE = "submitter-state.json"
 JOB_ID_HISTORY = 5
+# Runs that fell out of the history, kept so their directories can be pruned.
+EVICTED_HISTORY = 100
+EVICTED_SUFFIX = ".evicted"
 # Checkpoint directories of this many newest runs per job survive pruning.
 DEFAULT_KEEP_JOB_CHECKPOINTS = 2
 # `flink run -d` returns once the job is submitted; a hang past this is a
@@ -127,10 +130,27 @@ def recorded_job_ids(checkpoint_root: Path, slug: str) -> List[str]:
     return _read_state(checkpoint_root).get(slug, [])
 
 
+def _evicted_key(slug: str) -> str:
+    return f"{slug}{EVICTED_SUFFIX}"
+
+
+def evicted_job_ids(checkpoint_root: Path, slug: str) -> List[str]:
+    """Return runs that dropped out of the history, most recently evicted first.
+
+    They are still ours: the pruner may delete their checkpoint directories.
+    """
+    return _read_state(checkpoint_root).get(_evicted_key(slug), [])
+
+
 def record_job_id(checkpoint_root: Path, slug: str, job_id: str) -> None:
     state = _read_state(checkpoint_root)
     history = [job_id] + [i for i in state.get(slug, []) if i != job_id]
     state[slug] = history[:JOB_ID_HISTORY]
+    evicted = history[JOB_ID_HISTORY:]
+    if evicted:
+        previous = state.get(_evicted_key(slug), [])
+        merged = evicted + [i for i in previous if i not in evicted]
+        state[_evicted_key(slug)] = merged[:EVICTED_HISTORY]
     path = _state_path(checkpoint_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
@@ -165,29 +185,29 @@ def prune_job_checkpoints(
 ) -> List[Path]:
     """Delete checkpoint directories of superseded runs; return what was deleted.
 
-    Each job keeps the directories of its ``keep`` newest recorded runs. A
-    job's older runs go only once its newest run has completed a checkpoint,
-    so a NO_CLAIM restore source survives until the new run no longer needs
-    it. Directories of no recorded run go only once every job is in that
-    state. Active jobs, ``savepoints/``, the state file and anything that is
-    not a 32-hex job id directory are never touched. ``keep <= 0`` disables
-    pruning.
+    Only runs this submitter recorded are candidates (its history and the
+    runs evicted from it). Each job keeps the directories of its ``keep``
+    newest recorded runs; its older runs go only once its newest run has
+    completed a checkpoint, so a NO_CLAIM restore source survives until the
+    new run no longer needs it. Active jobs, directories of job ids the
+    submitter never recorded, ``savepoints/``, the state file and anything
+    that is not a 32-hex job id directory are never touched. ``keep <= 0``
+    disables pruning.
     """
     if keep <= 0:
         return []
     root = Path(checkpoint_root)
     state = _read_state(root)
-    histories = [state.get(job.slug, []) for job in JOBS]
     active = {str(job_id) for job_id in active_job_ids}
     protected = set(active)
     deletable = set()
-    all_settled = True
-    for history in histories:
-        protected.update(history)
+    for job in JOBS:
+        history = state.get(job.slug, [])
+        protected.update(history[:keep])
         if history and _has_completed_checkpoint(root, history[0]):
             deletable.update(history[keep:])
-        else:
-            all_settled = False
+            deletable.update(state.get(_evicted_key(job.slug), []))
+    deletable -= protected
 
     try:
         children = list(root.iterdir())
@@ -198,9 +218,7 @@ def prune_job_checkpoints(
         name = child.name
         if not _JOB_DIR.fullmatch(name) or child.is_symlink() or not child.is_dir():
             continue
-        if name in active:
-            continue
-        if name in deletable or (all_settled and name not in protected):
+        if name in deletable:
             try:
                 shutil.rmtree(child)
             except OSError as exc:
@@ -375,12 +393,23 @@ def reconcile(
         active_job_ids.add(job_id)
         logger.info("%s %s as %s", status, job.slug, job_id)
         outcome[job.slug] = status
-    try:
-        prune_job_checkpoints(
-            checkpoint_root, keep=keep_job_checkpoints, active_job_ids=active_job_ids
-        )
-    except Exception as exc:
-        logger.warning("Flink checkpoint pruning failed: %s", exc)
+    if keep_job_checkpoints > 0:
+        try:
+            # Submits can take minutes: list the running jobs again, and do
+            # not prune at all without a current view of them.
+            fresh = fetch_json(f"http://{jobmanager}/jobs/overview") or {}
+            active_job_ids.update(
+                str(job.get("jid"))
+                for job in fresh.get("jobs", []) or []
+                if job.get("state") in ACTIVE_STATES and job.get("jid")
+            )
+            prune_job_checkpoints(
+                checkpoint_root,
+                keep=keep_job_checkpoints,
+                active_job_ids=active_job_ids,
+            )
+        except Exception as exc:
+            logger.warning("Flink checkpoint pruning skipped: %s", exc)
     return outcome
 
 

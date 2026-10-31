@@ -52,16 +52,15 @@ def _job_dirs(root):
 
 def test_prune_keeps_the_newest_runs_once_the_current_one_checkpointed(tmp_path):
     analytics, enrichment = _fixture(tmp_path)
-    orphan = _run_dir(tmp_path, _jid(99), 7)
+    foreign = _run_dir(tmp_path, _jid(99), 7)
     state_before = (tmp_path / submitter.STATE_FILE).read_text()
 
     deleted = submitter.prune_job_checkpoints(tmp_path, keep=2)
 
-    assert sorted(p.name for p in deleted) == sorted(
-        [analytics[0], analytics[1], orphan.name]
-    )
+    assert sorted(p.name for p in deleted) == sorted([analytics[0], analytics[1]])
+    # A job id the submitter never recorded is not ours to delete.
     assert _job_dirs(tmp_path) == sorted(
-        [analytics[2], analytics[3], *enrichment, "savepoints"]
+        [analytics[2], analytics[3], *enrichment, foreign.name, "savepoints"]
     )
     assert (tmp_path / "savepoints" / "savepoint-abc" / "_metadata").is_file()
     assert (tmp_path / submitter.STATE_FILE).read_text() == state_before
@@ -207,3 +206,107 @@ def test_reconcile_survives_a_failing_prune(tmp_path, monkeypatch):
 
     assert result == {ANALYTICS.slug: "running", ENRICHMENT.slug: "running"}
     assert analytics[0] in _job_dirs(tmp_path)
+
+
+# --- review round 1 -----------------------------------------------------------
+
+
+def test_runs_evicted_from_the_history_are_still_pruned(tmp_path):
+    runs = [_jid(n) for n in range(1, 9)]
+    for job_id in runs[:-1]:
+        _run_dir(tmp_path, job_id, 3)
+    _run_dir(tmp_path, runs[-1], 1)
+    _history(tmp_path, ANALYTICS.slug, *runs)
+    assert len(submitter.recorded_job_ids(tmp_path, ANALYTICS.slug)) == (
+        submitter.JOB_ID_HISTORY
+    )
+    assert submitter.evicted_job_ids(tmp_path, ANALYTICS.slug) == runs[:3][::-1]
+    foreign = _run_dir(tmp_path, _jid(99), 7)
+
+    submitter.prune_job_checkpoints(tmp_path, keep=2)
+
+    assert _job_dirs(tmp_path) == sorted([runs[-2], runs[-1], foreign.name])
+
+
+class _ScriptedCluster(_RunningCluster):
+    """Answers each /jobs/overview call from a list, the last one repeating."""
+
+    def __init__(self, overviews, returncode=0):
+        super().__init__([])
+        self.overviews = list(overviews)
+        self.returncode = returncode
+
+    def fetch_json(self, url):
+        overview = (
+            self.overviews.pop(0) if len(self.overviews) > 1 else (self.overviews[0])
+        )
+        if isinstance(overview, Exception):
+            raise overview
+        return {"jobs": list(overview)}
+
+    def run(self, command, env):
+        if self.returncode == 124:
+            self.commands.append(command)
+            return SimpleNamespace(returncode=124, stdout="", stderr="timed out")
+        return super().run(command, env)
+
+
+def _running(job, jid):
+    return {"jid": jid, "name": job.name, "state": "RUNNING"}
+
+
+def _reconcile_with(tmp_path, cluster, keep=1):
+    return submitter.reconcile(
+        {"flink": {}, "kafka": {}},
+        jobmanager="jm:8081",
+        checkpoint_root=tmp_path,
+        fetch_json=cluster.fetch_json,
+        run=cluster.run,
+        keep_job_checkpoints=keep,
+    )
+
+
+def test_prune_uses_a_fresh_overview_of_running_jobs(tmp_path):
+    analytics, enrichment = _fixture(tmp_path)
+    initial = [_running(ANALYTICS, analytics[-1]), _running(ENRICHMENT, enrichment[-1])]
+    # By the time pruning runs, an old enrichment run is running again.
+    later = initial + [_running(ENRICHMENT, enrichment[0])]
+    cluster = _ScriptedCluster([initial, later])
+
+    _reconcile_with(tmp_path, cluster)
+
+    remaining = set(_job_dirs(tmp_path))
+    assert enrichment[0] in remaining
+    assert analytics[0] not in remaining
+
+
+def test_prune_is_skipped_when_the_fresh_overview_fails(tmp_path):
+    analytics, enrichment = _fixture(tmp_path)
+    initial = [_running(ANALYTICS, analytics[-1]), _running(ENRICHMENT, enrichment[-1])]
+    cluster = _ScriptedCluster([initial, OSError("jobmanager went away")])
+
+    result = _reconcile_with(tmp_path, cluster)
+
+    assert result == {ANALYTICS.slug: "running", ENRICHMENT.slug: "running"}
+    assert set(_job_dirs(tmp_path)) >= {*analytics, *enrichment}
+
+
+def test_timed_out_submit_that_started_keeps_its_checkpoints(tmp_path):
+    analytics, enrichment = _fixture(tmp_path)
+    late = _jid(77)
+    _run_dir(tmp_path, late, 1)
+    enrichment_only = [_running(ENRICHMENT, enrichment[-1])]
+    # The timed-out job shows up only after the submitter gave up on it.
+    cluster = _ScriptedCluster(
+        [
+            enrichment_only,
+            enrichment_only,
+            enrichment_only + [_running(ANALYTICS, late)],
+        ],
+        returncode=124,
+    )
+
+    result = _reconcile_with(tmp_path, cluster)
+
+    assert result[ANALYTICS.slug] == "failed"
+    assert late in _job_dirs(tmp_path)
