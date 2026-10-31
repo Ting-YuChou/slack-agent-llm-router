@@ -106,6 +106,36 @@ async def test_policy_state_query_filters_on_emitted_at():
     assert "WHERE emitted_at >= now() - INTERVAL {hours:UInt32} HOUR" in sql
 
 
+async def _policy_state_query(hours=6):
+    manager = ClickHouseManager({"database": "llm_router"})
+    manager.client = MagicMock()
+    manager._run_blocking = AsyncMock(return_value=SimpleNamespace(result_rows=[]))
+    await manager.get_routing_policy_state_events(hours=hours, raise_errors=True)
+    call = manager._run_blocking.await_args
+    return " ".join(call.args[1].split()), call.kwargs["parameters"]
+
+
+@pytest.mark.asyncio
+async def test_policy_state_query_keeps_a_coarse_event_time_bound():
+    sql, parameters = await _policy_state_query(hours=6)
+
+    # Partition pruning on the sorting key: a state covers events at most
+    # POLICY_STATE_MAX_EVENT_LAG_DAYS older than when it was emitted.
+    assert (
+        "AND timestamp >= now() - INTERVAL {hours:UInt32} HOUR - INTERVAL 7 DAY"
+    ) in sql
+    assert parameters == {"hours": 6}
+
+
+@pytest.mark.asyncio
+async def test_policy_state_query_lists_the_most_recently_emitted_first():
+    sql, _ = await _policy_state_query()
+
+    # A fresh state for a quiet scope (old event time) is not pushed past
+    # LIMIT 50 by busier scopes.
+    assert "ORDER BY emitted_at DESC, timestamp DESC, kafka_offset DESC" in sql
+
+
 # D6: avoid and clear of one window have the same timestamp; emitted_at
 # orders them.
 
@@ -171,15 +201,12 @@ async def test_alert_and_policy_state_tables_get_the_emitted_at_column():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "method", ["get_routing_guardrails", "get_routing_policy_state_events"]
-)
-async def test_latest_queries_break_timestamp_ties_by_emitted_at(method):
+async def test_latest_guardrail_query_breaks_timestamp_ties_by_emitted_at():
     manager = ClickHouseManager({"database": "llm_router"})
     manager.client = MagicMock()
     manager._run_blocking = AsyncMock(return_value=SimpleNamespace(result_rows=[]))
 
-    await getattr(manager, method)(hours=6, raise_errors=True)
+    await manager.get_routing_guardrails(hours=6, raise_errors=True)
 
     sql = manager._run_blocking.await_args.args[1]
     assert "ORDER BY timestamp DESC, emitted_at DESC" in sql

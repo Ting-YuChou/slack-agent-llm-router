@@ -310,3 +310,46 @@ def test_timed_out_submit_that_started_keeps_its_checkpoints(tmp_path):
 
     assert result[ANALYTICS.slug] == "failed"
     assert late in _job_dirs(tmp_path)
+
+
+# --- review round 2 -----------------------------------------------------------
+
+
+def _eight_runs(tmp_path, with_evicted_dirs=True):
+    """Eight analytics runs: five in the history, three evicted from it."""
+    runs = [_jid(n) for n in range(1, 9)]
+    for index, job_id in enumerate(runs):
+        if with_evicted_dirs or index >= 3:
+            _run_dir(tmp_path, job_id, 3)
+    _history(tmp_path, ANALYTICS.slug, *runs)
+    return runs
+
+
+def test_keep_beyond_the_history_size_also_keeps_evicted_runs(tmp_path):
+    runs = _eight_runs(tmp_path)
+
+    submitter.prune_job_checkpoints(tmp_path, keep=6)
+
+    # The six newest survive: five in the history and the newest evicted one.
+    assert _job_dirs(tmp_path) == sorted(runs[2:])
+    assert submitter.evicted_job_ids(tmp_path, ANALYTICS.slug) == [runs[2]]
+
+
+def test_evicted_ids_are_forgotten_once_their_directories_are_gone(tmp_path):
+    runs = _eight_runs(tmp_path, with_evicted_dirs=False)
+    history_before = submitter.recorded_job_ids(tmp_path, ANALYTICS.slug)
+
+    assert submitter.prune_job_checkpoints(tmp_path, keep=2) != []
+
+    assert submitter.evicted_job_ids(tmp_path, ANALYTICS.slug) == []
+    assert submitter.recorded_job_ids(tmp_path, ANALYTICS.slug) == history_before
+    assert _job_dirs(tmp_path) == sorted(runs[-2:])
+
+
+def test_pruned_evicted_runs_are_dropped_from_the_state(tmp_path):
+    runs = _eight_runs(tmp_path)
+
+    submitter.prune_job_checkpoints(tmp_path, keep=2)
+
+    assert submitter.evicted_job_ids(tmp_path, ANALYTICS.slug) == []
+    assert _job_dirs(tmp_path) == sorted(runs[-2:])

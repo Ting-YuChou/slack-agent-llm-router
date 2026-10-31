@@ -64,14 +64,15 @@ def _event(topic, offset, value=None):
 # --- 4: one observer group per instance, auto-committed ---------------------
 
 
-def test_observer_group_is_per_instance_and_auto_commits():
+def test_observer_group_is_per_instance_and_never_commits():
     config = _manager().observer_consumer_config
 
     assert config["group_id"].startswith("llm-router-observers-")
     assert str(os.getpid()) in config["group_id"]
     assert socket.gethostname().split(".")[0] in config["group_id"]
     assert config["auto_offset_reset"] == "latest"
-    assert config["enable_auto_commit"] is True
+    # review2 #1: no auto-commit either; observer groups keep no offsets.
+    assert config["enable_auto_commit"] is False
 
 
 def test_observer_group_prefix_is_configurable():
@@ -111,15 +112,22 @@ async def test_auto_committed_observer_does_not_commit_by_hand():
 async def test_lost_commit_does_not_stop_the_observer_loop():
     from aiokafka.errors import CommitFailedError
 
-    manager = _manager(observer_enable_auto_commit=False)
+    # Observer consumers never commit (review2 #1); the observed-events loop
+    # still commits for a requests_enriched consumer on sink settings, as
+    # tests/test_pipeline.py exercises, and must survive a lost commit there.
+    manager = _manager()
     seen = []
-    manager.register_observer("alerts", lambda event: seen.append(event["request_id"]))
+    manager.register_observer(
+        "requests_enriched", lambda event: seen.append(event["request_id"])
+    )
     commit = AsyncMock(side_effect=[CommitFailedError("rebalanced"), None])
-    messages = _Messages([_event("alerts", 1), _event("alerts", 2)], commit=commit)
-    manager.consumers["alerts_observer"] = messages
-    manager.observer_consumer_keys["alerts_observer"] = "alerts"
+    messages = _Messages(
+        [_event("requests.enriched", 1), _event("requests.enriched", 2)],
+        commit=commit,
+    )
+    manager.consumers["requests_enriched"] = messages
 
-    await manager._run_consumer("alerts_observer", messages)
+    await manager._consume_requests_enriched(messages)
 
     assert seen == ["r1", "r2"]
     assert commit.await_count == 2
@@ -213,15 +221,14 @@ async def test_observer_registered_while_running_starts_its_consumer(monkeypatch
     )
 
 
-def test_observer_registered_while_running_without_a_task_group_warns(caplog):
+def test_observer_registered_while_running_without_a_task_group_is_queued():
+    # review2 #5: during startup it is queued, not dropped with a warning.
     manager = _manager()
     manager.running = True
 
-    with caplog.at_level(logging.WARNING):
-        manager.register_observer("alerts", lambda event: None)
+    manager.register_observer("alerts", lambda event: None)
 
-    assert "alerts" in caplog.text
-    assert "observer" in caplog.text.lower()
+    assert manager._queued_observer_topics == {"alerts"}
 
 
 def test_observer_registered_before_start_waits_for_start():

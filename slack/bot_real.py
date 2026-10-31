@@ -113,6 +113,10 @@ CHANNEL_ALLOWLIST_MISS_TTL_SECONDS = 300.0
 # A failed conversations.info call (a 429, a network error) is retried sooner.
 CHANNEL_ALLOWLIST_ERROR_TTL_SECONDS = 10.0
 SLACK_PRIORITY_WORK_KINDS = frozenset({"interactive"})
+# The background task a chat feedback click waits for its confirmation in,
+# and how long shutdown lets it finish: the producer's 2 s wait plus margin.
+CHAT_FEEDBACK_DELIVERY_TASK = "chat_feedback_delivery"
+CHAT_FEEDBACK_SHUTDOWN_WAIT_SECONDS = 2.5
 # Work kinds a worker hands straight to their handler, never to chat.
 SLACK_DIRECT_WORK_KINDS = frozenset({"slash", "interactive", "agent_view"})
 
@@ -305,6 +309,7 @@ class SlackBot(
         self.running = False
         self.started_at: Optional[datetime] = None
         self.background_tasks: Set[asyncio.Task] = set()
+        self.chat_feedback_shutdown_wait_seconds = CHAT_FEEDBACK_SHUTDOWN_WAIT_SECONDS
         work_queue_config = dict(config.get("work_queue", {}) or {})
         self._work_queue = asyncio.Queue(
             maxsize=max(1, int(work_queue_config.get("capacity", 256)))
@@ -967,6 +972,18 @@ class SlackBot(
         self._accepting_work = False
         await self._stop_work_workers()
 
+        # A feedback click waiting on its confirmation gets to finish and
+        # reply, for about as long as the producer waits for it.
+        feedback = [
+            task
+            for task in self.background_tasks
+            if task.get_name() == CHAT_FEEDBACK_DELIVERY_TASK
+        ]
+        if feedback:
+            await asyncio.wait(
+                feedback, timeout=self.chat_feedback_shutdown_wait_seconds
+            )
+
         for task in list(self.background_tasks):
             task.cancel()
 
@@ -1152,7 +1169,7 @@ class SlackBot(
             confirm=confirm,
         )
         if confirm:
-            self._spawn_background_task(record, "chat_feedback_delivery")
+            self._spawn_background_task(record, CHAT_FEEDBACK_DELIVERY_TASK)
         else:
             await record
 
@@ -1194,6 +1211,11 @@ class SlackBot(
             try:
                 result = await produce(**fields)
             except asyncio.CancelledError:
+                # Cut off (at shutdown) with the send's fate unknown: the
+                # click stays claimed and the user hears so, best effort.
+                await self._post_chat_feedback_reply(
+                    payload, user_id, CHAT_FEEDBACK_UNCONFIRMED_TEXT
+                )
                 raise
             except Exception:
                 logger.exception(
@@ -1213,12 +1235,10 @@ class SlackBot(
                     )
         if outcome is False:
             self._chat_feedback_clicks.pop(click_id, None)
-        channel_id = (payload.get("channel") or {}).get("id")
-        if channel_id and hasattr(self.web_client, "chat_postEphemeral"):
-            container = payload.get("container") or {}
-            message = payload.get("message") or {}
-            thread_ts = container.get("thread_ts") or message.get("thread_ts")
-            text = (
+        await self._post_chat_feedback_reply(
+            payload,
+            user_id,
+            (
                 CHAT_FEEDBACK_THANKS_TEXT
                 if outcome
                 else (
@@ -1226,7 +1246,17 @@ class SlackBot(
                     if outcome is None
                     else CHAT_FEEDBACK_NOT_RECORDED_TEXT
                 )
-            )
+            ),
+        )
+
+    async def _post_chat_feedback_reply(
+        self, payload: Dict[str, Any], user_id: str, text: str
+    ) -> None:
+        channel_id = (payload.get("channel") or {}).get("id")
+        if channel_id and hasattr(self.web_client, "chat_postEphemeral"):
+            container = payload.get("container") or {}
+            message = payload.get("message") or {}
+            thread_ts = container.get("thread_ts") or message.get("thread_ts")
             await self.web_client.chat_postEphemeral(
                 channel=channel_id,
                 user=user_id,

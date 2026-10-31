@@ -422,9 +422,12 @@ def _event_query_text(query_request: QueryRequest) -> str:
         if names:
             # Whole names only, longest first: a file called "a" or "notes"
             # must not rewrite the words around it, and "plan.txt" must not
-            # leave ".bak" of "plan.txt.bak".
+            # leave ".bak" of "plan.txt.bak". Bounded by ASCII letters and
+            # digits only, so a name next to CJK text or "_" is still found.
             pattern = re.compile(
-                r"(?<!\w)(?:" + "|".join(re.escape(name) for name in names) + r")(?!\w)"
+                r"(?<![A-Za-z0-9])(?:"
+                + "|".join(re.escape(name) for name in names)
+                + r")(?![A-Za-z0-9])"
             )
             query = pattern.sub("[attachment]", query)
     return redact_text(query)
@@ -1338,8 +1341,11 @@ class KafkaProducerManager:
             )
         except Exception:
             delivered = False
-        # A waiting caller hears about its own send now, not once the whole
-        # dispatcher batch (which may hold a slow, retrying send) is done.
+        # A waiting caller hears about its own send now, not once the rest
+        # of its dispatcher batch is done. The dispatcher still takes no new
+        # envelopes until the whole batch is, so a slow batch can delay a
+        # click queued after it past its timeout ("may not have been
+        # recorded" in Slack).
         _resolve_delivery(envelope, delivered)
         return delivered
 
@@ -1694,6 +1700,12 @@ class KafkaProducerManager:
                     self.last_error = "Kafka producer stop timed out"
                     PIPELINE_METRICS.producer_errors.inc()
                     logger.error(self.last_error)
+
+
+# How far a policy state's newest event (its timestamp) may lag its
+# emission; bounds the policy-state query on the sorting key. A code
+# constant (int), so it is written into the SQL, not bound.
+POLICY_STATE_MAX_EVENT_LAG_DAYS: int = 7
 
 
 class ClickHouseManager:
@@ -2289,10 +2301,14 @@ class ClickHouseManager:
                 avoid_providers,
                 payload_json
             FROM {self.database}.routing_policy_state_events FINAL
-            -- timestamp is the newest event a state covers: filter on when
-            -- it was emitted, so a fresh state for a quiet scope shows.
+            -- timestamp is the newest event a state covers: filter and
+            -- order on when it was emitted, so a fresh state for a quiet
+            -- scope shows. The coarse timestamp bound keeps partition
+            -- pruning on the sorting key.
             WHERE emitted_at >= now() - INTERVAL {{hours:UInt32}} HOUR
-            ORDER BY timestamp DESC, emitted_at DESC, kafka_offset DESC
+              AND timestamp >= now() - INTERVAL {{hours:UInt32}} HOUR
+                - INTERVAL {POLICY_STATE_MAX_EVENT_LAG_DAYS} DAY
+            ORDER BY emitted_at DESC, timestamp DESC, kafka_offset DESC
             LIMIT 50
             """
 
@@ -2438,6 +2454,28 @@ def _remove_lag_series(tp: Any, topic_key: str) -> None:
         logger.debug(f"Failed to remove Kafka consumer lag series: {e}")
 
 
+def _remove_lag_series_for_key(topic_key: str) -> None:
+    """Forget every lag series of one consumer key."""
+    try:
+        samples = [
+            sample
+            for metric in PIPELINE_METRICS.consumer_lag.collect()
+            for sample in metric.samples
+            if sample.labels.get("topic_key") == topic_key
+        ]
+    except Exception as e:  # pragma: no cover - metrics are best effort
+        logger.debug(f"Failed to list Kafka consumer lag series: {e}")
+        return
+    for sample in samples:
+        _remove_lag_series(
+            SimpleNamespace(
+                topic=sample.labels.get("topic", ""),
+                partition=sample.labels.get("partition", ""),
+            ),
+            topic_key,
+        )
+
+
 def observer_group_id(prefix: str) -> str:
     """A consumer group of its own for this process's observers.
 
@@ -2508,8 +2546,8 @@ class KafkaConsumerManager:
             "enable_auto_commit": consumer_section.get("enable_auto_commit", False),
             "max_poll_records": consumer_section.get("max_poll_records", 500),
         }
-        # Observers only need live events: the group is new on every start,
-        # begins at the end and needs no durable offsets.
+        # Observers only need live events: the group starts at the end and
+        # keeps no offsets.
         self.observer_consumer_config = {
             **self.consumer_config,
             "group_id": observer_group_id(
@@ -2522,14 +2560,16 @@ class KafkaConsumerManager:
             "auto_offset_reset": consumer_section.get(
                 "observer_auto_offset_reset", "latest"
             ),
-            "enable_auto_commit": bool(
-                consumer_section.get("observer_enable_auto_commit", True)
-            ),
+            # Never committed, by hand or automatically: the group id is reused
+            # when a container restarts (same host, PID 1), and committed
+            # offsets would replay the outage into the monitor.
+            "enable_auto_commit": False,
         }
         # Observer consumer key -> source topic key, for started observers.
         self.observer_consumer_keys: Dict[str, str] = {}
         self._task_group: Optional[Any] = None
         self._pending_observer_starts: set[str] = set()
+        self._queued_observer_topics: set[str] = set()
         self.supervisor_initial_backoff_seconds = float(
             consumer_section.get("supervisor_initial_backoff_seconds", 1.0)
         )
@@ -2642,6 +2682,12 @@ class KafkaConsumerManager:
             "last_started_at": None,
             "last_stopped_at": None,
         }
+        # Seed the stall rule's timestamp: a consumer that never consumes
+        # would otherwise have lag but no last-consumed series to join.
+        if consumer_key not in self.last_consumed_at:
+            PIPELINE_METRICS.last_consumed_timestamp.labels(
+                topic=str(topic_name), topic_key=consumer_key
+            ).set(time.time())
         logger.info(f"Consumer {consumer_key} for topic {topic_name} initialized")
 
     async def _start_observer_consumers(self) -> None:
@@ -2682,17 +2728,32 @@ class KafkaConsumerManager:
         ):
             return
         if self._task_group is None:
-            logger.warning(
-                "Observer for %s registered while consuming without a task "
-                "group; it receives no events until the consumers restart",
-                topic_key,
-            )
+            # start_consuming() has begun but its task group is not up yet;
+            # _attach_task_group() starts it.
+            self._queued_observer_topics.add(topic_key)
             return
         self._pending_observer_starts.add(consumer_key)
-        self._task_group.create_task(
-            self._run_late_observer(topic_key, consumer_key),
-            name=f"kafka_consumer_{consumer_key}",
-        )
+        try:
+            self._task_group.create_task(
+                self._run_late_observer(topic_key, consumer_key),
+                name=f"kafka_consumer_{consumer_key}",
+            )
+        except RuntimeError as e:
+            self._pending_observer_starts.discard(consumer_key)
+            logger.warning(
+                "Could not start the %s observer consumer (%s); it receives "
+                "no events until the consumers restart",
+                topic_key,
+                e,
+            )
+
+    def _attach_task_group(self, task_group: Any) -> None:
+        """Make task_group the home of late observers and start queued ones."""
+        self._task_group = task_group
+        queued = sorted(self._queued_observer_topics)
+        self._queued_observer_topics.clear()
+        for topic_key in queued:
+            self._start_observer_while_running(topic_key)
 
     async def _run_late_observer(self, topic_key: str, consumer_key: str) -> None:
         try:
@@ -2738,7 +2799,6 @@ class KafkaConsumerManager:
         await self._start_observer_consumers()
         try:
             async with asyncio.TaskGroup() as task_group:
-                self._task_group = task_group
                 for topic_key, consumer in list(self.consumers.items()):
                     task_group.create_task(
                         self._supervise_consumer(topic_key, consumer),
@@ -2751,6 +2811,9 @@ class KafkaConsumerManager:
                     task_group.create_task(
                         self._lag_refresher(), name="kafka_lag_refresh"
                     )
+                # After the initial consumers, so observers registered during
+                # startup start once, without duplicating those above.
+                self._attach_task_group(task_group)
         finally:
             self._task_group = None
 
@@ -2805,6 +2868,9 @@ class KafkaConsumerManager:
         """Recreate a Kafka consumer after a task-level failure."""
         old_consumer = self.consumers.get(topic_key)
         if old_consumer is not None:
+            # stop() does not call on_partitions_revoked, so drop the old
+            # consumer's lag series here; the new one reports its own.
+            _remove_lag_series_for_key(topic_key)
             try:
                 await old_consumer.stop()
             except Exception as e:
@@ -3757,13 +3823,13 @@ class KafkaConsumerManager:
         )
 
     async def _commit_offsets(self, topic_key: str, offsets: Dict[TopicPartition, int]):
-        """Commit explicit offsets for a topic when manual commits are enabled."""
-        config = (
-            self.observer_consumer_config
-            if topic_key in self.observer_consumer_keys
-            else self.consumer_config
-        )
-        if config.get("enable_auto_commit", False) or not offsets:
+        """Commit explicit offsets for a topic when manual commits are enabled.
+
+        Observer consumers never commit (see observer_consumer_config).
+        """
+        if topic_key in self.observer_consumer_keys:
+            return
+        if self.consumer_config.get("enable_auto_commit", False) or not offsets:
             return
 
         consumer = self.consumers.get(topic_key)

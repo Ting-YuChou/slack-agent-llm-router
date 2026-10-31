@@ -29,9 +29,11 @@ def _message(ts="100.0"):
 
 
 def test_a_prefixed_request_id_takes_its_reference_after_the_prefix():
-    notice = SlackNotice("failed", request_id="slash:13345224609.738474920.80")
+    notice = SlackNotice(
+        "failed", request_id="slash:13345224609.738474920.8088930838d88f008e0"
+    )
 
-    assert notice.reference == "13345224"
+    assert notice.reference == "80889308"
     plain = SlackNotice("failed", request_id="abcd1234-5678")
     assert plain.reference == "abcd1234"
 
@@ -39,7 +41,9 @@ def test_a_prefixed_request_id_takes_its_reference_after_the_prefix():
 @pytest.mark.asyncio
 async def test_a_slash_error_shows_its_reference_in_the_ephemeral_reply():
     bot = _bot()
-    notice = SlackNotice("❌ failed", request_id="slash:13345224609.738")
+    notice = SlackNotice(
+        "❌ failed", request_id="slash:13345224609.738474920.8088930838d88f008e0"
+    )
 
     await bot._post_command_response("C1", "U1", notice)
 
@@ -47,7 +51,7 @@ async def test_a_slash_error_shows_its_reference_in_the_ephemeral_reply():
     assert reply["text"] == "❌ failed"
     assert reply["blocks"][-1] == {
         "type": "context",
-        "elements": [{"type": "mrkdwn", "text": "Reference: `13345224`"}],
+        "elements": [{"type": "mrkdwn", "text": "Reference: `80889308`"}],
     }
 
 
@@ -73,7 +77,11 @@ async def test_a_refused_slash_reference_falls_back_to_plain_text():
     bot.web_client.chat_postEphemeral.side_effect = [BlockRejected(), None]
 
     await bot._post_command_response(
-        "C1", "U1", SlackNotice("❌ failed", request_id="slash:13345224609.738")
+        "C1",
+        "U1",
+        SlackNotice(
+            "❌ failed", request_id="slash:13345224609.738474920.8088930838d88f008e0"
+        ),
     )
 
     calls = [c.kwargs for c in bot.web_client.chat_postEphemeral.await_args_list]

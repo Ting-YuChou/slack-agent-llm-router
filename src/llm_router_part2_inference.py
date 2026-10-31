@@ -707,11 +707,28 @@ def _add_scheduler_wait(request: Any, wait_seconds: Any) -> None:
         logger.debug("Cannot record the scheduler wait on %r", type(request))
 
 
-def _set_response_scheduler_wait(response: Any, wait_seconds: float) -> None:
+def _set_response_scheduler_wait(
+    response: Any, wait_seconds: float, wait_ended_at: float
+) -> None:
+    """Carry the leader's scheduler wait, and when it ended, to followers."""
     try:
         response._scheduler_wait_seconds = wait_seconds
+        response._scheduler_wait_ended_at = wait_ended_at
     except (AttributeError, TypeError, ValueError):
         logger.debug("Cannot carry the scheduler wait on %r", type(response))
+
+
+def _follower_scheduler_wait(response: Any, joined_at: float) -> Optional[float]:
+    """The part of the leader's scheduler wait a follower joined in time for.
+
+    A follower that joins after the lease was granted waited on the provider
+    call, not the queue, so it is charged nothing.
+    """
+    wait = _number(getattr(response, "_scheduler_wait_seconds", None))
+    ended_at = _number(getattr(response, "_scheduler_wait_ended_at", None))
+    if wait is None or ended_at is None:
+        return None
+    return min(wait, max(0.0, ended_at - joined_at))
 
 
 def request_queue_wait_ms(request: Any) -> Optional[int]:
@@ -4006,9 +4023,12 @@ class InferenceEngine:
 
         led_call = False
         leader_waits: List[float] = []
+        wait_ended_at = 0.0
 
         def record_wait(seconds: float) -> None:
+            nonlocal wait_ended_at
             leader_waits.append(seconds)
+            wait_ended_at = time.monotonic()
             _add_scheduler_wait(caller_request, seconds)
 
         async def admitted_call() -> InferenceResponse:
@@ -4030,17 +4050,20 @@ class InferenceEngine:
                 on_queue_wait=record_wait,
             )
             # Single-flight followers share this response: it carries the
-            # leader's scheduler wait to them.
-            _set_response_scheduler_wait(response, sum(leader_waits))
+            # leader's scheduler wait to them. No wait (scheduler disabled)
+            # leaves them none either.
+            if leader_waits:
+                _set_response_scheduler_wait(response, sum(leader_waits), wait_ended_at)
             return response
 
+        joined_at = time.monotonic()
         response = await self.single_flight.run(
             request, provider, model_name, admitted_call
         )
         if not led_call:
-            # A follower waited on the leader's flight, queue included.
+            # A follower shares the leader's queue wait from when it joined.
             _add_scheduler_wait(
-                caller_request, getattr(response, "_scheduler_wait_seconds", None)
+                caller_request, _follower_scheduler_wait(response, joined_at)
             )
         return response
 

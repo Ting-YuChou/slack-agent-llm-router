@@ -117,3 +117,25 @@ async def test_longer_attachment_names_are_replaced_first():
     row = await _published_row(request, _response())
 
     assert row["query_text"] == "compare [attachment] with [attachment]"
+
+
+# Names are bounded by ASCII letters and digits only: CJK text and "_" right
+# next to a name must not keep it in the log.
+
+
+@pytest.mark.asyncio
+async def test_a_name_next_to_cjk_text_is_stripped():
+    request = _request_with_files("請總結plan.pdf的內容", "plan.pdf")
+
+    row = await _published_row(request, _response())
+
+    assert row["query_text"] == "請總結[attachment]的內容"
+
+
+@pytest.mark.asyncio
+async def test_a_name_between_underscores_is_stripped():
+    request = _request_with_files("see _plan.pdf_ please", "plan.pdf")
+
+    row = await _published_row(request, _response())
+
+    assert row["query_text"] == "see _[attachment]_ please"

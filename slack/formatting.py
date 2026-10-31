@@ -340,9 +340,16 @@ class SlackNotice(str):
         notice = super().__new__(cls, text)
         notice.reference = None
         if request_id and is_valid_request_id(request_id):
-            # A prefixed id (`slash:<trigger_id>`) is told apart by what
-            # follows the prefix; the prefix is the same for every one.
-            notice.reference = request_id.split(":", 1)[-1][:8] or None
+            # A prefixed id is told apart by what follows the prefix. A
+            # trigger_id's leading digits are near-sequential, so a slash
+            # reference comes from its last dot-separated segment; logs keep
+            # the full id.
+            prefix, _, rest = request_id.partition(":")
+            if not rest:
+                rest = prefix
+            elif prefix == "slash":
+                rest = rest.rsplit(".", 1)[-1]
+            notice.reference = rest[:8] or None
         return notice
 
     def blocks(self, part: str) -> Optional[List[Dict[str, Any]]]:

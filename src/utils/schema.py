@@ -246,9 +246,11 @@ class InferenceResponse(BaseModel):
     # summed over every attempt, fallbacks included. None when neither was
     # measured. Never cached: a cache hit reports its own request's wait.
     queue_wait_ms: Optional[int] = Field(default=None, ge=0)
-    # The provider-scheduler wait behind this response, for single-flight
-    # followers that share it (T2). Not serialized.
+    # The provider-scheduler wait behind this response and when it ended
+    # (time.monotonic), for single-flight followers that share it (T2).
+    # Not serialized.
     _scheduler_wait_seconds: Optional[float] = PrivateAttr(default=None)
+    _scheduler_wait_ended_at: Optional[float] = PrivateAttr(default=None)
 
     # Cost tracking
     cost_usd: float = Field(ge=0.0)
