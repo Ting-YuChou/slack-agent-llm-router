@@ -1162,7 +1162,6 @@ class SlackMessageHandler:
                 "*Features:*",
                 "✅ Intelligent model routing",
                 "✅ Conversation continuity",
-                "✅ Context compression for long conversations",
                 "✅ Response caching for faster replies",
                 "✅ Usage analytics and cost tracking",
                 "",
