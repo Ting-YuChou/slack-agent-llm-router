@@ -2697,8 +2697,8 @@ class KafkaConsumerManager:
             "enable_auto_commit": consumer_section.get("enable_auto_commit", False),
             "max_poll_records": consumer_section.get("max_poll_records", 500),
         }
-        # Observers only need live events: the group is new on every start,
-        # begins at the end and needs no durable offsets.
+        # Observers only need live events: the group starts at the end and
+        # keeps no offsets.
         self.observer_consumer_config = {
             **self.consumer_config,
             "group_id": observer_group_id(
@@ -2711,14 +2711,16 @@ class KafkaConsumerManager:
             "auto_offset_reset": consumer_section.get(
                 "observer_auto_offset_reset", "latest"
             ),
-            "enable_auto_commit": bool(
-                consumer_section.get("observer_enable_auto_commit", True)
-            ),
+            # Never committed, by hand or automatically: the group id is reused
+            # when a container restarts (same host, PID 1), and committed
+            # offsets would replay the outage into the monitor.
+            "enable_auto_commit": False,
         }
         # Observer consumer key -> source topic key, for started observers.
         self.observer_consumer_keys: Dict[str, str] = {}
         self._task_group: Optional[Any] = None
         self._pending_observer_starts: set[str] = set()
+        self._queued_observer_topics: set[str] = set()
         self.supervisor_initial_backoff_seconds = float(
             consumer_section.get("supervisor_initial_backoff_seconds", 1.0)
         )
@@ -2871,17 +2873,32 @@ class KafkaConsumerManager:
         ):
             return
         if self._task_group is None:
-            logger.warning(
-                "Observer for %s registered while consuming without a task "
-                "group; it receives no events until the consumers restart",
-                topic_key,
-            )
+            # start_consuming() has begun but its task group is not up yet;
+            # _attach_task_group() starts it.
+            self._queued_observer_topics.add(topic_key)
             return
         self._pending_observer_starts.add(consumer_key)
-        self._task_group.create_task(
-            self._run_late_observer(topic_key, consumer_key),
-            name=f"kafka_consumer_{consumer_key}",
-        )
+        try:
+            self._task_group.create_task(
+                self._run_late_observer(topic_key, consumer_key),
+                name=f"kafka_consumer_{consumer_key}",
+            )
+        except RuntimeError as e:
+            self._pending_observer_starts.discard(consumer_key)
+            logger.warning(
+                "Could not start the %s observer consumer (%s); it receives "
+                "no events until the consumers restart",
+                topic_key,
+                e,
+            )
+
+    def _attach_task_group(self, task_group: Any) -> None:
+        """Make task_group the home of late observers and start queued ones."""
+        self._task_group = task_group
+        queued = sorted(self._queued_observer_topics)
+        self._queued_observer_topics.clear()
+        for topic_key in queued:
+            self._start_observer_while_running(topic_key)
 
     async def _run_late_observer(self, topic_key: str, consumer_key: str) -> None:
         try:
@@ -2927,7 +2944,6 @@ class KafkaConsumerManager:
         await self._start_observer_consumers()
         try:
             async with asyncio.TaskGroup() as task_group:
-                self._task_group = task_group
                 for topic_key, consumer in list(self.consumers.items()):
                     task_group.create_task(
                         self._supervise_consumer(topic_key, consumer),
@@ -2940,6 +2956,9 @@ class KafkaConsumerManager:
                     task_group.create_task(
                         self._lag_refresher(), name="kafka_lag_refresh"
                     )
+                # After the initial consumers, so observers registered during
+                # startup start once, without duplicating those above.
+                self._attach_task_group(task_group)
         finally:
             self._task_group = None
 
@@ -3924,13 +3943,13 @@ class KafkaConsumerManager:
         )
 
     async def _commit_offsets(self, topic_key: str, offsets: Dict[TopicPartition, int]):
-        """Commit explicit offsets for a topic when manual commits are enabled."""
-        config = (
-            self.observer_consumer_config
-            if topic_key in self.observer_consumer_keys
-            else self.consumer_config
-        )
-        if config.get("enable_auto_commit", False) or not offsets:
+        """Commit explicit offsets for a topic when manual commits are enabled.
+
+        Observer consumers never commit (see observer_consumer_config).
+        """
+        if topic_key in self.observer_consumer_keys:
+            return
+        if self.consumer_config.get("enable_auto_commit", False) or not offsets:
             return
 
         consumer = self.consumers.get(topic_key)

@@ -197,8 +197,8 @@ async def test_sink_loop_no_longer_notifies_observers():
 
 
 @pytest.mark.asyncio
-async def test_observer_loop_notifies_then_commits():
-    manager = _manager(observer_enable_auto_commit=False)
+async def test_observer_loop_notifies_without_committing():
+    manager = _manager()
     seen = []
     manager.register_observer("alerts", lambda event: seen.append(event["alert_type"]))
     messages = _Messages([_alert()])
@@ -209,12 +209,13 @@ async def test_observer_loop_notifies_then_commits():
 
     assert seen == ["latency"]
     assert manager.batch_processors["alerts"] == []
-    messages.commit.assert_awaited_once_with({TopicPartition("alerts", 0): 8})
+    # Observer groups keep no offsets (review2 #1).
+    messages.commit.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_observer_loop_skips_poison_without_dead_lettering():
-    manager = _manager(observer_enable_auto_commit=False)
+    manager = _manager()
     manager.dlq_producer = AsyncMock()
     manager.register_observer("alerts", lambda event: None)
     messages = _Messages([_alert(value=b"{bad")])
@@ -226,7 +227,7 @@ async def test_observer_loop_skips_poison_without_dead_lettering():
     # The sink group dead-letters the same record; the observer only skips it.
     manager.dlq_producer.send_and_wait.assert_not_awaited()
     manager.dlq_producer.send.assert_not_awaited()
-    messages.commit.assert_awaited_once_with({TopicPartition("alerts", 0): 8})
+    messages.commit.assert_not_awaited()
 
 
 @pytest.mark.asyncio
