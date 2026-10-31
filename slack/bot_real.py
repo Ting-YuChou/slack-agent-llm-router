@@ -2061,10 +2061,9 @@ class SlackMessageHandler:
         # since then does not change this message's lane.
         decided_agent = event.get("_agent_request")
         if not isinstance(decided_agent, bool):
-            is_agent_thread = getattr(
-                self.bot, "_is_agent_thread", lambda *_args: False
+            decided_agent = self.bot._is_agent_thread(
+                channel_id, event.get("thread_ts")
             )
-            decided_agent = is_agent_thread(channel_id, event.get("thread_ts"))
         in_agent_thread = bool(event.get("thread_ts")) and decided_agent
         # The chat path does not download an Agent thread's files.
         agent_files = [
@@ -2107,7 +2106,7 @@ class SlackMessageHandler:
             files = [
                 item for item in event.get("files") or [] if isinstance(item, dict)
             ]
-            builder = getattr(self.bot, "agent_bootstrap_builder", None)
+            builder = self.bot.agent_bootstrap_builder
             if files and builder is not None:
                 # Like the files of an initial request's thread, these reach
                 # the agent as untrusted reference context for the task.
@@ -2402,7 +2401,7 @@ class SlackMessageHandler:
         if not args:
             return "Usage: `/llm agent <task>`"
 
-        runtime = getattr(self.bot, "agent_runtime_client", None)
+        runtime = self.bot.agent_runtime_client
         if runtime is None:
             return "Agent mode is currently disabled."
         request_id = request_id or message_ts
@@ -2616,12 +2615,9 @@ class SlackMessageHandler:
         task_mode: Optional[str],
     ) -> str:
         bootstrap = AgentBootstrapContext(prompt=task)
-        builder = getattr(self.bot, "agent_bootstrap_builder", None)
+        builder = self.bot.agent_bootstrap_builder
         if include_thread_context and thread_ts and message_ts and builder is not None:
-            is_public_channel = getattr(self.bot, "_is_public_agent_channel", None)
-            if not callable(is_public_channel) or not await is_public_channel(
-                channel_id
-            ):
+            if not await self.bot._is_public_agent_channel(channel_id):
                 # Same egress rule as the shortcut: thread content from private,
                 # DM or Slack Connect channels never reaches a model provider.
                 bootstrap = AgentBootstrapContext(
@@ -2687,17 +2683,12 @@ class SlackMessageHandler:
         in the thread; `status_note` is added to it. Returns "" once the status
         message shows the start, otherwise the reply for the caller to post.
         """
-        cap_message = getattr(self.bot, "_agent_cap_message", None)
-        reserve = getattr(self.bot, "_reserve_agent_start", None)
-        if not callable(cap_message) or not callable(reserve):
-            reservation = None
-        else:
-            # Check and reserve with no await in between, so concurrent starts
-            # by one owner cannot both pass the cap.
-            refusal = cap_message(user_id, channel_id, thread_ts)
-            if refusal:
-                return refusal
-            reservation = reserve(user_id, channel_id, thread_ts)
+        # Check and reserve with no await in between, so concurrent starts
+        # by one owner cannot both pass the cap.
+        refusal = self.bot._agent_cap_message(user_id, channel_id, thread_ts)
+        if refusal:
+            return refusal
+        reservation = self.bot._reserve_agent_start(user_id, channel_id, thread_ts)
         try:
             return await self._start_agent_prompt_unchecked(
                 task,
@@ -2715,8 +2706,7 @@ class SlackMessageHandler:
                 status_note=status_note,
             )
         finally:
-            if reservation is not None:
-                self.bot._release_agent_start(user_id, reservation)
+            self.bot._release_agent_start(user_id, reservation)
 
     async def _start_agent_prompt_unchecked(
         self,
@@ -2735,7 +2725,7 @@ class SlackMessageHandler:
         status_ts: Optional[str] = None,
         status_note: str = "",
     ) -> str:
-        runtime = getattr(self.bot, "agent_runtime_client", None)
+        runtime = self.bot.agent_runtime_client
         if runtime is None:
             return "Agent mode is currently disabled."
 
@@ -2757,11 +2747,9 @@ class SlackMessageHandler:
             # the owner explicitly passes `--implement`.
             # Only this thread's own run counts, never the user's latest run
             # elsewhere.
-            agent_threads = getattr(self.bot, "agent_threads", None) or {}
-            thread_key = getattr(self.bot, "_thread_key", None)
             previous = (
-                agent_threads.get(thread_key(channel_id, thread_ts))
-                if thread_ts and callable(thread_key)
+                self.bot.agent_threads.get(self.bot._thread_key(channel_id, thread_ts))
+                if thread_ts
                 else None
             )
             if (
@@ -3059,7 +3047,7 @@ class SlackMessageHandler:
                 "✅ Usage analytics and cost tracking",
                 "",
                 "*User Tiers:*",
-                getattr(self.bot, "_format_tier_limit_summary", lambda: "")(),
+                self.bot._format_tier_limit_summary(),
             ]
         )
         return "\n".join(lines)
@@ -3069,7 +3057,7 @@ class SlackMessageHandler:
 
         A cached allowlist may be stale, so without an answer say so instead.
         """
-        runtime = getattr(self.bot, "agent_runtime_client", None)
+        runtime = self.bot.agent_runtime_client
         health_details = getattr(runtime, "health_details", None)
         details = await health_details() if callable(health_details) else None
         if not isinstance(details, dict):
@@ -3142,7 +3130,7 @@ class SlackMessageHandler:
                         return "Invalid preferred_models value. Use a comma-separated model list or `auto` to clear."
 
                     available_models = set(
-                        getattr(getattr(self.bot, "router", None), "models", {})
+                        getattr(self.bot.router, "models", None) or {}
                     )
                     if available_models:
                         unknown_models = [
@@ -3159,9 +3147,7 @@ class SlackMessageHandler:
                 return f"Invalid setting: `{setting_name}` or value: `{setting_value}`"
 
             self.bot.user_manager.update_user_preferences(user_id, user_prefs)
-            persist_user_state = getattr(self.bot, "_persist_user_state", None)
-            if persist_user_state is not None:
-                await persist_user_state(user_id)
+            await self.bot._persist_user_state(user_id)
             return f"✅ Updated {setting_name} to: {setting_value}"
 
         else:
@@ -3177,7 +3163,7 @@ class SlackMessageHandler:
 
             # Get user stats
             user_stats = await self.bot.get_user_stats(user_id)
-            runtime = getattr(self.bot, "agent_runtime_client", None)
+            runtime = self.bot.agent_runtime_client
             agent_models = ""
             if runtime is None:
                 agent_health = "⚪ Disabled"
@@ -3252,7 +3238,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                     + "\n\n"
                 )
 
-            if getattr(self.bot, "agent_runtime_client", None) is not None:
+            if self.bot.agent_runtime_client is not None:
                 models_text += f"*{await self._agent_models_text()}*\n\n"
 
             models_text += """
@@ -3326,9 +3312,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         if not cleared_keys:
             return "🧹 No saved conversation history was found for this channel."
 
-        delete_conversations = getattr(self.bot, "_delete_conversation_states", None)
-        if delete_conversations is not None:
-            await delete_conversations(cleared_keys)
+        await self.bot._delete_conversation_states(cleared_keys)
         return "🧹 Conversation history cleared for this channel."
 
     async def _handle_remember_command(
@@ -3345,7 +3329,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         if command_surface != "slash":
             return MEMORY_SLASH_ONLY_MESSAGE
 
-        memory_manager = getattr(self.bot, "memory_manager", None)
+        memory_manager = self.bot.memory_manager
         if not memory_manager or not getattr(memory_manager, "enabled", False):
             return "Memory is not enabled for this Slack bot."
 
@@ -3391,7 +3375,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         if command_surface != "slash":
             return MEMORY_SLASH_ONLY_MESSAGE
 
-        memory_manager = getattr(self.bot, "memory_manager", None)
+        memory_manager = self.bot.memory_manager
         if not memory_manager or not getattr(memory_manager, "enabled", False):
             return "Memory is not enabled for this Slack bot."
 
@@ -3450,7 +3434,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         if command_surface != "slash":
             return MEMORY_SLASH_ONLY_MESSAGE
 
-        memory_manager = getattr(self.bot, "memory_manager", None)
+        memory_manager = self.bot.memory_manager
         if not memory_manager or not getattr(memory_manager, "enabled", False):
             return "Memory is not enabled for this Slack bot."
 
@@ -3555,28 +3539,18 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                     logger.exception("Failed to build Slack memory context")
 
             # Create query request
-            conversation_id_builder = getattr(
-                self.bot, "_conversation_context_key", None
+            conversation_id = self.bot._conversation_context_key(
+                user_id=user_id,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
             )
-            if callable(conversation_id_builder):
-                conversation_id = conversation_id_builder(
-                    user_id=user_id,
-                    channel_id=channel_id,
-                    thread_ts=thread_ts,
-                )
-            else:
-                conversation_id = f"{user_id}:{channel_id}:{thread_ts or 'main'}"
 
-            query_metadata = (
-                self.bot._build_query_metadata(
-                    channel_id=channel_id,
-                    thread_ts=thread_ts,
-                    attachments=attachments or [],
-                    user_preferences=user_prefs,
-                    team_id=team_id,
-                )
-                if hasattr(self.bot, "_build_query_metadata")
-                else {}
+            query_metadata = self.bot._build_query_metadata(
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                attachments=attachments or [],
+                user_preferences=user_prefs,
+                team_id=team_id,
             )
             query_metadata.update(dict(routing_metadata or {}))
             self._add_slack_context_metadata(query_metadata, slack_context)
@@ -3604,7 +3578,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
 
             # Process through the ingress /route shares (requests.raw, API
             # metrics, error mapping); the per-user limiter already admitted it.
-            ingress = (getattr(self.bot, "services", None) or {}).get("chat_ingress")
+            ingress = (self.bot.services or {}).get("chat_ingress")
             if ingress is not None and callable(getattr(ingress, "handle", None)):
                 response = await ingress.handle(query_request, source="slack")
             else:
@@ -3721,10 +3695,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
                 )
             if message:
                 return message
-        error_builder = getattr(self.bot, "_build_user_safe_error_message", None)
-        if callable(error_builder):
-            return error_builder()
-        return "❌ Sorry, I couldn't process that request right now. Please try again in a moment."
+        return self.bot._build_user_safe_error_message()
 
     def _conversation_fallback(
         self,
@@ -3747,7 +3718,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         if (
             slack_context.source != "thread"
             or slack_context.error
-            or not getattr(self.bot, "bot_user_id", None)
+            or not self.bot.bot_user_id
         ):
             return conversations.get_conversation_summary(
                 user_id, channel_id, thread_ts
@@ -3772,10 +3743,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         message_ts: Optional[str],
     ) -> SlackFetchedContext:
         """Slack history for a query; the builder fails open as configured."""
-        slack_context_builder = getattr(self.bot, "_build_slack_context", None)
-        if not callable(slack_context_builder):
-            return SlackFetchedContext()
-        return await slack_context_builder(
+        return await self.bot._build_slack_context(
             client=client,
             channel_id=channel_id,
             thread_ts=thread_ts,
@@ -3791,7 +3759,7 @@ Remaining this hour: {user_stats.get('remaining_requests', 0)}
         team_id: Optional[str],
     ) -> List[Any]:
         """Long-term memory hits for a query; none when off or on failure."""
-        memory_manager = getattr(self.bot, "memory_manager", None)
+        memory_manager = self.bot.memory_manager
         if not memory_manager or not getattr(memory_manager, "enabled", False):
             return []
         try:

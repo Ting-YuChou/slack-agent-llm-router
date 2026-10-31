@@ -819,7 +819,11 @@ def test_setup_guide_lists_every_env_var_the_launcher_requires():
 
 @pytest.mark.asyncio
 async def test_setup_guide_lists_every_agent_subcommand_in_the_help():
-    handler = SlackMessageHandler(SimpleNamespace(agent_runtime_client=object()))
+    handler = SlackMessageHandler(
+        SimpleNamespace(
+            agent_runtime_client=object(), _format_tier_limit_summary=lambda: ""
+        )
+    )
     help_text = await handler._handle_help_command([], "U1", "C1", None)
     guide = SETUP_GUIDE.read_text(encoding="utf-8")
 
