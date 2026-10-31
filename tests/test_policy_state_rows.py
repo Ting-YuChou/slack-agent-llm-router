@@ -66,7 +66,44 @@ def test_a_state_without_latest_event_at_falls_back_to_emitted_at():
     row = _row(_state(latest_event_at=None), offset=10)
 
     assert row["timestamp"].isoformat() == "2026-10-30T12:00:00+00:00"
-    assert row["event_id"].startswith("policy_state:user:U1:2026-10-30T12:00:00+00:00:")
+    # emitted_at changes on replay, so it is not part of the id.
+    assert row["event_id"].startswith("policy_state:user:U1::")
+    assert "2026-10-30T12:00:00" not in row["event_id"]
+
+
+@pytest.mark.parametrize("latest_event_at", [None, "not-a-time"])
+def test_a_replay_without_a_usable_latest_event_at_keeps_its_id(latest_event_at):
+    first = _row(_state(latest_event_at=latest_event_at), offset=10)
+    replay = _row(
+        _state(
+            latest_event_at=latest_event_at,
+            emitted_at="2026-10-30T13:30:00+00:00",
+        ),
+        offset=99,
+    )
+
+    assert replay["event_id"] == first["event_id"]
+    assert first["event_id"].startswith("policy_state:user:U1::")
+
+
+def test_an_unparseable_latest_event_at_falls_back_to_emitted_at():
+    row = _row(_state(latest_event_at="not-a-time"), offset=10)
+
+    assert row["timestamp"].isoformat() == "2026-10-30T12:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_policy_state_query_filters_on_emitted_at():
+    manager = ClickHouseManager({"database": "llm_router"})
+    manager.client = MagicMock()
+    manager._run_blocking = AsyncMock(return_value=SimpleNamespace(result_rows=[]))
+
+    await manager.get_routing_policy_state_events(hours=6, raise_errors=True)
+
+    sql = " ".join(manager._run_blocking.await_args.args[1].split())
+    # timestamp is the state's event time; a state emitted now for a scope
+    # with old events is still recent.
+    assert "WHERE emitted_at >= now() - INTERVAL {hours:UInt32} HOUR" in sql
 
 
 # D6: avoid and clear of one window have the same timestamp; emitted_at
@@ -146,3 +183,37 @@ async def test_latest_queries_break_timestamp_ties_by_emitted_at(method):
 
     sql = manager._run_blocking.await_args.args[1]
     assert "ORDER BY timestamp DESC, emitted_at DESC" in sql
+    # One Flink call can emit a clear and an avoid with one emitted_at; the
+    # later offset is the later event.
+    assert "ORDER BY timestamp DESC, emitted_at DESC, kafka_offset DESC" in sql
+
+
+def test_emitted_at_has_the_same_default_in_fresh_and_migrated_tables():
+    from src.analytics_schema import TABLES
+
+    for table in TABLES:
+        if table.name not in {"alert_events", "routing_policy_state_events"}:
+            continue
+        (create_line,) = [
+            line.strip().rstrip(",")
+            for line in table.create_sql("db").splitlines()
+            if line.strip().startswith("emitted_at ")
+        ]
+        (alter,) = [sql for sql in table.alter_sql("db") if " emitted_at " in sql]
+        assert create_line == "emitted_at DateTime64(3) DEFAULT timestamp"
+        assert alter.endswith(create_line)
+
+
+def test_alert_entries_built_directly_get_an_emitted_at():
+    from src.llm_router_part3_pipeline import AlertEventEntry, RoutingPolicyStateEntry
+
+    before = datetime.now(timezone.utc)
+    stamp = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    alert = AlertEventEntry(
+        timestamp=stamp, alert_type="a", severity="s", description="d"
+    )
+    state = RoutingPolicyStateEntry(timestamp=stamp, scope_type="u", scope_key="k")
+
+    assert alert.emitted_at >= before
+    assert state.emitted_at >= before
+    assert alert.to_dict()["emitted_at"] == alert.emitted_at

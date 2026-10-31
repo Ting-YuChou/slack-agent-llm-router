@@ -838,9 +838,9 @@ class AlertEventEntry:
     window_start_ms: int = 0
     window_end_ms: int = 0
     payload_json: str = "{}"
-    # When the event was emitted: orders rows that share a timestamp, such
-    # as an avoid and its clear for one window.
-    emitted_at: Optional[datetime] = None
+    # When the event was emitted, or else ingested: orders rows that share a
+    # timestamp, such as an avoid and its clear for one window.
+    emitted_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     event_id: str = ""
     kafka_topic: str = ""
     kafka_partition: int = -1
@@ -869,7 +869,7 @@ class AlertEventEntry:
             "window_start_ms": self.window_start_ms,
             "window_end_ms": self.window_end_ms,
             "payload_json": self.payload_json,
-            "emitted_at": self.emitted_at or self.timestamp,
+            "emitted_at": self.emitted_at,
             "kafka_topic": self.kafka_topic,
             "kafka_partition": self.kafka_partition,
             "kafka_offset": self.kafka_offset,
@@ -902,7 +902,7 @@ class RoutingPolicyStateEntry:
     avoid_models: List[str] = field(default_factory=list)
     avoid_providers: List[str] = field(default_factory=list)
     payload_json: str = "{}"
-    emitted_at: Optional[datetime] = None
+    emitted_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     event_id: str = ""
     kafka_topic: str = ""
     kafka_partition: int = -1
@@ -937,7 +937,7 @@ class RoutingPolicyStateEntry:
             "avoid_models": list(self.avoid_models),
             "avoid_providers": list(self.avoid_providers),
             "payload_json": self.payload_json,
-            "emitted_at": self.emitted_at or self.timestamp,
+            "emitted_at": self.emitted_at,
             "kafka_topic": self.kafka_topic,
             "kafka_partition": self.kafka_partition,
             "kafka_offset": self.kafka_offset,
@@ -2119,7 +2119,7 @@ class ClickHouseManager:
             FROM {self.database}.alert_events FINAL
             WHERE timestamp >= now() - INTERVAL {{hours:UInt32}} HOUR
               AND source_event_type = 'routing.guardrails'
-            ORDER BY timestamp DESC, emitted_at DESC
+            ORDER BY timestamp DESC, emitted_at DESC, kafka_offset DESC
             LIMIT 50
             """
 
@@ -2192,8 +2192,10 @@ class ClickHouseManager:
                 avoid_providers,
                 payload_json
             FROM {self.database}.routing_policy_state_events FINAL
-            WHERE timestamp >= now() - INTERVAL {{hours:UInt32}} HOUR
-            ORDER BY timestamp DESC, emitted_at DESC
+            -- timestamp is the newest event a state covers: filter on when
+            -- it was emitted, so a fresh state for a quiet scope shows.
+            WHERE emitted_at >= now() - INTERVAL {{hours:UInt32}} HOUR
+            ORDER BY timestamp DESC, emitted_at DESC, kafka_offset DESC
             LIMIT 50
             """
 
@@ -3007,17 +3009,23 @@ class KafkaConsumerManager:
         """Convert a routing.policy_state payload to a ClickHouse row."""
         scope_type = str(data.get("scope_type", "unknown") or "unknown")
         scope_key = str(data.get("scope_key", "") or "")
-        # Event time, which a replay leaves unchanged; emitted_at for older
-        # states without it.
-        timestamp = _parse_datetime(
-            data.get("latest_event_at") or data.get("emitted_at")
-        )
+        # Event time, which a replay leaves unchanged. A missing or
+        # unparseable latest_event_at counts as absent: the row's time is
+        # then emitted_at, which is kept out of the id.
+        try:
+            latest_event_at: Optional[datetime] = _parse_datetime(
+                data.get("latest_event_at"), strict=True
+            )
+        except ValueError:
+            latest_event_at = None
+        timestamp = latest_event_at or _parse_datetime(data.get("emitted_at"))
+        event_time = latest_event_at.isoformat() if latest_event_at else ""
         metadata = dict(kafka_metadata or {})
         # A replay has a new offset and emitted_at but the same state: key the
         # row on what it describes. The content hash keeps apart distinct
         # states with one latest_event_at (counts drop as old buckets expire).
         metadata["event_id"] = (
-            f"policy_state:{scope_type}:{scope_key}:{timestamp.isoformat()}:"
+            f"policy_state:{scope_type}:{scope_key}:{event_time}:"
             f"{_policy_state_content_hash(data)}"
         )
         return RoutingPolicyStateEntry(
