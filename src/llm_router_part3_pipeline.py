@@ -3183,9 +3183,17 @@ class KafkaConsumerManager:
         """Update consumer observability after a message is handled."""
         now = time.time()
         self.last_consumed_at[topic_key] = now
-        PIPELINE_METRICS.last_consumed_timestamp.labels(topic=topic_key).set(now)
-
         topic = getattr(message, "topic", None)
+        PIPELINE_METRICS.last_consumed_timestamp.labels(
+            topic=str(
+                topic
+                or self.topic_names_by_key.get(topic_key)
+                or self.topics.get(topic_key)
+                or ""
+            ),
+            topic_key=topic_key,
+        ).set(now)
+
         partition = getattr(message, "partition", None)
         offset = getattr(message, "offset", None)
         if topic is None or partition is None or offset is None:
@@ -3203,6 +3211,7 @@ class KafkaConsumerManager:
             PIPELINE_METRICS.consumer_lag.labels(
                 topic=topic,
                 partition=str(partition),
+                topic_key=topic_key,
             ).set(lag)
         except Exception as e:
             logger.debug(f"Failed to update Kafka consumer lag: {e}")

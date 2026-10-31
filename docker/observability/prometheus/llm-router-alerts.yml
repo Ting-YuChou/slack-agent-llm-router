@@ -56,6 +56,21 @@ groups:
         annotations:
           summary: "Kafka consumer lag is high ({{ $labels.topic }})"
           description: "Ingestion is more than 10000 messages behind for 10 minutes."
+      - alert: LLMRouterKafkaConsumerStalled
+        # Both gauges carry topic_key (the consumer key: "<key>" for the sink,
+        # "<key>_observer" for an observer). Lag is recorded at each consumed
+        # message, so a consumer that stops while behind keeps lag > 0 and an
+        # ageing last-consumed timestamp.
+        expr: |
+          (max by (topic_key) (llm_router_kafka_consumer_lag) > 0)
+          and on (topic_key)
+          (time() - max by (topic_key) (llm_router_kafka_last_consumed_timestamp_seconds) > 300)
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer stalled ({{ $labels.topic_key }})"
+          description: "The consumer is behind its topic but has consumed nothing for over 5 minutes."
       - alert: LLMRouterKafkaConsumerPartitionsPaused
         expr: sum by (topic) (llm_router_kafka_consumer_paused_partitions) > 0
         for: 10m
