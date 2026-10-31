@@ -1638,6 +1638,12 @@ class KafkaProducerManager:
                     logger.error(self.last_error)
 
 
+# How far a policy state's newest event (its timestamp) may lag its
+# emission; bounds the policy-state query on the sorting key. A code
+# constant (int), so it is written into the SQL, not bound.
+POLICY_STATE_MAX_EVENT_LAG_DAYS: int = 7
+
+
 class ClickHouseManager:
     """Manages ClickHouse database operations"""
 
@@ -2231,10 +2237,14 @@ class ClickHouseManager:
                 avoid_providers,
                 payload_json
             FROM {self.database}.routing_policy_state_events FINAL
-            -- timestamp is the newest event a state covers: filter on when
-            -- it was emitted, so a fresh state for a quiet scope shows.
+            -- timestamp is the newest event a state covers: filter and
+            -- order on when it was emitted, so a fresh state for a quiet
+            -- scope shows. The coarse timestamp bound keeps partition
+            -- pruning on the sorting key.
             WHERE emitted_at >= now() - INTERVAL {{hours:UInt32}} HOUR
-            ORDER BY timestamp DESC, emitted_at DESC, kafka_offset DESC
+              AND timestamp >= now() - INTERVAL {{hours:UInt32}} HOUR
+                - INTERVAL {POLICY_STATE_MAX_EVENT_LAG_DAYS} DAY
+            ORDER BY emitted_at DESC, timestamp DESC, kafka_offset DESC
             LIMIT 50
             """
 
