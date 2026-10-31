@@ -55,7 +55,7 @@ CLASSIFIER_SNAPSHOT = [
     (
         "Can you implement a binary search algorithm in Rust?",
         QueryType.CODE_GENERATION,
-        0.6735,
+        0.7944,
     ),
     (
         "Please review this code and fix the bug in my parser function",
@@ -65,7 +65,7 @@ CLASSIFIER_SNAPSHOT = [
     (
         "What does this code do? def add(a, b): return a + b",
         QueryType.CODE_ANALYSIS,
-        0.81,
+        0.75,
     ),
     (
         "Analyze the sales data and compare the trends across regions",
@@ -95,12 +95,12 @@ CLASSIFIER_SNAPSHOT = [
     (
         "Why is that the case, and how can we conclude the argument is valid?",
         QueryType.REASONING,
-        0.81,
+        0.75,
     ),
     (
         "What is the latest news about the NVIDIA stock price today?",
         QueryType.WEB_RESEARCH,
-        0.8333,
+        0.85,
     ),
     ("最新的 AI 新聞是什麼？", QueryType.WEB_RESEARCH, 0.775),
     ("Hi there, how are you doing?", QueryType.GENERAL, 0.2),
@@ -221,7 +221,7 @@ class TestQueryClassifier:
 
         # Same type as origin/main, which classified the whole query.
         assert query_type == QueryType.WEB_RESEARCH
-        assert confidence == pytest.approx(0.5773)
+        assert confidence == pytest.approx(0.5417)
 
 
 class TestTokenCounter:

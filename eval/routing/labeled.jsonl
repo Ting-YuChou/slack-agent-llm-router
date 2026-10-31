@@ -202,3 +202,12 @@
 {"query": "上網查一下 iPhone 最新機型的價格", "label": "web_research", "lang": "zh", "split": "dev"}
 {"query": "搜尋一下最近的 OpenAI 新聞", "label": "web_research", "lang": "zh", "split": "test"}
 {"query": "今天台北的天氣如何？", "label": "web_research", "lang": "zh", "split": "test"}
+{"query": "Explain how stock options work", "label": "general", "lang": "en", "split": "dev"}
+{"query": "What is the price elasticity of demand?", "label": "general", "lang": "en", "split": "dev"}
+{"query": "How do I use Google Sheets formulas?", "label": "general", "lang": "en", "split": "dev"}
+{"query": "What did we decide in yesterday's standup?", "label": "general", "lang": "en", "split": "dev"}
+{"query": "Is the server down?", "label": "general", "lang": "en", "split": "dev"}
+{"query": "What happened in the meeting?", "label": "general", "lang": "en", "split": "dev"}
+{"query": "最近好累", "label": "general", "lang": "zh", "split": "dev"}
+{"query": "價格歧視是什麼意思", "label": "general", "lang": "zh", "split": "dev"}
+{"query": "今天要做什麼", "label": "general", "lang": "zh", "split": "dev"}
