@@ -19,12 +19,8 @@ from slack.state_store import (
     STATE_SCHEMA_VERSION,
     RedisSlackStateStore,
 )
-from slack.conversation import (
-    ConversationContext,
-)
-from slack.bot_agent import (
-    _is_complete_agent_run_record,
-)
+from slack.conversation import ConversationContext
+from slack.bot_agent import _is_complete_agent_run_record
 
 # The split modules log as the bot always has: one "slack.bot_real" logger.
 logger = logging.getLogger("slack.bot_real")

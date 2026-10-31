@@ -1,7 +1,7 @@
 """Slack bot state persistence backends (memory, file, Redis)."""
 
-import logging
 import json
+import logging
 import os
 import time
 from datetime import (

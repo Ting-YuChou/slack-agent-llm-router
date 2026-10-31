@@ -33,9 +33,7 @@ from slack.formatting import (
     _is_slack_notice_text,
     slack_chat_request_id,
 )
-from slack.state_store import (
-    SLACK_SESSION_TIMEOUT,
-)
+from slack.state_store import SLACK_SESSION_TIMEOUT
 
 # The split modules log as the bot always has: one "slack.bot_real" logger.
 logger = logging.getLogger("slack.bot_real")

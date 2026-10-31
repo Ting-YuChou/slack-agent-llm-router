@@ -8,9 +8,7 @@ import logging
 import os
 import random
 import time
-from datetime import (
-    datetime,
-)
+from datetime import datetime
 from typing import (
     Any,
     Awaitable,
@@ -35,16 +33,12 @@ from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
 import httpx
 
-from slack.agent_bootstrap import (
-    AgentBootstrapBuilder,
-)
+from slack.agent_bootstrap import AgentBootstrapBuilder
 from slack.agent_feedback import (
     AGENT_FEEDBACK_CALLBACK_ID,
     AgentFeedbackNonce,
 )
-from slack.agent_shortcut import (
-    AgentShortcutNonce,
-)
+from slack.agent_shortcut import AgentShortcutNonce
 from src.memory import MemoryManager, build_memory_scope
 from src.utils.schema import (
     Attachment,
@@ -53,6 +47,9 @@ from src.utils.schema import (
 )
 from src.utils.bounded_state import BoundedTTLMap
 from src.utils.metrics import SLACK_METRICS
+
+# Split out of this module; the names tests and callers import from
+# slack.bot_real are re-exported here.
 from slack.formatting import (
     CHAT_FEEDBACK_ACTIONS,
     CHAT_FEEDBACK_CLICKS_LIMIT,
@@ -87,9 +84,7 @@ from slack.conversation import (
     SlackQueryTrace,
     _queue_wait_ms,
 )
-from slack.attachments import (
-    SlackBotAttachmentsMixin,
-)
+from slack.attachments import SlackBotAttachmentsMixin
 from slack.bot_agent import (
     AGENT_ERROR_HINTS,
     AGENT_TERMINAL_STATUSES,
@@ -102,11 +97,10 @@ from slack.chat_handler import (
     AGENT_FOLLOWUP_FLAG_PATTERN,
     SlackMessageHandler,
 )
-from slack.bot_persistence import (
-    SlackBotPersistenceMixin,
-)
+from slack.bot_persistence import SlackBotPersistenceMixin
 
 logger = logging.getLogger(__name__)
+
 HANDLED_MESSAGES_LIMIT = 1000
 # Threads whose Agent runtime lookup a message event skips (S7): chat threads
 # known not to be Agent threads, and threads whose lookup just failed.
