@@ -12,7 +12,6 @@ from src.redaction import context_summary
 from src.routing_features import (
     CODE_KEYWORDS as CODE_KEYWORDS,
     HIGH_REASONING_QUERY_TYPES,
-    QUERY_TYPE_RULES as QUERY_TYPE_RULES,
     build_routing_features,
     calculate_priority,
     calculate_query_complexity as calculate_query_complexity,

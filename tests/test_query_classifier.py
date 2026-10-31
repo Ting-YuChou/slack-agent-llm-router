@@ -134,3 +134,11 @@ def test_flink_keeps_the_payload_query_type():
     )
 
     assert features["query_type"] == "math"
+
+
+def test_the_old_first_match_rules_are_gone():
+    import flink.logic
+    import src.routing_features
+
+    assert not hasattr(src.routing_features, "QUERY_TYPE_RULES")
+    assert not hasattr(flink.logic, "QUERY_TYPE_RULES")

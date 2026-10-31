@@ -7,7 +7,6 @@ inform task type and complexity, but it must not imply urgency by itself.
 
 from __future__ import annotations
 
-import re
 from typing import Any, Dict
 
 from src.query_classifier import classify as classify_query
@@ -28,108 +27,6 @@ CODE_KEYWORDS = [
     "traceback",
     "refactor",
     "bug",
-]
-
-# Superseded by src.query_classifier (R13) and no longer read here; kept only
-# because flink.logic re-exports the name.
-QUERY_TYPE_RULES = [
-    (
-        "code_analysis",
-        [
-            "debug",
-            "fix this code",
-            "review this code",
-            "refactor",
-            "stack trace",
-            "traceback",
-            "optimize this function",
-        ],
-    ),
-    (
-        "code_generation",
-        [
-            "write a",
-            "implement",
-            "build a",
-            "create a function",
-            "generate code",
-            "script",
-            "class ",
-            "def ",
-            "```",
-        ],
-    ),
-    (
-        "translation",
-        [
-            "translate",
-            "translation",
-            "convert this to english",
-            "convert this to chinese",
-        ],
-    ),
-    (
-        "summarization",
-        [
-            "summarize",
-            "summary",
-            "tldr",
-            "tl;dr",
-            "brief overview",
-        ],
-    ),
-    (
-        "brainstorming",
-        [
-            "brainstorm",
-            "ideas",
-            "suggestions",
-            "alternatives",
-        ],
-    ),
-    (
-        "planning",
-        [
-            "plan",
-            "roadmap",
-            "milestones",
-            "timeline",
-            "strategy",
-        ],
-    ),
-    (
-        "math",
-        [
-            "calculate",
-            "equation",
-            "derivative",
-            "integral",
-            "probability",
-        ],
-    ),
-    (
-        "reasoning",
-        [
-            "why",
-            "reason through",
-            "step by step",
-            "root cause",
-            "tradeoff",
-            "deduce",
-        ],
-    ),
-    (
-        "analysis",
-        [
-            "analyze",
-            "investigate",
-            "evaluate",
-            "assess",
-            "compare",
-            "architecture",
-            "incident report",
-        ],
-    ),
 ]
 
 HIGH_REASONING_QUERY_TYPES = {
