@@ -1492,7 +1492,8 @@ class KafkaProducerManager:
             timestamp=_parse_datetime(inference_response.timestamp),
             user_id=query_request.user_id,
             user_tier=query_request.user_tier,
-            query_text=query_request.query,
+            # Redacted, and for Slack without attached files' names (X6).
+            query_text=_event_query_text(query_request),
             query_type=query_type.value
             if hasattr(query_type, "value")
             else str(query_type),
