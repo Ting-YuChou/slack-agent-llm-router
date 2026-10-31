@@ -2884,14 +2884,6 @@ def start_rag_workers(config: str):
 
 
 @cli.command()
-def setup():
-    """Setup initial project structure and dependencies"""
-    from src.llm_router_part0_setup import setup_project_environment
-
-    setup_project_environment()
-
-
-@cli.command()
 @click.option(
     "--service",
     help="Specific service to check (router, inference, pipeline, monitoring)",
