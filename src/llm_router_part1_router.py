@@ -746,6 +746,14 @@ class ModelRouter:
                 raise RoutingRuleError(
                     f"router.routing_rules[{index}] must be a mapping"
                 )
+            if "weight" in rule_config:
+                # RoutingRule.weight was never read; tolerate old configs.
+                rule_config = {k: v for k, v in rule_config.items() if k != "weight"}
+                logger.warning(
+                    "router.routing_rules[%d]: 'weight' is deprecated and "
+                    "ignored; remove it",
+                    index,
+                )
             try:
                 rule = RoutingRule(**rule_config)
             except (RoutingRuleError, TypeError) as error:

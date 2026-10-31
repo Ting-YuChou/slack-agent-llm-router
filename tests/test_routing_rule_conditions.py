@@ -43,6 +43,26 @@ def test_rule_records_the_names_it_reads():
             True,
         ),
         ("cost_sensitivity == None", {"cost_sensitivity": None}, True),
+        # Forms the old eval accepted (R16c review).
+        (
+            "web_search_blocked_reason is None",
+            {"web_search_blocked_reason": None},
+            True,
+        ),
+        (
+            "web_search_blocked_reason is not None",
+            {"web_search_blocked_reason": "x"},
+            True,
+        ),
+        ("None is hint_reason", {"hint_reason": "pin"}, False),
+        ("temperature > -1", {"temperature": 0.0}, True),
+        ("temperature > -0.5", {"temperature": -1.0}, False),
+        (
+            "query_type in {'analysis', 'summarization'}",
+            {"query_type": "analysis"},
+            True,
+        ),
+        ("query_type not in {'analysis'}", {"query_type": "analysis"}, False),
     ],
 )
 def test_whitelisted_conditions_evaluate_like_python(condition, context, expected):
@@ -68,8 +88,13 @@ def test_a_known_name_missing_from_the_context_does_not_match():
         "[name for name in allowed_tools]",
         "query_type == 'a' if True else False",
         "token_count + 1 > 2",
-        "query_type is None",
+        "token_count > 50*1000",
+        "query_type is 'analysis'",
+        "query_type is user_tier",
         "-token_count < 0",
+        "token_count > -True",
+        "-'a' == query_type",
+        "query_type in {user_tier}",
         "f'{query_type}' == 'analysis'",
         "query_type := 'analysis'",
         "query_type in (user_tier, 'analysis')",
@@ -103,6 +128,47 @@ def test_a_misspelled_rule_fails_the_router_load(router_config):
 
     with pytest.raises(RoutingRuleError, match="user_teir"):
         ModelRouter(config)
+
+
+@pytest.mark.parametrize(
+    "condition, construct",
+    [
+        ("token_count > 50*1000", "arithmetic"),
+        ("len(query) > 3", "function call"),
+        ("query_type.upper() == 'A'", "function call"),
+        ("query_type.real == 'A'", "attribute access"),
+        ("allowed_tools[0] == 'x'", "subscript"),
+        ("query_type is 'a'", "'is' and 'is not' compare only with None"),
+    ],
+)
+def test_the_error_names_the_unsupported_construct(condition, construct):
+    with pytest.raises(RoutingRuleError, match="not supported") as error:
+        _rule(condition)
+
+    assert construct in str(error.value)
+
+
+def test_a_rule_weight_is_ignored_with_a_deprecation_warning(router_config, caplog):
+    config = dict(router_config)
+    config["routing_rules"] = [
+        {
+            "condition": "query_type == 'analysis'",
+            "models": ["gpt-5"],
+            "fallback": "gpt-5",
+            "weight": 2.0,
+        }
+    ]
+
+    with caplog.at_level("WARNING", logger="src.llm_router_part1_router"):
+        router = ModelRouter(config)
+
+    assert [rule.condition for rule in router.routing_rules] == [
+        "query_type == 'analysis'"
+    ]
+    assert any(
+        "weight" in record.getMessage() and "deprecated" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_a_malformed_rule_entry_fails_the_router_load(router_config):

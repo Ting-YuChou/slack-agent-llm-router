@@ -6,16 +6,18 @@ checked against a whitelist of syntax and names, and evaluated by walking the
 tree; nothing is ever passed to ``eval``.
 
 Allowed syntax: ``and``/``or``/``not`` (also upper case), comparisons with
-``== != < <= > >= in not in`` (chained comparisons too), context names,
-literal constants, and tuples or lists of literal constants. Anything else,
+``== != < <= > >= in not in`` (chained comparisons too), ``is``/``is not``
+against ``None``, context names, literal constants (negative numbers
+included), and tuples, lists or sets of literal constants. Anything else,
 such as calls, attributes, subscripts, arithmetic, lambdas or comprehensions,
-is rejected when the rule is loaded.
+is rejected when the rule is loaded, with an error naming the construct.
 """
 
 import ast
 import logging
 import operator
 import re
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Tuple
 
@@ -96,6 +98,28 @@ _COMPARE_OPS: Dict[type, Callable[[Any, Any], Any]] = {
     ast.GtE: operator.ge,
     ast.In: lambda left, right: left in right,
     ast.NotIn: lambda left, right: left not in right,
+    ast.Is: operator.is_,
+    ast.IsNot: operator.is_not,
+}
+_IDENTITY_OPS = (ast.Is, ast.IsNot)
+# How an error names a construct conditions do not support.
+_CONSTRUCT_NAMES: Dict[type, str] = {
+    ast.BinOp: "arithmetic",
+    ast.Call: "function call",
+    ast.Attribute: "attribute access",
+    ast.Subscript: "subscript",
+    ast.Lambda: "lambda",
+    ast.ListComp: "comprehension",
+    ast.SetComp: "comprehension",
+    ast.DictComp: "comprehension",
+    ast.GeneratorExp: "comprehension",
+    ast.IfExp: "conditional expression",
+    ast.NamedExpr: "assignment expression",
+    ast.JoinedStr: "f-string",
+    ast.Dict: "dict literal",
+    ast.Starred: "unpacking",
+    ast.Await: "await",
+    ast.Yield: "yield",
 }
 _KEYWORDS = (("AND", "and"), ("OR", "or"), ("NOT", "not"))
 
@@ -114,26 +138,52 @@ def _normalize(condition: str) -> str:
     return condition
 
 
+def _is_negative_number(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, ast.USub)
+        and isinstance(node.operand, ast.Constant)
+        and isinstance(node.operand.value, (int, float))
+        and not isinstance(node.operand.value, bool)
+    )
+
+
+def _is_literal(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) or _is_negative_number(node)
+
+
+def _is_none(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) and node.value is None
+
+
 def _check(node: ast.AST, condition: str, names: List[str]) -> None:
     """Reject any node outside the whitelist; collect the names read."""
 
-    def reject(what: str) -> None:
+    def reject(construct: str) -> None:
         raise RoutingRuleError(
-            f"routing rule {condition!r}: {what} is not allowed in a condition"
+            f"routing rule {condition!r}: {construct} is not supported in a "
+            "condition (allowed: and/or/not, comparisons, 'is None', context "
+            "names, constants and tuples, lists or sets of constants)"
         )
 
     if isinstance(node, ast.BoolOp):
         for value in node.values:
             _check(value, condition, names)
     elif isinstance(node, ast.UnaryOp):
-        if not isinstance(node.op, ast.Not):
-            reject(type(node.op).__name__)
-        _check(node.operand, condition, names)
+        if isinstance(node.op, ast.Not):
+            _check(node.operand, condition, names)
+        elif not _is_negative_number(node):
+            reject("arithmetic")
     elif isinstance(node, ast.Compare):
-        for op in node.ops:
+        operands = [node.left, *node.comparators]
+        for index, op in enumerate(node.ops):
             if type(op) not in _COMPARE_OPS:
                 reject(f"the {type(op).__name__} comparison")
-        for operand in (node.left, *node.comparators):
+            if isinstance(op, _IDENTITY_OPS) and not (
+                _is_none(operands[index]) or _is_none(operands[index + 1])
+            ):
+                reject("'is' and 'is not' compare only with None, so this")
+        for operand in operands:
             _check(operand, condition, names)
     elif isinstance(node, ast.Name):
         if node.id not in ROUTING_RULE_NAMES:
@@ -144,11 +194,11 @@ def _check(node: ast.AST, condition: str, names: List[str]) -> None:
         names.append(node.id)
     elif isinstance(node, ast.Constant):
         return
-    elif isinstance(node, (ast.Tuple, ast.List)):
-        if not all(isinstance(item, ast.Constant) for item in node.elts):
-            reject("a tuple or list of anything but constants")
+    elif isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        if not all(_is_literal(item) for item in node.elts):
+            reject("a tuple, list or set of anything but constants")
     else:
-        reject(type(node).__name__)
+        reject(_CONSTRUCT_NAMES.get(type(node), type(node).__name__))
 
 
 def compile_condition(condition: str) -> Tuple[ast.expr, FrozenSet[str]]:
@@ -156,7 +206,10 @@ def compile_condition(condition: str) -> Tuple[ast.expr, FrozenSet[str]]:
     if not isinstance(condition, str) or not condition.strip():
         raise RoutingRuleError("routing rule condition must be a non-empty string")
     try:
-        tree = ast.parse(_normalize(condition).strip(), mode="eval")
+        with warnings.catch_warnings():
+            # "x is 'a'" warns at parse time; _check rejects it below.
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(_normalize(condition).strip(), mode="eval")
     except SyntaxError as error:
         raise RoutingRuleError(
             f"routing rule {condition!r} does not parse: {error.msg}"
@@ -177,6 +230,8 @@ def _evaluate(node: ast.expr, context: Mapping[str, Any]) -> Any:
                 return result
         return result
     if isinstance(node, ast.UnaryOp):
+        if isinstance(node.op, ast.USub):
+            return -_evaluate(node.operand, context)
         return not _evaluate(node.operand, context)
     if isinstance(node, ast.Compare):
         left = _evaluate(node.left, context)
@@ -194,6 +249,8 @@ def _evaluate(node: ast.expr, context: Mapping[str, Any]) -> Any:
         return node.value
     if isinstance(node, (ast.Tuple, ast.List)):
         return tuple(_evaluate(item, context) for item in node.elts)
+    if isinstance(node, ast.Set):
+        return frozenset(_evaluate(item, context) for item in node.elts)
     raise RoutingRuleError(f"unexpected node {type(node).__name__}")
 
 
