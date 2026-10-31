@@ -6901,6 +6901,9 @@ class SlackBot:
                 request_id,
             )
         else:
+            # A producer that can confirm the send is asked to: the user is
+            # thanked, and the click kept, only once Kafka has the event.
+            confirm = getattr(producer, "confirms_chat_feedback_delivery", False)
             try:
                 recorded = bool(
                     await produce(
@@ -6908,6 +6911,7 @@ class SlackBot:
                         user_id=str(user_id),
                         rating=rating,
                         click_id=click_id,
+                        **({"wait_for_delivery": True} if confirm is True else {}),
                     )
                 )
             except Exception:
@@ -6917,7 +6921,7 @@ class SlackBot:
             else:
                 if not recorded:
                     logger.warning(
-                        "Chat feedback for request %s was not accepted for " "delivery",
+                        "Chat feedback for request %s was not delivered",
                         request_id,
                     )
         if not recorded:

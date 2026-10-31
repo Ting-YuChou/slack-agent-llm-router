@@ -73,6 +73,14 @@ class _DeliveryEnvelope:
     default_topic: str
     key: Optional[str]
     value: Dict[str, Any]
+    # Resolved with whether Kafka confirmed the send, for a caller that waits.
+    delivery: Optional["asyncio.Future[bool]"] = None
+
+
+def _resolve_delivery(envelope: _DeliveryEnvelope, delivered: bool) -> None:
+    future = envelope.delivery
+    if future is not None and not future.done():
+        future.set_result(delivered)
 
 
 def _isoformat_utc(timestamp: Optional[datetime] = None) -> str:
@@ -1099,6 +1107,9 @@ def _has_two_phase_send(producer: Any) -> bool:
 class KafkaProducerManager:
     """Manages Kafka message production"""
 
+    # produce_chat_feedback can wait for Kafka to confirm the send.
+    confirms_chat_feedback_delivery = True
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.bootstrap_servers = config.get("bootstrap_servers", ["localhost:9092"])
@@ -1232,14 +1243,18 @@ class KafkaProducerManager:
         *,
         key: Optional[str],
         value: Dict[str, Any],
+        delivery: Optional["asyncio.Future[bool]"] = None,
     ) -> bool:
-        """Accept a message for background delivery without yielding control."""
+        """Accept a message for background delivery without yielding control.
+
+        `delivery`, when given, is resolved once the send succeeded or failed.
+        """
         if not self._accepting:
             PIPELINE_METRICS.producer_queue_dropped.labels(
                 topic=topic_key, reason="not_accepting"
             ).inc()
             return False
-        envelope = _DeliveryEnvelope(topic_key, default_topic, key, value)
+        envelope = _DeliveryEnvelope(topic_key, default_topic, key, value, delivery)
         try:
             self._delivery_queue.put_nowait(envelope)
         except asyncio.QueueFull:
@@ -1264,6 +1279,7 @@ class KafkaProducerManager:
             return False
 
     def _record_delivery(self, envelope, delivered: bool) -> None:
+        _resolve_delivery(envelope, delivered)
         topic_key = envelope.topic_key
         if delivered:
             PIPELINE_METRICS.producer_queue_delivered.labels(topic=topic_key).inc()
@@ -1315,10 +1331,12 @@ class KafkaProducerManager:
                     if task.done() and not task.cancelled():
                         self._record_delivery(item, task.result())
                     elif task.done():
+                        _resolve_delivery(item, False)
                         PIPELINE_METRICS.producer_queue_dropped.labels(
                             topic=item.topic_key, reason="shutdown_timeout"
                         ).inc()
                     else:
+                        _resolve_delivery(item, False)
                         PIPELINE_METRICS.producer_queue_dropped.labels(
                             topic=item.topic_key, reason="shutdown_abandoned"
                         ).inc()
@@ -1334,6 +1352,7 @@ class KafkaProducerManager:
                 envelope = self._delivery_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            _resolve_delivery(envelope, False)
             PIPELINE_METRICS.producer_queue_dropped.labels(
                 topic=envelope.topic_key, reason=reason
             ).inc()
@@ -1422,8 +1441,15 @@ class KafkaProducerManager:
         rating: str,
         click_id: str,
         source: str = "slack",
+        wait_for_delivery: bool = False,
+        timeout: float = 2.0,
     ):
-        """Produce a chat.feedback event, keyed by the request it rates."""
+        """Produce a chat.feedback event, keyed by the request it rates.
+
+        Without `wait_for_delivery` this is True once the event is queued.
+        With it, True only once Kafka confirmed the send within `timeout`
+        seconds; a send still pending then may yet be delivered.
+        """
         event = build_chat_feedback_event(
             request_id=request_id,
             user_id=user_id,
@@ -1431,12 +1457,33 @@ class KafkaProducerManager:
             click_id=click_id,
             source=source,
         )
-        return self._enqueue_message(
+        if not wait_for_delivery:
+            return self._enqueue_message(
+                "chat_feedback",
+                "chat.feedback",
+                key=request_id,
+                value=event,
+            )
+        delivery: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
+        if not self._enqueue_message(
             "chat_feedback",
             "chat.feedback",
             key=request_id,
             value=event,
-        )
+            delivery=delivery,
+        ):
+            return False
+        try:
+            return bool(
+                await asyncio.wait_for(asyncio.shield(delivery), timeout=timeout)
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "chat.feedback for request %s was not confirmed within %.1f s",
+                request_id,
+                timeout,
+            )
+            return False
 
     async def produce_routing_decision(
         self,
