@@ -2,6 +2,7 @@
 its ALTERs and the keys its row builder may write."""
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -159,7 +160,12 @@ async def test_create_tables_runs_the_generated_creates_then_the_alters():
 
     await manager._create_tables()
 
-    statements = [call.args[1] for call in manager._run_blocking.await_args_list]
+    statements = [
+        call.args[1]
+        for call in manager._run_blocking.await_args_list
+        if call.args[0] is manager.client.command
+    ]
+    # No column list came back, so every ALTER runs.
     expected = [table.create_sql("llm_router") for table in TABLES] + [
         sql for table in TABLES for sql in table.alter_sql("llm_router")
     ]
@@ -173,6 +179,92 @@ async def test_create_tables_runs_the_generated_creates_then_the_alters():
         "ALTER TABLE llm_router.query_logs ADD COLUMN IF NOT EXISTS "
         "event_id String DEFAULT query_id"
     ) in statements
+
+
+def _manager_with_columns(existing, *, fail_alter=False):
+    """A manager whose system.columns lists ``existing`` (table, column) pairs."""
+    manager = ClickHouseManager({"database": "llm_router"})
+    manager.client = MagicMock()
+    calls = []
+
+    async def run_blocking(func, sql, *args, **kwargs):
+        calls.append((func, sql, kwargs))
+        if func is manager.client.query:
+            assert "system.columns" in sql
+            assert kwargs["parameters"] == {"database": "llm_router"}
+            return SimpleNamespace(result_rows=list(existing))
+        if fail_alter and sql.startswith("ALTER"):
+            raise RuntimeError("Code: 497. Not enough privileges")
+        return None
+
+    manager._run_blocking = run_blocking
+    return manager, calls
+
+
+def _all_columns():
+    return [(table.name, column.name) for table in TABLES for column in table.columns]
+
+
+@pytest.mark.asyncio
+async def test_create_tables_alters_only_the_missing_columns():
+    existing = [
+        pair
+        for pair in _all_columns()
+        if pair not in {("chat_requests", "ttft_ms"), ("model_performance", "provider")}
+    ]
+    manager, calls = _manager_with_columns(existing)
+
+    await manager._create_tables()
+
+    alters = [sql for func, sql, _ in calls if sql.startswith("ALTER")]
+    assert alters == [
+        "ALTER TABLE llm_router.model_performance ADD COLUMN IF NOT EXISTS "
+        "provider String DEFAULT ''",
+        "ALTER TABLE llm_router.chat_requests ADD COLUMN IF NOT EXISTS "
+        "ttft_ms Nullable(UInt32)",
+    ]
+    # One column lookup for the whole database.
+    assert sum(1 for func, _, _ in calls if func is manager.client.query) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_tables_issues_no_alters_when_nothing_is_missing():
+    manager, calls = _manager_with_columns(_all_columns())
+
+    await manager._create_tables()
+
+    assert [sql for _, sql, _ in calls if sql.startswith("ALTER")] == []
+
+
+@pytest.mark.asyncio
+async def test_a_missing_column_alter_failure_is_still_fatal():
+    existing = [
+        pair for pair in _all_columns() if pair != ("query_logs", "kafka_offset")
+    ]
+    manager, _ = _manager_with_columns(existing, fail_alter=True)
+
+    with pytest.raises(RuntimeError, match="schema migration.*query_logs"):
+        await manager._create_tables()
+
+
+@pytest.mark.asyncio
+async def test_create_tables_issues_every_alter_when_the_column_lookup_fails():
+    manager = ClickHouseManager({"database": "llm_router"})
+    manager.client = MagicMock()
+    commands = []
+
+    async def run_blocking(func, sql, *args, **kwargs):
+        if func is manager.client.query:
+            raise RuntimeError("no access to system.columns")
+        commands.append(sql)
+
+    manager._run_blocking = run_blocking
+
+    await manager._create_tables()
+
+    assert commands[len(TABLES) :] == [
+        sql for table in TABLES for sql in table.alter_sql("llm_router")
+    ]
 
 
 # Every ALTER fc64233 issued, so older deployments still migrate.

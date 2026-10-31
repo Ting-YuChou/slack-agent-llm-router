@@ -9,7 +9,7 @@ Stdlib only: the router imports this without the ClickHouse client.
 
 import re
 from dataclasses import dataclass
-from typing import FrozenSet, List, Optional, Tuple
+from typing import AbstractSet, FrozenSet, List, Optional, Tuple
 
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -64,13 +64,17 @@ class Table:
             lines.append(f"SETTINGS {self.settings}")
         return "\n".join(lines)
 
-    def alter_sql(self, database: str) -> List[str]:
+    def alter_sql(
+        self, database: str, existing: Optional[AbstractSet[str]] = None
+    ) -> List[str]:
+        """ADD COLUMN statements; with ``existing``, only for columns it lacks."""
         keys = self.key_columns
         return [
             f"ALTER TABLE {database}.{self.name} ADD COLUMN IF NOT EXISTS "
             + column.definition(column.backfill)
             for column in self.columns
-            if column.name not in keys or column.backfill is not None
+            if (column.name not in keys or column.backfill is not None)
+            and (existing is None or column.name not in existing)
         ]
 
 

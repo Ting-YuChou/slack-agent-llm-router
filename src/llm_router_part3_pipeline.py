@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from collections import OrderedDict
 from types import SimpleNamespace
-from typing import Dict, List, Mapping, Optional, Any, Callable, Tuple
+from typing import Dict, List, Mapping, Optional, Any, Callable, Set, Tuple
 from dataclasses import dataclass, asdict, field
 import uuid
 
@@ -1803,8 +1803,9 @@ class ClickHouseManager:
                     f"Failed to create required ClickHouse table {table.name}"
                 ) from e
 
+        existing = await self._existing_columns()
         for table in ANALYTICS_TABLES:
-            for sql in table.alter_sql(self.database):
+            for sql in table.alter_sql(self.database, existing.get(table.name)):
                 try:
                     await self._run_blocking(self.client.command, sql)
                 except Exception as e:
@@ -1816,6 +1817,30 @@ class ClickHouseManager:
                         "Failed to apply ClickHouse schema migration for "
                         f"{self.database}.{table.name}"
                     ) from e
+
+    async def _existing_columns(self) -> Dict[str, Set[str]]:
+        """Columns of this database's tables, read once from system.columns.
+
+        Empty when the lookup fails or returns nothing usable; every ALTER
+        then runs, as ADD COLUMN IF NOT EXISTS is idempotent.
+        """
+        try:
+            result = await self._run_blocking(
+                self.client.query,
+                "SELECT table, name FROM system.columns "
+                "WHERE database = {database:String}",
+                parameters={"database": self.database},
+            )
+            rows = list(getattr(result, "result_rows", None) or [])
+        except Exception as e:
+            logger.warning(f"Could not read ClickHouse columns, altering all: {e}")
+            return {}
+        columns: Dict[str, Set[str]] = {}
+        for row in rows:
+            if len(row) != 2 or not all(isinstance(value, str) for value in row):
+                return {}
+            columns.setdefault(row[0], set()).add(row[1])
+        return columns
 
     async def insert_query_log(self, query_log: QueryLogEntry):
         """Insert single query log entry"""
