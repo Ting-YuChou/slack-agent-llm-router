@@ -546,14 +546,16 @@ def build_inference_completed_event(
         "finish_reason": inference_response.finish_reason,
         "provider_request_id": inference_response.provider_request_id,
         "latency_ms": inference_response.latency_ms,
-        # Where the time went: routing; the provider queue (not measured
-        # per request yet); time to first token (no streaming yet).
+        # Where the time went: routing; the ingress and provider queues;
+        # time to first token (no streaming yet).
         "routing_ms": (
             int(routing_ms)
             if isinstance(routing_ms, (int, float)) and not isinstance(routing_ms, bool)
             else None
         ),
-        "queue_wait_ms": None,
+        "queue_wait_ms": _uint_or_none(
+            getattr(inference_response, "queue_wait_ms", None)
+        ),
         "ttft_ms": None,
         "token_count_input": inference_response.token_count_input,
         "token_count_output": inference_response.token_count_output,

@@ -2094,7 +2094,6 @@ class PerformanceProfiler:
                     "priority": "medium",
                     "description": f"High memory usage detected: {avg_memory:.0f}MB",
                     "suggestions": [
-                        "Implement context compression",
                         "Reduce batch sizes",
                         "Consider model quantization",
                     ],
