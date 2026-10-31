@@ -7,7 +7,7 @@ from flink.logic import build_request_enriched_event
 from src import query_classifier
 from src.llm_router_part1_router import ModelRouter
 from src.llm_router_part3_pipeline import build_request_raw_event
-from src.utils.schema import QueryRequest, QueryType
+from src.utils.schema import QueryRequest, QueryType, ToolPolicy
 
 from test_main import (  # noqa: F401
     DummyEventProducer,
@@ -24,9 +24,11 @@ class RawEventProducer(DummyEventProducer):
         super().__init__(config)
         self.raw_events = []
 
-    async def produce_request_raw(self, request):
+    async def produce_request_raw(self, request, classification=None):
         await super().produce_request_raw(request)
-        self.raw_events.append(build_request_raw_event(request))
+        self.raw_events.append(
+            build_request_raw_event(request, classification=classification)
+        )
 
 
 def _platform(tmp_path, router):
@@ -140,3 +142,51 @@ def test_classify_request_is_public_and_memoized(router_config):
     assert router.classify_request(request) == (QueryType.PLANNING, 0.7)
     assert router.classify_request(request) == (QueryType.PLANNING, 0.7)
     assert calls == ["Plan the rollout"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"tool_policy": ToolPolicy.REQUIRED, "allowed_tools": ["web_search"]},
+        {"metadata": {"enable_web_search": True}},
+    ],
+    ids=["required_tool", "enable_web_search"],
+)
+async def test_requests_raw_carries_the_routed_type_after_a_web_search_override(
+    tmp_path, router_config, patched_platform_deps, overrides
+):
+    router = _router(router_config)
+    router.classifier.classify_query = lambda _query: (QueryType.GENERAL, 0.2)
+    platform, producer = _platform(tmp_path, router)
+    request = QueryRequest(query="Check this", user_id="u1", **overrides)
+
+    await main.ChatIngress(platform).process(request)
+    decision = await router.route_query(request)
+
+    assert decision.query_type == QueryType.WEB_RESEARCH
+    assert producer.raw_events[0]["query_type"] == "web_research"
+    assert producer.raw_events[0]["classifier_confidence"] == pytest.approx(0.2)
+
+
+def test_classify_request_applies_the_web_search_override(router_config):
+    router = _router(router_config)
+    router.classifier.classify_query = lambda _query: (QueryType.MATH, 0.6)
+    request = QueryRequest(
+        query="Solve 2 + 2",
+        user_id="u1",
+        tool_policy=ToolPolicy.REQUIRED,
+        allowed_tools=["web_search"],
+    )
+
+    assert router.classify_request(request) == (QueryType.WEB_RESEARCH, 0.6)
+
+
+def test_build_request_raw_event_takes_the_classification_explicitly():
+    request = QueryRequest(query="Summarize this", user_id="u1")
+
+    event = build_request_raw_event(request, classification=("summarization", 0.8))
+
+    assert event["query_type"] == "summarization"
+    assert event["classifier_confidence"] == pytest.approx(0.8)
+    assert not hasattr(request, "_query_classification")

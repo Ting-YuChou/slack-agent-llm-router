@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple
+from typing import Annotated, Any, Dict, List, Literal, Optional
 import re
 import uuid
 
@@ -194,9 +194,6 @@ class QueryRequest(BaseModel):
     # The router's per-request work (classification, token counts, policy),
     # keyed by the inputs each depends on, so routing it again is cheap.
     _routing_memo: Dict[Any, Any] = PrivateAttr(default_factory=dict)
-    # (query type value, confidence) the chat ingress got from the router before
-    # publishing requests.raw; None when it did not classify (R13).
-    _query_classification: Optional[Tuple[str, float]] = PrivateAttr(default=None)
 
     @field_validator("query")
     @classmethod

@@ -950,19 +950,16 @@ class ModelRouter:
     async def _build_query_context(self, request: QueryRequest) -> Dict[str, Any]:
         """Build comprehensive context for routing decisions"""
         # Classify query type
-        query_type, classification_confidence = self._classify_request(request)
+        (
+            query_type,
+            classification_confidence,
+            web_search_allowed,
+            needs_web_search,
+        ) = self._effective_classification(request)
 
         # Count the approximate provider prompt, not just the user query.
         token_count = await self._request_token_count(request)
         metadata = request.metadata or {}
-        web_search_allowed = self._web_search_allowed(request)
-        needs_web_search = self._request_needs_web_search(
-            request,
-            query_type,
-            web_search_allowed,
-        )
-        if needs_web_search:
-            query_type = QueryType.WEB_RESEARCH
         routing_features = build_routing_features(
             self._build_routing_feature_payload(
                 request=request,
@@ -1032,12 +1029,30 @@ class ModelRouter:
         return memo if isinstance(memo, dict) else None
 
     def classify_request(self, request: QueryRequest) -> Tuple[QueryType, float]:
-        """The request's query type and confidence, memoized for routing.
+        """The query type routing uses, and the classifier's confidence.
 
-        The chat ingress calls this before publishing requests.raw, so the
-        event carries the type routing will use without classifying twice.
+        This is the classifier's type with the web search override routing
+        applies (a required web_search tool or metadata.enable_web_search
+        makes it web_research). The chat ingress calls it before publishing
+        requests.raw; the classification is memoized, so routing reuses it.
         """
-        return self._classify_request(request)
+        query_type, confidence, _allowed, _needs = self._effective_classification(
+            request
+        )
+        return query_type, confidence
+
+    def _effective_classification(
+        self, request: QueryRequest
+    ) -> Tuple[QueryType, float, bool, bool]:
+        """(query type, confidence, web search allowed, web search needed)."""
+        query_type, confidence = self._classify_request(request)
+        web_search_allowed = self._web_search_allowed(request)
+        needs_web_search = self._request_needs_web_search(
+            request, query_type, web_search_allowed
+        )
+        if needs_web_search:
+            query_type = QueryType.WEB_RESEARCH
+        return query_type, confidence, web_search_allowed, needs_web_search
 
     def _classify_request(self, request: QueryRequest) -> Tuple[QueryType, float]:
         memo = self._routing_memo(request)

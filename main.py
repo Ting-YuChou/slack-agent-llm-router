@@ -129,18 +129,21 @@ class ChatIngress:
     async def process(self, query_request: QueryRequest) -> Tuple[Any, int, Dict]:
         """requests.raw, inference and the status: (result, status, headers)."""
         platform = self._platform
-        self._classify(query_request)
-        await platform._publish_request_raw_event(query_request)
+        classification = self._classify(query_request)
+        await platform._publish_request_raw_event(
+            query_request, classification=classification
+        )
         result = await platform.services["inference"].process_query(query_request)
         result = _with_request_id(result, query_request.request_id)
         status_code, headers = route_response_status(result)
         return result, status_code, headers
 
-    def _classify(self, query_request: QueryRequest) -> None:
-        """Put the router's query type on the request for requests.raw (R13).
+    def _classify(self, query_request: QueryRequest) -> Optional[Tuple[str, float]]:
+        """The query type routing will use and its confidence, for requests.raw.
 
-        The router memoizes it, so routing reuses it. A failure never blocks
-        the request: requests.raw then goes out without a type.
+        The router memoizes the classification, so routing reuses it (R13).
+        None when there is no classifying router or it fails: a failure never
+        blocks the request, and requests.raw then goes out without a type.
         """
         services = self._platform.services
         router = getattr(services.get("inference"), "router", None)
@@ -148,17 +151,15 @@ class ChatIngress:
             router = services.get("router")
         classify_request = getattr(router, "classify_request", None)
         if not callable(classify_request):
-            return
+            return None
         try:
             query_type, confidence = classify_request(query_request)
-            query_request._query_classification = (
-                str(getattr(query_type, "value", query_type)),
-                float(confidence),
-            )
+            return str(getattr(query_type, "value", query_type)), float(confidence)
         except Exception:
             self._platform.logger.warning(
                 "Query classification failed before requests.raw", exc_info=True
             )
+            return None
 
     async def record(
         self,
@@ -1296,8 +1297,16 @@ class LLMRouterPlatform:
         """Build backward-compatible health payload."""
         return self._build_readiness_payload()
 
-    async def _publish_request_raw_event(self, query_request: QueryRequest):
-        """Best-effort publication of pre-inference API events."""
+    async def _publish_request_raw_event(
+        self,
+        query_request: QueryRequest,
+        classification: Optional[Tuple[str, float]] = None,
+    ):
+        """Best-effort publication of pre-inference API events.
+
+        `classification` is passed on only when there is one, so producers
+        that take just the request keep working.
+        """
         producer = self.services.get("event_producer")
         if producer is None:
             return
@@ -1307,7 +1316,10 @@ class LLMRouterPlatform:
             return
 
         try:
-            await publish_method(query_request)
+            if classification is None:
+                await publish_method(query_request)
+            else:
+                await publish_method(query_request, classification=classification)
         except Exception as exc:
             self.logger.warning(f"Failed to publish requests.raw event: {exc}")
 
