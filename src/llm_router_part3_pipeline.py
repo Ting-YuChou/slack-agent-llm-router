@@ -2560,7 +2560,12 @@ class BatchBufferState:
 
 
 class _BatchBackpressureRebalanceListener(ConsumerRebalanceListener):
-    """Reapply topic backpressure as soon as partitions are assigned."""
+    """Reapply topic backpressure as soon as partitions are assigned, and
+    drop the lag series of partitions this consumer no longer owns.
+
+    Installed on every consumer; observer consumers have no buffer state, so
+    only the lag cleanup applies to them.
+    """
 
     def __init__(self, manager: "KafkaConsumerManager", topic_key: str, consumer):
         self.manager = manager
@@ -2568,6 +2573,8 @@ class _BatchBackpressureRebalanceListener(ConsumerRebalanceListener):
         self.consumer = consumer
 
     async def on_partitions_revoked(self, revoked):
+        for tp in revoked or ():
+            _remove_lag_series(tp, self.topic_key)
         state = self.manager.batch_buffer_states.get(self.topic_key)
         if state is None:
             return
@@ -2606,6 +2613,18 @@ SINK_TOPIC_KEYS = (
     "chat_feedback",
     "routing_decisions",
 )
+
+
+def _remove_lag_series(tp: Any, topic_key: str) -> None:
+    """Forget a partition's lag so a revoked one cannot keep its old value."""
+    try:
+        PIPELINE_METRICS.consumer_lag.remove(
+            str(tp.topic), str(tp.partition), topic_key
+        )
+    except KeyError:
+        pass
+    except Exception as e:  # pragma: no cover - metrics are best effort
+        logger.debug(f"Failed to remove Kafka consumer lag series: {e}")
 
 
 def observer_group_id(prefix: str) -> str:
@@ -2706,6 +2725,14 @@ class KafkaConsumerManager:
         self.supervisor_max_backoff_seconds = float(
             consumer_section.get("supervisor_max_backoff_seconds", 30.0)
         )
+        # Lag is also refreshed from the broker on this interval, so a consumer
+        # that stops consuming shows growing lag (0 disables it).
+        self.lag_refresh_interval_seconds = max(
+            0.0, float(consumer_section.get("lag_refresh_interval_seconds", 30))
+        )
+        self.lag_refresh_timeout_seconds = max(
+            0.1, float(consumer_section.get("lag_refresh_timeout_seconds", 10))
+        )
         self.dlq_enabled = dlq_enabled(config)
         self.dlq_topic_suffix = str(dlq_section.get("topic_suffix", ".dlq"))
         self.dead_letter_topics = dict(config.get("dead_letter_topics", {}) or {})
@@ -2782,14 +2809,14 @@ class KafkaConsumerManager:
 
         Re-subscribing a running consumer races its fetcher, so the listener
         is installed before start() on first start and on every restart.
-        Observer consumers join the observer group and need no listener.
+        Observer consumers join the observer group; their listener only
+        cleans up lag series.
         """
         if topic_key in self.observer_consumer_keys:
             consumer = AIOKafkaConsumer(**self.observer_consumer_config)
-            consumer.subscribe(topics=[topic_name])
         else:
             consumer = AIOKafkaConsumer(**self.consumer_config)
-            self._install_rebalance_listener(topic_key, topic_name, consumer)
+        self._install_rebalance_listener(topic_key, topic_name, consumer)
         await consumer.start()
         return consumer
 
@@ -2909,6 +2936,10 @@ class KafkaConsumerManager:
                 task_group.create_task(
                     self._batch_processor(), name="kafka_batch_flush"
                 )
+                if self.lag_refresh_interval_seconds > 0:
+                    task_group.create_task(
+                        self._lag_refresher(), name="kafka_lag_refresh"
+                    )
         finally:
             self._task_group = None
 
@@ -3321,6 +3352,45 @@ class KafkaConsumerManager:
             ).set(lag)
         except Exception as e:
             logger.debug(f"Failed to update Kafka consumer lag: {e}")
+
+    async def _lag_refresher(self) -> None:
+        while self.running:
+            await asyncio.sleep(self.lag_refresh_interval_seconds)
+            await self._refresh_consumer_lag()
+
+    async def _refresh_consumer_lag(self) -> None:
+        """Set lag = broker end offset - position for every assigned partition.
+
+        Lag recorded per consumed message freezes when a consumer stops;
+        this keeps it current. Failures only skip that consumer.
+        """
+        for consumer_key, consumer in list(self.consumers.items()):
+            try:
+                assignment = getattr(consumer, "assignment", None)
+                end_offsets = getattr(consumer, "end_offsets", None)
+                position = getattr(consumer, "position", None)
+                if not all(map(callable, (assignment, end_offsets, position))):
+                    continue
+                partitions = list(assignment() or ())
+                if not partitions:
+                    continue
+                ends = await asyncio.wait_for(
+                    end_offsets(partitions), timeout=self.lag_refresh_timeout_seconds
+                )
+                for tp in partitions:
+                    end = (ends or {}).get(tp)
+                    if end is None:
+                        continue
+                    current = await asyncio.wait_for(
+                        position(tp), timeout=self.lag_refresh_timeout_seconds
+                    )
+                    PIPELINE_METRICS.consumer_lag.labels(
+                        topic=str(tp.topic),
+                        partition=str(tp.partition),
+                        topic_key=consumer_key,
+                    ).set(max(0, int(end) - int(current)))
+            except Exception as e:
+                logger.debug(f"Failed to refresh Kafka lag for {consumer_key}: {e}")
 
     def is_healthy(self) -> bool:
         """Return whether all configured consumer supervisors are running."""
