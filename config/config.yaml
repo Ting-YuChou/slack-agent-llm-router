@@ -205,6 +205,10 @@ router:
       max_tokens: 8192
       context_window: 8192
       cost_per_token: 1.0e-06
+      pricing:
+        input: 1.0
+        cached_input: 1.0
+        output: 1.0
       priority: 3
       allowed_tiers:
       - free
@@ -220,6 +224,10 @@ router:
       max_tokens: 128000
       context_window: 128000
       cost_per_token: 5.0e-06
+      pricing:
+        input: 5.0
+        cached_input: 5.0
+        output: 5.0
       priority: 4
       allowed_tiers:
       - free

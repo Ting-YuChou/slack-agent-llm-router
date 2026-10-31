@@ -2431,11 +2431,17 @@ class ModelRouter:
         }
 
     def _unit_rates(self, model_config: ModelConfig) -> Tuple[float, float]:
-        """(input, output) USD per token: pricing, else cost_per_token for both."""
+        """(input, output) USD per token, as inference bills them (RT1).
+
+        Pricing when it resolves; otherwise a self-hosted (vLLM) model costs
+        nothing and a paid model falls back to cost_per_token for both.
+        """
         pricing = resolve_model_pricing(self.models, model_config.name)
         if pricing is None and model_config.pricing is not None:
             pricing = model_config.pricing
         if pricing is None:
+            if model_config.provider.lower() == "vllm":
+                return 0.0, 0.0
             return model_config.cost_per_token, model_config.cost_per_token
         return per_token(pricing.input), per_token(pricing.output)
 
