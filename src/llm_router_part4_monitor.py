@@ -5,8 +5,11 @@ Comprehensive observability, alerting, and performance monitoring
 
 import asyncio
 from collections import Counter as CollectionCounter, OrderedDict
+import hashlib
 import json
 import logging
+import math
+import os
 import time
 import psutil
 import GPUtil
@@ -42,6 +45,153 @@ STALE_ALERT_EVENTS = Counter(
     "llm_router_alerts_stale_events_total",
     "Stream alert events too old to notify",
 )
+
+# Failed Redis calls of the shared alert dedupe store; each one falls back to
+# the in-process dedupe state.
+ALERT_DEDUPE_STORE_ERRORS = Counter(
+    "llm_router_alert_dedupe_store_errors_total",
+    "Alert dedupe store (Redis) operations that failed",
+    ["operation"],
+)
+
+
+class AlertDedupeStore:
+    """Shared record of notified stream-alert incidents, kept in Redis.
+
+    One key per incident ``(source, type, scope)``, set with ``NX`` and a TTL
+    of the dedupe cooldown, so a restarted (or second) process sees that the
+    incident already paged. The value is the notified level
+    ``"<action rank>,<severity rank>"`` so a later escalation still pages.
+    Every call returns ``None`` when Redis is unavailable, and the caller
+    falls back to its in-memory dedupe; after a failure Redis is skipped for
+    ``retry_after_seconds``.
+    """
+
+    def __init__(self, config: Dict[str, Any]):
+        self.host = str(config.get("host", "localhost"))
+        self.port = int(config.get("port", 6379))
+        self.db = int(config.get("db", 0))
+        self.password_env = config.get("password_env")
+        self.key_prefix = str(config.get("key_prefix", "llm_router:alert_incident:"))
+        self.connect_timeout_ms = int(config.get("connect_timeout_ms", 100))
+        self.socket_timeout_ms = int(config.get("socket_timeout_ms", 100))
+        self.operation_timeout_ms = int(config.get("operation_timeout_ms", 500))
+        self.max_connections = int(config.get("max_connections", 10))
+        self.retry_after_seconds = max(
+            0.0, float(config.get("retry_after_seconds", 30))
+        )
+        self._client: Any = None
+        self._clock: Callable[[], float] = time.monotonic
+        self._retry_at: Optional[float] = None
+        self._unavailable_logged = False
+
+    def _get_client(self) -> Any:
+        if self._client is None:
+            from redis.asyncio import Redis
+
+            password = None
+            if self.password_env:
+                password = os.getenv(str(self.password_env))
+            self._client = Redis(
+                host=self.host,
+                port=self.port,
+                db=self.db,
+                password=password,
+                decode_responses=True,
+                socket_connect_timeout=self.connect_timeout_ms / 1000.0,
+                socket_timeout=self.socket_timeout_ms / 1000.0,
+                max_connections=self.max_connections,
+                health_check_interval=30,
+            )
+        return self._client
+
+    def key(self, incident: tuple) -> str:
+        source, alert_type, scope = incident
+        digest = hashlib.sha256(
+            json.dumps(list(scope), default=str).encode("utf-8")
+        ).hexdigest()[:32]
+        return f"{self.key_prefix}{source}:{alert_type}:{digest}"
+
+    async def _call(self, operation: str, factory: Callable[[Any], Any]) -> Any:
+        """Run one Redis command; raise ``_StoreUnavailable`` on any failure."""
+        now = self._clock()
+        if self._retry_at is not None and now < self._retry_at:
+            raise _StoreUnavailable()
+        try:
+            result = await asyncio.wait_for(
+                factory(self._get_client()),
+                timeout=self.operation_timeout_ms / 1000.0,
+            )
+        except Exception as exc:
+            ALERT_DEDUPE_STORE_ERRORS.labels(operation=operation).inc()
+            self._retry_at = now + self.retry_after_seconds
+            if not self._unavailable_logged:
+                self._unavailable_logged = True
+                logger.warning(
+                    "Alert dedupe store unavailable (%s); using in-memory "
+                    "dedupe: %s",
+                    operation,
+                    exc,
+                )
+            else:
+                logger.debug("Alert dedupe store %s failed: %s", operation, exc)
+            raise _StoreUnavailable() from exc
+        if self._unavailable_logged:
+            self._unavailable_logged = False
+            logger.info("Alert dedupe store recovered")
+        self._retry_at = None
+        return result
+
+    async def claim(self, incident: tuple, level: str, ttl: int) -> Optional[bool]:
+        """Mark an incident notified: True if claimed, False if already held."""
+        key = self.key(incident)
+        try:
+            claimed = await self._call(
+                "claim", lambda client: client.set(key, level, nx=True, ex=ttl)
+            )
+        except _StoreUnavailable:
+            return None
+        return bool(claimed)
+
+    async def stored_level(self, incident: tuple) -> Optional[str]:
+        key = self.key(incident)
+        try:
+            value = await self._call("get", lambda client: client.get(key))
+        except _StoreUnavailable:
+            return None
+        return None if value is None else str(value)
+
+    async def refresh(self, incident: tuple, level: str, ttl: int) -> None:
+        """Overwrite the incident level and restart its TTL (an escalation)."""
+        key = self.key(incident)
+        try:
+            await self._call("refresh", lambda client: client.set(key, level, ex=ttl))
+        except _StoreUnavailable:
+            return
+
+    async def release(self, incidents: List[tuple]) -> None:
+        keys = sorted({self.key(incident) for incident in incidents})
+        if not keys:
+            return
+        try:
+            await self._call("release", lambda client: client.delete(*keys))
+        except _StoreUnavailable:
+            return
+
+    async def close(self) -> None:
+        client, self._client = self._client, None
+        if client is None:
+            return
+        closer = getattr(client, "aclose", None) or getattr(client, "close", None)
+        if callable(closer):
+            try:
+                await closer()
+            except Exception:
+                logger.debug("Failed to close alert dedupe store", exc_info=True)
+
+
+class _StoreUnavailable(Exception):
+    """The alert dedupe store could not answer; fall back to memory."""
 
 
 def _parse_event_timestamp(value: Any) -> datetime:
@@ -315,6 +465,14 @@ class AlertManager:
         self._seen_alert_identities: "OrderedDict[tuple, None]" = OrderedDict()
         self._active_external_alerts: "OrderedDict[tuple, Dict[str, Any]]" = (
             OrderedDict()
+        )
+        # Optional Redis record of notified incidents, so a restart or a
+        # second process does not page an active incident again.
+        store_config = dict(alerts_config.get("dedupe_store", {}) or {})
+        self.dedupe_store: Optional[AlertDedupeStore] = (
+            AlertDedupeStore(store_config)
+            if store_config.get("enabled", False)
+            else None
         )
         self.suppressed_alert_count = 0
         self.dropped_notification_count = 0
@@ -636,6 +794,8 @@ class AlertManager:
     async def close(self) -> None:
         """Stop the sender and close handler HTTP clients."""
         await self.stop_sender()
+        if self.dedupe_store is not None:
+            await self.dedupe_store.close()
         for handler in self.notification_handlers.values():
             aclose = getattr(handler, "aclose", None)
             if callable(aclose):
@@ -778,6 +938,10 @@ class AlertManager:
                 if identity[:3] in resolved_keys
             ]:
                 del self._seen_alert_identities[identity]
+        if self.dedupe_store is not None:
+            # Also the clear's own incident, which a restarted process may
+            # not hold in memory.
+            await self.dedupe_store.release([incident, *targets])
         for key in targets:
             active = self._active_external_alerts.pop(key)
             resolved = {
@@ -867,7 +1031,7 @@ class AlertManager:
         if (
             active is not None
             and now - float(active["_notified_at"]) < self.dedupe_cooldown_seconds
-            and self._alert_level(normalized_alert) <= self._alert_level(active)
+            and self._alert_level(normalized_alert) <= self._notified_level(active)
         ):
             # Same incident, no escalation: stay quiet but keep it fresh so
             # a storm does not evict the active incident first.
@@ -875,14 +1039,81 @@ class AlertManager:
             self.suppressed_alert_count += 1
             return
 
+        escalation = (
+            active is not None
+            and now - float(active["_notified_at"]) < self.dedupe_cooldown_seconds
+        )
+        notify, stored_level = await self._claim_in_dedupe_store(
+            incident, normalized_alert, escalation
+        )
+
         self._active_external_alerts[incident] = {
             **normalized_alert,
             "_notified_at": now,
         }
+        if stored_level is not None:
+            self._active_external_alerts[incident]["_notified_level"] = stored_level
         self._active_external_alerts.move_to_end(incident)
         while len(self._active_external_alerts) > self.dedupe_max_entries:
             self._active_external_alerts.popitem(last=False)
+        if not notify:
+            # Already paged before a restart or by another process: track it
+            # (so a clear resolves it) without paging again.
+            self.suppressed_alert_count += 1
+            return
         await self._dispatch_alert(normalized_alert)
+
+    @classmethod
+    def _notified_level(cls, active: Dict[str, Any]) -> tuple[int, int]:
+        """The level an active incident paged at, here or (per the store)
+        before a restart."""
+        level = cls._alert_level(active)
+        stored = active.get("_notified_level")
+        return max(level, stored) if stored is not None else level
+
+    @staticmethod
+    def _encode_level(level: tuple[int, int]) -> str:
+        return f"{level[0]},{level[1]}"
+
+    @staticmethod
+    def _decode_level(value: str) -> Optional[tuple[int, int]]:
+        try:
+            action, severity = (int(part) for part in value.split(","))
+        except (AttributeError, ValueError):
+            return None
+        return action, severity
+
+    async def _claim_in_dedupe_store(
+        self, incident: tuple, alert: Dict[str, Any], escalation: bool
+    ) -> tuple[bool, Optional[tuple[int, int]]]:
+        """Return whether to notify, and the level the store says already paged.
+
+        In-memory dedupe already decided this alert should page; the store
+        only adds suppression for an incident another process (or this one
+        before a restart) already paged at the same or a higher level.
+        """
+        store = self.dedupe_store
+        if store is None or self.dedupe_cooldown_seconds <= 0:
+            return True, None
+        ttl = max(1, int(math.ceil(self.dedupe_cooldown_seconds)))
+        level = self._alert_level(alert)
+        encoded = self._encode_level(level)
+        if escalation:
+            await store.refresh(incident, encoded, ttl)
+            return True, None
+        claimed = await store.claim(incident, encoded, ttl)
+        if claimed is None or claimed:
+            return True, None
+        stored = await store.stored_level(incident)
+        stored_level = None if stored is None else self._decode_level(stored)
+        if stored_level is not None and level > stored_level:
+            await store.refresh(incident, encoded, ttl)
+            return True, None
+        # Held with an unreadable level: assume it paged at the top level.
+        return False, stored_level or (
+            max(self._ACTION_RANK.values()),
+            max(self._SEVERITY_RANK.values()),
+        )
 
     def _get_current_value(self, rule: AlertRule, metrics: Dict[str, float]) -> float:
         """Get current value for the metric being alerted on"""

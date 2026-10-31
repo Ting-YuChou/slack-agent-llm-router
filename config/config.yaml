@@ -765,6 +765,18 @@ monitoring:
     # Stream alerts older than this (emitted_at, else window end) are recorded
     # but do not notify, so a consumer replaying from earliest stays quiet.
     max_event_age_seconds: 900
+    # Shared record of paged stream incidents (SET NX EX cooldown), so a
+    # restart or a second process does not page an active incident again.
+    # On Redis errors the in-memory dedupe above still applies.
+    dedupe_store:
+      enabled: false
+      host: localhost
+      port: 6379
+      db: 5
+      key_prefix: "llm_router:alert_incident:"
+      connect_timeout_ms: 100
+      socket_timeout_ms: 100
+      retry_after_seconds: 30
   health_checks:
     interval_seconds: 30
     timeout_seconds: 10

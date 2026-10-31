@@ -645,6 +645,17 @@ monitoring:
     latency_threshold_ms: 5000
     memory_usage_threshold: 0.9
     disk_usage_threshold: 0.8
+    # Restart-safe stream alert dedupe (used once monitoring is enabled).
+    dedupe_store:
+      enabled: true
+      host: redis
+      port: 6379
+      db: 5
+      password_env: REDIS_PASSWORD
+      key_prefix: "llm_router:alert_incident:"
+      connect_timeout_ms: 100
+      socket_timeout_ms: 100
+      retry_after_seconds: 30
   health_checks:
     interval_seconds: 30
     timeout_seconds: 10
