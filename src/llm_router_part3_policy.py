@@ -1444,9 +1444,9 @@ class PolicyMaterializer:
             "bootstrap_servers": self.kafka_config.get(
                 "bootstrap_servers", ["localhost:9092"]
             ),
+            # Its own group: sharing the sink's would rebalance both (D4).
             "group_id": materializer_config.get(
-                "group_id",
-                consumer_config.get("group_id", "llm-router-policy-materializer"),
+                "group_id", "llm-router-policy-materializer"
             ),
             "auto_offset_reset": materializer_config.get(
                 "auto_offset_reset",
