@@ -1,0 +1,16 @@
+# Prometheus for the compose stack (`--profile observability`).
+# Scrapes the workers' metrics exporter (Kafka consumers and ingestion) on
+# monitoring.prometheus_port from config/config.compose.yaml and evaluates the
+# router alert rules mounted next to this file.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/rules/llm-router-alerts.yml
+
+scrape_configs:
+  - job_name: llm-router-workers
+    static_configs:
+      - targets:
+          - workers:8000

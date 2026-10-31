@@ -170,6 +170,22 @@ services:
       redis-stack:
         condition: service_healthy
 
+  # Optional: `docker compose --profile observability up -d prometheus`.
+  # Loads the router alert rules and scrapes the workers' metrics exporter.
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: slack-llm-router-prometheus
+    profiles: ["observability"]
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./docker/observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/observability/prometheus/llm-router-alerts.yml:/etc/prometheus/rules/llm-router-alerts.yml:ro
+    depends_on:
+      workers:
+        condition: service_started
+    restart: unless-stopped
+
   flink-jobmanager:
     build:
       context: .
