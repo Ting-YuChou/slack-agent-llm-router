@@ -1,6 +1,7 @@
 """Round-2 review fixes for A10 alerting."""
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -55,17 +56,26 @@ async def _at(manager, seconds, error_rate):
 # --- 1: no rule joins the logical-key and topic-name label spaces ---
 
 
-def test_no_rule_joins_consumed_timestamp_with_lag():
+def test_stall_rule_joins_consumed_timestamp_with_lag_only_on_topic_key():
+    # O2: both metrics now carry topic_key, so the stall rule joins on it.
     document = yaml.safe_load(RULES_PATH.read_text())
-    names = [r["alert"] for g in document["groups"] for r in g["rules"]]
-    assert "LLMRouterKafkaConsumerStalled" not in names
-    for group in document["groups"]:
-        for rule in group["rules"]:
-            expr = rule["expr"]
-            assert not (
-                "llm_router_kafka_last_consumed_timestamp_seconds" in expr
-                and "llm_router_kafka_consumer_lag" in expr
-            ), rule["alert"]
+    rules = {r["alert"]: r for g in document["groups"] for r in g["rules"]}
+    assert "LLMRouterKafkaConsumerStalled" in rules
+    for name, rule in rules.items():
+        expr = rule["expr"]
+        if not (
+            "llm_router_kafka_last_consumed_timestamp_seconds" in expr
+            and "llm_router_kafka_consumer_lag" in expr
+        ):
+            continue
+        assert name == "LLMRouterKafkaConsumerStalled"
+        groupings = re.findall(r"\b(?:on|by|ignoring|without)\s*\(([^)]*)\)", expr)
+        assert groupings, expr
+        assert all(
+            [label.strip() for label in grouping.split(",")] == ["topic_key"]
+            for grouping in groupings
+        ), expr
+        assert re.search(r"\bon\s*\(\s*topic_key\s*\)", expr), expr
 
 
 # --- 2: resolve hysteresis ---

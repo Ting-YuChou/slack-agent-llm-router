@@ -5,13 +5,16 @@ Comprehensive observability, alerting, and performance monitoring
 
 import asyncio
 from collections import Counter as CollectionCounter, OrderedDict
+import hashlib
 import json
 import logging
+import math
+import os
 import time
 import psutil
 import GPUtil
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Sequence, Tuple
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,6 +45,399 @@ STALE_ALERT_EVENTS = Counter(
     "llm_router_alerts_stale_events_total",
     "Stream alert events too old to notify",
 )
+
+# Failed Redis calls of the shared alert dedupe store; each one falls back to
+# the in-process dedupe state.
+ALERT_DEDUPE_STORE_ERRORS = Counter(
+    "llm_router_alert_dedupe_store_errors_total",
+    "Alert dedupe store (Redis) operations that failed",
+    ["operation"],
+)
+
+
+@dataclass(frozen=True)
+class DedupeClaim:
+    """Answer of ``AlertDedupeStore.try_claim``."""
+
+    notify: bool
+    # When held: the level that already paged, the TTL left on its key and
+    # (wall-clock ms) when that page happened.
+    stored_level: Optional[Tuple[int, int]] = None
+    remaining_seconds: Optional[float] = None
+    notified_at_ms: Optional[int] = None
+
+
+@dataclass
+class _PendingRelease:
+    keys: set
+    cleared_ms: int
+    attempts: int = 0
+
+
+def _is_response_error(exc: BaseException) -> bool:
+    """Redis answered with an error (WRONGTYPE, ACL, ...): retrying won't help."""
+    return any(cls.__name__ == "ResponseError" for cls in type(exc).__mro__)
+
+
+class AlertDedupeStore:
+    """Shared record of notified stream-alert incidents, kept in Redis.
+
+    One key per incident ``(source, type, scope)`` holding
+    ``"<action rank>,<severity rank>,<paged at ms>"`` with a TTL of at most
+    the dedupe cooldown, so a restarted (or second) process sees that the
+    incident already paged, and when. Claiming is one compare-and-set
+    script: it pages only when the key is missing or holds a lower level.
+    Each scope keeps a set of its incident keys so a clear can close every
+    avoid incident of the scope; the release reports which keys it removed.
+    Every call returns ``None`` when Redis is unavailable, and the caller
+    falls back to its in-memory dedupe; after a failure Redis is skipped for
+    ``retry_after_seconds``. Releases Redis could not take are retried
+    before the next claim, up to ``max_release_attempts``.
+    """
+
+    # KEYS: incident, scope set. ARGV: action rank, severity rank, ttl ms,
+    # now ms. Returns {1} to page, or {0, action, severity, pttl, paged ms
+    # (-1 if unknown)} when already held at the same or a higher level.
+    CLAIM_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+local action = tonumber(ARGV[1])
+local severity = tonumber(ARGV[2])
+if current then
+  local held_action, held_severity = string.match(current, '^(%d+),(%d+)')
+  if held_action then
+    held_action = tonumber(held_action)
+    held_severity = tonumber(held_severity)
+    if action < held_action
+      or (action == held_action and severity <= held_severity) then
+      local paged = tonumber(string.match(current, '^%d+,%d+,(%d+)$') or '-1')
+      return {0, held_action, held_severity, redis.call('PTTL', KEYS[1]), paged}
+    end
+  end
+end
+redis.call('SET', KEYS[1], ARGV[1] .. ',' .. ARGV[2] .. ',' .. ARGV[4],
+  'PX', ARGV[3])
+redis.call('SADD', KEYS[2], KEYS[1])
+if redis.call('PTTL', KEYS[2]) < tonumber(ARGV[3]) then
+  redis.call('PEXPIRE', KEYS[2], ARGV[3])
+end
+return {1}
+"""
+
+    # KEYS: scope set. ARGV: avoid action rank, clear time ms, then incident
+    # keys to close. Closes every avoid incident of the scope plus the named
+    # ones, but only those paged at or before the clear (a replayed release
+    # must not close a newer incident). Returns the keys it deleted.
+    RELEASE_SCRIPT = """
+local removed = {}
+local prefix = ARGV[1] .. ','
+local cleared = tonumber(ARGV[2])
+local function paged_before(value)
+  local paged = string.match(value, '^%d+,%d+,(%d+)$')
+  return (not paged) or tonumber(paged) <= cleared
+end
+local function drop(name)
+  if redis.call('DEL', name) == 1 then
+    table.insert(removed, name)
+  end
+  redis.call('SREM', KEYS[1], name)
+end
+for _, member in ipairs(redis.call('SMEMBERS', KEYS[1])) do
+  local value = redis.call('GET', member)
+  if not value then
+    redis.call('SREM', KEYS[1], member)
+  elseif string.sub(value, 1, string.len(prefix)) == prefix
+    and paged_before(value) then
+    drop(member)
+  end
+end
+for i = 3, #ARGV do
+  local value = redis.call('GET', ARGV[i])
+  if not value then
+    redis.call('SREM', KEYS[1], ARGV[i])
+  elseif paged_before(value) then
+    drop(ARGV[i])
+  end
+end
+return removed
+"""
+
+    # KEYS: incident, scope set. ARGV: ttl ms. Lengthens (never shortens)
+    # the TTL of keys that exist: a continuing incident stays deduplicated.
+    EXTEND_SCRIPT = """
+for _, name in ipairs(KEYS) do
+  local left = redis.call('PTTL', name)
+  if left ~= -2 and left < tonumber(ARGV[1]) then
+    redis.call('PEXPIRE', name, ARGV[1])
+  end
+end
+return 1
+"""
+
+    def __init__(self, config: Dict[str, Any], avoid_rank: int = 2):
+        self.host = str(config.get("host", "localhost"))
+        self.port = int(config.get("port", 6379))
+        self.db = int(config.get("db", 0))
+        self.password_env = config.get("password_env")
+        self.key_prefix = str(config.get("key_prefix", "llm_router:alert_incident:"))
+        self.connect_timeout_ms = int(config.get("connect_timeout_ms", 100))
+        self.socket_timeout_ms = int(config.get("socket_timeout_ms", 100))
+        self.operation_timeout_ms = int(config.get("operation_timeout_ms", 500))
+        self.max_connections = int(config.get("max_connections", 10))
+        self.retry_after_seconds = max(
+            0.0, float(config.get("retry_after_seconds", 30))
+        )
+        self._client: Any = None
+        self._clock: Callable[[], float] = time.monotonic
+        self._retry_at: Optional[float] = None
+        self._unavailable_logged = False
+        self.avoid_rank = int(avoid_rank)
+        self.max_pending_releases = max(
+            1, int(config.get("max_pending_releases", 1024))
+        )
+        self.max_release_attempts = max(1, int(config.get("max_release_attempts", 5)))
+        # scope set key -> release still to apply.
+        self._pending_releases: "OrderedDict[str, _PendingRelease]" = OrderedDict()
+
+    def _get_client(self) -> Any:
+        if self._client is None:
+            from redis.asyncio import Redis
+
+            password = None
+            if self.password_env:
+                password = os.getenv(str(self.password_env))
+            self._client = Redis(
+                host=self.host,
+                port=self.port,
+                db=self.db,
+                password=password,
+                decode_responses=True,
+                socket_connect_timeout=self.connect_timeout_ms / 1000.0,
+                socket_timeout=self.socket_timeout_ms / 1000.0,
+                max_connections=self.max_connections,
+                health_check_interval=30,
+            )
+        return self._client
+
+    def _scope_tag(self, incident: tuple) -> str:
+        source, _alert_type, scope = incident
+        digest = hashlib.sha256(
+            json.dumps(list(scope), default=str).encode("utf-8")
+        ).hexdigest()[:32]
+        # Hash tag: an incident and its scope set live in one cluster slot.
+        return f"{{{source}:{digest}}}"
+
+    def key(self, incident: tuple) -> str:
+        return f"{self.key_prefix}{self._scope_tag(incident)}:{incident[1]}"
+
+    def scope_key(self, incident: tuple) -> str:
+        return f"{self.key_prefix}{self._scope_tag(incident)}:incidents"
+
+    async def _call(self, operation: str, factory: Callable[[Any], Any]) -> Any:
+        """Run one Redis command; raise ``_StoreUnavailable`` on any failure."""
+        now = self._clock()
+        if self._retry_at is not None and now < self._retry_at:
+            raise _StoreUnavailable()
+        try:
+            result = await asyncio.wait_for(
+                factory(self._get_client()),
+                timeout=self.operation_timeout_ms / 1000.0,
+            )
+        except Exception as exc:
+            ALERT_DEDUPE_STORE_ERRORS.labels(operation=operation).inc()
+            if _is_response_error(exc):
+                # Redis is up and refused this command; no backoff.
+                logger.warning("Alert dedupe store rejected %s: %s", operation, exc)
+                raise _StoreUnavailable() from exc
+            self._retry_at = now + self.retry_after_seconds
+            if not self._unavailable_logged:
+                self._unavailable_logged = True
+                logger.warning(
+                    "Alert dedupe store unavailable (%s); using in-memory "
+                    "dedupe: %s",
+                    operation,
+                    exc,
+                )
+            else:
+                logger.debug("Alert dedupe store %s failed: %s", operation, exc)
+            raise _StoreUnavailable() from exc
+        if self._unavailable_logged:
+            self._unavailable_logged = False
+            logger.info("Alert dedupe store recovered")
+        self._retry_at = None
+        return result
+
+    async def _apply_release(self, scope_key: str, pending: _PendingRelease) -> Any:
+        return await self._call(
+            "release",
+            lambda client: client.eval(
+                self.RELEASE_SCRIPT,
+                1,
+                scope_key,
+                self.avoid_rank,
+                int(pending.cleared_ms),
+                *sorted(pending.keys),
+            ),
+        )
+
+    async def _flush_pending_releases(self) -> Dict[str, List[str]]:
+        """Apply queued releases; return the keys each removed.
+
+        Raises ``_StoreUnavailable`` while Redis cannot take them. A release
+        Redis rejects, or one that failed ``max_release_attempts`` times, is
+        dropped (and logged) so it cannot keep the shared dedupe off.
+        """
+        removed: Dict[str, List[str]] = {}
+        for scope_key in list(self._pending_releases):
+            pending = self._pending_releases.get(scope_key)
+            if pending is None:
+                continue
+            try:
+                result = await self._apply_release(scope_key, pending)
+            except _StoreUnavailable as exc:
+                cause = exc.__cause__
+                if cause is None:
+                    raise  # skipped during the backoff: not an attempt
+                pending.attempts += 1
+                if (
+                    _is_response_error(cause)
+                    or pending.attempts >= self.max_release_attempts
+                ):
+                    self._pending_releases.pop(scope_key, None)
+                    logger.warning(
+                        "Alert dedupe store dropped a release after %d "
+                        "attempt(s); its incidents expire with their TTL: %s",
+                        pending.attempts,
+                        cause,
+                    )
+                    continue
+                raise
+            self._pending_releases.pop(scope_key, None)
+            removed[scope_key] = [str(name) for name in (result or [])]
+        return removed
+
+    @staticmethod
+    def _now_ms(now_ms: Optional[int]) -> int:
+        return int(time.time() * 1000) if now_ms is None else int(now_ms)
+
+    async def try_claim(
+        self,
+        incident: tuple,
+        level: Tuple[int, int],
+        ttl_seconds: float,
+        now_ms: Optional[int] = None,
+    ) -> Optional[DedupeClaim]:
+        """Atomically record that ``incident`` pages at ``level`` at ``now_ms``.
+
+        Returns whether this caller should page (the incident is not held, or
+        held at a lower level), or ``None`` when Redis cannot answer, in
+        which case the caller keeps its in-memory decision.
+        """
+        ttl_ms = max(1, int(math.ceil(ttl_seconds * 1000)))
+        key, scope_key = self.key(incident), self.scope_key(incident)
+        paged_ms = self._now_ms(now_ms)
+        try:
+            await self._flush_pending_releases()
+            result = await self._call(
+                "claim",
+                lambda client: client.eval(
+                    self.CLAIM_SCRIPT,
+                    2,
+                    key,
+                    scope_key,
+                    int(level[0]),
+                    int(level[1]),
+                    ttl_ms,
+                    paged_ms,
+                ),
+            )
+        except _StoreUnavailable:
+            return None
+        try:
+            if int(result[0]) == 1:
+                return DedupeClaim(notify=True)
+            stored = (int(result[1]), int(result[2]))
+            remaining = max(0, int(result[3])) / 1000.0
+            notified = int(result[4]) if len(result) > 4 else -1
+        except (TypeError, ValueError, IndexError):
+            logger.debug("Unexpected dedupe store reply: %r", result)
+            return None
+        return DedupeClaim(
+            notify=False,
+            stored_level=stored,
+            remaining_seconds=remaining,
+            notified_at_ms=None if notified < 0 else notified,
+        )
+
+    async def claim(
+        self, incident: tuple, level: Any, ttl_seconds: float
+    ) -> Optional[bool]:
+        """``try_claim`` reduced to True (page), False (held) or None."""
+        if isinstance(level, str):
+            level = tuple(int(part) for part in level.split(","))
+        result = await self.try_claim(incident, level, ttl_seconds)
+        return None if result is None else result.notify
+
+    async def extend(self, incident: tuple, ttl_seconds: float) -> None:
+        """Keep a held incident (and its scope set) for at least ``ttl_seconds``."""
+        ttl_ms = max(1, int(math.ceil(ttl_seconds * 1000)))
+        key, scope_key = self.key(incident), self.scope_key(incident)
+        try:
+            await self._call(
+                "extend",
+                lambda client: client.eval(
+                    self.EXTEND_SCRIPT, 2, key, scope_key, ttl_ms
+                ),
+            )
+        except _StoreUnavailable:
+            return
+
+    async def release(
+        self,
+        incident: tuple,
+        targets: Sequence[tuple] = (),
+        cleared_ms: Optional[int] = None,
+    ) -> Optional[List[str]]:
+        """Close a scope: its avoid incidents, ``incident`` and ``targets``.
+
+        Returns the incident keys this call removed, or ``None`` when Redis
+        did not take the release. Such a release is kept and retried before
+        the next claim, so a cleared incident pages again; it still only
+        closes incidents paged at or before ``cleared_ms``.
+        """
+        scope_key = self.scope_key(incident)
+        cleared = self._now_ms(cleared_ms)
+        pending = self._pending_releases.pop(scope_key, None)
+        if pending is None:
+            pending = _PendingRelease(keys=set(), cleared_ms=cleared)
+        pending.keys.update(self.key(item) for item in [incident, *targets])
+        pending.cleared_ms = max(pending.cleared_ms, cleared)
+        self._pending_releases[scope_key] = pending
+        while len(self._pending_releases) > self.max_pending_releases:
+            self._pending_releases.pop(next(iter(self._pending_releases)))
+        try:
+            removed = await self._flush_pending_releases()
+        except _StoreUnavailable:
+            return None
+        return removed.get(scope_key)
+
+    async def close(self) -> None:
+        client, self._client = self._client, None
+        if client is None:
+            return
+        closer = getattr(client, "aclose", None) or getattr(client, "close", None)
+        if callable(closer):
+            try:
+                await closer()
+            except Exception:
+                logger.debug("Failed to close alert dedupe store", exc_info=True)
+
+
+class _StoreUnavailable(Exception):
+    """The alert dedupe store could not answer; fall back to memory."""
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def _parse_event_timestamp(value: Any) -> datetime:
@@ -293,6 +689,19 @@ class AlertManager:
         self.dedupe_max_entries = max(
             1, int(alerts_config.get("dedupe_max_entries", 4096))
         )
+        # An avoid incident lasts until Flink's guardrail state expires
+        # (window end + active TTL) unless re-entered. Its dedupe (memory and
+        # Redis) must not outlive that, or a missed clear would silence the
+        # next avoid of the scope for the whole cooldown. The event's
+        # active_until_ms wins; else window_end_ms + incident_ttl_seconds.
+        incident_ttl = alerts_config.get("incident_ttl_seconds")
+        self.incident_ttl_seconds: Optional[float] = (
+            None if incident_ttl is None else max(0.0, float(incident_ttl))
+        )
+        self.incident_ttl_grace_seconds = max(
+            0.0, float(alerts_config.get("incident_ttl_grace_seconds", 60))
+        )
+        self._wall_clock: Callable[[], float] = time.time
         self.notification_timeout_seconds = max(
             0.001, float(alerts_config.get("notification_timeout_seconds", 10))
         )
@@ -315,6 +724,14 @@ class AlertManager:
         self._seen_alert_identities: "OrderedDict[tuple, None]" = OrderedDict()
         self._active_external_alerts: "OrderedDict[tuple, Dict[str, Any]]" = (
             OrderedDict()
+        )
+        # Optional Redis record of notified incidents, so a restart or a
+        # second process does not page an active incident again.
+        store_config = dict(alerts_config.get("dedupe_store", {}) or {})
+        self.dedupe_store: Optional[AlertDedupeStore] = (
+            AlertDedupeStore(store_config, avoid_rank=self._ACTION_RANK["avoid"])
+            if store_config.get("enabled", False)
+            else None
         )
         self.suppressed_alert_count = 0
         self.dropped_notification_count = 0
@@ -636,6 +1053,8 @@ class AlertManager:
     async def close(self) -> None:
         """Stop the sender and close handler HTTP clients."""
         await self.stop_sender()
+        if self.dedupe_store is not None:
+            await self.dedupe_store.close()
         for handler in self.notification_handlers.values():
             aclose = getattr(handler, "aclose", None)
             if callable(aclose):
@@ -778,8 +1197,31 @@ class AlertManager:
                 if identity[:3] in resolved_keys
             ]:
                 del self._seen_alert_identities[identity]
-        for key in targets:
-            active = self._active_external_alerts.pop(key)
+        # Take the targets out before any await, so a concurrent handler
+        # evicting one cannot break the resolve.
+        closed = [
+            (key, active)
+            for key, active in (
+                (key, self._active_external_alerts.pop(key, None)) for key in targets
+            )
+            if active is not None
+        ]
+        removed: Optional[List[str]] = None
+        if self.dedupe_store is not None:
+            # The store closes every avoid incident of the scope and the
+            # clear's own, which a restarted process may not hold in memory.
+            removed = await self.dedupe_store.release(
+                incident, targets, cleared_ms=int(self._wall_clock() * 1000)
+            )
+        for key, active in closed:
+            # With the store, only the replica whose release removed the
+            # incident's key announces the resolve; the others close their
+            # copy quietly. Without Redis, every replica announces its own.
+            announce = (
+                removed is None
+                or self.dedupe_store is None
+                or self.dedupe_store.key(key) in removed
+            )
             resolved = {
                 **{k: v for k, v in active.items() if not k.startswith("_")},
                 "description": f"Resolved: {active.get('description')}",
@@ -788,7 +1230,8 @@ class AlertManager:
                 "status": "resolved",
             }
             self._append_alert_to_history(resolved)
-            await self._dispatch_alert(resolved)
+            if announce:
+                await self._dispatch_alert(resolved)
 
     async def record_external_alert(self, alert_data: Dict[str, Any]):
         """Record and optionally notify on alert events emitted by the stream layer.
@@ -863,26 +1306,111 @@ class AlertManager:
             return
 
         now = self._clock()
+        bound = self._incident_bound_seconds(alert_data)
         active = self._active_external_alerts.get(incident)
         if (
             active is not None
             and now - float(active["_notified_at"]) < self.dedupe_cooldown_seconds
-            and self._alert_level(normalized_alert) <= self._alert_level(active)
+            and (active.get("_expires_at") is None or now < active["_expires_at"])
+            and self._alert_level(normalized_alert) <= self._notified_level(active)
         ):
             # Same incident, no escalation: stay quiet but keep it fresh so
             # a storm does not evict the active incident first.
             self._active_external_alerts.move_to_end(incident)
             self.suppressed_alert_count += 1
+            if bound is not None:
+                # The incident goes on: so does its expiry, up to the cooldown.
+                active["_expires_at"] = max(active["_expires_at"] or 0, now + bound)
+                if self.dedupe_store is not None:
+                    left = self.dedupe_cooldown_seconds - (
+                        now - float(active["_notified_at"])
+                    )
+                    await self.dedupe_store.extend(incident, min(left, bound))
             return
+
+        key_ttl = self.dedupe_cooldown_seconds
+        if bound is not None:
+            key_ttl = min(key_ttl, bound)
+        claim = await self._claim_in_dedupe_store(incident, normalized_alert, key_ttl)
 
         self._active_external_alerts[incident] = {
             **normalized_alert,
             "_notified_at": now,
+            "_expires_at": None if bound is None else now + key_ttl,
         }
+        if claim is not None and not claim.notify:
+            entry = self._active_external_alerts[incident]
+            if claim.stored_level is not None:
+                entry["_notified_level"] = claim.stored_level
+            if claim.notified_at_ms is not None:
+                # The page happened when the key was set, not now.
+                elapsed = self._wall_clock() - claim.notified_at_ms / 1000
+                entry["_notified_at"] = now - max(0.0, elapsed)
+            elif claim.remaining_seconds is not None:
+                # A key without its page time: assume a full-cooldown TTL.
+                elapsed = self.dedupe_cooldown_seconds - claim.remaining_seconds
+                entry["_notified_at"] = now - max(0.0, elapsed)
+            if bound is not None and claim.remaining_seconds is not None:
+                # The key's TTL is the incident's remaining life.
+                entry["_expires_at"] = now + claim.remaining_seconds
         self._active_external_alerts.move_to_end(incident)
         while len(self._active_external_alerts) > self.dedupe_max_entries:
             self._active_external_alerts.popitem(last=False)
+        if claim is not None and not claim.notify:
+            # Already paged before a restart or by another process: track it
+            # (so a clear resolves it) without paging again.
+            self.suppressed_alert_count += 1
+            return
         await self._dispatch_alert(normalized_alert)
+
+    @classmethod
+    def _notified_level(cls, active: Dict[str, Any]) -> tuple[int, int]:
+        """The level an active incident paged at, here or (per the store)
+        before a restart."""
+        level = cls._alert_level(active)
+        stored = active.get("_notified_level")
+        return max(level, stored) if stored is not None else level
+
+    def _incident_bound_seconds(self, alert_data: Dict[str, Any]) -> Optional[float]:
+        """Seconds an avoid incident lives, from receipt, without another avoid.
+
+        Flink drops an entered scope ``active_ttl`` after its last avoid
+        window; dedupe must not outlive that (plus a grace), or a missed clear
+        would silence the scope's next avoid for the whole cooldown. Measured
+        from when the event is received, never against the event time, so
+        consumer lag does not shorten it.
+        """
+        if alert_data.get("guardrail_action") != "avoid":
+            return None
+        ttl = self.incident_ttl_seconds
+        active_until_ms = alert_data.get("active_until_ms")
+        window_end_ms = alert_data.get("window_end_ms")
+        if _is_number(active_until_ms) and _is_number(window_end_ms):
+            ttl = (float(active_until_ms) - float(window_end_ms)) / 1000
+        if ttl is None:
+            return None
+        return max(1.0, ttl + self.incident_ttl_grace_seconds)
+
+    async def _claim_in_dedupe_store(
+        self, incident: tuple, alert: Dict[str, Any], ttl_seconds: float
+    ) -> Optional[DedupeClaim]:
+        """Ask the shared store whether this page is still due.
+
+        In-memory dedupe already decided this alert should page (new, past
+        its cooldown, or an escalation); the store only adds suppression for
+        an incident another process (or this one before a restart) already
+        paged at the same or a higher level. ``None`` (no store, or Redis
+        unavailable) keeps the in-memory decision.
+        """
+        store = self.dedupe_store
+        if store is None or self.dedupe_cooldown_seconds <= 0:
+            return None
+        return await store.try_claim(
+            incident,
+            self._alert_level(alert),
+            ttl_seconds,
+            now_ms=int(self._wall_clock() * 1000),
+        )
 
     def _get_current_value(self, rule: AlertRule, metrics: Dict[str, float]) -> float:
         """Get current value for the metric being alerted on"""
@@ -1689,7 +2217,6 @@ class PerformanceProfiler:
                     "priority": "medium",
                     "description": f"High memory usage detected: {avg_memory:.0f}MB",
                     "suggestions": [
-                        "Implement context compression",
                         "Reduce batch sizes",
                         "Consider model quantization",
                     ],
@@ -1749,6 +2276,11 @@ class MonitoringService:
     async def initialize(self):
         """Initialize monitoring service"""
         logger.info("Initializing monitoring service...")
+        if self.alert_manager.dedupe_store is None:
+            logger.warning(
+                "Monitoring is on without alerts.dedupe_store: multiple worker "
+                "replicas will each page every stream alert"
+            )
         # Monitoring service is ready immediately
         logger.info("Monitoring service initialized successfully")
 

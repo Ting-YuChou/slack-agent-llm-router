@@ -66,8 +66,6 @@ inference:
     enabled: false
   vllm:
     enabled: false
-  compression:
-    enabled: false
   cache:
     enabled: false
     backend: memory
@@ -97,7 +95,6 @@ slack:
   enabled: true
   bot_token_env: SLACK_BOT_TOKEN
   app_token_env: SLACK_APP_TOKEN
-  signing_secret_env: SLACK_SIGNING_SECRET
   channels:
     - ai-testing
   work_queue:
@@ -165,12 +162,9 @@ security:
     enabled: false
 
 features:
-  context_compression: false
   semantic_caching: false
-  batch_processing: false
   multi_modal: false
   function_calling: false
-  streaming_responses: false
 
 pipeline:
   enabled: false

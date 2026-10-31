@@ -457,20 +457,6 @@ class InferenceMetrics:
             ["provider", "model", "outcome"],
         )
 
-        # Context compression metrics
-        self.context_compressions = Counter(
-            "llm_router_context_compressions_total",
-            "Total context compressions",
-            ["method"],
-        )
-
-        self.compression_ratio = Histogram(
-            "llm_router_compression_ratio",
-            "Context compression ratios",
-            ["method"],
-            buckets=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-        )
-
         # Error metrics
         self.errors_total = Counter(
             "llm_router_inference_errors_total",
@@ -601,16 +587,20 @@ class PipelineMetrics:
             ["topic"],
         )
 
+        # Both consumer gauges carry topic (the Kafka topic name) and
+        # topic_key (the consumer's key: the config topic key for the sink,
+        # "<key>_observer" for an observer-group consumer), so alert rules
+        # can join them on topic_key.
         self.consumer_lag = Gauge(
             "llm_router_kafka_consumer_lag",
-            "Kafka consumer lag",
-            ["topic", "partition"],
+            "Kafka consumer lag at the last consumed message",
+            ["topic", "partition", "topic_key"],
         )
 
         self.last_consumed_timestamp = Gauge(
             "llm_router_kafka_last_consumed_timestamp_seconds",
             "Unix timestamp of the latest successfully consumed Kafka message",
-            ["topic"],
+            ["topic", "topic_key"],
         )
 
         # ClickHouse metrics

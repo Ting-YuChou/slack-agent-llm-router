@@ -10,11 +10,6 @@ api:
   host: 0.0.0.0
   port: 8080
   log_level: info
-  cors_origins:
-    - http://localhost:3000
-    - http://127.0.0.1:3000
-    - http://localhost:8501
-    - http://127.0.0.1:8501
   rate_limiting:
     enabled: true
     requests_per_minute: 1000
@@ -122,7 +117,6 @@ router:
       - brainstorming
       - planning
       - translation
-      - question_answering
   models:
     gpt-5:
       provider: openai
@@ -222,11 +216,6 @@ inference:
       pricing:
         cache_creation_input_multiplier: 1.25
         cache_read_input_multiplier: 0.1
-  compression:
-    enabled: true
-    max_context_tokens: 100000
-    compression_ratio: 0.3
-    method: semantic_graph
   cache:
     enabled: true
     backend: redis
@@ -550,7 +539,6 @@ kafka:
     - kafka:29092
   topics:
     queries: llm-queries
-    responses: llm-responses
     metrics: llm-metrics
     requests_raw: requests.raw
     inference_completed: inference.completed
@@ -562,7 +550,6 @@ kafka:
     routing_policy_state: routing.policy_state
     routing_decisions: routing.decisions
     alerts: alerts
-    errors: llm-errors
   producer:
     acks: all
     retries: 3
@@ -586,6 +573,10 @@ kafka:
     auto_offset_reset: latest
     # ClickHouse sink only: a new or reset group replays the retained backlog.
     sink_auto_offset_reset: earliest
+    # In-process observers (the monitor) read live events in a group of
+    # their own per process: <prefix>-<host>-<pid>, auto-committed.
+    observer_group_prefix: llm-router-observers
+    observer_auto_offset_reset: latest
     enable_auto_commit: false
     max_poll_records: 500
     batch_size: 100
@@ -631,6 +622,9 @@ clickhouse:
 monitoring:
   prometheus_port: 8000
   prometheus:
+    # Serve the workers' metrics (Kafka consumers) on prometheus_port even
+    # with monitoring disabled; scraped by the observability profile.
+    enabled: true
     scrape_interval: 15s
     evaluation_interval: 15s
   grafana:
@@ -642,6 +636,21 @@ monitoring:
     latency_threshold_ms: 5000
     memory_usage_threshold: 0.9
     disk_usage_threshold: 0.8
+    # Avoid-incident dedupe ends this long (plus the grace) after the last
+    # avoid was received. Keep equal to flink...active_ttl_seconds.
+    incident_ttl_seconds: 180
+    incident_ttl_grace_seconds: 60
+    # Restart-safe stream alert dedupe (used once monitoring is enabled).
+    dedupe_store:
+      enabled: true
+      host: redis
+      port: 6379
+      db: 5
+      password_env: REDIS_PASSWORD
+      key_prefix: "llm_router:alert_incident:"
+      connect_timeout_ms: 100
+      socket_timeout_ms: 100
+      retry_after_seconds: 30
   health_checks:
     interval_seconds: 30
     timeout_seconds: 10
@@ -652,7 +661,6 @@ slack:
   enabled: false
   bot_token_env: SLACK_BOT_TOKEN
   app_token_env: SLACK_APP_TOKEN
-  signing_secret_env: SLACK_SIGNING_SECRET
   channels:
     - general
     - ai-testing
@@ -851,11 +859,6 @@ security:
     #     active: 20
     #     allow_priority: false
     clients: []
-  jwt:
-    enabled: false
-    secret_key_env: JWT_SECRET_KEY
-    algorithm: HS256
-    expiration_hours: 24
   cors:
     enabled: true
     allow_origins:
@@ -894,12 +897,9 @@ development:
   mock_external_apis: false
 
 features:
-  context_compression: true
   semantic_caching: true
-  batch_processing: true
   multi_modal: false
   function_calling: true
-  streaming_responses: true
 
 pipeline:
   enabled: true
