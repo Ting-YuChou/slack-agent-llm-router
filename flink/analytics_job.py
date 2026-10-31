@@ -10,7 +10,7 @@ import logging
 import os
 from pathlib import Path
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -110,6 +110,7 @@ from flink.logic import (
     INFERENCE_COMPLETED_EVENT,
     MODEL_METRICS_1M_EVENT,
     ROUTING_GUARDRAIL_EVENT,
+    UNSUPPORTED_EVENT_VERSION_COUNTER,
     _empty_routing_policy_aggregate,
     add_routing_policy_event,
     build_alert_event,
@@ -132,6 +133,7 @@ from flink.logic import (
     metric_has_uncached_sample,
     metric_provider_avg_latency_ms,
     metric_provider_failure_rate,
+    unsupported_event_version_drop,
     validate_inference_completed_event,
 )
 
@@ -202,6 +204,38 @@ else:  # pragma: no cover - used only when PyFlink watermark APIs are unavailabl
 class InferenceCompletedMapper(MapFunction):
     """Map inference.completed messages into validated dict payloads or alerts."""
 
+    def __init__(self):
+        # Events dropped for an unsupported event_version (A12b); the Flink
+        # counter is registered in open(), the int covers local runs.
+        self.dropped_unsupported_version = 0
+        self.unsupported_version_counter: Any = None
+
+    def open(self, runtime_context):
+        try:
+            self.unsupported_version_counter = (
+                runtime_context.get_metrics_group().counter(
+                    UNSUPPORTED_EVENT_VERSION_COUNTER
+                )
+            )
+        except Exception as exc:  # pragma: no cover - metrics are best effort
+            logger.warning(
+                "Could not register %s: %s", UNSUPPORTED_EVENT_VERSION_COUNTER, exc
+            )
+
+    def _drop_unsupported_version(self, data: Any) -> Optional[Dict[str, Any]]:
+        dropped = unsupported_event_version_drop(data)
+        if dropped is None:
+            return None
+        self.dropped_unsupported_version += 1
+        if self.unsupported_version_counter is not None:
+            self.unsupported_version_counter.inc()
+        logger.warning(
+            "Dropping %s event with an unsupported event_version (type %s)",
+            "inference.completed",
+            type(data.get("event_version")).__name__,
+        )
+        return dropped
+
     def map(self, value: str) -> Dict[str, Any]:
         try:
             data = json.loads(value)
@@ -216,6 +250,10 @@ class InferenceCompletedMapper(MapFunction):
                 description="Could not decode inference.completed payload as JSON",
                 severity="error",
             )
+
+        dropped = self._drop_unsupported_version(data)
+        if dropped is not None:
+            return dropped
 
         try:
             return validate_inference_completed_event(data)
