@@ -129,11 +129,36 @@ class ChatIngress:
     async def process(self, query_request: QueryRequest) -> Tuple[Any, int, Dict]:
         """requests.raw, inference and the status: (result, status, headers)."""
         platform = self._platform
+        self._classify(query_request)
         await platform._publish_request_raw_event(query_request)
         result = await platform.services["inference"].process_query(query_request)
         result = _with_request_id(result, query_request.request_id)
         status_code, headers = route_response_status(result)
         return result, status_code, headers
+
+    def _classify(self, query_request: QueryRequest) -> None:
+        """Put the router's query type on the request for requests.raw (R13).
+
+        The router memoizes it, so routing reuses it. A failure never blocks
+        the request: requests.raw then goes out without a type.
+        """
+        services = self._platform.services
+        router = getattr(services.get("inference"), "router", None)
+        if router is None:
+            router = services.get("router")
+        classify_request = getattr(router, "classify_request", None)
+        if not callable(classify_request):
+            return
+        try:
+            query_type, confidence = classify_request(query_request)
+            query_request._query_classification = (
+                str(getattr(query_type, "value", query_type)),
+                float(confidence),
+            )
+        except Exception:
+            self._platform.logger.warning(
+                "Query classification failed before requests.raw", exc_info=True
+            )
 
     async def record(
         self,

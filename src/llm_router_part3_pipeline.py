@@ -399,6 +399,7 @@ def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
     # A Slack file's name can say what is in it (X6): Slack requests send
     # only each file's type and size. /route keeps its existing shape.
     from_slack = (query_request.metadata or {}).get("source") == "slack"
+    classification = getattr(query_request, "_query_classification", None)
     attachments = [
         {
             "id": attachment.id,
@@ -449,6 +450,10 @@ def build_request_raw_event(query_request: QueryRequest) -> Dict[str, Any]:
         ),
         "attachments": attachments,
         "attachments_count": len(attachments),
+        # The router's classification when the ingress got one (R13); Flink
+        # keeps it instead of inferring its own type.
+        "query_type": classification[0] if classification else None,
+        "classifier_confidence": classification[1] if classification else None,
     }
 
 

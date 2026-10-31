@@ -48,83 +48,68 @@ CLASSIFIER_STRESS_QUERIES = {
     "mixed_realistic": MIXED_REALISTIC_QUERY,
 }
 
-# (query, type, confidence) recorded from classify_query before the regex rewrite.
+# (query, type, confidence) recorded from the shared classifier (R13). Types
+# changed only where eval/routing/labels.json says the old one was wrong.
 CLASSIFIER_SNAPSHOT = [
-    (
-        "Write a Python function to sort a list",
-        QueryType.CODE_GENERATION,
-        0.5642857142857143,
-    ),
+    ("Write a Python function to sort a list", QueryType.CODE_GENERATION, 0.75),
     (
         "Can you implement a binary search algorithm in Rust?",
         QueryType.CODE_GENERATION,
-        0.20714285714285713,
+        0.6735,
     ),
     (
         "Please review this code and fix the bug in my parser function",
         QueryType.CODE_ANALYSIS,
-        0.43333333333333335,
+        0.6233,
     ),
     (
         "What does this code do? def add(a, b): return a + b",
-        QueryType.CODE_GENERATION,
-        0.20714285714285713,
+        QueryType.CODE_ANALYSIS,
+        0.81,
     ),
     (
         "Analyze the sales data and compare the trends across regions",
         QueryType.ANALYSIS,
-        0.5166666666666666,
+        0.8333,
     ),
     (
         "Summarize the key points of this meeting transcript",
         QueryType.SUMMARIZATION,
-        0.46,
+        0.8333,
     ),
     (
         "Write a short story about a robot who learns to paint",
         QueryType.CREATIVE_WRITING,
-        0.43333333333333335,
+        0.81,
     ),
-    (
-        "Compose a poem about autumn leaves",
-        QueryType.CREATIVE_WRITING,
-        0.43333333333333335,
-    ),
-    ("What are some good ideas for a team offsite?", QueryType.BRAINSTORMING, 0.38),
-    ("Help me think of names for my new coffee shop", QueryType.BRAINSTORMING, 0.23),
+    ("Compose a poem about autumn leaves", QueryType.CREATIVE_WRITING, 0.81),
+    ("What are some good ideas for a team offsite?", QueryType.BRAINSTORMING, 0.775),
+    ("Help me think of names for my new coffee shop", QueryType.BRAINSTORMING, 0.7167),
     (
         "How to plan a product launch roadmap with clear milestones",
         QueryType.PLANNING,
-        0.7333333333333333,
+        0.7167,
     ),
-    ("Solve the equation 3x + 5 = 20", QueryType.MATH, 0.43333333333333335),
-    ("Calculate the derivative of x^2 * sin(x)", QueryType.MATH, 0.36666666666666664),
+    ("Solve the equation 3x + 5 = 20", QueryType.MATH, 0.775),
+    ("Calculate the derivative of x^2 * sin(x)", QueryType.MATH, 0.775),
     (
         "Why is that the case, and how can we conclude the argument is valid?",
         QueryType.REASONING,
-        0.5166666666666666,
+        0.81,
     ),
     (
         "What is the latest news about the NVIDIA stock price today?",
         QueryType.WEB_RESEARCH,
-        0.5466666666666666,
+        0.8333,
     ),
-    ("最新的 AI 新聞是什麼？", QueryType.WEB_RESEARCH, 0.28444444444444444),
-    ("Hi there, how are you doing?", QueryType.GENERAL, 0.5),
-    ("Thanks, that was really helpful", QueryType.GENERAL, 0.5),
-    ("Translate this sentence into French", QueryType.GENERAL, 0.5),
+    ("最新的 AI 新聞是什麼？", QueryType.WEB_RESEARCH, 0.775),
+    ("Hi there, how are you doing?", QueryType.GENERAL, 0.2),
+    ("Thanks, that was really helpful", QueryType.GENERAL, 0.2),
+    ("Translate this sentence into French", QueryType.TRANSLATION, 0.775),
     # Keyword gaps that cross a dot inside a sentence.
-    (
-        "write a python 3.12 script to parse logs",
-        QueryType.CODE_GENERATION,
-        0.35714285714285715,
-    ),
-    (
-        "fix the bug in utils.py function",
-        QueryType.CODE_ANALYSIS,
-        0.36666666666666664,
-    ),
-    ("Write a node.js function", QueryType.CODE_GENERATION, 0.2642857142857143),
+    ("write a python 3.12 script to parse logs", QueryType.CODE_GENERATION, 0.75),
+    ("fix the bug in utils.py function", QueryType.CODE_ANALYSIS, 0.81),
+    ("Write a node.js function", QueryType.CODE_GENERATION, 0.75),
 ]
 
 
@@ -234,9 +219,9 @@ class TestQueryClassifier:
 
         query_type, confidence = classifier.classify_query(query)
 
-        # Same result as origin/main, which classified the whole query.
+        # Same type as origin/main, which classified the whole query.
         assert query_type == QueryType.WEB_RESEARCH
-        assert confidence == pytest.approx(0.5688888888888889)
+        assert confidence == pytest.approx(0.5773)
 
 
 class TestTokenCounter:

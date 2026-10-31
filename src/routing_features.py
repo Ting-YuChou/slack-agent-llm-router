@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict
 
+from src.query_classifier import classify as classify_query
+
 EXPLICIT_LOW_LATENCY_SLA_VALUES = {"low", "interactive"}
 
 CODE_KEYWORDS = [
@@ -28,6 +30,8 @@ CODE_KEYWORDS = [
     "bug",
 ]
 
+# Superseded by src.query_classifier (R13) and no longer read here; kept only
+# because flink.logic re-exports the name.
 QUERY_TYPE_RULES = [
     (
         "code_analysis",
@@ -214,19 +218,10 @@ def estimate_query_tokens(query_text: str, context: str = "") -> int:
 
 
 def infer_query_type(query_text: str) -> str:
-    """Infer a coarse query type without depending on the API router runtime."""
-    normalized_query = (query_text or "").strip().lower()
-    if not normalized_query:
+    """The router's query type for a request whose event carries none (R13)."""
+    if not (query_text or "").strip():
         return "general"
-
-    for query_type, rules in QUERY_TYPE_RULES:
-        if any(rule in normalized_query for rule in rules):
-            return query_type
-
-    if re.search(r"\b(def|class|function)\b", normalized_query):
-        return "code_generation"
-
-    return "general"
+    return classify_query(query_text)[0]
 
 
 def calculate_query_complexity(

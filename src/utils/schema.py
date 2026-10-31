@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Annotated, Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple
 import re
 import uuid
 
@@ -194,6 +194,9 @@ class QueryRequest(BaseModel):
     # The router's per-request work (classification, token counts, policy),
     # keyed by the inputs each depends on, so routing it again is cheap.
     _routing_memo: Dict[Any, Any] = PrivateAttr(default_factory=dict)
+    # (query type value, confidence) the chat ingress got from the router before
+    # publishing requests.raw; None when it did not classify (R13).
+    _query_classification: Optional[Tuple[str, float]] = PrivateAttr(default=None)
 
     @field_validator("query")
     @classmethod
@@ -708,6 +711,8 @@ class RouterConfig(ConfigModel):
     routing_strategy: str = "intelligent"
     classifier: RouterClassifierConfig = Field(default_factory=RouterClassifierConfig)
     tokenizer_enabled: bool = True
+    # Half-life of the time-decayed model stats routing scores with (R13).
+    stats_half_life_seconds: float = Field(300.0, gt=0)
     credential_gating: bool = False
     fast_lane_models: List[str] = Field(default_factory=list)
     models: Dict[str, ModelConfig] = Field(default_factory=dict)
@@ -768,7 +773,6 @@ class ProviderModelFallbackConfig(ConfigModel):
             QueryType.GENERAL.value,
             QueryType.CODE_GENERATION.value,
             QueryType.CODE_ANALYSIS.value,
-            QueryType.QUESTION_ANSWERING.value,
         ]
     )
     max_input_tokens: int = Field(2048, ge=1)

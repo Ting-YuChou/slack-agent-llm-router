@@ -122,7 +122,6 @@ router:
       - brainstorming
       - planning
       - translation
-      - question_answering
   models:
     gpt-5:
       provider: openai
