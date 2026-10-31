@@ -13,7 +13,9 @@ With ``--watch`` it re-checks periodically, which resubmits the jobs after a
 JobManager restart (the session cluster has no HA store of its own).
 
 Job ids of past runs are kept in ``<checkpoint root>/submitter-state.json``;
-Flink writes checkpoints to ``<checkpoint root>/<job id>/chk-<n>``.
+Flink writes checkpoints to ``<checkpoint root>/<job id>/chk-<n>``. Once a
+job's newest run has completed a checkpoint, the directories of its older
+runs beyond ``--keep-job-checkpoints`` (default 2) are deleted.
 """
 
 from __future__ import annotations
@@ -23,19 +25,35 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 logger = logging.getLogger("flink.submitter")
 
 WORKSPACE = Path(__file__).resolve().parents[1]
 STATE_FILE = "submitter-state.json"
 JOB_ID_HISTORY = 5
+# Runs that fell out of the history, kept so their directories can be pruned.
+EVICTED_HISTORY = 100
+EVICTED_SUFFIX = ".evicted"
+# Checkpoint directories of this many newest runs per job survive pruning.
+DEFAULT_KEEP_JOB_CHECKPOINTS = 2
 # `flink run -d` returns once the job is submitted; a hang past this is a
 # failed attempt so the watch loop keeps going.
 SUBMIT_TIMEOUT_SECONDS = float(os.environ.get("FLINK_SUBMIT_TIMEOUT_SECONDS", "300"))
@@ -44,6 +62,8 @@ ACTIVE_STATES = frozenset(
 )
 _JOB_ID = re.compile(r"Job has been submitted with JobID (\S+)")
 _CHECKPOINT_DIR = re.compile(r"chk-(\d+)$")
+# Flink names a job's checkpoint directory after its 32-hex JobID.
+_JOB_DIR = re.compile(r"[0-9a-f]{32}")
 
 
 @dataclass(frozen=True)
@@ -110,10 +130,31 @@ def recorded_job_ids(checkpoint_root: Path, slug: str) -> List[str]:
     return _read_state(checkpoint_root).get(slug, [])
 
 
+def _evicted_key(slug: str) -> str:
+    return f"{slug}{EVICTED_SUFFIX}"
+
+
+def evicted_job_ids(checkpoint_root: Path, slug: str) -> List[str]:
+    """Return runs that dropped out of the history, most recently evicted first.
+
+    They are still ours: the pruner may delete their checkpoint directories.
+    """
+    return _read_state(checkpoint_root).get(_evicted_key(slug), [])
+
+
 def record_job_id(checkpoint_root: Path, slug: str, job_id: str) -> None:
     state = _read_state(checkpoint_root)
     history = [job_id] + [i for i in state.get(slug, []) if i != job_id]
     state[slug] = history[:JOB_ID_HISTORY]
+    evicted = history[JOB_ID_HISTORY:]
+    if evicted:
+        previous = state.get(_evicted_key(slug), [])
+        merged = evicted + [i for i in previous if i not in evicted]
+        state[_evicted_key(slug)] = merged[:EVICTED_HISTORY]
+    _write_state(checkpoint_root, state)
+
+
+def _write_state(checkpoint_root: Path, state: Mapping[str, List[str]]) -> None:
     path = _state_path(checkpoint_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
@@ -135,6 +176,90 @@ def latest_checkpoint(checkpoint_root: Path, job_ids: Sequence[str]) -> Optional
         if completed:
             return max(completed)[1]
     return None
+
+
+def _has_completed_checkpoint(checkpoint_root: Path, job_id: str) -> bool:
+    return latest_checkpoint(checkpoint_root, [job_id]) is not None
+
+
+def prune_job_checkpoints(
+    checkpoint_root: Path,
+    keep: int = DEFAULT_KEEP_JOB_CHECKPOINTS,
+    active_job_ids: Iterable[str] = (),
+) -> List[Path]:
+    """Delete checkpoint directories of superseded runs; return what was deleted.
+
+    Only runs this submitter recorded are candidates (its history and the
+    runs evicted from it, newest first). Each job keeps the directories of
+    its ``keep`` newest recorded runs, evicted ones included when ``keep``
+    exceeds the history; its older runs go only once its newest run has
+    completed a checkpoint, so a NO_CLAIM restore source survives until the
+    new run no longer needs it. Active jobs, directories of job ids the
+    submitter never recorded, ``savepoints/``, the state file and anything
+    that is not a 32-hex job id directory are never touched. ``keep <= 0``
+    disables pruning. Evicted runs whose directories are gone are dropped
+    from the state file.
+    """
+    if keep <= 0:
+        return []
+    root = Path(checkpoint_root)
+    state = _read_state(root)
+    active = {str(job_id) for job_id in active_job_ids}
+    protected = set(active)
+    deletable = set()
+    for job in JOBS:
+        history = state.get(job.slug, [])
+        evicted = state.get(_evicted_key(job.slug), [])
+        runs = history + [i for i in evicted if i not in history]
+        protected.update(runs[:keep])
+        if history and _has_completed_checkpoint(root, history[0]):
+            deletable.update(runs[keep:])
+    deletable -= protected
+
+    try:
+        children = list(root.iterdir())
+    except FileNotFoundError:
+        return []
+    deleted: List[Path] = []
+    for child in sorted(children):
+        name = child.name
+        if not _JOB_DIR.fullmatch(name) or child.is_symlink() or not child.is_dir():
+            continue
+        if name in deletable:
+            try:
+                shutil.rmtree(child)
+            except OSError as exc:
+                logger.warning("Could not delete old checkpoints %s: %s", child, exc)
+                continue
+            deleted.append(child)
+    if deleted:
+        logger.info(
+            "Pruned checkpoints of %d superseded Flink run(s): %s",
+            len(deleted),
+            ", ".join(path.name for path in deleted),
+        )
+    _forget_pruned_evicted_runs(root, deletable)
+    return deleted
+
+
+def _forget_pruned_evicted_runs(root: Path, deletable: Iterable[str]) -> None:
+    """Drop prunable evicted ids whose directories no longer exist."""
+    gone = {job_id for job_id in deletable if not (root / job_id).exists()}
+    if not gone:
+        return
+    state = _read_state(root)
+    changed = False
+    for job in JOBS:
+        key = _evicted_key(job.slug)
+        evicted = state.get(key)
+        if not evicted:
+            continue
+        kept = [job_id for job_id in evicted if job_id not in gone]
+        if kept != evicted:
+            state[key] = kept
+            changed = True
+    if changed:
+        _write_state(root, state)
 
 
 def _fetch_json(url: str) -> Any:
@@ -240,14 +365,21 @@ def reconcile(
     parallelism: Optional[int] = None,
     fetch_json: Callable[[str], Any] = _fetch_json,
     run: Callable[..., Any] = _run,
+    keep_job_checkpoints: int = DEFAULT_KEEP_JOB_CHECKPOINTS,
 ) -> Dict[str, str]:
-    """Make sure every job runs; return what happened to each job slug."""
+    """Make sure every job runs; return what happened to each job slug.
+
+    Afterwards, prune checkpoint directories of superseded runs (see
+    ``prune_job_checkpoints``); a failed prune only logs.
+    """
     overview = fetch_json(f"http://{jobmanager}/jobs/overview") or {}
-    active = {
-        job.get("name")
+    active_jobs = [
+        job
         for job in overview.get("jobs", []) or []
         if job.get("state") in ACTIVE_STATES
-    }
+    ]
+    active = {job.get("name") for job in active_jobs}
+    active_job_ids = {str(job.get("jid")) for job in active_jobs if job.get("jid")}
     outcome: Dict[str, str] = {}
     for job in JOBS:
         if job.name in active:
@@ -286,8 +418,26 @@ def reconcile(
             outcome[job.slug] = "failed"
             continue
         record_job_id(checkpoint_root, job.slug, job_id)
+        active_job_ids.add(job_id)
         logger.info("%s %s as %s", status, job.slug, job_id)
         outcome[job.slug] = status
+    if keep_job_checkpoints > 0:
+        try:
+            # Submits can take minutes: list the running jobs again, and do
+            # not prune at all without a current view of them.
+            fresh = fetch_json(f"http://{jobmanager}/jobs/overview") or {}
+            active_job_ids.update(
+                str(job.get("jid"))
+                for job in fresh.get("jobs", []) or []
+                if job.get("state") in ACTIVE_STATES and job.get("jid")
+            )
+            prune_job_checkpoints(
+                checkpoint_root,
+                keep=keep_job_checkpoints,
+                active_job_ids=active_job_ids,
+            )
+        except Exception as exc:
+            logger.warning("Flink checkpoint pruning skipped: %s", exc)
     return outcome
 
 
@@ -330,6 +480,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=int(os.environ.get("FLINK_JOB_PARALLELISM", "0")) or None,
         help="override flink.parallelism (the local stack has one TaskManager)",
     )
+    parser.add_argument(
+        "--keep-job-checkpoints",
+        type=int,
+        default=int(
+            os.environ.get(
+                "FLINK_KEEP_JOB_CHECKPOINTS", str(DEFAULT_KEEP_JOB_CHECKPOINTS)
+            )
+        ),
+        help="checkpoint directories of this many newest runs per job are kept "
+        "(0 disables pruning)",
+    )
     parser.add_argument("--watch", action="store_true")
     parser.add_argument("--interval-seconds", type=float, default=30.0)
     parser.add_argument("--timeout-seconds", type=float, default=120.0)
@@ -346,6 +507,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 jobmanager=args.jobmanager,
                 checkpoint_root=checkpoint_root,
                 parallelism=args.parallelism,
+                keep_job_checkpoints=args.keep_job_checkpoints,
             )
             print(json.dumps(outcome, sort_keys=True), flush=True)
             failed = "failed" in outcome.values()
