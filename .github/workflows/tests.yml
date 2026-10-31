@@ -88,12 +88,21 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-ci.txt
 
-      - name: Run pytest with agent coverage report
-        run: python -m pytest tests -q --cov=src.agent_runtime --cov=src.agent_analytics --cov-report=term-missing
+      # One run measures src/ and slack/; the two report steps below hold each module set to its own floor.
+      - name: Run pytest with coverage
+        run: python -m pytest tests -q --cov=src --cov=slack --cov-report=
 
       # Floor is 2 points below the measured coverage of src/agent_*; raise it as coverage grows.
       - name: Enforce agent coverage threshold
-        run: python -m coverage report --fail-under=77
+        run: python -m coverage report --show-missing --include="src/agent_runtime.py,src/agent_analytics.py" --fail-under=77
+
+      # The chat path: router, inference, pipeline, policy, scheduler, admission, the Slack bot and the
+      # Phase 4 modules. Floor is 2 points below the measured coverage (87.04%); raise it as coverage grows.
+      - name: Enforce chat coverage threshold
+        run: >-
+          python -m coverage report
+          --include="src/llm_router_part1_router.py,src/llm_router_part2_inference.py,src/llm_router_part3_pipeline.py,src/llm_router_part3_policy.py,src/provider_scheduler.py,src/admission.py,src/query_classifier.py,src/analytics_schema.py,src/event_version.py,src/routing_rules.py,slack/*"
+          --fail-under=85
 
       - name: Compile source tree
         run: python -m compileall src tests slack
@@ -227,6 +236,94 @@ jobs:
           python -m pytest tests/test_agent_observability_integration.py tests/test_agent_mcp_reader_integration.py -v -rs | tee agent-integration.log
           # A missing flag, variable or service would skip these tests silently; this job exists to run them.
           if grep -qE "[0-9]+ skipped" agent-integration.log; then echo "Integration tests were skipped" >&2; exit 1; fi
+
+  # The opt-in chat pipeline integration tests: Kafka to ClickHouse through the pipeline, the real ClickHouse
+  # driver and ReplacingMergeTree tests, and the policy materializer against a real broker. Kafka and ClickHouse
+  # reuse the agent-integration images; every image is pinned by digest. The ClickHouse login is the throwaway
+  # llm_router/llm_router_pass pair that tests/test_integration_pipeline.py expects (as in docker-compose.yml).
+  chat-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      kafka:
+        image: confluentinc/cp-kafka:7.8.7@sha256:2b5c4a369c1b8d1a3257d7415bbbfd320ce522448725282373051981f4bae56c
+        ports:
+          - 9092:9092
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+          CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+        options: >-
+          --health-cmd "cub kafka-ready -b localhost:9092 1 20"
+          --health-interval 5s
+          --health-timeout 30s
+          --health-retries 20
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8.14.39@sha256:1ffa82edee000a42c09313bd9f1293d94c570aee74babc1b3ca9983a35fa597b
+        ports:
+          - 8123:8123
+        env:
+          CLICKHOUSE_USER: llm_router
+          CLICKHOUSE_PASSWORD: llm_router_pass
+        options: >-
+          --health-cmd "wget -qO- http://localhost:8123/ping"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+      redis:
+        image: redis:7.4-alpine@sha256:8da19c7399dca900c6822a1cf30f9d2285585e2c4b457ff4095b0f4500054d3f
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 1s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Read by scripts/integration_smoke.py, which tests/test_integration_pipeline.py runs.
+      CLICKHOUSE_PASSWORD: llm_router_pass
+      CHAT_TEST_KAFKA_BROKERS: localhost:9092
+      CHAT_TEST_CLICKHOUSE_HOST: localhost
+      CHAT_TEST_CLICKHOUSE_PORT: "8123"
+      CHAT_TEST_CLICKHOUSE_USER: llm_router
+      CHAT_TEST_CLICKHOUSE_PASSWORD: llm_router_pass
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements-ci.txt
+            requirements-dev.txt
+
+      # The Kafka and ClickHouse clients come from requirements-dev.txt, which also pins the ML stack this job skips.
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-ci.txt $(grep -E '^(aiokafka|clickhouse-connect)==' requirements-dev.txt)
+
+      - name: Run the integration tests
+        run: |
+          python -m pytest tests/test_integration_pipeline.py tests/test_analytics_dedupe.py tests/test_clickhouse_poison_batches.py tests/test_policy_pause_poll_kafka.py -v -rs | tee chat-integration.log
+          # A missing variable or service would skip these tests silently; this job exists to run them.
+          if grep -qE "[0-9]+ skipped" chat-integration.log; then echo "Integration tests were skipped" >&2; exit 1; fi
 
   agent-runtime:
     runs-on: ubuntu-latest
