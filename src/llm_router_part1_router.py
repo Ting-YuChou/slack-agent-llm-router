@@ -11,7 +11,6 @@ import math
 import os
 import re
 import time
-from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
@@ -31,6 +30,7 @@ from src.prompt_assembly import (
 )
 from src.pricing import per_token, resolve_model_pricing
 from src.routing_features import build_routing_features
+from src.routing_rules import RoutingRule, RoutingRuleError
 from src.utils.metrics import ROUTER_METRICS
 from src.utils.schema import (
     ModelConfig,
@@ -193,27 +193,6 @@ class EligibleModels(NamedTuple):
         if self.guardrails_bypassed:
             return f"{reason}; {GUARDRAIL_BYPASS_NOTE}"
         return reason
-
-
-@dataclass
-class RoutingRule:
-    """Routing rule for model selection"""
-
-    condition: str
-    models: List[str]
-    fallback: str
-    weight: float = 1.0
-
-    def matches(self, query_context: Dict[str, Any]) -> bool:
-        """Check if this rule matches the given query context"""
-        try:
-            # Simple condition evaluation (in production, use a more robust parser)
-            normalized_condition = re.sub(r"\bAND\b", "and", self.condition)
-            normalized_condition = re.sub(r"\bOR\b", "or", normalized_condition)
-            normalized_condition = re.sub(r"\bNOT\b", "not", normalized_condition)
-            return eval(normalized_condition, {"__builtins__": {}}, query_context)
-        except Exception:
-            return False
 
 
 class QueryClassifier:
@@ -451,7 +430,6 @@ class ModelRouter:
         if self.stats_prior_weight < 0:
             raise ValueError("router.stats_prior_weight must not be negative")
         self._stats_clock = stats_clock
-        self.request_cache: Dict[str, RoutingDecision] = {}
         self._initialized = False
         self._missing_model_credentials: Dict[str, str] = {}
 
@@ -475,18 +453,18 @@ class ModelRouter:
         logger.info("Model router initialized successfully")
 
     def is_healthy(self) -> bool:
-        """Return whether the router is ready to serve traffic."""
+        """Return whether the router is ready to serve traffic.
+
+        The policy cache is best-effort and not consulted: routing works
+        without it, and readiness reports it under degraded_services (O4).
+        """
         default_model_loaded = self.default_model in self.models
         classifier_ready = getattr(self.classifier, "_is_initialized", False)
-        policy_cache_healthy = True
-        if self.policy_cache and hasattr(self.policy_cache, "is_healthy"):
-            policy_cache_healthy = self.policy_cache.is_healthy()
         return (
             self._initialized
             and classifier_ready
             and bool(self.models)
             and default_model_loaded
-            and policy_cache_healthy
         )
 
     def tokenizer_status(self) -> Dict[str, Any]:
@@ -556,17 +534,36 @@ class ModelRouter:
             and resolve_model_pricing(self.models, model_name) is None
         ]
 
-    def _load_routing_rules(self):
-        """Load routing rules from configuration"""
-        rules_config = self.config.get("routing_rules", [])
+    def _load_routing_rules(self) -> None:
+        """Load routing rules from configuration.
 
-        for rule_config in rules_config:
+        An invalid rule (bad syntax, an unknown name, a missing field) raises
+        RoutingRuleError: a rule that silently never matched hid config typos.
+        """
+        rules_config = self.config.get("routing_rules", []) or []
+
+        for index, rule_config in enumerate(rules_config):
+            if not isinstance(rule_config, dict):
+                raise RoutingRuleError(
+                    f"router.routing_rules[{index}] must be a mapping"
+                )
+            if "weight" in rule_config:
+                # RoutingRule.weight was never read; tolerate old configs.
+                rule_config = {k: v for k, v in rule_config.items() if k != "weight"}
+                logger.warning(
+                    "router.routing_rules[%d]: 'weight' is deprecated and "
+                    "ignored; remove it",
+                    index,
+                )
             try:
                 rule = RoutingRule(**rule_config)
-                self.routing_rules.append(rule)
-                logger.debug(f"Loaded routing rule: {rule.condition}")
-            except Exception as e:
-                logger.error(f"Failed to load routing rule: {e}")
+            except (RoutingRuleError, TypeError) as error:
+                # TypeError: a missing or unknown field in the rule entry.
+                raise RoutingRuleError(
+                    f"router.routing_rules[{index}]: {error}"
+                ) from None
+            self.routing_rules.append(rule)
+            logger.debug("Loaded routing rule: %s", rule.condition)
 
     async def route_query(self, request: QueryRequest) -> RoutingDecision:
         """Main routing logic - selects the best model for a query"""
@@ -1609,13 +1606,15 @@ class ModelRouter:
         sources = str(policy.get("policy_source") or "").split("+")
         return "unavailable" in sources
 
-    @staticmethod
-    def _routing_view(context: Dict[str, Any]) -> Tuple[Any, ...]:
+    def _routing_view(self, context: Dict[str, Any]) -> Tuple[Any, ...]:
         """What routing reads from a context that a policy can change.
 
         Two contexts with the same view route the same request alike, so
         shadow mode need not replay a policy whose context matches the base.
-        Sensitivities only matter when "high"; session hotness when "hot".
+        Scoring reads sensitivities only when "high" and session hotness only
+        when "hot". Rules count by outcome (RT2): a policy value that changes
+        no rule's match, such as a default the base context simply lacks,
+        does not force a replay.
         """
 
         def names(key: str) -> Tuple[str, ...]:
@@ -1646,6 +1645,7 @@ class ModelRouter:
             str(context.get("session_hotness") or "").lower() == "hot",
             context.get("query_complexity"),
             str(context.get("policy_query_type") or "").lower(),
+            tuple(rule.matches(context) for rule in self.routing_rules),
         )
 
     def _policy_cache_mode(self) -> str:
@@ -2250,11 +2250,17 @@ class ModelRouter:
         }
 
     def _unit_rates(self, model_config: ModelConfig) -> Tuple[float, float]:
-        """(input, output) USD per token: pricing, else cost_per_token for both."""
+        """(input, output) USD per token, as inference bills them (RT1).
+
+        Pricing when it resolves; otherwise a self-hosted (vLLM) model costs
+        nothing and a paid model falls back to cost_per_token for both.
+        """
         pricing = resolve_model_pricing(self.models, model_config.name)
         if pricing is None and model_config.pricing is not None:
             pricing = model_config.pricing
         if pricing is None:
+            if model_config.provider.lower() == "vllm":
+                return 0.0, 0.0
             return model_config.cost_per_token, model_config.cost_per_token
         return per_token(pricing.input), per_token(pricing.output)
 
