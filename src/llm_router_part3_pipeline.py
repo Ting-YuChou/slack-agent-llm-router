@@ -77,6 +77,14 @@ class _DeliveryEnvelope:
     default_topic: str
     key: Optional[str]
     value: Dict[str, Any]
+    # Resolved with whether Kafka confirmed the send, for a caller that waits.
+    delivery: Optional["asyncio.Future[bool]"] = None
+
+
+def _resolve_delivery(envelope: _DeliveryEnvelope, delivered: bool) -> None:
+    future = envelope.delivery
+    if future is not None and not future.done():
+        future.set_result(delivered)
 
 
 def _isoformat_utc(timestamp: Optional[datetime] = None) -> str:
@@ -1225,6 +1233,15 @@ class KafkaProducerManager:
             logger.error(f"Failed to initialize Kafka producer: {e}")
             raise
 
+    @property
+    def confirms_chat_feedback_delivery(self) -> bool:
+        """Whether a send's success means the broker acked it.
+
+        Only then can produce_chat_feedback(wait_for_delivery=True) confirm
+        delivery; without acks a send succeeds once it is handed over.
+        """
+        return bool(getattr(self, "wait_for_ack", False))
+
     def is_healthy(self) -> bool:
         """Return whether the Kafka producer has been initialized."""
         failure_threshold = int(
@@ -1287,14 +1304,18 @@ class KafkaProducerManager:
         *,
         key: Optional[str],
         value: Dict[str, Any],
+        delivery: Optional["asyncio.Future[bool]"] = None,
     ) -> bool:
-        """Accept a message for background delivery without yielding control."""
+        """Accept a message for background delivery without yielding control.
+
+        `delivery`, when given, is resolved once the send succeeded or failed.
+        """
         if not self._accepting:
             PIPELINE_METRICS.producer_queue_dropped.labels(
                 topic=topic_key, reason="not_accepting"
             ).inc()
             return False
-        envelope = _DeliveryEnvelope(topic_key, default_topic, key, value)
+        envelope = _DeliveryEnvelope(topic_key, default_topic, key, value, delivery)
         try:
             self._delivery_queue.put_nowait(envelope)
         except asyncio.QueueFull:
@@ -1309,16 +1330,21 @@ class KafkaProducerManager:
     async def _send_envelope(self, envelope) -> bool:
         topic_key = envelope.topic_key
         try:
-            return await self._send_message(
+            delivered = await self._send_message(
                 topic_key,
                 envelope.default_topic,
                 key=envelope.key,
                 value=envelope.value,
             )
         except Exception:
-            return False
+            delivered = False
+        # A waiting caller hears about its own send now, not once the whole
+        # dispatcher batch (which may hold a slow, retrying send) is done.
+        _resolve_delivery(envelope, delivered)
+        return delivered
 
     def _record_delivery(self, envelope, delivered: bool) -> None:
+        _resolve_delivery(envelope, delivered)
         topic_key = envelope.topic_key
         if delivered:
             PIPELINE_METRICS.producer_queue_delivered.labels(topic=topic_key).inc()
@@ -1370,10 +1396,12 @@ class KafkaProducerManager:
                     if task.done() and not task.cancelled():
                         self._record_delivery(item, task.result())
                     elif task.done():
+                        _resolve_delivery(item, False)
                         PIPELINE_METRICS.producer_queue_dropped.labels(
                             topic=item.topic_key, reason="shutdown_timeout"
                         ).inc()
                     else:
+                        _resolve_delivery(item, False)
                         PIPELINE_METRICS.producer_queue_dropped.labels(
                             topic=item.topic_key, reason="shutdown_abandoned"
                         ).inc()
@@ -1389,6 +1417,7 @@ class KafkaProducerManager:
                 envelope = self._delivery_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            _resolve_delivery(envelope, False)
             PIPELINE_METRICS.producer_queue_dropped.labels(
                 topic=envelope.topic_key, reason=reason
             ).inc()
@@ -1481,8 +1510,16 @@ class KafkaProducerManager:
         rating: str,
         click_id: str,
         source: str = "slack",
-    ):
-        """Produce a chat.feedback event, keyed by the request it rates."""
+        wait_for_delivery: bool = False,
+        timeout: float = 2.0,
+    ) -> Optional[bool]:
+        """Produce a chat.feedback event, keyed by the request it rates.
+
+        Without `wait_for_delivery` this is True once the event is queued.
+        With it: True once Kafka confirmed the send, False when it was not
+        queued or the send failed, and None when no answer came within
+        `timeout` seconds, since that send may still be delivered.
+        """
         event = build_chat_feedback_event(
             request_id=request_id,
             user_id=user_id,
@@ -1490,12 +1527,33 @@ class KafkaProducerManager:
             click_id=click_id,
             source=source,
         )
-        return self._enqueue_message(
+        if not wait_for_delivery:
+            return self._enqueue_message(
+                "chat_feedback",
+                "chat.feedback",
+                key=request_id,
+                value=event,
+            )
+        delivery: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
+        if not self._enqueue_message(
             "chat_feedback",
             "chat.feedback",
             key=request_id,
             value=event,
-        )
+            delivery=delivery,
+        ):
+            return False
+        try:
+            return bool(
+                await asyncio.wait_for(asyncio.shield(delivery), timeout=timeout)
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "chat.feedback for request %s was not confirmed within %.1f s",
+                request_id,
+                timeout,
+            )
+            return None
 
     async def produce_routing_decision(
         self,

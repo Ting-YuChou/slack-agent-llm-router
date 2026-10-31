@@ -1148,8 +1148,6 @@ class SlackConfig(ConfigModel):
     bot_token_env: Optional[str] = None
     app_token: Optional[str] = None
     app_token_env: Optional[str] = None
-    signing_secret: Optional[str] = None
-    signing_secret_env: Optional[str] = None
     channels: List[str] = Field(default_factory=list)
     response_settings: SlackResponseSettingsConfig = Field(
         default_factory=SlackResponseSettingsConfig
