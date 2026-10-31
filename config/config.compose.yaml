@@ -10,11 +10,6 @@ api:
   host: 0.0.0.0
   port: 8080
   log_level: info
-  cors_origins:
-    - http://localhost:3000
-    - http://127.0.0.1:3000
-    - http://localhost:8501
-    - http://127.0.0.1:8501
   rate_limiting:
     enabled: true
     requests_per_minute: 1000
@@ -222,11 +217,6 @@ inference:
       pricing:
         cache_creation_input_multiplier: 1.25
         cache_read_input_multiplier: 0.1
-  compression:
-    enabled: true
-    max_context_tokens: 100000
-    compression_ratio: 0.3
-    method: semantic_graph
   cache:
     enabled: true
     backend: redis
@@ -851,11 +841,6 @@ security:
     #     active: 20
     #     allow_priority: false
     clients: []
-  jwt:
-    enabled: false
-    secret_key_env: JWT_SECRET_KEY
-    algorithm: HS256
-    expiration_hours: 24
   cors:
     enabled: true
     allow_origins:
@@ -894,12 +879,9 @@ development:
   mock_external_apis: false
 
 features:
-  context_compression: true
   semantic_caching: true
-  batch_processing: true
   multi_modal: false
   function_calling: true
-  streaming_responses: true
 
 pipeline:
   enabled: true
