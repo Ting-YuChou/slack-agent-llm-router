@@ -18,12 +18,15 @@ from types import SimpleNamespace
 from typing import (
     Awaitable,
     Callable,
+    Collection,
+    Coroutine,
     Dict,
     List,
     Optional,
     Any,
     Tuple,
     Sequence,
+    cast,
 )
 import hashlib
 
@@ -996,7 +999,8 @@ class BaseInferenceProvider(ABC):
         model_configs: Optional[Dict[str, Any]] = None,
     ):
         self.config = config
-        self.client = None
+        # The provider SDK's async client, set by initialize().
+        self.client: Any = None
         # The router's model configs: per-model pricing (and, for OpenAI,
         # reasoning effort and temperature support).
         self.model_configs: Dict[str, Any] = (
@@ -2112,7 +2116,8 @@ class vLLMProvider(BaseInferenceProvider):
     async def _validate_endpoint_models(self, endpoint: VLLMEndpointState):
         if not endpoint.models:
             return
-        response = await endpoint.client.get("/v1/models")
+        client = cast(httpx.AsyncClient, endpoint.client)
+        response = await client.get("/v1/models")
         if response.status_code != 200:
             raise RuntimeError(f"model list returned {response.status_code}")
         data = response.json()
@@ -2287,7 +2292,7 @@ class SingleFlightCoordinator:
         request: QueryRequest,
         provider: Any,
         model_name: str,
-        operation: Callable[[], Awaitable[InferenceResponse]],
+        operation: Callable[[], Coroutine[Any, Any, InferenceResponse]],
     ) -> InferenceResponse:
         """Run a leader immediately and shield it from follower cancellation."""
         if not self.enabled:
@@ -2301,11 +2306,14 @@ class SingleFlightCoordinator:
             if shared_future is None:
                 shared_future = asyncio.create_task(operation())
                 self.inflight_requests[inflight_key] = shared_future
-                shared_future.add_done_callback(
-                    lambda completed, key=inflight_key: self._on_completed(
-                        key, completed
-                    )
-                )
+
+                def on_done(
+                    completed: asyncio.Task,
+                    key: Tuple[int, str, str] = inflight_key,
+                ) -> None:
+                    self._on_completed(key, completed)
+
+                shared_future.add_done_callback(on_done)
 
         try:
             response = await asyncio.shield(shared_future)
@@ -2409,9 +2417,10 @@ class InferenceEngine:
         self.config = config
         self.router = router
         self.event_producer = event_producer
-        self.rag_service = rag_service
+        # Retrieval paths run only when a RAG service is configured.
+        self.rag_service: Any = rag_service
         self.admission_controller = admission_controller
-        self.providers = {}
+        self.providers: Dict[str, BaseInferenceProvider] = {}
         self.cache = ResponseCache(config.get("cache", {}))
         single_flight_config = config.get("single_flight")
         if single_flight_config is None:
@@ -2434,7 +2443,7 @@ class InferenceEngine:
         self.web_search_tool: Optional[WebSearchTool] = None
 
         # Performance tracking
-        self.inference_stats = {}
+        self.inference_stats: Dict[str, Dict[str, Any]] = {}
         self._initialized = False
 
     async def initialize(self):
@@ -2637,15 +2646,17 @@ class InferenceEngine:
             model_name = routing_decision.selected_model
 
             # Step 4: Check full-response cache.
-            response = await self._get_cached_inference_response(request, model_name)
-            if response:
+            cached_response = await self._get_cached_inference_response(
+                request, model_name
+            )
+            if cached_response:
                 logger.info(f"Cache hit for request {request_id}")
                 await self._publish_analytics_events(
                     request,
-                    response,
+                    cached_response,
                     routing_decision=routing_decision,
                 )
-                return response
+                return cached_response
 
             # Step 5: Generate response, falling back to local models for cloud outages
             (
@@ -3289,7 +3300,7 @@ class InferenceEngine:
         query = request.query or ""
         lowered = query.lower()
 
-        query_type = getattr(routing_decision, "query_type", None)
+        query_type: Any = getattr(routing_decision, "query_type", None)
         query_type_value = (
             query_type.value if hasattr(query_type, "value") else str(query_type or "")
         )
@@ -3320,7 +3331,7 @@ class InferenceEngine:
 
         return True
 
-    def _rag_intent_terms(self, key: str, default: Sequence[str]) -> Sequence[str]:
+    def _rag_intent_terms(self, key: str, default: Collection[str]) -> Collection[str]:
         intent_config = dict(getattr(self.rag_service, "intent_gate_config", {}) or {})
         configured = intent_config.get(key)
         if isinstance(configured, (list, tuple, set)) and configured:
@@ -3375,7 +3386,7 @@ class InferenceEngine:
             return True
         if metadata.get("web_search_auto") is False:
             return False
-        query_type = getattr(routing_decision, "query_type", None)
+        query_type: Any = getattr(routing_decision, "query_type", None)
         query_type_value = (
             query_type.value if hasattr(query_type, "value") else query_type
         )
@@ -4174,7 +4185,9 @@ class InferenceEngine:
             request, routing_decision, policy_context
         )
         if getattr(request, "_rag_images", []):
-            policy_candidates = request.metadata.get("rag_vision_fallback_models")
+            # Earlier request stages already read metadata as a dict.
+            metadata = cast(Dict[str, Any], request.metadata)
+            policy_candidates = metadata.get("rag_vision_fallback_models")
             if policy_candidates is not None:
                 return [
                     model_name

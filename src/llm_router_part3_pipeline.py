@@ -16,7 +16,7 @@ import time
 from datetime import datetime, timezone
 from collections import OrderedDict
 from types import SimpleNamespace
-from typing import Dict, List, Mapping, Optional, Any, Callable, Set, Tuple
+from typing import Dict, List, Mapping, Optional, Any, Callable, Set, Tuple, Type, cast
 from dataclasses import dataclass, asdict, field
 import uuid
 
@@ -1614,7 +1614,7 @@ class KafkaProducerManager:
         service: str,
         metric_name: str,
         metric_value: float,
-        labels: Dict[str, str] = None,
+        labels: Optional[Dict[str, str]] = None,
     ):
         """Produce system metric"""
         metric_entry = MetricEntry(
@@ -1807,7 +1807,7 @@ class ClickHouseManager:
         columns = list(records[0].keys())
         rows = [[record.get(column) for column in columns] for record in records]
         await self._run_blocking(
-            self.client.insert,
+            cast(Client, self.client).insert,
             table_name,
             rows,
             column_names=columns,
@@ -1898,7 +1898,7 @@ class ClickHouseManager:
         """
         try:
             result = await self._run_blocking(
-                self.client.query,
+                cast(Client, self.client).query,
                 "SELECT table, name FROM system.columns "
                 "WHERE database = {database:String}",
                 parameters={"database": self.database},
@@ -2105,7 +2105,7 @@ class ClickHouseManager:
             """
 
             result = await self._run_blocking(
-                self.client.query, analytics_query, parameters=parameters
+                cast(Client, self.client).query, analytics_query, parameters=parameters
             )
             analytics: Dict[str, Any] = {
                 "total_queries": 0,
@@ -2168,7 +2168,7 @@ class ClickHouseManager:
             """
 
             result = await self._run_blocking(
-                self.client.query,
+                cast(Client, self.client).query,
                 query,
                 parameters={"hours": time_window_hours},
             )
@@ -2221,7 +2221,7 @@ class ClickHouseManager:
             """
 
             result = await self._run_blocking(
-                self.client.query,
+                cast(Client, self.client).query,
                 query,
                 parameters={"hours": time_window_hours},
             )
@@ -2297,7 +2297,7 @@ class ClickHouseManager:
             """
 
             result = await self._run_blocking(
-                self.client.query,
+                cast(Client, self.client).query,
                 query,
                 parameters={"hours": time_window_hours},
             )
@@ -2449,7 +2449,7 @@ def observer_group_id(prefix: str) -> str:
     return f"{prefix}-{host}-{os.getpid()}"
 
 
-def _commit_lost_errors() -> Tuple[type, ...]:
+def _commit_lost_errors() -> Tuple[Type[BaseException], ...]:
     """aiokafka's errors for a commit lost to a rebalance or a left group."""
     try:
         from aiokafka import errors as kafka_errors
@@ -2490,7 +2490,7 @@ class KafkaConsumerManager:
         self.clickhouse = clickhouse_manager
         self.bootstrap_servers = config.get("bootstrap_servers", ["localhost:9092"])
         self.topics = config.get("topics", {})
-        self.consumers = {}
+        self.consumers: Dict[str, Any] = {}
         self.topic_names_by_key: Dict[str, str] = {}
         consumer_section = config.get("consumer", {})
         dlq_section = config.get("dlq", {})
@@ -3177,9 +3177,9 @@ class KafkaConsumerManager:
         """
         for consumer_key, consumer in list(self.consumers.items()):
             try:
-                assignment = getattr(consumer, "assignment", None)
-                end_offsets = getattr(consumer, "end_offsets", None)
-                position = getattr(consumer, "position", None)
+                assignment: Any = getattr(consumer, "assignment", None)
+                end_offsets: Any = getattr(consumer, "end_offsets", None)
+                position: Any = getattr(consumer, "position", None)
                 if not all(map(callable, (assignment, end_offsets, position))):
                     continue
                 partitions = list(assignment() or ())
@@ -4064,7 +4064,8 @@ class KafkaIngestionPipeline:
         clickhouse_config = config.get("clickhouse", {})
         self.clickhouse_manager = ClickHouseManager(clickhouse_config)
         self.producer_manager = KafkaProducerManager(config)
-        self.consumer_manager = None  # Will be initialized after ClickHouse
+        # Will be initialized after ClickHouse
+        self.consumer_manager: Optional[KafkaConsumerManager] = None
         self._stream_handlers: Dict[str, List[Callable[[Dict[str, Any]], Any]]] = {
             "requests_enriched": [],
             "analytics_model_metrics_1m": [],
@@ -4140,7 +4141,7 @@ class KafkaIngestionPipeline:
         service: str,
         metric_name: str,
         metric_value: float,
-        labels: Dict[str, str] = None,
+        labels: Optional[Dict[str, str]] = None,
     ):
         """Log metric through the pipeline"""
         await self.producer_manager.produce_metric(
