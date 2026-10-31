@@ -703,6 +703,8 @@ class LoggingConfig(ConfigModel):
 
 
 class RouterClassifierConfig(ConfigModel):
+    # Deprecated no-op (R16c): the classifier loads no semantic model. Kept so
+    # configs that still set it load.
     semantic_enabled: bool = True
 
 

@@ -210,46 +210,32 @@ class QueryClassifier:
     """The router's typed view of src.query_classifier, which Flink shares."""
 
     def __init__(self, semantic_enabled: bool = True):
+        # Deprecated no-op (R16c): no semantic model is loaded any more. Kept
+        # so configs that set classifier.semantic_enabled still load.
         self.semantic_enabled = semantic_enabled
         self.tokenizer = None
         self.model = None
-        self.tfidf_vectorizer = None
         # The shared rules' patterns by type (the regex performance tests run
         # them on untruncated input).
         self._compiled_patterns: Dict[QueryType, List[re.Pattern[str]]] = {
             QueryType(query_type): [pattern for pattern, _weight in rules]
             for query_type, rules in query_classifier.COMPILED_RULES.items()
         }
+        # Router readiness (ModelRouter.is_healthy) waits for initialize();
+        # classification itself needs none.
         self._is_initialized = False
 
     async def initialize(self):
-        """Initialize the classifier with pre-trained models"""
-        if not self.semantic_enabled:
-            self._is_initialized = True
-            logger.info("Semantic query classification is disabled")
-            return
-
-        try:
-            # Load a lightweight sentence transformer for semantic analysis
-            from sentence_transformers import SentenceTransformer
-            from sklearn.feature_extraction.text import TfidfVectorizer
-
-            self.model = SentenceTransformer("all-MiniLM-L6-v2")
-            self.tfidf_vectorizer = TfidfVectorizer(
-                max_features=5000, stop_words="english", ngram_range=(1, 2)
+        """Mark the classifier ready; the rules need no loading."""
+        if self.semantic_enabled:
+            logger.info(
+                "router.classifier.semantic_enabled is deprecated and ignored; "
+                "classification is rule based"
             )
-            self._is_initialized = True
-            logger.info("Query classifier initialized successfully")
-        except Exception as e:
-            logger.warning(f"Failed to initialize advanced classifier: {e}")
-            logger.info("Falling back to pattern-based classification")
-            self._is_initialized = True
+        self._is_initialized = True
 
     def classify_query(self, query: str) -> Tuple[QueryType, float]:
         """Classify query type with confidence score"""
-        if not self._is_initialized:
-            asyncio.create_task(self.initialize())
-
         query_type, confidence = query_classifier.classify(query)
         return QueryType(query_type), confidence
 
