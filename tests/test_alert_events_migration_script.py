@@ -32,7 +32,9 @@ case "$query" in
   EXISTS*) echo "$FAKE_EXISTS" ;;
   SHOW*) printf '%s\\n' "$FAKE_SHOW" ;;
   *system.columns*) printf '%s\\n' "$FAKE_COLUMNS" ;;
-  *count*) echo 3 ;;
+  *uniqExact*) echo "${FAKE_EXPECTED:-3}" ;;
+  *FINAL*) echo "${FAKE_MIGRATED:-3}" ;;
+  *count*) echo "${FAKE_SOURCE:-3}" ;;
 esac
 """
 
@@ -129,3 +131,61 @@ def test_an_old_table_with_the_backfill_columns_keeps_its_derived_ids():
 
     assert insert.startswith("INSERT INTO db.alert_events (event_id, timestamp,")
     assert f"SELECT {ALERT_EVENTS.columns[0].backfill}, timestamp," in insert
+
+
+OLD_COLUMNS = "timestamp\nalert_type\nseverity\ndescription"
+
+
+def _migrate_old(tmp_path, **fake):
+    return _run(
+        tmp_path, FAKE_EXISTS="1", FAKE_SHOW=OLD_SHOW, FAKE_COLUMNS=OLD_COLUMNS, **fake
+    )
+
+
+def test_a_failing_sql_generator_stops_before_the_rename(tmp_path):
+    result, queries = _migrate_old(tmp_path, PYTHON="/usr/bin/false")
+
+    assert result.returncode != 0
+    assert not any(q.startswith(("RENAME", "CREATE", "INSERT")) for q in queries)
+
+
+def test_an_empty_sql_generator_stops_before_the_rename(tmp_path):
+    result, queries = _migrate_old(tmp_path, PYTHON="/usr/bin/true")
+
+    assert result.returncode != 0
+    assert not any(q.startswith(("RENAME", "CREATE", "INSERT")) for q in queries)
+
+
+def test_duplicates_collapsed_by_the_new_table_are_not_a_failure(tmp_path):
+    result, queries = _migrate_old(
+        tmp_path, FAKE_SOURCE="5", FAKE_EXPECTED="3", FAKE_MIGRATED="3"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "2 duplicate" in result.stdout
+    (expected,) = [q for q in queries if "uniqExact" in q]
+    # Distinct sorting keys of the copied rows, read from the backup.
+    assert "alert_events_backup_" in expected
+    assert any("FINAL" in q and q.startswith("SELECT count()") for q in queries)
+
+
+def test_a_migrated_count_below_the_distinct_source_rows_fails(tmp_path):
+    result, _ = _migrate_old(
+        tmp_path, FAKE_SOURCE="5", FAKE_EXPECTED="3", FAKE_MIGRATED="2"
+    )
+
+    assert result.returncode == 1
+    assert "Row count mismatch" in result.stderr
+
+
+def test_the_expected_count_counts_distinct_sorting_keys():
+    from scripts import alert_events_sql
+
+    sql = alert_events_sql.expected_count_sql(
+        "db", "backup", ["timestamp", "alert_type", "source_event_type"]
+    )
+
+    assert sql == (
+        "SELECT uniqExact(source_event_type, timestamp, "
+        "toString(generateUUIDv4())) FROM db.backup"
+    )
