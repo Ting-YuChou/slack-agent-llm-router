@@ -735,7 +735,7 @@ class ModelRouter:
             and resolve_model_pricing(self.models, model_name) is None
         ]
 
-    def _load_routing_rules(self):
+    def _load_routing_rules(self) -> None:
         """Load routing rules from configuration.
 
         An invalid rule (bad syntax, an unknown name, a missing field) raises
