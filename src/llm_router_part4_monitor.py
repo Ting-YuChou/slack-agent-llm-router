@@ -14,7 +14,7 @@ import time
 import psutil
 import GPUtil
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Sequence, Tuple
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -55,19 +55,79 @@ ALERT_DEDUPE_STORE_ERRORS = Counter(
 )
 
 
+@dataclass(frozen=True)
+class DedupeClaim:
+    """Answer of ``AlertDedupeStore.try_claim``."""
+
+    notify: bool
+    # When held: the level that already paged and the cooldown left on it.
+    stored_level: Optional[Tuple[int, int]] = None
+    remaining_seconds: Optional[float] = None
+
+
 class AlertDedupeStore:
     """Shared record of notified stream-alert incidents, kept in Redis.
 
-    One key per incident ``(source, type, scope)``, set with ``NX`` and a TTL
-    of the dedupe cooldown, so a restarted (or second) process sees that the
-    incident already paged. The value is the notified level
-    ``"<action rank>,<severity rank>"`` so a later escalation still pages.
+    One key per incident ``(source, type, scope)`` holding the paged level
+    ``"<action rank>,<severity rank>"`` with a TTL of the dedupe cooldown,
+    so a restarted (or second) process sees that the incident already
+    paged. Claiming is one compare-and-set script: it pages only when the
+    key is missing or holds a lower level. Each scope keeps a set of its
+    incident keys so a clear can close every avoid incident of the scope.
     Every call returns ``None`` when Redis is unavailable, and the caller
     falls back to its in-memory dedupe; after a failure Redis is skipped for
-    ``retry_after_seconds``.
+    ``retry_after_seconds``. Releases Redis could not take are retried
+    before the next claim.
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    # KEYS: incident, scope set. ARGV: action rank, severity rank, ttl ms.
+    # Returns {1} to page, or {0, action, severity, pttl} when already held
+    # at the same or a higher level.
+    CLAIM_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+local action = tonumber(ARGV[1])
+local severity = tonumber(ARGV[2])
+if current then
+  local held_action, held_severity = string.match(current, '^(%d+),(%d+)$')
+  if held_action then
+    held_action = tonumber(held_action)
+    held_severity = tonumber(held_severity)
+    if action < held_action
+      or (action == held_action and severity <= held_severity) then
+      return {0, held_action, held_severity, redis.call('PTTL', KEYS[1])}
+    end
+  end
+end
+redis.call('SET', KEYS[1], ARGV[1] .. ',' .. ARGV[2], 'PX', ARGV[3])
+redis.call('SADD', KEYS[2], KEYS[1])
+if redis.call('PTTL', KEYS[2]) < tonumber(ARGV[3]) then
+  redis.call('PEXPIRE', KEYS[2], ARGV[3])
+end
+return {1}
+"""
+
+    # KEYS: scope set. ARGV: avoid action rank, then incident keys to close.
+    # Closes every avoid incident of the scope plus the named ones.
+    RELEASE_SCRIPT = """
+local removed = 0
+local prefix = ARGV[1] .. ','
+for _, member in ipairs(redis.call('SMEMBERS', KEYS[1])) do
+  local value = redis.call('GET', member)
+  if not value then
+    redis.call('SREM', KEYS[1], member)
+  elseif string.sub(value, 1, string.len(prefix)) == prefix then
+    removed = removed + redis.call('DEL', member)
+    redis.call('SREM', KEYS[1], member)
+  end
+end
+for i = 2, #ARGV do
+  removed = removed + redis.call('DEL', ARGV[i])
+  redis.call('SREM', KEYS[1], ARGV[i])
+end
+return removed
+"""
+
+    def __init__(self, config: Dict[str, Any], avoid_rank: int = 2):
         self.host = str(config.get("host", "localhost"))
         self.port = int(config.get("port", 6379))
         self.db = int(config.get("db", 0))
@@ -84,6 +144,12 @@ class AlertDedupeStore:
         self._clock: Callable[[], float] = time.monotonic
         self._retry_at: Optional[float] = None
         self._unavailable_logged = False
+        self.avoid_rank = int(avoid_rank)
+        self.max_pending_releases = max(
+            1, int(config.get("max_pending_releases", 1024))
+        )
+        # scope set key -> incident keys still to delete.
+        self._pending_releases: "OrderedDict[str, set]" = OrderedDict()
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -105,12 +171,19 @@ class AlertDedupeStore:
             )
         return self._client
 
-    def key(self, incident: tuple) -> str:
-        source, alert_type, scope = incident
+    def _scope_tag(self, incident: tuple) -> str:
+        source, _alert_type, scope = incident
         digest = hashlib.sha256(
             json.dumps(list(scope), default=str).encode("utf-8")
         ).hexdigest()[:32]
-        return f"{self.key_prefix}{source}:{alert_type}:{digest}"
+        # Hash tag: an incident and its scope set live in one cluster slot.
+        return f"{{{source}:{digest}}}"
+
+    def key(self, incident: tuple) -> str:
+        return f"{self.key_prefix}{self._scope_tag(incident)}:{incident[1]}"
+
+    def scope_key(self, incident: tuple) -> str:
+        return f"{self.key_prefix}{self._scope_tag(incident)}:incidents"
 
     async def _call(self, operation: str, factory: Callable[[Any], Any]) -> Any:
         """Run one Redis command; raise ``_StoreUnavailable`` on any failure."""
@@ -142,39 +215,84 @@ class AlertDedupeStore:
         self._retry_at = None
         return result
 
-    async def claim(self, incident: tuple, level: str, ttl: int) -> Optional[bool]:
-        """Mark an incident notified: True if claimed, False if already held."""
-        key = self.key(incident)
+    async def _flush_pending_releases(self) -> None:
+        """Retry releases that failed earlier; raise if Redis is still out."""
+        while self._pending_releases:
+            scope_key, keys = next(iter(self._pending_releases.items()))
+            await self._call(
+                "release",
+                lambda client: client.eval(
+                    self.RELEASE_SCRIPT,
+                    1,
+                    scope_key,
+                    self.avoid_rank,
+                    *sorted(keys),
+                ),
+            )
+            self._pending_releases.pop(scope_key, None)
+
+    async def try_claim(
+        self, incident: tuple, level: Tuple[int, int], ttl_seconds: float
+    ) -> Optional[DedupeClaim]:
+        """Atomically record that ``incident`` pages at ``level``.
+
+        Returns whether this caller should page (the incident is not held, or
+        held at a lower level), or ``None`` when Redis cannot answer, in
+        which case the caller keeps its in-memory decision.
+        """
+        ttl_ms = max(1, int(math.ceil(ttl_seconds * 1000)))
+        key, scope_key = self.key(incident), self.scope_key(incident)
         try:
-            claimed = await self._call(
-                "claim", lambda client: client.set(key, level, nx=True, ex=ttl)
+            await self._flush_pending_releases()
+            result = await self._call(
+                "claim",
+                lambda client: client.eval(
+                    self.CLAIM_SCRIPT,
+                    2,
+                    key,
+                    scope_key,
+                    int(level[0]),
+                    int(level[1]),
+                    ttl_ms,
+                ),
             )
         except _StoreUnavailable:
             return None
-        return bool(claimed)
-
-    async def stored_level(self, incident: tuple) -> Optional[str]:
-        key = self.key(incident)
         try:
-            value = await self._call("get", lambda client: client.get(key))
-        except _StoreUnavailable:
+            if int(result[0]) == 1:
+                return DedupeClaim(notify=True)
+            stored = (int(result[1]), int(result[2]))
+            remaining = max(0, int(result[3])) / 1000.0
+        except (TypeError, ValueError, IndexError):
+            logger.debug("Unexpected dedupe store reply: %r", result)
             return None
-        return None if value is None else str(value)
+        return DedupeClaim(
+            notify=False, stored_level=stored, remaining_seconds=remaining
+        )
 
-    async def refresh(self, incident: tuple, level: str, ttl: int) -> None:
-        """Overwrite the incident level and restart its TTL (an escalation)."""
-        key = self.key(incident)
-        try:
-            await self._call("refresh", lambda client: client.set(key, level, ex=ttl))
-        except _StoreUnavailable:
-            return
+    async def claim(
+        self, incident: tuple, level: Any, ttl_seconds: float
+    ) -> Optional[bool]:
+        """``try_claim`` reduced to True (page), False (held) or None."""
+        if isinstance(level, str):
+            level = tuple(int(part) for part in level.split(","))
+        result = await self.try_claim(incident, level, ttl_seconds)
+        return None if result is None else result.notify
 
-    async def release(self, incidents: List[tuple]) -> None:
-        keys = sorted({self.key(incident) for incident in incidents})
-        if not keys:
-            return
+    async def release(self, incident: tuple, targets: Sequence[tuple] = ()) -> None:
+        """Close a scope: its avoid incidents, ``incident`` and ``targets``.
+
+        A release Redis cannot take (an error or the backoff) is kept and
+        retried before the next claim, so a cleared incident pages again.
+        """
+        scope_key = self.scope_key(incident)
+        keys = set(self._pending_releases.pop(scope_key, set()))
+        keys.update(self.key(item) for item in [incident, *targets])
+        self._pending_releases[scope_key] = keys
+        while len(self._pending_releases) > self.max_pending_releases:
+            self._pending_releases.pop(next(iter(self._pending_releases)))
         try:
-            await self._call("release", lambda client: client.delete(*keys))
+            await self._flush_pending_releases()
         except _StoreUnavailable:
             return
 
@@ -470,7 +588,7 @@ class AlertManager:
         # second process does not page an active incident again.
         store_config = dict(alerts_config.get("dedupe_store", {}) or {})
         self.dedupe_store: Optional[AlertDedupeStore] = (
-            AlertDedupeStore(store_config)
+            AlertDedupeStore(store_config, avoid_rank=self._ACTION_RANK["avoid"])
             if store_config.get("enabled", False)
             else None
         )
@@ -938,12 +1056,20 @@ class AlertManager:
                 if identity[:3] in resolved_keys
             ]:
                 del self._seen_alert_identities[identity]
+        # Take the targets out before any await, so a concurrent handler
+        # evicting one cannot break the resolve.
+        closed = [
+            active
+            for active in (
+                self._active_external_alerts.pop(key, None) for key in targets
+            )
+            if active is not None
+        ]
         if self.dedupe_store is not None:
-            # Also the clear's own incident, which a restarted process may
-            # not hold in memory.
-            await self.dedupe_store.release([incident, *targets])
-        for key in targets:
-            active = self._active_external_alerts.pop(key)
+            # The store closes every avoid incident of the scope and the
+            # clear's own, which a restarted process may not hold in memory.
+            await self.dedupe_store.release(incident, targets)
+        for active in closed:
             resolved = {
                 **{k: v for k, v in active.items() if not k.startswith("_")},
                 "description": f"Resolved: {active.get('description')}",
@@ -1039,24 +1165,24 @@ class AlertManager:
             self.suppressed_alert_count += 1
             return
 
-        escalation = (
-            active is not None
-            and now - float(active["_notified_at"]) < self.dedupe_cooldown_seconds
-        )
-        notify, stored_level = await self._claim_in_dedupe_store(
-            incident, normalized_alert, escalation
-        )
+        claim = await self._claim_in_dedupe_store(incident, normalized_alert)
 
         self._active_external_alerts[incident] = {
             **normalized_alert,
             "_notified_at": now,
         }
-        if stored_level is not None:
-            self._active_external_alerts[incident]["_notified_level"] = stored_level
+        if claim is not None and not claim.notify:
+            entry = self._active_external_alerts[incident]
+            if claim.stored_level is not None:
+                entry["_notified_level"] = claim.stored_level
+            if claim.remaining_seconds is not None:
+                # The page happened when the key was set, not now.
+                elapsed = self.dedupe_cooldown_seconds - claim.remaining_seconds
+                entry["_notified_at"] = now - max(0.0, elapsed)
         self._active_external_alerts.move_to_end(incident)
         while len(self._active_external_alerts) > self.dedupe_max_entries:
             self._active_external_alerts.popitem(last=False)
-        if not notify:
+        if claim is not None and not claim.notify:
             # Already paged before a restart or by another process: track it
             # (so a clear resolves it) without paging again.
             self.suppressed_alert_count += 1
@@ -1071,48 +1197,22 @@ class AlertManager:
         stored = active.get("_notified_level")
         return max(level, stored) if stored is not None else level
 
-    @staticmethod
-    def _encode_level(level: tuple[int, int]) -> str:
-        return f"{level[0]},{level[1]}"
-
-    @staticmethod
-    def _decode_level(value: str) -> Optional[tuple[int, int]]:
-        try:
-            action, severity = (int(part) for part in value.split(","))
-        except (AttributeError, ValueError):
-            return None
-        return action, severity
-
     async def _claim_in_dedupe_store(
-        self, incident: tuple, alert: Dict[str, Any], escalation: bool
-    ) -> tuple[bool, Optional[tuple[int, int]]]:
-        """Return whether to notify, and the level the store says already paged.
+        self, incident: tuple, alert: Dict[str, Any]
+    ) -> Optional[DedupeClaim]:
+        """Ask the shared store whether this page is still due.
 
-        In-memory dedupe already decided this alert should page; the store
-        only adds suppression for an incident another process (or this one
-        before a restart) already paged at the same or a higher level.
+        In-memory dedupe already decided this alert should page (new, past
+        its cooldown, or an escalation); the store only adds suppression for
+        an incident another process (or this one before a restart) already
+        paged at the same or a higher level. ``None`` (no store, or Redis
+        unavailable) keeps the in-memory decision.
         """
         store = self.dedupe_store
         if store is None or self.dedupe_cooldown_seconds <= 0:
-            return True, None
-        ttl = max(1, int(math.ceil(self.dedupe_cooldown_seconds)))
-        level = self._alert_level(alert)
-        encoded = self._encode_level(level)
-        if escalation:
-            await store.refresh(incident, encoded, ttl)
-            return True, None
-        claimed = await store.claim(incident, encoded, ttl)
-        if claimed is None or claimed:
-            return True, None
-        stored = await store.stored_level(incident)
-        stored_level = None if stored is None else self._decode_level(stored)
-        if stored_level is not None and level > stored_level:
-            await store.refresh(incident, encoded, ttl)
-            return True, None
-        # Held with an unreadable level: assume it paged at the top level.
-        return False, stored_level or (
-            max(self._ACTION_RANK.values()),
-            max(self._SEVERITY_RANK.values()),
+            return None
+        return await store.try_claim(
+            incident, self._alert_level(alert), self.dedupe_cooldown_seconds
         )
 
     def _get_current_value(self, rule: AlertRule, metrics: Dict[str, float]) -> float:

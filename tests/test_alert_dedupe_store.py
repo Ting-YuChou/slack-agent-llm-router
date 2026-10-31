@@ -19,33 +19,88 @@ class _RecordingHandler:
         self.calls.append(payload)
 
 
+class _Server(dict):
+    """String keys of one fake Redis; sets and expiries ride along."""
+
+    def __init__(self):
+        super().__init__()
+        self.sets = {}
+        self.expires_at = {}
+        self.now = 0.0
+
+    def expire_keys(self):
+        for name, at in list(self.expires_at.items()):
+            if at <= self.now:
+                self.pop(name, None)
+                self.sets.pop(name, None)
+                del self.expires_at[name]
+
+
 class _FakeRedis:
-    """The few async Redis commands the dedupe store uses, over a shared dict."""
+    """Emulates the dedupe store's Redis commands and Lua scripts in Python.
+
+    Instances built over the same ``data`` share one server, like processes
+    sharing one Redis.
+    """
 
     def __init__(self, data=None):
-        self.data = {} if data is None else data
+        self.data = _Server() if data is None else data
         self.ttls = {}
         self.calls = []
         self.closed = False
+        self.before_eval = None
 
-    async def set(self, name, value, nx=False, ex=None):
-        self.calls.append(("set", name))
-        if nx and name in self.data:
-            return None
-        self.data[name] = str(value)
-        self.ttls[name] = ex
-        return True
+    async def eval(self, script, numkeys, *args):
+        self.calls.append(("eval",))
+        if self.before_eval is not None:
+            self.before_eval(script)
+        keys, argv = list(args[:numkeys]), [str(a) for a in args[numkeys:]]
+        self.data.expire_keys()
+        if script == AlertDedupeStore.CLAIM_SCRIPT:
+            return self._claim(keys, argv)
+        if script == AlertDedupeStore.RELEASE_SCRIPT:
+            return self._release(keys, argv)
+        raise AssertionError("unknown script")
 
-    async def get(self, name):
-        self.calls.append(("get", name))
-        return self.data.get(name)
+    def _claim(self, keys, argv):
+        key, scope_set = keys
+        action, severity, ttl_ms = int(argv[0]), int(argv[1]), int(argv[2])
+        current = self.data.get(key)
+        if current is not None:
+            try:
+                stored = tuple(int(part) for part in current.split(","))
+            except ValueError:
+                stored = None
+            if stored is not None and (action, severity) <= stored:
+                remaining = self.data.expires_at[key] - self.data.now
+                return [0, stored[0], stored[1], int(remaining * 1000)]
+        self.data[key] = f"{action},{severity}"
+        self.data.expires_at[key] = self.data.now + ttl_ms / 1000
+        self.ttls[key] = ttl_ms / 1000
+        self.data.sets.setdefault(scope_set, set()).add(key)
+        self.data.expires_at[scope_set] = self.data.now + ttl_ms / 1000
+        return [1]
 
-    async def delete(self, *names):
-        self.calls.append(("delete", *names))
+    def _release(self, keys, argv):
+        (scope_set,) = keys
+        avoid_rank, explicit = argv[0], argv[1:]
+        members = self.data.sets.get(scope_set, set())
         removed = 0
-        for name in names:
-            if self.data.pop(name, None) is not None:
+        for member in sorted(members):
+            value = self.data.get(member)
+            if value is None or value.startswith(f"{avoid_rank},"):
+                if self.data.pop(member, None) is not None:
+                    removed += 1
+                self.data.expires_at.pop(member, None)
+                members.discard(member)
+        for member in explicit:
+            if self.data.pop(member, None) is not None:
                 removed += 1
+            self.data.expires_at.pop(member, None)
+            members.discard(member)
+        if not members:
+            self.data.sets.pop(scope_set, None)
+            self.data.expires_at.pop(scope_set, None)
         return removed
 
     async def aclose(self):
@@ -53,16 +108,8 @@ class _FakeRedis:
 
 
 class _DownRedis(_FakeRedis):
-    async def set(self, *args, **kwargs):
-        self.calls.append(("set",))
-        raise ConnectionError("redis down")
-
-    async def get(self, *args, **kwargs):
-        self.calls.append(("get",))
-        raise ConnectionError("redis down")
-
-    async def delete(self, *args, **kwargs):
-        self.calls.append(("delete",))
+    async def eval(self, *args, **kwargs):
+        self.calls.append(("eval",))
         raise ConnectionError("redis down")
 
 
@@ -337,3 +384,151 @@ def test_store_client_reads_password_env_and_short_timeouts(monkeypatch):
     assert captured["socket_connect_timeout"] == pytest.approx(0.1)
     assert captured["socket_timeout"] == pytest.approx(0.1)
     assert captured["decode_responses"] is True
+
+
+# --- review round 1 -----------------------------------------------------------
+
+
+class _HeldButUnreadable(_FakeRedis):
+    """The incident looks held, but the level can never be read back."""
+
+    async def set(self, *args, **kwargs):
+        return None
+
+    async def get(self, *args, **kwargs):
+        raise ConnectionError("redis read timed out")
+
+    async def eval(self, *args, **kwargs):
+        raise ConnectionError("redis read timed out")
+
+
+@pytest.mark.asyncio
+async def test_unreadable_store_never_suppresses_a_page():
+    manager, handler = _manager(_HeldButUnreadable())
+
+    await manager.record_external_alert(_guardrail())
+
+    assert len(handler.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_escalation_pages_once_across_processes():
+    redis = _FakeRedis()
+    first, first_handler = _manager(redis)
+    second, second_handler = _manager(_FakeRedis(redis.data))
+
+    await first.record_external_alert(_guardrail())
+    await second.record_external_alert(_avoid(1))
+    # first still holds its warn in memory: avoid looks like an escalation
+    # to it, but second already paged at avoid.
+    await first.record_external_alert(_avoid(2))
+
+    assert [c["guardrail_action"] for c in first_handler.calls] == ["warn"]
+    assert [c["guardrail_action"] for c in second_handler.calls] == ["avoid"]
+
+
+@pytest.mark.asyncio
+async def test_release_skipped_during_backoff_is_retried_before_the_next_claim():
+    redis = _FakeRedis()
+    manager, handler = _manager(redis, retry_after_seconds=30)
+    now = [1000.0]
+    manager.dedupe_store._clock = lambda: now[0]
+
+    await manager.record_external_alert(_avoid(0))
+    manager.dedupe_store._client = _DownRedis()
+    await manager.record_external_alert(_next_window(1, scope_key="other"))
+    # In backoff now: the clear cannot reach Redis.
+    await manager.record_external_alert(_next_window(2, guardrail_action="clear"))
+    assert redis.data != {}
+
+    manager.dedupe_store._client = redis
+    now[0] += 31
+    await manager.record_external_alert(_avoid(3))
+
+    assert [(c["scope_key"], c["status"]) for c in handler.calls] == [
+        ("gpt-5", "firing"),
+        ("other", "firing"),
+        ("gpt-5", "resolved"),
+        ("gpt-5", "firing"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pending_release_reaches_other_processes_once_redis_recovers():
+    redis = _FakeRedis()
+    manager, _ = _manager(redis, retry_after_seconds=30)
+    now = [1000.0]
+    manager.dedupe_store._clock = lambda: now[0]
+    await manager.record_external_alert(_avoid(0))
+
+    manager.dedupe_store._client = _DownRedis()
+    await manager.record_external_alert(_next_window(1, guardrail_action="clear"))
+    manager.dedupe_store._client = redis
+    now[0] += 31
+    # Any later claim (another scope here) flushes the pending release.
+    await manager.record_external_alert(_next_window(2, scope_key="other"))
+
+    other, other_handler = _manager(_FakeRedis(redis.data))
+    await other.record_external_alert(_avoid(3))
+    assert len(other_handler.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_clear_after_restart_releases_every_avoid_incident_of_its_scope():
+    redis = _FakeRedis()
+    before, _ = _manager(redis)
+    await before.record_external_alert(_avoid(0))
+    await before.record_external_alert(_next_window(1, trigger_type="queue_depth"))
+
+    after, after_handler = _manager(_FakeRedis(redis.data))
+    await after.record_external_alert(
+        _next_window(2, guardrail_action="clear", trigger_type="error_rate")
+    )
+
+    # The avoid incident (latency_spike) is gone; the warn one is not, as
+    # Flink never clears warn-only incidents.
+    assert len(redis.data) == 1
+    await after.record_external_alert(_avoid(3))
+    await after.record_external_alert(_next_window(4, trigger_type="queue_depth"))
+    assert [c["rule_name"] for c in after_handler.calls] == ["latency_spike"]
+
+
+@pytest.mark.asyncio
+async def test_suppressed_incident_keeps_the_original_page_time():
+    redis = _FakeRedis()
+    clock = [0.0]
+
+    def tick(seconds):
+        clock[0] += seconds
+        redis.data.now = clock[0]
+
+    before, before_handler = _manager(redis)
+    before._clock = lambda: clock[0]
+    await before.record_external_alert(_avoid(0))
+
+    tick(800)
+    after, after_handler = _manager(_FakeRedis(redis.data))
+    after._clock = lambda: clock[0]
+    await after.record_external_alert(_avoid(1))
+    assert after_handler.calls == []
+
+    # The page happened at t=0, so the cooldown ends at t=900, not t=1700.
+    tick(101)
+    await after.record_external_alert(_avoid(2))
+    assert len(after_handler.calls) == 1
+    assert len(before_handler.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_survives_targets_evicted_while_releasing():
+    manager, handler = _manager(_FakeRedis())
+    await manager.record_external_alert(_avoid(0))
+
+    async def evicting_release(*args, **kwargs):
+        manager._active_external_alerts.clear()
+
+    manager.dedupe_store.release = evicting_release
+
+    await manager.record_external_alert(_next_window(1, guardrail_action="clear"))
+
+    assert [c["status"] for c in handler.calls] == ["firing", "resolved"]
