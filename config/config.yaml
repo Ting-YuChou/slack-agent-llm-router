@@ -98,6 +98,10 @@ logging:
 router:
   default_model: gpt-5
   routing_strategy: intelligent
+  # Half-life of the time-decayed model stats that routing scores with.
+  stats_half_life_seconds: 300
+  # Requests' worth of prior pulling the recent success rate to the lifetime one.
+  stats_prior_weight: 3
   fast_lane_models:
   - qwen3.6-27b-fast
   scoring:
@@ -128,7 +132,6 @@ router:
     - brainstorming
     - planning
     - translation
-    - question_answering
   models:
     gpt-5:
       provider: openai
@@ -280,7 +283,7 @@ inference:
       - general
       - code_generation
       - code_analysis
-      - question_answering
+      - translation
       max_input_tokens: 2048
       max_output_tokens: 1024
       disallow_attachments: true

@@ -13,6 +13,7 @@ This is the unified entry point that orchestrates all system components:
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import multiprocessing as mp
@@ -114,6 +115,23 @@ def _with_request_id(result: Any, request_id: str) -> Any:
     return result
 
 
+def _accepts_keyword(function: Any, name: str) -> bool:
+    """Whether `function` takes keyword `name` (or **kwargs)."""
+    try:
+        parameters = inspect.signature(function).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        or (
+            parameter.name == name
+            and parameter.kind
+            in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        )
+        for parameter in parameters
+    )
+
+
 class ChatIngress:
     """The chat request path /route and Slack share.
 
@@ -129,11 +147,37 @@ class ChatIngress:
     async def process(self, query_request: QueryRequest) -> Tuple[Any, int, Dict]:
         """requests.raw, inference and the status: (result, status, headers)."""
         platform = self._platform
-        await platform._publish_request_raw_event(query_request)
+        classification = self._classify(query_request)
+        await platform._publish_request_raw_event(
+            query_request, classification=classification
+        )
         result = await platform.services["inference"].process_query(query_request)
         result = _with_request_id(result, query_request.request_id)
         status_code, headers = route_response_status(result)
         return result, status_code, headers
+
+    def _classify(self, query_request: QueryRequest) -> Optional[Tuple[str, float]]:
+        """The query type routing will use and its confidence, for requests.raw.
+
+        The router memoizes the classification, so routing reuses it (R13).
+        None when there is no classifying router or it fails: a failure never
+        blocks the request, and requests.raw then goes out without a type.
+        """
+        services = self._platform.services
+        router = getattr(services.get("inference"), "router", None)
+        if router is None:
+            router = services.get("router")
+        classify_request = getattr(router, "classify_request", None)
+        if not callable(classify_request):
+            return None
+        try:
+            query_type, confidence = classify_request(query_request)
+            return str(getattr(query_type, "value", query_type)), float(confidence)
+        except Exception:
+            self._platform.logger.warning(
+                "Query classification failed before requests.raw", exc_info=True
+            )
+            return None
 
     async def record(
         self,
@@ -1284,8 +1328,17 @@ class LLMRouterPlatform:
         """Build backward-compatible health payload."""
         return self._build_readiness_payload()
 
-    async def _publish_request_raw_event(self, query_request: QueryRequest):
-        """Best-effort publication of pre-inference API events."""
+    async def _publish_request_raw_event(
+        self,
+        query_request: QueryRequest,
+        classification: Optional[Tuple[str, float]] = None,
+    ):
+        """Best-effort publication of pre-inference API events.
+
+        `classification` is passed on only when there is one and the
+        producer accepts it, so producers that take just the request keep
+        getting the event (without the type).
+        """
         producer = self.services.get("event_producer")
         if producer is None:
             return
@@ -1295,7 +1348,12 @@ class LLMRouterPlatform:
             return
 
         try:
-            await publish_method(query_request)
+            if classification is None or not _accepts_keyword(
+                publish_method, "classification"
+            ):
+                await publish_method(query_request)
+            else:
+                await publish_method(query_request, classification=classification)
         except Exception as exc:
             self.logger.warning(f"Failed to publish requests.raw event: {exc}")
 

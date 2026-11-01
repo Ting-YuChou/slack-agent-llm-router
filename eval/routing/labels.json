@@ -1,0 +1,33 @@
+{
+  "description": "Routing labeled set (X9b). Each row of labeled.jsonl has query, label (a QueryType value), lang (en | zh) and split (dev | test). Labels follow these definitions, not either classifier's output. Tune on dev only; test is held out for tests/test_routing_eval.py.",
+  "labels": {
+    "general": "Greetings, thanks, small talk, and questions answered from general knowledge: what something is, what a term means, how a well-known concept works, how to do an everyday task. Words such as now, current or today do not make a request web_research on their own.",
+    "code_generation": "Asks for new code: a function, class, script, program, query (SQL), regex, config file (Dockerfile) or tests.",
+    "code_analysis": "Asks about existing code or an error it produced: explain what code does, review it, debug it, fix a bug, read a stack trace, refactor or optimize it.",
+    "analysis": "Asks to analyze, compare, evaluate or assess data, options, documents or systems (not code), and to report findings, trends, risks or trade-offs.",
+    "summarization": "Asks to condense given content: summarize, TL;DR, key points, recap, brief overview of a document, thread, transcript or email.",
+    "creative_writing": "Asks for original prose or verse meant for people: stories, poems, haiku, blog posts, speeches, greetings, welcome or announcement messages, fictional dialogue.",
+    "brainstorming": "Asks for several ideas, names, suggestions or alternatives to choose from.",
+    "planning": "Asks for a plan: steps, phases, milestones, roadmap, timeline, schedule, agenda or itinerary.",
+    "translation": "Asks to translate text between languages, or how to say a word or phrase in another language.",
+    "math": "Asks for a calculation or a math answer: arithmetic, percentages, equations, derivatives, integrals, probability, statistics, unit or rate conversions.",
+    "reasoning": "Asks to reason out an answer that has to be deduced: logic puzzles, whether an argument or inference is valid, step-by-step deduction, or the likely root cause of a described situation.",
+    "web_research": "Needs fresh or external information the model cannot know: news, today's prices or weather, recent releases or events, whether an outside service is down, or an explicit request to search or look something up online."
+  },
+  "tie_breaks": [
+    "The main request decides the label, not words in the material it refers to.",
+    "A request to translate is translation, whatever the text is about.",
+    "A request that needs live or post-cutoff information is web_research, whatever its topic.",
+    "Existing code or an error message to explain, review, fix or improve is code_analysis; a request for new code is code_generation.",
+    "Summarize, recap or TL;DR is summarization, even when the request says write or analyze.",
+    "A pure calculation is math, even when it is phrased as a question or a word problem.",
+    "Several ideas or options is brainstorming; ordered steps, dates or milestones is planning.",
+    "Judging whether an argument or inference holds, or deducing a cause, is reasoning; comparing or assessing options or data is analysis.",
+    "Explaining a well-known concept is general; explaining a specific situation's cause is reasoning.",
+    "question_answering is not used: a factual question is general (or web_research when it needs fresh data). It overlaps general, the router cannot tell them apart from wording, and both route the same way, so the classifier never outputs it."
+  ],
+  "splits": {
+    "dev": "Per label: 7 English and 5 Chinese rows. Used to measure and improve the classifier.",
+    "test": "Per label: 3 English and 2 Chinese rows. Held out; tests/test_routing_eval.py asserts per-class and macro F1 thresholds on it."
+  }
+}
