@@ -631,9 +631,22 @@ class LLMRouterPlatform:
             await self._initialize_background_services()
         self.logger.info("Service initialization complete")
 
+    def _metrics_exporter_enabled(self) -> bool:
+        """Return whether this process should serve Prometheus metrics.
+
+        ``monitoring.prometheus.enabled`` controls the exporter on its own, so
+        the workers' Kafka consumer metrics can be scraped without the
+        monitoring service; when unset it follows ``monitoring.enabled``.
+        """
+        monitoring_config = self.config.get("monitoring", {}) or {}
+        prometheus_config = monitoring_config.get("prometheus", {}) or {}
+        if "enabled" in prometheus_config:
+            return bool(prometheus_config["enabled"])
+        return self._service_enabled("monitoring")
+
     def _start_metrics_server(self):
-        """Start the Prometheus metrics server when monitoring is enabled."""
-        if not self._service_enabled("monitoring"):
+        """Start the Prometheus metrics server when its exporter is enabled."""
+        if not self._metrics_exporter_enabled():
             return
 
         metrics_port = self.config.get("monitoring", {}).get("prometheus_port", 8000)
