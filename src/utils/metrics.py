@@ -457,20 +457,6 @@ class InferenceMetrics:
             ["provider", "model", "outcome"],
         )
 
-        # Context compression metrics
-        self.context_compressions = Counter(
-            "llm_router_context_compressions_total",
-            "Total context compressions",
-            ["method"],
-        )
-
-        self.compression_ratio = Histogram(
-            "llm_router_compression_ratio",
-            "Context compression ratios",
-            ["method"],
-            buckets=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-        )
-
         # Error metrics
         self.errors_total = Counter(
             "llm_router_inference_errors_total",

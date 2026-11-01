@@ -144,6 +144,8 @@ class QueryRequest(BaseModel):
     # can match per-query settings (reasoning effort) to how it was routed.
     _routing_features: Optional[Any] = PrivateAttr(default=None)
     _routing_query_type: Optional[str] = PrivateAttr(default=None)
+    # Provider-scheduler lease waits of this request's attempts (T2).
+    _scheduler_wait_seconds: Optional[float] = PrivateAttr(default=None)
 
     # Required fields
     query: str = Field(..., min_length=1, max_length=50000)
@@ -239,6 +241,16 @@ class InferenceResponse(BaseModel):
     # Performance metrics
     latency_ms: int = Field(ge=0)
     tokens_per_second: float = Field(ge=0.0)
+    # Time this request spent queued: the Slack bot's ingress queue
+    # (metadata ingress_queue_wait_ms) plus provider-scheduler lease waits
+    # summed over every attempt, fallbacks included. None when neither was
+    # measured. Never cached: a cache hit reports its own request's wait.
+    queue_wait_ms: Optional[int] = Field(default=None, ge=0)
+    # The provider-scheduler wait behind this response and when it ended
+    # (time.monotonic), for single-flight followers that share it (T2).
+    # Not serialized.
+    _scheduler_wait_seconds: Optional[float] = PrivateAttr(default=None)
+    _scheduler_wait_ended_at: Optional[float] = PrivateAttr(default=None)
 
     # Cost tracking
     cost_usd: float = Field(ge=0.0)
@@ -687,7 +699,6 @@ class ApiConfig(ConfigModel):
     host: str = "0.0.0.0"
     port: int = Field(8080, ge=1, le=65535)
     log_level: str = "info"
-    cors_origins: List[str] = Field(default_factory=list)
     rate_limiting: ApiRateLimitingConfig = Field(default_factory=ApiRateLimitingConfig)
 
 
@@ -802,13 +813,6 @@ class ProviderEndpointConfig(ConfigModel):
     )
 
 
-class CompressionConfig(ConfigModel):
-    enabled: bool = False
-    max_context_tokens: int = Field(100_000, ge=1)
-    compression_ratio: float = Field(0.3, gt=0.0, le=1.0)
-    method: str = "semantic_graph"
-
-
 class CacheConfig(ConfigModel):
     enabled: bool = False
     backend: str = "memory"
@@ -892,7 +896,6 @@ class InferenceConfig(ConfigModel):
     vllm: ProviderEndpointConfig = Field(default_factory=ProviderEndpointConfig)
     openai: ProviderEndpointConfig = Field(default_factory=ProviderEndpointConfig)
     anthropic: ProviderEndpointConfig = Field(default_factory=ProviderEndpointConfig)
-    compression: CompressionConfig = Field(default_factory=CompressionConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
     batching: BatchingConfig = Field(default_factory=BatchingConfig)
     single_flight: SingleFlightConfig = Field(default_factory=SingleFlightConfig)
@@ -1249,13 +1252,6 @@ class ApiKeysSecurityConfig(ConfigModel):
         return self
 
 
-class JwtSecurityConfig(ConfigModel):
-    enabled: bool = False
-    secret_key_env: str = "JWT_SECRET_KEY"
-    algorithm: str = "HS256"
-    expiration_hours: int = Field(24, ge=1)
-
-
 class CorsSecurityConfig(ConfigModel):
     enabled: bool = False
     allow_origins: List[str] = Field(default_factory=list)
@@ -1266,7 +1262,6 @@ class CorsSecurityConfig(ConfigModel):
 
 class SecurityConfig(ConfigModel):
     api_keys: ApiKeysSecurityConfig = Field(default_factory=ApiKeysSecurityConfig)
-    jwt: JwtSecurityConfig = Field(default_factory=JwtSecurityConfig)
     cors: CorsSecurityConfig = Field(default_factory=CorsSecurityConfig)
     # Request bodies above this size get 413 before they are parsed.
     max_request_body_bytes: int = Field(2 * 1024 * 1024, ge=1)
@@ -1348,12 +1343,9 @@ class DevelopmentConfig(ConfigModel):
 
 
 class FeatureFlagsConfig(ConfigModel):
-    context_compression: bool = True
     semantic_caching: bool = True
-    batch_processing: bool = True
     multi_modal: bool = False
     function_calling: bool = True
-    streaming_responses: bool = True
 
 
 class PipelineConfig(ConfigModel):

@@ -22,7 +22,6 @@ from typing import (
     List,
     Optional,
     Any,
-    AsyncIterator,
     Tuple,
     Sequence,
 )
@@ -684,6 +683,69 @@ async def _await_within(
     return await asyncio.wait_for(awaitable, timeout=max(0.0, time_limit_seconds))
 
 
+INGRESS_QUEUE_WAIT_METADATA_KEY = "ingress_queue_wait_ms"
+
+
+def _number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return max(0.0, float(value))
+
+
+def _add_scheduler_wait(request: Any, wait_seconds: Any) -> None:
+    """Add one provider-scheduler lease wait to the request's total (T2)."""
+    wait = _number(wait_seconds)
+    if wait is None:
+        return
+    previous = _number(getattr(request, "_scheduler_wait_seconds", None)) or 0.0
+    try:
+        request._scheduler_wait_seconds = previous + wait
+    except (AttributeError, TypeError, ValueError):
+        logger.debug("Cannot record the scheduler wait on %r", type(request))
+
+
+def _set_response_scheduler_wait(
+    response: Any, wait_seconds: float, wait_ended_at: float
+) -> None:
+    """Carry the leader's scheduler wait, and when it ended, to followers."""
+    try:
+        response._scheduler_wait_seconds = wait_seconds
+        response._scheduler_wait_ended_at = wait_ended_at
+    except (AttributeError, TypeError, ValueError):
+        logger.debug("Cannot carry the scheduler wait on %r", type(response))
+
+
+def _follower_scheduler_wait(response: Any, joined_at: float) -> Optional[float]:
+    """The part of the leader's scheduler wait a follower joined in time for.
+
+    A follower that joins after the lease was granted waited on the provider
+    call, not the queue, so it is charged nothing.
+    """
+    wait = _number(getattr(response, "_scheduler_wait_seconds", None))
+    ended_at = _number(getattr(response, "_scheduler_wait_ended_at", None))
+    if wait is None or ended_at is None:
+        return None
+    return min(wait, max(0.0, ended_at - joined_at))
+
+
+def request_queue_wait_ms(request: Any) -> Optional[int]:
+    """Ingress queue wait plus scheduler lease waits; None when neither is known.
+
+    The Slack bot sets metadata ingress_queue_wait_ms; /route strips it from
+    client metadata (it is not in CLIENT_METADATA_KEYS).
+    """
+    metadata = getattr(request, "metadata", None)
+    ingress_ms = (
+        _number(metadata.get(INGRESS_QUEUE_WAIT_METADATA_KEY))
+        if isinstance(metadata, dict)
+        else None
+    )
+    scheduler_seconds = _number(getattr(request, "_scheduler_wait_seconds", None))
+    if ingress_ms is None and scheduler_seconds is None:
+        return None
+    return int(round((ingress_ms or 0.0) + (scheduler_seconds or 0.0) * 1000))
+
+
 @dataclass
 class InferenceContext:
     """Context information for inference requests"""
@@ -695,224 +757,6 @@ class InferenceContext:
     token_count_input: int
     compressed_context: bool = False
     cached_response: bool = False
-
-
-class ContextCompressor:
-    """Advanced context compression for long sequences"""
-
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.enabled = bool(config.get("enabled", True))
-        self.compression_ratio = config.get("compression_ratio", 0.3)
-        self.max_context_tokens = config.get("max_context_tokens", 100000)
-        self.method = config.get("method", "semantic_graph")
-        self.tokenizer = None
-
-    async def initialize(self):
-        """Initialize compression components"""
-        if not self.enabled:
-            logger.info("Context compression is disabled")
-            return
-
-        try:
-            # Load tokenizer for token counting
-            from transformers import AutoTokenizer
-
-            self.tokenizer = AutoTokenizer.from_pretrained("microsoft/DialoGPT-medium")
-            logger.info("Context compressor initialized")
-        except Exception as e:
-            logger.warning(f"Failed to initialize context compressor: {e}")
-
-    async def compress_context(self, context: str, target_length: int) -> str:
-        """Compress context to target length while preserving key information"""
-        if not self.enabled:
-            return context
-        if not context or len(context) < target_length:
-            return context
-
-        if self.method == "semantic_graph":
-            return await self._semantic_graph_compression(context, target_length)
-        elif self.method == "sketch_based":
-            return await self._sketch_based_compression(context, target_length)
-        elif self.method == "attention_based":
-            return await self._attention_based_compression(context, target_length)
-        else:
-            return self._sliding_window_compression(context, target_length)
-
-    async def _semantic_graph_compression(
-        self, context: str, target_length: int
-    ) -> str:
-        """Semantic graph-based compression preserving key relationships"""
-        # Split into sentences
-        sentences = self._split_sentences(context)
-        if len(sentences) <= 3:
-            return context
-
-        # Score sentences by importance
-        sentence_scores = await self._score_sentences(sentences)
-
-        # Select top sentences maintaining order
-        selected_indices = sorted(
-            sorted(
-                range(len(sentences)), key=lambda i: sentence_scores[i], reverse=True
-            )[: max(3, int(len(sentences) * self.compression_ratio))]
-        )
-
-        compressed = " ".join(sentences[i] for i in selected_indices)
-
-        # Ensure target length
-        if len(compressed) > target_length:
-            compressed = compressed[:target_length] + "..."
-
-        return compressed
-
-    async def _sketch_based_compression(self, context: str, target_length: int) -> str:
-        """Sketch-based compression using key phrase extraction"""
-        # Extract key phrases and entities
-        key_phrases = self._extract_key_phrases(context)
-
-        # Build compressed version focusing on key information
-        sections = context.split("\n\n")
-        important_sections = []
-
-        for section in sections:
-            if any(phrase.lower() in section.lower() for phrase in key_phrases):
-                important_sections.append(section)
-
-        compressed = "\n\n".join(important_sections)
-
-        if len(compressed) > target_length:
-            compressed = compressed[:target_length] + "..."
-
-        return compressed or context[:target_length]
-
-    async def _attention_based_compression(
-        self, context: str, target_length: int
-    ) -> str:
-        """Attention-based compression (simplified implementation)"""
-        # This would ideally use a trained attention model
-        # For now, implement a heuristic approach
-
-        paragraphs = context.split("\n\n")
-        if len(paragraphs) <= 2:
-            return context[:target_length]
-
-        # Score paragraphs by length and keyword density
-        paragraph_scores = []
-        important_keywords = self._extract_keywords(context)
-
-        for para in paragraphs:
-            score = len(para)  # Length score
-            score += sum(para.lower().count(kw) for kw in important_keywords) * 50
-            paragraph_scores.append(score)
-
-        # Select top paragraphs
-        num_select = max(2, int(len(paragraphs) * self.compression_ratio))
-        top_indices = sorted(
-            range(len(paragraphs)), key=lambda i: paragraph_scores[i], reverse=True
-        )[:num_select]
-
-        # Maintain original order
-        selected_paragraphs = [paragraphs[i] for i in sorted(top_indices)]
-        compressed = "\n\n".join(selected_paragraphs)
-
-        if len(compressed) > target_length:
-            compressed = compressed[:target_length] + "..."
-
-        return compressed
-
-    def _sliding_window_compression(self, context: str, target_length: int) -> str:
-        """Simple sliding window compression"""
-        if len(context) <= target_length:
-            return context
-
-        # Take beginning and end, skip middle
-        keep_start = target_length // 2
-        keep_end = target_length - keep_start - 20  # Reserve space for separator
-
-        start_part = context[:keep_start]
-        end_part = context[-keep_end:]
-
-        return f"{start_part}\n...[COMPRESSED]...\n{end_part}"
-
-    def _split_sentences(self, text: str) -> List[str]:
-        """Split text into sentences"""
-        import re
-
-        sentences = re.split(r"[.!?]+", text)
-        return [s.strip() for s in sentences if s.strip()]
-
-    async def _score_sentences(self, sentences: List[str]) -> List[float]:
-        """Score sentences by importance"""
-        scores = []
-
-        # Simple heuristic scoring
-        for sentence in sentences:
-            score = 0
-
-            # Length factor (prefer medium-length sentences)
-            length = len(sentence.split())
-            if 10 <= length <= 30:
-                score += 2
-            elif length > 30:
-                score += 1
-
-            # Keyword density
-            keywords = ["important", "key", "main", "crucial", "significant", "primary"]
-            score += sum(sentence.lower().count(kw) for kw in keywords)
-
-            # Position factor (first and last sentences often important)
-            if sentences.index(sentence) in [0, len(sentences) - 1]:
-                score += 1
-
-            scores.append(score)
-
-        return scores
-
-    def _extract_key_phrases(self, text: str) -> List[str]:
-        """Extract key phrases from text"""
-        # Simple implementation - in production, use NLP libraries
-        words = text.lower().split()
-
-        # Find repeated phrases
-        phrases = {}
-        for i in range(len(words) - 1):
-            phrase = " ".join(words[i : i + 2])
-            phrases[phrase] = phrases.get(phrase, 0) + 1
-
-        # Return top phrases
-        return sorted(phrases.keys(), key=phrases.get, reverse=True)[:10]
-
-    def _extract_keywords(self, text: str) -> List[str]:
-        """Extract important keywords"""
-        words = text.lower().split()
-
-        # Filter out common words
-        stop_words = {
-            "the",
-            "a",
-            "an",
-            "and",
-            "or",
-            "but",
-            "in",
-            "on",
-            "at",
-            "to",
-            "for",
-            "of",
-            "with",
-            "by",
-        }
-        keywords = [w for w in words if len(w) > 3 and w not in stop_words]
-
-        # Count frequency
-        word_count = {}
-        for word in keywords:
-            word_count[word] = word_count.get(word, 0) + 1
-
-        # Return top keywords
-        return sorted(word_count.keys(), key=word_count.get, reverse=True)[:15]
 
 
 class ResponseCache:
@@ -1057,7 +901,8 @@ class ResponseCache:
         ).hexdigest()
 
     # Trace fields that name the asking message, not what it asks.
-    TRACE_METADATA_KEYS = {"surface"}
+    # Per-request trace values; the answer does not depend on them.
+    TRACE_METADATA_KEYS = {"surface", INGRESS_QUEUE_WAIT_METADATA_KEY}
     SLACK_TRACE_METADATA_KEYS = {"message_ts", "event_id"}
 
     def _cacheable_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
@@ -1195,13 +1040,6 @@ class BaseInferenceProvider(ABC):
         pass
 
     @abstractmethod
-    async def stream_response(
-        self, request: QueryRequest, model_name: str
-    ) -> AsyncIterator[str]:
-        """Stream response for the given request"""
-        pass
-
-    @abstractmethod
     def get_health_status(self) -> Dict[str, Any]:
         """Get provider health status"""
         pass
@@ -1325,14 +1163,6 @@ class BaseInferenceProvider(ABC):
             marker in mime_type for marker in self.TEXT_MIME_MARKERS
         )
 
-    async def generate_batch_responses(
-        self, requests: List[QueryRequest], model_name: str
-    ) -> List[InferenceResponse]:
-        """Generate responses for a batch of requests."""
-        return await asyncio.gather(
-            *(self.generate_response(request, model_name) for request in requests)
-        )
-
 
 class OpenAIProvider(BaseInferenceProvider):
     """OpenAI API provider implementation"""
@@ -1408,26 +1238,6 @@ class OpenAIProvider(BaseInferenceProvider):
 
         except Exception as e:
             logger.error(f"OpenAI inference error: {e}")
-            raise
-
-    async def stream_response(
-        self, request: QueryRequest, model_name: str
-    ) -> AsyncIterator[str]:
-        """Stream response using OpenAI API"""
-        try:
-            prompt = self._build_prompt(request)
-            request_kwargs = self._build_response_request_kwargs(
-                request,
-                model_name,
-                prompt,
-            )
-            async with self.client.responses.stream(**request_kwargs) as stream:
-                async for event in stream:
-                    if event.type == "response.output_text.delta":
-                        yield event.delta
-
-        except Exception as e:
-            logger.error(f"OpenAI streaming error: {e}")
             raise
 
     def _build_response_request_kwargs(
@@ -1699,27 +1509,6 @@ class AnthropicProvider(BaseInferenceProvider):
             logger.error(f"Anthropic inference error: {e}")
             raise
 
-    async def stream_response(
-        self, request: QueryRequest, model_name: str
-    ) -> AsyncIterator[str]:
-        """Stream response using Anthropic API"""
-        try:
-            messages = self._build_messages(request)
-
-            async with self.client.messages.stream(
-                model=model_name,
-                max_tokens=request.max_tokens,
-                temperature=request.temperature,
-                system=self._build_system(),
-                messages=messages,
-            ) as stream:
-                async for text in stream.text_stream:
-                    yield text
-
-        except Exception as e:
-            logger.error(f"Anthropic streaming error: {e}")
-            raise
-
     def _build_messages(self, request: QueryRequest) -> List[Dict[str, Any]]:
         """Build Anthropic messages with an optional cache breakpoint."""
         rag_images = getattr(request, "_rag_images", [])
@@ -1958,7 +1747,7 @@ class vLLMProvider(BaseInferenceProvider):
         start_time = time.time()
         prompt = self._build_prompt(request)
         endpoint_path, payload = self._build_request_payload(
-            prompt, model_name, request, stream=False
+            prompt, model_name, request
         )
         prefix_key = self._prompt_prefix_fingerprint(model_name, prompt)
         excluded_endpoints: set[str] = set()
@@ -2026,57 +1815,6 @@ class vLLMProvider(BaseInferenceProvider):
         if last_error:
             raise last_error
         raise RuntimeError(f"No healthy vLLM endpoint can serve model {model_name}")
-
-    async def stream_response(
-        self, request: QueryRequest, model_name: str
-    ) -> AsyncIterator[str]:
-        """Stream response using vLLM"""
-        endpoint: Optional[VLLMEndpointState] = None
-        try:
-            prompt = self._build_prompt(request)
-            endpoint_path, payload = self._build_request_payload(
-                prompt, model_name, request, stream=True
-            )
-            prefix_key = self._prompt_prefix_fingerprint(model_name, prompt)
-            endpoint = await self._reserve_endpoint(model_name, prefix_key, set())
-            client = self._endpoint_client(endpoint)
-            if client is None:
-                raise RuntimeError(f"vLLM endpoint {endpoint.name} has no client")
-
-            async with client.stream("POST", endpoint_path, json=payload) as response:
-                if response.status_code >= 400:
-                    # Read the error body so the HTTPStatusError carries it.
-                    await response.aread()
-                    response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    raw_data = line[6:]
-                    if raw_data == "[DONE]":
-                        break
-                    data = json.loads(raw_data)
-                    delta = self._extract_stream_delta(data)
-                    if delta:
-                        yield delta
-            await self._mark_endpoint_success(endpoint, prefix_key)
-
-        except Exception as e:
-            if self._is_request_rejection(e):
-                logger.warning("vLLM endpoint rejected the stream request: %s", e)
-                raise
-            if endpoint is not None:
-                await self._mark_endpoint_failure(endpoint, e)
-            logger.error(f"vLLM streaming error: {e}")
-            if isinstance(e, httpx.HTTPStatusError):
-                # str(e) names the internal endpoint URL; the chunk reaches
-                # the user, so it carries only the status.
-                yield f"Error: upstream returned HTTP {e.response.status_code}"
-            else:
-                yield f"Error: {str(e)}"
-
-        finally:
-            if endpoint is not None:
-                await self._release_endpoint(endpoint)
 
     def _build_endpoint_states(self, config: Dict[str, Any]) -> List[VLLMEndpointState]:
         endpoint_configs = config.get("endpoints") or []
@@ -2155,8 +1893,6 @@ class vLLMProvider(BaseInferenceProvider):
         prompt: str,
         model_name: str,
         request: QueryRequest,
-        *,
-        stream: bool,
     ) -> Tuple[str, Dict[str, Any]]:
         if self.api_mode == "chat_completions":
             return (
@@ -2166,7 +1902,7 @@ class vLLMProvider(BaseInferenceProvider):
                     "messages": self._build_chat_messages(prompt),
                     "max_tokens": request.max_tokens,
                     "temperature": request.temperature,
-                    "stream": stream,
+                    "stream": False,
                 },
             )
 
@@ -2177,7 +1913,7 @@ class vLLMProvider(BaseInferenceProvider):
                 "prompt": prompt,
                 "max_tokens": request.max_tokens,
                 "temperature": request.temperature,
-                "stream": stream,
+                "stream": False,
                 "logprobs": None,
             },
         )
@@ -2478,15 +2214,6 @@ class vLLMProvider(BaseInferenceProvider):
             return self._coerce_chat_content(choice.get("message", {}))
         return str(choice.get("text", ""))
 
-    def _extract_stream_delta(self, data: Dict[str, Any]) -> str:
-        choices = data.get("choices") or []
-        if not choices:
-            return ""
-        choice = choices[0]
-        if self.api_mode == "chat_completions":
-            return self._coerce_chat_content(choice.get("delta", {}))
-        return str(choice.get("text", ""))
-
     def _coerce_chat_content(self, message: Any) -> str:
         if not isinstance(message, dict):
             return ""
@@ -2660,7 +2387,12 @@ class SingleFlightCoordinator:
             else None,
             "session_id": request.session_id,
             "conversation_id": request.conversation_id,
-            "metadata": request.metadata,
+            # The ingress wait differs per request and changes no answer.
+            "metadata": {
+                key: value
+                for key, value in (request.metadata or {}).items()
+                if key != INGRESS_QUEUE_WAIT_METADATA_KEY
+            },
             "attachments": attachment_signatures,
             "rag_images": rag_image_signatures,
         }
@@ -2697,7 +2429,6 @@ class InferenceEngine:
         self.rag_service = rag_service
         self.admission_controller = admission_controller
         self.providers = {}
-        self.context_compressor = ContextCompressor(config.get("compression", {}))
         self.cache = ResponseCache(config.get("cache", {}))
         single_flight_config = config.get("single_flight")
         if single_flight_config is None:
@@ -2726,9 +2457,6 @@ class InferenceEngine:
     async def initialize(self):
         """Initialize all providers and components"""
         logger.info("Initializing inference engine...")
-
-        # Initialize context compressor
-        await self.context_compressor.initialize()
 
         # Initialize cache
         await self.cache.initialize()
@@ -2801,25 +2529,6 @@ class InferenceEngine:
         """Return whether the inference engine is ready to process requests."""
         return self._initialized and bool(self.providers)
 
-    async def _compress_request_context_if_needed(self, request: QueryRequest) -> bool:
-        """Canonicalize long context before cache keys are generated."""
-        if not (
-            request.context
-            and len(request.context) > self.context_compressor.max_context_tokens
-        ):
-            return False
-
-        original_length = len(request.context)
-        target_length = int(original_length * self.context_compressor.compression_ratio)
-        request.context = await self.context_compressor.compress_context(
-            request.context,
-            target_length,
-        )
-        logger.info(
-            f"Compressed context from {original_length} to {len(request.context)} chars"
-        )
-        return True
-
     async def _get_cached_inference_response(
         self, request: QueryRequest, model_name: str
     ) -> Optional[InferenceResponse]:
@@ -2849,6 +2558,7 @@ class InferenceEngine:
                 "attempts": 0,
                 # The answer is to this request, not to the one cached.
                 "request_id": request.request_id,
+                "queue_wait_ms": request_queue_wait_ms(request),
             }
         )
 
@@ -2890,10 +2600,7 @@ class InferenceEngine:
             model_name = routing_decision.selected_model
             routed_enrichment = _enrichment_snapshot(request)
 
-            # Step 2: Context compression before cache lookup keeps keys stable.
-            compressed_context = await self._compress_request_context_if_needed(request)
-
-            # Step 3: Optionally enrich school-document requests with RAG context.
+            # Step 2: Optionally enrich school-document requests with RAG context.
             # Retrieval gets a share of the time left, so its own outcome
             # handling runs; the request deadline is only the backstop.
             rag_result = await self._within_request_deadline(
@@ -2925,7 +2632,7 @@ class InferenceEngine:
             )
             model_name = routing_decision.selected_model
 
-            # Step 4: Optionally enrich current-info requests with web search.
+            # Step 3: Optionally enrich current-info requests with web search.
             web_search_result = await self._within_request_deadline(
                 self._run_web_search_if_needed(
                     request,
@@ -2936,7 +2643,7 @@ class InferenceEngine:
                 stage="web_search",
             )
 
-            # Step 4b: RAG and web context came after routing; re-check that
+            # Step 3b: RAG and web context came after routing; re-check that
             # the enriched prompt still fits the model, re-routing if not.
             routing_decision = await self._fit_enriched_prompt(
                 request,
@@ -2946,7 +2653,7 @@ class InferenceEngine:
             )
             model_name = routing_decision.selected_model
 
-            # Step 5: Check full-response cache.
+            # Step 4: Check full-response cache.
             response = await self._get_cached_inference_response(request, model_name)
             if response:
                 logger.info(f"Cache hit for request {request_id}")
@@ -2957,7 +2664,7 @@ class InferenceEngine:
                 )
                 return response
 
-            # Step 6: Generate response, falling back to local models for cloud outages
+            # Step 5: Generate response, falling back to local models for cloud outages
             (
                 response,
                 model_name,
@@ -2968,14 +2675,14 @@ class InferenceEngine:
                 execution_budget=execution_budget,
                 started_calls=started_calls,
             )
-            response.compressed_context = compressed_context
             response.request_id = request.request_id
+            response.queue_wait_ms = request_queue_wait_ms(request)
             self._attach_rag_result(response, rag_result)
             self._attach_web_search_result(response, web_search_result)
 
             response_complete = self._flag_incomplete_response(request, response)
 
-            # Step 7: Cache response; truncated, filtered or empty answers are
+            # Step 6: Cache response; truncated, filtered or empty answers are
             # returned but not cached, so a retry can do better.
             if (
                 response_complete
@@ -2988,7 +2695,8 @@ class InferenceEngine:
                 await self.cache.cache_response(
                     cache_key,
                     response.model_dump(
-                        mode="json", exclude={"provider_request_id", "request_id"}
+                        mode="json",
+                        exclude={"provider_request_id", "request_id", "queue_wait_ms"},
                     ),
                 )
 
@@ -3063,6 +2771,7 @@ class InferenceEngine:
                 finish_reason="error",
                 attempts=len(set(started_calls)),
                 request_id=request_id,
+                queue_wait_ms=request_queue_wait_ms(request),
             )
             # The caller keeps the "error" provider sentinel; analytics get the
             # failed model's real provider so outages count against it.
@@ -3663,6 +3372,7 @@ class InferenceEngine:
             tool_latency_ms=rag_result.latency_ms,
             finish_reason="rag_no_hits",
             request_id=request.request_id,
+            queue_wait_ms=request_queue_wait_ms(request),
         )
 
     def _should_run_web_search(
@@ -3719,137 +3429,6 @@ class InferenceEngine:
         if result.tool_call:
             response.tool_calls = [*response.tool_calls, result.tool_call]
             response.tool_latency_ms += result.latency_ms
-
-    async def stream_query(self, request: QueryRequest) -> AsyncIterator[str]:
-        """Stream query response"""
-        start_time = time.time()
-        try:
-            # Route query
-            routing_decision = await self.router.route_query(request)
-            model_name = routing_decision.selected_model
-            await self._compress_request_context_if_needed(request)
-            rag_result = await self._run_rag_if_needed(request, routing_decision)
-            if rag_result and rag_result.required_no_hits:
-                response = self._build_required_rag_no_hit_response(
-                    request,
-                    model_name,
-                    rag_result,
-                    start_time,
-                )
-                await self._finalize_successful_response(
-                    request,
-                    response,
-                    model_name,
-                    routing_decision,
-                    start_time,
-                )
-                yield "文件庫沒有足夠資訊可以回答這個問題。"
-                return
-            routing_decision = await self._prepare_rag_images(
-                request, routing_decision, rag_result
-            )
-            model_name = routing_decision.selected_model
-            await self._run_web_search_if_needed(request, routing_decision)
-
-            cached_response = await self._get_cached_inference_response(
-                request,
-                model_name,
-            )
-            if cached_response:
-                await self._publish_analytics_events(
-                    request,
-                    cached_response,
-                    routing_decision=routing_decision,
-                )
-                async for chunk in self._stream_cached_response(cached_response):
-                    yield chunk
-                return
-
-            # Get provider
-            provider = self._get_provider_for_model(model_name)
-            if not provider:
-                if getattr(request, "_rag_images", []):
-                    response, _, _ = await self._execute_pre_token_vision_fallback(
-                        request, routing_decision, model_name
-                    )
-                    yield response.response_text
-                    return
-                yield f"Error: No provider available for model: {model_name}"
-                return
-
-            model_info = self.router.get_model_info(model_name) or {}
-            provider_name = (
-                model_info.get("config", {}).get("provider")
-                or getattr(provider, "provider_name", None)
-                or "unknown"
-            )
-            request_started_at_ms = int(time.time() * 1000)
-            lease = None
-            pre_token_failure: Optional[Exception] = None
-            emitted_token = False
-            try:
-                lease = await self.scheduler.acquire(
-                    request=request,
-                    model_name=model_name,
-                    provider=str(provider_name),
-                    estimated_input_tokens=self._estimate_provider_admission_input_tokens(
-                        request
-                    ),
-                )
-                try:
-                    async for chunk in provider.stream_response(request, model_name):
-                        emitted_token = True
-                        yield chunk
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    await self.scheduler.record_failure(
-                        provider=str(provider_name),
-                        model_name=model_name,
-                        error=exc,
-                        request_started_at_ms=request_started_at_ms,
-                        circuit_permit=lease.circuit_permit,
-                    )
-                    if emitted_token or not getattr(request, "_rag_images", []):
-                        raise
-                    pre_token_failure = exc
-                else:
-                    await self.scheduler.record_success(
-                        provider=str(provider_name),
-                        model_name=model_name,
-                        request_started_at_ms=request_started_at_ms,
-                        circuit_permit=lease.circuit_permit,
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                if not getattr(request, "_rag_images", []):
-                    raise
-                pre_token_failure = exc
-            finally:
-                if lease is not None:
-                    await self.scheduler.release(lease, actual_tokens=None)
-            if pre_token_failure is not None:
-                response, _, _ = await self._execute_pre_token_vision_fallback(
-                    request, routing_decision, model_name
-                )
-                yield response.response_text
-                return
-
-        except AdmissionRejectedError as exc:
-            yield f"Error: {exc.decision.reason}"
-        except Exception:
-            logger.exception("Streaming failed")
-            yield "Error: Request processing failed"
-
-    async def _stream_cached_response(
-        self, response: InferenceResponse
-    ) -> AsyncIterator[str]:
-        """Yield cached full responses in deterministic chunks for streaming clients."""
-        chunk_size = int(self.config.get("stream_cache_chunk_chars", 512) or 512)
-        chunk_size = max(chunk_size, 1)
-        for index in range(0, len(response.response_text), chunk_size):
-            yield response.response_text[index : index + chunk_size]
 
     def _configured_provider_name(self, model_name: str) -> Optional[str]:
         """Return the provider configured for a model, or None when unknown."""
@@ -3913,7 +3492,7 @@ class InferenceEngine:
                 started_calls=started_calls,
             )
         if execution_budget.remaining_seconds <= 0:
-            # Routing, compression, image prep or the cache lookup used the
+            # Routing, image prep or the cache lookup used the
             # whole deadline: no model or provider is to blame.
             raise RequestStageDeadlineError(
                 "request deadline reached before the model call"
@@ -4409,6 +3988,9 @@ class InferenceEngine:
         provider = self._get_provider_for_model(model_name)
         if not provider:
             raise ValueError(f"No provider available for model: {model_name}")
+        # Lease waits add up on the caller's request: the capped copy below
+        # lives only for this model's call.
+        caller_request = request
         request = self._request_within_output_cap(request, model_name)
 
         model_info = self.router.get_model_info(model_name) or {}
@@ -4428,11 +4010,23 @@ class InferenceEngine:
                 started_calls.append(model_name)
             return await provider.generate_response(request, model_name)
 
+        led_call = False
+        leader_waits: List[float] = []
+        wait_ended_at = 0.0
+
+        def record_wait(seconds: float) -> None:
+            nonlocal wait_ended_at
+            leader_waits.append(seconds)
+            wait_ended_at = time.monotonic()
+            _add_scheduler_wait(caller_request, seconds)
+
         async def admitted_call() -> InferenceResponse:
+            nonlocal led_call
+            led_call = True
             estimated_input_tokens = await self._admission_input_tokens(
                 request, model_name
             )
-            return await self.scheduler.run_provider_call(
+            response = await self.scheduler.run_provider_call(
                 request=request,
                 model_name=model_name,
                 provider=str(provider_name),
@@ -4442,11 +4036,25 @@ class InferenceEngine:
                 attempt_timeout_seconds=attempt_timeout_seconds,
                 fallback_reserve_seconds=fallback_reserve_seconds,
                 reserve_attempts=reserve_attempts,
+                on_queue_wait=record_wait,
             )
+            # Single-flight followers share this response: it carries the
+            # leader's scheduler wait to them. No wait (scheduler disabled)
+            # leaves them none either.
+            if leader_waits:
+                _set_response_scheduler_wait(response, sum(leader_waits), wait_ended_at)
+            return response
 
-        return await self.single_flight.run(
+        joined_at = time.monotonic()
+        response = await self.single_flight.run(
             request, provider, model_name, admitted_call
         )
+        if not led_call:
+            # A follower shares the leader's queue wait from when it joined.
+            _add_scheduler_wait(
+                caller_request, _follower_scheduler_wait(response, joined_at)
+            )
+        return response
 
     async def _admission_input_tokens(
         self, request: QueryRequest, model_name: str
@@ -5049,7 +4657,6 @@ class InferenceEngine:
             "inference_engine": "healthy",
             "providers": provider_health,
             "cache_enabled": self.cache.enabled,
-            "compression_enabled": self.context_compressor.config.get("enabled", True),
             "web_search_enabled": bool(
                 self.web_search_tool and self.web_search_tool.enabled
             ),

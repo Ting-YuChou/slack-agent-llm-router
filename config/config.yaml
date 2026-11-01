@@ -10,8 +10,6 @@ api:
   host: 0.0.0.0
   port: 8080
   log_level: info
-  cors_origins:
-  - '*'
   rate_limiting:
     enabled: true
     requests_per_minute: 1000
@@ -207,6 +205,10 @@ router:
       max_tokens: 8192
       context_window: 8192
       cost_per_token: 1.0e-06
+      pricing:
+        input: 1.0
+        cached_input: 1.0
+        output: 1.0
       priority: 3
       allowed_tiers:
       - free
@@ -222,6 +224,10 @@ router:
       max_tokens: 128000
       context_window: 128000
       cost_per_token: 5.0e-06
+      pricing:
+        input: 5.0
+        cached_input: 5.0
+        output: 5.0
       priority: 4
       allowed_tiers:
       - free
@@ -302,11 +308,6 @@ inference:
       pricing:
         cache_creation_input_multiplier: 1.25
         cache_read_input_multiplier: 0.1
-  compression:
-    enabled: true
-    max_context_tokens: 100000
-    compression_ratio: 0.3
-    method: semantic_graph
   cache:
     enabled: true
     backend: redis
@@ -980,11 +981,6 @@ security:
     #     active: 20
     #     allow_priority: false
     clients: []
-  jwt:
-    enabled: false
-    secret_key_env: JWT_SECRET_KEY
-    algorithm: HS256
-    expiration_hours: 24
   cors:
     enabled: true
     allow_origins:
@@ -1017,12 +1013,9 @@ development:
   profiling: false
   mock_external_apis: false
 features:
-  context_compression: true
   semantic_caching: true
-  batch_processing: true
   multi_modal: false
   function_calling: true
-  streaming_responses: true
 pipeline:
   enabled: false
 shutdown:

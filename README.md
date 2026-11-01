@@ -800,7 +800,6 @@ need one are skipped. The Kafka/ClickHouse integration tests are opt-in with
 ## Notes And Limitations
 
 - root compose does not start a local `vLLM` model server
-- `stream_query` does not currently have the same cloud-to-local fallback path as the main non-streaming route
 - monitoring in this repo is API/dashboard-oriented; root compose does not start Grafana or Prometheus UI services
 - Slack `redis` backend is the right choice for durability, but true production rollout still needs secret management and runtime ops hardening
 
