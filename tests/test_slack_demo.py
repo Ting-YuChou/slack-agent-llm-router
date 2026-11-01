@@ -120,8 +120,14 @@ WEB_API_METHOD_SCOPES = {
 
 
 def test_demo_manifest_grants_every_scope_the_bot_calls_need():
-    source = (ROOT / "slack" / "bot_real.py").read_text(encoding="utf-8")
-    called = set(re.findall(r"\bweb_client\.([A-Za-z_][A-Za-z0-9_]*)\(", source))
+    called = {
+        method
+        for path in sorted((ROOT / "slack").glob("*.py"))
+        for method in re.findall(
+            r"\bweb_client\.([A-Za-z_][A-Za-z0-9_]*)\(",
+            path.read_text(encoding="utf-8"),
+        )
+    }
     manifest = yaml.safe_load(
         (ROOT / "slack" / "app-manifest.demo.yaml").read_text(encoding="utf-8")
     )
@@ -819,7 +825,11 @@ def test_setup_guide_lists_every_env_var_the_launcher_requires():
 
 @pytest.mark.asyncio
 async def test_setup_guide_lists_every_agent_subcommand_in_the_help():
-    handler = SlackMessageHandler(SimpleNamespace(agent_runtime_client=object()))
+    handler = SlackMessageHandler(
+        SimpleNamespace(
+            agent_runtime_client=object(), _format_tier_limit_summary=lambda: ""
+        )
+    )
     help_text = await handler._handle_help_command([], "U1", "C1", None)
     guide = SETUP_GUIDE.read_text(encoding="utf-8")
 

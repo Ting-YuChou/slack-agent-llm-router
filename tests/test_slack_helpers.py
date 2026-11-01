@@ -40,6 +40,7 @@ from slack.bot_real import (
     FileSlackStateStore,
     RedisSlackStateStore,
     SlackBot,
+    SlackFetchedContext,
     SlackMessageHandler,
     SlackWorkItem,
     UserManager,
@@ -784,6 +785,7 @@ class TestSlackMessageHandler:
     async def test_help_and_status_expose_agent_mode_and_runtime_health(self):
         agent_runtime = SimpleNamespace(health=AsyncMock(return_value=True))
         bot = SimpleNamespace(
+            _format_tier_limit_summary=lambda: "",
             user_manager=UserManager(),
             conversation_manager=ConversationManager({}),
             inference_engine=SimpleNamespace(),
@@ -830,7 +832,11 @@ class TestSlackMessageHandler:
     @pytest.mark.asyncio
     async def test_help_lists_every_command_subcommand_and_flag_the_bot_parses(self):
         runtime = SimpleNamespace(health_details=AsyncMock(return_value=None))
-        handler = SlackMessageHandler(SimpleNamespace(agent_runtime_client=runtime))
+        handler = SlackMessageHandler(
+            SimpleNamespace(
+                agent_runtime_client=runtime, _format_tier_limit_summary=lambda: ""
+            )
+        )
 
         help_text = await handler._handle_help_command([], "u1", "c1", None)
 
@@ -878,6 +884,7 @@ class TestSlackMessageHandler:
             )
         )
         bot = SimpleNamespace(
+            _format_tier_limit_summary=lambda: "",
             agent_runtime_client=runtime,
             get_available_models=AsyncMock(return_value=[]),
         )
@@ -899,6 +906,7 @@ class TestSlackMessageHandler:
             cached_configured_models=lambda: ["openai/gpt-5.6-luna"],
         )
         bot = SimpleNamespace(
+            _format_tier_limit_summary=lambda: "",
             agent_runtime_client=runtime,
             get_available_models=AsyncMock(return_value=[]),
         )
@@ -1376,6 +1384,7 @@ class TestSlackAgentApprovals:
     @pytest.mark.asyncio
     async def test_settings_command_updates_preferences(self):
         bot = SimpleNamespace(
+            _persist_user_state=AsyncMock(),
             user_manager=UserManager(),
             conversation_manager=ConversationManager({}),
             inference_engine=SimpleNamespace(process_query=AsyncMock()),
@@ -1395,6 +1404,7 @@ class TestSlackAgentApprovals:
     @pytest.mark.asyncio
     async def test_settings_command_validates_and_clears_preferred_models(self):
         bot = SimpleNamespace(
+            _persist_user_state=AsyncMock(),
             user_manager=UserManager(),
             router=SimpleNamespace(models={"gpt-5": object(), "mistral-7b": object()}),
             conversation_manager=ConversationManager({}),
@@ -1422,6 +1432,11 @@ class TestSlackAgentApprovals:
     @pytest.mark.asyncio
     async def test_handle_query_updates_history(self, inference_response_factory):
         bot = SimpleNamespace(
+            services={},
+            _build_query_metadata=lambda **_kwargs: {},
+            _conversation_context_key=lambda user_id, channel_id, thread_ts: f"{user_id}:{channel_id}:{thread_ts or 'main'}",
+            memory_manager=None,
+            _build_slack_context=AsyncMock(return_value=SlackFetchedContext()),
             user_manager=UserManager(),
             conversation_manager=ConversationManager({}),
             inference_engine=SimpleNamespace(
@@ -1480,6 +1495,9 @@ class TestSlackAgentApprovals:
             )
         )
         bot = SimpleNamespace(
+            services={},
+            memory_manager=None,
+            _build_slack_context=AsyncMock(return_value=SlackFetchedContext()),
             user_manager=user_manager,
             conversation_manager=ConversationManager({}),
             inference_engine=inference_engine,
@@ -1672,6 +1690,9 @@ class TestSlackAgentApprovals:
             )
         )
         bot = SimpleNamespace(
+            services={},
+            memory_manager=None,
+            _build_slack_context=AsyncMock(return_value=SlackFetchedContext()),
             user_manager=UserManager(),
             conversation_manager=ConversationManager({}),
             inference_engine=inference_engine,
@@ -1714,6 +1735,9 @@ class TestSlackAgentApprovals:
             )
         )
         bot = SimpleNamespace(
+            services={},
+            memory_manager=None,
+            _build_slack_context=AsyncMock(return_value=SlackFetchedContext()),
             user_manager=UserManager(),
             conversation_manager=ConversationManager({}),
             inference_engine=inference_engine,
@@ -1752,6 +1776,11 @@ class TestSlackAgentApprovals:
         self, inference_response_factory
     ):
         bot = SimpleNamespace(
+            _build_slack_context=AsyncMock(return_value=SlackFetchedContext()),
+            memory_manager=None,
+            services={},
+            _build_query_metadata=lambda **_kwargs: {},
+            _conversation_context_key=lambda user_id, channel_id, thread_ts: f"{user_id}:{channel_id}:{thread_ts or 'main'}",
             user_manager=UserManager(),
             conversation_manager=ConversationManager({}),
             inference_engine=SimpleNamespace(
@@ -1916,6 +1945,8 @@ class TestSlackAgentApprovals:
             )
         )
         bot = SimpleNamespace(
+            services={},
+            _build_slack_context=AsyncMock(return_value=SlackFetchedContext()),
             user_manager=UserManager(),
             conversation_manager=ConversationManager({}),
             inference_engine=inference_engine,

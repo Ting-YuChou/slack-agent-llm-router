@@ -13,6 +13,7 @@ from slack.bot_real import (
     SLACK_EMPTY_ANSWER_MESSAGE,
     SLACK_THINKING_TEXT,
     SlackBot,
+    slack_chat_request_id,
 )
 
 
@@ -737,7 +738,11 @@ async def test_command_replies_and_errors_stay_plain_text(
     await bot._process_message(top_level(ts="101.0", text="!llm help"))
     help_reply = bot.web_client.chat_postMessage.await_args.kwargs
 
-    assert "blocks" not in error_reply
+    reference = slack_chat_request_id(None, "C1", "100.0")[:8]
+    assert error_reply["blocks"][-1] == {
+        "type": "context",
+        "elements": [{"type": "mrkdwn", "text": f"Reference: `{reference}`"}],
+    }
     assert help_reply == {"channel": "C1", "text": "help text", "thread_ts": "101.0"}
 
 

@@ -461,7 +461,7 @@ class AgentBootstrapBuilder:
         if not isinstance(element, dict):
             return ""
         element_type = element.get("type")
-        if element_type in {"text", "plain_text"}:
+        if element_type in {"text", "plain_text", "mrkdwn"}:
             return str(element.get("text") or "")
         if element_type == "link":
             url = str(element.get("url") or "")
@@ -483,7 +483,11 @@ class AgentBootstrapBuilder:
         if parts:
             separator = " " if element_type == "rich_text_section" else "\n"
             return separator.join(parts)
-        return str(element.get("text") or "")
+        text = element.get("text")
+        if isinstance(text, dict):
+            # A section block's text is a text object, not a string.
+            return self._render_rich_element(text)
+        return str(text or "")
 
     async def _load_resource(
         self, client: Any, file_payload: Dict[str, Any]
