@@ -15,7 +15,7 @@ import math
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Type, cast
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.structs import TopicPartition
@@ -298,7 +298,7 @@ def _is_rejected_by_redis(exc: BaseException) -> bool:
     return not (words and words[0].upper() in _TRANSIENT_REPLY_CODES)
 
 
-def _commit_lost_errors() -> Tuple[type, ...]:
+def _commit_lost_errors() -> Tuple[Type[BaseException], ...]:
     """aiokafka's errors for a commit lost to a rebalance or a left group."""
     try:
         from aiokafka import errors as kafka_errors
@@ -1689,7 +1689,7 @@ class PolicyMaterializer:
             return
         records = await getmany(timeout_ms=max(1, int(seconds * 1000)))
         for partition, batch in (records or {}).items():
-            offsets = [
+            offsets: List[Any] = [
                 getattr(record, "offset", None)
                 for record in batch
                 if getattr(record, "offset", None) is not None
@@ -1868,8 +1868,10 @@ class PolicyMaterializer:
         if isinstance(failure_reason, str) and failure_reason:
             payload["failure_reason"] = failure_reason
         key = f"{source_topic}:{partition}:{offset}"
+        # Only called while a DLQ producer is set (see _skip_invalid_message).
+        producer = cast(Any, self.dlq_producer)
         await asyncio.wait_for(
-            self.dlq_producer.send_and_wait(dlq_topic, key=key, value=payload),
+            producer.send_and_wait(dlq_topic, key=key, value=payload),
             timeout=self.dlq_send_timeout_seconds,
         )
         PIPELINE_METRICS.dead_letter_messages.labels(topic=topic_key).inc()
