@@ -1005,7 +1005,6 @@ class ClickHouseConfig(ConfigModel):
     password: str = ""
     connect_timeout_seconds: float = Field(2.0, gt=0)
     send_receive_timeout_seconds: float = Field(10.0, gt=0)
-    tables: Dict[str, Any] = Field(default_factory=dict)
     dashboard: Dict[str, Any] = Field(
         default_factory=lambda: {
             "cache_ttl_seconds": 5,
