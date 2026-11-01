@@ -601,16 +601,20 @@ class PipelineMetrics:
             ["topic"],
         )
 
+        # Both consumer gauges carry topic (the Kafka topic name) and
+        # topic_key (the consumer's key: the config topic key for the sink,
+        # "<key>_observer" for an observer-group consumer), so alert rules
+        # can join them on topic_key.
         self.consumer_lag = Gauge(
             "llm_router_kafka_consumer_lag",
-            "Kafka consumer lag",
-            ["topic", "partition"],
+            "Kafka consumer lag at the last consumed message",
+            ["topic", "partition", "topic_key"],
         )
 
         self.last_consumed_timestamp = Gauge(
             "llm_router_kafka_last_consumed_timestamp_seconds",
             "Unix timestamp of the latest successfully consumed Kafka message",
-            ["topic"],
+            ["topic", "topic_key"],
         )
 
         # ClickHouse metrics

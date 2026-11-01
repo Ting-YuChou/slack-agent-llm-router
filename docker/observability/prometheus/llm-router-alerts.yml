@@ -49,13 +49,32 @@ groups:
           summary: "Messages sent to the dead-letter topic ({{ $labels.topic }})"
           description: "The ingestion consumer could not persist some messages and dead-lettered them."
       - alert: LLMRouterKafkaConsumerLagHigh
-        expr: sum by (topic) (llm_router_kafka_consumer_lag) > 10000
+        # Sink consumers only: observer consumers (topic_key "requests_enriched"
+        # or "<key>_observer") read the same topics and start at latest.
+        expr: sum by (topic, topic_key) (llm_router_kafka_consumer_lag{topic_key!~"requests_enriched|.+_observer"}) > 10000
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "Kafka consumer lag is high ({{ $labels.topic }})"
+          summary: "Kafka consumer lag is high ({{ $labels.topic }}, {{ $labels.topic_key }})"
           description: "Ingestion is more than 10000 messages behind for 10 minutes."
+      - alert: LLMRouterKafkaConsumerStalled
+        # Both gauges carry topic_key, the consumer key: "<key>" for a sink
+        # consumer, "<key>_observer" for an observer, and the bare
+        # "requests_enriched" for its observer-only consumer. All of them are
+        # covered. Lag is recorded at each consumed message and refreshed from
+        # the broker every lag_refresh_interval_seconds, so a consumer that
+        # stops while records arrive shows lag > 0 and an ageing timestamp.
+        expr: |
+          (max by (topic_key) (llm_router_kafka_consumer_lag) > 0)
+          and on (topic_key)
+          (time() - max by (topic_key) (llm_router_kafka_last_consumed_timestamp_seconds) > 300)
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer stalled ({{ $labels.topic_key }})"
+          description: "The consumer is behind its topic but has consumed nothing for over 5 minutes."
       - alert: LLMRouterKafkaConsumerPartitionsPaused
         expr: sum by (topic) (llm_router_kafka_consumer_paused_partitions) > 0
         for: 10m

@@ -84,9 +84,7 @@ TEST_CONFIG = {
         'bootstrap_servers': ['localhost:9092'],
         'topics': {
             'queries': 'test-llm-queries',
-            'responses': 'test-llm-responses',
-            'metrics': 'test-llm-metrics',
-            'errors': 'test-llm-errors'
+            'metrics': 'test-llm-metrics'
         },
         'producer': {
             'acks': 'all',

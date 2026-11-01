@@ -6,8 +6,12 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
+from src.event_version import (
+    EVENT_SCHEMA_VERSION as EVENT_SCHEMA_VERSION,
+    is_supported_event_version,
+)
 from src.redaction import context_summary
 from src.routing_features import (
     CODE_KEYWORDS as CODE_KEYWORDS,
@@ -21,7 +25,6 @@ from src.routing_features import (
     infer_query_type as infer_query_type,
 )
 
-EVENT_SCHEMA_VERSION = "1.0"
 REQUESTS_RAW_EVENT = "requests.raw"
 REQUESTS_ENRICHED_EVENT = "requests.enriched"
 INFERENCE_COMPLETED_EVENT = "inference.completed"
@@ -30,6 +33,9 @@ ALERT_EVENT = "alerts"
 MODEL_METRICS_1M_EVENT = "analytics.model_metrics_1m"
 ROUTING_GUARDRAIL_EVENT = "routing.guardrails"
 ROUTING_POLICY_STATE_EVENT = "routing.policy_state"
+# Mapper output for an input the job drops; no filter or sink selects it.
+DROPPED_EVENT = "dropped"
+UNSUPPORTED_EVENT_VERSION_COUNTER = "unsupported_event_version_dropped"
 REQUIRED_REQUEST_FIELDS = ("request_id", "query_text", "user_id", "user_tier")
 REQUIRED_COMPLETION_FIELDS = (
     "request_id",
@@ -174,6 +180,19 @@ def completion_event_timestamp_ms(
         or event.get("request_timestamp"),
         default_ms=default_ms,
     )
+
+
+def unsupported_event_version_drop(data: Any) -> Optional[Dict[str, Any]]:
+    """The dropped-event marker for an event with an unsupported version (A12b).
+
+    Returns None for events the jobs can read: a missing version (legacy) or
+    one with the supported major. The marker carries no input fields.
+    """
+    if isinstance(data, dict) and not is_supported_event_version(
+        data.get("event_version")
+    ):
+        return {"event_type": DROPPED_EVENT}
+    return None
 
 
 def normalize_request_event(data: Dict[str, Any]) -> Dict[str, Any]:

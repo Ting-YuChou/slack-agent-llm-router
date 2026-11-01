@@ -263,6 +263,11 @@ if _missing("aiokafka"):
     aiokafka_structs.TopicPartition = _TopicPartition
     aiokafka_errors.KafkaError = Exception
 
+    class _CommitFailedError(Exception):
+        pass
+
+    aiokafka_errors.CommitFailedError = _CommitFailedError
+
 
 if _missing("clickhouse_connect"):
     clickhouse_connect = _ensure_module("clickhouse_connect")
