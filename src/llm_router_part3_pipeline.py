@@ -3892,8 +3892,10 @@ class KafkaConsumerManager:
             await self._refresh_batch_backpressure(topic_key)
 
             started_at = time.perf_counter()
+            insert_seconds: Optional[float] = None
             try:
                 await insert_method(batch)
+                insert_seconds = time.perf_counter() - started_at
             except Exception as error:
                 kind = _classify_insert_error(error)
                 unresolved: List[Any] = batch
@@ -3907,15 +3909,6 @@ class KafkaConsumerManager:
                     self._record_flush_failure(topic_key, kind)
                     await self._refresh_batch_backpressure(topic_key)
                     raise failure or error
-            else:
-                # Only a batch written in one insert: a failed one is restored
-                # and flushed again, and a bisected one is many small inserts.
-                PIPELINE_METRICS.batch_size.labels(processor=topic_key).observe(
-                    len(batch)
-                )
-                PIPELINE_METRICS.batch_processing_time.labels(
-                    processor=topic_key
-                ).observe(time.perf_counter() - started_at)
 
             state.inflight_rows = 0
             self._record_flush_success(topic_key)
@@ -3926,6 +3919,24 @@ class KafkaConsumerManager:
                     topic_key, self.awaiting_commit_offsets[topic_key]
                 )
                 self._replace_awaiting_offsets(topic_key, {})
+            if insert_seconds is not None:
+                self._observe_flush(topic_key, len(batch), insert_seconds)
+
+    @staticmethod
+    def _observe_flush(topic_key: str, rows: int, seconds: float) -> None:
+        """Record a batch written in one insert.
+
+        A failed batch is restored and flushed again, and a bisected one is
+        many small inserts, so neither is recorded. Called after the flush's
+        own bookkeeping: a metric must never keep written rows uncommitted.
+        """
+        try:
+            PIPELINE_METRICS.batch_size.labels(processor=topic_key).observe(rows)
+            PIPELINE_METRICS.batch_processing_time.labels(processor=topic_key).observe(
+                seconds
+            )
+        except Exception:
+            logger.warning("Flush metrics could not be recorded", exc_info=True)
 
     def _restore_detached_batch(
         self,
