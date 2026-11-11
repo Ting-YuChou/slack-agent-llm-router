@@ -2160,7 +2160,7 @@ async def test_progress_heartbeat_is_configurable(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_a_failed_update_is_retried_at_the_next_interval(tmp_path):
+async def test_a_failed_update_is_retried_on_the_next_poll(tmp_path):
     now = [0.0]
     bot, tracked = heartbeat_bot(tmp_path, now)
     run = progress_state("R1", "running", 3, 2, 0.01, "verifying")

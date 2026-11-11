@@ -971,6 +971,7 @@ def _fake_aiohttp(sessions):
         ClientSession=client_session,
         ClientTimeout=lambda **kwargs: ("timeout", kwargs),
         TCPConnector=lambda **kwargs: ("connector", kwargs),
+        DummyCookieJar=lambda: "no cookies",
     )
 
 
@@ -1016,8 +1017,59 @@ async def test_initialize_shares_one_http_session_with_the_web_client(monkeypatc
     assert created["web_client"].session is sessions[0]
     # The SDK applies its 30 s timeout only to sessions it creates itself.
     assert sessions[0].kwargs["timeout"] == ("timeout", {"total": 30})
-    assert sessions[0].kwargs["connector"] == ("connector", {"keepalive_timeout": 60})
+    assert sessions[0].kwargs["connector"] == ("connector", {"keepalive_timeout": 30})
+    # Per-call sessions kept no cookies between calls; neither does this one.
+    assert sessions[0].kwargs["cookie_jar"] == "no cookies"
     assert sessions[0].closed is False
+
+
+@pytest.mark.asyncio
+async def test_the_shared_session_keeps_the_clients_own_timeout(monkeypatch):
+    sessions, created = [], {}
+    monkeypatch.setitem(sys.modules, "aiohttp", _fake_aiohttp(sessions))
+    bot = _shared_session_bot(monkeypatch, created)
+    original = sys.modules["slack.bot_real"].AsyncWebClient
+
+    class SlowClient(original):
+        def __init__(self, token):
+            super().__init__(token)
+            self.timeout = 75
+
+    monkeypatch.setattr("slack.bot_real.AsyncWebClient", SlowClient)
+
+    await bot.initialize()
+
+    # With a supplied session the SDK no longer applies the client's timeout.
+    assert sessions[0].kwargs["timeout"] == ("timeout", {"total": 75})
+
+
+@pytest.mark.asyncio
+async def test_initializing_again_closes_the_previous_session(monkeypatch):
+    sessions, created = [], {}
+    monkeypatch.setitem(sys.modules, "aiohttp", _fake_aiohttp(sessions))
+    bot = _shared_session_bot(monkeypatch, created)
+
+    await bot.initialize()
+    await bot.initialize()
+
+    assert [session.close_calls for session in sessions] == [1, 0]
+    assert created["web_client"].session is sessions[1]
+    await bot.shutdown()
+    assert [session.close_calls for session in sessions] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_closes_the_session_when_an_earlier_step_fails(monkeypatch):
+    sessions, created = [], {}
+    monkeypatch.setitem(sys.modules, "aiohttp", _fake_aiohttp(sessions))
+    bot = _shared_session_bot(monkeypatch, created)
+    await bot.initialize()
+    bot.state_store.shutdown = AsyncMock(side_effect=RuntimeError("redis down"))
+
+    with pytest.raises(RuntimeError):
+        await bot.shutdown()
+
+    assert sessions[0].close_calls == 1
 
 
 @pytest.mark.asyncio
