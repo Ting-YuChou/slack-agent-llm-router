@@ -645,14 +645,30 @@ class PipelineMetrics:
             "llm_router_batch_size",
             "Batch processing sizes",
             ["processor"],
-            buckets=[1, 5, 10, 25, 50, 100, 250, 500, 1000, float("inf")],
+            # Up to the sink's high watermark: a catch-up flush writes it all.
+            buckets=[1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, float("inf")],
         )
 
         self.batch_processing_time = Histogram(
             "llm_router_batch_processing_time_seconds",
             "Batch processing time",
             ["processor"],
-            buckets=[0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0, float("inf")],
+            # A healthy ClickHouse insert takes tens of milliseconds.
+            buckets=[
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.1,
+                0.5,
+                1.0,
+                5.0,
+                10.0,
+                30.0,
+                60.0,
+                300.0,
+                float("inf"),
+            ],
         )
 
 

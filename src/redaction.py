@@ -21,7 +21,17 @@ from __future__ import annotations
 
 import bisect
 import re
-from typing import Any, Callable, Dict, List, Match, Optional, Pattern, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Match,
+    Optional,
+    Pattern,
+    Sequence,
+    Tuple,
+)
 
 REDACTED = "[REDACTED]"
 
@@ -849,12 +859,40 @@ def is_credential_key(key: Any) -> bool:
     return bool(_CREDENTIAL_KEY.search(_CAMEL_BOUNDARY.sub("_", key)))
 
 
+# Rounds after the first; reached only by input built to chain credentials.
+_MAX_EXTRA_ROUNDS = 4
+
+
+def _run_steps(text: str, steps: Sequence[Callable[[str], str]]) -> Tuple[str, int]:
+    """Apply `steps` in order; return the text and how many leading steps
+    ran up to and including the last one that changed it (0 if none did)."""
+    reach = 0
+    for index, step in enumerate(steps, start=1):
+        masked = step(text)
+        if masked != text:
+            text, reach = masked, index
+    return text, reach
+
+
 def redact_text(text: str) -> str:
     """Return `text` with credentials replaced by `[REDACTED]`."""
     if not text:
         return text
-    for step in _STEPS:
-        text = step(text)
+    # Masking one credential can uncover another for an earlier step
+    # ("token: --password --password x": the line assignment masks the first
+    # flag, and only then does the flag step see the second). So the steps
+    # before the last one that changed the text run again, until they change
+    # nothing. Text without credentials, the common case, costs one pass, and
+    # a repeat never includes the steps after the last change.
+    text, reach = _run_steps(text, _STEPS)
+    for _ in range(_MAX_EXTRA_ROUNDS):
+        if reach <= 1:
+            break
+        text, again = _run_steps(text, _STEPS[: reach - 1])
+        if not again:
+            break
+        # An earlier step masked something new: later steps must see it too.
+        text, reach = _run_steps(text, _STEPS)
     return text
 
 
