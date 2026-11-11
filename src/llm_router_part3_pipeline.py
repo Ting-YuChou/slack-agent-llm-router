@@ -3891,6 +3891,7 @@ class KafkaConsumerManager:
             state.inflight_rows = len(batch)
             await self._refresh_batch_backpressure(topic_key)
 
+            started_at = time.perf_counter()
             try:
                 await insert_method(batch)
             except Exception as error:
@@ -3906,6 +3907,15 @@ class KafkaConsumerManager:
                     self._record_flush_failure(topic_key, kind)
                     await self._refresh_batch_backpressure(topic_key)
                     raise failure or error
+            else:
+                # Only a batch written in one insert: a failed one is restored
+                # and flushed again, and a bisected one is many small inserts.
+                PIPELINE_METRICS.batch_size.labels(processor=topic_key).observe(
+                    len(batch)
+                )
+                PIPELINE_METRICS.batch_processing_time.labels(
+                    processor=topic_key
+                ).observe(time.perf_counter() - started_at)
 
             state.inflight_rows = 0
             self._record_flush_success(topic_key)
