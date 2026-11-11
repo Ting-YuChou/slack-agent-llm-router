@@ -762,6 +762,10 @@ class InferenceContext:
     cached_response: bool = False
 
 
+# Pings tried at startup before the response cache is disabled for the process.
+_CACHE_STARTUP_PINGS = 3
+
+
 class ResponseCache:
     """Intelligent response caching system"""
 
@@ -785,6 +789,32 @@ class ResponseCache:
         self.redis_config = dict(config.get("redis", {}))
         self.scope = str(config.get("scope", "user")).lower()
         self.redis_client = None
+        # After a Redis error the cache is skipped until this monotonic time.
+        self._unavailable_until = 0.0
+        self._clock: Callable[[], float] = time.monotonic
+
+    def _redis_setting(self, key: str, default: int) -> int:
+        """A positive whole number from `cache.redis`, or its default."""
+        value = self.redis_config.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            logger.warning("Ignoring cache.redis.%s=%r; using %s", key, value, default)
+            return default
+        return value
+
+    def _available(self) -> bool:
+        return self._clock() >= self._unavailable_until
+
+    def _note_error(self, error: Exception) -> None:
+        """Skip the cache for a while after Redis failed.
+
+        Without this an unreachable Redis costs every request a timeout on
+        the lookup and another on the write. A full connection pool is the
+        router's own load, not an outage, so it does not start a cooldown.
+        """
+        if "Too many connections" in str(error):
+            return
+        cooldown_ms = self._redis_setting("error_cooldown_ms", 5000)
+        self._unavailable_until = self._clock() + cooldown_ms / 1000.0
 
     async def initialize(self):
         """Initialize Redis connection"""
@@ -810,8 +840,26 @@ class ResponseCache:
                 db=int(self.redis_config.get("db", 0)),
                 password=password,
                 decode_responses=True,
+                # Without these a stalled Redis holds the request open with no
+                # limit. Both apply to every lookup and write, so they stay
+                # short; they are looser than admission's 100 ms because a
+                # spurious timeout costs a full provider call.
+                socket_connect_timeout=self._redis_setting("connect_timeout_ms", 250)
+                / 1000.0,
+                socket_timeout=self._redis_setting("socket_timeout_ms", 250) / 1000.0,
+                max_connections=self._redis_setting("max_connections", 100),
+                health_check_interval=30,
             )
-            await self.redis_client.ping()
+            # A failed ping disables the cache for the whole process, so a
+            # Redis that is merely slow to start gets more than one chance.
+            for attempt in range(1, _CACHE_STARTUP_PINGS + 1):
+                try:
+                    await self.redis_client.ping()
+                    break
+                except Exception:
+                    if attempt == _CACHE_STARTUP_PINGS:
+                        raise
+                    await asyncio.sleep(0.5)
             logger.info("Response cache initialized")
         except Exception as e:
             logger.warning(f"Failed to initialize cache: {e}")
@@ -822,20 +870,22 @@ class ResponseCache:
         if not self.enabled or not self.redis_client:
             return None
 
-        try:
-            cached_data = await self.redis_client.get(cache_key)
-            if cached_data:
-                INFERENCE_METRICS.cache_hits.inc()
-                return json.loads(cached_data)
-        except Exception as e:
-            logger.warning(f"Cache get error: {e}")
+        if self._available():
+            try:
+                cached_data = await self.redis_client.get(cache_key)
+                if cached_data:
+                    INFERENCE_METRICS.cache_hits.inc()
+                    return json.loads(cached_data)
+            except Exception as e:
+                logger.warning(f"Cache get error: {e}")
+                self._note_error(e)
 
         INFERENCE_METRICS.cache_misses.inc()
         return None
 
     async def cache_response(self, cache_key: str, response_data: Dict[str, Any]):
         """Cache response data"""
-        if not self.enabled or not self.redis_client:
+        if not self.enabled or not self.redis_client or not self._available():
             return
 
         try:
@@ -844,6 +894,7 @@ class ResponseCache:
             )
         except Exception as e:
             logger.warning(f"Cache set error: {e}")
+            self._note_error(e)
 
     def generate_cache_key(self, request: QueryRequest, model_name: str) -> str:
         """Generate cache key for request"""
@@ -943,6 +994,45 @@ def _provider_http_timeout(read_seconds: float) -> httpx.Timeout:
     return httpx.Timeout(connect=3.0, read=read_seconds, write=10.0, pool=2.0)
 
 
+# httpx drops idle connections after 5 s, so most chat requests paid for a new
+# TCP and TLS handshake. Sixty seconds stays under common idle limits upstream.
+_DEFAULT_KEEPALIVE_EXPIRY_SECONDS = 60.0
+
+
+def _provider_http_client(
+    sdk: Any, config: Any, timeout: httpx.Timeout
+) -> Optional[Any]:
+    """The SDK's own HTTP client with a longer keep-alive, or None.
+
+    Only the idle expiry changes: the pool keeps the SDK's size, because a
+    smaller pool would turn bursts into pool timeouts. An SDK without
+    DefaultAsyncHttpxClient (a test stub) keeps building its own client.
+    """
+    factory = getattr(sdk, "DefaultAsyncHttpxClient", None)
+    if factory is None:
+        return None
+    value = config.get("keepalive_expiry_seconds") if isinstance(config, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        if value is not None:
+            logger.warning(
+                "Ignoring keepalive_expiry_seconds=%r; using %s",
+                value,
+                _DEFAULT_KEEPALIVE_EXPIRY_SECONDS,
+            )
+        value = _DEFAULT_KEEPALIVE_EXPIRY_SECONDS
+    sdk_limits = getattr(sdk, "DEFAULT_CONNECTION_LIMITS", None)
+    return factory(
+        limits=httpx.Limits(
+            max_connections=getattr(sdk_limits, "max_connections", 1000),
+            max_keepalive_connections=getattr(
+                sdk_limits, "max_keepalive_connections", 100
+            ),
+            keepalive_expiry=float(value),
+        ),
+        timeout=timeout,
+    )
+
+
 # Query types that get a model's high reasoning effort on their own.
 _HIGH_EFFORT_QUERY_TYPES = frozenset({"reasoning", "math"})
 # Query types that get it only when the router also scored the request
@@ -1018,11 +1108,38 @@ class BaseInferenceProvider(ABC):
         self.config = config
         # The provider SDK's async client, set by initialize().
         self.client: Any = None
+        # The HTTP client handed to the SDK client, closed by _close_http_client().
+        self._http_client: Any = None
         # The router's model configs: per-model pricing (and, for OpenAI,
         # reasoning effort and temperature support).
         self.model_configs: Dict[str, Any] = (
             model_configs if isinstance(model_configs, dict) else {}
         )
+
+    async def _new_sdk_client(self, sdk: Any, factory: Any, **kwargs: Any) -> Any:
+        """Build a cloud SDK client on an HTTP client this provider owns.
+
+        The HTTP client of an earlier initialize() is closed first, and a new
+        one is closed again if the SDK refuses to build its client: unlike the
+        SDK's own client, this one is not closed when it is garbage collected.
+        """
+        await self._close_http_client()
+        timeout = _provider_http_timeout(self.timeout_seconds())
+        kwargs.update(timeout=timeout, max_retries=0)
+        self._http_client = _provider_http_client(sdk, self.config, timeout)
+        if self._http_client is not None:
+            kwargs["http_client"] = self._http_client
+        try:
+            return factory(**kwargs)
+        except Exception:
+            await self._close_http_client()
+            raise
+
+    async def _close_http_client(self) -> None:
+        """Close the HTTP client given to the SDK; safe before initialize()."""
+        http_client, self._http_client = getattr(self, "_http_client", None), None
+        if http_client is not None:
+            await http_client.aclose()
 
     def timeout_seconds(self) -> float:
         """Longest a single provider call may take, in seconds."""
@@ -1187,13 +1304,17 @@ class OpenAIProvider(BaseInferenceProvider):
         api_key_env = self.config.get("api_key_env", "OPENAI_API_KEY")
         if not api_key and api_key_env:
             api_key = os.getenv(str(api_key_env))
-        self.client = openai.AsyncOpenAI(
+        self.client = await self._new_sdk_client(
+            openai,
+            openai.AsyncOpenAI,
             api_key=api_key,
             base_url=self.config.get("base_url", "https://api.openai.com/v1"),
-            timeout=_provider_http_timeout(self.timeout_seconds()),
-            max_retries=0,
         )
         logger.info("OpenAI provider initialized")
+
+    async def aclose(self) -> None:
+        """Close the pooled connections to OpenAI."""
+        await self._close_http_client()
 
     async def generate_response(
         self, request: QueryRequest, model_name: str
@@ -1450,13 +1571,17 @@ class AnthropicProvider(BaseInferenceProvider):
         api_key_env = self.config.get("api_key_env", "ANTHROPIC_API_KEY")
         if not api_key and api_key_env:
             api_key = os.getenv(str(api_key_env))
-        self.client = anthropic.AsyncAnthropic(
+        self.client = await self._new_sdk_client(
+            anthropic,
+            anthropic.AsyncAnthropic,
             api_key=api_key,
             base_url=self.config.get("base_url", "https://api.anthropic.com"),
-            timeout=_provider_http_timeout(self.timeout_seconds()),
-            max_retries=0,
         )
         logger.info("Anthropic provider initialized")
+
+    async def aclose(self) -> None:
+        """Close the pooled connections to Anthropic."""
+        await self._close_http_client()
 
     async def generate_response(
         self, request: QueryRequest, model_name: str
@@ -4685,16 +4810,23 @@ class InferenceEngine:
         await self.batch_processor.shutdown()
         await self.tool_registry.close()
 
-        # Close HTTP clients
-        for provider in self.providers.values():
-            if hasattr(provider, "aclose"):
-                await provider.aclose()
-            elif hasattr(provider, "http_client") and provider.http_client:
-                await provider.http_client.aclose()
+        # Close HTTP clients. One that fails to close must not keep the
+        # others, or Redis, open.
+        for name, provider in self.providers.items():
+            try:
+                if hasattr(provider, "aclose"):
+                    await provider.aclose()
+                elif hasattr(provider, "http_client") and provider.http_client:
+                    await provider.http_client.aclose()
+            except Exception:
+                logger.warning("Provider %s did not close cleanly", name, exc_info=True)
 
         # Close Redis connection
         if self.cache.redis_client:
-            await self.cache.redis_client.close()
+            try:
+                await self.cache.redis_client.close()
+            except Exception:
+                logger.warning("Response cache did not close cleanly", exc_info=True)
 
         self._initialized = False
         logger.info("Inference engine shutdown complete")
