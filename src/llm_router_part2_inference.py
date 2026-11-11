@@ -810,6 +810,18 @@ class ResponseCache:
                 db=int(self.redis_config.get("db", 0)),
                 password=password,
                 decode_responses=True,
+                # Without these a stalled Redis holds the request open with no
+                # limit. They are looser than admission's 100 ms: a failed
+                # first ping disables the cache for the whole process, and a
+                # spurious timeout costs a full provider call.
+                socket_connect_timeout=int(
+                    self.redis_config.get("connect_timeout_ms", 1000)
+                )
+                / 1000.0,
+                socket_timeout=int(self.redis_config.get("socket_timeout_ms", 250))
+                / 1000.0,
+                max_connections=int(self.redis_config.get("max_connections", 100)),
+                health_check_interval=30,
             )
             await self.redis_client.ping()
             logger.info("Response cache initialized")
