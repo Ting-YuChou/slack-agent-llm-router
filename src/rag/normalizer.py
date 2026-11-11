@@ -22,7 +22,8 @@ class LayoutNormalizationResult:
     stats: Dict[str, int] = field(default_factory=dict)
     # What normalization removed, with the removed text. Kept off the document
     # metadata, which is copied into every chunk and returned to clients.
-    audit: Dict[str, Any] = field(default_factory=dict)
+    # Always the same shape: nothing excluded is an empty list.
+    audit: Dict[str, Any] = field(default_factory=lambda: {"excluded_blocks": []})
 
 
 class DocumentLayoutNormalizer:

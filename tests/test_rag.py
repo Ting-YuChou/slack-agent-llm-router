@@ -1433,10 +1433,12 @@ def test_docling_parser_extracts_table_text_and_layout_metadata():
     assert blocks[2].metadata["figure"]["bbox"] == [5.0, 6.0, 7.0, 8.0]
 
 
-def test_serialized_results_drop_the_layout_audit_of_already_indexed_chunks():
+@pytest.mark.asyncio
+async def test_serialized_results_drop_the_layout_audit_of_already_indexed_chunks():
+    store = InMemoryRagVectorStore()
     service = RagService(
-        {"enabled": True, "backend": "memory"},
-        vector_store=InMemoryRagVectorStore(),
+        {"enabled": True, "backend": "memory", "min_score": 0.0},
+        vector_store=store,
         embedding_provider=HashEmbeddingProvider(dimensions=16),
     )
     chunk = StructureAwareChunker({}).chunk(
@@ -1472,21 +1474,60 @@ def test_serialized_results_drop_the_layout_audit_of_already_indexed_chunks():
         )
     )[0]
     assert "layout_normalization_audit" in chunk.metadata
+    # Indexed as an earlier release did, then read back through retrieval.
+    embedding = await service.embedding_provider.embed(chunk.text)
+    await store.upsert_chunks([chunk], [embedding], knowledge_base_id="school")
+    results = await service.retrieve("tuition September", knowledge_base_ids=["school"])
+    assert [result.chunk.chunk_id for result in results] == [chunk.chunk_id]
+    assert "layout_normalization_audit" in results[0].chunk.metadata
 
-    serialized = service.serialize_results(
-        [
-            RagSearchResult(
-                chunk=chunk,
-                score=0.9,
-                match_source="keyword",
-                knowledge_base_id="school",
-                index_version="v1",
-            )
-        ]
-    )
+    serialized = service.serialize_results(results)
 
     metadata = serialized[0]["metadata"]
     assert "layout_normalization_audit" not in metadata
     assert "Internal draft header" not in repr(serialized)
     assert metadata["title"] == "School Handbook"
     assert metadata["layout_normalization"] == {"boilerplate_removed": 1}
+
+
+def test_chunk_storage_never_writes_the_layout_audit():
+    from src.rag.vector_store import _metadata_for_chunk_storage
+
+    stored = _metadata_for_chunk_storage(
+        {
+            "title": "School Handbook",
+            "layout_normalization_audit": {"excluded_blocks": [{"text": "secret"}]},
+        }
+    )
+
+    assert stored == {"title": "School Handbook"}
+
+
+@pytest.mark.asyncio
+async def test_an_uploaded_layout_audit_key_never_reaches_a_chunk():
+    """Metadata copied from an old /rag/query response must not re-index the text."""
+    store = InMemoryRagVectorStore()
+    service = RagService(
+        {"enabled": True, "backend": "memory", "min_score": 0.0},
+        vector_store=store,
+        embedding_provider=HashEmbeddingProvider(dimensions=16),
+    )
+    await service.initialize()
+
+    await service.ingest_document(
+        content=b"Tuition is due in September.",
+        filename="handbook.txt",
+        knowledge_base_id="school",
+        metadata={
+            "title": "School Handbook",
+            "layout_normalization_audit": {
+                "excluded_blocks": [{"text": "Internal draft header"}]
+            },
+        },
+    )
+
+    results = await service.retrieve("tuition September", knowledge_base_ids=["school"])
+    assert results
+    for result in results:
+        assert "layout_normalization_audit" not in result.chunk.metadata
+        assert result.chunk.metadata["title"] == "School Handbook"

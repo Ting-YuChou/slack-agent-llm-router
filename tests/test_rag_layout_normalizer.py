@@ -609,7 +609,8 @@ def test_disabled_normalizer_reports_an_empty_audit():
         _document_with_boilerplate()
     )
 
-    assert result.audit == {}
+    # The same shape as an enabled run, so readers need no special case.
+    assert result.audit == {"excluded_blocks": []}
 
 
 def test_chunks_of_a_normalized_document_carry_no_audit():
