@@ -143,3 +143,103 @@ async def test_engine_shutdown_closes_cloud_provider_http_clients():
 
     for http_client in closed:
         http_client.aclose.assert_awaited_once()
+
+
+# --- review: lifecycle of the HTTP client, and the real SDKs --------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("provider_cls", "sdk_name", "client_name"), PROVIDERS)
+async def test_initializing_again_closes_the_previous_http_client(
+    provider_cls, sdk_name, client_name
+):
+    sdk, first = _sdk(client_name)
+    second = MagicMock(name="second_http_client")
+    second.aclose = AsyncMock()
+    sdk.DefaultAsyncHttpxClient.side_effect = [first, second]
+    provider = provider_cls({"api_key": "test"})
+
+    with patch(f"{MODULE}.{sdk_name}", sdk):
+        await provider.initialize()
+        await provider.initialize()
+
+    first.aclose.assert_awaited_once()
+    second.aclose.assert_not_awaited()
+    await provider.aclose()
+    second.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("provider_cls", "sdk_name", "client_name"), PROVIDERS)
+async def test_a_client_the_sdk_refused_is_closed(provider_cls, sdk_name, client_name):
+    sdk, http_client = _sdk(client_name)
+    getattr(sdk, client_name).side_effect = ValueError("bad api key")
+    provider = provider_cls({"api_key": "test"})
+
+    with patch(f"{MODULE}.{sdk_name}", sdk), pytest.raises(ValueError):
+        await provider.initialize()
+
+    http_client.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("provider_cls", "sdk_name", "client_name"), PROVIDERS)
+async def test_an_ignored_keepalive_setting_is_logged(
+    provider_cls, sdk_name, client_name, caplog
+):
+    sdk, _ = _sdk(client_name)
+
+    with patch(f"{MODULE}.{sdk_name}", sdk), caplog.at_level("WARNING"):
+        await provider_cls(
+            {"api_key": "test", "keepalive_expiry_seconds": "30"}
+        ).initialize()
+
+    assert "keepalive_expiry_seconds" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_engine_shutdown_closes_the_rest_when_one_provider_fails():
+    engine = InferenceEngine.__new__(InferenceEngine)
+    engine.batch_processor = MagicMock(shutdown=AsyncMock())
+    engine.tool_registry = MagicMock(close=AsyncMock())
+    broken = MagicMock(aclose=AsyncMock(side_effect=RuntimeError("close failed")))
+    healthy = MagicMock(aclose=AsyncMock())
+    engine.providers = {"openai": broken, "anthropic": healthy}
+    redis_client = MagicMock(close=AsyncMock())
+    engine.cache = MagicMock(redis_client=redis_client)
+    engine._initialized = True
+
+    await engine.shutdown()
+
+    healthy.aclose.assert_awaited_once()
+    redis_client.close.assert_awaited_once()
+    assert engine._initialized is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_cls", "sdk_name"),
+    [(OpenAIProvider, "openai"), (AnthropicProvider, "anthropic")],
+)
+async def test_the_real_sdk_uses_the_keepalive_client(provider_cls, sdk_name):
+    sdk = pytest.importorskip(sdk_name)
+    if not hasattr(sdk, "DefaultAsyncHttpxClient"):
+        pytest.skip("the suite's SDK stub is installed")
+    provider = provider_cls({"api_key": "test", "keepalive_expiry_seconds": 45})
+
+    await provider.initialize()
+    try:
+        http_client = provider._http_client
+        assert isinstance(http_client, httpx.AsyncClient)
+        # The SDK sends requests through the client it was handed.
+        assert provider.client._client is http_client
+        assert http_client.follow_redirects is True
+        pool = http_client._transport._pool
+        assert pool._keepalive_expiry == 45.0
+        # The pool keeps the size the SDK itself would use.
+        defaults = sdk.DEFAULT_CONNECTION_LIMITS
+        assert pool._max_connections == defaults.max_connections
+        assert pool._max_keepalive_connections == defaults.max_keepalive_connections
+    finally:
+        await provider.aclose()
+    assert http_client.is_closed
