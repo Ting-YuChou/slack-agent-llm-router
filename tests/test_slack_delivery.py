@@ -945,3 +945,169 @@ async def test_empty_chat_reply_never_claims_an_agent_handoff(
         expected.append(SLACK_EMPTY_ANSWER_MESSAGE)
     assert [post["text"] for post in posts] == expected
     assert posts[-1]["thread_ts"] == "100.0"
+
+
+# CH2: one shared HTTP session for Slack Web API calls
+
+
+class _FakeAiohttpSession:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.closed = False
+        self.close_calls = 0
+
+    async def close(self):
+        self.close_calls += 1
+        self.closed = True
+
+
+def _fake_aiohttp(sessions):
+    def client_session(**kwargs):
+        session = _FakeAiohttpSession(**kwargs)
+        sessions.append(session)
+        return session
+
+    return SimpleNamespace(
+        ClientSession=client_session,
+        ClientTimeout=lambda **kwargs: ("timeout", kwargs),
+        TCPConnector=lambda **kwargs: ("connector", kwargs),
+    )
+
+
+def _shared_session_bot(monkeypatch, created, *, auth_test=None):
+    class SessionWebClient:
+        def __init__(self, token):
+            self.token = token
+            self.session = None
+            self.retry_handlers = []
+            self.auth_test = auth_test or AsyncMock(return_value={"user_id": "B1"})
+            created["web_client"] = self
+
+    class DummySocketClient:
+        def __init__(self, app_token, web_client):
+            self.socket_mode_request_listeners = []
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test")
+    monkeypatch.setattr("slack.bot_real.AsyncWebClient", SessionWebClient)
+    monkeypatch.setattr("slack.bot_real.AsyncSocketModeClient", DummySocketClient)
+    return SlackBot(
+        {
+            "bot_token_env": "SLACK_BOT_TOKEN",
+            "app_token_env": "SLACK_APP_TOKEN",
+            "channels": [],
+        },
+        inference_engine=SimpleNamespace(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_initialize_shares_one_http_session_with_the_web_client(monkeypatch):
+    sessions, created = [], {}
+    monkeypatch.setitem(sys.modules, "aiohttp", _fake_aiohttp(sessions))
+    bot = _shared_session_bot(monkeypatch, created)
+
+    await bot.initialize()
+
+    assert len(sessions) == 1
+    assert created["web_client"].session is sessions[0]
+    # The SDK applies its 30 s timeout only to sessions it creates itself.
+    assert sessions[0].kwargs["timeout"] == ("timeout", {"total": 30})
+    assert sessions[0].kwargs["connector"] == ("connector", {"keepalive_timeout": 60})
+    assert sessions[0].closed is False
+
+
+@pytest.mark.asyncio
+async def test_shutdown_closes_the_shared_http_session(monkeypatch):
+    sessions, created = [], {}
+    monkeypatch.setitem(sys.modules, "aiohttp", _fake_aiohttp(sessions))
+    bot = _shared_session_bot(monkeypatch, created)
+    await bot.initialize()
+    # Tests and callers may swap the client; the bot still owns the session.
+    bot.web_client = SimpleNamespace()
+
+    await bot.shutdown()
+    await bot.shutdown()
+
+    assert sessions[0].close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_initialize_without_aiohttp_leaves_the_client_alone(monkeypatch):
+    created = {}
+    monkeypatch.setitem(sys.modules, "aiohttp", None)
+    bot = _shared_session_bot(monkeypatch, created)
+
+    await bot.initialize()
+
+    assert bot.initialized is True
+    assert created["web_client"].session is None
+    await bot.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_initialize_closes_the_session(monkeypatch):
+    sessions, created = [], {}
+    monkeypatch.setitem(sys.modules, "aiohttp", _fake_aiohttp(sessions))
+    bot = _shared_session_bot(
+        monkeypatch, created, auth_test=AsyncMock(side_effect=RuntimeError("down"))
+    )
+
+    with pytest.raises(RuntimeError):
+        await bot.initialize()
+
+    assert len(sessions) == 1
+    assert sessions[0].close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_real_client_reuses_one_connection_with_a_shared_session():
+    """With the real slack_sdk, calls over the shared session keep one connection."""
+    from slack import bot_real
+
+    web = pytest.importorskip("aiohttp.web")
+    stubs = {name: sys.modules.pop(name) for name in _slack_sdk_modules()}
+    try:
+        try:
+            async_client = importlib.import_module("slack_sdk.web.async_client")
+        except ImportError:
+            pytest.skip("slack_sdk is not installed")
+        peers = []
+
+        async def post_message(request):
+            peers.append(request.transport.get_extra_info("peername"))
+            return web.json_response({"ok": True, "channel": "C1", "ts": "1.0"})
+
+        app = web.Application()
+        app.router.add_post("/chat.postMessage", post_message)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        session = bot_real._new_slack_http_session(30)
+        try:
+            port = site._server.sockets[0].getsockname()[1]
+            client = async_client.AsyncWebClient(
+                token="xoxb-test", base_url=f"http://127.0.0.1:{port}/"
+            )
+            assert client.session is None
+            client.session = session
+
+            await client.chat_postMessage(channel="C1", text="one")
+            await client.chat_postMessage(channel="C1", text="two")
+            still_open = not session.closed
+        finally:
+            await session.close()
+            await runner.cleanup()
+    finally:
+        for name in _slack_sdk_modules():
+            del sys.modules[name]
+        sys.modules.update(stubs)
+
+    assert len(peers) == 2
+    assert peers[0] == peers[1]
+    assert still_open is True
+    assert session.timeout.total == 30

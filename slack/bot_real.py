@@ -133,6 +133,27 @@ def _add_rate_limit_retry(client: Any) -> None:
         )
 
 
+SLACK_HTTP_TIMEOUT_SECONDS = 30
+SLACK_HTTP_KEEPALIVE_SECONDS = 60
+
+
+def _new_slack_http_session(timeout_seconds: float) -> Optional[Any]:
+    """One aiohttp session for every Web API call, so connections are kept alive.
+
+    Without it the SDK opens and closes a session (TCP and TLS) per call. The
+    SDK applies its own timeout only to sessions it creates, so it is set here.
+    Must be called inside the running loop. None when aiohttp is not installed.
+    """
+    try:
+        import aiohttp
+    except ImportError:
+        return None
+    return aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+        connector=aiohttp.TCPConnector(keepalive_timeout=SLACK_HTTP_KEEPALIVE_SECONDS),
+    )
+
+
 @dataclass(frozen=True)
 class SlackWorkItem:
     kind: str
@@ -338,6 +359,8 @@ class SlackBot(
         self._accepting_work = True
         self._socket_disconnect_lock = asyncio.Lock()
         self._socket_disconnected = False
+        # Owned by the bot, not the client: callers may replace web_client.
+        self._slack_http_session: Optional[Any] = None
 
     async def initialize(self):
         """Initialize Slack bot"""
@@ -353,6 +376,7 @@ class SlackBot(
 
             self.web_client = AsyncWebClient(token=bot_token)
             _add_rate_limit_retry(self.web_client)
+            self._share_slack_http_session()
             self.bot_token = bot_token
             self.socket_client = AsyncSocketModeClient(
                 app_token=app_token, web_client=self.web_client
@@ -390,7 +414,29 @@ class SlackBot(
 
         except Exception as e:
             logger.error(f"Failed to initialize Slack bot: {e}")
+            await self._close_slack_http_session()
             raise
+
+    def _share_slack_http_session(self) -> None:
+        """Give the Web API client the bot's session, if it takes one."""
+        # Clients without a `session` attribute (test doubles) are left alone.
+        if getattr(self.web_client, "session", False) is not None:
+            return
+        session = _new_slack_http_session(SLACK_HTTP_TIMEOUT_SECONDS)
+        if session is None:
+            return
+        self._slack_http_session = session
+        self.web_client.session = session
+
+    async def _close_slack_http_session(self) -> None:
+        session = getattr(self, "_slack_http_session", None)
+        self._slack_http_session = None
+        if session is None:
+            return
+        try:
+            await session.close()
+        except Exception:
+            logger.warning("Slack HTTP session close failed", exc_info=True)
 
     async def start(self):
         """Start the Slack bot"""
@@ -1001,6 +1047,7 @@ class SlackBot(
         except Exception:
             logger.warning("Slack memory shutdown failed", exc_info=True)
         await self._close_attachment_http_client()
+        await self._close_slack_http_session()
 
         logger.info("Slack bot shutdown complete")
 
