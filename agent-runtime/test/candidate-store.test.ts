@@ -8,6 +8,7 @@ import path from "node:path";
 import { test, type TestContext } from "node:test";
 
 import { HarnessError } from "../src/error-taxonomy.js";
+import { readBlobs } from "../src/git-blobs.js";
 import { CandidateStore } from "../src/verification.js";
 import { hardenedGitEnv } from "../src/worktree-manager.js";
 
@@ -115,7 +116,7 @@ test("a baseline gitlink is refused", async t => {
   r.git("update-index", "--add", "--cacheinfo", `160000,${"1".repeat(40)},vendor/sub`);
   r.git("commit", "-q", "-m", "gitlink");
   const baseline = r.git("rev-parse", "HEAD").toString().trim();
-  await assert.rejects(new CandidateStore(r.store).create(r.repo, baseline, "run"));
+  await assert.rejects(new CandidateStore(r.store).create(r.repo, baseline, "run"), /Baseline contains an unsupported entry/);
 });
 
 test("a baseline file over 2 MiB is refused", async t => {
@@ -123,7 +124,16 @@ test("a baseline file over 2 MiB is refused", async t => {
   await r.write("src/a.txt", "one\n"); await r.write("data/huge.bin", Buffer.alloc(2 * 1024 * 1024 + 1, 1));
   const baseline = r.commit("baseline");
   await unlink(path.join(r.repo, "data/huge.bin"));
+  // The binary diff of such a file already exceeds git's output limit, so the snapshot fails before the baseline copy.
   await assert.rejects(new CandidateStore(r.store).create(r.repo, baseline, "run"));
+  // The baseline reader has the same limit of its own, and reports it before buffering the blob.
+  const oid = r.git("rev-parse", `${baseline}:data/huge.bin`).toString().trim();
+  await assert.rejects(async () => { for await (const _blob of readBlobs(r.repo, [oid], 2 * 1024 * 1024)) { /* never yielded */ } }, /is larger than 2097152 bytes/);
+  const small = r.git("rev-parse", `${baseline}:src/a.txt`).toString().trim();
+  const read: string[] = [];
+  for await (const blob of readBlobs(r.repo, [small, small], 2 * 1024 * 1024)) read.push(blob.data.toString());
+  assert.deepEqual(read, ["one\n", "one\n"]);
+  await assert.rejects(async () => { for await (const _blob of readBlobs(r.repo, ["0".repeat(40)], 1024)) { /* missing */ } }, /is not a readable blob/);
 });
 
 test("a snapshot without a baseline tree keeps an empty baseline directory for the mount", async t => {
@@ -202,4 +212,15 @@ test("the number of git processes does not grow with the baseline tree", async t
     return (await readFile(log, "utf8")).split("\n").filter(Boolean).length;
   };
   assert.equal(await processes(30), await processes(3));
+});
+
+test("hash() reads the working tree as git lists it; a snapshot taken first settles a file replaced by a directory", async t => {
+  const f = await fixture(t);
+  const store = new CandidateStore(f.store);
+  // A tracked file becomes a directory: until `create` refreshes the index, git still lists the old path.
+  await unlink(path.join(f.repo, "src/a.txt")); await f.write("src/a.txt/inner.txt", "inner\n");
+  await assert.rejects(store.hash(f.repo, f.baseline), /unsupported file/);
+  const snapshot = await store.create(f.repo, f.baseline, "run");
+  assert.equal(await store.hash(f.repo, f.baseline), snapshot.hash);
+  await store.assertUnchanged(snapshot, f.repo, f.baseline, "run");
 });

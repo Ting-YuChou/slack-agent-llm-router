@@ -129,3 +129,18 @@ test("run_checks time accumulates on the run", async () => {
   const both = orchestrator.getRun(created.run_id).writer_checks_ms;
   assert.ok(Number.isInteger(both) && both! >= first! + 30, `both calls took ${both} ms`);
 });
+
+test("checks still running when the run ends are counted in its harness metrics", async () => {
+  const { orchestrator, process } = fixture({
+    runChecks: request => new Promise((_resolve, reject) => { request.signal.addEventListener("abort", () => setTimeout(() => reject(new Error("aborted")), 30), { once: true }); }),
+  });
+  const created = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "late", user_id: "U", prompt: "fix" });
+  process.emit(request("ui-1")); await tick();
+  await orchestrator.cancel(created.run_id, "U");
+  // The checks only stop after the run is already terminal.
+  await new Promise(resolve => setTimeout(resolve, 80));
+  const run = orchestrator.getRun(created.run_id);
+  assert.equal(run.status, "cancelled");
+  assert.ok(Number.isInteger(run.writer_checks_ms) && run.writer_checks_ms! >= 25, `took ${run.writer_checks_ms} ms`);
+  assert.equal(run.harness_metrics?.writer_checks_s, run.writer_checks_ms! / 1000);
+});

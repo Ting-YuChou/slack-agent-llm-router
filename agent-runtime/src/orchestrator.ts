@@ -1214,6 +1214,8 @@ export class CodingAgentOrchestrator {
     } finally {
       if (workflow.checksOperation === operation) workflow.checksOperation = undefined;
       run.writer_checks_ms = (run.writer_checks_ms ?? 0) + elapsedMs(checksStarted);
+      // A cancelled or timed-out run is terminal before its checks stop; its metrics were computed without them.
+      if (isTerminal(run.status)) run.harness_metrics = computeHarnessMetrics(run);
       this.persistSoon();
     }
   }

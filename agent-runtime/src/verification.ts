@@ -159,7 +159,11 @@ export class CandidateStore {
     }
     return { hash: hash.digest("hex"), path: snapshot, patch, artifact };
   }
-  /** The hash `create` would give, without taking a snapshot: nothing is written to the store, the index or the worktree. */
+  /**
+   * The hash of a snapshot already taken of this worktree, recomputed without taking another: nothing is
+   * written to the store, the index or the worktree. It reads the index as it is, so call it after `create`,
+   * which refreshes the index first (a tracked file replaced by a directory is only settled there).
+   */
   async hash(worktree: string, baseline: string): Promise<string> {
     if (!/^[a-f0-9]{40,64}$/.test(baseline)) throw new Error("Invalid baseline");
     const hash = createHash("sha256").update(baseline);

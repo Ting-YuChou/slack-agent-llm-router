@@ -26,6 +26,8 @@ export interface HarnessMetrics {
 
 const ratio = (used: number, max: number | undefined) => max ? Math.round((used / max) * 1000) / 1000 : null;
 const seconds = (ms: number) => Math.round(ms / 100) / 10;
+/** Stage times are fractions of a second, so they keep millisecond precision. */
+const stageSeconds = (ms: number) => Math.round(ms) / 1000;
 const STAGES = { snapshot_s: "snapshot_ms", verify_s: "verify_ms", grade_s: "grade_ms", assert_unchanged_s: "assert_unchanged_ms" } as const;
 
 /** Derived from the run alone, so it can be recomputed from any persisted record. */
@@ -39,7 +41,7 @@ export function computeHarnessMetrics(run: RunRecord, now = Date.now()): Harness
   const stages: Partial<Record<keyof typeof STAGES, number>> = {};
   for (const [metric, field] of Object.entries(STAGES) as Array<[keyof typeof STAGES, typeof STAGES[keyof typeof STAGES]]>) {
     const measured = attempts.map(attempt => attempt.gate_timing?.[field]).filter((ms): ms is number => typeof ms === "number");
-    if (measured.length) stages[metric] = seconds(measured.reduce((sum, ms) => sum + ms, 0));
+    if (measured.length) stages[metric] = stageSeconds(measured.reduce((sum, ms) => sum + ms, 0));
   }
   return {
     outcome: run.execution_outcome ?? null,
@@ -63,6 +65,6 @@ export function computeHarnessMetrics(run: RunRecord, now = Date.now()): Harness
     truncated_requests: Object.values(run.truncated_requests ?? {}).reduce((sum, count) => sum + count, 0),
     truncated_requests_by_role: { ...run.truncated_requests },
     ...stages,
-    ...(run.writer_checks_ms === undefined ? {} : { writer_checks_s: seconds(run.writer_checks_ms) }),
+    ...(run.writer_checks_ms === undefined ? {} : { writer_checks_s: stageSeconds(run.writer_checks_ms) }),
   };
 }

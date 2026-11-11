@@ -108,7 +108,8 @@ test("stage seconds are summed over attempts", () => {
     ],
     writer_checks_calls: 2, writer_checks_ms: 12_340,
   }), now);
-  assert.deepEqual(STAGE_KEYS.map(key => metrics[key]), [0.6, 78, 31.2, 0.1, 12.3]);
+  // To the millisecond: a snapshot or re-check takes a fraction of a second.
+  assert.deepEqual(STAGE_KEYS.map(key => metrics[key]), [0.55, 78, 31.24, 0.09, 12.34]);
 });
 
 test("a stage no attempt reached is left out rather than reported as zero", () => {
