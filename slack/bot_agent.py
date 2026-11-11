@@ -1228,7 +1228,10 @@ class SlackBotAgentMixin:
     async def _update_agent_progress(
         self, tracked: Dict[str, Any], run: Dict[str, Any], *, force: bool = False
     ) -> None:
-        """Rewrite the run's status message, at most once per progress interval."""
+        """Rewrite the run's status message, at most once per progress interval.
+
+        When nothing but the elapsed time changed, at most once per heartbeat.
+        """
         status_ts = tracked.get("status_ts")
         if not status_ts or not hasattr(self.web_client, "chat_update"):
             return
@@ -1244,12 +1247,25 @@ class SlackBotAgentMixin:
             tracked.get("status_text")
             or f"🛠️ Pi coding agent run `{run.get('run_id')}`."
         )
+        hint = self._agent_discuss_hint(run)
+        # Everything shown except the elapsed time, which changes every call.
+        fingerprint = (header, self._agent_progress_line(run, 0), hint)
+        if (
+            not force
+            and last is not None
+            and fingerprint == tracked.get("progress_fingerprint")
+            and now - last
+            < max(
+                self.agent_progress_interval_seconds,
+                self.agent_progress_heartbeat_seconds,
+            )
+        ):
+            return
         started = _agent_run_started_at(run)
         if started is None:
             # A run restored after a bot restart is timed from its first update.
             started = tracked.setdefault("tracked_at", now)
         text = f"{header}\n{self._agent_progress_line(run, now - started)}"
-        hint = self._agent_discuss_hint(run)
         if hint:
             text = f"{text}\n{hint}"
         if text == tracked.get("progress_text"):
@@ -1263,6 +1279,7 @@ class SlackBotAgentMixin:
             return
         tracked["progress_updated_at"] = now
         tracked["progress_text"] = text
+        tracked["progress_fingerprint"] = fingerprint
 
     async def _post_agent_approval(
         self, tracked: Dict[str, Any], run: Dict[str, Any]

@@ -301,6 +301,11 @@ class SlackBot(
         self.agent_progress_interval_seconds = float(
             self.agent_config.get("progress_interval_seconds", 10)
         )
+        # A status message whose only change is its elapsed time is rewritten
+        # this often, so a long verify or approval wait still shows life.
+        self.agent_progress_heartbeat_seconds = float(
+            self.agent_config.get("progress_heartbeat_seconds", 60)
+        )
         # Wall-clock seconds, so elapsed time compares with the run's created_at.
         self.agent_progress_clock: Callable[[], float] = time.time
         # How long a monitor keeps reattaching to a run it cannot reach: the
