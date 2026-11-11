@@ -565,3 +565,60 @@ async def test_rag_service_normalizes_layout_before_chunking_and_surfaces_warnin
         item.chunk.metadata.get("is_unresolved_footnote")
         for item in store.items.values()
     )
+
+
+def _document_with_boilerplate() -> ParsedDocument:
+    blocks = []
+    for page in range(1, 4):
+        blocks.extend(
+            [
+                _block(
+                    "Confidential running header",
+                    page=page,
+                    block_type="page_header",
+                    bbox=[10, 0, 500, 40],
+                    order=1,
+                    metadata={"page_height": 800},
+                ),
+                _block(
+                    f"Useful body {page}",
+                    page=page,
+                    bbox=[10, 100, 500, 140],
+                    order=2,
+                    metadata={"page_height": 800},
+                ),
+            ]
+        )
+    return _document(*blocks)
+
+
+def test_excluded_block_audit_stays_on_the_result_not_the_document_metadata():
+    result = DocumentLayoutNormalizer({}).normalize(_document_with_boilerplate())
+
+    assert "layout_normalization_audit" not in result.document.metadata
+    assert result.document.metadata["layout_normalization"]["boilerplate_removed"] == 3
+    excluded = result.audit["excluded_blocks"]
+    assert [entry["page"] for entry in excluded] == [1, 2, 3]
+    assert {entry["reason"] for entry in excluded} == {"explicit_header_footer"}
+    assert {entry["text"] for entry in excluded} == {"Confidential running header"}
+    assert set(excluded[0]) == {"block_id", "page", "block_type", "reason", "text"}
+
+
+def test_disabled_normalizer_reports_an_empty_audit():
+    result = DocumentLayoutNormalizer({"enabled": False}).normalize(
+        _document_with_boilerplate()
+    )
+
+    # The same shape as an enabled run, so readers need no special case.
+    assert result.audit == {"excluded_blocks": []}
+
+
+def test_chunks_of_a_normalized_document_carry_no_audit():
+    result = DocumentLayoutNormalizer({}).normalize(_document_with_boilerplate())
+
+    chunks = StructureAwareChunker({}).chunk(result.document)
+
+    assert chunks
+    for chunk in chunks:
+        assert "layout_normalization_audit" not in chunk.metadata
+        assert "Confidential running header" not in repr(chunk.metadata)

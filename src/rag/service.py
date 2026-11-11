@@ -37,6 +37,7 @@ from src.rag.storage import (
     S3RagAssetStore,
 )
 from src.rag.vector_store import (
+    LAYOUT_AUDIT_METADATA_KEY,
     RagSearchResult,
     build_vector_store,
     capture_search_report,
@@ -864,6 +865,8 @@ class RagService:
                 if count:
                     RAG_METRICS.layout_outcomes.labels(outcome).inc(count)
             parsed = normalization.document
+            # Uploaded metadata may carry the key, copied from an old response.
+            parsed.metadata.pop(LAYOUT_AUDIT_METADATA_KEY, None)
             visual_warnings, asset_refs = await self._process_visual_blocks(
                 content=content,
                 filename=filename,
@@ -2743,13 +2746,19 @@ def _decode(value: Any) -> str:
 
 
 def _public_rag_metadata(value: Any) -> Any:
-    """Remove durable asset coordinates while retaining opaque image handles."""
+    """Remove durable asset coordinates while retaining opaque image handles.
+
+    Chunks indexed before the layout audit left document metadata still carry
+    the text of excluded blocks; it is never returned to clients.
+    """
     if isinstance(value, list):
         return [_public_rag_metadata(item) for item in value]
     if not isinstance(value, dict):
         return value
     output: Dict[str, Any] = {}
     for key, item in value.items():
+        if key == LAYOUT_AUDIT_METADATA_KEY:
+            continue
         if key == "asset_ref" and isinstance(item, dict):
             uri = item.get("uri")
             if isinstance(uri, str) and uri.startswith("rag-asset://"):

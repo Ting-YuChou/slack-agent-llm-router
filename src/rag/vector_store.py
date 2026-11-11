@@ -20,6 +20,10 @@ from src.utils.metrics import RAG_METRICS
 
 logger = logging.getLogger(__name__)
 
+# Until the layout audit left document metadata it was copied into every
+# chunk, with the text of each excluded block. It is never stored or returned.
+LAYOUT_AUDIT_METADATA_KEY = "layout_normalization_audit"
+
 SIDECAR_METADATA_KEYS = {
     "figure_sidecar",
     "table_sidecar",
@@ -1567,7 +1571,7 @@ def _metadata_for_chunk_storage(metadata: Dict[str, Any]) -> Dict[str, Any]:
     return {
         key: value
         for key, value in dict(metadata or {}).items()
-        if key not in SIDECAR_METADATA_KEYS
+        if key not in SIDECAR_METADATA_KEYS and key != LAYOUT_AUDIT_METADATA_KEY
     }
 
 
