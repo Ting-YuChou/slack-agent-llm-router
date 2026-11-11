@@ -2023,6 +2023,45 @@ def test_aggregate_reports_startup_medians_without_making_them_contract_metrics(
     }
 
 
+def test_aggregate_reports_stage_medians_without_making_them_contract_metrics():
+    def record(**stages):
+        return {**_record(passed=True), "harness_metrics": stages}
+
+    summary = agent_eval.aggregate(
+        [
+            record(snapshot_s=0.2, verify_s=40.0, grade_s=30.0, assert_unchanged_s=0.1),
+            record(snapshot_s=0.4, verify_s=50.0, grade_s=90.0, assert_unchanged_s=0.1),
+            # A run that failed verification was never graded or re-checked.
+            record(snapshot_s=0.3, verify_s=45.0, writer_checks_s=12.0),
+        ]
+    )
+
+    assert summary["snapshot_s_p50"] == 0.3
+    assert summary["verify_s_p50"] == 45.0
+    assert summary["grade_s_p50"] == 60.0
+    assert summary["assert_unchanged_s_p50"] == 0.1
+    assert summary["writer_checks_s_p50"] == 12.0
+    assert not set(agent_eval.CONTRACT_METRICS) & {
+        "snapshot_s_p50",
+        "verify_s_p50",
+        "grade_s_p50",
+        "assert_unchanged_s_p50",
+        "writer_checks_s_p50",
+    }
+
+
+def test_stage_medians_are_omitted_when_no_run_reports_them():
+    summary = agent_eval.aggregate([_record(passed=True)])
+
+    assert not {key for key in summary if key.endswith("_s_p50")} & {
+        "snapshot_s_p50",
+        "verify_s_p50",
+        "grade_s_p50",
+        "assert_unchanged_s_p50",
+        "writer_checks_s_p50",
+    }
+
+
 # --- coverage tasks: degrade, declined delivery, run_checks, codegraph -----------
 
 

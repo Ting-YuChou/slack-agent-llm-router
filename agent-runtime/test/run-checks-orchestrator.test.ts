@@ -116,3 +116,16 @@ test("cancelling a run stops its checks and rolls back", async () => {
   assert.deepEqual(rollbacks, ["a".repeat(40)]);
   assert.equal(process.answer("ui-1"), undefined, "a cancelled run never answers the writer");
 });
+
+test("run_checks time accumulates on the run", async () => {
+  const { orchestrator, process } = fixture({ runChecks: () => new Promise(resolve => setTimeout(() => resolve(passed), 40)) });
+  const created = await orchestrator.createSession({ team_id: "T", channel_id: "C", thread_ts: "timed", user_id: "U", prompt: "fix" });
+  assert.equal(orchestrator.getRun(created.run_id).writer_checks_ms, undefined, "no call, no time");
+  const call = async (id: string) => { process.emit(request(id)); while (!process.answer(id)) await new Promise(resolve => setTimeout(resolve, 5)); };
+  await call("ui-1");
+  const first = orchestrator.getRun(created.run_id).writer_checks_ms;
+  assert.ok(Number.isInteger(first) && first! >= 30, `first call took ${first} ms`);
+  await call("ui-2");
+  const both = orchestrator.getRun(created.run_id).writer_checks_ms;
+  assert.ok(Number.isInteger(both) && both! >= first! + 30, `both calls took ${both} ms`);
+});

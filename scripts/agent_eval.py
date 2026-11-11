@@ -495,6 +495,17 @@ def _harness_medians(records):
             "repair_startup_s"
         ),
     }
+    # Where a run's time went: the gate's stages and the writer's run_checks calls.
+    for stage in (
+        "snapshot_s",
+        "verify_s",
+        "grade_s",
+        "assert_unchanged_s",
+        "writer_checks_s",
+    ):
+        sources[f"{stage}_p50"] = lambda r, stage=stage: (
+            r.get("harness_metrics") or {}
+        ).get(stage)
     medians = {}
     for metric, read in sources.items():
         value = _median(read(record) for record in records)

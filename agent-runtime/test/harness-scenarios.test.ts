@@ -333,3 +333,23 @@ test("S23 a run without a profile answers budget_status with its default ledger 
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("harness: a gated run records how long each gate stage took", async () => {
+  const failed = { status: "failed" as const, checks: [{ name: "candidate:pytest", status: "failed" as const, exit_code: 1 }] };
+  const { run } = await runScenario({ name: "H stage timing", profile, verify: [failed, "passed"],
+    attempts: [
+      { files: { "src/a.js": "broken\n" }, records: [...piTurn("stop"), settledRecord] },
+      { files: fix, records: [...piTurn("stop"), settledRecord] },
+    ],
+    expect: { status: "completed", committed: true } });
+  assert.equal(run.status, "completed", JSON.stringify(run.error));
+  const duration = (value: unknown) => Number.isInteger(value) && (value as number) >= 0;
+  const [repaired, delivered] = run.attempts!.map(attempt => attempt.gate_timing);
+  assert.ok(duration(repaired?.snapshot_ms) && duration(repaired?.verify_ms), JSON.stringify(repaired));
+  assert.equal(repaired?.grade_ms, undefined, "a failed verification is never graded");
+  assert.equal(repaired?.assert_unchanged_ms, undefined, "only the delivered candidate is re-checked");
+  assert.ok(duration(delivered?.snapshot_ms) && duration(delivered?.verify_ms) && duration(delivered?.grade_ms) && duration(delivered?.assert_unchanged_ms), JSON.stringify(delivered));
+  assert.equal(delivered?.grade_samples_ms?.length, 1);
+  for (const key of ["snapshot_s", "verify_s", "grade_s", "assert_unchanged_s"] as const) assert.equal(typeof run.harness_metrics?.[key], "number", key);
+  assert.equal("writer_checks_s" in run.harness_metrics!, false, "run_checks was never called");
+});
