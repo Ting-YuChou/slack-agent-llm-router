@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, type Hash } from "node:crypto";
 import { mkdir, readFile, writeFile, lstat, copyFile, realpath, open } from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
@@ -13,6 +13,7 @@ import type { FixerSpec } from "./fixers.js";
 import type { Candidate, CheckStatus, GraderSampling, VerificationCheck, VerificationResult } from "./quality-gate.js";
 import { RESOURCE_LIMIT_FLAGS } from "./container-flags.js";
 import { hardenedGitEnv } from "./worktree-manager.js";
+import { readBlobs } from "./git-blobs.js";
 import { isGatewayRole, OUTPUT_TOKEN_CEILING, type ProfileLimits } from "./run-budget.js";
 const exec = promisify(execFile);
 /** One trusted check. `{report}` in argv becomes the check's report path under /out. */
@@ -97,46 +98,76 @@ export async function loadProfile(file: string, repo: string, worktreeRoot: stri
   const data = await readFile(resolved);
   return { profile: validateProfile(JSON.parse(data.toString())), checksum: createHash("sha256").update(data).digest("hex") };
 }
+interface CandidateFile { file: string; mode: number; content: Buffer }
+const MAX_SNAPSHOT_FILE_BYTES = 2 * 1024 * 1024;
 export class CandidateStore {
   constructor(readonly root: string) {}
-  /** `baselineTree: false` skips the trusted baseline copy (candidate-only runs); an empty directory keeps the mount valid. */
-  async create(worktree: string, baseline: string, runId: string, options: { baselineTree?: boolean } = {}): Promise<Candidate> {
-    if (!/^[a-f0-9]{40,64}$/.test(baseline)) throw new Error("Invalid baseline");
-    await exec("git", ["add", "-N", "--", "."], { env: hardenedGitEnv(), cwd: worktree });
-    const patch = (await exec("git", ["diff", "--binary", baseline, "--"], { env: hardenedGitEnv(), cwd: worktree, maxBuffer: 2 * 1024 * 1024 })).stdout;
+  private async candidatePaths(worktree: string): Promise<string[]> {
     const paths = (await exec("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], { env: hardenedGitEnv(), cwd: worktree, maxBuffer: 4 * 1024 * 1024 })).stdout.split("\0").filter(Boolean);
-    const location = path.join(this.root, runId.replace(/[^\w-]/g, "_"), randomUUID());
-    const snapshot = path.join(location, "candidate"); await mkdir(snapshot, { recursive: true, mode: 0o700 });
-    const hash = createHash("sha256").update(baseline); let bytes = 0;
-    for (const file of [...new Set(paths)].sort()) {
+    return [...new Set(paths)].sort();
+  }
+  /** The candidate's files in hash order, without protected paths or this store's own files. */
+  private async *candidateFiles(worktree: string, paths: string[]): AsyncGenerator<CandidateFile> {
+    let bytes = 0;
+    for (const file of paths) {
       if (path.resolve(worktree, file).startsWith(path.resolve(this.root) + path.sep)) continue;
       let stat; try { stat = await lstat(path.join(worktree, file)); } catch { continue; }
       if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Candidate contains an unsupported file");
       const checked = await validateWorkspacePath(worktree, file, "read");
       if (!checked.allowed) continue;
-      bytes += stat.size; if (bytes > 64 * 1024 * 1024 || stat.size > 2 * 1024 * 1024) throw new HarnessError("snapshot_too_large", "Candidate snapshot too large");
-      const content = await readFile(path.join(worktree, file));
-      hash.update(file).update("\0").update(String(stat.mode & 0o111)).update("\0").update(content);
-      const target = path.join(snapshot, file); await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
-      await writeFile(target, content, { mode: stat.mode & 0o111 ? 0o500 : 0o400 });
+      bytes += stat.size; if (bytes > 64 * 1024 * 1024 || stat.size > MAX_SNAPSHOT_FILE_BYTES) throw new HarnessError("snapshot_too_large", "Candidate snapshot too large");
+      yield { file, mode: stat.mode, content: await readFile(path.join(worktree, file)) };
+    }
+  }
+  /** The candidate's identity. Stored hashes are compared across restarts, so this encoding must never change. */
+  private digest(hash: Hash, entry: CandidateFile): void {
+    hash.update(entry.file).update("\0").update(String(entry.mode & 0o111)).update("\0").update(entry.content);
+  }
+  /** `baselineTree: false` skips the trusted baseline copy (candidate-only runs); an empty directory keeps the mount valid. */
+  async create(worktree: string, baseline: string, runId: string, options: { baselineTree?: boolean } = {}): Promise<Candidate> {
+    if (!/^[a-f0-9]{40,64}$/.test(baseline)) throw new Error("Invalid baseline");
+    await exec("git", ["add", "-N", "--", "."], { env: hardenedGitEnv(), cwd: worktree });
+    const patch = (await exec("git", ["diff", "--binary", baseline, "--"], { env: hardenedGitEnv(), cwd: worktree, maxBuffer: 2 * 1024 * 1024 })).stdout;
+    const paths = await this.candidatePaths(worktree);
+    const location = path.join(this.root, runId.replace(/[^\w-]/g, "_"), randomUUID());
+    const snapshot = path.join(location, "candidate"); await mkdir(snapshot, { recursive: true, mode: 0o700 });
+    const hash = createHash("sha256").update(baseline);
+    for await (const entry of this.candidateFiles(worktree, paths)) {
+      this.digest(hash, entry);
+      const target = path.join(snapshot, entry.file); await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+      await writeFile(target, entry.content, { mode: entry.mode & 0o111 ? 0o500 : 0o400 });
     }
     const artifact = path.join(location, "candidate.patch"); await writeFile(artifact, String(redact(patch)), { mode: 0o400 });
     // Baseline test/config copies cannot be changed by the candidate.
     const baselineDir = path.join(location, "baseline"); await mkdir(baselineDir, { mode: 0o700 });
     if (options.baselineTree === false) return { hash: hash.digest("hex"), path: snapshot, patch, artifact };
     const originalFiles = (await exec("git", ["ls-tree", "-r", "-z", baseline], { env: hardenedGitEnv(), cwd: worktree })).stdout.split("\0").filter(Boolean);
+    const trusted: Array<{ file: string; executable: boolean; oid: string }> = [];
     for (const entry of originalFiles) {
       const split = entry.indexOf("\t"); const file = entry.slice(split + 1);
-      const executable = entry.startsWith("100755 ");
+      const [mode, type, oid] = entry.slice(0, split).split(" ");
       if (!(await validateWorkspacePath(worktree, file, "read")).allowed) continue;
-      const data = (await exec("git", ["show", `${baseline}:${file}`], { env: hardenedGitEnv(), cwd: worktree, encoding: "buffer", maxBuffer: 2 * 1024 * 1024 })).stdout;
-      const dest = path.join(baselineDir, file); await mkdir(path.dirname(dest), { recursive: true }); await writeFile(dest, data, { mode: executable ? 0o500 : 0o400 });
+      // A symlink is a blob holding its target; a gitlink has nothing to copy.
+      if (type !== "blob" || !oid) throw new Error("Baseline contains an unsupported entry");
+      trusted.push({ file, executable: mode === "100755", oid });
+    }
+    // One git process for the whole tree instead of one per file.
+    let next = 0;
+    for await (const blob of readBlobs(worktree, trusted.map(entry => entry.oid), MAX_SNAPSHOT_FILE_BYTES)) {
+      const { file, executable } = trusted[next++]!;
+      const dest = path.join(baselineDir, file); await mkdir(path.dirname(dest), { recursive: true }); await writeFile(dest, blob.data, { mode: executable ? 0o500 : 0o400 });
     }
     return { hash: hash.digest("hex"), path: snapshot, patch, artifact };
   }
-  async assertUnchanged(candidate: Candidate, worktree: string, baseline: string, runId: string) {
-    const actual = await this.create(worktree, baseline, runId);
-    if (candidate.hash !== actual.hash) throw new HarnessError("candidate_changed", "candidate_changed_after_verification");
+  /** The hash `create` would give, without taking a snapshot: nothing is written to the store, the index or the worktree. */
+  async hash(worktree: string, baseline: string): Promise<string> {
+    if (!/^[a-f0-9]{40,64}$/.test(baseline)) throw new Error("Invalid baseline");
+    const hash = createHash("sha256").update(baseline);
+    for await (const entry of this.candidateFiles(worktree, await this.candidatePaths(worktree))) this.digest(hash, entry);
+    return hash.digest("hex");
+  }
+  async assertUnchanged(candidate: Candidate, worktree: string, baseline: string, _runId: string) {
+    if (candidate.hash !== await this.hash(worktree, baseline)) throw new HarnessError("candidate_changed", "candidate_changed_after_verification");
   }
 }
 /** What one verifier container produced. `exit` is null when the runner itself failed or was killed. */

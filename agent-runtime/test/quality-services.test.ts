@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, readdirSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -242,4 +242,68 @@ test("without AGENTS.md at the baseline the planner and investigators get no gui
     assert.doesNotMatch(prompt, /AGENTS\.md|UNTRUSTED-|approve everything/, role);
     assert.ok(prompt.endsWith("}"), `${role} prompt ends with its context JSON`);
   }
+});
+
+// --- which snapshots carry the trusted baseline tree ----------------------------------------------
+
+const passingGrader: GraderProcessFactory = (_options, onEvent, onRecord) => ({
+  prompt: (_id, prompt) => {
+    const hash = /"candidate_hash":"([^"]+)"/.exec(prompt)?.[1];
+    play([...submit("submit_grade", { status: "passed", candidate_hash: hash, criteria: [{ id: "correct", passed: true, evidence: "src/a.js:1 exports 2" }], findings: [] }), settled], onEvent, onRecord);
+  },
+  close: async () => {},
+});
+const filesUnder = (directory: string, prefix = ""): string[] => readdirSync(directory, { withFileTypes: true })
+  .flatMap(entry => entry.isDirectory() ? filesUnder(path.join(directory, entry.name), `${prefix}${entry.name}/`) : [`${prefix}${entry.name}`]).sort();
+/** The baseline tree of every snapshot taken for a run, emptiest first. */
+const baselineTrees = (root: string, runId: string): string[][] => {
+  const run = path.join(root, "runtime", "artifacts", runId);
+  return readdirSync(run).map(snapshot => filesUnder(path.join(run, snapshot, "baseline"))).sort((a, b) => a.length - b.length);
+};
+const baselineOf = (candidate: { path: string }) => filesUnder(path.join(path.dirname(candidate.path), "baseline"));
+
+test("the verified snapshot carries the baseline tree; an archive snapshot does not", async () => {
+  const { root, repo, baseline } = fixture();
+  const verified: string[][] = [];
+  const { services: quality } = services(root, repo, {
+    createVerifier: () => ({ verify: async candidate => { verified.push(baselineOf(candidate)); return { status: "passed", checks: [] }; }, stop: async () => {} }),
+    createGraderProcess: passingGrader,
+  });
+  quality.prepare?.("run-tree", "single");
+  const input = { run_id: "run-tree", worktree: repo, baseline, requirement: "make a 2", attempt: 1, signal: new AbortController().signal };
+  assert.equal((await quality.evaluate(input)).action, "pass");
+  assert.deepEqual(verified, [["src/a.js"]]);
+  await quality.archive!(input);
+  assert.deepEqual(baselineTrees(root, "run-tree"), [[], ["src/a.js"]]);
+});
+
+test("a discovery snapshot carries no baseline tree", async () => {
+  const { root, repo, baseline } = fixture();
+  const { createExecutionProcess } = promptRecorder();
+  const { services: quality } = services(root, repo, { createExecutionProcess });
+  quality.prepare?.("run-discover", "structured");
+  await quality.discover!({ run_id: "run-discover", worktree: repo, baseline, requirement: "make a 2", attempt: 1, owner: "U1", initial_active_ms: 0, signal: new AbortController().signal });
+  assert.deepEqual(baselineTrees(root, "run-discover"), [[]]);
+});
+
+test("with a newer tested base only the merged candidate carries a baseline tree", async () => {
+  const { root, repo, baseline } = fixture();
+  const git = (args: string[], options: { input?: string; env?: NodeJS.ProcessEnv } = {}) => execFileSync("git", args, { cwd: repo, encoding: "utf8", ...options }).trim();
+  // A commit on top of the baseline that adds a trusted test, built without touching the working tree.
+  const env = { ...process.env, GIT_INDEX_FILE: path.join(root, "tested.index") };
+  git(["read-tree", baseline], { env });
+  git(["update-index", "--add", "--cacheinfo", `100644,${git(["hash-object", "-w", "--stdin"], { input: "assert(true);\n" })},test/extra.js`], { env });
+  const tested = git(["commit-tree", git(["write-tree"], { env }), "-p", baseline, "-m", "tested"]);
+  const verified: string[][] = [];
+  const { services: quality } = services(root, repo, {
+    verificationBases: new Map([["run-merged", tested]]),
+    createVerifier: () => ({ verify: async candidate => { verified.push(baselineOf(candidate)); return { status: "passed", checks: [] }; }, stop: async () => {} }),
+    createGraderProcess: passingGrader,
+  });
+  quality.prepare?.("run-merged", "single");
+  const result = await quality.evaluate({ run_id: "run-merged", worktree: repo, baseline, requirement: "make a 2", attempt: 1, signal: new AbortController().signal });
+  assert.equal(result.action, "pass");
+  assert.equal(result.candidate.testedBaseline, tested);
+  assert.deepEqual(verified, [["src/a.js", "test/extra.js"]], "the verifier restores trusted paths from the tested base");
+  assert.deepEqual(baselineTrees(root, "run-merged"), [[], ["src/a.js", "test/extra.js"]]);
 });

@@ -107,8 +107,9 @@ export function createQualityServices(options: {
       const fixed = profile.fixers?.length ? await applyFixers({ fixers: profile.fixers, worktree: input.worktree, baseline: input.baseline,
         scratch: path.join(options.root, "fixers"), run: fixerRunner, signal: input.signal }) : undefined;
       const withFixes = (candidate: Candidate): Candidate => fixed ? { ...candidate, fixes: fixed.fixes, ...(fixed.cause ? { fixer_cause: fixed.cause } : {}) } : candidate;
-      const source = await store.create(input.worktree, input.baseline, input.run_id);
       const tested = options.verificationBases.get(input.run_id);
+      // Only the snapshot the verifier mounts needs the trusted baseline tree: this one, unless a merged one replaces it below.
+      const source = await store.create(input.worktree, input.baseline, input.run_id, { baselineTree: !tested || tested === input.baseline });
       if (!tested || tested === input.baseline) { artifacts.set(`${input.run_id}:${input.attempt}`, path.dirname(source.path)); return withFixes(source); }
       const worktrees = new WorktreeManager({ repoPath: options.repoPath, worktreeRoot: options.worktreeRoot, baseRef: tested });
       const tree = await worktrees.create(`verify-${input.run_id}-${input.attempt}`, tested);
@@ -151,7 +152,8 @@ export function createQualityServices(options: {
     structured: profile.structuredWorkflow,
     prepare: (id,mode) => { options.ledger.open(id,mode === 'structured' ? profile.structuredWorkflow!.maxCostUsd : profile.maxCostUsd); },
     discover: async input => {
-      const snapshot = await store.create(input.worktree,input.baseline,input.run_id);
+      // Planner and investigators read the candidate only; nothing verifies this snapshot.
+      const snapshot = await store.create(input.worktree,input.baseline,input.run_id,{ baselineTree: false });
       // AGENTS.md as the baseline commit has it, so the writer's edits never steer the planner or investigators.
       const agents = await readFileAtCommit(input.worktree, input.baseline, "AGENTS.md", REPO_GUIDANCE_MAX_BYTES + 4);
       return coordinator.discover({ run_id: input.run_id, owner: input.owner, requirement: input.requirement, baseline: input.baseline, snapshot, fingerprint, initial_active_ms: input.initial_active_ms,
@@ -162,8 +164,7 @@ export function createQualityServices(options: {
       if (!saved || saved.requirement !== input.requirement || saved.baseline !== input.baseline || saved.fingerprint !== fingerprint) throw new Error('workflow_identity_changed');
       if ((await exec('git',['rev-parse','HEAD'],{ cwd: input.worktree, env: hardenedGitEnv() })).stdout.trim() !== input.baseline) throw new Error('workflow_baseline_changed');
       await access(saved.snapshot.path); if (saved.snapshot.artifact) await access(saved.snapshot.artifact);
-      const current = await store.create(input.worktree,input.baseline,input.run_id);
-      if (current.hash !== saved.snapshot.hash) throw new Error('workflow_snapshot_changed');
+      if (await store.hash(input.worktree,input.baseline) !== saved.snapshot.hash) throw new Error('workflow_snapshot_changed');
     },
     writerStarted: id => coordinator.writerStarted(id), canResume: id => coordinator.canResume(id), resumeElapsed: id => coordinator.elapsed(id), tasks: id => coordinator.tasks(id),
     resumeCheckpoint: id => options.control.get<{ updated_at: number }>('structured',id)?.updated_at ?? 0,
@@ -178,7 +179,7 @@ export function createQualityServices(options: {
     activeTimeoutMs: profile.activeTimeoutMs, maxCostUsd: profile.maxCostUsd,
     evaluate: input => gate.evaluate(input),
     assertUnchanged: (candidate, input) => store.assertUnchanged({ ...candidate, hash: candidate.sourceHash ?? candidate.hash }, input.worktree, input.baseline, input.run_id),
-    archive: async input => { await store.create(input.worktree, input.baseline, input.run_id); },
+    archive: async input => { await store.create(input.worktree, input.baseline, input.run_id, { baselineTree: false }); },
     execution: (id, parent, role, currentAttempt, phase, queueMs) => execution(id, parent, role, currentAttempt, phase, undefined, queueMs),
   };
 }

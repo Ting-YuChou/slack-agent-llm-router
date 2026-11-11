@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -45,6 +45,25 @@ test("snapshotting a candidate never runs a filter or diff driver from the host'
     await withGlobalConfig(h.globalConfig, () => new CandidateStore(path.join(h.root, "candidates")).create(h.repo, h.baseline, "run-1"));
     assert.equal(existsSync(h.marker), false, "a host-configured filter ran on agent-controlled .gitattributes");
   } finally { await rm(h.root, { recursive: true, force: true }); }
+});
+
+test("the baseline tree is copied raw even when the baseline commit asks for a host-configured filter", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "hardened-baseline-"));
+  try {
+    const repo = path.join(root, "repo"); const marker = path.join(root, "pwned"); const globalConfig = path.join(root, "global.gitconfig");
+    const touch = `sh -c 'touch ${marker}; cat'`;
+    await writeFile(globalConfig, `[filter "evil"]\n\tclean = ${touch}\n\tsmudge = ${touch}\n[diff "evil"]\n\ttextconv = sh -c 'touch ${marker}; cat \\"$1\\"' --\n`);
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, env: { ...hardenedGitEnv() } });
+    execFileSync("git", ["init", "-q", "-b", "main", repo]);
+    await writeFile(path.join(repo, ".gitattributes"), "* filter=evil diff=evil\n");
+    await writeFile(path.join(repo, "a.txt"), "one\n");
+    git("add", "."); git("commit", "-q", "-m", "baseline");
+    const baseline = git("rev-parse", "HEAD").toString().trim();
+    await writeFile(path.join(repo, "a.txt"), "two\n");
+    const snapshot = await withGlobalConfig(globalConfig, () => new CandidateStore(path.join(root, "candidates")).create(repo, baseline, "run-1"));
+    assert.equal(existsSync(marker), false, "a host-configured filter ran while copying the baseline tree");
+    assert.equal(readFileSync(path.join(path.dirname(snapshot.path), "baseline", "a.txt"), "utf8"), "one\n");
+  } finally { execFileSync("chmod", ["-R", "u+rwX", root]); await rm(root, { recursive: true, force: true }); }
 });
 
 test("archiving an undelivered patch never runs a filter or diff driver from the host's git config", async () => {
