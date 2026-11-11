@@ -943,6 +943,36 @@ def _provider_http_timeout(read_seconds: float) -> httpx.Timeout:
     return httpx.Timeout(connect=3.0, read=read_seconds, write=10.0, pool=2.0)
 
 
+# httpx drops idle connections after 5 s, so most chat requests paid for a new
+# TCP and TLS handshake. Sixty seconds stays under common idle limits upstream.
+_DEFAULT_KEEPALIVE_EXPIRY_SECONDS = 60.0
+
+
+def _provider_http_client(
+    sdk: Any, config: Any, timeout: httpx.Timeout
+) -> Optional[Any]:
+    """The SDK's own HTTP client with a longer keep-alive, or None.
+
+    Only the idle expiry changes: the pool keeps the SDK's size, because a
+    smaller pool would turn bursts into pool timeouts. An SDK without
+    DefaultAsyncHttpxClient (a test stub) keeps building its own client.
+    """
+    factory = getattr(sdk, "DefaultAsyncHttpxClient", None)
+    if factory is None:
+        return None
+    value = config.get("keepalive_expiry_seconds") if isinstance(config, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        value = _DEFAULT_KEEPALIVE_EXPIRY_SECONDS
+    return factory(
+        limits=httpx.Limits(
+            max_connections=1000,
+            max_keepalive_connections=100,
+            keepalive_expiry=float(value),
+        ),
+        timeout=timeout,
+    )
+
+
 # Query types that get a model's high reasoning effort on their own.
 _HIGH_EFFORT_QUERY_TYPES = frozenset({"reasoning", "math"})
 # Query types that get it only when the router also scored the request
@@ -1018,11 +1048,28 @@ class BaseInferenceProvider(ABC):
         self.config = config
         # The provider SDK's async client, set by initialize().
         self.client: Any = None
+        # The HTTP client handed to the SDK client, closed by _close_http_client().
+        self._http_client: Any = None
         # The router's model configs: per-model pricing (and, for OpenAI,
         # reasoning effort and temperature support).
         self.model_configs: Dict[str, Any] = (
             model_configs if isinstance(model_configs, dict) else {}
         )
+
+    def _sdk_client_kwargs(self, sdk: Any) -> Dict[str, Any]:
+        """Timeout, retry and HTTP client arguments shared by the cloud SDK clients."""
+        timeout = _provider_http_timeout(self.timeout_seconds())
+        kwargs: Dict[str, Any] = {"timeout": timeout, "max_retries": 0}
+        self._http_client = _provider_http_client(sdk, self.config, timeout)
+        if self._http_client is not None:
+            kwargs["http_client"] = self._http_client
+        return kwargs
+
+    async def _close_http_client(self) -> None:
+        """Close the HTTP client given to the SDK; safe before initialize()."""
+        http_client, self._http_client = getattr(self, "_http_client", None), None
+        if http_client is not None:
+            await http_client.aclose()
 
     def timeout_seconds(self) -> float:
         """Longest a single provider call may take, in seconds."""
@@ -1190,10 +1237,13 @@ class OpenAIProvider(BaseInferenceProvider):
         self.client = openai.AsyncOpenAI(
             api_key=api_key,
             base_url=self.config.get("base_url", "https://api.openai.com/v1"),
-            timeout=_provider_http_timeout(self.timeout_seconds()),
-            max_retries=0,
+            **self._sdk_client_kwargs(openai),
         )
         logger.info("OpenAI provider initialized")
+
+    async def aclose(self) -> None:
+        """Close the pooled connections to OpenAI."""
+        await self._close_http_client()
 
     async def generate_response(
         self, request: QueryRequest, model_name: str
@@ -1453,10 +1503,13 @@ class AnthropicProvider(BaseInferenceProvider):
         self.client = anthropic.AsyncAnthropic(
             api_key=api_key,
             base_url=self.config.get("base_url", "https://api.anthropic.com"),
-            timeout=_provider_http_timeout(self.timeout_seconds()),
-            max_retries=0,
+            **self._sdk_client_kwargs(anthropic),
         )
         logger.info("Anthropic provider initialized")
+
+    async def aclose(self) -> None:
+        """Close the pooled connections to Anthropic."""
+        await self._close_http_client()
 
     async def generate_response(
         self, request: QueryRequest, model_name: str
