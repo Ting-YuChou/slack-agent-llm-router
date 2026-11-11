@@ -409,7 +409,9 @@ def _event_query_text(query_request: QueryRequest) -> str:
     """The query as events carry it: redacted, and for Slack without the
     attached files' names (a file-only message asks about them by name)."""
     query = query_request.query
-    if (query_request.metadata or {}).get("source") == "slack":
+    from_slack = (query_request.metadata or {}).get("source") == "slack"
+    names: List[str] = []
+    if from_slack:
         names = sorted(
             {
                 attachment.name
@@ -419,18 +421,27 @@ def _event_query_text(query_request: QueryRequest) -> str:
             key=len,
             reverse=True,
         )
-        if names:
-            # Whole names only, longest first: a file called "a" or "notes"
-            # must not rewrite the words around it, and "plan.txt" must not
-            # leave ".bak" of "plan.txt.bak". Bounded by ASCII letters and
-            # digits only, so a name next to CJK text or "_" is still found.
-            pattern = re.compile(
-                r"(?<![A-Za-z0-9])(?:"
-                + "|".join(re.escape(name) for name in names)
-                + r")(?![A-Za-z0-9])"
-            )
-            query = pattern.sub("[attachment]", query)
-    return redact_text(query)
+    # Three events carry this text and redaction is the costly part, so it is
+    # kept on the request. Copies share the memo: the key holds every input.
+    memo = getattr(query_request, "_routing_memo", None)
+    key = ("event_query_text", query, from_slack, tuple(sorted(names)))
+    if isinstance(memo, dict) and key in memo:
+        return memo[key]
+    if names:
+        # Whole names only, longest first: a file called "a" or "notes"
+        # must not rewrite the words around it, and "plan.txt" must not
+        # leave ".bak" of "plan.txt.bak". Bounded by ASCII letters and
+        # digits only, so a name next to CJK text or "_" is still found.
+        pattern = re.compile(
+            r"(?<![A-Za-z0-9])(?:"
+            + "|".join(re.escape(name) for name in names)
+            + r")(?![A-Za-z0-9])"
+        )
+        query = pattern.sub("[attachment]", query)
+    text = redact_text(query)
+    if isinstance(memo, dict):
+        memo[key] = text
+    return text
 
 
 def _without_attachment_names(slack_metadata: Any) -> Any:
@@ -739,8 +750,16 @@ class QueryLogEntry:
     kafka_partition: int = -1
     kafka_offset: int = -1
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for database insertion"""
+    def to_dict(self, *, query_text_redacted: bool = False) -> Dict[str, Any]:
+        """Convert to dictionary for database insertion.
+
+        `query_text_redacted` is for a caller that built `query_text` with
+        `_event_query_text` in this process; rows read back from Kafka are
+        always redacted here.
+        """
+        query_text = (
+            self.query_text if query_text_redacted else redact_text(self.query_text)
+        )
         return {
             "event_id": self.event_id or self.query_id,
             "query_id": self.query_id,
@@ -749,7 +768,7 @@ class QueryLogEntry:
             "user_tier": self.user_tier.value
             if isinstance(self.user_tier, UserTier)
             else str(self.user_tier),
-            "query_text": redact_text(self.query_text)[:10000],
+            "query_text": query_text[:10000],
             "query_type": self.query_type.value
             if hasattr(self.query_type, "value")
             else str(self.query_type),
@@ -1612,7 +1631,7 @@ class KafkaProducerManager:
             "queries",
             "llm-queries",
             key=query_log.user_id,
-            value=query_log.to_dict(),
+            value=query_log.to_dict(query_text_redacted=True),
         )
 
     async def produce_metric(
