@@ -184,3 +184,28 @@ def test_an_object_without_a_memo_still_gets_redacted_text(redactions):
     assert _event_query_text(request) == redact_text(SECRET_QUERY)
     assert _event_query_text(request) == redact_text(SECRET_QUERY)
     assert redactions == [SECRET_QUERY, SECRET_QUERY]
+
+
+# --- one pass must be final: the query log no longer gets a second one ----------
+
+# Inputs where masking one credential used to uncover the next one, so a
+# single pass left a secret that only a second pass would have masked.
+CHAINED_SECRETS = [
+    ("token: --password --password s3cr3t!9", "s3cr3t!9"),
+    ("set API_KEY= --token --token abc123XYZ789abc", "abc123XYZ789abc"),
+]
+
+
+@pytest.mark.parametrize("text, secret", CHAINED_SECRETS)
+def test_one_redaction_pass_leaves_nothing_for_a_second(text, secret):
+    once = redact_text(text)
+
+    assert secret not in once
+    assert redact_text(once) == once
+
+
+@pytest.mark.parametrize("text, secret", CHAINED_SECRETS)
+def test_the_query_log_message_carries_no_chained_secret(text, secret):
+    request = QueryRequest(query=text, user_id="u1")
+
+    assert secret not in _event_query_text(request)

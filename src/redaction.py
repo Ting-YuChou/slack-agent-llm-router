@@ -849,12 +849,23 @@ def is_credential_key(key: Any) -> bool:
     return bool(_CREDENTIAL_KEY.search(_CAMEL_BOUNDARY.sub("_", key)))
 
 
+# A round only repeats after it masked something; this bounds pathological input.
+_MAX_ROUNDS = 5
+
+
 def redact_text(text: str) -> str:
     """Return `text` with credentials replaced by `[REDACTED]`."""
     if not text:
         return text
-    for step in _STEPS:
-        text = step(text)
+    # Masking one credential can uncover the next ("--password --password x"),
+    # so repeat until a round changes nothing. Text without credentials, the
+    # common case, costs a single round.
+    for _ in range(_MAX_ROUNDS):
+        before = text
+        for step in _STEPS:
+            text = step(text)
+        if text == before:
+            break
     return text
 
 
