@@ -96,3 +96,29 @@ test("startup time is the first attempt's dispatch-to-prompt; repairs report the
   assert.equal(plain.repair_startup_s, null);
   assert.equal(computeHarnessMetrics(run({}), now).startup_s, null);
 });
+
+const STAGE_KEYS = ["snapshot_s", "verify_s", "grade_s", "assert_unchanged_s", "writer_checks_s"] as const;
+
+test("stage seconds are summed over attempts", () => {
+  const metrics = computeHarnessMetrics(run({
+    attempts: [
+      { attempt: 1, execution_id: "e1", verification_status: "failed", grader_status: "pending", gate_timing: { snapshot_ms: 300, verify_ms: 40_000 } },
+      { attempt: 2, execution_id: "e2", verification_status: "passed", grader_status: "passed",
+        gate_timing: { snapshot_ms: 250, verify_ms: 38_000, grade_ms: 31_240, grade_samples_ms: [31_240], assert_unchanged_ms: 90 } },
+    ],
+    writer_checks_calls: 2, writer_checks_ms: 12_340,
+  }), now);
+  // To the millisecond: a snapshot or re-check takes a fraction of a second.
+  assert.deepEqual(STAGE_KEYS.map(key => metrics[key]), [0.55, 78, 31.24, 0.09, 12.34]);
+});
+
+test("a stage no attempt reached is left out rather than reported as zero", () => {
+  const metrics = computeHarnessMetrics(run({ attempts: [{ attempt: 1, execution_id: "e1", verification_status: "failed", grader_status: "pending", gate_timing: { snapshot_ms: 300, verify_ms: 1000 } }] }), now);
+  assert.deepEqual([metrics.snapshot_s, metrics.verify_s], [0.3, 1]);
+  for (const key of ["grade_s", "assert_unchanged_s", "writer_checks_s"]) assert.equal(key in metrics, false, key);
+});
+
+test("runs without stage timing carry no stage keys", () => {
+  const metrics = computeHarnessMetrics(run({ attempts: [{ attempt: 1, execution_id: "e1", verification_status: "passed", grader_status: "passed" }], writer_checks_calls: 1 }), now);
+  for (const key of STAGE_KEYS) assert.equal(key in metrics, false, key);
+});

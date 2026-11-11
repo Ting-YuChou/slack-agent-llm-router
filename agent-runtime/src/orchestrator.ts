@@ -11,7 +11,7 @@ import { interruptRestartedRun, type RuntimeStateStore } from "./runtime-state.j
 import { appendRunEvent, eventsAfter } from "./run-events.js";
 import { workflowMode, type InvestigationDegraded, type WorkflowMode, type WorkflowNode } from "./structured-workflow.js";
 import { WorkflowBudget } from "./workflow-budget.js";
-import type { Candidate, GateInput, GateResult } from "./quality-gate.js";
+import type { Candidate, GateInput, GateResult, GateTiming } from "./quality-gate.js";
 import { classifyGateError, failureCause, type RunFailure } from "./error-taxonomy.js";
 import { promptTelemetry, renderPrompt } from "./prompts.js";
 import type { FixResult } from "./fixers.js";
@@ -124,6 +124,8 @@ export interface RunRecord {
   execution_status?: "running" | "succeeded" | "failed";
   /** run_checks calls the writer made in this run. */
   writer_checks_calls?: number;
+  /** Whole milliseconds those calls took, summed. */
+  writer_checks_ms?: number;
   /** How the latest writer execution ended (Pi stop reason classification). */
   execution_outcome?: RunOutcome;
   grader_findings?: Array<{ path: string; line: number; severity: string; reason: string }>;
@@ -134,7 +136,9 @@ export interface RunRecord {
   publication_status?: string;
   /** Startup of a run without a workflow; workflow runs record it per attempt. */
   startup?: AttemptStartup;
-  attempts?: Array<{ attempt: number; execution_id: string; startup?: AttemptStartup; candidate_hash?: string; verification_status?: string; grader_status?: string; artifact?: string; fixes?: FixResult[]; fixer_cause?: string }>;
+  attempts?: Array<{ attempt: number; execution_id: string; startup?: AttemptStartup; candidate_hash?: string; verification_status?: string; grader_status?: string; artifact?: string; fixes?: FixResult[]; fixer_cause?: string;
+    /** How long the gate's stages took for this attempt; `assert_unchanged_ms` only for the candidate that was delivered. */
+    gate_timing?: Partial<GateTiming> & { assert_unchanged_ms?: number } }>;
   run_id: string;
   session_id: string;
   status: RunStatus;
@@ -1197,6 +1201,7 @@ export class CodingAgentOrchestrator {
     this.persistSoon();
     const operation = this.quality.runChecks({ run_id: run.run_id, worktree: session.worktreePath, baseline: session.baselineCommit, ...(event.checks ? { checks: event.checks } : {}), signal: workflow.controller.signal, deadlineMs: windowMs });
     workflow.checksOperation = operation;
+    const checksStarted = performance.now();
     try {
       const response = await operation;
       if (workflow.controller.signal.aborted || isTerminal(run.status) || this.terminalClaims.has(run.run_id)) return;
@@ -1208,6 +1213,9 @@ export class CodingAgentOrchestrator {
       respond({ status: "unknown", reason: "run_checks_failed", checks: [], report: "The checks could not run. Continue; the final verification still runs." });
     } finally {
       if (workflow.checksOperation === operation) workflow.checksOperation = undefined;
+      run.writer_checks_ms = (run.writer_checks_ms ?? 0) + elapsedMs(checksStarted);
+      // A cancelled or timed-out run is terminal before its checks stop; its metrics were computed without them.
+      if (isTerminal(run.status)) run.harness_metrics = computeHarnessMetrics(run);
       this.persistSoon();
     }
   }
@@ -1263,7 +1271,8 @@ export class CodingAgentOrchestrator {
         run.grader_findings = result.grade?.findings;
         run.verification_status = result.verification.status; run.grader_status = result.grade?.status ?? "pending";
         Object.assign(run.attempts!.at(-1)!, { candidate_hash: result.candidate.hash, verification_status: run.verification_status, grader_status: run.grader_status, artifact: result.candidate.artifact,
-          ...(result.candidate.fixes?.length ? { fixes: result.candidate.fixes } : {}), ...(result.candidate.fixer_cause ? { fixer_cause: result.candidate.fixer_cause } : {}) });
+          ...(result.candidate.fixes?.length ? { fixes: result.candidate.fixes } : {}), ...(result.candidate.fixer_cause ? { fixer_cause: result.candidate.fixer_cause } : {}),
+          ...(result.timing ? { gate_timing: result.timing } : {}) });
         if (result.action === "repair") {
           workflow.attempt++; workflow.executionId = randomUUID(); workflow.checking = false;
           this.notifyTrace(run.run_id, { type: "repair", attempt: workflow.attempt, reason: repairReason(result) });
@@ -1280,7 +1289,9 @@ export class CodingAgentOrchestrator {
         }
         // Writers are kept for reuse only under a trusted profile, so only runs with a workflow can hold one.
         if (!await this.releaseWriter(session, run)) return;
-        await this.quality.assertUnchanged(result.candidate, input);
+        const assertStarted = performance.now();
+        try { await this.quality.assertUnchanged(result.candidate, input); }
+        finally { const attempt = run.attempts!.at(-1)!; attempt.gate_timing = { ...attempt.gate_timing, assert_unchanged_ms: elapsedMs(assertStarted) }; }
         workflow.controller.signal.throwIfAborted();
         this.setPhase(run, "finalizing"); await this.persistState();
       } catch (error) {
@@ -1792,6 +1803,11 @@ function resumeFromPatchPrompt(run: RunRecord): string {
     `Task: ${run.workflow_requirement ?? run.task_summary ?? "the previous attempt's task"}`,
     "Finish the task from these changes and fix what made the previous attempt fail.",
   ].join("\n");
+}
+
+/** Whole milliseconds since a performance.now() reading. */
+function elapsedMs(started: number): number {
+  return Math.max(0, Math.round(performance.now() - started));
 }
 
 function isTerminal(status: RunStatus): boolean {

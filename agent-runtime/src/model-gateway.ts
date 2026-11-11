@@ -46,6 +46,17 @@ export function createModelGateway(options: {
   const classifierCalls = new Map<string, { count: number; expiresAt: number }>();
   const activeStreams = new Map<string, number>();
   const requestCounts = new Map<string, { count: number; expiresAt: number }>();
+  // Executions whose prompt time the budget store has already handed over; it never gives one twice, so stop asking.
+  const firstModelKnown = new Map<string, number>();
+  const firstModel = async (execution: string, expiresAt: number): Promise<number | undefined> => {
+    const now = Date.now();
+    for (const [id, expires] of firstModelKnown) if (expires < now) firstModelKnown.delete(id);
+    if (firstModelKnown.has(execution)) return undefined;
+    const sent = await Promise.resolve(options.budgetLedger?.firstModel(execution)).catch(() => undefined);
+    // No answer can mean the prompt is not recorded yet; the next request asks again.
+    if (sent !== undefined) firstModelKnown.set(execution, expiresAt);
+    return sent;
+  };
   return createServer(guardedHandler("model-gateway", async (request, response) => {
     if (request.method === "GET" && request.url === "/health") {
       sendJson(response, 200, {
@@ -110,7 +121,7 @@ export function createModelGateway(options: {
       else try { admission = await admitBudget(options.budgetLedger, options.prices ?? {}, claims.workflowRunId, `${claims.provider}/${claims.model}`, rawBody, claims.runId); rawBody = admission.body; }
       catch (error) { refuse(response, options.tracing, claims, "workflow_budget_unavailable_or_exhausted", "Model budget unavailable or exhausted", budgetRefusal(error)); return; }
       const requestStarted = performance.now();
-      const sent = await Promise.resolve(options.budgetLedger?.firstModel(claims.runId)).catch(() => undefined);
+      const sent = await firstModel(claims.runId, claims.expiresAt);
     if (sent !== undefined) options.tracing?.firstModel(claims.runId, claims.traceparent, sent);
     const span = options.tracing?.gateway(claims.runId, claims.traceparent, claims.provider, claims.model);
       const disconnect = upstreamDisconnect(response, span);
@@ -155,17 +166,17 @@ export function createModelGateway(options: {
       sendJson(response, 503, { error: { code: "provider_not_configured", message: "Requested model provider is not configured" } });
       return;
     }
-    let rawBody: Buffer;
+    // Parsed once here and encoded once below, by budget admission when there is a budget store.
+    let sanitized: Record<string, unknown>;
     try {
-      rawBody = await readBody(request);
-      const body = JSON.parse(rawBody.toString("utf8"));
+      const body = JSON.parse((await readBody(request)).toString("utf8"));
       if (!validateAgentModelRequest(body, model, claims.reasoningEffort)) throw new Error("invalid model request");
       const policy = sanitizeAgentRequest(model.api, body);
       if (!policy.ok) {
         sendJson(response, 400, { error: { code: "request_field_not_allowed", message: `Request field is not allowed through the gateway: ${policy.field}` } });
         return;
       }
-      rawBody = Buffer.from(JSON.stringify(policy.body));
+      sanitized = policy.body;
     } catch {
       sendJson(response, 400, {
         error: { code: "invalid_request", message: "Request does not match the token-bound model configuration" },
@@ -194,13 +205,14 @@ export function createModelGateway(options: {
     };
     let admission: { body: Buffer; data: (chunk: Buffer) => void; finish: () => Promise<{ truncated: boolean }> | void };
     // Tests and local tools may run without a budget store; the gateway process itself refuses to start without one.
-    if (!options.budgetLedger) admission = { body: rawBody, data: () => {}, finish: () => {} };
+    if (!options.budgetLedger) admission = { body: Buffer.from(JSON.stringify(sanitized)), data: () => {}, finish: () => {} };
     else {
-      try { admission = await admitBudget(options.budgetLedger, options.prices ?? {}, claims.workflowRunId, `${claims.provider}/${claims.model}`, rawBody, claims.runId, claims.outputTokenLimit === undefined ? undefined : Math.min(OUTPUT_TOKEN_CEILING, claims.outputTokenLimit)); rawBody = admission.body; }
+      try { admission = await admitBudget(options.budgetLedger, options.prices ?? {}, claims.workflowRunId, `${claims.provider}/${claims.model}`, sanitized, claims.runId, claims.outputTokenLimit === undefined ? undefined : Math.min(OUTPUT_TOKEN_CEILING, claims.outputTokenLimit)); }
       catch (error) { releaseSlot(); refuse(response, options.tracing, claims, "workflow_budget_unavailable_or_exhausted", "Model budget unavailable or exhausted", budgetRefusal(error)); return; }
     }
+    const rawBody = admission.body;
     const requestStarted = performance.now();
-    const sent = await Promise.resolve(options.budgetLedger?.firstModel(claims.runId)).catch(() => undefined);
+    const sent = await firstModel(claims.runId, claims.expiresAt);
     if (sent !== undefined) options.tracing?.firstModel(claims.runId, claims.traceparent, sent);
     const span = options.tracing?.gateway(claims.runId, claims.traceparent, claims.provider, claims.model);
     const disconnect = upstreamDisconnect(response, span);

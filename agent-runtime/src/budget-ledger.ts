@@ -12,6 +12,9 @@ export class BudgetLedger {
       CREATE TABLE IF NOT EXISTS prompt_times(execution TEXT PRIMARY KEY, sent INTEGER NOT NULL, first_model INTEGER);`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS execution_scopes(execution TEXT PRIMARY KEY,workflow TEXT NOT NULL,stage TEXT NOT NULL,cap REAL NOT NULL);
       CREATE TABLE IF NOT EXISTS reservation_scopes(id TEXT PRIMARY KEY,workflow TEXT NOT NULL,stage TEXT NOT NULL);`);
+    // Every admission sums a workflow's reservations (and a stage's); rows are never deleted, so both need an index.
+    this.db.exec(`CREATE INDEX IF NOT EXISTS reservations_workflow ON reservations(workflow);
+      CREATE INDEX IF NOT EXISTS reservation_scopes_stage ON reservation_scopes(workflow,stage);`);
   }
   open(id: string, limit: number, initial = 0) {
     if (!Number.isFinite(limit) || limit <= 0 || !Number.isFinite(initial) || initial < 0) throw new Error("Invalid budget");

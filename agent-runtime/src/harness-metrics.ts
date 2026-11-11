@@ -18,10 +18,17 @@ export interface HarnessMetrics {
   truncated_requests: number;
   /** truncated_requests per gateway role; `unknown` for tokens issued without one. */
   truncated_requests_by_role: Record<string, number>;
+  /** Gate stage time summed over attempts. Each is present only when some attempt reached that stage. */
+  snapshot_s?: number; verify_s?: number; grade_s?: number; assert_unchanged_s?: number;
+  /** Time spent in the writer's run_checks calls; absent when it made none. */
+  writer_checks_s?: number;
 }
 
 const ratio = (used: number, max: number | undefined) => max ? Math.round((used / max) * 1000) / 1000 : null;
 const seconds = (ms: number) => Math.round(ms / 100) / 10;
+/** Stage times are fractions of a second, so they keep millisecond precision. */
+const stageSeconds = (ms: number) => Math.round(ms) / 1000;
+const STAGES = { snapshot_s: "snapshot_ms", verify_s: "verify_ms", grade_s: "grade_ms", assert_unchanged_s: "assert_unchanged_ms" } as const;
 
 /** Derived from the run alone, so it can be recomputed from any persisted record. */
 export function computeHarnessMetrics(run: RunRecord, now = Date.now()): HarnessMetrics {
@@ -31,6 +38,11 @@ export function computeHarnessMetrics(run: RunRecord, now = Date.now()): Harness
   const first = attempts[0];
   const firstStartupMs = (first?.startup ?? run.startup)?.dispatch_to_prompt_ms;
   const created = Date.parse(run.created_at);
+  const stages: Partial<Record<keyof typeof STAGES, number>> = {};
+  for (const [metric, field] of Object.entries(STAGES) as Array<[keyof typeof STAGES, typeof STAGES[keyof typeof STAGES]]>) {
+    const measured = attempts.map(attempt => attempt.gate_timing?.[field]).filter((ms): ms is number => typeof ms === "number");
+    if (measured.length) stages[metric] = stageSeconds(measured.reduce((sum, ms) => sum + ms, 0));
+  }
   return {
     outcome: run.execution_outcome ?? null,
     turn_util: ratio(run.turn_count, run.limits?.maxTurns),
@@ -52,5 +64,7 @@ export function computeHarnessMetrics(run: RunRecord, now = Date.now()): Harness
     repair_startup_s: attempts.length > 1 ? seconds(attempts.slice(1).reduce((sum, attempt) => sum + (attempt.startup?.dispatch_to_prompt_ms ?? 0), 0)) : null,
     truncated_requests: Object.values(run.truncated_requests ?? {}).reduce((sum, count) => sum + count, 0),
     truncated_requests_by_role: { ...run.truncated_requests },
+    ...stages,
+    ...(run.writer_checks_ms === undefined ? {} : { writer_checks_s: stageSeconds(run.writer_checks_ms) }),
   };
 }

@@ -45,9 +45,14 @@ export interface Candidate { sourceHash?: string; testedBaseline?: string; hash:
   /** What the profile's fixers changed before this snapshot, and why they gave up if they did. */
   fixes?: FixResult[]; fixer_cause?: string }
 export interface GateInput { run_id: string; worktree: string; baseline: string; requirement: string; attempt: number; signal: AbortSignal }
-export interface GateResult { action: "pass" | "repair" | "fail"; candidate: Candidate; verification: VerificationResult; grade?: Grade; repair_prompt?: string; failure?: { code: "scope_violation"; files: string[] } | { code: "verification_failed"; cause_code?: CauseCode } }
+/** Whole milliseconds each gate stage took. A stage the gate never reached is absent; one grader sample includes its retry. */
+export interface GateTiming { snapshot_ms: number; verify_ms?: number; grade_ms?: number; grade_samples_ms?: number[] }
+export interface GateResult { action: "pass" | "repair" | "fail"; candidate: Candidate; verification: VerificationResult; grade?: Grade; repair_prompt?: string; failure?: { code: "scope_violation"; files: string[] } | { code: "verification_failed"; cause_code?: CauseCode };
+  timing?: GateTiming }
 export interface QualityGateOptions {
   profile: { id: string; rubric: string[]; maxRepairs: number; grader?: GraderSampling };
+  /** Monotonic milliseconds for stage timing; defaults to performance.now. */
+  now?(): number;
   snapshot(input: GateInput): Promise<Candidate>;
   verify(candidate: Candidate, input: GateInput): Promise<VerificationResult>;
   grade(candidate: Candidate, verification: VerificationResult, input: GateInput): Promise<unknown>;
@@ -120,13 +125,15 @@ export class QualityGate {
     };
   }
   /** Samples independent graders until the profile's aggregate is decided; the verdict carries the deciding sample's criteria and findings. */
-  private async gradeSamples(candidate: Candidate, verification: VerificationResult, input: GateInput): Promise<Grade> {
+  private async gradeSamples(candidate: Candidate, verification: VerificationResult, input: GateInput, sampleMs: number[]): Promise<Grade> {
     const sampling = this.options.profile.grader ?? DEFAULT_GRADER_SAMPLING;
     const grades: Grade[] = [];
     let status: Grade["status"] | undefined;
     while ((status = decideSamples(grades.map(grade => grade.status), sampling)) === undefined) {
       input.signal.throwIfAborted();
+      const started = this.now();
       grades.push(await this.gradeWithRetry(candidate, verification, input));
+      sampleMs.push(this.since(started));
     }
     // An unknown outcome takes the first sample that gave no verdict, and so its cause.
     const deciding = grades.find(grade => grade.status === status) ?? syntheticUnknown(this.options.profile.rubric, candidate.hash, { code: "insufficient_evidence", message: "Grader samples reached no verdict" });
@@ -154,29 +161,37 @@ export class QualityGate {
     }
   }
 
+  private now(): number { return this.options.now ? this.options.now() : performance.now(); }
+  private since(started: number): number { return Math.max(0, Math.round(this.now() - started)); }
+
   async evaluate(input: GateInput): Promise<GateResult> {
     input.signal.throwIfAborted();
-    let candidate: Candidate;
+    let candidate: Candidate; let started = this.now();
     try { candidate = await this.options.snapshot(input); }
     catch (error) {
       if (!(error instanceof ScopeViolationError)) throw error;
-      return this.scopeViolation(input, error.files);
+      return { ...this.scopeViolation(input, error.files), timing: { snapshot_ms: this.since(started) } };
     }
+    const timing: GateTiming = { snapshot_ms: this.since(started) };
+    started = this.now();
     const verification = await this.options.verify(candidate, input);
+    timing.verify_ms = this.since(started);
     input.signal.throwIfAborted();
     await this.options.record?.("verification", { candidate_hash: candidate.hash, source_hash: candidate.sourceHash ?? candidate.hash, tested_baseline: candidate.testedBaseline ?? input.baseline, ...verification, ...promptTelemetry("implementation") }, input);
     let grade: Grade | undefined;
     if (verification.status === "passed") {
-      grade = await this.gradeSamples(candidate, verification, input);
+      const sampleMs: number[] = []; started = this.now();
+      grade = await this.gradeSamples(candidate, verification, input, sampleMs);
+      timing.grade_ms = this.since(started); timing.grade_samples_ms = sampleMs;
       await this.options.record?.("grade", { ...grade, ...promptTelemetry("grader") }, input);
     }
     input.signal.throwIfAborted();
-    if (verification.status === "passed" && grade?.status === "passed") return { action: "pass", candidate, verification, grade };
+    if (verification.status === "passed" && grade?.status === "passed") return { action: "pass", candidate, verification, grade, timing };
     const retry = verification.status !== "unknown" && grade?.status !== "unknown" && input.attempt <= this.options.profile.maxRepairs;
     const cause = verification.status === "unknown" ? verificationCause(verification) : grade?.cause?.code;
     const failure = !retry && cause ? { code: "verification_failed" as const, cause_code: cause } : undefined;
     return { action: retry ? "repair" : "fail", candidate, verification, grade, ...(failure ? { failure } : {}),
-      repair_prompt: repairPrompt(input.requirement, verification, grade) };
+      repair_prompt: repairPrompt(input.requirement, verification, grade), timing };
   }
 }
 

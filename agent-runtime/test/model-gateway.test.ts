@@ -639,3 +639,34 @@ test("the gateway applies a token's output cap and never sends one above the cei
   await admitted(await agentRequest(base, { workflowRunId: "wf", role: "writer", outputTokenLimit: 100_000 }));
   assert.deepEqual(bodies.map((body) => body.max_output_tokens), [12000, 32768]);
 });
+
+test("first-model is asked until the host answers, then never again for that execution", async (t) => {
+  const asked: string[] = [];
+  // The prompt time is not recorded yet when the first request arrives; the second request gets it.
+  const answers: Array<number | undefined> = [undefined, 1234];
+  const ledger: BudgetAdmissionLedger = { ...truncationLedger([]), firstModel: async (execution) => { asked.push(execution); return execution === "exec-a" ? answers.shift() : undefined; } };
+  const base = await gatewayAt(t, { prices: { "openai/gpt-5.6-luna": { input: 1, output: 1 } }, budgetLedger: ledger, fetchFn: async () => new Response(COMPLETED, { status: 200 }) });
+  for (let request = 0; request < 4; request++) await admitted(await agentRequest(base, { runId: "exec-a", workflowRunId: "wf", role: "writer", outputTokenLimit: 32768 }));
+  assert.deepEqual(asked, ["exec-a", "exec-a"]);
+  await admitted(await agentRequest(base, { runId: "exec-b", workflowRunId: "wf", role: "writer", outputTokenLimit: 32768 }));
+  assert.deepEqual(asked, ["exec-a", "exec-a", "exec-b"], "another execution is asked on its own");
+});
+
+test("a classifier execution's first-model time is asked for once it is known", async (t) => {
+  const asked: string[] = [];
+  const ledger: BudgetAdmissionLedger = { ...refusingLedger(), firstModel: async (execution) => { asked.push(execution); return 99; } };
+  const base = await gatewayAt(t, { prices: { [JEV_REF]: { input: 1, output: 1 } }, budgetLedger: ledger });
+  for (let request = 0; request < 3; request++) await admitted(await classifierRequest(base, { runId: "exec-c", workflowRunId: "wf" }));
+  assert.deepEqual(asked, ["exec-c"]);
+});
+
+test("the provider receives the same bytes the budget was reserved for", async (t) => {
+  const sent: string[] = []; const reserved: number[] = [];
+  const ledger: BudgetAdmissionLedger = { ...truncationLedger([]), reserve: async (_workflow, _id, amount) => { reserved.push(amount); } };
+  const base = await gatewayAt(t, { prices: { "openai/gpt-5.6-luna": { input: 1, output: 0 } }, budgetLedger: ledger,
+    fetchFn: async (_input, init) => { sent.push(String(init?.body)); return new Response(COMPLETED, { status: 200 }); } });
+  await admitted(await agentRequest(base, { workflowRunId: "wf", role: "writer", outputTokenLimit: 12000 }));
+  // What the agent sent, plus the fields the gateway owns, in the order they are added.
+  assert.equal(sent[0], JSON.stringify({ model: luna.id, reasoning: { effort: "max" }, input: "x", store: false, max_output_tokens: 12000 }));
+  assert.deepEqual(reserved, [Buffer.byteLength(sent[0]!) / 1_000_000]);
+});

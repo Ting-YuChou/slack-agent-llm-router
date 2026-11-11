@@ -6,11 +6,12 @@ export interface ModelPrice { input: number; output: number; cacheRead?: number 
 /** Without a role-bound limit (classifier, legacy tokens) output stays at the historical conservative cap. */
 const DEFAULT_OUTPUT_LIMIT = 4096;
 
-export async function admitBudget(ledger: BudgetAdmissionLedger | undefined, prices: Record<string, ModelPrice>, workflow: string | undefined, model: string, raw: Buffer, execution?: string, outputLimit = DEFAULT_OUTPUT_LIMIT) {
+/** `raw` is the request as bytes, or already parsed; a parsed body is copied, never changed, and encoded once. */
+export async function admitBudget(ledger: BudgetAdmissionLedger | undefined, prices: Record<string, ModelPrice>, workflow: string | undefined, model: string, raw: Buffer | Record<string, unknown>, execution?: string, outputLimit = DEFAULT_OUTPUT_LIMIT) {
   if (!workflow) throw new Error("budget_required");
   const price = priceFor(model, prices);
   if (!ledger || !price || !Number.isFinite(price.input) || price.input <= 0 || !Number.isFinite(price.output) || price.output < 0) throw new Error("workflow_budget_setup_missing");
-  const body = JSON.parse(raw.toString());
+  const body = Buffer.isBuffer(raw) ? JSON.parse(raw.toString()) : { ...raw };
   let effective = outputLimit;
   if (model.startsWith("openai/")) body.max_output_tokens = effective = Math.min(outputLimit, Number(body.max_output_tokens) || outputLimit);
   else if (!model.startsWith("openrouter/typesafe/jev")) body.max_tokens = effective = Math.min(outputLimit, Number(body.max_tokens) || outputLimit);

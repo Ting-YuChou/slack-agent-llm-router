@@ -61,3 +61,16 @@ test("settlement prices cached input at the cache-read rate", async () => {
   await plain.finish();
   assert.ok(Math.abs(settled[2]! - 1000 * 4 / 1_000_000) < 1e-12);
 });
+
+test("an already-parsed body reserves and encodes exactly as its bytes would", async () => {
+  const openai = { model: "gpt-5.6-luna", input: "héllo ✓", tools: [{ type: "function", name: "t" }], store: false, max_output_tokens: 128000 };
+  const anthropic = { model: "claude-sonnet-4-6", messages: [{ role: "user", content: "héllo ✓" }] };
+  for (const [model, request] of [["openai/gpt-5.6-luna", openai], ["anthropic/claude-sonnet-4-6", anthropic]] as const) {
+    const fromBytes = ledger(); const fromObject = ledger(); const before = JSON.stringify(request);
+    const bytes = await admitBudget(fromBytes, price, "w", model, Buffer.from(before), "e", 32768);
+    const parsed = await admitBudget(fromObject, price, "w", model, request, "e", 32768);
+    assert.deepEqual(parsed.body, bytes.body, model);
+    assert.deepEqual(fromObject.reservations, fromBytes.reservations, model);
+    assert.equal(JSON.stringify(request), before, "the caller's object is not changed");
+  }
+});
