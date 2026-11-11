@@ -20,6 +20,9 @@ class LayoutNormalizationResult:
     document: ParsedDocument
     warnings: List[str] = field(default_factory=list)
     stats: Dict[str, int] = field(default_factory=dict)
+    # What normalization removed, with the removed text. Kept off the document
+    # metadata, which is copied into every chunk and returned to clients.
+    audit: Dict[str, Any] = field(default_factory=dict)
 
 
 class DocumentLayoutNormalizer:
@@ -70,13 +73,11 @@ class DocumentLayoutNormalizer:
             "page_seams_stitched": stitched,
             "cross_page_tables_merged": merged_tables,
         }
-        normalized.metadata["layout_normalization_audit"] = {
-            "excluded_blocks": excluded
-        }
         return LayoutNormalizationResult(
             document=normalized,
             warnings=[*footnote_warnings, *table_warnings],
             stats=dict(normalized.metadata["layout_normalization"]),
+            audit={"excluded_blocks": excluded},
         )
 
     def _link_related_figures(self, blocks: Sequence[DocumentBlock]) -> None:

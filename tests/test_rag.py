@@ -1431,3 +1431,62 @@ def test_docling_parser_extracts_table_text_and_layout_metadata():
     assert blocks[2].asset_ref == "#/pictures/0"
     assert blocks[2].metadata["figure"]["figure_id"] == "pictures-0"
     assert blocks[2].metadata["figure"]["bbox"] == [5.0, 6.0, 7.0, 8.0]
+
+
+def test_serialized_results_drop_the_layout_audit_of_already_indexed_chunks():
+    service = RagService(
+        {"enabled": True, "backend": "memory"},
+        vector_store=InMemoryRagVectorStore(),
+        embedding_provider=HashEmbeddingProvider(dimensions=16),
+    )
+    chunk = StructureAwareChunker({}).chunk(
+        ParsedDocument(
+            document_id="doc-legacy",
+            filename="handbook.pdf",
+            content_hash="hash",
+            blocks=[
+                DocumentBlock(
+                    doc_id="doc-legacy",
+                    page=1,
+                    bbox=None,
+                    block_type="text",
+                    text="Tuition is due in September.",
+                    reading_order=1,
+                )
+            ],
+            metadata={
+                "title": "School Handbook",
+                "layout_normalization": {"boilerplate_removed": 1},
+                "layout_normalization_audit": {
+                    "excluded_blocks": [
+                        {
+                            "block_id": "p1-b1",
+                            "page": 1,
+                            "block_type": "page_header",
+                            "reason": "explicit_header_footer",
+                            "text": "Internal draft header",
+                        }
+                    ]
+                },
+            },
+        )
+    )[0]
+    assert "layout_normalization_audit" in chunk.metadata
+
+    serialized = service.serialize_results(
+        [
+            RagSearchResult(
+                chunk=chunk,
+                score=0.9,
+                match_source="keyword",
+                knowledge_base_id="school",
+                index_version="v1",
+            )
+        ]
+    )
+
+    metadata = serialized[0]["metadata"]
+    assert "layout_normalization_audit" not in metadata
+    assert "Internal draft header" not in repr(serialized)
+    assert metadata["title"] == "School Handbook"
+    assert metadata["layout_normalization"] == {"boilerplate_removed": 1}
