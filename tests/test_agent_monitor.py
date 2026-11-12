@@ -2051,3 +2051,124 @@ async def test_approval_notification_text_cannot_ping_through_a_path(tmp_path):
     text = posted_texts(bot)[0]
     assert text.startswith("Approval required: Edit &lt;!here&gt;?")
     assert "<!here>" not in text
+
+
+# SG2: a status message that only aged is rewritten once per heartbeat
+
+
+def heartbeat_bot(tmp_path, now, **agent):
+    bot = SlackBot(
+        {
+            "channels": [],
+            "state": {"backend": "file", "file_path": str(tmp_path / "state.json")},
+            "agent": agent,
+        },
+        SimpleNamespace(),
+    )
+    bot.web_client = SimpleNamespace(
+        chat_postMessage=AsyncMock(), chat_update=AsyncMock()
+    )
+    bot.agent_progress_clock = lambda: now[0]
+    tracked = track(bot)
+    tracked["status_ts"] = "1.0"
+    return bot, tracked
+
+
+async def progress_at(bot, tracked, now, at, run, **kwargs):
+    now[0] = at
+    await bot._update_agent_progress(tracked, run, **kwargs)
+    return bot.web_client.chat_update.await_count
+
+
+@pytest.mark.asyncio
+async def test_progress_with_only_elapsed_changed_waits_for_the_heartbeat(tmp_path):
+    now = [0.0]
+    bot, tracked = heartbeat_bot(tmp_path, now)
+    run = progress_state("R1", "running", 3, 2, 0.01, "verifying")
+
+    assert await progress_at(bot, tracked, now, 0, run) == 1
+    for at in (10, 20, 35, 59.9):
+        assert await progress_at(bot, tracked, now, at, run) == 1
+    assert await progress_at(bot, tracked, now, 60, run) == 2
+    assert await progress_at(bot, tracked, now, 75, run) == 2
+    assert await progress_at(bot, tracked, now, 120, run) == 3
+
+    texts = [call.kwargs["text"] for call in bot.web_client.chat_update.await_args_list]
+    assert "Elapsed: 1m 00s" in texts[1]
+    assert "Elapsed: 2m 00s" in texts[2]
+
+
+@pytest.mark.asyncio
+async def test_a_changed_counter_is_shown_at_the_progress_interval(tmp_path):
+    now = [0.0]
+    bot, tracked = heartbeat_bot(tmp_path, now)
+
+    def run(tools, **extra):
+        return progress_state("R1", "running", tools, 2, 0.01, "implementing") | extra
+
+    assert await progress_at(bot, tracked, now, 0, run(1)) == 1
+    # Inside the interval even a real change waits.
+    assert await progress_at(bot, tracked, now, 5, run(2)) == 1
+    assert await progress_at(bot, tracked, now, 10, run(2)) == 2
+    assert await progress_at(bot, tracked, now, 20, run(2)) == 2
+    assert await progress_at(bot, tracked, now, 21, run(2, last_tool="bash")) == 3
+    assert (
+        await progress_at(
+            bot, tracked, now, 31, run(2, last_tool="bash", phase="verifying")
+        )
+        == 4
+    )
+    assert "Tools: 2" in bot.web_client.chat_update.await_args_list[1].kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_waiting_for_approval_does_not_rewrite_the_status_every_poll(tmp_path):
+    now = [0.0]
+    bot, tracked = heartbeat_bot(tmp_path, now)
+    run = progress_state("R1", "awaiting_approval", 4, 3, 0.02)
+
+    # The monitor polls a waiting run every two seconds.
+    for at in range(0, 300, 2):
+        await progress_at(bot, tracked, now, float(at), run)
+
+    assert bot.web_client.chat_update.await_count == 5
+
+
+@pytest.mark.asyncio
+async def test_the_final_state_is_never_held_back_by_the_heartbeat(tmp_path):
+    now = [0.0]
+    bot, tracked = heartbeat_bot(tmp_path, now)
+    run = progress_state("R1", "completed", 4, 3, 0.02)
+
+    assert await progress_at(bot, tracked, now, 0, run) == 1
+    assert await progress_at(bot, tracked, now, 3, run, force=True) == 2
+    # Identical text is still not sent twice.
+    assert await progress_at(bot, tracked, now, 3, run, force=True) == 2
+
+
+@pytest.mark.asyncio
+async def test_progress_heartbeat_is_configurable(tmp_path):
+    now = [0.0]
+    bot, tracked = heartbeat_bot(tmp_path, now, progress_heartbeat_seconds=25)
+    run = progress_state("R1", "running", 3, 2, 0.01, "grading")
+
+    assert bot.agent_progress_heartbeat_seconds == 25
+    assert await progress_at(bot, tracked, now, 0, run) == 1
+    assert await progress_at(bot, tracked, now, 20, run) == 1
+    assert await progress_at(bot, tracked, now, 25, run) == 2
+    assert file_bot(tmp_path / "default").agent_progress_heartbeat_seconds == 60
+
+
+@pytest.mark.asyncio
+async def test_a_failed_update_is_retried_on_the_next_poll(tmp_path):
+    now = [0.0]
+    bot, tracked = heartbeat_bot(tmp_path, now)
+    run = progress_state("R1", "running", 3, 2, 0.01, "verifying")
+    assert await progress_at(bot, tracked, now, 0, run) == 1
+    changed = progress_state("R1", "running", 4, 2, 0.01, "verifying")
+    bot.web_client.chat_update.side_effect = [RuntimeError("slack down"), None]
+
+    assert await progress_at(bot, tracked, now, 10, changed) == 2
+    assert await progress_at(bot, tracked, now, 11, changed) == 3
+
+    assert "Tools: 4" in bot.web_client.chat_update.await_args.kwargs["text"]

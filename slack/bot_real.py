@@ -133,6 +133,31 @@ def _add_rate_limit_retry(client: Any) -> None:
         )
 
 
+SLACK_HTTP_TIMEOUT_SECONDS = 30
+# Well under a minute: a connection the far end already dropped would be
+# reused, and the SDK's retry could then post a message twice.
+SLACK_HTTP_KEEPALIVE_SECONDS = 30
+
+
+def _new_slack_http_session(timeout_seconds: float) -> Optional[Any]:
+    """One aiohttp session for every Web API call, so connections are kept alive.
+
+    Without it the SDK opens and closes a session (TCP and TLS) per call. The
+    SDK applies its own timeout only to sessions it creates, so it is set here.
+    Must be called inside the running loop. None when aiohttp is not installed.
+    """
+    try:
+        import aiohttp
+    except ImportError:
+        return None
+    return aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+        connector=aiohttp.TCPConnector(keepalive_timeout=SLACK_HTTP_KEEPALIVE_SECONDS),
+        # The per-call sessions this replaces never carried a cookie over.
+        cookie_jar=aiohttp.DummyCookieJar(),
+    )
+
+
 @dataclass(frozen=True)
 class SlackWorkItem:
     kind: str
@@ -280,6 +305,11 @@ class SlackBot(
         self.agent_progress_interval_seconds = float(
             self.agent_config.get("progress_interval_seconds", 10)
         )
+        # A status message whose only change is its elapsed time is rewritten
+        # this often, so a long verify or approval wait still shows life.
+        self.agent_progress_heartbeat_seconds = float(
+            self.agent_config.get("progress_heartbeat_seconds", 60)
+        )
         # Wall-clock seconds, so elapsed time compares with the run's created_at.
         self.agent_progress_clock: Callable[[], float] = time.time
         # How long a monitor keeps reattaching to a run it cannot reach: the
@@ -338,6 +368,8 @@ class SlackBot(
         self._accepting_work = True
         self._socket_disconnect_lock = asyncio.Lock()
         self._socket_disconnected = False
+        # Owned by the bot, not the client: callers may replace web_client.
+        self._slack_http_session: Optional[Any] = None
 
     async def initialize(self):
         """Initialize Slack bot"""
@@ -353,6 +385,7 @@ class SlackBot(
 
             self.web_client = AsyncWebClient(token=bot_token)
             _add_rate_limit_retry(self.web_client)
+            await self._share_slack_http_session()
             self.bot_token = bot_token
             self.socket_client = AsyncSocketModeClient(
                 app_token=app_token, web_client=self.web_client
@@ -390,7 +423,37 @@ class SlackBot(
 
         except Exception as e:
             logger.error(f"Failed to initialize Slack bot: {e}")
+            await self._close_slack_http_session()
             raise
+
+    async def _share_slack_http_session(self) -> None:
+        """Give the Web API client the bot's session, if it takes one."""
+        # A session from an earlier initialize() belonged to the old client.
+        await self._close_slack_http_session()
+        # Clients without a `session` attribute (test doubles) are left alone,
+        # and so is one that already has a session.
+        if not hasattr(self.web_client, "session") or self.web_client.session:
+            return
+        # The SDK stops applying the client's own timeout once it is handed a
+        # session, so the session carries it.
+        timeout = getattr(self.web_client, "timeout", None)
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            timeout = SLACK_HTTP_TIMEOUT_SECONDS
+        session = _new_slack_http_session(timeout)
+        if session is None:
+            return
+        self._slack_http_session = session
+        self.web_client.session = session
+
+    async def _close_slack_http_session(self) -> None:
+        session = getattr(self, "_slack_http_session", None)
+        self._slack_http_session = None
+        if session is None:
+            return
+        try:
+            await session.close()
+        except Exception:
+            logger.warning("Slack HTTP session close failed", exc_info=True)
 
     async def start(self):
         """Start the Slack bot"""
@@ -968,39 +1031,44 @@ class SlackBot(
     async def shutdown(self):
         """Shutdown the Slack bot"""
         logger.info("Shutting down Slack bot...")
-        self.running = False
-        self._accepting_work = False
-        await self._stop_work_workers()
-
-        # A feedback click waiting on its confirmation gets to finish and
-        # reply, for about as long as the producer waits for it.
-        feedback = [
-            task
-            for task in self.background_tasks
-            if task.get_name() == CHAT_FEEDBACK_DELIVERY_TASK
-        ]
-        if feedback:
-            await asyncio.wait(
-                feedback, timeout=self.chat_feedback_shutdown_wait_seconds
-            )
-
-        for task in list(self.background_tasks):
-            task.cancel()
-
-        if self.background_tasks:
-            await asyncio.gather(*self.background_tasks, return_exceptions=True)
-
-        if self.socket_client:
-            await self._disconnect_socket_once()
-
-        if not self._uses_granular_redis_state():
-            await self._persist_state()
-        await self.state_store.shutdown()
         try:
-            await self.memory_manager.shutdown()
-        except Exception:
-            logger.warning("Slack memory shutdown failed", exc_info=True)
-        await self._close_attachment_http_client()
+            self.running = False
+            self._accepting_work = False
+            await self._stop_work_workers()
+
+            # A feedback click waiting on its confirmation gets to finish and
+            # reply, for about as long as the producer waits for it.
+            feedback = [
+                task
+                for task in self.background_tasks
+                if task.get_name() == CHAT_FEEDBACK_DELIVERY_TASK
+            ]
+            if feedback:
+                await asyncio.wait(
+                    feedback, timeout=self.chat_feedback_shutdown_wait_seconds
+                )
+
+            for task in list(self.background_tasks):
+                task.cancel()
+
+            if self.background_tasks:
+                await asyncio.gather(*self.background_tasks, return_exceptions=True)
+
+            if self.socket_client:
+                await self._disconnect_socket_once()
+
+            if not self._uses_granular_redis_state():
+                await self._persist_state()
+            await self.state_store.shutdown()
+            try:
+                await self.memory_manager.shutdown()
+            except Exception:
+                logger.warning("Slack memory shutdown failed", exc_info=True)
+        finally:
+            # Reached even when a step above fails or shutdown is cancelled,
+            # so the process never exits with open HTTP connections.
+            await self._close_attachment_http_client()
+            await self._close_slack_http_session()
 
         logger.info("Slack bot shutdown complete")
 
