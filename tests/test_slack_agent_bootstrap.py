@@ -1020,3 +1020,69 @@ async def test_message_files_without_loadable_content_leave_the_task_alone():
 
     assert result.prompt == "task"
     assert result.truncated is True
+
+
+# SG4: thread pages are read 100 messages at a time
+
+
+def _paged_thread(total):
+    """A conversations.replies fake over ``total`` messages, oldest first."""
+    messages = [
+        {"ts": str(index), "user": "U1", "text": f"msg-{index:03d}"}
+        for index in range(1, total + 1)
+    ]
+    calls = []
+
+    async def replies(**kwargs):
+        calls.append(kwargs)
+        start = int(kwargs.get("cursor") or 0)
+        end = start + kwargs["limit"]
+        response = {"ok": True, "messages": messages[start:end]}
+        if end < total:
+            response["response_metadata"] = {"next_cursor": str(end)}
+        return response
+
+    return replies, calls
+
+
+@pytest.mark.asyncio
+async def test_a_long_thread_is_paged_100_at_a_time_and_keeps_its_newest_messages():
+    replies, calls = _paged_thread(250)
+    builder = AgentBootstrapBuilder(_settings())
+
+    result = await builder.build(
+        SimpleNamespace(conversations_replies=replies),
+        channel_id="C1",
+        thread_ts="1",
+        owner_user_id="U1",
+        task="task",
+    )
+
+    assert [call["limit"] for call in calls] == [100, 100, 100]
+    assert [call.get("cursor") for call in calls] == [None, "100", "200"]
+    # max_thread_messages still bounds what is kept: the newest 20.
+    kept = re.findall(r"msg-\d{3}", result.context)
+    assert kept == [f"msg-{index:03d}" for index in range(231, 251)]
+    assert "thread_page_cap" not in result.warnings
+    assert result.error is None
+    assert result.truncated is True
+
+
+@pytest.mark.asyncio
+async def test_a_short_thread_is_read_in_one_page_of_100():
+    replies, calls = _paged_thread(3)
+    builder = AgentBootstrapBuilder(_settings(max_thread_messages=2))
+
+    result = await builder.build(
+        SimpleNamespace(conversations_replies=replies),
+        channel_id="C1",
+        thread_ts="1",
+        owner_user_id="U1",
+        task="task",
+        latest_ts="4",
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["limit"] == 100
+    assert calls[0]["latest"] == "4"
+    assert re.findall(r"msg-\d{3}", result.context) == ["msg-002", "msg-003"]
