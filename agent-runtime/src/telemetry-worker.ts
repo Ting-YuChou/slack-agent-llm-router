@@ -1,6 +1,6 @@
-import { parentPort, workerData } from "node:worker_threads";
+import { parentPort, receiveMessageOnPort, workerData } from "node:worker_threads";
 import { Kafka, logLevel } from "kafkajs";
-import { TelemetryStore, publishOutbox } from "./telemetry.js";
+import { TelemetryStore, drainAppends, publishOutbox, type AppendMessage } from "./telemetry.js";
 const store = new TelemetryStore(workerData.file, workerData.maxBytes);
 const producer = new Kafka({
   clientId: "pi-agent-analytics", brokers: workerData.brokers, logLevel: logLevel.NOTHING,
@@ -34,11 +34,20 @@ const timer = setInterval(() => {
   if (!publishing && !closed)
     active = publish();
 }, 1000);
-async function handleMessage(message: { op: "append" | "close"; id: unknown; records: Parameters<TelemetryStore["appendMany"]>[0] }) {
+type WorkerMessage = AppendMessage | { op: "close"; id: unknown };
+async function handleMessage(message: WorkerMessage): Promise<void> {
+  if (message.op === "append") {
+    // Everything from here to the COMMIT is synchronous: neither close nor the publisher's ack can interleave.
+    const { batch, next } = drainAppends<WorkerMessage>(message, () => receiveMessageOnPort(parentPort!)?.message);
+    let results: Array<Error | undefined> | undefined;
+    try { results = store.appendGroups(batch.map(m => m.records)); }
+    catch { /* the transaction failed: every drained message gets the error */ }
+    batch.forEach((m, i) => parentPort?.postMessage(results && !results[i] ? { id: m.id } : { id: m.id, error: "telemetry_write_failed" }));
+    if (next) await handleMessage(next);
+    return;
+  }
   try {
-    if (message.op === "append")
-      store.appendMany(message.records);
-    else if (message.op === "close") {
+    if (message.op === "close") {
       closed = true;
       clearInterval(timer);
       await active;
