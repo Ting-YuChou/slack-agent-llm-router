@@ -2172,3 +2172,151 @@ async def test_a_failed_update_is_retried_on_the_next_poll(tmp_path):
     assert await progress_at(bot, tracked, now, 11, changed) == 3
 
     assert "Tools: 4" in bot.web_client.chat_update.await_args.kwargs["text"]
+
+
+# SG1: the monitor follows a run with the runtime's long-poll
+
+
+def long_poll_bot(tmp_path, monkeypatch, outcomes, *, took=0.0, **agent):
+    """A monitor on a fake clock; each wait_for_update call takes ``took``."""
+    import slack.bot_agent as bot_agent_module
+
+    now = [0.0]
+    calls = []
+    sleeps = []
+    remaining = list(outcomes)
+
+    async def wait_for_update(run_id, **kwargs):
+        calls.append(kwargs)
+        now[0] += took
+        outcome = remaining.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    bot = SlackBot(
+        {
+            "channels": [],
+            "state": {"backend": "file", "file_path": str(tmp_path / "state.json")},
+            "agent": agent,
+        },
+        SimpleNamespace(),
+        services={"agent_runtime": SimpleNamespace(wait_for_update=wait_for_update)},
+    )
+    bot.web_client = SimpleNamespace(chat_postMessage=AsyncMock())
+    bot.agent_monitor_clock = lambda: now[0]
+    bot.agent_monitor_sleep = sleep
+    bot.agent_monitor_random = lambda: 1.0
+    monkeypatch.setattr(bot_agent_module.asyncio, "sleep", sleep)
+    return bot, calls, sleeps
+
+
+def test_monitor_long_poll_seconds_is_configurable(tmp_path):
+    assert file_bot(tmp_path / "default").agent_monitor_long_poll_seconds == 25
+    configured = heartbeat_bot(tmp_path, [0.0], monitor_long_poll_seconds=0)[0]
+    assert configured.agent_monitor_long_poll_seconds == 0
+
+
+@pytest.mark.asyncio
+async def test_monitor_long_polls_and_resumes_from_the_cursor_after_an_approval(
+    tmp_path, monkeypatch
+):
+    waiting = {**approval_state("R1", "A1"), "events_truncated": 4}
+    bot, calls, _ = long_poll_bot(
+        tmp_path,
+        monkeypatch,
+        [
+            waiting,
+            waiting,
+            AgentRuntimeError("down", status=503),
+            run_state("R1", "completed", answer="done"),
+        ],
+    )
+    tracked = track(bot)
+
+    await bot._monitor_agent_run(tracked)
+
+    assert [call["long_poll_seconds"] for call in calls] == [25, 25, 25, 25]
+    # The approval's own events are handled; wait for the ones after them.
+    # After anything but an approval the run is read again from scratch.
+    assert [call.get("resume_after") for call in calls] == [None, 5, 5, None]
+    assert "resume_after" not in calls[0]
+    assert "resume_after" not in calls[3]
+    for call in calls:
+        assert call["refresh_seconds"] == bot.agent_progress_interval_seconds
+        assert callable(call["on_progress"])
+    assert tracked["posted_approval_ids"] == ["A1"]
+    assert tracked["result_posted"] is True
+
+
+@pytest.mark.asyncio
+async def test_monitor_with_long_polling_disabled_calls_the_runtime_as_before(
+    tmp_path, monkeypatch
+):
+    bot, calls, sleeps = long_poll_bot(
+        tmp_path,
+        monkeypatch,
+        [
+            approval_state("R1", "A1"),
+            approval_state("R1", "A1"),
+            run_state("R1", "completed"),
+        ],
+        monitor_long_poll_seconds=0,
+    )
+    tracked = track(bot)
+
+    await bot._monitor_agent_run(tracked)
+
+    assert [set(call) for call in calls] == [{"on_progress", "refresh_seconds"}] * 3
+    assert sleeps == [2.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_an_approval_wait_that_returns_at_once_still_sleeps_the_poll_interval(
+    tmp_path, monkeypatch
+):
+    # A CI-repair job's events route ignores after/wait, so its long-poll
+    # comes straight back: the monitor must not spin on it.
+    bot, calls, sleeps = long_poll_bot(
+        tmp_path,
+        monkeypatch,
+        [
+            approval_state("R1", "A1"),
+            approval_state("R1", "A1"),
+            approval_state("R1", "A1"),
+            run_state("R1", "completed"),
+        ],
+    )
+    tracked = track(bot)
+
+    await bot._monitor_agent_run(tracked)
+
+    assert len(calls) == 4
+    assert sleeps == [2.0, 2.0, 2.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("took, expected", [(30.0, 0.0), (2.0, 0.0), (0.5, 1.5)])
+async def test_an_approval_wait_that_already_waited_is_not_slept_again(
+    tmp_path, monkeypatch, took, expected
+):
+    bot, calls, sleeps = long_poll_bot(
+        tmp_path,
+        monkeypatch,
+        [
+            approval_state("R1", "A1"),
+            approval_state("R1", "A1"),
+            run_state("R1", "completed"),
+        ],
+        took=took,
+    )
+    tracked = track(bot)
+
+    await bot._monitor_agent_run(tracked)
+
+    assert len(calls) == 3
+    assert sleeps == [expected, expected]

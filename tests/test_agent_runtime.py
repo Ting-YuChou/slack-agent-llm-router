@@ -1260,3 +1260,484 @@ async def test_resume_from_patch_posts_owner_with_idempotency_key(monkeypatch):
     assert json.loads(requests[0].content) == {"user_id": "U1"}
     assert requests[0].headers["idempotency-key"] == "slack-key-1"
     assert conflict.value.code == "patch_conflict"
+
+
+@pytest.mark.asyncio
+async def test_get_events_long_poll_sends_wait_and_outlasts_the_control_timeout(
+    monkeypatch,
+):
+    seen = []
+
+    def handler(request):
+        seen.append(
+            (
+                request.url.path,
+                request.url.query.decode(),
+                request.extensions["timeout"]["read"],
+                request.extensions["timeout"]["connect"],
+            )
+        )
+        return httpx.Response(200, text="")
+
+    runtime = client(handler, monkeypatch)
+    try:
+        assert await runtime.get_events("R", after=3) == []
+        assert await runtime.get_events("R", after=3, wait=25) == []
+        assert await runtime.get_events("R", after=3, wait=2.5) == []
+        assert await runtime.get_events("R", after=3, wait=0) == []
+    finally:
+        await runtime.close()
+
+    assert seen == [
+        # Without wait the request is the plain poll it always was.
+        ("/v1/runs/R/events", "after=3", 10, 2),
+        # The runtime holds a long-poll up to `wait` seconds before answering.
+        ("/v1/runs/R/events", "after=3&wait=25", 35, 2),
+        ("/v1/runs/R/events", "after=3&wait=2.5", 12.5, 2),
+        ("/v1/runs/R/events", "after=3", 10, 2),
+    ]
+
+
+def _long_poll_runtime(monkeypatch, run_for, events_for):
+    """A runtime on a fake clock whose events route can hold a long-poll.
+
+    ``run_for(now)`` returns the run payload; ``events_for(params, hold)``
+    returns the SSE text (or a response) and may ``await hold(seconds)``
+    first, as the runtime does while no event is past the cursor. Returns the
+    runtime, the requests seen and a function listing the client's own sleeps.
+    """
+    import src.agent_runtime as agent_runtime_module
+
+    requests = []
+    held = set()
+
+    async def handler(request):
+        params = request.url.params
+        if request.url.path.endswith("/events"):
+            requests.append(("events", params["after"], params.get("wait")))
+            result = await events_for(params, hold)
+            if isinstance(result, httpx.Response):
+                return result
+            return httpx.Response(200, text=result)
+        requests.append(("run", None, None))
+        return httpx.Response(200, json=run_for(runtime._monotonic()))
+
+    runtime = client(handler, monkeypatch)
+    sleeps = _fake_clock(runtime, monkeypatch)
+
+    async def hold(seconds):
+        held.add(len(sleeps))
+        await agent_runtime_module.asyncio.sleep(seconds)
+
+    def client_sleeps():
+        return [s for index, s in enumerate(sleeps) if index not in held]
+
+    return runtime, requests, client_sleeps
+
+
+async def _no_progress(run):
+    return None
+
+
+@pytest.mark.asyncio
+async def test_long_poll_follows_a_quiet_run_with_a_handful_of_requests(monkeypatch):
+    def run_for(now):
+        status = "completed" if now >= 60 else "running"
+        return {**_run_payload(status), "events": [{"type": "turn"}] * 2}
+
+    async def events_for(params, hold):
+        # Nothing happens: the runtime holds each request for its whole wait.
+        await hold(float(params["wait"]))
+        return ""
+
+    runtime, requests, client_sleeps = _long_poll_runtime(
+        monkeypatch, run_for, events_for
+    )
+    try:
+        run = await runtime.wait_for_update(
+            "R",
+            on_progress=_no_progress,
+            refresh_seconds=10.0,
+            long_poll_seconds=25.0,
+        )
+    finally:
+        await runtime.close()
+
+    assert run["status"] == "completed"
+    events = [request for request in requests if request[0] == "events"]
+    reads = [request for request in requests if request[0] == "run"]
+    # One-second polling would have asked 60 times.
+    assert 1 <= len(events) <= 8
+    # Each long-poll ends when the next refresh is due, never later.
+    assert {request[1:] for request in events} == {("2", "10")}
+    # Turns and cost still arrive every refresh_seconds.
+    assert len(reads) == 7
+    assert sum(client_sleeps()) == 0
+
+
+@pytest.mark.asyncio
+async def test_long_poll_without_refresh_waits_the_whole_long_poll(monkeypatch):
+    def run_for(now):
+        status = "completed" if now >= 60 else "running"
+        return {**_run_payload(status), "events": []}
+
+    async def events_for(params, hold):
+        await hold(float(params["wait"]))
+        if runtime._monotonic() >= 60:
+            return _sse((1, {"type": "status", "status": "completed"}))
+        return ""
+
+    runtime, requests, client_sleeps = _long_poll_runtime(
+        monkeypatch, run_for, events_for
+    )
+    try:
+        run = await runtime.wait_for_update(
+            "R", on_progress=_no_progress, long_poll_seconds=25.0
+        )
+    finally:
+        await runtime.close()
+
+    assert run["status"] == "completed"
+    assert requests == [
+        ("run", None, None),
+        ("events", "0", "25"),
+        ("events", "0", "25"),
+        ("events", "0", "25"),
+        ("run", None, None),
+    ]
+    assert sum(client_sleeps()) == 0
+
+
+@pytest.mark.asyncio
+async def test_long_poll_requests_stay_a_poll_interval_apart_when_events_flow(
+    monkeypatch,
+):
+    pages = iter(
+        [
+            (0.0, _sse((1, {"type": "tool", "phase": "start", "tool": "read"}))),
+            (0.0, _sse((2, {"type": "tool", "phase": "end", "tool": "read"}))),
+            # Held for less than a poll interval: only the rest is slept.
+            (0.25, _sse((3, {"type": "tool", "phase": "start", "tool": "edit"}))),
+            (0.0, _sse((4, {"type": "status", "status": "completed"}))),
+        ]
+    )
+    started = []
+
+    def run_for(now):
+        status = "completed" if len(started) >= 4 else "running"
+        return {**_run_payload(status), "events": []}
+
+    async def events_for(params, hold):
+        started.append(runtime._monotonic())
+        seconds, text = next(pages)
+        if seconds:
+            await hold(seconds)
+        return text
+
+    progress = []
+
+    async def on_progress(run):
+        progress.append((run.get("tool_count"), run.get("last_tool")))
+
+    runtime, requests, client_sleeps = _long_poll_runtime(
+        monkeypatch, run_for, events_for
+    )
+    try:
+        run = await runtime.wait_for_update(
+            "R", poll_seconds=0.5, on_progress=on_progress, long_poll_seconds=25.0
+        )
+    finally:
+        await runtime.close()
+
+    assert run["status"] == "completed"
+    assert requests == [
+        ("run", None, None),
+        ("events", "0", "25"),
+        ("events", "1", "25"),
+        ("events", "2", "25"),
+        ("events", "3", "25"),
+        ("run", None, None),
+    ]
+    # No sleep after the full read, then never more than one events request
+    # per poll interval however fast the events come back.
+    assert started == [0.0, 0.5, 1.0, 1.5]
+    assert client_sleeps() == [0.5, 0.5, 0.25]
+    assert progress == [(None, None), (1, "read"), (1, "read"), (2, "edit")]
+
+
+@pytest.mark.asyncio
+async def test_long_poll_change_events_are_spaced_like_plain_polls(monkeypatch):
+    runs = iter(["running", "running", "completed"])
+
+    def run_for(now):
+        return {**_run_payload(next(runs)), "events": []}
+
+    pages = iter(
+        [
+            _sse((1, {"type": "phase", "phase": "verifying"})),
+            _sse((2, {"type": "status", "status": "completed"})),
+        ]
+    )
+
+    async def events_for(params, hold):
+        return next(pages)
+
+    runtime, requests, client_sleeps = _long_poll_runtime(
+        monkeypatch, run_for, events_for
+    )
+    try:
+        run = await runtime.wait_for_update(
+            "R", poll_seconds=0.5, on_progress=_no_progress, long_poll_seconds=25.0
+        )
+    finally:
+        await runtime.close()
+
+    assert run["status"] == "completed"
+    assert [request[0] for request in requests] == [
+        "run",
+        "events",
+        "run",
+        "events",
+        "run",
+    ]
+    assert client_sleeps() == [0.5]
+
+
+@pytest.mark.asyncio
+async def test_long_poll_never_waits_past_the_next_refresh(monkeypatch):
+    def run_for(now):
+        status = "completed" if now >= 4 else "running"
+        return {**_run_payload(status), "events": []}
+
+    async def events_for(params, hold):
+        if "wait" in params:
+            await hold(float(params["wait"]))
+        return ""
+
+    runtime, requests, client_sleeps = _long_poll_runtime(
+        monkeypatch, run_for, events_for
+    )
+    try:
+        run = await runtime.wait_for_update(
+            "R",
+            poll_seconds=0.5,
+            on_progress=_no_progress,
+            # Too short a window to be worth holding a request open for.
+            refresh_seconds=0.25,
+            long_poll_seconds=25.0,
+        )
+    finally:
+        await runtime.close()
+
+    assert run["status"] == "completed"
+    assert {request[2] for request in requests if request[0] == "events"} == {None}
+    # Plain polls keep the plain poll interval.
+    assert set(client_sleeps()) == {0.5}
+
+
+@pytest.mark.asyncio
+async def test_long_poll_without_progress_keeps_polling_the_run(monkeypatch):
+    def run_for(now):
+        status = "completed" if now >= 2 else "running"
+        return {**_run_payload(status), "events": []}
+
+    async def events_for(params, hold):
+        raise AssertionError("no event cursor without on_progress")
+
+    runtime, requests, client_sleeps = _long_poll_runtime(
+        monkeypatch, run_for, events_for
+    )
+    try:
+        run = await runtime.wait_for_update(
+            "R", poll_seconds=0.5, long_poll_seconds=25.0
+        )
+    finally:
+        await runtime.close()
+
+    assert run["status"] == "completed"
+    assert client_sleeps() == [0.5, 0.5, 0.5, 0.5]
+    assert len(requests) == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first_page",
+    [_sse((8, {"type": "approval_decision", "decision": "approve"})), ""],
+    ids=["event", "timeout"],
+)
+async def test_resume_after_long_polls_before_reading_the_run(monkeypatch, first_page):
+    # After an approval card the caller already handled events up to 7. A
+    # long-poll that times out is still followed by a full read: one status
+    # change in the runtime emits no event.
+    def run_for(now):
+        return {**_run_payload("awaiting_approval"), "events": []}
+
+    async def events_for(params, hold):
+        if not first_page:
+            await hold(float(params["wait"]))
+        return first_page
+
+    runtime, requests, client_sleeps = _long_poll_runtime(
+        monkeypatch, run_for, events_for
+    )
+    try:
+        run = await runtime.wait_for_update(
+            "R",
+            on_progress=_no_progress,
+            refresh_seconds=10.0,
+            long_poll_seconds=25.0,
+            resume_after=7,
+        )
+    finally:
+        await runtime.close()
+
+    assert run["status"] == "awaiting_approval"
+    assert requests == [("events", "7", "25"), ("run", None, None)]
+    assert client_sleeps() == []
+
+
+@pytest.mark.asyncio
+async def test_resume_after_is_ignored_without_long_polling(monkeypatch):
+    def run_for(now):
+        return {**_run_payload("awaiting_approval"), "events": []}
+
+    async def events_for(params, hold):
+        raise AssertionError("resume_after needs long_poll_seconds")
+
+    runtime, requests, _ = _long_poll_runtime(monkeypatch, run_for, events_for)
+    try:
+        run = await runtime.wait_for_update(
+            "R", on_progress=_no_progress, resume_after=7
+        )
+    finally:
+        await runtime.close()
+
+    assert run["status"] == "awaiting_approval"
+    assert requests == [("run", None, None)]
+
+
+@pytest.mark.asyncio
+async def test_a_5xx_during_the_resume_long_poll_backs_off_and_retries(monkeypatch):
+    def run_for(now):
+        return {**_run_payload("completed"), "events": []}
+
+    pages = iter(
+        [
+            httpx.Response(503, json={"error": {"code": "unavailable"}}),
+            httpx.Response(503, json={"error": {"code": "unavailable"}}),
+            "",
+        ]
+    )
+
+    async def events_for(params, hold):
+        return next(pages)
+
+    runtime, requests, client_sleeps = _long_poll_runtime(
+        monkeypatch, run_for, events_for
+    )
+    try:
+        run = await runtime.wait_for_update(
+            "R", on_progress=_no_progress, long_poll_seconds=25.0, resume_after=7
+        )
+    finally:
+        await runtime.close()
+
+    assert run["status"] == "completed"
+    assert requests == [
+        ("events", "7", "25"),
+        ("events", "7", "25"),
+        ("events", "7", "25"),
+        ("run", None, None),
+    ]
+    assert client_sleeps() == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_long_poll_does_not_touch_the_error_backoff(monkeypatch):
+    def run_for(now):
+        return {**_run_payload("completed" if now >= 50 else "running"), "events": []}
+
+    pages = iter(
+        [
+            httpx.Response(503),
+            "",
+            "",
+            httpx.Response(503),
+            _sse((1, {"type": "status", "status": "completed"})),
+        ]
+    )
+
+    async def events_for(params, hold):
+        page = next(pages)
+        if page == "":
+            await hold(float(params["wait"]))
+        return page
+
+    runtime, requests, client_sleeps = _long_poll_runtime(
+        monkeypatch, run_for, events_for
+    )
+    try:
+        run = await runtime.wait_for_update(
+            "R",
+            on_progress=_no_progress,
+            long_poll_seconds=25.0,
+            # Two empty 25 s long-polls are not 50 s of errors.
+            max_error_seconds=30.0,
+        )
+    finally:
+        await runtime.close()
+
+    assert run["status"] == "completed"
+    assert [request[0] for request in requests] == ["run"] + ["events"] * 5 + ["run"]
+    # Each error starts again from the first backoff step.
+    assert client_sleeps() == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_a_change_event_during_a_long_poll_returns_the_terminal_run(
+    monkeypatch,
+):
+    runs = iter(
+        [
+            {**_run_payload("running"), "events": [{"type": "turn"}] * 3},
+            {**_run_payload("failed"), "error": "boom", "events": []},
+        ]
+    )
+
+    def run_for(now):
+        return next(runs)
+
+    async def events_for(params, hold):
+        await hold(7.0)
+        return _sse((4, {"type": "status", "status": "failed"}))
+
+    runtime, requests, client_sleeps = _long_poll_runtime(
+        monkeypatch, run_for, events_for
+    )
+    try:
+        run = await runtime.wait_for_update(
+            "R",
+            on_progress=_no_progress,
+            refresh_seconds=10.0,
+            long_poll_seconds=25.0,
+        )
+    finally:
+        await runtime.close()
+
+    assert run["status"] == "failed"
+    assert run["error"] == "boom"
+    assert requests == [
+        ("run", None, None),
+        ("events", "3", "10"),
+        ("run", None, None),
+    ]
+    assert client_sleeps() == []
+
+
+def test_run_event_cursor_counts_kept_and_truncated_events():
+    from src.agent_runtime import run_event_cursor
+
+    assert run_event_cursor({}) == 0
+    assert run_event_cursor({"events": None, "events_truncated": None}) == 0
+    assert run_event_cursor({"events": [{}, {}]}) == 2
+    assert run_event_cursor({"events": [{}] * 3, "events_truncated": 10}) == 13

@@ -73,6 +73,12 @@ def configured_model_refs(health: Optional[Dict[str, Any]]) -> List[str]:
     ]
 
 
+def run_event_cursor(run: Dict[str, Any]) -> int:
+    """The event cursor just past everything a full run read reported."""
+    # The runtime keeps the newest events; cursors are absolute.
+    return len(run.get("events") or []) + int(run.get("events_truncated") or 0)
+
+
 def is_transient_error(exc: AgentRuntimeError) -> bool:
     """Connection errors, timeouts, 429 and 5xx: the same call may succeed later."""
     if isinstance(
@@ -99,6 +105,8 @@ class AgentRuntimeClient:
         "interrupted",
     }
     MAX_RETRY_BACKOFF_SECONDS = 30.0
+    # A long-poll shorter than this is sent as a plain poll.
+    MIN_LONG_POLL_SECONDS = 0.5
     # Events after which the cheap event log no longer describes the run.
     RUN_CHANGE_EVENT_TYPES = {"status", "phase", "approval", "approval_decision"}
     # Plain chat threads have no session; ask the runtime about each at most
@@ -127,6 +135,8 @@ class AgentRuntimeClient:
         self._monotonic = time.monotonic
         self._health_timeout_seconds = min(connect_timeout, 2.0)
         self._control_timeout = httpx.Timeout(control_timeout, connect=connect_timeout)
+        self._control_timeout_seconds = control_timeout
+        self._connect_timeout_seconds = connect_timeout
         self._retry_attempts = max(1, int(config.get("read_retry_attempts", 3)))
         self._retry_base_seconds = float(config.get("read_retry_base_seconds", 0.5))
         self._retry_max_seconds = float(config.get("read_retry_max_seconds", 4))
@@ -435,10 +445,24 @@ class AgentRuntimeClient:
                 )
         return result
 
-    async def get_events(self, run_id: str, after: int = 0) -> List[Dict[str, Any]]:
-        text = await self._request_text(
-            "GET", f"/v1/runs/{run_id}/events?after={max(0, int(after))}"
-        )
+    async def get_events(
+        self, run_id: str, after: int = 0, wait: Optional[float] = None
+    ) -> List[Dict[str, Any]]:
+        """Read the events after a cursor.
+
+        With ``wait`` the runtime holds the request up to that many seconds
+        until such an event exists, and answers with none when the time is up.
+        """
+        path = f"/v1/runs/{run_id}/events?after={max(0, int(after))}"
+        timeout: Optional[httpx.Timeout] = None
+        if wait is not None and wait > 0:
+            path += f"&wait={wait:g}"
+            # The control timeout alone would fire before the long-poll answers.
+            timeout = httpx.Timeout(
+                wait + self._control_timeout_seconds,
+                connect=self._connect_timeout_seconds,
+            )
+        text = await self._request_text("GET", path, timeout=timeout)
         events: List[Dict[str, Any]] = []
         event_id: Optional[int] = None
         for block in text.split("\n\n"):
@@ -539,6 +563,8 @@ class AgentRuntimeClient:
         max_error_seconds: float = 300.0,
         on_progress: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
         refresh_seconds: Optional[float] = None,
+        long_poll_seconds: Optional[float] = None,
+        resume_after: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Poll until the run needs Slack attention, riding out transient errors.
 
@@ -547,14 +573,42 @@ class AgentRuntimeClient:
         or phase change, and with ``refresh_seconds`` at least that often:
         turns and cost are never in the event log. Each poll reports the latest
         known state.
+
+        With ``long_poll_seconds`` the runtime holds each events request until
+        an event arrives, at most that long and never past the next refresh;
+        events requests still start at least ``poll_seconds`` apart. With
+        ``resume_after`` as well, an event cursor the caller has already
+        handled, one such long-poll comes before the first full read.
         """
         backoff = 1.0
         errors_since: Optional[float] = None
         run: Optional[Dict[str, Any]] = None
         read_at = 0.0
         cursor = 0
+        hold = float(long_poll_seconds or 0)
+        long_poll = hold > 0
+        resume = resume_after if long_poll else None
+        # Long-poll mode: when the last events request started.
+        events_at: Optional[float] = None
         while True:
+            if (
+                long_poll
+                and run is not None
+                and on_progress is not None
+                and events_at is not None
+            ):
+                # A long-poll that waited has already spent the poll interval;
+                # one that came straight back is spaced like a plain poll.
+                pause = events_at + poll_seconds - self._monotonic()
+                if pause > 0:
+                    await asyncio.sleep(pause)
             try:
+                if resume is not None:
+                    events_at = self._monotonic()
+                    await self.get_events(run_id, after=resume, wait=hold)
+                    # Read the run even after an empty answer: one status
+                    # change in the runtime emits no event.
+                    resume = None
                 stale = (
                     refresh_seconds is not None
                     and self._monotonic() - read_at >= refresh_seconds
@@ -562,11 +616,17 @@ class AgentRuntimeClient:
                 if run is None or on_progress is None or stale:
                     run = await self._read_run(run_id)
                     read_at = self._monotonic()
-                    # The runtime keeps the newest events; cursors are absolute.
-                    cursor = len(run.get("events") or []) + int(
-                        run.get("events_truncated") or 0
-                    )
+                    cursor = run_event_cursor(run)
                     events = None
+                elif long_poll:
+                    events_at = self._monotonic()
+                    wait: Optional[float] = hold
+                    if refresh_seconds is not None:
+                        wait = min(hold, refresh_seconds - (events_at - read_at))
+                    if wait < self.MIN_LONG_POLL_SECONDS:
+                        # Not worth holding a request open for: just poll.
+                        wait = None
+                    events = await self.get_events(run_id, after=cursor, wait=wait)
                 else:
                     events = await self.get_events(run_id, after=cursor)
             except AgentRuntimeError as exc:
@@ -599,7 +659,14 @@ class AgentRuntimeClient:
                 run = self._with_tool_events(run, events)
             if on_progress is not None:
                 await on_progress(run)
-            await asyncio.sleep(poll_seconds)
+            if not long_poll:
+                await asyncio.sleep(poll_seconds)
+            elif events is None and (
+                on_progress is None
+                or (refresh_seconds is not None and refresh_seconds <= 0)
+            ):
+                # The next request is another full read, not a long-poll.
+                await asyncio.sleep(poll_seconds)
 
     @staticmethod
     def _with_tool_events(
@@ -689,8 +756,12 @@ class AgentRuntimeClient:
                 "Agent runtime returned invalid JSON"
             ) from exc
 
-    async def _request_text(self, method: str, path: str) -> str:
-        response = await self._send(method, path, timeout=self._control_timeout)
+    async def _request_text(
+        self, method: str, path: str, *, timeout: Optional[httpx.Timeout] = None
+    ) -> str:
+        response = await self._send(
+            method, path, timeout=timeout or self._control_timeout
+        )
         if response.status_code != 200:
             self._raise_for_error(response)
         return response.text

@@ -24,6 +24,7 @@ from src.agent_runtime import (
     AgentRuntimeError,
     AgentRuntimeUnauthorized,
     is_transient_error,
+    run_event_cursor,
 )
 from slack.agent_bootstrap import (
     AgentBootstrapContext,
@@ -1113,7 +1114,17 @@ class SlackBotAgentMixin:
         deadline = self.agent_monitor_clock() + self.agent_run_deadline_seconds
         failures = 0
         delay_posted = False
+        # After an approval card: the event cursor the next wait resumes from.
+        resume_after: Optional[int] = None
         while True:
+            options: Dict[str, Any] = {}
+            if self.agent_monitor_long_poll_seconds > 0:
+                options["long_poll_seconds"] = self.agent_monitor_long_poll_seconds
+                if resume_after is not None:
+                    options["resume_after"] = resume_after
+            # Anything but another approval is followed by a plain full read.
+            resume_after = None
+            started = self.agent_monitor_clock()
             try:
                 run = await runtime.wait_for_update(
                     tracked["run_id"],
@@ -1122,6 +1133,7 @@ class SlackBotAgentMixin:
                     ),
                     # The status message is rewritten at most this often anyway.
                     refresh_seconds=self.agent_progress_interval_seconds,
+                    **options,
                 )
             except AgentRuntimeError as exc:
                 if exc.status == 404:
@@ -1163,12 +1175,17 @@ class SlackBotAgentMixin:
                 )
                 return
             failures = 0
+            elapsed = self.agent_monitor_clock() - started
             await self._close_agent_approval_cards(tracked, run)
             if run.get("status") == "awaiting_approval":
                 deadline = self.agent_monitor_clock() + self.agent_run_deadline_seconds
                 await self._update_agent_progress(tracked, run)
                 await self._post_agent_approval(tracked, run)
-                await asyncio.sleep(self.agent_monitor_poll_seconds)
+                resume_after = run_event_cursor(run)
+                # A long-poll that already waited is not followed by a pause;
+                # a wait that came straight back sleeps the whole interval, so
+                # the monitor cannot spin.
+                await asyncio.sleep(max(0.0, self.agent_monitor_poll_seconds - elapsed))
                 continue
             if not tracked.get("result_posted"):
                 await self._update_agent_progress(tracked, run, force=True)
