@@ -735,7 +735,14 @@ class SlackMessageHandler:
     ) -> str:
         bootstrap = AgentBootstrapContext(prompt=task)
         builder = self.bot.agent_bootstrap_builder
-        if include_thread_context and thread_ts and message_ts and builder is not None:
+        if (
+            include_thread_context
+            and thread_ts
+            and message_ts
+            # A top-level message is its own thread root: nothing precedes it.
+            and thread_ts != message_ts
+            and builder is not None
+        ):
             if not await self.bot._is_public_agent_channel(channel_id):
                 # Same egress rule as the shortcut: thread content from private,
                 # DM or Slack Connect channels never reaches a model provider.
