@@ -264,3 +264,27 @@ test("without the parallel option samples still run strictly one after another",
   assert.deepEqual(verdicts(result)?.map(sample => sample.status), ["passed", "needs_changes"]);
   assert.deepEqual(gate.asked, []);
 });
+
+test("after an unknown first sample the others run one at a time, since only a rejection can still decide", async () => {
+  const gate = openGate(parallel());
+  await gate.started(1);
+  gate.calls[0]!.finish("unknown");
+  await gate.started(2);
+  assert.equal(await gate.count(), 2, "a rejection from the second sample would make the third pointless");
+  gate.calls[1]!.finish("needs_changes");
+  const result = await gate.result;
+  assert.equal(gate.calls.length, 2);
+  assert.equal(result.grade?.status, "needs_changes");
+});
+
+test("parallel sampling grades one at a time when the budget room cannot be read", async () => {
+  const gate = openGate(parallel(), { room: () => { throw new Error("database is closed"); } });
+  await gate.started(1);
+  gate.calls[0]!.finish("passed");
+  await gate.started(2);
+  assert.equal(await gate.count(), 2);
+  gate.calls[1]!.finish("passed");
+  await gate.started(3);
+  gate.calls[2]!.finish("passed");
+  assert.equal((await gate.result).action, "pass");
+});

@@ -122,12 +122,13 @@ function isBudgetRefusal(error: unknown): boolean {
 
 /**
  * How many samples parallel grading starts together: only those needed whatever the others say.
- * unanimous: the first sample alone, since its rejection ends the grading; after it, a pass needs every sample left.
+ * unanimous: the first sample alone, since its rejection ends the grading; while every sample so far passed, a pass
+ * needs each one left. After an unknown sample only a rejection can still decide, and one is enough, so they go singly.
  * majority: as many as the leading verdict still lacks for a strict majority.
  */
 function parallelBatch(statuses: Array<Grade["status"]>, sampling: GraderSampling): number {
   const remaining = sampling.samples - statuses.length;
-  if (sampling.aggregate === "unanimous") return statuses.length ? remaining : 1;
+  if (sampling.aggregate === "unanimous") return statuses.length && statuses.every(status => status === "passed") ? remaining : 1;
   const lead = Math.max(statuses.filter(status => status === "passed").length, statuses.filter(status => status === "needs_changes").length);
   return Math.min(remaining, Math.max(1, Math.floor(sampling.samples / 2) + 1 - lead));
 }
@@ -175,7 +176,9 @@ export class QualityGate {
   private batchSize(grades: Grade[], sampling: GraderSampling, input: GateInput): number {
     const wanted = parallelBatch(grades.map(grade => grade.status), sampling);
     if (wanted < 2) return 1;
-    const room = this.options.concurrentSamples?.(wanted, input) ?? wanted;
+    // Running together is an optimisation: when the room cannot be read, grade one at a time rather than fail the gate.
+    let room: number;
+    try { room = this.options.concurrentSamples?.(wanted, input) ?? wanted; } catch { return 1; }
     return Number.isFinite(room) ? Math.max(1, Math.min(wanted, Math.floor(room))) : 1;
   }
   /**
@@ -201,7 +204,8 @@ export class QualityGate {
     }));
     if (fatal) throw fatal.error;
     for (const [index, grade] of (batch as Grade[]).entries()) {
-      // Alone, the sample has the budget and the container it may have lacked; one attempt keeps the worst case within the sequential one.
+      // Alone, the sample has the budget and the container it may have lacked. One attempt keeps the worst-case time within
+      // the sequential one; it is a third execution for a sample that also retried inside the batch.
       if (!contended(grade) || decideSamples(without(index), sampling) !== undefined) continue;
       input.signal.throwIfAborted();
       const started = this.now();
