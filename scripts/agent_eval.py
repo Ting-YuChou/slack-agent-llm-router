@@ -945,6 +945,12 @@ def parse_args(argv=None, require_live=True):
         help="How the samples combine (default unanimous); needs --grader-samples",
     )
     parser.add_argument(
+        "--grader-parallel",
+        action="store_true",
+        help="Run the samples that are all needed at the same time (profile "
+        "grader.parallel); needs --grader-samples",
+    )
+    parser.add_argument(
         "--no-baseline-overrides",
         action="store_true",
         help="Without override flags, run the tasks' own profiles rather than the "
@@ -976,6 +982,8 @@ def parse_args(argv=None, require_live=True):
         parser.error("--max-cost-usd must be positive")
     if args.grader_aggregate and args.grader_samples is None:
         parser.error("--grader-aggregate needs --grader-samples")
+    if args.grader_parallel and args.grader_samples is None:
+        parser.error("--grader-parallel needs --grader-samples")
     return args
 
 
@@ -988,6 +996,7 @@ def profile_overrides(args):
         overrides["grader"] = {
             "samples": args.grader_samples,
             "aggregate": args.grader_aggregate or "unanimous",
+            **({"parallel": True} if args.grader_parallel else {}),
         }
     return overrides
 
@@ -996,7 +1005,10 @@ def baseline_overrides(baseline):
     """The baseline's ``profile_overrides``; ``ValueError`` unless the flags can set them."""
     overrides = baseline.get("profile_overrides") or {}
     flags = argparse.Namespace(
-        writer_reuse=False, grader_samples=None, grader_aggregate=None
+        writer_reuse=False,
+        grader_samples=None,
+        grader_aggregate=None,
+        grader_parallel=False,
     )
     if isinstance(overrides, dict):
         flags.writer_reuse = overrides.get("writerReuse") is True
@@ -1009,6 +1021,7 @@ def baseline_overrides(baseline):
         ):
             flags.grader_samples = grader["samples"]
             flags.grader_aggregate = grader["aggregate"]
+            flags.grader_parallel = grader.get("parallel") is True
     if profile_overrides(flags) != overrides:
         raise ValueError(
             f"profile_overrides {json.dumps(overrides, sort_keys=True)} "

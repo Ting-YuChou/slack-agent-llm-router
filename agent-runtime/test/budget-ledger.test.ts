@@ -86,3 +86,26 @@ test('a second prompt for the same execution never re-arms first-model', () => {
     assert.equal(ledger.firstModel('reader', 400), undefined, 'the gateway may stop asking once it has an answer');
   } finally { ledger.close(); rmSync(root, { recursive: true, force: true }); }
 });
+
+test('concurrentRoom says how many requests like the latest one still fit, without spending anything', () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'budget-room-')); const ledger = new BudgetLedger(path.join(root, 'db'));
+  try {
+    ledger.open('run', 1);
+    assert.equal(ledger.concurrentRoom('run', 2), 1, 'nothing reserved yet: no size to judge by');
+    ledger.reserve('run', 'writer', 0.2); ledger.settle('writer', 0.05);
+    ledger.reserve('run', 'grader-1', 0.4); ledger.settle('grader-1', 0.05);
+    // 0.9 left and the latest request reserved 0.4: two fit, a third does not.
+    assert.equal(ledger.concurrentRoom('run', 2), 2);
+    assert.equal(ledger.concurrentRoom('run', 3), 2);
+    ledger.reserve('run', 'repair', 0.3); ledger.settle('repair', 0.3);
+    ledger.reserve('run', 'grader-2', 0.4); ledger.settle('grader-2', 0.05);
+    // 0.55 left: only one request of 0.4 fits.
+    assert.equal(ledger.concurrentRoom('run', 2), 1);
+    assert.equal(ledger.concurrentRoom('missing', 2), 1);
+    const before = ledger.summary('run');
+    ledger.concurrentRoom('run', 2);
+    assert.deepEqual(ledger.summary('run'), before);
+    ledger.stop('run');
+    assert.equal(ledger.concurrentRoom('run', 2), 1, 'a stopped budget has room for nothing more');
+  } finally { ledger.close(); rmSync(root, { recursive: true, force: true }); }
+});
