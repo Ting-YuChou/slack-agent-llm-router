@@ -1184,8 +1184,10 @@ class SlackBotAgentMixin:
                 resume_after = run_event_cursor(run)
                 # A long-poll that already waited is not followed by a pause;
                 # a wait that came straight back sleeps the whole interval, so
-                # the monitor cannot spin.
-                await asyncio.sleep(max(0.0, self.agent_monitor_poll_seconds - elapsed))
+                # the monitor cannot spin. Without long-polling the pause is
+                # the plain poll interval, as it always was.
+                waited = elapsed if options else 0.0
+                await asyncio.sleep(max(0.0, self.agent_monitor_poll_seconds - waited))
                 continue
             if not tracked.get("result_posted"):
                 await self._update_agent_progress(tracked, run, force=True)

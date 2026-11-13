@@ -2320,3 +2320,27 @@ async def test_an_approval_wait_that_already_waited_is_not_slept_again(
 
     assert len(calls) == 3
     assert sleeps == [expected, expected]
+
+
+@pytest.mark.asyncio
+async def test_with_long_polling_disabled_an_approval_wait_always_sleeps_the_poll_interval(
+    tmp_path, monkeypatch
+):
+    # However long the plain polling took, the pause after it is unchanged.
+    bot, calls, sleeps = long_poll_bot(
+        tmp_path,
+        monkeypatch,
+        [
+            approval_state("R1", "A1"),
+            approval_state("R1", "A1"),
+            run_state("R1", "completed"),
+        ],
+        took=30.0,
+        monitor_long_poll_seconds=0,
+    )
+    tracked = track(bot)
+
+    await bot._monitor_agent_run(tracked)
+
+    assert len(calls) == 3
+    assert sleeps == [2.0, 2.0]
