@@ -2536,3 +2536,36 @@ def test_the_codegraph_task_needs_the_call_graph_to_find_all_dead_code(tmp_path)
     )
     assert _run_node(checks["unit"], tree) == 0
     assert _run_node(oracle, tree) != 0
+
+
+def test_eval_can_grade_with_parallel_samples():
+    args = agent_eval.parse_args(
+        ["--live-openai", "--grader-samples", "3", "--grader-parallel"]
+    )
+    assert agent_eval.profile_overrides(args) == {
+        "grader": {"samples": 3, "aggregate": "unanimous", "parallel": True}
+    }
+    # Parallel is a property of the sampling, so it needs one.
+    with pytest.raises(SystemExit):
+        agent_eval.parse_args(["--live-openai", "--grader-parallel"])
+
+
+@pytest.mark.parametrize(
+    "grader",
+    [
+        {"samples": 3, "aggregate": "unanimous"},
+        {"samples": 3, "aggregate": "majority", "parallel": True},
+    ],
+)
+def test_eval_reads_back_baseline_overrides_with_or_without_parallel(grader):
+    overrides = {"writerReuse": True, "grader": grader}
+    assert agent_eval.baseline_overrides({"profile_overrides": overrides}) == overrides
+
+
+def test_eval_refuses_a_baseline_whose_parallel_flag_is_not_a_plain_true():
+    for parallel in (False, "yes", 1):
+        overrides = {
+            "grader": {"samples": 3, "aggregate": "unanimous", "parallel": parallel}
+        }
+        with pytest.raises(ValueError):
+            agent_eval.baseline_overrides({"profile_overrides": overrides})

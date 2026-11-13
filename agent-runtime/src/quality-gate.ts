@@ -22,7 +22,9 @@ export interface VerificationCheck {
 export interface VerificationResult { status: CheckStatus; checks: VerificationCheck[] }
 export type GraderAggregate = "unanimous" | "majority";
 /** How many independent graders judge one candidate, and how their verdicts combine. */
-export interface GraderSampling { samples: 1 | 3; aggregate: GraderAggregate }
+export interface GraderSampling { samples: 1 | 3; aggregate: GraderAggregate;
+  /** Run the samples that are needed whatever the others say at the same time instead of one after another. */
+  parallel?: boolean }
 export const DEFAULT_GRADER_SAMPLING: GraderSampling = { samples: 1, aggregate: "unanimous" };
 /** One sample's own verdict; `cause_code` says why an unknown sample gave none. */
 export interface SampleVerdict { status: Grade["status"]; grader_attempts: number; cause_code?: CauseCode }
@@ -56,6 +58,8 @@ export interface QualityGateOptions {
   snapshot(input: GateInput): Promise<Candidate>;
   verify(candidate: Candidate, input: GateInput): Promise<VerificationResult>;
   grade(candidate: Candidate, verification: VerificationResult, input: GateInput): Promise<unknown>;
+  /** How many of `wanted` grader samples the run's budget has room for at once; all of them when absent. */
+  concurrentSamples?(wanted: number, input: GateInput): number;
   record?(kind: string, payload: unknown, input: GateInput): Promise<void>;
 }
 /** Verification as models may see it: host artifact paths stay on the host. */
@@ -111,6 +115,28 @@ function isBudgetExhausted(error: unknown): boolean {
   return error instanceof Error && error.message === "workflow_budget_exhausted";
 }
 
+/** The gateway refused a model request because the run's budget had no room for its reservation. */
+function isBudgetRefusal(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("workflow_budget_unavailable_or_exhausted");
+}
+
+/**
+ * How many samples parallel grading starts together: only those needed whatever the others say.
+ * unanimous: the first sample alone, since its rejection ends the grading; after it, a pass needs every sample left.
+ * majority: as many as the leading verdict still lacks for a strict majority.
+ */
+function parallelBatch(statuses: Array<Grade["status"]>, sampling: GraderSampling): number {
+  const remaining = sampling.samples - statuses.length;
+  if (sampling.aggregate === "unanimous") return statuses.length ? remaining : 1;
+  const lead = Math.max(statuses.filter(status => status === "passed").length, statuses.filter(status => status === "needs_changes").length);
+  return Math.min(remaining, Math.max(1, Math.floor(sampling.samples / 2) + 1 - lead));
+}
+
+/** A sample that may have failed only because another ran beside it: a stacked budget reservation, or a queue for a container. */
+function contended(grade: Grade): boolean {
+  return grade.cause?.code === "grader_execution_failed" || grade.cause?.code === "grader_timeout";
+}
+
 export class QualityGate {
   constructor(private readonly options: QualityGateOptions) {}
   /** Out-of-scope edits are a writer mistake, not missing infrastructure: give it the file list to revert. */
@@ -131,6 +157,8 @@ export class QualityGate {
     let status: Grade["status"] | undefined;
     while ((status = decideSamples(grades.map(grade => grade.status), sampling)) === undefined) {
       input.signal.throwIfAborted();
+      const size = sampling.parallel ? this.batchSize(grades, sampling, input) : 1;
+      if (size > 1) { await this.gradeBatch(candidate, verification, input, sampling, grades, sampleMs, size); continue; }
       const started = this.now();
       grades.push(await this.gradeWithRetry(candidate, verification, input));
       sampleMs.push(this.since(started));
@@ -143,8 +171,48 @@ export class QualityGate {
       sample_verdicts: grades.map(grade => ({ status: grade.status, grader_attempts: grade.grader_attempts ?? 1, ...(grade.cause ? { cause_code: grade.cause.code } : {}) })),
     };
   }
-  /** Grader infrastructure errors get one fresh grader; a grader that judges the evidence insufficient does not. */
-  private async gradeWithRetry(candidate: Candidate, verification: VerificationResult, input: GateInput): Promise<Grade> {
+  /** The samples to start together now, held to what the run's budget has room for. */
+  private batchSize(grades: Grade[], sampling: GraderSampling, input: GateInput): number {
+    const wanted = parallelBatch(grades.map(grade => grade.status), sampling);
+    if (wanted < 2) return 1;
+    const room = this.options.concurrentSamples?.(wanted, input) ?? wanted;
+    return Number.isFinite(room) ? Math.max(1, Math.min(wanted, Math.floor(room))) : 1;
+  }
+  /**
+   * Grades `size` samples at once and appends them in sample order. Every sample is awaited, even once the others
+   * have decided the outcome: a request abandoned in flight would keep its whole budget reservation.
+   */
+  private async gradeBatch(candidate: Candidate, verification: VerificationResult, input: GateInput, sampling: GraderSampling, grades: Grade[], sampleMs: number[], size: number): Promise<void> {
+    const before = grades.map(grade => grade.status);
+    const batch: Array<Grade | undefined> = new Array<Grade | undefined>(size).fill(undefined);
+    const times = new Array<number>(size).fill(0);
+    const without = (skip: number) => [...before, ...batch.flatMap((grade, index) => grade && index !== skip ? [grade.status] : [])];
+    // Only an abort or an exhausted budget escapes a sample, and either ends the grading: stop the others and wait for them.
+    const stop = new AbortController();
+    const sample: GateInput = { ...input, signal: AbortSignal.any([input.signal, stop.signal]) };
+    let fatal: { error: unknown } | undefined;
+    // A failed sample earns a fresh grader only while the outcome is open, and not after a budget refusal: its sibling still holds its reservation.
+    const retry = (error: unknown) => decideSamples(without(-1), sampling) === undefined && !isBudgetRefusal(error);
+    await Promise.all(batch.map(async (_, index) => {
+      const started = this.now();
+      try { batch[index] = await this.gradeWithRetry(candidate, verification, sample, retry); }
+      catch (error) { fatal ??= { error }; stop.abort(error); }
+      times[index] = this.since(started);
+    }));
+    if (fatal) throw fatal.error;
+    for (const [index, grade] of (batch as Grade[]).entries()) {
+      // Alone, the sample has the budget and the container it may have lacked; one attempt keeps the worst case within the sequential one.
+      if (!contended(grade) || decideSamples(without(index), sampling) !== undefined) continue;
+      input.signal.throwIfAborted();
+      const started = this.now();
+      const again = await this.gradeWithRetry(candidate, verification, input, () => false);
+      batch[index] = { ...again, grader_attempts: (grade.grader_attempts ?? 1) + (again.grader_attempts ?? 1) };
+      times[index] = (times[index] ?? 0) + this.since(started);
+    }
+    grades.push(...(batch as Grade[])); sampleMs.push(...times);
+  }
+  /** Grader infrastructure errors get one fresh grader, unless `retry` says no; a grader that judges the evidence insufficient does not. */
+  private async gradeWithRetry(candidate: Candidate, verification: VerificationResult, input: GateInput, retry: (error: unknown) => boolean = () => true): Promise<Grade> {
     const { rubric } = this.options.profile;
     for (let attempt = 1; ; attempt++) {
       try {
@@ -155,7 +223,7 @@ export class QualityGate {
         return grade;
       } catch (error) {
         if (input.signal.aborted || isBudgetExhausted(error)) throw error;
-        if (attempt < GRADER_ATTEMPTS) continue;
+        if (attempt < GRADER_ATTEMPTS && retry(error)) continue;
         return { ...syntheticUnknown(rubric, candidate.hash, graderCause(error)), grader_attempts: attempt };
       }
     }

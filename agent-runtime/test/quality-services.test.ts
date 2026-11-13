@@ -307,3 +307,74 @@ test("with a newer tested base only the merged candidate carries a baseline tree
   assert.deepEqual(verified, [["src/a.js", "test/extra.js"]], "the verifier restores trusted paths from the tested base");
   assert.deepEqual(baselineTrees(root, "run-merged"), [[], ["src/a.js", "test/extra.js"]]);
 });
+
+/** Three-sample parallel grading whose grader processes stay open until the test lets each one submit. */
+function parallelGrading() {
+  const open: Array<{ pass(): void; closed: boolean }> = [];
+  const lifecycle: string[] = [];
+  const createGraderProcess: GraderProcessFactory = (_options, onEvent, onRecord) => {
+    const entry = { closed: false, pass: () => {} };
+    open.push(entry);
+    return {
+      prompt: (_id, prompt) => {
+        const hash = /"candidate_hash":"([^"]+)"/.exec(prompt)?.[1];
+        entry.pass = () => play([...submit("submit_grade", { status: "passed", candidate_hash: hash, criteria: [{ id: "correct", passed: true, evidence: "src/a.js:1 exports 2" }], findings: [] }), settled], onEvent, onRecord);
+      },
+      close: async () => { entry.closed = true; },
+    };
+  };
+  const tracing = new Proxy({}, { get: (_target, name) => name === "lifecycle"
+    ? (_run: string, stage: string, phase: string) => { if (stage === "grading") lifecycle.push(phase); }
+    : () => undefined });
+  const until = async (condition: () => boolean) => { for (let turn = 0; turn < 200 && !condition(); turn++) await new Promise(resolve => setTimeout(resolve, 5)); assert.ok(condition(), "condition reached"); };
+  return { open, lifecycle, createGraderProcess, tracing, until, profile: { ...profile, grader: { samples: 3 as const, aggregate: "unanimous" as const, parallel: true } } };
+}
+
+test("parallel samples run two grader processes at once when the budget has room, and stop closes both", async () => {
+  const { root, repo, baseline } = fixture();
+  const grading = parallelGrading();
+  const ledger = new BudgetLedger(path.join(root, "budget.db"));
+  const { services: quality } = services(root, repo, {
+    profile: grading.profile, ledger, tracing: grading.tracing as never, createGraderProcess: grading.createGraderProcess,
+    createVerifier: () => ({ verify: async () => ({ status: "passed", checks: [] }), stop: async () => {} }),
+  });
+  quality.prepare?.("run-par", "single");
+  const controller = new AbortController();
+  const result = quality.evaluate({ run_id: "run-par", worktree: repo, baseline, requirement: "make a 2", attempt: 1, signal: controller.signal });
+  result.catch(() => {});
+  await grading.until(() => grading.open.length === 1);
+  // The first sample's request: its reservation is the size the next two are judged by.
+  ledger.reserve("run-par", "sample-1", 0.2); ledger.settle("sample-1", 0.05);
+  grading.open[0]!.pass();
+  await grading.until(() => grading.open.length === 3);
+  assert.deepEqual(grading.open.map(entry => entry.closed), [true, false, false]);
+  assert.deepEqual(grading.lifecycle, ["start", "end", "start"], "the two overlapping samples share one grading span");
+  await quality.stop?.("run-par");
+  assert.deepEqual(grading.open.map(entry => entry.closed), [true, true, true]);
+  controller.abort(new Error("cancelled"));
+  await assert.rejects(result);
+  assert.deepEqual(grading.lifecycle, ["start", "end", "start", "end"]);
+});
+
+test("parallel samples fall back to one grader at a time when the budget has room for one", async () => {
+  const { root, repo, baseline } = fixture();
+  const grading = parallelGrading();
+  const ledger = new BudgetLedger(path.join(root, "budget.db"));
+  const { services: quality } = services(root, repo, {
+    profile: grading.profile, ledger, createGraderProcess: grading.createGraderProcess,
+    createVerifier: () => ({ verify: async () => ({ status: "passed", checks: [] }), stop: async () => {} }),
+  });
+  quality.prepare?.("run-seq", "single");
+  const result = quality.evaluate({ run_id: "run-seq", worktree: repo, baseline, requirement: "make a 2", attempt: 1, signal: new AbortController().signal });
+  await grading.until(() => grading.open.length === 1);
+  // 0.4 of the 1.0 budget is left after a request that reserved 0.6: no room for two more like it.
+  ledger.reserve("run-seq", "sample-1", 0.6);
+  grading.open[0]!.pass();
+  await grading.until(() => grading.open.length === 2);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(grading.open.length, 2, "the third sample waits for the second");
+  grading.open[1]!.pass();
+  await grading.until(() => grading.open.length === 3);
+  grading.open[2]!.pass();
+  assert.equal((await result).action, "pass");
+});

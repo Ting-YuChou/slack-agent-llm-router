@@ -48,7 +48,9 @@ export function createQualityServices(options: {
   const store = new CandidateStore(path.join(options.root, "artifacts"));
   const createVerifier = options.createVerifier ?? ((selected: VerificationProfile) => new DockerVerifier(selected));
   const fixerRunner = (options.createFixerRunner ?? dockerFixerRunner)(profile.image);
-  const graders = new Map<string, GraderRunner>();
+  // Parallel sampling runs several graders for one run at once.
+  const graders = new Map<string, Set<GraderRunner>>();
+  const grading = new Map<string, number>();
   const verifiers = new Map<string, QualityVerifier>();
   const artifacts = new Map<string, string>();
   const executions = new Map<string, { parent: string; role: string; attempt: number; started_at: string }>();
@@ -135,11 +137,20 @@ export function createQualityServices(options: {
         execution: (id, parent, phase, cost, queueMs) => execution(id, parent, "grader", input.attempt, phase, cost, queueMs),
         cost: cost => options.phase(input.run_id, "grading", cost, "grader"), createProcess: options.createGraderProcess,
       });
-      graders.set(input.run_id, runner);
-      await options.phase(input.run_id, "grading"); tracing?.lifecycle(input.run_id, "grading", "start");
-      try { return await runner.grade(candidate, verification, input.requirement, profile.rubric, input.run_id, input.signal); }
-      finally { if (runner.stopped) graders.delete(input.run_id); tracing?.lifecycle(input.run_id, "grading", "end"); }
+      const running = graders.get(input.run_id) ?? new Set<GraderRunner>();
+      graders.set(input.run_id, running); running.add(runner);
+      // One grading span per run, however many samples overlap: a second start would cut the first span short.
+      const overlapping = (grading.get(input.run_id) ?? 0) + 1; grading.set(input.run_id, overlapping);
+      try {
+        await options.phase(input.run_id, "grading"); if (overlapping === 1) tracing?.lifecycle(input.run_id, "grading", "start");
+        return await runner.grade(candidate, verification, input.requirement, profile.rubric, input.run_id, input.signal);
+      } finally {
+        if (runner.stopped) { running.delete(runner); if (!running.size && graders.get(input.run_id) === running) graders.delete(input.run_id); }
+        const left = (grading.get(input.run_id) ?? 1) - 1;
+        if (left > 0) grading.set(input.run_id, left); else { grading.delete(input.run_id); tracing?.lifecycle(input.run_id, "grading", "end"); }
+      }
     },
+    concurrentSamples: (wanted, input) => options.ledger.concurrentRoom(input.run_id, wanted),
     record: async (kind, payload, input) => {
       const location = artifacts.get(`${input.run_id}:${input.attempt}`);
       if (!location) throw new HarnessError("candidate_artifact_missing", "candidate_artifact_missing");
@@ -169,7 +180,9 @@ export function createQualityServices(options: {
     writerStarted: id => coordinator.writerStarted(id), canResume: id => coordinator.canResume(id), resumeElapsed: id => coordinator.elapsed(id), tasks: id => coordinator.tasks(id),
     resumeCheckpoint: id => options.control.get<{ updated_at: number }>('structured',id)?.updated_at ?? 0,
     stopDiscovery: id => runner.stop(id),
-    stop: async id => { options.ledger.stop(id); await runner.stop(id); await writerChecks.stop(id); await verifiers.get(id)?.stop(); await graders.get(id)?.stop(); },
+    stop: async id => { options.ledger.stop(id); await runner.stop(id); await writerChecks.stop(id); await verifiers.get(id)?.stop();
+      const stopped = await Promise.allSettled([...graders.get(id) ?? []].map(grader => grader.stop()));
+      const failed = stopped.find(result => result.status === "rejected"); if (failed?.status === "rejected") throw failed.reason; },
     runChecks: request => writerChecks.run(request),
     maxRepairs: profile.maxRepairs,
     get writerChecks() { return { maxCalls: profile.writerChecks?.maxCalls ?? 4, checks: writerChecks.checkNames, defaultChecks: writerChecks.defaultChecks, estimateMs: (names: string[]) => writerChecks.estimateMs(names), reserveMs: writerChecks.reserveMs }; },

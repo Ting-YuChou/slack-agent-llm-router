@@ -57,7 +57,7 @@ export function validateProfile(raw: unknown): VerificationProfile {
   }
   if (p.grader !== undefined) {
     const g = p.grader as Partial<GraderSampling> | null;
-    if (!g || typeof g !== "object" || Array.isArray(g) || Object.keys(g).some(key => key !== "samples" && key !== "aggregate") || (g.samples !== undefined && g.samples !== 1 && g.samples !== 3) || (g.aggregate !== undefined && g.aggregate !== "unanimous" && g.aggregate !== "majority")) throw new Error("Invalid grader sampling");
+    if (!g || typeof g !== "object" || Array.isArray(g) || Object.keys(g).some(key => key !== "samples" && key !== "aggregate" && key !== "parallel") || (g.parallel !== undefined && typeof g.parallel !== "boolean") || (g.samples !== undefined && g.samples !== 1 && g.samples !== 3) || (g.aggregate !== undefined && g.aggregate !== "unanimous" && g.aggregate !== "majority")) throw new Error("Invalid grader sampling");
   }
   if (p.isolation !== undefined && !["per_mode", "per_check"].includes(p.isolation)) throw new Error("Invalid verification isolation");
   if (p.writerReuse !== undefined && typeof p.writerReuse !== "boolean") throw new Error("Invalid writer reuse");
@@ -78,7 +78,7 @@ export function validateProfile(raw: unknown): VerificationProfile {
     if (!Number.isInteger(config.concurrency) || config.concurrency < 1 || config.concurrency > 4 || !Number.isFinite(config.maxCostUsd) || config.maxCostUsd <= 0 || config.maxCostUsd > 5 || !Number.isInteger(config.activeTimeoutMs) || config.activeTimeoutMs <= 0 || config.activeTimeoutMs > 1_800_000 || !Number.isFinite(config.discoveryCostUsd) || config.discoveryCostUsd <= 0 || config.discoveryCostUsd >= config.maxCostUsd || typeof config.degradeUnknown !== 'boolean') throw new Error('Invalid structured workflow limits');
     p.structuredWorkflow = config;
   }
-  return { ...p, isolation: p.isolation ?? "per_mode", writerChecks: { defaultChecks: p.writerChecks?.defaultChecks ?? p.checks.map(c => c.name), maxCalls: p.writerChecks?.maxCalls ?? 4, ...(p.writerChecks?.reserveMs !== undefined ? { reserveMs: p.writerChecks.reserveMs } : {}) }, baselinePaths: p.baselinePaths ?? ["tests/", "agent-runtime/test/"], maxRepairs: Math.min(2, Math.max(0, p.maxRepairs ?? 2)), maxCostUsd: p.maxCostUsd ?? 1, activeTimeoutMs: p.activeTimeoutMs ?? 900_000, grader: { samples: p.grader?.samples ?? 1, aggregate: p.grader?.aggregate ?? "unanimous" }, writerReuse: p.writerReuse ?? false };
+  return { ...p, isolation: p.isolation ?? "per_mode", writerChecks: { defaultChecks: p.writerChecks?.defaultChecks ?? p.checks.map(c => c.name), maxCalls: p.writerChecks?.maxCalls ?? 4, ...(p.writerChecks?.reserveMs !== undefined ? { reserveMs: p.writerChecks.reserveMs } : {}) }, baselinePaths: p.baselinePaths ?? ["tests/", "agent-runtime/test/"], maxRepairs: Math.min(2, Math.max(0, p.maxRepairs ?? 2)), maxCostUsd: p.maxCostUsd ?? 1, activeTimeoutMs: p.activeTimeoutMs ?? 900_000, grader: { samples: p.grader?.samples ?? 1, aggregate: p.grader?.aggregate ?? "unanimous", ...(p.grader?.parallel === true ? { parallel: true } : {}) }, writerReuse: p.writerReuse ?? false };
 }
 const isPlainObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 /** Above the ceiling is refused, never clamped: a profile asking for more than the harness allows is a mistake to fix. */
