@@ -380,3 +380,149 @@ test('repository guidance cannot close its untrusted block early', async () => {
   assert.equal(rendered.split(fence[1]!).length, 4, 'the boundary is named once, then opens and closes the block');
   assert.match(rendered.slice(0, rendered.indexOf('<<<')), /untrusted/i);
 });
+
+const deferred = <T = void>() => { let resolve!: (value: T) => void, reject!: (error: unknown) => void; const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; }); return { promise, resolve, reject }; };
+/** Lets pending work run until `condition` holds; false when it never does, so a wrong schedule fails instead of hanging. */
+async function until(condition: () => boolean, turns = 200) { for (let turn = 0; turn < turns && !condition(); turn++) await new Promise(resolve => setImmediate(resolve)); return condition(); }
+/** Investigators whose completion the test controls: start order, how many run at once, and one gate per node. */
+function gatedInvestigators(ids: string[], plan: unknown[]) {
+  const gates = new Map(ids.map(id => [id, deferred<unknown>()])); const started: string[] = [], finished: string[] = []; const load = { active: 0, max: 0 };
+  const execute = async (request: any) => {
+    if (request.node.role === 'planner') return { tasks: request.node.wave === 1 ? plan : [] };
+    started.push(request.node.id); load.max = Math.max(load.max, ++load.active);
+    try { return await gates.get(request.node.id)!.promise; } finally { load.active--; finished.push(request.node.id); }
+  };
+  return { execute, gates, started, finished, load, release: (id: string, result: unknown = ok) => gates.get(id)!.resolve(result), releaseAll: () => { for (const gate of gates.values()) gate.resolve(ok); } };
+}
+
+test('a free slot starts the next ready node while a slower sibling is still running', async () => {
+  const { WorkflowCoordinator } = await import('../src/structured-workflow.js');
+  await withStore(async (store, root) => {
+    const nodes = gatedInvestigators(['a', 'b', 'c'], [task('a'), task('b'), task('c')]);
+    const discovery = new WorkflowCoordinator({ store, concurrency: 2, execute: nodes.execute }).discover(discoveryInput(root), new AbortController().signal);
+    try {
+      assert.ok(await until(() => nodes.started.length === 2)); assert.deepEqual(nodes.started, ['a', 'b']);
+      nodes.release('b');
+      assert.ok(await until(() => nodes.started.includes('c')), 'c takes the slot b freed');
+      assert.deepEqual(nodes.finished, ['b'], 'a is still running when c starts');
+      nodes.release('a'); nodes.release('c');
+      await discovery;
+      assert.equal(nodes.load.max, 2); assert.deepEqual(nodes.started, ['a', 'b', 'c'], 'each node runs exactly once');
+    } finally { nodes.releaseAll(); await discovery.catch(() => undefined); }
+  });
+});
+
+test('a node between two attempts is not started again when a sibling settles', async () => {
+  const { WorkflowCoordinator } = await import('../src/structured-workflow.js');
+  await withStore(async (store, root) => {
+    const recorded = deferred(), sibling = deferred<unknown>(); const attempts: number[] = []; let gap = false, running = 0, overlap = 0;
+    const coordinator = new WorkflowCoordinator({ store, concurrency: 2,
+      execute: async (request: any) => {
+        if (request.node.role === 'planner') return { tasks: request.node.wave === 1 ? [task('a'), task('b')] : [] };
+        if (request.node.id === 'b') return sibling.promise;
+        attempts.push(request.node.attempt); overlap = Math.max(overlap, ++running);
+        try { if (request.node.attempt === 1) throw new Error('container exited 1'); return ok; } finally { running--; }
+      },
+      record: async node => { if (node.id === 'a' && node.state === 'unknown') { gap = true; await recorded.promise; } } });
+    const discovery = coordinator.discover(discoveryInput(root), new AbortController().signal);
+    try {
+      assert.ok(await until(() => gap), 'a failed once and is recording that attempt');
+      sibling.resolve(ok);
+      assert.ok(await until(() => coordinator.tasks('r').find(node => node.id === 'b')?.state === 'succeeded'));
+      await until(() => false, 20);
+      assert.deepEqual(attempts, [1], 'a is not started again during the gap');
+      recorded.resolve(); await discovery;
+      assert.deepEqual(attempts, [1, 2]); assert.equal(overlap, 1);
+      assert.equal(coordinator.tasks('r').find(node => node.id === 'a')!.attempt, 2);
+    } finally { recorded.resolve(); sibling.resolve(ok); await discovery.catch(() => undefined); }
+  });
+});
+
+for (const degradeUnknown of [false, true]) {
+  test(`a dependent starts as soon as its dependency ${degradeUnknown ? 'degrades to unresolved' : 'succeeds'}, not when an unrelated node ends`, async () => {
+    const { WorkflowCoordinator } = await import('../src/structured-workflow.js');
+    await withStore(async (store, root) => {
+      const nodes = gatedInvestigators(['dep', 'slow', 'child'], [task('dep'), task('slow'), task('child', ['dep'])]);
+      const coordinator = new WorkflowCoordinator({ store, concurrency: 2, degradeUnknown, execute: nodes.execute });
+      const discovery = coordinator.discover(discoveryInput(root), new AbortController().signal);
+      try {
+        assert.ok(await until(() => nodes.started.length === 2)); assert.deepEqual(nodes.started, ['dep', 'slow']);
+        // The stub hands every attempt the same gate, so an unknown result is returned for the retry too.
+        nodes.release('dep', degradeUnknown ? unknownResult : ok);
+        assert.ok(await until(() => nodes.started.includes('child')), 'child starts once dep settles');
+        assert.equal(coordinator.tasks('r').find(node => node.id === 'dep')!.state, degradeUnknown ? 'unresolved' : 'succeeded');
+        assert.ok(!nodes.finished.includes('slow'), 'slow is still running when child starts');
+        nodes.release('slow'); nodes.release('child');
+        await discovery;
+        assert.equal(nodes.load.max, 2); assert.equal(nodes.started.filter(id => id === 'child').length, 1);
+      } finally { nodes.releaseAll(); await discovery.catch(() => undefined); }
+    });
+  });
+}
+
+test('a fatal node failure starts nothing new, interrupts its sibling and rejects with the first error', async () => {
+  const { WorkflowCoordinator } = await import('../src/structured-workflow.js');
+  const unhandled: unknown[] = []; const probe = (reason: unknown) => { unhandled.push(reason); };
+  process.on('unhandledRejection', probe);
+  try {
+    await withStore(async (store, root) => {
+      const fatal = deferred(); const started: string[] = [];
+      const coordinator = new WorkflowCoordinator({ store, concurrency: 2, execute: async (request: any) => {
+        if (request.node.role === 'planner') return { tasks: [task('a'), task('b'), task('c')] };
+        started.push(request.node.id);
+        if (request.node.id === 'b') { await fatal.promise; throw new Error('budget_exceeded'); }
+        // The sibling ends with its own, later error once it is aborted.
+        return new Promise((_, reject) => { request.signal.addEventListener('abort', () => reject(new Error('sibling stopped')), { once: true }); });
+      } });
+      const discovery = coordinator.discover(discoveryInput(root), new AbortController().signal);
+      try {
+        assert.ok(await until(() => started.length === 2)); assert.deepEqual(started, ['a', 'b']);
+        fatal.resolve();
+        await assert.rejects(discovery, /budget_exceeded/);
+        await until(() => false, 20);
+        assert.deepEqual(started, ['a', 'b'], 'the ready node c is never started');
+        const states = Object.fromEntries(coordinator.tasks('r').map(node => [node.id, node.state]));
+        assert.equal(states.a, 'interrupted'); assert.equal(states.b, 'unknown'); assert.equal(states.c, 'pending');
+        assert.ok(!Object.values(states).includes('running'), 'no node is left running');
+      } finally { fatal.resolve(); await discovery.catch(() => undefined); }
+    });
+    assert.deepEqual(unhandled, []);
+  } finally { process.off('unhandledRejection', probe); }
+});
+
+test('discovery waits for a final record that throws after the wave has no pending node left', async () => {
+  const { WorkflowCoordinator } = await import('../src/structured-workflow.js');
+  await withStore(async (store, root) => {
+    const recording = deferred(); const calls: string[] = []; let gated = false, outcome: string | undefined;
+    const coordinator = new WorkflowCoordinator({ store, concurrency: 2,
+      execute: async (request: any) => { calls.push(request.node.id); return request.node.role === 'planner' ? { tasks: request.node.wave === 1 ? [task('a'), task('b')] : [] } : ok; },
+      record: async node => { if (node.id === 'a' && node.state === 'succeeded') { gated = true; await recording.promise; throw new Error('budget_exceeded'); } } });
+    const discovery = coordinator.discover(discoveryInput(root), new AbortController().signal);
+    discovery.then(() => { outcome = 'resolved'; }, () => { outcome = 'rejected'; });
+    try {
+      assert.ok(await until(() => gated && coordinator.tasks('r').find(node => node.id === 'b')?.state === 'succeeded'), 'both nodes are settled in the store');
+      await until(() => false, 20);
+      assert.equal(outcome, undefined, 'a is still recording'); assert.ok(!calls.includes('planner-2'), 'the next wave has not started');
+      recording.resolve();
+      await assert.rejects(discovery);
+      assert.ok(!calls.includes('planner-2'));
+    } finally { recording.resolve(); await discovery.catch(() => undefined); }
+  });
+});
+
+test('concurrency 1 runs nodes one at a time in insertion order', async () => {
+  const { WorkflowCoordinator } = await import('../src/structured-workflow.js');
+  await withStore(async (store, root) => {
+    const nodes = gatedInvestigators(['a', 'b', 'c'], [task('a'), task('b'), task('c')]);
+    const discovery = new WorkflowCoordinator({ store, concurrency: 1, execute: nodes.execute }).discover(discoveryInput(root), new AbortController().signal);
+    try {
+      for (const [index, id] of ['a', 'b', 'c'].entries()) {
+        assert.ok(await until(() => nodes.started.length === index + 1)); await until(() => false, 10);
+        assert.deepEqual(nodes.started, ['a', 'b', 'c'].slice(0, index + 1));
+        nodes.release(id);
+      }
+      await discovery;
+      assert.equal(nodes.load.max, 1); assert.deepEqual(nodes.finished, ['a', 'b', 'c']);
+    } finally { nodes.releaseAll(); await discovery.catch(() => undefined); }
+  });
+});

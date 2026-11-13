@@ -171,15 +171,26 @@ export class WorkflowCoordinator {
           this.options.store.saveDependencies(input.run_id, task.id, [...task.dependencies, ...node.fixed_dependencies!]);
           await this.options.record?.(node);
         }
-        while (true) {
-          const nodes = this.tasks(input.run_id).filter(node => node.role !== 'planner' && node.wave === wave && !settled(node));
-          if (!nodes.length) break;
-          const completed = new Set(this.tasks(input.run_id).filter(settled).map(node => node.id));
-          const ready = nodes.filter(node => [...node.dependencies, ...(node.fixed_dependencies ?? [])].every(id => completed.has(id))).slice(0, this.options.concurrency);
-          if (!ready.length) throw new Error('workflow_dependencies_unavailable');
-          const results = await Promise.allSettled(ready.map(node => this.execute(input, node, bounded, hooks).catch(error => { controller.abort(error); throw error; })));
-          const failure = results.find(result => result.status === 'rejected'); if (failure?.status === 'rejected') throw failure.reason;
-        }
+        // A sliding window: a node starts as soon as a slot is free and its dependencies are settled. The map, not the
+        // store, says what is in flight: between two attempts a node is `unknown` with no execution and would look ready.
+        const inFlight = new Map<string, Promise<void>>(); let failure: { error: unknown } | undefined;
+        const fail = (error: unknown) => { failure ??= { error }; controller.abort(error); };
+        try {
+          while (true) {
+            const all = this.tasks(input.run_id), pending = all.filter(node => node.role !== 'planner' && node.wave === wave && !settled(node));
+            if (!failure) {
+              const done = new Set(all.filter(settled).map(node => node.id));
+              for (const node of pending) {
+                if (inFlight.size >= this.options.concurrency) break;
+                if (inFlight.has(node.id) || ![...node.dependencies, ...(node.fixed_dependencies ?? [])].every(id => done.has(id))) continue;
+                inFlight.set(node.id, this.execute(input, node, bounded, hooks).then(() => undefined, fail).finally(() => inFlight.delete(node.id)));
+              }
+            }
+            // A node is settled in the store before its last record, which may still throw: leave only when nothing is in flight.
+            if (!inFlight.size) { if (failure) throw failure.error; if (!pending.length) break; throw new Error('workflow_dependencies_unavailable'); }
+            await Promise.race(inFlight.values());
+          }
+        } catch (error) { fail(error); await Promise.all(inFlight.values()); throw failure!.error; }
       }
       signal.throwIfAborted();
       const nodes = this.tasks(input.run_id), investigations = nodes.filter(node => node.role !== 'planner');
