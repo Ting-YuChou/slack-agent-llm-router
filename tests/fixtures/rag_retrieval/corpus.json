@@ -1,0 +1,763 @@
+[
+ {
+  "document_id": "zh-courses",
+  "title": "資訊工程學系課程一覽",
+  "language": "zh",
+  "filename": "zh-courses.json",
+  "blocks": [
+   {
+    "type": "section_header",
+    "text": "資訊工程學系一一四學年度課程一覽",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "CS1101 計算機概論：四學分，上學期開設，由林志明老師授課，每週一第一、二節於工程館 101 教室上課。先修課程為無。成績計算方式為期中考百分之三十、期末考百分之四十、作業百分之三十。本課程採實體授課，修課人數上限為六十人，額滿後依年級高低順序篩選。",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "CS1102 程式設計一：三學分，下學期開設，由陳淑芬老師授課，每週二第三、四節於資訊大樓 108 教室上課。先修課程為無。成績計算方式為期末專題百分之五十、平時作業百分之三十、出席百分之二十。本課程需自備筆記型電腦，並於第一週完成開發環境安裝，逾期不予加簽。",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "CS1103 程式設計二：三學分，上學期開設，由黃建宏老師授課，每週三第五、六節於綜合教學館 115 教室上課。先修課程為無。成績計算方式為兩次小考各百分之二十、期末考百分之四十、課堂參與百分之二十。本課程與研究所合開，大學部學生修習前須經授課教師同意並填寫加簽單。",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "CS1201 離散數學：四學分，下學期開設，由張雅婷老師授課，每週四第七、八節於理學院大樓 122 教室上課。先修課程為計算機概論。成績計算方式為實作作業百分之六十、期末報告百分之四十。本課程每週另有一小時助教實習課，實習課出席狀況列入平時成績計算。",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "CS1202 線性代數：三學分，上學期開設，由李國華老師授課，每週五第一、二節於工程館 129 教室上課。先修課程為程式設計一。成績計算方式為期中考百分之三十、期末考百分之四十、作業百分之三十。本課程採英語授課，教材與考試均使用英文，外籍學生可優先選修。",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "CS2101 資料結構：三學分，下學期開設，由王美玲老師授課，每週一第三、四節於資訊大樓 136 教室上課。先修課程為程式設計二。成績計算方式為期末專題百分之五十、平時作業百分之三十、出席百分之二十。本課程期末須分組完成專題並公開展示，分組名單於第三週前繳交助教。",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "CS2102 演算法：四學分，上學期開設，由吳俊傑老師授課，每週二第五、六節於綜合教學館 143 教室上課。先修課程為離散數學。成績計算方式為兩次小考各百分之二十、期末考百分之四十、課堂參與百分之二十。本課程採實體授課，修課人數上限為六十人，額滿後依年級高低順序篩選。",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "CS2103 數位邏輯設計：三學分，下學期開設，由劉怡君老師授課，每週三第七、八節於理學院大樓 150 教室上課。先修課程為線性代數。成績計算方式為實作作業百分之六十、期末報告百分之四十。本課程需自備筆記型電腦，並於第一週完成開發環境安裝，逾期不予加簽。",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "CS2104 計算機組織：三學分，上學期開設，由蔡宗翰老師授課，每週四第一、二節於工程館 157 教室上課。先修課程為資料結構。成績計算方式為期中考百分之三十、期末考百分之四十、作業百分之三十。本課程與研究所合開，大學部學生修習前須經授課教師同意並填寫加簽單。",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "CS2201 機率與統計：四學分，下學期開設，由楊惠雯老師授課，每週五第三、四節於資訊大樓 164 教室上課。先修課程為演算法。成績計算方式為期末專題百分之五十、平時作業百分之三十、出席百分之二十。本課程每週另有一小時助教實習課，實習課出席狀況列入平時成績計算。",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "CS2202 物件導向程式設計：三學分，上學期開設，由許文彬老師授課，每週一第五、六節於綜合教學館 171 教室上課。先修課程為數位邏輯設計。成績計算方式為兩次小考各百分之二十、期末考百分之四十、課堂參與百分之二十。本課程採英語授課，教材與考試均使用英文，外籍學生可優先選修。",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "CS2203 組合語言：三學分，下學期開設，由林志明老師授課，每週二第七、八節於理學院大樓 178 教室上課。先修課程為計算機組織。成績計算方式為實作作業百分之六十、期末報告百分之四十。本課程期末須分組完成專題並公開展示，分組名單於第三週前繳交助教。",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "CS2204 系統程式：四學分，上學期開設，由陳淑芬老師授課，每週三第一、二節於工程館 185 教室上課。先修課程為機率與統計。成績計算方式為期中考百分之三十、期末考百分之四十、作業百分之三十。本課程採實體授課，修課人數上限為六十人，額滿後依年級高低順序篩選。",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "CS3101 資料庫系統：三學分，下學期開設，由黃建宏老師授課，每週四第三、四節於資訊大樓 192 教室上課。先修課程為物件導向程式設計。成績計算方式為期末專題百分之五十、平時作業百分之三十、出席百分之二十。本課程需自備筆記型電腦，並於第一週完成開發環境安裝，逾期不予加簽。",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "CS3102 計算機網路：三學分，上學期開設，由張雅婷老師授課，每週五第五、六節於綜合教學館 199 教室上課。先修課程為組合語言。成績計算方式為兩次小考各百分之二十、期末考百分之四十、課堂參與百分之二十。本課程與研究所合開，大學部學生修習前須經授課教師同意並填寫加簽單。",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "CS3103 軟體工程：四學分，下學期開設，由李國華老師授課，每週一第七、八節於理學院大樓 206 教室上課。先修課程為系統程式。成績計算方式為實作作業百分之六十、期末報告百分之四十。本課程每週另有一小時助教實習課，實習課出席狀況列入平時成績計算。",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "CS3104 正規語言與自動機：三學分，上學期開設，由王美玲老師授課，每週二第一、二節於工程館 213 教室上課。先修課程為資料庫系統。成績計算方式為期中考百分之三十、期末考百分之四十、作業百分之三十。本課程採英語授課，教材與考試均使用英文，外籍學生可優先選修。",
+    "page": 3
+   },
+   {
+    "type": "text",
+    "text": "CS3201 人工智慧導論：三學分，下學期開設，由吳俊傑老師授課，每週三第三、四節於資訊大樓 220 教室上課。先修課程為計算機網路。成績計算方式為期末專題百分之五十、平時作業百分之三十、出席百分之二十。本課程期末須分組完成專題並公開展示，分組名單於第三週前繳交助教。",
+    "page": 3
+   },
+   {
+    "type": "text",
+    "text": "CS3202 機器學習導論：四學分，上學期開設，由劉怡君老師授課，每週四第五、六節於綜合教學館 227 教室上課。先修課程為軟體工程。成績計算方式為兩次小考各百分之二十、期末考百分之四十、課堂參與百分之二十。本課程採實體授課，修課人數上限為六十人，額滿後依年級高低順序篩選。",
+    "page": 3
+   },
+   {
+    "type": "text",
+    "text": "CS3203 計算機圖學：三學分，下學期開設，由蔡宗翰老師授課，每週五第七、八節於理學院大樓 234 教室上課。先修課程為正規語言與自動機。成績計算方式為實作作業百分之六十、期末報告百分之四十。本課程需自備筆記型電腦，並於第一週完成開發環境安裝，逾期不予加簽。",
+    "page": 3
+   },
+   {
+    "type": "text",
+    "text": "CS3204 嵌入式系統：三學分，上學期開設，由楊惠雯老師授課，每週一第一、二節於工程館 241 教室上課。先修課程為人工智慧導論。成績計算方式為期中考百分之三十、期末考百分之四十、作業百分之三十。本課程與研究所合開，大學部學生修習前須經授課教師同意並填寫加簽單。",
+    "page": 3
+   },
+   {
+    "type": "text",
+    "text": "CS3205 作業系統：四學分，下學期開設，由許文彬老師授課，每週二第三、四節於資訊大樓 248 教室上課。先修課程為機器學習導論。成績計算方式為期末專題百分之五十、平時作業百分之三十、出席百分之二十。本課程每週另有一小時助教實習課，實習課出席狀況列入平時成績計算。",
+    "page": 3
+   },
+   {
+    "type": "text",
+    "text": "CS3206 網頁程式設計：三學分，上學期開設，由林志明老師授課，每週三第五、六節於綜合教學館 255 教室上課。先修課程為計算機圖學。成績計算方式為兩次小考各百分之二十、期末考百分之四十、課堂參與百分之二十。本課程採英語授課，教材與考試均使用英文，外籍學生可優先選修。",
+    "page": 3
+   },
+   {
+    "type": "text",
+    "text": "CS3207 資訊安全概論：三學分，下學期開設，由陳淑芬老師授課，每週四第七、八節於理學院大樓 262 教室上課。先修課程為嵌入式系統。成績計算方式為實作作業百分之六十、期末報告百分之四十。本課程期末須分組完成專題並公開展示，分組名單於第三週前繳交助教。",
+    "page": 3
+   },
+   {
+    "type": "text",
+    "text": "CS3208 數值方法：四學分，上學期開設，由黃建宏老師授課，每週五第一、二節於工程館 269 教室上課。先修課程為作業系統。成績計算方式為期中考百分之三十、期末考百分之四十、作業百分之三十。本課程採實體授課，修課人數上限為六十人，額滿後依年級高低順序篩選。",
+    "page": 4
+   },
+   {
+    "type": "text",
+    "text": "CS3301 人機互動：三學分，下學期開設，由張雅婷老師授課，每週一第三、四節於資訊大樓 276 教室上課。先修課程為網頁程式設計。成績計算方式為期末專題百分之五十、平時作業百分之三十、出席百分之二十。本課程需自備筆記型電腦，並於第一週完成開發環境安裝，逾期不予加簽。",
+    "page": 4
+   },
+   {
+    "type": "text",
+    "text": "CS3302 行動應用開發：三學分，上學期開設，由李國華老師授課，每週二第五、六節於綜合教學館 283 教室上課。先修課程為資訊安全概論。成績計算方式為兩次小考各百分之二十、期末考百分之四十、課堂參與百分之二十。本課程與研究所合開，大學部學生修習前須經授課教師同意並填寫加簽單。",
+    "page": 4
+   },
+   {
+    "type": "text",
+    "text": "CS3303 雲端運算：四學分，下學期開設，由王美玲老師授課，每週三第七、八節於理學院大樓 290 教室上課。先修課程為數值方法。成績計算方式為實作作業百分之六十、期末報告百分之四十。本課程每週另有一小時助教實習課，實習課出席狀況列入平時成績計算。",
+    "page": 4
+   },
+   {
+    "type": "text",
+    "text": "CS3304 資料探勘：三學分，上學期開設，由吳俊傑老師授課，每週四第一、二節於工程館 297 教室上課。先修課程為人機互動。成績計算方式為期中考百分之三十、期末考百分之四十、作業百分之三十。本課程採英語授課，教材與考試均使用英文，外籍學生可優先選修。",
+    "page": 4
+   },
+   {
+    "type": "text",
+    "text": "CS3305 影像處理：三學分，下學期開設，由劉怡君老師授課，每週五第三、四節於資訊大樓 304 教室上課。先修課程為行動應用開發。成績計算方式為期末專題百分之五十、平時作業百分之三十、出席百分之二十。本課程期末須分組完成專題並公開展示，分組名單於第三週前繳交助教。",
+    "page": 4
+   },
+   {
+    "type": "text",
+    "text": "CS4101 深度學習：四學分，上學期開設，由蔡宗翰老師授課，每週一第五、六節於綜合教學館 311 教室上課。先修課程為雲端運算。成績計算方式為兩次小考各百分之二十、期末考百分之四十、課堂參與百分之二十。本課程採實體授課，修課人數上限為六十人，額滿後依年級高低順序篩選。",
+    "page": 4
+   },
+   {
+    "type": "text",
+    "text": "CS4102 自然語言處理：三學分，下學期開設，由楊惠雯老師授課，每週二第七、八節於理學院大樓 318 教室上課。先修課程為資料探勘。成績計算方式為實作作業百分之六十、期末報告百分之四十。本課程需自備筆記型電腦，並於第一週完成開發環境安裝，逾期不予加簽。",
+    "page": 4
+   },
+   {
+    "type": "text",
+    "text": "CS4103 電腦視覺：三學分，上學期開設，由許文彬老師授課，每週三第一、二節於工程館 325 教室上課。先修課程為影像處理。成績計算方式為期中考百分之三十、期末考百分之四十、作業百分之三十。本課程與研究所合開，大學部學生修習前須經授課教師同意並填寫加簽單。",
+    "page": 5
+   },
+   {
+    "type": "text",
+    "text": "CS4104 分散式系統：四學分，下學期開設，由林志明老師授課，每週四第三、四節於資訊大樓 332 教室上課。先修課程為深度學習。成績計算方式為期末專題百分之五十、平時作業百分之三十、出席百分之二十。本課程每週另有一小時助教實習課，實習課出席狀況列入平時成績計算。",
+    "page": 5
+   },
+   {
+    "type": "text",
+    "text": "CS4105 密碼學：三學分，上學期開設，由陳淑芬老師授課，每週五第五、六節於綜合教學館 339 教室上課。先修課程為自然語言處理。成績計算方式為兩次小考各百分之二十、期末考百分之四十、課堂參與百分之二十。本課程採英語授課，教材與考試均使用英文，外籍學生可優先選修。",
+    "page": 5
+   },
+   {
+    "type": "text",
+    "text": "CS4201 資訊檢索：三學分，下學期開設，由黃建宏老師授課，每週一第七、八節於理學院大樓 346 教室上課。先修課程為電腦視覺。成績計算方式為實作作業百分之六十、期末報告百分之四十。本課程期末須分組完成專題並公開展示，分組名單於第三週前繳交助教。",
+    "page": 5
+   },
+   {
+    "type": "text",
+    "text": "CS4202 強化學習：四學分，上學期開設，由張雅婷老師授課，每週二第一、二節於工程館 353 教室上課。先修課程為分散式系統。成績計算方式為期中考百分之三十、期末考百分之四十、作業百分之三十。本課程採實體授課，修課人數上限為六十人，額滿後依年級高低順序篩選。",
+    "page": 5
+   },
+   {
+    "type": "text",
+    "text": "CS4203 量子計算導論：三學分，下學期開設，由李國華老師授課，每週三第三、四節於資訊大樓 360 教室上課。先修課程為密碼學。成績計算方式為期末專題百分之五十、平時作業百分之三十、出席百分之二十。本課程需自備筆記型電腦，並於第一週完成開發環境安裝，逾期不予加簽。",
+    "page": 5
+   },
+   {
+    "type": "text",
+    "text": "CS4204 區塊鏈技術：三學分，上學期開設，由王美玲老師授課，每週四第五、六節於綜合教學館 367 教室上課。先修課程為資訊檢索。成績計算方式為兩次小考各百分之二十、期末考百分之四十、課堂參與百分之二十。本課程與研究所合開，大學部學生修習前須經授課教師同意並填寫加簽單。",
+    "page": 5
+   },
+   {
+    "type": "text",
+    "text": "CS4205 生物資訊：四學分，下學期開設，由吳俊傑老師授課，每週五第七、八節於理學院大樓 374 教室上課。先修課程為強化學習。成績計算方式為實作作業百分之六十、期末報告百分之四十。本課程每週另有一小時助教實習課，實習課出席狀況列入平時成績計算。",
+    "page": 5
+   },
+   {
+    "type": "text",
+    "text": "CS4301 高等演算法：三學分，上學期開設，由劉怡君老師授課，每週一第一、二節於工程館 381 教室上課。先修課程為量子計算導論。成績計算方式為期中考百分之三十、期末考百分之四十、作業百分之三十。本課程採英語授課，教材與考試均使用英文，外籍學生可優先選修。",
+    "page": 6
+   },
+   {
+    "type": "text",
+    "text": "CS4302 高等作業系統：三學分，下學期開設，由蔡宗翰老師授課，每週二第三、四節於資訊大樓 388 教室上課。先修課程為區塊鏈技術。成績計算方式為期末專題百分之五十、平時作業百分之三十、出席百分之二十。本課程期末須分組完成專題並公開展示，分組名單於第三週前繳交助教。",
+    "page": 6
+   },
+   {
+    "type": "text",
+    "text": "CS4303 網路安全實務：四學分，上學期開設，由楊惠雯老師授課，每週三第五、六節於綜合教學館 395 教室上課。先修課程為生物資訊。成績計算方式為兩次小考各百分之二十、期末考百分之四十、課堂參與百分之二十。本課程採實體授課，修課人數上限為六十人，額滿後依年級高低順序篩選。",
+    "page": 6
+   },
+   {
+    "type": "text",
+    "text": "CS4304 巨量資料分析：三學分，下學期開設，由許文彬老師授課，每週四第七、八節於理學院大樓 402 教室上課。先修課程為高等演算法。成績計算方式為實作作業百分之六十、期末報告百分之四十。本課程需自備筆記型電腦，並於第一週完成開發環境安裝，逾期不予加簽。",
+    "page": 6
+   },
+   {
+    "type": "text",
+    "text": "CS4305 遊戲程式設計：三學分，上學期開設，由林志明老師授課，每週五第一、二節於工程館 409 教室上課。先修課程為高等作業系統。成績計算方式為期中考百分之三十、期末考百分之四十、作業百分之三十。本課程與研究所合開，大學部學生修習前須經授課教師同意並填寫加簽單。",
+    "page": 6
+   },
+   {
+    "type": "text",
+    "text": "CS4306 軟體測試：四學分，下學期開設，由陳淑芬老師授課，每週一第三、四節於資訊大樓 416 教室上課。先修課程為網路安全實務。成績計算方式為期末專題百分之五十、平時作業百分之三十、出席百分之二十。本課程每週另有一小時助教實習課，實習課出席狀況列入平時成績計算。",
+    "page": 6
+   },
+   {
+    "type": "text",
+    "text": "CS4307 專題研究一：三學分，上學期開設，由黃建宏老師授課，每週二第五、六節於綜合教學館 423 教室上課。先修課程為巨量資料分析。成績計算方式為兩次小考各百分之二十、期末考百分之四十、課堂參與百分之二十。本課程採英語授課，教材與考試均使用英文，外籍學生可優先選修。",
+    "page": 6
+   },
+   {
+    "type": "text",
+    "text": "CS4308 專題研究二：三學分，下學期開設，由張雅婷老師授課，每週三第七、八節於理學院大樓 430 教室上課。先修課程為遊戲程式設計。成績計算方式為實作作業百分之六十、期末報告百分之四十。本課程期末須分組完成專題並公開展示，分組名單於第三週前繳交助教。",
+    "page": 6
+   },
+   {
+    "type": "text",
+    "text": "CS4309 平行程式設計：四學分，上學期開設，由李國華老師授課，每週四第一、二節於工程館 437 教室上課。先修課程為軟體測試。成績計算方式為期中考百分之三十、期末考百分之四十、作業百分之三十。本課程採實體授課，修課人數上限為六十人，額滿後依年級高低順序篩選。",
+    "page": 7
+   },
+   {
+    "type": "text",
+    "text": "CS4310 編譯器設計：三學分，下學期開設，由王美玲老師授課，每週五第三、四節於資訊大樓 444 教室上課。先修課程為專題研究一。成績計算方式為期末專題百分之五十、平時作業百分之三十、出席百分之二十。本課程需自備筆記型電腦，並於第一週完成開發環境安裝，逾期不予加簽。",
+    "page": 7
+   }
+  ]
+ },
+ {
+  "document_id": "zh-calendar",
+  "title": "一一四學年度行事曆",
+  "language": "zh",
+  "filename": "zh-calendar.json",
+  "blocks": [
+   {
+    "type": "section_header",
+    "text": "第一學期重要日程",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "第一學期於 9 月 8 日開學並正式上課。新生訓練於 9 月 3 日至 9 月 4 日在體育館舉行，全體新生均須參加。",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "網路加退選自 9 月 8 日上午九時開始，加退選截止日為 9 月 19 日下午五時，逾期不再受理人工加簽。",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "期中考週為 11 月 3 日至 11 月 7 日，考試期間圖書館延長開放至晚上十二時。",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "停修申請截止日為 12 月 5 日，停修科目仍登載於成績單並註記停修字樣。",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "期末考週為 1 月 5 日至 1 月 9 日，寒假自 1 月 12 日開始。",
+    "page": 1
+   },
+   {
+    "type": "section_header",
+    "text": "第二學期重要日程",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "第二學期於 2 月 23 日開學。學雜費繳費期限為 2 月 20 日，逾期未繳者視同未完成註冊。",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "校慶運動會於 4 月 18 日舉行，當日全校停課一天，並於 4 月 20 日補假。",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "畢業典禮訂於 6 月 13 日上午在大禮堂舉行，畢業生須於 6 月 5 日前完成離校手續。",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "暑假自 6 月 29 日開始，暑期課程於 7 月 6 日上課，為期六週。",
+    "page": 2
+   }
+  ]
+ },
+ {
+  "document_id": "zh-scholarship",
+  "title": "學生獎助學金實施辦法",
+  "language": "zh",
+  "filename": "zh-scholarship.json",
+  "blocks": [
+   {
+    "type": "section_header",
+    "text": "獎學金",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "第一條 書卷獎：每學期各班學業成績前三名且操行成績八十分以上者，頒發獎狀及獎學金新臺幣 5,000 元。",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "第二條 傑出研究獎學金：研究生以本校名義發表期刊論文者，每篇核發新臺幣 30,000 元，每人每學年以兩篇為限。",
+    "page": 1
+   },
+   {
+    "type": "section_header",
+    "text": "助學金",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "第三條 清寒助學金：家庭經濟弱勢、持有低收入戶或中低收入戶證明之學生，每學期補助新臺幣 20,000 元，申請期限為開學後兩週內。",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "第四條 急難救助金：學生本人或家庭遭逢重大變故致生活陷入困境者，得檢附證明文件向生活輔導組申請，最高補助新臺幣 50,000 元。",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "第五條 工讀助學金：每小時以基本工資計算，每月工讀時數上限為四十小時，由各單位依需求公開徵選。",
+    "page": 2
+   },
+   {
+    "type": "section_header",
+    "text": "申請與審查",
+    "page": 3
+   },
+   {
+    "type": "text",
+    "text": "第六條 各項獎助學金之申請一律透過學生資訊系統線上提出，紙本申請恕不受理，審查結果於申請截止後三十日內公告。",
+    "page": 3
+   }
+  ]
+ },
+ {
+  "document_id": "zh-offices",
+  "title": "行政單位辦公時間與聯絡方式",
+  "language": "zh",
+  "filename": "zh-offices.json",
+  "blocks": [
+   {
+    "type": "section_header",
+    "text": "教務處",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "註冊組位於行政大樓一樓 102 室，辦理學籍、成績與畢業資格審查，聯絡電話為分機 2211，辦公時間為週一至週五上午八時三十分至下午五時。",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "課務組位於行政大樓一樓 105 室，辦理選課、排課與教室借用，聯絡電話為分機 2225。",
+    "page": 1
+   },
+   {
+    "type": "section_header",
+    "text": "學生事務處",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "生活輔導組位於學生活動中心二樓 203 室，辦理請假、獎懲、就學貸款與學雜費減免，聯絡電話為分機 2310。",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "衛生保健組位於體育館旁健康中心，提供傷病處理與健康檢查，聯絡電話為分機 2350，夜間緊急狀況請撥校安專線。",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "諮商輔導中心位於圖書館地下一樓，提供個別諮商與心理測驗，初談須事先上網預約。",
+    "page": 2
+   },
+   {
+    "type": "section_header",
+    "text": "總務處",
+    "page": 3
+   },
+   {
+    "type": "text",
+    "text": "出納組位於行政大樓二樓 210 室，辦理學雜費收退費與各項款項支付，臨櫃收款時間至下午三時三十分止。",
+    "page": 3
+   }
+  ]
+ },
+ {
+  "document_id": "zh-library",
+  "title": "圖書館借閱規則",
+  "language": "zh",
+  "filename": "zh-library.json",
+  "blocks": [
+   {
+    "type": "section_header",
+    "text": "借閱冊數與期限",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "大學部學生每人可借圖書 15 冊，借期三十天；研究生每人可借圖書 30 冊，借期六十天；教職員每人可借圖書 50 冊，借期九十天。",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "所借圖書如無他人預約，得於到期日前線上辦理續借，續借以兩次為限。",
+    "page": 1
+   },
+   {
+    "type": "section_header",
+    "text": "逾期與賠償",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "圖書逾期歸還者，每冊每日收取逾期處理費新臺幣 5 元，累計未繳清前暫停借閱權利。",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "遺失或毀損館藏者，應於一個月內購買相同版本賠償，無法購得時依定價三倍計價賠償。",
+    "page": 2
+   },
+   {
+    "type": "section_header",
+    "text": "空間使用",
+    "page": 3
+   },
+   {
+    "type": "text",
+    "text": "討論室須於三日前透過空間預約系統登記，每次使用以兩小時為限，逾時十五分鐘未報到者取消預約。",
+    "page": 3
+   }
+  ]
+ },
+ {
+  "document_id": "zh-dorm",
+  "title": "學生宿舍管理規則",
+  "language": "zh",
+  "filename": "zh-dorm.json",
+  "blocks": [
+   {
+    "type": "section_header",
+    "text": "學生宿舍管理規則",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "宿舍門禁時間為晚上 11 時 30 分至翌日上午 6 時，門禁期間進出須刷學生證並登記。住宿生不得留宿非本宿舍人員，訪客須於晚上十時前離開並於櫃檯登記換證。寢室內禁止使用電磁爐、電暖器等高耗電電器，違者第一次勸導，第二次起記點。每學期累計記點達十點者，次學期不得申請住宿。寒暑假留宿須另行申請並繳交留宿費用，未經核准不得擅自留宿。退宿應於學期結束後三日內完成清潔檢查並繳回鑰匙，保證金於檢查合格後退還。宿舍公共區域每日由清潔人員打掃，寢室內部由住宿生自行維護，並配合每月一次之安全衛生檢查。住宿生如需修繕，應透過宿舍報修系統登記，緊急事故請直接聯絡值班宿舍輔導員。",
+    "page": 1
+   }
+  ]
+ },
+ {
+  "document_id": "en-labs",
+  "title": "Research Laboratory Directory",
+  "language": "en",
+  "filename": "en-labs.json",
+  "blocks": [
+   {
+    "type": "section_header",
+    "text": "Research Laboratory Directory",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "Laboratory A211, the Analytical Chemistry Instrumentation Laboratory, is supervised by Professor Hernandez-Whitfield; reservations require departmental authorization through extension 4101 and mandatory orientation certification beforehand. Laboratory B224, the Environmental Microbiology Research Laboratory, is supervised by Professor Konstantinopoulos; reservations require departmental authorization through extension 4118 and mandatory orientation certification beforehand. Laboratory C237, the Computational Neuroscience Visualization Laboratory, is supervised by Professor Vandersteenhoven; reservations require departmental authorization through extension 4135 and mandatory orientation certification beforehand. Laboratory D250, the Semiconductor Characterization Laboratory, is supervised by Professor Ramachandran; reservations require departmental authorization through extension 4152 and mandatory orientation certification beforehand. Laboratory E263, the Biomedical Engineering Prototyping Laboratory, is supervised by Professor Featherstonehaugh; reservations require departmental authorization through extension 4169 and mandatory orientation certification beforehand. Laboratory F276, the Atmospheric Spectroscopy Measurement Laboratory, is supervised by Professor Abdulrahman; reservations require departmental authorization through extension 4186 and mandatory orientation certification beforehand. Laboratory G289, the Electromagnetic Compatibility Testing Laboratory, is supervised by Professor Wojciechowski; reservations require departmental authorization through extension 4203 and mandatory orientation certification beforehand. Laboratory A302, the Pharmaceutical Formulation Development Laboratory, is supervised by Professor Papadimitriou; reservations require departmental authorization through extension 4220 and mandatory orientation certification beforehand. Laboratory B315, the Geotechnical Engineering Simulation Laboratory, is supervised by Professor Mwangi-Robertson; reservations require departmental authorization through extension 4237 and mandatory orientation certification beforehand. Laboratory C328, the Photovoltaic Materials Fabrication Laboratory, is supervised by Professor Schwarzenberger; reservations require departmental authorization through extension 4254 and mandatory orientation certification beforehand. Laboratory D341, the Comparative Genomics Sequencing Laboratory, is supervised by Professor Thorvaldsdottir; reservations require departmental authorization through extension 4271 and mandatory orientation certification beforehand. Laboratory E354, the Hydrodynamics Experimentation Laboratory, is supervised by Professor Hernandez-Whitfield; reservations require departmental authorization through extension 4288 and mandatory orientation certification beforehand. Laboratory F367, the Structural Crystallography Diffraction Laboratory, is supervised by Professor Konstantinopoulos; reservations require departmental authorization through extension 4305 and mandatory orientation certification beforehand. Laboratory G380, the Autonomous Robotics Integration Laboratory, is supervised by Professor Vandersteenhoven; reservations require departmental authorization through extension 4322 and mandatory orientation certification beforehand. Laboratory A393, the Nanotechnology Microfabrication Laboratory, is supervised by Professor Ramachandran; reservations require departmental authorization through extension 4339 and mandatory orientation certification beforehand. Laboratory B406, the Thermodynamics Instrumentation Laboratory, is supervised by Professor Featherstonehaugh; reservations require departmental authorization through extension 4356 and mandatory orientation certification beforehand. Laboratory C419, the Neuropharmacology Electrophysiology Laboratory, is supervised by Professor Abdulrahman; reservations require departmental authorization through extension 4373 and mandatory orientation certification beforehand. Laboratory D432, the Aerospace Propulsion Diagnostics Laboratory, is supervised by Professor Wojciechowski; reservations require departmental authorization through extension 4390 and mandatory orientation certification beforehand. Laboratory E445, the Bioinformatics Computation Laboratory, is supervised by Professor Papadimitriou; reservations require departmental authorization through extension 4407 and mandatory orientation certification beforehand. Laboratory F458, the Radiochemistry Containment Laboratory, is supervised by Professor Mwangi-Robertson; reservations require departmental authorization through extension 4424 and mandatory orientation certification beforehand. Laboratory G471, the Oceanographic Sedimentology Analysis Laboratory, is supervised by Professor Schwarzenberger; reservations require departmental authorization through extension 4441 and mandatory orientation certification beforehand. Laboratory A484, the Cryogenic Superconductivity Research Laboratory, is supervised by Professor Thorvaldsdottir; reservations require departmental authorization through extension 4458 and mandatory orientation certification beforehand. Laboratory B497, the Telecommunications Protocol Verification Laboratory, is supervised by Professor Hernandez-Whitfield; reservations require departmental authorization through extension 4475 and mandatory orientation certification beforehand. Laboratory C510, the Immunohistochemistry Preparation Laboratory, is supervised by Professor Konstantinopoulos; reservations require departmental authorization through extension 4492 and mandatory orientation certification beforehand. Laboratory D523, the Seismological Instrumentation Calibration Laboratory, is supervised by Professor Vandersteenhoven; reservations require departmental authorization through extension 4509 and mandatory orientation certification beforehand. Laboratory E536, the Metallurgical Microstructure Examination Laboratory, is supervised by Professor Ramachandran; reservations require departmental authorization through extension 4526 and mandatory orientation certification beforehand. Laboratory F549, the Psychophysiology Observation Laboratory, is supervised by Professor Featherstonehaugh; reservations require departmental authorization through extension 4543 and mandatory orientation certification beforehand. Laboratory G562, the Agricultural Biotechnology Propagation Laboratory, is supervised by Professor Abdulrahman; reservations require departmental authorization through extension 4560 and mandatory orientation certification beforehand. Laboratory A575, the Ultrafast Photonics Characterization Laboratory, is supervised by Professor Wojciechowski; reservations require departmental authorization through extension 4577 and mandatory orientation certification beforehand. Laboratory B588, the Epidemiological Surveillance Modelling Laboratory, is supervised by Professor Papadimitriou; reservations require departmental authorization through extension 4594 and mandatory orientation certification beforehand. Laboratory C601, the Polymer Rheology Characterization Laboratory, is supervised by Professor Mwangi-Robertson; reservations require departmental authorization through extension 4611 and mandatory orientation certification beforehand. Laboratory D614, the Paleontological Specimen Conservation Laboratory, is supervised by Professor Schwarzenberger; reservations require departmental authorization through extension 4628 and mandatory orientation certification beforehand. Laboratory E627, the Cardiovascular Biomechanics Assessment Laboratory, is supervised by Professor Thorvaldsdottir; reservations require departmental authorization through extension 4645 and mandatory orientation certification beforehand. Laboratory F640, the Cybersecurity Vulnerability Assessment Laboratory, is supervised by Professor Hernandez-Whitfield; reservations require departmental authorization through extension 4662 and mandatory orientation certification beforehand. Laboratory G653, the Electrochemical Energy Storage Laboratory, is supervised by Professor Konstantinopoulos; reservations require departmental authorization through extension 4679 and mandatory orientation certification beforehand. Laboratory A666, the Developmental Neurobiology Microscopy Laboratory, is supervised by Professor Vandersteenhoven; reservations require departmental authorization through extension 4696 and mandatory orientation certification beforehand. Laboratory B679, the Transportation Infrastructure Monitoring Laboratory, is supervised by Professor Ramachandran; reservations require departmental authorization through extension 4713 and mandatory orientation certification beforehand. Laboratory C692, the Astroparticle Detector Development Laboratory, is supervised by Professor Featherstonehaugh; reservations require departmental authorization through extension 4730 and mandatory orientation certification beforehand. Laboratory D705, the Proteomics Mass Spectrometry Laboratory, is supervised by Professor Abdulrahman; reservations require departmental authorization through extension 4747 and mandatory orientation certification beforehand. Laboratory E718, the Hydrogeological Contamination Remediation Laboratory, is supervised by Professor Wojciechowski; reservations require departmental authorization through extension 4764 and mandatory orientation certification beforehand. Laboratory F731, the Linguistic Phonetics Acoustics Laboratory, is supervised by Professor Papadimitriou; reservations require departmental authorization through extension 4781 and mandatory orientation certification beforehand. Laboratory G744, the Tissue Engineering Bioreactor Laboratory, is supervised by Professor Mwangi-Robertson; reservations require departmental authorization through extension 4798 and mandatory orientation certification beforehand.",
+    "page": 1
+   }
+  ]
+ },
+ {
+  "document_id": "en-calendar",
+  "title": "Academic Calendar 2025-26",
+  "language": "en",
+  "filename": "en-calendar.json",
+  "blocks": [
+   {
+    "type": "section_header",
+    "text": "Fall Semester 2025",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "Fall classes begin on Monday, August 25, 2025. New student orientation runs from August 20 to August 22 in the Student Union.",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "The add/drop deadline for the fall semester is September 5, 2025 at 5:00 p.m.; after that date a course withdrawal appears on the transcript.",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "Midterm examinations are held October 13 through October 17. Thanksgiving recess runs from November 26 to November 28.",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "Fall final examinations begin on December 8 and end on December 12, 2025. Grades are posted by December 19.",
+    "page": 1
+   },
+   {
+    "type": "section_header",
+    "text": "Spring Semester 2026",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "Spring classes begin on January 20, 2026. The tuition payment deadline for the spring semester is January 16, 2026.",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "Spring break is scheduled for March 16 through March 20. Registration for the following fall opens on April 6.",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "Spring final examinations begin on May 11, 2026, and commencement takes place on Saturday, May 23, 2026 in the Memorial Stadium.",
+    "page": 2
+   }
+  ]
+ },
+ {
+  "document_id": "en-tuition",
+  "title": "Tuition and Fees",
+  "language": "en",
+  "filename": "en-tuition.json",
+  "blocks": [
+   {
+    "type": "section_header",
+    "text": "Tuition Rates",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "Undergraduate tuition for residents is $412 per credit hour; non-resident undergraduate tuition is $1,138 per credit hour. Graduate tuition is $655 per credit hour for residents.",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "A mandatory student services fee of $290 is charged each semester to students enrolled in six or more credit hours.",
+    "page": 1
+   },
+   {
+    "type": "section_header",
+    "text": "Payment",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "Students who register after the first day of classes are charged a late registration fee of $75. Unpaid balances accrue a monthly finance charge of 1.5 percent.",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "The installment payment plan divides the semester balance into four equal monthly payments; enrollment in the plan costs $40 and must be completed through the Bursar portal before the payment deadline.",
+    "page": 2
+   },
+   {
+    "type": "section_header",
+    "text": "Refunds",
+    "page": 3
+   },
+   {
+    "type": "text",
+    "text": "Students who withdraw during the first week receive a 100 percent tuition refund; the refund drops to 50 percent in the second week and no refund is issued after the third week.",
+    "page": 3
+   }
+  ]
+ },
+ {
+  "document_id": "en-housing",
+  "title": "Residence Hall Policies",
+  "language": "en",
+  "filename": "en-housing.json",
+  "blocks": [
+   {
+    "type": "section_header",
+    "text": "Community Standards",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "Quiet hours are in effect from 10:00 p.m. to 8:00 a.m. Sunday through Thursday, and from midnight to 9:00 a.m. on Friday and Saturday. During final examinations quiet hours are extended to 24 hours a day.",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "Residents may host an overnight guest for no more than three consecutive nights with the written consent of every roommate, and guests must be registered at the front desk.",
+    "page": 1
+   },
+   {
+    "type": "section_header",
+    "text": "Rooms and Maintenance",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "Candles, incense, space heaters and hot plates are prohibited in all residence halls. Each room may have one refrigerator no larger than 4.5 cubic feet.",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "Maintenance requests are submitted through the housing portal; emergencies such as flooding or loss of heat should be reported immediately to the resident assistant on duty.",
+    "page": 2
+   },
+   {
+    "type": "section_header",
+    "text": "Contracts",
+    "page": 3
+   },
+   {
+    "type": "text",
+    "text": "The housing contract covers the full academic year. Cancelling after July 1 forfeits the $250 housing deposit.",
+    "page": 3
+   }
+  ]
+ },
+ {
+  "document_id": "en-courses",
+  "title": "Undergraduate Course Catalog Excerpt",
+  "language": "en",
+  "filename": "en-courses.json",
+  "blocks": [
+   {
+    "type": "section_header",
+    "text": "Mathematics",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "MATH2410 Differential Equations (3 credits) covers first-order equations, linear systems and Laplace transforms. Prerequisite: MATH1620 Calculus II with a grade of C or better. Taught by Dr. Okonkwo.",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "MATH3050 Real Analysis (4 credits) is a proof-based study of sequences, continuity and integration. Prerequisite: MATH2300 Introduction to Proofs.",
+    "page": 1
+   },
+   {
+    "type": "section_header",
+    "text": "Physics",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "PHYS1150 General Physics I (4 credits) introduces mechanics and thermodynamics with a weekly laboratory. Taught by Dr. Lindqvist in Science Hall room 140.",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "PHYS3310 Quantum Mechanics (3 credits) develops the Schrodinger equation and angular momentum. Prerequisite: PHYS2220 Modern Physics and MATH2410.",
+    "page": 2
+   },
+   {
+    "type": "section_header",
+    "text": "Computer Science",
+    "page": 3
+   },
+   {
+    "type": "text",
+    "text": "CSCI2270 Data Structures (4 credits) studies lists, trees, hash tables and graphs with programming assignments in C++. Prerequisite: CSCI1300.",
+    "page": 3
+   },
+   {
+    "type": "text",
+    "text": "CSCI4830 Machine Learning (3 credits) surveys supervised and unsupervised methods; the final project counts for 40 percent of the grade.",
+    "page": 3
+   }
+  ]
+ },
+ {
+  "document_id": "en-offices",
+  "title": "Campus Offices and Contact Information",
+  "language": "en",
+  "filename": "en-offices.json",
+  "blocks": [
+   {
+    "type": "section_header",
+    "text": "Academic Services",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "The Office of the Registrar is located in Founders Hall room 110 and handles transcripts, enrollment verification and degree audits. Call extension 3120; the office is open weekdays from 8:30 a.m. to 4:30 p.m.",
+    "page": 1
+   },
+   {
+    "type": "text",
+    "text": "The Academic Advising Center in Founders Hall room 215 offers drop-in advising on Tuesdays and Thursdays from 1:00 p.m. to 3:00 p.m.",
+    "page": 1
+   },
+   {
+    "type": "section_header",
+    "text": "Student Services",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "The Financial Aid Office is on the second floor of the Student Union and can be reached at extension 3275. Priority deadline for the aid application is March 1.",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "Counseling and Psychological Services provides free short-term counseling; appointments are booked online and a crisis line is staffed around the clock.",
+    "page": 2
+   },
+   {
+    "type": "text",
+    "text": "The Disability Resource Center in Library West room 020 arranges exam accommodations, which must be requested at least five business days in advance.",
+    "page": 2
+   }
+  ]
+ }
+]

@@ -1,0 +1,194 @@
+[
+ {
+  "id": "zh-01",
+  "language": "zh",
+  "kind": "exact",
+  "query": "CS4310 編譯器設計在哪間教室上課？",
+  "document_id": "zh-courses",
+  "answer_span": "於資訊大樓 444 教室上課"
+ },
+ {
+  "id": "zh-02",
+  "language": "zh",
+  "kind": "exact",
+  "query": "機器學習導論的授課老師是誰？",
+  "document_id": "zh-courses",
+  "answer_span": "CS3202 機器學習導論：四學分，上學期開設，由劉怡君老師授課"
+ },
+ {
+  "id": "zh-03",
+  "language": "zh",
+  "kind": "exact",
+  "query": "CS1101 計算機概論是幾學分的課？",
+  "document_id": "zh-courses",
+  "answer_span": "CS1101 計算機概論：四學分"
+ },
+ {
+  "id": "zh-04",
+  "language": "zh",
+  "kind": "exact",
+  "query": "平行程式設計的先修課程是什麼？",
+  "document_id": "zh-courses",
+  "answer_span": "CS4309 平行程式設計"
+ },
+ {
+  "id": "zh-05",
+  "language": "zh",
+  "kind": "exact",
+  "query": "加退選截止日是哪一天？",
+  "document_id": "zh-calendar",
+  "answer_span": "加退選截止日為 9 月 19 日"
+ },
+ {
+  "id": "zh-06",
+  "language": "zh",
+  "kind": "exact",
+  "query": "畢業典禮什麼時候舉行？",
+  "document_id": "zh-calendar",
+  "answer_span": "畢業典禮訂於 6 月 13 日"
+ },
+ {
+  "id": "zh-07",
+  "language": "zh",
+  "kind": "exact",
+  "query": "清寒助學金每學期補助多少錢？",
+  "document_id": "zh-scholarship",
+  "answer_span": "每學期補助新臺幣 20,000 元"
+ },
+ {
+  "id": "zh-08",
+  "language": "zh",
+  "kind": "semantic",
+  "query": "家裡突然出事生活過不下去，可以找學校幫忙嗎？",
+  "document_id": "zh-scholarship",
+  "answer_span": "最高補助新臺幣 50,000 元"
+ },
+ {
+  "id": "zh-09",
+  "language": "zh",
+  "kind": "exact",
+  "query": "註冊組的分機號碼是多少？",
+  "document_id": "zh-offices",
+  "answer_span": "聯絡電話為分機 2211"
+ },
+ {
+  "id": "zh-10",
+  "language": "zh",
+  "kind": "semantic",
+  "query": "想辦就學貸款要去哪個單位？",
+  "document_id": "zh-offices",
+  "answer_span": "生活輔導組位於學生活動中心二樓 203 室"
+ },
+ {
+  "id": "zh-11",
+  "language": "zh",
+  "kind": "exact",
+  "query": "研究生可以借幾冊圖書？",
+  "document_id": "zh-library",
+  "answer_span": "研究生每人可借圖書 30 冊"
+ },
+ {
+  "id": "zh-12",
+  "language": "zh",
+  "kind": "exact",
+  "query": "宿舍門禁時間是幾點？",
+  "document_id": "zh-dorm",
+  "answer_span": "宿舍門禁時間為晚上 11 時 30 分"
+ },
+ {
+  "id": "en-01",
+  "language": "en",
+  "kind": "exact",
+  "query": "Who supervises laboratory B588?",
+  "document_id": "en-labs",
+  "answer_span": "Laboratory B588, the Epidemiological Surveillance Modelling Laboratory, is supervised by Professor Papadimitriou"
+ },
+ {
+  "id": "en-02",
+  "language": "en",
+  "kind": "exact",
+  "query": "What is the extension for laboratory C237?",
+  "document_id": "en-labs",
+  "answer_span": "extension 4135"
+ },
+ {
+  "id": "en-03",
+  "language": "en",
+  "kind": "exact",
+  "query": "Which professor supervises laboratory F731?",
+  "document_id": "en-labs",
+  "answer_span": "Laboratory F731, the Linguistic Phonetics Acoustics Laboratory, is supervised by Professor Papadimitriou"
+ },
+ {
+  "id": "en-04",
+  "language": "en",
+  "kind": "exact",
+  "query": "When is the add/drop deadline for the fall semester?",
+  "document_id": "en-calendar",
+  "answer_span": "September 5, 2025"
+ },
+ {
+  "id": "en-05",
+  "language": "en",
+  "kind": "exact",
+  "query": "When do spring final examinations begin?",
+  "document_id": "en-calendar",
+  "answer_span": "Spring final examinations begin on May 11, 2026"
+ },
+ {
+  "id": "en-06",
+  "language": "en",
+  "kind": "exact",
+  "query": "How much is the late registration fee?",
+  "document_id": "en-tuition",
+  "answer_span": "late registration fee of $75"
+ },
+ {
+  "id": "en-07",
+  "language": "en",
+  "kind": "semantic",
+  "query": "Can I spread my bill over several months?",
+  "document_id": "en-tuition",
+  "answer_span": "four equal monthly payments"
+ },
+ {
+  "id": "en-08",
+  "language": "en",
+  "kind": "exact",
+  "query": "What are the quiet hours in the residence halls?",
+  "document_id": "en-housing",
+  "answer_span": "from 10:00 p.m. to 8:00 a.m."
+ },
+ {
+  "id": "en-09",
+  "language": "en",
+  "kind": "semantic",
+  "query": "Is my friend allowed to stay over in my dorm room?",
+  "document_id": "en-housing",
+  "answer_span": "no more than three consecutive nights"
+ },
+ {
+  "id": "en-10",
+  "language": "en",
+  "kind": "exact",
+  "query": "What is the prerequisite for MATH2410?",
+  "document_id": "en-courses",
+  "answer_span": "Prerequisite: MATH1620 Calculus II"
+ },
+ {
+  "id": "en-11",
+  "language": "en",
+  "kind": "exact",
+  "query": "Who teaches PHYS1150?",
+  "document_id": "en-courses",
+  "answer_span": "Taught by Dr. Lindqvist"
+ },
+ {
+  "id": "en-12",
+  "language": "en",
+  "kind": "exact",
+  "query": "What is the phone extension of the registrar?",
+  "document_id": "en-offices",
+  "answer_span": "Call extension 3120"
+ }
+]
