@@ -152,3 +152,89 @@ test("a failed capture write never becomes an unhandled rejection", async () => 
   assert.deepEqual(unhandled, []);
   assert.deepEqual(reasons, ["capture_write_failed", "capture_write_failed"]);
 });
+
+function captureRpc() {
+  const stored: any[] = [];
+  const reasons: string[] = [];
+  const telemetry = { record: async (_r: string, _s: string, kind: string, payload: any) => { if (kind === "rpc") stored.push(payload); return true; }, markIncomplete: (_id: string, reason: string) => { reasons.push(reason); }, completeness: () => reasons };
+  return { stored, reasons, telemetry };
+}
+const streamed = (text: string, delta: string) => {
+  const message = { role: "assistant", content: [{ type: "text", text }], model: "m", usage: { input: 1, output: 2 }, timestamp: 1700000000000 };
+  return { type: "message_update", message, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta, partial: { ...message } } };
+};
+
+test("streaming updates are stored without the message so far and the record is not mutated", async () => {
+  const { PiRunCapture } = await moduleUnderTest();
+  const { stored, telemetry } = captureRpc();
+  const capture = new PiRunCapture(telemetry, "r", "s", "/unused", "container");
+  const value = streamed("hello world", "world");
+  const before = structuredClone(value);
+  capture.onRecord(value);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(value, before);
+  assert.equal(stored.length, 1);
+  assert.notEqual(stored[0], value);
+  assert.deepEqual(stored[0], {
+    type: "message_update",
+    message: { role: "assistant", model: "m", usage: { input: 1, output: 2 }, timestamp: 1700000000000 },
+    assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "world" },
+  });
+  assert.equal("content" in stored[0].message, false);
+  assert.equal("partial" in stored[0].assistantMessageEvent, false);
+  // Fields that are missing or not objects are left as they are.
+  for (const odd of [{ type: "message_update" }, { type: "message_update", message: "text", assistantMessageEvent: null }, { type: "message_update", message: ["a"], assistantMessageEvent: 7 }]) {
+    stored.length = 0;
+    capture.onRecord(odd);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(stored, [odd]);
+  }
+});
+
+test("completed messages are stored unchanged", async () => {
+  const { PiRunCapture } = await moduleUnderTest();
+  const { stored, telemetry } = captureRpc();
+  const capture = new PiRunCapture(telemetry, "r", "s", "/unused", "container");
+  const value = { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hello world" }], usage: { input: 1, output: 2 }, timestamp: 1700000000000 } };
+  const before = structuredClone(value);
+  capture.onRecord(value);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(stored, [before]);
+  assert.equal(stored[0], value);
+});
+
+test("a streaming update nested beyond the limit still marks the capture incomplete", async () => {
+  const { PiRunCapture } = await moduleUnderTest();
+  const { stored, reasons, telemetry } = captureRpc();
+  const capture = new PiRunCapture(telemetry, "r", "s", "/unused", "container");
+  let deep: any = { leaf: true };
+  for (let i = 0; i < 200; i++) deep = { child: deep };
+  // The nesting lives only in the parts that are not stored.
+  const value = streamed("hello", "hello") as any;
+  value.message.content = [deep];
+  value.assistantMessageEvent.partial = { content: [deep] };
+  capture.onRecord(value);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual([...new Set(reasons)], ["rpc_nesting_limit"]);
+  assert.equal(stored.length, 1);
+  assert.doesNotMatch(JSON.stringify(stored[0]), /leaf/);
+});
+
+test("stored bytes grow linearly with the length of a streamed answer", async () => {
+  const { PiRunCapture } = await moduleUnderTest();
+  const { stored, telemetry } = captureRpc();
+  const capture = new PiRunCapture(telemetry, "r", "s", "/unused", "container");
+  let text = "";
+  let input = 0;
+  for (let i = 0; i < 400; i++) {
+    text += "abcde";
+    const value = streamed(text, "abcde");
+    input += JSON.stringify(value).length;
+    capture.onRecord(value);
+  }
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(stored.length, 400);
+  const bytes = stored.reduce((sum, payload) => sum + JSON.stringify(payload).length, 0);
+  assert.ok(bytes < 400 * 400, `stored ${bytes} bytes`);
+  assert.ok(input > 5 * 400 * 400, `input ${input} bytes`);
+});

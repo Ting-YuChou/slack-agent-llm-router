@@ -309,3 +309,131 @@ test("feedback after terminal cleanup keeps ordering without retaining per-run m
   assert.equal(telemetry.sequences.size,0);
   assert.equal(telemetry.versions.size,0);
 });
+
+test("a group commit keeps each group atomic and isolates a group over capacity", async () => {
+  const { TelemetryStore } = await telemetryModule();
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-groups-'));
+  try {
+    const row = (id: string) => outboxRow({ event_id: id, run_id: 'r', kind: 'rpc', topic: 'agent.events.v1', payload: 'x'.repeat(100) });
+    const bytes = Buffer.byteLength(JSON.stringify(row('a')));
+    const store = new TelemetryStore(path.join(root, 'outbox.sqlite'), bytes * 3 + 10);
+    const results = store.appendGroups([[row('a')], [row('b'), row('c'), row('d')], [row('e')]]);
+    assert.equal(results.length, 3);
+    assert.equal(results[0], undefined);
+    assert.match(String(results[1]?.message), /capacity/);
+    assert.equal(results[2], undefined);
+    assert.deepEqual(store.pending().map(r => r.event_id), ['a', 'e']);
+    assert.equal(store.health().depth, 2);
+    assert.equal(store.health().bytes, bytes * 2);
+    assert.deepEqual(store.appendGroups([]), []);
+    assert.deepEqual(store.appendGroups([[], [row('f')]]), [undefined, undefined]);
+    assert.deepEqual(store.pending().map(r => r.event_id), ['a', 'e', 'f']);
+    assert.equal(store.health().bytes, bytes * 3);
+    store.close();
+  }
+  finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+test("a group commit dedupes identities across groups and frees the ids of a rolled-back group", async () => {
+  const { TelemetryStore } = await telemetryModule();
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-group-dedupe-'));
+  try {
+    const rpc = (id: string, size = 10) => outboxRow({ event_id: id, run_id: 'r', kind: 'rpc', topic: 'agent.events.v1', payload: 'x'.repeat(size) });
+    const click = (id: string, verdict: string) => outboxRow({ event_id: id, kind: 'feedback', topic: 'agent.events.v1', run_id: 'r', payload: { verdict } });
+    let store = new TelemetryStore(path.join(root, 'outbox.sqlite'));
+    assert.deepEqual(store.appendGroups([[rpc('same')], [rpc('same'), rpc('other')]]), [undefined, undefined]);
+    assert.deepEqual(store.pending().map(r => r.event_id), ['same', 'other']);
+    store.ack(['same', 'other']);
+    store.append(click('click-a', 'accepted'));
+    store.ack(['click-a']);
+    assert.deepEqual(store.appendGroups([[click('click-b', 'needs_changes')], [click('click-a', 'accepted')], [click('click-b', 'accepted')]]), [undefined, undefined, undefined]);
+    assert.deepEqual(store.pending().map(r => [r.event_id, (r.payload as { verdict: string }).verdict]), [['click-b', 'needs_changes']]);
+    store.close();
+    const small = Buffer.byteLength(JSON.stringify(click('click-c', 'accepted')));
+    store = new TelemetryStore(path.join(root, 'small.sqlite'), small + 500);
+    const results = store.appendGroups([[click('click-c', 'accepted'), rpc('big', 1000)], [click('click-c', 'accepted')], [rpc('big', 1)]]);
+    assert.match(String(results[0]?.message), /capacity/);
+    assert.deepEqual(results.slice(1), [undefined, undefined]);
+    assert.deepEqual(store.pending().map(r => r.event_id), ['click-c', 'big']);
+    assert.equal(store.health().depth, 2);
+    // The later group, not the rolled-back one, left the receipt that blocks a replay after ACK.
+    store.ack(['click-c', 'big']);
+    store.append(click('click-c', 'accepted'));
+    assert.equal(store.pending().length, 0);
+    store.close();
+  }
+  finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+test("a group commit on a closed store throws and leaves the file usable", async () => {
+  const { TelemetryStore } = await telemetryModule();
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-group-closed-'));
+  try {
+    const file = path.join(root, 'outbox.sqlite');
+    const row = (id: string) => outboxRow({ event_id: id, run_id: 'r', kind: 'rpc', topic: 'agent.events.v1', payload: 'x' });
+    let store = new TelemetryStore(file);
+    store.appendGroups([[row('a')]]);
+    store.close();
+    assert.throws(() => store.appendGroups([[row('b')], [row('c')]]));
+    assert.throws(() => store.appendMany([row('b')]));
+    store = new TelemetryStore(file);
+    assert.deepEqual(store.appendGroups([[row('d')]]), [undefined]);
+    assert.deepEqual(store.pending().map(r => r.event_id), ['a', 'd']);
+    assert.equal(store.health().depth, 2);
+    store.close();
+  }
+  finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+test("queued appends drain in order up to the caps without dropping a message", async () => {
+  const { drainAppends } = await telemetryModule();
+  const append = (id: number, records = 1) => ({ op: "append" as const, id, records: Array.from({ length: records }, (_, i) => outboxRow({ event_id: `${id}-${i}` })) });
+  const close = { op: "close" as const, id: "close" };
+  const drain = (messages: Array<ReturnType<typeof append> | typeof close>, ...caps: number[]) => {
+    const queue = messages.slice(1);
+    let receives = 0;
+    const { batch, next } = drainAppends(messages[0] as ReturnType<typeof append>, () => { receives++; return queue.shift(); }, ...caps);
+    // Whatever was pulled is either in the batch or handed back as next.
+    assert.deepEqual([...batch, ...(next ? [next] : []), ...queue], messages);
+    return { ids: batch.map(m => m.id), next, left: queue.length, receives };
+  };
+  assert.deepEqual(drain([append(1)]), { ids: [1], next: undefined, left: 0, receives: 1 });
+  assert.deepEqual(drain([append(1), append(2), append(3), append(4)]), { ids: [1, 2, 3, 4], next: undefined, left: 0, receives: 4 });
+  assert.deepEqual(drain([append(1), append(2), close, append(3)]), { ids: [1, 2], next: close, left: 1, receives: 2 });
+  assert.deepEqual(drain([append(1), close]), { ids: [1], next: close, left: 0, receives: 1 });
+  assert.deepEqual(drain([append(1), append(2), append(3), append(4), append(5), close], 3), { ids: [1, 2, 3], next: undefined, left: 3, receives: 2 });
+  assert.deepEqual(drain([append(1, 2), append(2, 2), append(3, 2), append(4, 2)], 64, 5), { ids: [1, 2, 3], next: undefined, left: 1, receives: 2 });
+  assert.deepEqual(drain([append(1, 5), append(2), close], 64, 5), { ids: [1], next: undefined, left: 2, receives: 0 });
+  assert.deepEqual(drain([append(1), append(2)], 1), { ids: [1], next: undefined, left: 1, receives: 0 });
+  assert.equal(drain(Array.from({ length: 100 }, (_, i) => append(i))).ids.length, 64);
+  assert.equal(drain(Array.from({ length: 100 }, (_, i) => append(i, 10))).ids.length, 26);
+});
+test("records fired at once through the writer all resolve and keep their order", async () => {
+  const { AgentTelemetry, TelemetryStore } = await telemetryModule();
+  const root = await mkdtemp(path.join(tmpdir(), 'agent-group-worker-'));
+  try {
+    const file = path.join(root, 'outbox.sqlite');
+    // No broker listens here; the worker only writes the outbox.
+    const telemetry = new AgentTelemetry({ file, brokers: ['127.0.0.1:1'] });
+    try {
+      const results = await Promise.all(Array.from({ length: 200 }, (_, i) => telemetry.record('r', 's', 'rpc', { i })));
+      assert.deepEqual(results, Array.from({ length: 200 }, () => true));
+      assert.deepEqual(telemetry.completeness('r'), []);
+    }
+    finally {
+      await telemetry.close();
+    }
+    const store = new TelemetryStore(file);
+    const rows = store.pending(1000);
+    store.close();
+    assert.deepEqual(rows.map(r => (r.payload as { i: number }).i), Array.from({ length: 200 }, (_, i) => i));
+    assert.ok(rows.every((r, i) => i === 0 || r.sequence > rows[i - 1].sequence));
+    assert.equal(new Set(rows.map(r => r.event_id)).size, 200);
+  }
+  finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

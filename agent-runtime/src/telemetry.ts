@@ -181,28 +181,49 @@ export class TelemetryStore {
   }
   append(record: AgentEnvelope): void { this.appendMany([record]); }
   appendMany(records: AgentEnvelope[]): void {
-    this.db.exec("BEGIN IMMEDIATE");
+    const [error] = this.appendGroups([records]);
+    if (error) throw error;
+  }
+  /**
+   * One transaction, one fsync, for many independent groups. Each group is all-or-nothing behind a
+   * savepoint: a group that fails is rolled back and reported in its slot, the others still commit.
+   * Throws when the transaction itself fails, which means no group was stored.
+   */
+  appendGroups(groups: AgentEnvelope[][]): Array<Error | undefined> {
+    const results: Array<Error | undefined> = [];
     try {
+      this.db.exec("BEGIN IMMEDIATE");
       this.db.prepare("DELETE FROM feedback_receipts WHERE created < ? AND id NOT IN (SELECT id FROM outbox)").run(Date.now() - 90 * 86400000);
       const insert = this.db.prepare("INSERT OR IGNORE INTO outbox VALUES (?, ?, ?, ?, ?, ?)");
-      for (const record of records) {
-        if (this.db.prepare("SELECT id FROM outbox WHERE id=?").get(record.event_id))
-          continue;
-        if (record.kind === "feedback" && this.db.prepare("SELECT id FROM feedback_receipts WHERE id=?").get(record.event_id))
-          continue;
-        const body = JSON.stringify(record);
-        if (this.health().bytes + Buffer.byteLength(body) > this.maxBytes)
-          throw new Error("outbox_capacity_exceeded");
-        insert.run(record.event_id, record.topic, record.run_id, body, Buffer.byteLength(body), Date.now());
-        if (record.kind === "feedback")
-          this.db.prepare("INSERT INTO feedback_receipts VALUES (?,?)").run(record.event_id, Date.now());
+      for (const records of groups) {
+        this.db.exec("SAVEPOINT g");
+        let failure: Error | undefined;
+        try {
+          for (const record of records) {
+            if (this.db.prepare("SELECT id FROM outbox WHERE id=?").get(record.event_id))
+              continue;
+            if (record.kind === "feedback" && this.db.prepare("SELECT id FROM feedback_receipts WHERE id=?").get(record.event_id))
+              continue;
+            const body = JSON.stringify(record);
+            if (this.health().bytes + Buffer.byteLength(body) > this.maxBytes)
+              throw new Error("outbox_capacity_exceeded");
+            insert.run(record.event_id, record.topic, record.run_id, body, Buffer.byteLength(body), Date.now());
+            if (record.kind === "feedback")
+              this.db.prepare("INSERT INTO feedback_receipts VALUES (?,?)").run(record.event_id, Date.now());
+          }
+        }
+        catch (error) { failure = error instanceof Error ? error : new Error(String(error)); }
+        // SQLite may already have rolled the whole transaction back; then this throws and every group failed.
+        this.db.exec(failure ? "ROLLBACK TO g; RELEASE g" : "RELEASE g");
+        results.push(failure);
       }
       this.db.exec("COMMIT");
     }
     catch (error) {
-      this.db.exec("ROLLBACK");
+      try { this.db.exec("ROLLBACK"); } catch { /* nothing open: BEGIN failed, or SQLite rolled back itself */ }
       throw error;
     }
+    return results;
   }
   pending(limit = 100): AgentEnvelope[] {
     return (this.db.prepare("SELECT body FROM outbox ORDER BY rowid LIMIT ?").all(limit) as Array<{
@@ -236,6 +257,24 @@ export class TelemetryStore {
     return { depth: row.depth, bytes: row.bytes, oldest_age_ms: row.oldest === null ? 0 : Date.now() - row.oldest, capacity_bytes: this.maxBytes };
   }
   close(): void { this.db.close(); }
+}
+export interface AppendMessage { op: "append"; id: unknown; records: AgentEnvelope[] }
+/**
+ * Collects the appends already queued behind `first` so the writer commits them together.
+ * A pulled message cannot be put back, so the caps are checked before each receive():
+ * the first message that is not an append is returned as `next` for the caller to handle.
+ */
+export function drainAppends<Other extends { op: string }>(first: AppendMessage, receive: () => AppendMessage | Other | undefined, maxMessages = 64, maxRecords = 256): { batch: AppendMessage[]; next?: Other } {
+  const batch = [first];
+  let records = first.records.length;
+  while (batch.length < maxMessages && records < maxRecords) {
+    const message = receive();
+    if (!message) break;
+    if (message.op !== "append") return { batch, next: message as Other };
+    batch.push(message as AppendMessage);
+    records += (message as AppendMessage).records.length;
+  }
+  return { batch };
 }
 export async function publishOutbox(store: TelemetryStore, producer: {
   send: (request: {

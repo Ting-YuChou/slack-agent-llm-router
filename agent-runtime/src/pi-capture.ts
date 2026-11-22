@@ -10,6 +10,16 @@ export function newSessionEntries(entries: unknown[], baseline: Set<string>): Re
   const seen = new Set(baseline);
   return entries.map(record).filter(entry => typeof entry.id === "string" && !seen.has(entry.id) && Boolean(seen.add(entry.id)));
 }
+const plain = (value: unknown): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value);
+// A message_update arrives per streamed delta and carries the whole message so far twice.
+// Store the delta only; message_end and the session entry keep the full content. Never mutates the input.
+export function compactRpc(value: Record<string, unknown>): Record<string, unknown> {
+  if (value.type !== "message_update") return value;
+  const compact = { ...value };
+  if (plain(value.message)) { const { content: _content, ...message } = value.message; compact.message = message; }
+  if (plain(value.assistantMessageEvent)) { const { partial: _partial, ...event } = value.assistantMessageEvent; compact.assistantMessageEvent = event; }
+  return compact;
+}
 export function isPiBashPath(value: unknown): value is string { return typeof value === "string" && /^\/tmp\/pi-bash-[a-f0-9]{16}\.log$/.test(value); }
 // Open with O_NOFOLLOW, then validate the open descriptor. Never copy a model-supplied arbitrary file.
 export const bashReadScript = `const fs=require('node:fs'); const p=process.argv[1];
@@ -76,7 +86,7 @@ export class PiRunCapture {
   onCommand(value: Record<string, unknown>): void { if (this.stopped) return; this.enqueue("rpc_command", value); }
   onRecord(value: Record<string, unknown>): void {
     if (this.stopped) return;
-    this.enqueue("rpc", value);
+    this.enqueue("rpc", compactRpc(value));
     if (value.type === "tool_execution_start" && typeof value.toolCallId === "string" && typeof record(value.args).command === "string")
       this.commands.set(value.toolCallId, record(value.args).command);
     const walk = (v: unknown, depth = 0): void => {
