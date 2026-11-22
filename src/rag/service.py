@@ -595,7 +595,8 @@ class RagService:
                 resolved_storage_ref = ref.uri
                 resolved_source = ref.to_dict()
             else:
-                resolved_storage_ref = self.stage_document_content(
+                resolved_storage_ref = await asyncio.to_thread(
+                    self.stage_document_content,
                     content,
                     filename=filename,
                     knowledge_base_id=resolved_kb_id,
@@ -859,7 +860,9 @@ class RagService:
                         RagObjectRef.from_dict(job.source)
                     )
                 else:
-                    content = self.load_staged_content(storage_ref or job.storage_ref)
+                    content = await asyncio.to_thread(
+                        self.load_staged_content, storage_ref or job.storage_ref
+                    )
             parsed = await asyncio.to_thread(
                 self.parser.parse_bytes,
                 content=content,
@@ -887,7 +890,7 @@ class RagService:
                 document_id=document_id,
                 index_version=job.index_version,
             )
-            chunks = self.chunker.chunk(parsed)
+            chunks = await asyncio.to_thread(self.chunker.chunk, parsed)
             if not chunks:
                 raise ValueError("Document parsing produced no indexable text chunks")
             embeddings, warnings = await self._embed_chunks(chunks)
@@ -2476,7 +2479,7 @@ class RagService:
                 new_status=job.status,
             )
             setattr(job, "_persisted_status", job.status)
-            self._update_staging_manifest(job)
+            await self._update_staging_manifest(job)
             return
         job_ttl = self._job_retention_ttl(job.status)
         await client.setex(
@@ -2490,18 +2493,25 @@ class RagService:
             new_status=job.status,
         )
         setattr(job, "_persisted_status", job.status)
-        self._update_staging_manifest(job)
+        await self._update_staging_manifest(job)
 
     def _job_retention_ttl(self, status: str) -> int:
         if status in {"completed", "completed_with_warnings"}:
             return int(self.storage_config.get("completed_file_ttl_seconds", 86400))
         return max(self.job_ttl_seconds, self.failed_file_ttl_seconds)
 
-    def _update_staging_manifest(self, job: IngestionJob) -> None:
+    async def _update_staging_manifest(self, job: IngestionJob) -> None:
         if not job.storage_ref or self._staging_store is None:
             return
         try:
-            self._staging_store.update_status(job.storage_ref, job.status)
+            # The staged job id names the manifest, which saves a scan of
+            # every manifest in the staging directory on each job save.
+            await asyncio.to_thread(
+                self._staging_store.update_status,
+                job.storage_ref,
+                job.status,
+                _safe_path_component(job.job_id),
+            )
         except FileNotFoundError:
             logger.debug("No staging manifest for job %s", job.job_id)
 
@@ -2574,10 +2584,24 @@ class RagService:
         )
         size = 0
         published = False
+        store = self._staging_store
+
+        def reserve_and_write(staged_file: Any, chunk: bytes) -> None:
+            store.reserve(resolved_job_id, len(chunk))
+            staged_file.write(chunk)
+
+        begin_task = asyncio.create_task(
+            asyncio.to_thread(store.begin, resolved_job_id, safe_filename)
+        )
         try:
-            temporary, target = self._staging_store.begin(
-                resolved_job_id, safe_filename
-            )
+            temporary, target = await asyncio.shield(begin_task)
+        except asyncio.CancelledError:
+            # The thread keeps running; wait for it so a manifest and lease
+            # it creates are not left behind.
+            await asyncio.wait({begin_task})
+            if begin_task.exception() is None:
+                store.rollback(resolved_job_id)
+            raise
         except StagingCapacityError as exc:
             raise RagStorageCapacityError(str(exc)) from exc
         try:
@@ -2591,11 +2615,19 @@ class RagService:
                         raise RagPayloadTooLarge(
                             "Multipart document exceeds the configured RAG upload limit"
                         )
+                    write_task = asyncio.create_task(
+                        asyncio.to_thread(reserve_and_write, staged_file, chunk)
+                    )
                     try:
-                        self._staging_store.reserve(resolved_job_id, len(chunk))
+                        await asyncio.shield(write_task)
+                    except asyncio.CancelledError:
+                        # Let the thread finish before the rollback below
+                        # closes the file and removes the manifest under it.
+                        await asyncio.wait({write_task})
+                        write_task.exception()
+                        raise
                     except StagingCapacityError as exc:
                         raise RagStorageCapacityError(str(exc)) from exc
-                    await asyncio.to_thread(staged_file.write, chunk)
                 await asyncio.to_thread(staged_file.flush)
                 await asyncio.to_thread(os.fsync, staged_file.fileno())
             publish_task = asyncio.create_task(

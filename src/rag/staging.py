@@ -8,7 +8,7 @@ import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator
+from typing import Any, Callable, Dict, Iterator, Optional
 
 from src.utils.metrics import RAG_METRICS
 
@@ -96,21 +96,27 @@ class RagStagingStore:
         except (FileNotFoundError, ValueError, TypeError):
             return dict(default)
 
-    def _atomic_json(self, path: Path, payload: Dict[str, Any]) -> None:
+    def _atomic_json(
+        self, path: Path, payload: Dict[str, Any], durable: bool = True
+    ) -> None:
         temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         with temporary.open("w", encoding="utf-8") as output:
             json.dump(payload, output, sort_keys=True)
             output.flush()
-            os.fsync(output.fileno())
+            if durable:
+                os.fsync(output.fileno())
         os.replace(temporary, path)
 
     def _usage_unlocked(self) -> int:
         return int(self._read_json(self._ledger_path, {"bytes": 0}).get("bytes", 0))
 
     def _set_usage_unlocked(self, value: int) -> None:
+        # The ledger is a cache of the manifests: reconcile() rebuilds it at
+        # startup, so losing the last write in a crash costs nothing.
         self._atomic_json(
             self._ledger_path,
             {"bytes": max(0, int(value)), "updated_at": self._clock()},
+            durable=False,
         )
         RAG_METRICS.staged_bytes.set(max(0, int(value)))
 
@@ -205,19 +211,31 @@ class RagStagingStore:
             raise
 
     def _manifest_for_storage_ref(
-        self, storage_ref: str
+        self, storage_ref: str, job_id: Optional[str] = None
     ) -> tuple[Path, Dict[str, Any]]:
         resolved = str(Path(storage_ref).resolve())
+        # job_id is only a hint for skipping the directory scan; the manifest
+        # it names is used only if it really describes this file.
+        if job_id and Path(job_id).name == job_id:
+            manifest_path = self._manifest_path(job_id)
+            manifest = self._read_json(manifest_path, {})
+            data_path = manifest.get("data_path")
+            if data_path and str(Path(data_path).resolve()) == resolved:
+                return manifest_path, manifest
         for manifest_path in self.root.glob("*.manifest.json"):
             manifest = self._read_json(manifest_path, {})
             if str(Path(manifest.get("data_path", "")).resolve()) == resolved:
                 return manifest_path, manifest
         raise FileNotFoundError(f"No staging manifest for {storage_ref}")
 
-    def update_status(self, storage_ref: str, status: str) -> None:
+    def update_status(
+        self, storage_ref: str, status: str, job_id: Optional[str] = None
+    ) -> None:
         self.ensure_reconciled()
         with self._locked():
-            manifest_path, manifest = self._manifest_for_storage_ref(storage_ref)
+            manifest_path, manifest = self._manifest_for_storage_ref(
+                storage_ref, job_id
+            )
             now = self._clock()
             if status in {"completed", "completed_with_warnings"}:
                 ttl = self.completed_ttl
@@ -230,8 +248,10 @@ class RagStagingStore:
             )
             self._atomic_json(manifest_path, manifest)
 
-    def refresh_lease(self, storage_ref: str, status: str) -> None:
-        self.update_status(storage_ref, status)
+    def refresh_lease(
+        self, storage_ref: str, status: str, job_id: Optional[str] = None
+    ) -> None:
+        self.update_status(storage_ref, status, job_id)
 
     def delete(self, storage_ref: str) -> None:
         with self._locked():
