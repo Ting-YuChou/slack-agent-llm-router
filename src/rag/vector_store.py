@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from src.memory import tokenize
+from src.rag.keywords import keyword_terms
 from src.rag.chunker import DocumentChunk
 from src.utils.metrics import RAG_METRICS
 
@@ -23,6 +24,10 @@ logger = logging.getLogger(__name__)
 # Until the layout audit left document metadata it was copied into every
 # chunk, with the text of each excluded block. It is never stored or returned.
 LAYOUT_AUDIT_METADATA_KEY = "layout_normalization_audit"
+# TEXT field holding a chunk's keyword terms, already split by us. RediSearch
+# only breaks ``text`` on spaces and ASCII punctuation: it cannot split CJK
+# text, and it joins the words on either side of a line break into one term.
+KEYWORD_TERMS_FIELD = "keyword_terms"
 
 SIDECAR_METADATA_KEYS = {
     "figure_sidecar",
@@ -335,7 +340,7 @@ class InMemoryRagVectorStore:
         min_score: float,
         deadline_seconds: Optional[float] = None,  # in-process: nothing to cut off
     ) -> List[RagSearchResult]:
-        tokens = tokenize(query)
+        tokens = keyword_terms(query)
         allowed_kbs = set(knowledge_base_ids or [])
         searchable_items = [
             (storage_id, item)
@@ -417,6 +422,9 @@ class RedisStackRagVectorStore:
         self.staging_ttl_seconds = max(
             1, int(self.indexing_config.get("staging_ttl_seconds", 86400))
         )
+        # Set once the index is known to have the terms field; until then a
+        # query naming it could fail the whole keyword branch.
+        self._keyword_terms_ready = False
 
     async def initialize(self):
         import redis.asyncio as redis_asyncio
@@ -449,10 +457,12 @@ class RedisStackRagVectorStore:
 
     async def _ensure_index(self):
         try:
-            await self.client.execute_command("FT.INFO", self.index_name)
-            return
+            info = await self.client.execute_command("FT.INFO", self.index_name)
         except Exception:
-            pass
+            info = None
+        if info is not None:
+            await self._ensure_keyword_terms_field(info)
+            return
 
         try:
             await self.client.execute_command(
@@ -476,6 +486,9 @@ class RedisStackRagVectorStore:
                 "TEXT",
                 "keywords",
                 "TAG",
+                KEYWORD_TERMS_FIELD,
+                "TEXT",
+                "NOSTEM",
                 "block_types",
                 "TAG",
                 "page_start",
@@ -503,6 +516,43 @@ class RedisStackRagVectorStore:
             raise RuntimeError(
                 "RAG Redis backend requires Redis Stack RediSearch/vector support"
             ) from exc
+        self._keyword_terms_ready = True
+
+    async def _ensure_keyword_terms_field(self, info: Any) -> None:
+        """Add the terms field to an index created before it existed.
+
+        Chunks gain the field as their documents are ingested again; until
+        then they are matched through ``text`` alone, as before.
+        """
+        if _index_has_field(info, KEYWORD_TERMS_FIELD):
+            self._keyword_terms_ready = True
+            return
+        try:
+            await self.client.execute_command(
+                "FT.ALTER",
+                self.index_name,
+                "SCHEMA",
+                "ADD",
+                KEYWORD_TERMS_FIELD,
+                "TEXT",
+                "NOSTEM",
+            )
+        except Exception as exc:
+            # Another worker starting at the same time may have added it.
+            try:
+                info = await self.client.execute_command("FT.INFO", self.index_name)
+            except Exception:
+                info = None
+            if not _index_has_field(info, KEYWORD_TERMS_FIELD):
+                logger.warning(
+                    "Could not add %s to RAG index %s; "
+                    "keyword search uses text only: %s",
+                    KEYWORD_TERMS_FIELD,
+                    self.index_name,
+                    exc,
+                )
+                return
+        self._keyword_terms_ready = True
 
     async def upsert_chunks(
         self,
@@ -764,6 +814,12 @@ class RedisStackRagVectorStore:
             "created_at": updated_at,
             "updated_at": updated_at,
         }
+        terms = keyword_terms(chunk.text)
+        if terms:
+            # Escaped so RediSearch keeps "10:30" or "v1.2" as one term.
+            mapping[KEYWORD_TERMS_FIELD] = " ".join(
+                _escape_text_token(term) for term in terms
+            )
         if embedding:
             if len(embedding) != self.dimensions:
                 raise ValueError("Embedding dimensions do not match RAG index")
@@ -947,17 +1003,28 @@ class RedisStackRagVectorStore:
         self, query: str, knowledge_base_ids: Sequence[str], limit: int
     ) -> List[RagSearchResult]:
         tokens = tokenize(query)
-        if not self.client or not tokens:
+        terms = keyword_terms(query) if self._keyword_terms_ready else []
+        if not self.client or not (tokens or terms):
             return []
         filter_query = self._filter_query(knowledge_base_ids)
-        text_query = "|".join(_escape_text_token(token) for token in tokens)
+        clauses = []
+        if tokens:
+            text_query = "|".join(_escape_text_token(token) for token in tokens)
+            clauses.append(f"@text:({text_query})")
+        if terms:
+            terms_query = "|".join(_escape_text_token(term) for term in terms)
+            clauses.append(f"@{KEYWORD_TERMS_FIELD}:({terms_query})")
+        if len(clauses) == 1:
+            match_query, filtered_match = clauses[0], clauses[0]
+        else:
+            match_query = " | ".join(f"({clause})" for clause in clauses)
+            filtered_match = f"({match_query})"
         redis_query = (
-            f"{filter_query} @text:({text_query})"
-            if filter_query != "*"
-            else f"@text:({text_query})"
+            f"{filter_query} {filtered_match}" if filter_query != "*" else match_query
         )
         results = await self._keyword_text_search(redis_query, limit)
-        if results:
+        if results or not tokens:
+            # The tag fallback holds ASCII tokens only.
             return results
 
         token_query = "|".join(_escape_tag(token) for token in tokens)
@@ -1552,6 +1619,26 @@ class RedisStackRagVectorStore:
         )
 
 
+def _index_has_field(info: Any, name: str) -> bool:
+    """Whether an FT.INFO reply lists ``name`` among the index attributes."""
+
+    def walk(value: Any) -> bool:
+        if isinstance(value, dict):
+            return walk(list(value.keys())) or walk(list(value.values()))
+        if isinstance(value, (list, tuple)):
+            return any(walk(item) for item in value)
+        return isinstance(value, (bytes, str)) and _decode(value) == name
+
+    if isinstance(info, dict):
+        attributes = info.get("attributes", info.get(b"attributes"))
+        return walk(attributes) if attributes is not None else False
+    if isinstance(info, (list, tuple)):
+        for key, value in zip(info[::2], info[1::2]):
+            if isinstance(key, (bytes, str)) and _decode(key) == "attributes":
+                return walk(value)
+    return False
+
+
 def build_vector_store(config: Dict[str, Any]):
     backend = str(config.get("backend", "redis_stack")).lower()
     if backend == "memory":
@@ -1593,7 +1680,7 @@ def _bm25_scores(
 ) -> Dict[str, float]:
     if not query_tokens or not documents:
         return {}
-    tokenized_documents = [(doc_id, tokenize(text)) for doc_id, text in documents]
+    tokenized_documents = [(doc_id, keyword_terms(text)) for doc_id, text in documents]
     document_count = len(tokenized_documents)
     lengths = [len(tokens) for _doc_id, tokens in tokenized_documents]
     avg_length = sum(lengths) / document_count if document_count else 0.0

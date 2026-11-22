@@ -1377,8 +1377,8 @@ class RagParserConfig(ConfigModel):
 
 class RagChunkingConfig(ConfigModel):
     strategy: str = "hybrid"
-    chunk_size_tokens: int = Field(900, ge=100, le=4000)
-    chunk_overlap_tokens: int = Field(120, ge=0, le=1000)
+    chunk_size_tokens: int = Field(300, ge=100, le=4000)
+    chunk_overlap_tokens: int = Field(40, ge=0, le=1000)
     repeat_table_headers: bool = True
     max_chunk_chars: int = Field(6000, ge=500)
 
@@ -1431,7 +1431,7 @@ class RagRetrievalConfig(ConfigModel):
     keyword_weight: float = Field(0.35, ge=0.0)
     vector_weight: float = Field(0.6, ge=0.0)
     recency_weight: float = Field(0.05, ge=0.0)
-    max_context_chars: int = Field(6000, ge=500)
+    max_context_chars: int = Field(12000, ge=500)
     max_concurrent_branches: int = Field(3, ge=1, le=3)
     deadline_seconds: float = Field(30.0, gt=0.0, le=300.0)
 

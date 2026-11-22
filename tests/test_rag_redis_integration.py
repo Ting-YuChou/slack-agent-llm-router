@@ -665,3 +665,141 @@ async def test_v1_and_v2_search_indexes_have_disjoint_key_roots():
             except Exception:
                 pass
         await client.aclose()
+
+
+def _keyword_only(store, query, knowledge_base_ids=("school",)):
+    return store.search(
+        query,
+        None,
+        knowledge_base_ids=list(knowledge_base_ids),
+        limit=5,
+        candidate_count=10,
+        keyword_weight=1.0,
+        vector_weight=0.0,
+        recency_weight=0.0,
+        min_score=0.01,
+    )
+
+
+def _isolated_store(key_prefix: str) -> RedisStackRagVectorStore:
+    return RedisStackRagVectorStore(
+        {
+            "backend": "redis_stack",
+            "embedding": {"dimensions": 4},
+            "redis": {
+                "host": os.getenv("RAG_REDIS_HOST", "localhost"),
+                "port": int(os.getenv("RAG_REDIS_PORT", "6380")),
+                "db": int(os.getenv("RAG_REDIS_DB", "0")),
+                "key_prefix": key_prefix,
+            },
+        }
+    )
+
+
+async def _drop_isolated_store(store: RedisStackRagVectorStore, key_prefix: str):
+    if not store.client:
+        return
+    try:
+        await store.client.execute_command("FT.DROPINDEX", store.index_name)
+    except Exception:
+        pass
+    keys = [key async for key in store.client.scan_iter(match=f"{key_prefix}:*")]
+    if keys:
+        await store.client.delete(*keys)
+    await store.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_redis_keyword_search_matches_chinese_and_mixed_queries():
+    probe = await _redis_stack_client_or_skip()
+    await probe.aclose()
+    key_prefix = f"ragtest:{uuid.uuid4().hex}"
+    store = _isolated_store(key_prefix)
+
+    try:
+        await store.initialize()
+        for chunk in (
+            _chunk("deadline", "doc-1", "網路加退選截止日為九月十九日下午五時。"),
+            _chunk("dorm", "doc-2", "宿舍門禁時間為晚上十一時三十分。"),
+            _chunk("course", "doc-3", "CS3205 作業系統 期末考佔百分之四十"),
+            _chunk("english", "doc-4", "Tuition payment is due on May 1."),
+            # A heading and the paragraph under it, joined by a blank line.
+            _chunk("physics", "doc-5", "Physics\n\nPHYS1150 meets at 10:30"),
+        ):
+            await store.upsert_chunks([chunk], [None], knowledge_base_id="school")
+
+        chinese = await _keyword_only(store, "加退選截止日是哪一天")
+        mixed = await _keyword_only(store, "CS3205 門禁")
+        english = await _keyword_only(store, "tuition payment")
+        after_break = await _keyword_only(store, "PHYS1150")
+        before_break = await _keyword_only(store, "physics")
+        punctuated = await _keyword_only(store, "10:30")
+
+        assert [result.chunk.chunk_id for result in chinese] == ["deadline"]
+        assert chinese[0].match_source == "keyword"
+        assert chinese[0].score == pytest.approx(1.0)
+        assert {result.chunk.chunk_id for result in mixed} == {"course", "dorm"}
+        assert [result.chunk.chunk_id for result in english] == ["english"]
+        assert [result.chunk.chunk_id for result in after_break] == ["physics"]
+        assert [result.chunk.chunk_id for result in before_break] == ["physics"]
+        assert [result.chunk.chunk_id for result in punctuated] == ["physics"]
+    finally:
+        await _drop_isolated_store(store, key_prefix)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_redis_index_from_before_the_terms_field_gains_it_at_startup():
+    probe = await _redis_stack_client_or_skip()
+    key_prefix = f"ragtest:{uuid.uuid4().hex}"
+    store = _isolated_store(key_prefix)
+    await probe.execute_command(
+        "FT.CREATE",
+        store.index_name,
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        store._chunk_prefix(),
+        "SCHEMA",
+        "knowledge_base_id",
+        "TAG",
+        "document_id",
+        "TAG",
+        "chunk_id",
+        "TAG",
+        "index_version",
+        "TAG",
+        "text",
+        "TEXT",
+        "keywords",
+        "TAG",
+        "embedding",
+        "VECTOR",
+        "HNSW",
+        "6",
+        "TYPE",
+        "FLOAT32",
+        "DIM",
+        "4",
+        "DISTANCE_METRIC",
+        "COSINE",
+    )
+    await probe.aclose()
+
+    try:
+        await store.initialize()
+        info = await store.client.execute_command("FT.INFO", store.index_name)
+        await store.upsert_chunks(
+            [_chunk("deadline", "doc-1", "網路加退選截止日為九月十九日下午五時。")],
+            [None],
+            knowledge_base_id="school",
+        )
+
+        results = await _keyword_only(store, "加退選截止日")
+
+        assert b"keyword_terms" in repr(info).encode()
+        assert [result.chunk.chunk_id for result in results] == ["deadline"]
+    finally:
+        await _drop_isolated_store(store, key_prefix)
