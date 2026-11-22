@@ -352,7 +352,13 @@ print("ok")
 def test_real_docling_accepts_the_built_options():
     # conftest.py replaces torch with a stub that the real Docling cannot
     # import against, so the installed package is exercised in a clean process.
-    if importlib.util.find_spec("docling.document_converter") is None:
+    # Asking for a submodule would import the package and raise when it is
+    # absent, so look for the package itself.
+    try:
+        installed = importlib.util.find_spec("docling") is not None
+    except (ImportError, ValueError):
+        installed = False
+    if not installed:
         pytest.skip("docling is not installed")
     completed = subprocess.run(
         [sys.executable, "-c", _REAL_DOCLING_CHECK],
