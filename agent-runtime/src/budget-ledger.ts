@@ -43,6 +43,18 @@ export class BudgetLedger {
       this.db.prepare("INSERT INTO reservations(id,workflow,reserved) VALUES(?,?,?)").run(id,workflow,amount); this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
+  /**
+   * How many of `wanted` requests the size of this workflow's latest reservation the budget has room for at once: at least 1.
+   * Reads only; a caller that starts that many may still see one refused, and must cope.
+   */
+  concurrentRoom(workflow: string, wanted: number): number {
+    const budget = this.db.prepare("SELECT limit_usd,initial_usd,active FROM budgets WHERE id=?").get(workflow);
+    const last = this.db.prepare("SELECT reserved FROM reservations WHERE workflow=? ORDER BY rowid DESC LIMIT 1").get(workflow);
+    if (!budget || !budget.active || !last || !(Number(last.reserved) > 0)) return 1;
+    const total = this.db.prepare("SELECT COALESCE(SUM(COALESCE(actual,reserved)),0) total FROM reservations WHERE workflow=?").get(workflow)!;
+    const room = Math.floor((Number(budget.limit_usd) - Number(budget.initial_usd) - Number(total.total)) / Number(last.reserved));
+    return Math.max(1, Math.min(wanted, room));
+  }
   settle(id: string, amount: number | null) {
     if (amount === null) return;
     if (!Number.isFinite(amount) || amount < 0) throw new Error("Invalid usage");

@@ -198,3 +198,9 @@ test("an abort or exhausted budget during a later sample stops grading instead o
   await assert.rejects(make(() => { controller.abort(); throw new Error("grader_aborted"); }).evaluate(input));
   assert.equal(executions, 2);
 });
+
+test("a profile carries parallel sampling only when it asks for it", () => {
+  assert.deepEqual(validateProfile({ ...base, grader: { samples: 3, parallel: true } }).grader, { samples: 3, aggregate: "unanimous", parallel: true });
+  assert.deepEqual(validateProfile({ ...base, grader: { samples: 3, parallel: false } }).grader, { samples: 3, aggregate: "unanimous" });
+  for (const parallel of ["yes", 1, null]) assert.throws(() => validateProfile({ ...base, grader: { samples: 3, parallel } }), /Invalid grader sampling/, JSON.stringify(parallel));
+});
