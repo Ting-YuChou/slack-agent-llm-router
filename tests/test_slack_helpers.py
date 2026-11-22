@@ -4486,3 +4486,51 @@ async def test_shortcut_in_a_discuss_thread_preselects_discuss():
     modal = bot.web_client.views_open.await_args.kwargs["view"]
     mode = next(b for b in modal["blocks"] if b.get("block_id") == "agent_mode")
     assert mode["element"]["initial_option"]["value"] == "discuss"
+
+
+# SG3: a top-level agent start has no earlier thread messages to read
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "channel",
+    [
+        {"is_channel": True, "is_private": False},
+        {"is_channel": True, "is_private": True},
+    ],
+    ids=["public", "private"],
+)
+async def test_top_level_inline_agent_command_reads_no_thread(channel):
+    runtime = SimpleNamespace(
+        create_session=AsyncMock(
+            return_value={"session_id": "S1", "run_id": "R1", "status": "starting"}
+        )
+    )
+    bot = SlackBot(
+        {"channels": []}, SimpleNamespace(), services={"agent_runtime": runtime}
+    )
+    bot.web_client = SimpleNamespace(
+        conversations_info=AsyncMock(return_value={"ok": True, "channel": channel})
+    )
+    bot._monitor_agent_run = AsyncMock()
+    bot.agent_bootstrap_builder = SimpleNamespace(
+        build=AsyncMock(return_value=AgentBootstrapContext(prompt="thread context"))
+    )
+    handler = SlackMessageHandler(bot)
+
+    # The handler uses a top-level message's own ts as its thread ts.
+    response = await handler._handle_command(
+        "agent fix the test",
+        "U1",
+        "C1",
+        "100.1",
+        client=SimpleNamespace(),
+        team_id="T1",
+        message_ts="100.1",
+    )
+
+    bot.web_client.conversations_info.assert_not_awaited()
+    bot.agent_bootstrap_builder.build.assert_not_awaited()
+    assert runtime.create_session.await_args.args[4] == "fix the test"
+    assert runtime.create_session.await_args.kwargs["routing_text"] == "fix the test"
+    assert "without prior Slack thread context" not in response

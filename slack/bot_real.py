@@ -302,6 +302,11 @@ class SlackBot(
         self.agent_monitor_poll_seconds = float(
             self.agent_config.get("monitor_poll_seconds", 2)
         )
+        # How long the runtime may hold one events request of the run monitor;
+        # 0 turns long-polling off.
+        self.agent_monitor_long_poll_seconds = float(
+            self.agent_config.get("monitor_long_poll_seconds", 25)
+        )
         self.agent_progress_interval_seconds = float(
             self.agent_config.get("progress_interval_seconds", 10)
         )

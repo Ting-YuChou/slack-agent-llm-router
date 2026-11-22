@@ -240,7 +240,9 @@ class AgentBootstrapBuilder:
         kwargs: Dict[str, Any] = {
             "channel": channel_id,
             "ts": thread_ts,
-            "limit": min(max(max_messages, 1), MAX_THREAD_PAGE_LIMIT),
+            # Slack pages a thread oldest first: full pages reach the newest
+            # messages of a long thread before the page cap does.
+            "limit": MAX_THREAD_PAGE_LIMIT,
         }
         if latest_ts:
             kwargs.update({"latest": latest_ts, "inclusive": False})
@@ -267,6 +269,7 @@ class AgentBootstrapBuilder:
             eligible=eligible,
             max_pages=max_pages,
             send=send,
+            next_page_limit=MAX_THREAD_PAGE_LIMIT,
         )
         if window.stopped_by is not None:
             if isinstance(window.stopped_by, _BudgetExhausted):
