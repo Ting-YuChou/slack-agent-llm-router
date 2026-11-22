@@ -71,6 +71,11 @@ JOB_STATUSES = {
     *TERMINAL_JOB_STATUSES,
 }
 
+_JOB_MGET_CHUNK_SIZE = 500
+# Lives in the batch counts hash next to the per-status deltas, because the
+# manifest JSON is not rewritten on a status change.
+_BATCH_UPDATED_AT_FIELD = "_updated_at"
+
 
 class RagPayloadTooLarge(ValueError):
     """Raised before an oversized RAG upload can enter parsing or indexing."""
@@ -1457,12 +1462,35 @@ class RagService:
         batch = await self._load_batch(batch_id)
         if batch is None:
             return None
+        jobs = await self._get_jobs(batch.job_ids)
+        return batch.to_public_dict(jobs=jobs)
+
+    async def _get_jobs(self, job_ids: Sequence[str]) -> List[IngestionJob]:
+        """get_job for many ids, reading Redis with MGET instead of one GET each."""
+        client = self._job_client()
+        raw_jobs: List[Any] = [None] * len(job_ids)
+        if client:
+            for start in range(0, len(job_ids), _JOB_MGET_CHUNK_SIZE):
+                chunk = job_ids[start : start + _JOB_MGET_CHUNK_SIZE]
+                raw_jobs[start : start + len(chunk)] = await client.mget(
+                    [self._job_key(job_id) for job_id in chunk]
+                )
         jobs = []
-        for job_id in batch.job_ids:
-            job = await self.get_job(job_id)
+        for job_id, raw in zip(job_ids, raw_jobs):
+            job = None
+            if raw:
+                try:
+                    job = IngestionJob.from_dict(json.loads(_decode(raw)))
+                    setattr(job, "_persisted_status", job.status)
+                    self.jobs[job.job_id] = job
+                except Exception:
+                    job = None
+                    logger.warning("Failed to decode RAG ingestion job %s", job_id)
+            if job is None:
+                job = self.jobs.get(job_id)
             if job:
                 jobs.append(job)
-        return batch.to_public_dict(jobs=jobs)
+        return jobs
 
     async def retry_job(self, job_id: str) -> Optional[IngestionJob]:
         job = await self.get_job(job_id)
@@ -2660,33 +2688,55 @@ class RagService:
         return self.retry_backoff_seconds * max(1, attempts)
 
     async def _save_batch(self, batch: IngestionBatch) -> None:
+        """Write the batch manifest; status changes never come through here."""
         self.batches[batch.batch_id] = batch
         client = self._job_client()
         if not client:
             return
-        await client.setex(
+        jobs_key = self._batch_jobs_key(batch.batch_id)
+        pipeline = client.pipeline(transaction=True)
+        pipeline.setex(
             self._batch_key(batch.batch_id),
             self.job_ttl_seconds,
             json.dumps(batch.to_dict(jobs=[]), sort_keys=True),
         )
+        # The manifest's status_counts are the base the counts hash adds to,
+        # so a rewritten manifest starts again from an empty hash.
+        pipeline.delete(self._batch_counts_key(batch.batch_id))
         if batch.job_ids:
-            await client.delete(self._batch_jobs_key(batch.batch_id))
-            for job_id in batch.job_ids:
-                await client.sadd(self._batch_jobs_key(batch.batch_id), job_id)
-            await client.expire(
-                self._batch_jobs_key(batch.batch_id), self.job_ttl_seconds
-            )
+            pipeline.delete(jobs_key)
+            pipeline.sadd(jobs_key, *batch.job_ids)
+            pipeline.expire(jobs_key, self.job_ttl_seconds)
+        await pipeline.execute()
 
     async def _load_batch(self, batch_id: str) -> Optional[IngestionBatch]:
         client = self._job_client()
         if client:
-            raw = await client.get(self._batch_key(batch_id))
+            pipeline = client.pipeline(transaction=True)
+            pipeline.get(self._batch_key(batch_id))
+            pipeline.hgetall(self._batch_counts_key(batch_id))
+            pipeline.smembers(self._batch_jobs_key(batch_id))
+            raw, deltas, job_ids = await pipeline.execute()
             if raw:
                 try:
                     payload = json.loads(_decode(raw))
-                    job_ids = await client.smembers(self._batch_jobs_key(batch_id))
                     if job_ids:
                         payload["job_ids"] = [_decode(job_id) for job_id in job_ids]
+                    fields = {
+                        _decode(field): _decode(value)
+                        for field, value in (deltas or {}).items()
+                    }
+                    updated_at = fields.pop(_BATCH_UPDATED_AT_FIELD, None)
+                    if updated_at:
+                        payload["updated_at"] = updated_at
+                    # Manifests from before the counts hash hold absolute
+                    # counts; new ones hold zeros. Either way the hash is a delta.
+                    counts = dict(payload.get("status_counts") or {})
+                    for status, delta in fields.items():
+                        counts[status] = int(counts.get(status, 0)) + int(delta)
+                    payload["status_counts"] = {
+                        status: max(int(count), 0) for status, count in counts.items()
+                    }
                     return IngestionBatch.from_dict(payload)
                 except Exception:
                     logger.warning("Failed to decode RAG batch %s", batch_id)
@@ -2701,28 +2751,48 @@ class RagService:
     ) -> None:
         if not job.batch_id or previous_status == new_status:
             return
-        batch = await self._load_batch(job.batch_id)
-        if batch is None:
+        now = datetime.now()
+        local = self.batches.get(job.batch_id)
+        if local is not None:
+            if previous_status in JOB_STATUSES:
+                local.status_counts[previous_status] = max(
+                    int(local.status_counts.get(previous_status, 0)) - 1,
+                    0,
+                )
+            if new_status in JOB_STATUSES:
+                local.status_counts[new_status] = (
+                    int(local.status_counts.get(new_status, 0)) + 1
+                )
+            if job.job_id not in local.job_ids:
+                local.job_ids.append(job.job_id)
+            local.updated_at = now
+            self.batches[job.batch_id] = local
+        client = self._job_client()
+        if not client:
             return
+        # Increments in one MULTI/EXEC: concurrent workers cannot overwrite each
+        # other's counts, and the cost no longer grows with the batch.
+        counts_key = self._batch_counts_key(job.batch_id)
+        jobs_key = self._batch_jobs_key(job.batch_id)
+        pipeline = client.pipeline(transaction=True)
         if previous_status in JOB_STATUSES:
-            batch.status_counts[previous_status] = max(
-                int(batch.status_counts.get(previous_status, 0)) - 1,
-                0,
-            )
+            pipeline.hincrby(counts_key, previous_status, -1)
         if new_status in JOB_STATUSES:
-            batch.status_counts[new_status] = (
-                int(batch.status_counts.get(new_status, 0)) + 1
-            )
-        if job.job_id not in batch.job_ids:
-            batch.job_ids.append(job.job_id)
-        batch.updated_at = datetime.now()
-        await self._save_batch(batch)
+            pipeline.hincrby(counts_key, new_status, 1)
+        pipeline.hset(counts_key, _BATCH_UPDATED_AT_FIELD, now.isoformat())
+        pipeline.sadd(jobs_key, job.job_id)
+        for key in (self._batch_key(job.batch_id), counts_key, jobs_key):
+            pipeline.expire(key, self.job_ttl_seconds)
+        await pipeline.execute()
 
     def _batch_key(self, batch_id: str) -> str:
         return self._prefixed_key(f"batch:{batch_id}")
 
     def _batch_jobs_key(self, batch_id: str) -> str:
         return self._prefixed_key(f"batch:{batch_id}:jobs")
+
+    def _batch_counts_key(self, batch_id: str) -> str:
+        return self._prefixed_key(f"batch:{batch_id}:counts")
 
 
 def decode_base64_document(
