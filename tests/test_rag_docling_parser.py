@@ -414,3 +414,70 @@ def test_parser_config_validates_converter_pool_size():
     assert RagParserConfig(converter_pool_size=4).converter_pool_size == 4
     with pytest.raises(ValidationError):
         RagParserConfig(converter_pool_size=0)
+
+
+def _partial(fake_docling, errors=()):
+    result = _FakeResult("Only the first page")
+    result.status = fake_docling.ConversionStatus.PARTIAL_SUCCESS
+    result.errors = list(errors)
+    fake_docling.results = [result]
+
+
+def test_partial_success_with_no_errors_is_a_timeout_when_one_was_set(fake_docling):
+    # What Docling returns when a document short enough to be queued whole
+    # runs out of time: pages are missing and no error names them.
+    _partial(fake_docling)
+
+    with pytest.raises(RuntimeError, match="(?i)timeout.*300"):
+        _parse(DoclingParser({}))
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"timeout_seconds": 0},
+        {"converter_kwargs": {"allowed_formats": ["pdf"]}},
+    ],
+)
+def test_partial_success_with_no_errors_is_kept_when_no_timeout_was_set(
+    fake_docling, config
+):
+    _partial(fake_docling)
+
+    assert _parse(DoclingParser(config)).blocks[0].text == "Only the first page"
+
+
+def test_ocr_languages_warn_when_docling_picks_the_engine_itself(fake_docling, caplog):
+    class OcrAutoOptions:
+        def __init__(self):
+            self.lang = []
+
+    class PdfPipelineOptions(fake_docling.PdfPipelineOptions):
+        def __init__(self):
+            super().__init__()
+            self.ocr_options = OcrAutoOptions()
+
+    sys.modules[
+        "docling.datamodel.pipeline_options"
+    ].PdfPipelineOptions = PdfPipelineOptions
+
+    with caplog.at_level("WARNING", logger="src.rag.parser"):
+        _parse(DoclingParser({"ocr_languages": ["ch_tra"]}))
+        _parse(DoclingParser({"ocr_languages": []}))
+
+    warnings = [
+        r.getMessage() for r in caplog.records if "ocr_languages" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "ch_tra" in warnings[0]
+
+
+def test_service_sizes_the_converter_pool_for_every_consumer():
+    service = _service(
+        {
+            "parser": {"provider": "docling"},
+            "ingestion_queue": {"consumer_count": 4, "concurrency": 2},
+        }
+    )
+
+    assert service.parser.converter_pool_size == 8

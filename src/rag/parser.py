@@ -113,6 +113,8 @@ class DoclingParser(DocumentParser):
         self._idle_converters: "queue.LifoQueue[Any]" = queue.LifoQueue()
         self._options_warning_lock = threading.Lock()
         self._options_warning_logged = False
+        # Whether the converters were built with a document timeout.
+        self._document_timeout: Optional[float] = None
 
     def parse_bytes(
         self,
@@ -317,7 +319,20 @@ class DoclingParser(DocumentParser):
             ]
             if languages:
                 options.ocr_options.lang = languages
-            return {InputFormat.PDF: PdfFormatOption(pipeline_options=options)}
+                if type(options.ocr_options).__name__ == "OcrAutoOptions":
+                    # The automatic engine choice ignores lang; only an
+                    # explicit OCR engine (via converter_kwargs) honours it.
+                    logger.warning(
+                        "rag.parser.ocr_languages=%s has no effect: Docling "
+                        "selects the OCR engine itself and uses that engine's "
+                        "default languages",
+                        languages,
+                    )
+            format_options = {
+                InputFormat.PDF: PdfFormatOption(pipeline_options=options)
+            }
+            self._document_timeout = values.get("document_timeout")
+            return format_options
         except Exception as exc:
             with self._options_warning_lock:
                 already_logged = self._options_warning_logged
@@ -341,10 +356,14 @@ class DoclingParser(DocumentParser):
             str(getattr(error, "error_message", error))
             for error in getattr(result, "errors", None) or []
         ]
-        if not any(
+        timed_out = any(
             "timeout" in message.lower() or "timed out" in message.lower()
             for message in messages
-        ):
+        )
+        # A page Docling could not parse always leaves an error. Pages cut off
+        # by the timeout only do when they were still waiting to be queued, so
+        # a short document that ran out of time has none.
+        if not timed_out and (messages or self._document_timeout is None):
             return
         raise DocumentParseTimeoutError(
             f"Docling stopped parsing {filename} at the document timeout "

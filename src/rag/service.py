@@ -461,10 +461,13 @@ class RagService:
         self._janitor_task: Optional[asyncio.Task] = None
         if parser is None:
             parser_config = dict(self.parser_config)
-            # One Docling converter per ingestion slot keeps parsing as parallel
-            # as the worker pool unless the deployment sizes it explicitly.
+            # One Docling converter per ingestion slot (every consumer runs
+            # `concurrency` jobs) keeps parsing as parallel as the worker
+            # pool unless the deployment sizes it explicitly.
             if parser_config.get("converter_pool_size") is None:
-                parser_config["converter_pool_size"] = self.worker_concurrency
+                parser_config["converter_pool_size"] = (
+                    self.worker_count * self.worker_concurrency
+                )
             parser = build_document_parser(parser_config)
         self.parser = parser
         self.layout_normalizer = DocumentLayoutNormalizer(
