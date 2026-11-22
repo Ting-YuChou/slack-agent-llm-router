@@ -226,3 +226,16 @@ async def test_every_answer_in_the_fixture_reaches_the_index():
 
     lost = [row["id"] for row in report["rows"] if not row["indexed"]]
     assert lost == []
+
+
+@pytest.mark.asyncio
+async def test_exact_term_queries_find_their_answer_in_both_languages():
+    corpus, queries = load_fixture()
+
+    report = await run_eval(corpus, queries)
+
+    summary = report["summary"]
+    assert summary["zh/exact"]["recall"] >= 0.9
+    assert summary["en/exact"]["recall"] >= 0.9
+    assert summary["zh/exact"]["in_context"] >= 0.9
+    assert summary["en/exact"]["in_context"] >= 0.9
