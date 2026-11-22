@@ -3,12 +3,15 @@
 import copy
 import hashlib
 import logging
+import queue
 import tempfile
+import threading
 import uuid
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +92,10 @@ class TextDocumentParser(DocumentParser):
         )
 
 
+class DocumentParseTimeoutError(RuntimeError):
+    """Raised when the parser backend stopped at its document timeout."""
+
+
 class DoclingParser(DocumentParser):
     """Docling-backed PDF parser with a text fallback for non-PDF files."""
 
@@ -97,6 +104,15 @@ class DoclingParser(DocumentParser):
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = dict(config or {})
         self.text_parser = TextDocumentParser()
+        # A converter owns the loaded layout/OCR models, so it is reused across
+        # documents and handed to one conversion at a time.
+        self.converter_pool_size = max(
+            1, int(self.config.get("converter_pool_size") or 1)
+        )
+        self._converter_slots = threading.BoundedSemaphore(self.converter_pool_size)
+        self._idle_converters: "queue.LifoQueue[Any]" = queue.LifoQueue()
+        self._options_warning_lock = threading.Lock()
+        self._options_warning_logged = False
 
     def parse_bytes(
         self,
@@ -128,9 +144,9 @@ class DoclingParser(DocumentParser):
         with tempfile.NamedTemporaryFile(suffix=suffix or ".pdf") as temp_file:
             temp_file.write(content)
             temp_file.flush()
-            result = self._build_converter(DocumentConverter).convert(
-                source=temp_file.name
-            )
+            with self._checked_out_converter(DocumentConverter) as converter:
+                result = converter.convert(source=temp_file.name)
+        self._raise_on_timeout(result, filename)
 
         document = getattr(result, "document", result)
         blocks = self._extract_blocks(document, resolved_doc_id)
@@ -247,11 +263,94 @@ class DoclingParser(DocumentParser):
         blocks.sort(key=lambda block: (block.page, block.reading_order))
         return blocks
 
+    @contextmanager
+    def _checked_out_converter(self, converter_cls: Any) -> Iterator[Any]:
+        self._converter_slots.acquire()
+        try:
+            try:
+                converter = self._idle_converters.get_nowait()
+            except queue.Empty:
+                converter = self._build_converter(converter_cls)
+            try:
+                yield converter
+            finally:
+                self._idle_converters.put(converter)
+        finally:
+            self._converter_slots.release()
+
     def _build_converter(self, converter_cls: Any) -> Any:
         kwargs = dict(self.config.get("converter_kwargs") or {})
         if kwargs:
             return converter_cls(**kwargs)
-        return converter_cls()
+        format_options = self._build_format_options()
+        if format_options is None:
+            return converter_cls()
+        return converter_cls(format_options=format_options)
+
+    def _build_format_options(self) -> Optional[Dict[Any, Any]]:
+        """Map the parser config onto Docling's PDF pipeline options.
+
+        Docling is not version-pinned; a release without these classes or
+        fields gets a default converter instead of a failed ingestion.
+        """
+        try:
+            from docling.datamodel.base_models import InputFormat
+            from docling.datamodel.pipeline_options import PdfPipelineOptions
+            from docling.document_converter import PdfFormatOption
+
+            options = PdfPipelineOptions()
+            values: Dict[str, Any] = {
+                "do_ocr": bool(self.config.get("ocr_enabled", True)),
+                "do_table_structure": bool(
+                    self.config.get("table_structure_enabled", True)
+                ),
+            }
+            timeout_seconds = self.config.get("timeout_seconds", 300)
+            if timeout_seconds:
+                values["document_timeout"] = float(timeout_seconds)
+            for name, value in values.items():
+                if not hasattr(options, name):
+                    raise AttributeError(f"PdfPipelineOptions has no {name}")
+                setattr(options, name, value)
+            languages = [
+                str(language) for language in self.config.get("ocr_languages") or []
+            ]
+            if languages:
+                options.ocr_options.lang = languages
+            return {InputFormat.PDF: PdfFormatOption(pipeline_options=options)}
+        except Exception as exc:
+            with self._options_warning_lock:
+                already_logged = self._options_warning_logged
+                self._options_warning_logged = True
+            if not already_logged:
+                logger.warning(
+                    "Installed Docling does not accept the rag.parser OCR, table "
+                    "and timeout options (%s); using its default converter",
+                    exc,
+                )
+            return None
+
+    def _raise_on_timeout(self, result: Any, filename: str) -> None:
+        """Docling reports a document timeout as PARTIAL_SUCCESS, not an error."""
+        status = getattr(result, "status", None)
+        if status is None:
+            return
+        if str(getattr(status, "name", status)).upper() != "PARTIAL_SUCCESS":
+            return
+        messages = [
+            str(getattr(error, "error_message", error))
+            for error in getattr(result, "errors", None) or []
+        ]
+        if not any(
+            "timeout" in message.lower() or "timed out" in message.lower()
+            for message in messages
+        ):
+            return
+        raise DocumentParseTimeoutError(
+            f"Docling stopped parsing {filename} at the document timeout "
+            f"(rag.parser.timeout_seconds={self.config.get('timeout_seconds', 300)}); "
+            "the partial document was discarded"
+        )
 
 
 def build_document_parser(config: Dict[str, Any]) -> DocumentParser:
