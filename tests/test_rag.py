@@ -116,6 +116,28 @@ class FakeVisualProcessor:
         )
 
 
+class FakeStreamPipeline:
+    """Queues FakeStreamRedis commands and runs them on execute()."""
+
+    def __init__(self, client):
+        self._client = client
+        self._queued = []
+
+    def __getattr__(self, name):
+        def queue(*args, **kwargs):
+            self._queued.append((name, args, kwargs))
+            return self
+
+        return queue
+
+    async def execute(self):
+        queued, self._queued = self._queued, []
+        return [
+            await getattr(self._client, name)(*args, **kwargs)
+            for name, args, kwargs in queued
+        ]
+
+
 class FakeStreamRedis:
     def __init__(self):
         self.values = {}
@@ -146,12 +168,30 @@ class FakeStreamRedis:
         self.values.pop(key, None)
         self.sets.pop(key, None)
 
-    async def sadd(self, key, member):
-        self.sets.setdefault(key, set()).add(member)
+    async def sadd(self, key, *members):
+        self.sets.setdefault(key, set()).update(members)
 
     async def expire(self, key, ttl):
         self.expirations[key] = ttl
         return True
+
+    async def mget(self, keys):
+        return [self.values.get(key) for key in keys]
+
+    async def hincrby(self, key, field, amount=1):
+        counts = self.values.setdefault(key, {})
+        counts[field] = int(counts.get(field, 0)) + int(amount)
+        return counts[field]
+
+    async def hset(self, key, field, value):
+        self.values.setdefault(key, {})[field] = value
+        return 1
+
+    async def hgetall(self, key):
+        return dict(self.values.get(key, {}))
+
+    def pipeline(self, transaction=True):
+        return FakeStreamPipeline(self)
 
     async def eval(self, script, _numkeys, key, token, *args):
         if "INCR" in script:

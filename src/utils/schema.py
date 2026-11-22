@@ -1365,6 +1365,7 @@ class RagParserConfig(ConfigModel):
     ocr_languages: List[str] = Field(default_factory=list)
     table_structure_enabled: bool = True
     converter_kwargs: Dict[str, Any] = Field(default_factory=dict)
+    converter_pool_size: Optional[int] = Field(None, ge=1)
 
     @field_validator("provider")
     @classmethod
