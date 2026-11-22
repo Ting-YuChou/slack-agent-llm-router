@@ -1,11 +1,37 @@
 """Structure-aware chunking for parsed school documents."""
 
 import hashlib
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List
 
 from src.rag.parser import DocumentBlock, ParsedDocument
 from src.rag.visual import compose_figure_text
+
+
+_CJK = "\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff"
+_CJK_RE = re.compile(f"[{_CJK}]")
+# One unit per CJK character and one per run of anything else between spaces,
+# so text without spaces is not counted as a single word.
+_UNIT_RE = re.compile(f"[{_CJK}]|[^\\s{_CJK}]+")
+_SENTENCE_END_RE = re.compile(r"[。！？；!?;]+[」』”’）)\]]*\s*|\.[\"')\]]*\s+|\n+")
+
+
+def estimate_tokens(text: str) -> int:
+    """Approximate token count; equals ``len(text.split())`` without CJK."""
+    return len(_UNIT_RE.findall(text or ""))
+
+
+def split_sentences(text: str) -> List[str]:
+    """Cut after sentence punctuation and line breaks; the pieces rejoin to text."""
+    sentences = []
+    start = 0
+    for match in _SENTENCE_END_RE.finditer(text):
+        sentences.append(text[start : match.end()])
+        start = match.end()
+    if start < len(text):
+        sentences.append(text[start:])
+    return [sentence for sentence in sentences if sentence.strip()]
 
 
 @dataclass
@@ -35,12 +61,18 @@ class StructureAwareChunker:
         self.chunk_size_tokens = int(self.config.get("chunk_size_tokens", 900))
         self.chunk_overlap_tokens = int(self.config.get("chunk_overlap_tokens", 120))
         self.max_chunk_chars = int(self.config.get("max_chunk_chars", 6000))
+        # More overlap than half a chunk makes every chunk mostly repetition
+        # (and a step of one word when it reaches the chunk size).
+        self._overlap_tokens = max(
+            0, min(self.chunk_overlap_tokens, self.chunk_size_tokens // 2)
+        )
 
     def chunk(self, document: ParsedDocument) -> List[DocumentChunk]:
         chunks: List[DocumentChunk] = []
         current_blocks: List[DocumentBlock] = []
         current_section: List[str] = []
         current_tokens = 0
+        current_chars = 0
 
         for block in sorted(
             document.blocks, key=lambda item: (item.page, item.reading_order)
@@ -55,9 +87,12 @@ class StructureAwareChunker:
                     )
                     current_blocks = []
                     current_tokens = 0
+                    current_chars = 0
                 current_section = self._next_section_path(current_section, block.text)
 
             block_tokens = self._estimate_tokens(block.text)
+            # Blocks are joined by a blank line.
+            block_chars = len(block.text.strip()) + 2
             if block.block_type in self.STANDALONE_BLOCK_TYPES:
                 if current_blocks:
                     chunks.append(
@@ -65,6 +100,7 @@ class StructureAwareChunker:
                     )
                     current_blocks = []
                     current_tokens = 0
+                    current_chars = 0
                 table_chunks = self._build_table_chunks(
                     document, block, current_section
                 )
@@ -81,29 +117,41 @@ class StructureAwareChunker:
                 continue
 
             if (
-                current_blocks
-                and current_tokens + block_tokens > self.chunk_size_tokens
+                block_tokens > self.chunk_size_tokens
+                or block_chars > self.max_chunk_chars
             ):
-                chunks.append(
-                    self._build_chunk(document, current_blocks, current_section)
-                )
-                current_blocks = self._overlap_tail(current_blocks)
-                current_tokens = sum(
-                    self._estimate_tokens(item.text) for item in current_blocks
-                )
-
-            if block_tokens > self.chunk_size_tokens:
                 if current_blocks:
                     chunks.append(
                         self._build_chunk(document, current_blocks, current_section)
                     )
                     current_blocks = []
                     current_tokens = 0
+                    current_chars = 0
                 chunks.extend(self._split_large_block(document, block, current_section))
                 continue
 
+            if current_blocks and (
+                current_tokens + block_tokens > self.chunk_size_tokens
+                or current_chars + block_chars > self.max_chunk_chars
+            ):
+                chunks.append(
+                    self._build_chunk(document, current_blocks, current_section)
+                )
+                current_blocks = self._overlap_tail(
+                    current_blocks,
+                    self.chunk_size_tokens - block_tokens,
+                    self.max_chunk_chars - block_chars,
+                )
+                current_tokens = sum(
+                    self._estimate_tokens(item.text) for item in current_blocks
+                )
+                current_chars = sum(
+                    len(item.text.strip()) + 2 for item in current_blocks
+                )
+
             current_blocks.append(block)
             current_tokens += block_tokens
+            current_chars += block_chars
 
         if current_blocks:
             chunks.append(self._build_chunk(document, current_blocks, current_section))
@@ -373,27 +421,137 @@ class StructureAwareChunker:
         return chunks
 
     def _split_text(self, text: str) -> List[str]:
+        if _CJK_RE.search(text):
+            # Words are not separated by spaces here: pack whole sentences.
+            return self._pack_sentences(text, self._overlap_tokens)
         words = text.split()
         if not words:
             return []
-        step = max(self.chunk_size_tokens - self.chunk_overlap_tokens, 1)
+        step = max(self.chunk_size_tokens - self._overlap_tokens, 1)
         pieces = []
         for start in range(0, len(words), step):
             piece = " ".join(words[start : start + self.chunk_size_tokens])
-            if piece:
+            if len(piece) > self.max_chunk_chars:
+                pieces.extend(self._pack_sentences(piece, 0))
+            elif piece:
                 pieces.append(piece)
         return pieces
 
-    def _overlap_tail(self, blocks: List[DocumentBlock]) -> List[DocumentBlock]:
-        if self.chunk_overlap_tokens <= 0:
-            return []
-        total = 0
-        selected: List[DocumentBlock] = []
-        for block in reversed(blocks):
-            total += self._estimate_tokens(block.text)
-            selected.append(block)
-            if total >= self.chunk_overlap_tokens:
+    def _pack_sentences(self, text: str, overlap_tokens: int) -> List[str]:
+        """Split text into pieces within both limits, cutting between sentences.
+
+        Consecutive pieces share up to ``overlap_tokens`` of whole sentences.
+        """
+        parts: List[str] = []
+        for sentence in split_sentences(text):
+            if (
+                estimate_tokens(sentence) <= self.chunk_size_tokens
+                and len(sentence) <= self.max_chunk_chars
+            ):
+                parts.append(sentence)
+            else:
+                parts.extend(self._hard_split(sentence))
+        pieces: List[str] = []
+        current: List[str] = []
+        tokens = 0
+        chars = 0
+        for part in parts:
+            part_tokens = estimate_tokens(part)
+            if current and (
+                tokens + part_tokens > self.chunk_size_tokens
+                or chars + len(part) > self.max_chunk_chars
+            ):
+                pieces.append("".join(current).strip())
+                current = self._tail_within(
+                    current,
+                    min(overlap_tokens, self.chunk_size_tokens - part_tokens),
+                    self.max_chunk_chars - len(part),
+                )
+                tokens = sum(estimate_tokens(item) for item in current)
+                chars = sum(len(item) for item in current)
+            current.append(part)
+            tokens += part_tokens
+            chars += len(part)
+        if current:
+            pieces.append("".join(current).strip())
+        return [piece for piece in pieces if piece]
+
+    def _hard_split(self, sentence: str) -> List[str]:
+        """Cut one over-long sentence between units; the slices rejoin to it."""
+        slices: List[str] = []
+        start = None
+        count = 0
+        for match in _UNIT_RE.finditer(sentence):
+            unit_start, unit_end = match.span()
+            if unit_end - unit_start > self.max_chunk_chars:
+                # A single unbroken run longer than a chunk, e.g. encoded data.
+                if start is not None:
+                    slices.append(sentence[start:unit_start])
+                    start = None
+                    count = 0
+                slices.extend(
+                    sentence[offset : min(offset + self.max_chunk_chars, unit_end)]
+                    for offset in range(unit_start, unit_end, self.max_chunk_chars)
+                )
+                continue
+            if start is not None and (
+                count + 1 > self.chunk_size_tokens
+                or unit_end - start > self.max_chunk_chars
+            ):
+                slices.append(sentence[start:unit_start])
+                start = None
+                count = 0
+            if start is None:
+                start = unit_start
+            count += 1
+        if start is not None:
+            slices.append(sentence[start:])
+        return slices
+
+    def _tail_within(
+        self, parts: List[str], token_budget: int, char_budget: int
+    ) -> List[str]:
+        """The longest run of trailing parts that fits both budgets."""
+        selected: List[str] = []
+        tokens = 0
+        chars = 0
+        for part in reversed(parts):
+            tokens += estimate_tokens(part)
+            chars += len(part)
+            if tokens > token_budget or chars > char_budget:
                 break
+            selected.append(part)
+        return list(reversed(selected))
+
+    def _overlap_tail(
+        self, blocks: List[DocumentBlock], room_tokens: int, room_chars: int
+    ) -> List[DocumentBlock]:
+        """What the next chunk repeats from the end of the one just closed.
+
+        Whole trailing blocks while they fit the overlap; when even the last
+        block is larger, only its final sentences. ``room_*`` is what the next
+        block leaves free, so the new chunk stays within the limits.
+        """
+        token_budget = min(self._overlap_tokens, room_tokens)
+        if token_budget <= 0 or room_chars <= 0:
+            return []
+        selected: List[DocumentBlock] = []
+        tokens = 0
+        chars = 0
+        for block in reversed(blocks):
+            tokens += self._estimate_tokens(block.text)
+            chars += len(block.text.strip()) + 2
+            if tokens > token_budget or chars > room_chars:
+                if not selected:
+                    tail = "".join(
+                        self._tail_within(
+                            split_sentences(block.text), token_budget, room_chars - 2
+                        )
+                    ).strip()
+                    if tail:
+                        selected.append(replace(block, text=tail))
+                break
+            selected.append(block)
         return list(reversed(selected))
 
     def _next_section_path(self, current: List[str], text: str) -> List[str]:
@@ -417,7 +575,7 @@ class StructureAwareChunker:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _estimate_tokens(self, text: str) -> int:
-        return max(1, len(text.split()))
+        return max(1, estimate_tokens(text))
 
     def _has_indexable_metadata(self, block: DocumentBlock) -> bool:
         if block.block_type != "figure" or not isinstance(block.metadata, dict):

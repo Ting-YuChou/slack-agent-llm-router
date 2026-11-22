@@ -216,3 +216,13 @@ async def test_run_eval_fails_loudly_when_a_document_cannot_be_ingested():
 
     with pytest.raises(ValueError, match="no indexable text chunks"):
         await run_eval(broken, [], settings=TOY_SETTINGS)
+
+
+@pytest.mark.asyncio
+async def test_every_answer_in_the_fixture_reaches_the_index():
+    corpus, queries = load_fixture()
+
+    report = await run_eval(corpus, queries)
+
+    lost = [row["id"] for row in report["rows"] if not row["indexed"]]
+    assert lost == []
