@@ -58,8 +58,8 @@ class StructureAwareChunker:
 
     def __init__(self, config: Dict[str, Any]):
         self.config = dict(config or {})
-        self.chunk_size_tokens = int(self.config.get("chunk_size_tokens", 900))
-        self.chunk_overlap_tokens = int(self.config.get("chunk_overlap_tokens", 120))
+        self.chunk_size_tokens = int(self.config.get("chunk_size_tokens", 300))
+        self.chunk_overlap_tokens = int(self.config.get("chunk_overlap_tokens", 40))
         self.max_chunk_chars = int(self.config.get("max_chunk_chars", 6000))
         # More overlap than half a chunk makes every chunk mostly repetition
         # (and a step of one word when it reaches the chunk size).

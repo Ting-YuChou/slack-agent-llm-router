@@ -402,8 +402,8 @@ rag:
     unresolved_policy: preserve_with_warning
   chunking:
     strategy: hybrid
-    chunk_size_tokens: 900
-    chunk_overlap_tokens: 120
+    chunk_size_tokens: 300
+    chunk_overlap_tokens: 40
     repeat_table_headers: true
     max_chunk_chars: 6000
   embedding:
@@ -478,7 +478,7 @@ rag:
     keyword_weight: 0.35
     vector_weight: 0.6
     recency_weight: 0.05
-    max_context_chars: 6000
+    max_context_chars: 12000
     max_concurrent_branches: 3
     deadline_seconds: 30
   rerank:

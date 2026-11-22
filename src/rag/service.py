@@ -99,6 +99,9 @@ _STORE_DEADLINE_MARGIN_MAX_SECONDS = 0.25
 # Share of the retrieval time left that the query embedding may use: the
 # keyword branch needs the rest even when the embedding server hangs.
 _EMBEDDING_DEADLINE_SHARE = 0.5
+# A source is only added to the context while each one can still get this
+# much of its text; below that it is noise next to the better-ranked ones.
+_MIN_SOURCE_CONTEXT_CHARS = 80
 
 RAG_HITS = "hits"
 RAG_NO_HITS = "no_hits"
@@ -1103,9 +1106,15 @@ class RagService:
         return results[:top_k]
 
     def build_context(self, results: Sequence[RagSearchResult]) -> str:
+        """Render the sources for the prompt within ``max_context_chars``.
+
+        When they do not all fit, every source keeps a share: short ones
+        stay whole and the rest split what is left evenly, rather than the
+        first source taking the budget and the others being dropped.
+        """
         if not results:
             return ""
-        max_context_chars = int(self.retrieval_config.get("max_context_chars", 6000))
+        max_context_chars = int(self.retrieval_config.get("max_context_chars", 12000))
         lines = [
             RAG_CONTEXT_HEADER,
             RAG_CONTEXT_INSTRUCTIONS,
@@ -1113,6 +1122,8 @@ class RagService:
         remaining = max_context_chars - len("\n\n".join(lines)) - 2
         if remaining <= 0:
             return "\n\n".join(lines)[:max_context_chars]
+        sources: List[tuple[str, str]] = []
+        fixed = 0
         for index, result in enumerate(results, start=1):
             chunk = result.chunk
             title = str(
@@ -1125,21 +1136,23 @@ class RagService:
                 if chunk.page_start == chunk.page_end
                 else f"pp. {chunk.page_start}-{chunk.page_end}"
             )
-            text = self._context_text_for_chunk(chunk)
             source_header = (
                 f"[S{index}] {title} ({page}, kb={result.knowledge_base_id})\n"
                 f"Chunk: {chunk.chunk_id}\n"
             )
-            budget = remaining - len(source_header) - len("Content: ") - 2
-            if budget <= 0:
+            # The header, the "Content: " label and the blank line after it.
+            cost = len(source_header) + len("Content: ") + 2
+            floor = _MIN_SOURCE_CONTEXT_CHARS if sources else 1
+            if fixed + cost + floor * (len(sources) + 1) > remaining:
+                # Lower-ranked sources no longer leave each a useful share.
                 break
+            fixed += cost
+            sources.append((source_header, self._context_text_for_chunk(chunk)))
+        budgets = _share_evenly(remaining - fixed, [len(text) for _, text in sources])
+        for (source_header, text), budget in zip(sources, budgets):
             if len(text) > budget:
                 text = text[: max(budget - 3, 0)].rstrip() + "..."
-            entry = source_header + f"Content: {text}"
-            if len(entry) + 2 > remaining:
-                break
-            lines.append(entry)
-            remaining -= len(entry) + 2
+            lines.append(source_header + f"Content: {text}")
         return "\n\n".join(lines)
 
     def _context_text_for_chunk(self, chunk: DocumentChunk) -> str:
@@ -2766,6 +2779,17 @@ def _public_rag_metadata(value: Any) -> Any:
             continue
         output[key] = _public_rag_metadata(item)
     return output
+
+
+def _share_evenly(total: int, wanted: Sequence[int]) -> List[int]:
+    """Split ``total`` so small requests are met in full and the rest is even."""
+    shares = [0] * len(wanted)
+    left = max(0, total)
+    order = sorted(range(len(wanted)), key=lambda index: wanted[index])
+    for position, index in enumerate(order):
+        shares[index] = min(wanted[index], left // (len(order) - position))
+        left -= shares[index]
+    return shares
 
 
 def _parse_datetime(value: Any) -> datetime:

@@ -239,3 +239,17 @@ async def test_exact_term_queries_find_their_answer_in_both_languages():
     assert summary["en/exact"]["recall"] >= 0.9
     assert summary["zh/exact"]["in_context"] >= 0.9
     assert summary["en/exact"]["in_context"] >= 0.9
+
+
+@pytest.mark.asyncio
+async def test_every_retrieved_source_reaches_the_context():
+    corpus, queries = load_fixture()
+
+    report = await run_eval(corpus, queries)
+
+    dropped = [
+        row["id"]
+        for row in report["rows"]
+        if row["sources_in_context"] != row["results"]
+    ]
+    assert dropped == []
