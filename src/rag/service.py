@@ -1124,6 +1124,7 @@ class RagService:
             return "\n\n".join(lines)[:max_context_chars]
         sources: List[tuple[str, str]] = []
         fixed = 0
+        floors = 0
         for index, result in enumerate(results, start=1):
             chunk = result.chunk
             title = str(
@@ -1142,12 +1143,17 @@ class RagService:
             )
             # The header, the "Content: " label and the blank line after it.
             cost = len(source_header) + len("Content: ") + 2
-            floor = _MIN_SOURCE_CONTEXT_CHARS if sources else 1
-            if fixed + cost + floor * (len(sources) + 1) > remaining:
-                # Lower-ranked sources no longer leave each a useful share.
+            text = self._context_text_for_chunk(chunk)
+            # What this source must be able to keep: all of a short text,
+            # a useful excerpt of a long one. The first only has to fit at all.
+            floor = min(len(text), _MIN_SOURCE_CONTEXT_CHARS if sources else 1)
+            if fixed + cost + floors + floor > remaining:
                 break
+            if not sources:
+                floor = min(len(text), _MIN_SOURCE_CONTEXT_CHARS)
             fixed += cost
-            sources.append((source_header, self._context_text_for_chunk(chunk)))
+            floors += floor
+            sources.append((source_header, text))
         budgets = _share_evenly(remaining - fixed, [len(text) for _, text in sources])
         for (source_header, text), budget in zip(sources, budgets):
             if len(text) > budget:

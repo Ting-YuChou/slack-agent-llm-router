@@ -287,3 +287,27 @@ async def test_failing_to_add_the_terms_field_leaves_text_search_working():
 
     assert store._keyword_terms_ready is False
     assert client.queries()[0] == f"{SCHOOL} @text:(cs3205)"
+
+
+@pytest.mark.asyncio
+async def test_losing_the_race_to_add_the_terms_field_still_enables_it():
+    class _RacedRedis(_Redis):
+        async def execute_command(self, *command):
+            if command[0] == "FT.ALTER":
+                # Another worker added the field between our FT.INFO and now.
+                self.info = _index_info("text", "keyword_terms")
+                self.commands.append(command)
+                raise RuntimeError("Duplicate field in schema - keyword_terms")
+            return await super().execute_command(*command)
+
+    client = _RacedRedis(info=_index_info("text"))
+    store = _store(client, ready=False)
+
+    await store._ensure_index()
+
+    assert store._keyword_terms_ready is True
+    assert [command[0] for command in client.commands] == [
+        "FT.INFO",
+        "FT.ALTER",
+        "FT.INFO",
+    ]

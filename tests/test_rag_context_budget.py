@@ -149,3 +149,14 @@ def test_defaults_agree_between_schema_code_and_checked_in_configs():
         assert rag["chunking"]["chunk_overlap_tokens"] == 40, name
         assert rag["chunking"]["max_chunk_chars"] == 6000, name
         assert rag["retrieval"]["max_context_chars"] == 12000, name
+
+
+def test_short_sources_that_fit_are_kept_even_when_the_budget_is_tight():
+    results = [_result(1, "a" * 40), _result(2, "b"), _result(3, "c" * 30)]
+    whole = "\n\n".join(
+        [PREAMBLE, _entry(1, "a" * 40), _entry(2, "b"), _entry(3, "c" * 30)]
+    )
+
+    context = _service(len(whole) + 2).build_context(results)
+
+    assert context == whole

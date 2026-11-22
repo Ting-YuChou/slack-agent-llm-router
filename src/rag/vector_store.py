@@ -538,13 +538,20 @@ class RedisStackRagVectorStore:
                 "NOSTEM",
             )
         except Exception as exc:
-            logger.warning(
-                "Could not add %s to RAG index %s; keyword search uses text only: %s",
-                KEYWORD_TERMS_FIELD,
-                self.index_name,
-                exc,
-            )
-            return
+            # Another worker starting at the same time may have added it.
+            try:
+                info = await self.client.execute_command("FT.INFO", self.index_name)
+            except Exception:
+                info = None
+            if not _index_has_field(info, KEYWORD_TERMS_FIELD):
+                logger.warning(
+                    "Could not add %s to RAG index %s; "
+                    "keyword search uses text only: %s",
+                    KEYWORD_TERMS_FIELD,
+                    self.index_name,
+                    exc,
+                )
+                return
         self._keyword_terms_ready = True
 
     async def upsert_chunks(
